@@ -1,0 +1,125 @@
+# Thermocline configuration.
+#
+# The fast tier is a small cluster holding the working set. The cold tier is a
+# big cheap cluster holding everything. When adopting on a running database,
+# your existing cluster becomes the cold tier as it is.
+
+hot:
+  uri: "mongodb://rs-fast-1,rs-fast-2,rs-fast-3/?replicaSet=rsFast"
+
+cold:
+  uri: "mongodb://rs-cold-1,rs-cold-2,rs-cold-3/?replicaSet=rsCold"
+
+feeder:
+  # Names this feeder's checkpoint. Changing it starts mirroring from now,
+  # skipping everything written before, so only change it deliberately.
+  id: "default"
+
+  # Collections to mirror, as db.collection. Leave empty to mirror everything
+  # except system databases and Thermocline's own bookkeeping.
+  namespaces:
+    - "app.orders"
+    - "app.events"
+
+  # How often the resume position is saved. Mirroring is idempotent, so this
+  # trades repeated work after a restart against checkpoint writes.
+  checkpoint_every: 5s
+
+  # Documents per bulk write to the cold tier.
+  batch_size: 500
+
+  # How long a change stream poll blocks before returning empty. Also sets how
+  # often an idle feeder flushes and checkpoints.
+  max_await: 1s
+
+  # What to do with a delete on the fast tier that the evictor did not
+  # announce. The evictor announces every document it removes, so an
+  # unannounced delete came from the application.
+  #
+  #   tombstone  mark the archived copy as deleted, so reads stop returning it.
+  #              Correct when the evictor is the only thing removing data.
+  #   ignore     leave the archived copy readable. Choose this if you run bulk
+  #              deletes outside the evictor and would rather keep the archive.
+  #   halt       stop the feeder and alert rather than guess.
+  unannounced_deletes: tombstone
+
+evictor:
+  # Must match feeder.id. The evictor reads mirroring lag from that feeder's
+  # checkpoint and refuses to remove anything while it is behind.
+  feeder_id: "default"
+
+  # Documents removed per second, smoothed across the whole run. Start low and
+  # raise it only after watching a full business day. This is the knob that
+  # decides whether eviction is invisible or an incident.
+  rate: 1000
+
+  # Documents per pass. Each pass costs five round trips.
+  batch_size: 500
+
+  # Mirroring lag past which eviction stops. Removing a document the archive
+  # has not received destroys it, so this check fails closed: if the lag cannot
+  # be read at all, nothing is removed.
+  max_feeder_lag: 30s
+
+  rules:
+    - ns: "app.orders"
+      older_than: 90d
+      # Leave date_field empty to read age from the timestamp inside a default
+      # ObjectId _id. That needs no extra index and lets the scan follow the
+      # _id index in order. Set it only if your _id is not a time-ordered
+      # ObjectId, and then index {thatField: 1, _id: 1}.
+      # date_field: "createdAt"
+
+  # Live signals that pause eviction. Unlike max_feeder_lag these fail open: a
+  # metric that moves in a future MongoDB release should not stop eviction
+  # forever, since that would be its own outage.
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05        # fraction of the WiredTiger cache
+    min_write_tickets: 20
+    min_oplog_window: 24h
+
+warmer:
+  # Documents copied up per second, smoothed across the whole run.
+  rate: 2000
+
+  # Documents per pass. These carry whole documents, unlike the evictor's
+  # batches of ids, so keep it smaller.
+  batch_size: 200
+
+  # How long a warmed document is protected from the evictor. Without this, a
+  # warm followed by an eviction sweep undoes itself.
+  residency: 30d
+
+  rules:
+    - ns: "app.orders"
+      # Fill the fast tier back this far. This is what moves the completeness
+      # watermark, which is what lets a range query be answered from the fast
+      # tier alone instead of falling through to the archive.
+      back: 90d
+      # date_field: "createdAt"   # same convention as the evictor
+
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05
+    min_write_tickets: 20
+    min_oplog_window: 24h
+
+router:
+  # The address clients connect to. In production this takes over the name the
+  # application already dials, by repointing DNS, so nothing in the application
+  # changes.
+  listen: "0.0.0.0:27017"
+
+  # What to do with a query whose answer the fast tier cannot guarantee is
+  # whole, meaning it reaches earlier than the completeness watermark.
+  #
+  #   strict      refuse it. The fast tier returning some of the matching
+  #               documents looks exactly like it returning all of them, and a
+  #               short answer reported as success is the worst failure here.
+  #   permissive  answer anyway and count it. For deployments that would rather
+  #               have fast approximate reads than an error.
+  completeness: strict
+
+  # How long a copied-up document is protected from the evictor.
+  residency: 30d

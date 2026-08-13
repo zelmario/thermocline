@@ -1,0 +1,281 @@
+// Package feeder mirrors writes from the fast tier into the cold tier.
+//
+// It tails the fast tier's change stream and applies every insert, update and
+// replace to the cold tier as an upsert. It never deletes and never drops. That
+// single restriction is what makes the cold tier a complete archive rather than
+// a second copy of whatever state the fast tier happens to be in, and it is why
+// removing a document from the fast tier does not remove it from the archive.
+package feeder
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/zelmar/thermocline/internal/checkpoint"
+	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmar/thermocline/internal/meta"
+)
+
+// metaDB is aliased so classify.go does not import meta for one constant.
+const metaDB = meta.DB
+
+// ErrUnannouncedDelete is returned when policy is "halt" and a delete arrived
+// that the evictor did not announce.
+var ErrUnannouncedDelete = errors.New("unannounced delete on the fast tier")
+
+// Feeder mirrors one fast tier into one cold tier.
+type Feeder struct {
+	hot  *mongo.Client
+	cold *mongo.Client
+	cfg  config.FeederConfig
+	cp   *checkpoint.Store
+	log  *slog.Logger
+
+	// buffered work, flushed together
+	pending []pendingOp
+	// lag of the most recent event applied
+	lastEventAt time.Time
+	lastToken   bson.Raw
+	lastSaved   time.Time
+
+	// cached view of whether a warmer is running, see echo.go
+	warmActive    bool
+	warmCheckedAt time.Time
+}
+
+// pendingOp is one decoded change waiting to be written.
+type pendingOp struct {
+	ns   string
+	key  bson.Raw // documentKey, always {_id: ...}
+	id   bson.RawValue
+	doc  bson.Raw // full document, nil for deletes
+	kind action
+}
+
+// changeEvent is the subset of a change stream document the feeder reads.
+type changeEvent struct {
+	ID            bson.Raw `bson:"_id"`
+	OperationType string   `bson:"operationType"`
+	NS            struct {
+		DB   string `bson:"db"`
+		Coll string `bson:"coll"`
+	} `bson:"ns"`
+	DocumentKey  bson.Raw       `bson:"documentKey"`
+	FullDocument bson.Raw       `bson:"fullDocument"`
+	ClusterTime  bson.Timestamp `bson:"clusterTime"`
+}
+
+// New builds a Feeder. It does not contact either cluster.
+func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Feeder {
+	return &Feeder{
+		hot:  hot,
+		cold: cold,
+		cfg:  cfg,
+		cp:   checkpoint.New(cold),
+		log:  log,
+	}
+}
+
+// EnsureIndexes creates the bookkeeping indexes the feeder and evictor need.
+// Safe to call on every start.
+func (f *Feeder) EnsureIndexes(ctx context.Context) error {
+	// Eviction notices expire on their own. They only have to outlive feeder
+	// lag, and an hour is generous next to a 30 second alerting threshold.
+	_, err := f.cold.Database(meta.DB).Collection(meta.Evicting).Indexes().
+		CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(3600).SetName("tc_notice_ttl"),
+		})
+	if err != nil {
+		return fmt.Errorf("create evicting ttl index: %w", err)
+	}
+
+	// Warming notices expire the same way, for the same reason.
+	_, err = f.cold.Database(meta.DB).Collection(meta.Warming).Indexes().
+		CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(3600).SetName("tc_warm_ttl"),
+		})
+	if err != nil {
+		return fmt.Errorf("create warming ttl index: %w", err)
+	}
+	return nil
+}
+
+// Run tails the fast tier until ctx is cancelled. It reopens the stream on
+// recoverable errors, resuming from the last saved checkpoint.
+func (f *Feeder) Run(ctx context.Context) error {
+	if err := f.EnsureIndexes(ctx); err != nil {
+		return err
+	}
+
+	for {
+		err := f.runOnce(ctx)
+		switch {
+		case err == nil, errors.Is(err, context.Canceled):
+			return nil
+		case errors.Is(err, ErrUnannouncedDelete):
+			return err
+		}
+
+		f.log.Error("change stream ended, reopening", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// runOnce opens a stream and pumps it until it fails or ctx ends.
+func (f *Feeder) runOnce(ctx context.Context) error {
+	token, err := f.cp.Load(ctx, f.cfg.ID)
+	if err != nil {
+		return err
+	}
+
+	opts := options.ChangeStream().
+		SetFullDocument(options.UpdateLookup).
+		SetMaxAwaitTime(f.cfg.MaxAwait)
+	if len(token) > 0 {
+		// StartAfter resumes past an invalidate, ResumeAfter does not.
+		opts.SetStartAfter(token)
+		f.log.Info("resuming from checkpoint", "id", f.cfg.ID)
+	} else {
+		f.log.Warn("no checkpoint, mirroring from now on",
+			"id", f.cfg.ID,
+			"note", "documents written before this moment are not mirrored; run the warmer to backfill")
+	}
+
+	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
+	if err != nil {
+		return fmt.Errorf("open change stream: %w", err)
+	}
+	defer func() { _ = stream.Close(context.WithoutCancel(ctx)) }()
+
+	f.log.Info("mirroring", "namespaces", f.namespaceDescription())
+
+	for {
+		if ctx.Err() != nil {
+			return f.flush(context.WithoutCancel(ctx))
+		}
+
+		// TryNext blocks up to MaxAwaitTime, so an idle stream still paces the
+		// loop and flushes at least that often.
+		if stream.TryNext(ctx) {
+			if err := f.handle(ctx, stream.Current); err != nil {
+				return err
+			}
+			f.lastToken = stream.ResumeToken()
+			if len(f.pending) >= f.cfg.BatchSize {
+				if err := f.flushAndCheckpoint(ctx); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := stream.Err(); err != nil {
+			// Flush what we have before giving the stream up, so a reopen does
+			// not repeat work we already decoded.
+			if ferr := f.flush(context.WithoutCancel(ctx)); ferr != nil {
+				f.log.Error("flush before reopen failed", "err", ferr)
+			}
+			return err
+		}
+
+		// Idle. Write out whatever is buffered and save our position.
+		if err := f.flushAndCheckpoint(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+// pipeline restricts the stream to the operations and namespaces we mirror.
+func (f *Feeder) pipeline() mongo.Pipeline {
+	match := bson.D{
+		{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
+			// Mirrored.
+			"insert", "update", "replace", "delete",
+			// Never mirrored, but let through so they can be logged. A dropped
+			// collection on the fast tier is exactly the moment an operator
+			// needs to hear that the archive kept its copy.
+			"drop", "dropDatabase", "rename",
+		}}}},
+		{Key: "ns.db", Value: bson.D{{Key: "$nin", Value: bson.A{
+			"admin", "local", "config", meta.DB,
+		}}}},
+	}
+
+	if len(f.cfg.Namespaces) > 0 {
+		var want bson.A
+		for _, ns := range f.cfg.Namespaces {
+			db, coll := splitNS(ns)
+			want = append(want, bson.D{
+				{Key: "ns.db", Value: db},
+				{Key: "ns.coll", Value: coll},
+			})
+		}
+		match = append(match, bson.E{Key: "$or", Value: want})
+	}
+
+	return mongo.Pipeline{{{Key: "$match", Value: match}}}
+}
+
+// handle decodes one event and buffers the work it implies.
+func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
+	var ev changeEvent
+	if err := bson.Unmarshal(raw, &ev); err != nil {
+		return fmt.Errorf("decode change event: %w", err)
+	}
+	if skipNamespace(ev.NS.DB) {
+		return nil
+	}
+	f.lastEventAt = time.Unix(int64(ev.ClusterTime.T), 0).UTC()
+
+	ns := ev.NS.DB + "." + ev.NS.Coll
+
+	// Classify before touching documentKey. DDL events do not carry one, and
+	// looking it up first turns "somebody dropped a collection" into a
+	// confusing warning about a missing _id.
+	act, decided := classifyOp(ev.OperationType)
+	if decided && act == actionSkip {
+		f.log.Warn("ignoring operation that is never mirrored",
+			"ns", ns, "op", ev.OperationType,
+			"note", "the archive keeps its copy")
+		return nil
+	}
+
+	id, err := ev.DocumentKey.LookupErr("_id")
+	if err != nil {
+		f.log.Warn("event without _id, skipping", "ns", ns, "op", ev.OperationType)
+		return nil
+	}
+
+	if !decided {
+		// A delete. Whether it is an eviction is resolved in bulk at flush
+		// time, because one lookup per delete would be far too slow while the
+		// evictor is running.
+		f.pending = append(f.pending, pendingOp{
+			ns: ns, key: ev.DocumentKey, id: id, kind: actionDeletePending,
+		})
+		return nil
+	}
+
+	if len(ev.FullDocument) == 0 {
+		// updateLookup found nothing, so the document was deleted between the
+		// change and our read. The delete event is behind this one in the
+		// stream and will be handled then.
+		return nil
+	}
+	f.pending = append(f.pending, pendingOp{
+		ns: ns, key: ev.DocumentKey, id: id, doc: ev.FullDocument, kind: actionUpsert,
+	})
+	return nil
+}

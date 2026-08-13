@@ -1,0 +1,4 @@
+bin/
+.dev/
+cline.yaml
+*.log
