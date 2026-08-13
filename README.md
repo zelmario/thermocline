@@ -199,6 +199,27 @@ bin/cline feeder --config cline.yaml
 Both tiers must be replica sets, since the feeder uses change streams.
 MongoDB 4.2 or newer.
 
+## Testing on a realistic timescale
+
+Nothing assumes days. The tier boundary is entirely config, so `older_than: 3m`
+behaves exactly like `older_than: 90d` and a full lifecycle runs in minutes.
+`cline.test.yaml` is a minute-scale profile.
+
+For tests that run repeatedly, fabricate the age instead of waiting for it:
+
+```js
+ObjectId.createFromTime(Math.floor(Date.now()/1000) - 86400)   // one day old
+```
+
+Age is read from the ObjectId, so a fabricated timestamp is indistinguishable
+from a genuinely old document and the same code paths run. ObjectId timestamps
+have one second of resolution, so minute-scale boundaries are safe and
+sub-second ones are not.
+
+One thing catches everybody: a cluster built minutes ago has minutes of oplog,
+and the production default of `min_oplog_window: 24h` blocks eviction outright.
+It looks like a hang. Lower it in any test profile.
+
 ## Developing
 
 ```
@@ -245,6 +266,10 @@ mongosh --port 28018 --eval '
   on mirroring lag, which usually covers it, but the restore case deserves an
   explicit check.
 - **Sharded fast tiers.** Untested.
+- **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
+  the write ticket pool dynamic and host-sized, so an absolute floor is
+  meaningless: a container reports a total of 8 tickets where a pre-7.0 server
+  reported a fixed 128.
 - **Router connection pooling.** One upstream connection per client is simple
   and correct for authentication, and it will not scale to tens of thousands of
   clients.

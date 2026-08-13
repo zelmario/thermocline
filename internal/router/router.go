@@ -43,7 +43,18 @@ type Router struct {
 	primary   string
 
 	wmCache watermarkCache
+	addr    atomic.Value
 	Stats   Stats
+}
+
+// Addr returns the address the router is listening on, once it is. Empty until
+// then. Useful for tests that bind port zero and need to find out where they
+// landed.
+func (r *Router) Addr() string {
+	if v, ok := r.addr.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // Stats counts what the router did. Every one of these is a number an operator
@@ -83,6 +94,7 @@ func (r *Router) Listen(ctx context.Context) error {
 		return fmt.Errorf("listen on %s: %w", r.cfg.Listen, err)
 	}
 	defer func() { _ = ln.Close() }()
+	r.addr.Store(ln.Addr().String())
 
 	go func() {
 		<-ctx.Done()
@@ -90,7 +102,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	}()
 
 	r.log.Info("router listening",
-		"addr", r.cfg.Listen,
+		"addr", ln.Addr().String(),
 		"fast_tier", r.currentPrimary(),
 		"completeness", string(r.cfg.Completeness))
 

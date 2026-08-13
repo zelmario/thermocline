@@ -1,0 +1,62 @@
+# Minute-scale profile for testing.
+#
+# Nothing in Thermocline assumes days. The tier boundary is entirely config, so
+# "older_than: 3m" behaves exactly like "older_than: 90d" and a full lifecycle
+# runs in minutes instead of a quarter.
+#
+# Two ways to use it, and both exercise the same code:
+#
+#   Real time.  Insert documents now, wait past older_than, then evict. Slower
+#               but tests the actual passage of time. What the durations below
+#               are set up for.
+#
+#   Fabricated. Give documents old timestamps and test instantly:
+#                 ObjectId.createFromTime(Math.floor(Date.now()/1000) - 86400)
+#               Age is read from the ObjectId, so a document with a fabricated
+#               timestamp is indistinguishable from a genuinely old one. Use
+#               this for anything that runs repeatedly.
+#
+# ObjectId timestamps have one second of resolution, so minute-scale boundaries
+# are safe and sub-second ones are not.
+
+hot:
+  uri: "mongodb://127.0.0.1:28017/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://127.0.0.1:28018/?replicaSet=rsCold"
+
+feeder:
+  id: "test"
+  namespaces: ["shop.orders"]
+  checkpoint_every: 1s
+  max_await: 500ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "test"
+  rate: 500
+  batch_size: 100
+  max_feeder_lag: 30s
+  rules:
+    - ns: "shop.orders"
+      older_than: 3m          # 90d in production
+  backoff:
+    # A cluster built minutes ago has minutes of oplog. The 24h production
+    # default blocks eviction outright, which looks like a hang and is the
+    # first thing to trip anyone testing this.
+    min_oplog_window: 1m
+
+warmer:
+  rate: 500
+  batch_size: 50
+  residency: 5m               # 30d in production
+  rules:
+    - ns: "shop.orders"
+      back: 60m
+  backoff:
+    min_oplog_window: 1m
+
+router:
+  # Not 27017 when a mongod already has it on this host.
+  listen: "127.0.0.1:27100"
+  completeness: strict
+  residency: 5m

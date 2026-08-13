@@ -27,7 +27,10 @@ type Reading struct {
 	ReplicationLag time.Duration
 	CacheDirty     float64
 	WriteTickets   int
-	OplogWindow    time.Duration
+	// WriteTicketsTotal is the size of the pool WriteTickets is free out of.
+	// MongoDB 7.0 made this dynamic, so the free count alone says nothing.
+	WriteTicketsTotal int
+	OplogWindow       time.Duration
 
 	// Missing names the checks that could not be taken, usually a permissions
 	// problem or a MongoDB version that reports the metric elsewhere.
@@ -71,8 +74,17 @@ func Evaluate(r Reading, limits config.BackoffConfig, maxFeederLag time.Duration
 	if !r.isMissing("cache dirty") && r.CacheDirty > limits.MaxCacheDirty {
 		return Verdict{Reason: fmt.Sprintf("cache is %.1f%% dirty, limit %.1f%%", r.CacheDirty*100, limits.MaxCacheDirty*100)}
 	}
-	if !r.isMissing("write tickets") && r.WriteTickets < limits.MinWriteTickets {
-		return Verdict{Reason: fmt.Sprintf("%d write tickets free, limit %d", r.WriteTickets, limits.MinWriteTickets)}
+	if !r.isMissing("write tickets") && r.WriteTicketsTotal > 0 {
+		// A fraction, not a count. MongoDB 7.0 replaced the fixed pool of 128
+		// tickets with one sized to the host and resized under load; a
+		// container can report a total of 8. Any absolute floor large enough to
+		// be useful on the old servers is unreachable on the new ones, and
+		// eviction would pause forever on a perfectly healthy cluster.
+		free := float64(r.WriteTickets) / float64(r.WriteTicketsTotal)
+		if free < limits.MinWriteTicketsFree {
+			return Verdict{Reason: fmt.Sprintf("%d of %d write tickets free (%.0f%%), limit %.0f%%",
+				r.WriteTickets, r.WriteTicketsTotal, free*100, limits.MinWriteTicketsFree*100)}
+		}
 	}
 	if !r.isMissing("oplog window") && r.OplogWindow < limits.MinOplogWindow.D() {
 		return Verdict{Reason: fmt.Sprintf("oplog window is %s, limit %s", r.OplogWindow.Round(time.Minute), limits.MinOplogWindow)}
@@ -140,19 +152,28 @@ func (c *Checker) sampleServerStatus(ctx context.Context, r *Reading) {
 	}
 
 	dirty, okDirty := lookupNumber(status, "wiredTiger", "cache", "tracked dirty bytes in the cache")
-	total, okTotal := lookupNumber(status, "wiredTiger", "cache", "maximum bytes configured")
-	if okDirty && okTotal && total > 0 {
-		r.CacheDirty = dirty / total
+	cacheMax, okCache := lookupNumber(status, "wiredTiger", "cache", "maximum bytes configured")
+	if okDirty && okCache && cacheMax > 0 {
+		r.CacheDirty = dirty / cacheMax
 	} else {
 		r.missing("cache dirty")
 	}
 
 	// MongoDB 7.0 moved ticket accounting under queues.execution. Try the new
 	// location first, then the old one.
-	if tickets, ok := lookupNumber(status, "queues", "execution", "write", "available"); ok {
-		r.WriteTickets = int(tickets)
-	} else if tickets, ok := lookupNumber(status, "wiredTiger", "concurrentTransactions", "write", "available"); ok {
-		r.WriteTickets = int(tickets)
+	free, okFree := lookupNumber(status, "queues", "execution", "write", "available")
+	total, okTotal := lookupNumber(status, "queues", "execution", "write", "totalTickets")
+
+	if !okFree {
+		free, okFree = lookupNumber(status, "wiredTiger", "concurrentTransactions", "write", "available")
+		out, okOut := lookupNumber(status, "wiredTiger", "concurrentTransactions", "write", "out")
+		if okFree && okOut {
+			total, okTotal = free+out, true
+		}
+	}
+	if okFree && okTotal && total > 0 {
+		r.WriteTickets = int(free)
+		r.WriteTicketsTotal = int(total)
 	} else {
 		r.missing("write tickets")
 	}

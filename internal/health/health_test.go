@@ -10,21 +10,22 @@ import (
 
 func limits() config.BackoffConfig {
 	return config.BackoffConfig{
-		MaxReplicationLag: config.Duration(10 * time.Second),
-		MaxCacheDirty:     0.05,
-		MinWriteTickets:   20,
-		MinOplogWindow:    config.Duration(24 * time.Hour),
+		MaxReplicationLag:   config.Duration(10 * time.Second),
+		MaxCacheDirty:       0.05,
+		MinWriteTicketsFree: 0.25,
+		MinOplogWindow:      config.Duration(24 * time.Hour),
 	}
 }
 
 // healthy is a reading with every signal comfortably inside its limit.
 func healthy() Reading {
 	return Reading{
-		FeederLag:      time.Second,
-		ReplicationLag: time.Second,
-		CacheDirty:     0.01,
-		WriteTickets:   120,
-		OplogWindow:    48 * time.Hour,
+		FeederLag:         time.Second,
+		ReplicationLag:    time.Second,
+		CacheDirty:        0.01,
+		WriteTickets:      120,
+		WriteTicketsTotal: 128,
+		OplogWindow:       48 * time.Hour,
 	}
 }
 
@@ -106,7 +107,8 @@ func TestUnknownPerformanceSignalsAllowEviction(t *testing.T) {
 func TestEvaluateChecksMirroringFirst(t *testing.T) {
 	// Everything is wrong at once. The reported reason should be the one that
 	// risks data, not the one that risks latency.
-	r := Reading{FeederLag: time.Hour, ReplicationLag: time.Hour, CacheDirty: 0.9, WriteTickets: 0}
+	r := Reading{FeederLag: time.Hour, ReplicationLag: time.Hour, CacheDirty: 0.9,
+		WriteTickets: 0, WriteTicketsTotal: 128}
 	v := Evaluate(r, limits(), 30*time.Second)
 	if v.OK {
 		t.Fatal("eviction allowed with every signal out of range")

@@ -132,8 +132,11 @@ func (r EvictionRule) UsesObjectIDTime() bool { return r.DateField == "" }
 type BackoffConfig struct {
 	MaxReplicationLag Duration `yaml:"max_replication_lag"`
 	MaxCacheDirty     float64  `yaml:"max_cache_dirty"`
-	MinWriteTickets   int      `yaml:"min_write_tickets"`
-	MinOplogWindow    Duration `yaml:"min_oplog_window"`
+	// MinWriteTicketsFree is a fraction of the pool, not a count. MongoDB 7.0
+	// made the pool dynamic and host-sized, so a container can report a total
+	// of 8 tickets and any useful absolute floor becomes unreachable.
+	MinWriteTicketsFree float64  `yaml:"min_write_tickets_free"`
+	MinOplogWindow      Duration `yaml:"min_oplog_window"`
 }
 
 // Tier is one side of the pair.
@@ -179,10 +182,10 @@ func Default() Config {
 			MaxFeederLag: Duration(30 * time.Second),
 			FeederID:     "default",
 			Backoff: BackoffConfig{
-				MaxReplicationLag: Duration(10 * time.Second),
-				MaxCacheDirty:     0.05,
-				MinWriteTickets:   20,
-				MinOplogWindow:    Duration(24 * time.Hour),
+				MaxReplicationLag:   Duration(10 * time.Second),
+				MaxCacheDirty:       0.05,
+				MinWriteTicketsFree: 0.25,
+				MinOplogWindow:      Duration(24 * time.Hour),
 			},
 		},
 		Warmer: WarmerConfig{
@@ -190,10 +193,10 @@ func Default() Config {
 			BatchSize: 200,
 			Residency: Duration(30 * 24 * time.Hour),
 			Backoff: BackoffConfig{
-				MaxReplicationLag: Duration(10 * time.Second),
-				MaxCacheDirty:     0.05,
-				MinWriteTickets:   20,
-				MinOplogWindow:    Duration(24 * time.Hour),
+				MaxReplicationLag:   Duration(10 * time.Second),
+				MaxCacheDirty:       0.05,
+				MinWriteTicketsFree: 0.25,
+				MinOplogWindow:      Duration(24 * time.Hour),
 			},
 		},
 		Router: RouterConfig{
@@ -320,6 +323,10 @@ func (e EvictorConfig) Validate() error {
 	}
 	if e.FeederID == "" {
 		return errors.New("evictor.feeder_id is required so lag can be read")
+	}
+	if e.Backoff.MinWriteTicketsFree < 0 || e.Backoff.MinWriteTicketsFree > 1 {
+		return fmt.Errorf("evictor.backoff.min_write_tickets_free must be a fraction between 0 and 1, got %v",
+			e.Backoff.MinWriteTicketsFree)
 	}
 	if e.Backoff.MaxCacheDirty <= 0 || e.Backoff.MaxCacheDirty > 1 {
 		return fmt.Errorf("evictor.backoff.max_cache_dirty must be a fraction between 0 and 1, got %v",

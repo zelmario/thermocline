@@ -75,8 +75,11 @@ evictor:
   # forever, since that would be its own outage.
   backoff:
     max_replication_lag: 10s
-    max_cache_dirty: 0.05        # fraction of the WiredTiger cache
-    min_write_tickets: 20
+    max_cache_dirty: 0.05         # fraction of the WiredTiger cache
+    # A fraction of the ticket pool, not a count. MongoDB 7.0 replaced the
+    # fixed pool of 128 with one sized to the host, and a small container
+    # reports a total of 8, so any absolute floor is unreachable there.
+    min_write_tickets_free: 0.25
     min_oplog_window: 24h
 
 warmer:
@@ -102,7 +105,7 @@ warmer:
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05
-    min_write_tickets: 20
+    min_write_tickets_free: 0.25
     min_oplog_window: 24h
 
 router:
