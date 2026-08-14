@@ -73,6 +73,27 @@ type RouterConfig struct {
 	Completeness Completeness `yaml:"completeness"`
 	// Residency is how long a copied-up document is protected from eviction.
 	Residency Duration `yaml:"residency"`
+	// Managed lists the namespaces Thermocline mirrors, copied from
+	// feeder.namespaces at load time rather than configured twice.
+	//
+	// The router needs it to tell a collection it tiers from one that only ever
+	// lived on the fast tier. An untiered collection is whole by definition, so
+	// demanding a completeness claim for it would refuse perfectly good queries.
+	// Empty means every namespace is managed, matching the feeder.
+	Managed []string `yaml:"-"`
+}
+
+// Manages reports whether ns is one of the namespaces Thermocline tiers.
+func (r RouterConfig) Manages(ns string) bool {
+	if len(r.Managed) == 0 {
+		return true
+	}
+	for _, m := range r.Managed {
+		if m == ns {
+			return true
+		}
+	}
+	return false
 }
 
 // WarmerConfig tunes filling the fast tier from the archive.
@@ -230,6 +251,7 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.Router.Managed = cfg.Feeder.Namespaces
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}

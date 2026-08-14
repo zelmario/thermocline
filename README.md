@@ -121,12 +121,9 @@ Range queries are governed by the watermark below.
 
 ### What it does not do yet
 
-- **Aggregations are passed straight through.** They are not miss-checked and
-  not completeness-checked. This is the largest hole in the completeness
-  guarantee, because every driver's `countDocuments` issues an `aggregate`:
-  measured against a partly filled fast tier it returned 1 where the answer was
-  45,904, and reported success. Until this is closed, the guarantee covers
-  `find` and nothing else.
+- **Aggregations are completeness-checked but not miss-checked.** A pipeline is
+  never resolved against the archive document by document; it is either safe to
+  run on the fast tier or refused. See below.
 - **`getMore` is passed through**, so a cursor that started on the fast tier
   stays there. Synthesised single-document replies carry cursor id zero, so no
   `getMore` follows them.
@@ -137,6 +134,36 @@ Range queries are governed by the watermark below.
   connection per client.
 - **TLS is not handled.** Terminate it in front, or add it before taking over a
   production address.
+
+### Aggregations
+
+Every driver's `countDocuments` is an `aggregate`, so leaving pipelines
+unguarded left the most common count in the system free to return a wrong
+number. Against a partly filled fast tier one returned 1 where the answer was
+45,904, and reported success.
+
+Pipelines are now judged **before they run**, unlike `find`, which is inspected
+on the way back. A pipeline can end in `$out` or `$merge`, and refusing after
+the fact would leave a truncated collection already written.
+
+Two rules do the work, and both exist because a pipeline is not a filter:
+
+- **Only a leading `$match` bounds the scan.** A `$match` further down filters
+  what earlier stages already read, so it says nothing about how far back the
+  scan reached. A pipeline with no leading `$match` scans the whole collection
+  and is refused unless the fast tier holds all of it.
+- **A joined collection has to be whole.** `$lookup`, `$graphLookup` and
+  `$unionWith` read by key, not by time, so no partial watermark covers them.
+  Joining a tiered collection that the fast tier holds only part of is refused,
+  because the alternative is a join that silently drops rows.
+
+Collections Thermocline does not tier are exempt. They live only on the fast
+tier, so they are whole by definition, and demanding a claim for them would
+refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
+
+`$out` and `$merge` are refused even under `completeness: permissive`. Returning
+a short answer is a wrong number on somebody's screen; writing one makes it the
+input to everything downstream.
 
 ## The completeness watermark
 

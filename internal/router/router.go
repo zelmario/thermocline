@@ -185,6 +185,15 @@ func (c *conn) pump(ctx context.Context) error {
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	name, db, nameErr := msg.CommandName()
 
+	// Aggregations are judged before they run, not on the way back. A pipeline
+	// can end in $out or $merge, and a refusal after the fact would leave a
+	// truncated collection already written.
+	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
+		if refusal, refused := c.guardAggregate(ctx, msg, db); refused {
+			return wire.Write(c.client, refusal)
+		}
+	}
+
 	if err := wire.Write(c.upstream, msg); err != nil {
 		return fmt.Errorf("forward to fast tier: %w", err)
 	}

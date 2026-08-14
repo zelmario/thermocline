@@ -195,6 +195,13 @@ func (r *Router) singleDocReply(msg, reply *wire.Message, ns string, doc bson.Ra
 
 // errorReply builds a command failure the driver will surface to the caller.
 func (r *Router) errorReply(msg, reply *wire.Message, errmsg string) (*wire.Message, error) {
+	return r.commandError(reply.Header.RequestID, msg.Header.RequestID, errmsg)
+}
+
+// commandError builds a failed command reply from scratch, so it can also be
+// used for a command that was refused before it ever reached the fast tier and
+// therefore has no reply to borrow a request id from.
+func (r *Router) commandError(requestID, responseTo int32, errmsg string) (*wire.Message, error) {
 	out := bson.D{
 		{Key: "ok", Value: 0.0},
 		{Key: "errmsg", Value: errmsg},
@@ -204,7 +211,7 @@ func (r *Router) errorReply(msg, reply *wire.Message, errmsg string) (*wire.Mess
 		{Key: "code", Value: int32(125)},
 		{Key: "codeName", Value: "CommandFailed"},
 	}
-	return wire.NewMsg(reply.Header.RequestID, msg.Header.RequestID, out)
+	return wire.NewMsg(requestID, responseTo, out)
 }
 
 func splitNS(ns string) (db, coll string) {
