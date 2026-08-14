@@ -134,12 +134,18 @@ router:
   # What to do with a query whose answer the fast tier cannot guarantee is
   # whole, meaning it reaches earlier than the completeness watermark.
   #
-  #   strict      refuse it. The fast tier returning some of the matching
-  #               documents looks exactly like it returning all of them, and a
-  #               short answer reported as success is the worst failure here.
-  #   permissive  answer anyway and count it. For deployments that would rather
-  #               have fast approximate reads than an error.
-  completeness: strict
+  #   archive     run the whole query against the archive instead. It holds
+  #               every document, so the caller gets a correct answer and
+  #               nothing in the application changes. The cost is that the
+  #               query runs at archive speed, and that the archive trails the
+  #               fast tier by the feeder's mirroring lag, so such a read is as
+  #               fresh as a secondary read rather than perfectly current.
+  #   strict      refuse it. Correct and loud, but a refused countDocuments is
+  #               a broken application. Choose this when you would rather find
+  #               out immediately than run slowly.
+  #   permissive  answer from the fast tier anyway and count it. This returns
+  #               short results and calls them success.
+  completeness: archive
 
   # How long a copied-up document is protected from the evictor.
   residency: 30d

@@ -55,12 +55,23 @@ type LogConfig struct {
 type Completeness string
 
 const (
+	// Archive answers the query from the cold tier instead. The archive holds
+	// every document, so it can answer in full what the fast tier cannot, and
+	// the caller gets a correct result rather than an error.
+	//
+	// This is the default because the point of the system is that applications
+	// do not change. Refusing a countDocuments is safe and still a broken
+	// promise. The cost is that such a query runs at archive speed, and the
+	// router counts them so an operator can see how often it happens.
+	Archive Completeness = "archive"
 	// Strict refuses the query. The fast tier returning some of the matching
 	// documents looks exactly like it returning all of them, and a short answer
-	// reported as success is the worst failure this system has.
+	// reported as success is the worst failure this system has. Use this when
+	// you would rather an application break loudly than run slowly.
 	Strict Completeness = "strict"
-	// Permissive answers anyway and counts it. For deployments that would
-	// rather have fast approximate reads than an error.
+	// Permissive answers from the fast tier anyway and counts it. This returns
+	// short results and calls them success, so it exists only for deployments
+	// that have decided approximate reads are acceptable.
 	Permissive Completeness = "permissive"
 )
 
@@ -234,7 +245,7 @@ func Default() Config {
 		},
 		Router: RouterConfig{
 			Listen:       "127.0.0.1:27017",
-			Completeness: Strict,
+			Completeness: Archive,
 			Residency:    Duration(30 * 24 * time.Hour),
 		},
 	}
@@ -302,9 +313,9 @@ func (r RouterConfig) Validate() error {
 		return errors.New("router.listen is required")
 	}
 	switch r.Completeness {
-	case Strict, Permissive:
+	case Archive, Strict, Permissive:
 	default:
-		return fmt.Errorf("router.completeness must be strict or permissive, got %q", r.Completeness)
+		return fmt.Errorf("router.completeness must be archive, strict or permissive, got %q", r.Completeness)
 	}
 	if r.Residency <= 0 {
 		return errors.New("router.residency must be positive, or the evictor removes what was just copied up")

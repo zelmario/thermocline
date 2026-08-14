@@ -173,6 +173,22 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+
+	// The archive holds every document, so it can answer in full what the fast
+	// tier cannot. A pipeline that writes is the exception: $out and $merge
+	// would land the result on the archive rather than where the application
+	// expects it, so those still have to be refused.
+	if c.r.cfg.Completeness == config.Archive && !scope.writes {
+		coll, _ := stringField(cmd, "aggregate")
+		out, err := c.answerFromArchive(ctx, msg, db, coll)
+		if err == nil {
+			c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
+			return out, true
+		}
+		c.log.Warn("could not answer this aggregation from the archive, refusing instead",
+			"ns", scope.primary, "err", err)
+	}
+
 	if c.r.cfg.Completeness == config.Permissive && !scope.writes {
 		c.log.Warn("aggregation may be short", "ns", scope.primary, "because", because)
 		return nil, false

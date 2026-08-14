@@ -135,6 +135,34 @@ Range queries are governed by the watermark below.
 - **TLS is not handled.** Terminate it in front, or add it before taking over a
   production address.
 
+### Reads the fast tier cannot answer
+
+The rule is that no application changes. A query that returns the wrong number
+breaks that, and so does a query that returns an error it never used to return.
+Refusing a `countDocuments` is safe and still a broken application.
+
+So a read the fast tier cannot answer in full **runs against the archive
+instead**. That works because the archive is not a partial complement of the
+fast tier, it is a complete MongoDB holding every document, so there is no
+merging of two half-answers: the query runs whole, on one tier or the other.
+Tombstoned records are filtered out on the way, so documents the application
+deleted do not come back.
+
+This covers the cases that used to need a decision before adoption: unbounded
+`find`, `countDocuments` and other aggregations, `$lookup` into a tiered
+collection, and skip-based pagination. All of them now return the same answer
+they would from a single cluster.
+
+**The one difference a caller can observe is freshness.** The archive trails the
+fast tier by the feeder's mirroring lag, normally well under a second, so a read
+that falls through has the staleness of a secondary read. That is a timing
+difference rather than an API difference, but it is real: a read of something
+written milliseconds ago may not see it. Applications needing read-your-own-
+writes on old data should keep that range warm.
+
+`router.completeness` chooses the behaviour: `archive` (the default), `strict`
+to refuse instead, `permissive` to return the fast tier's short answer.
+
 ### Aggregations
 
 Every driver's `countDocuments` is an `aggregate`, so leaving pipelines

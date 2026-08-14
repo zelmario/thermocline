@@ -1,0 +1,385 @@
+package router
+
+import (
+	"context"
+	"sync"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+
+	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmar/thermocline/internal/wire"
+)
+
+// Answering from the archive is what keeps the promise that no application
+// changes. A query the fast tier cannot answer in full used to be refused, and
+// a refused countDocuments is a broken application however safe the refusal is.
+//
+// It works because the archive is not a partial complement of the fast tier, it
+// is a complete MongoDB holding every document. So there is no merging of two
+// half-answers: the query runs on one tier or the other, whole.
+//
+// The one difference a caller can observe is freshness. The archive is behind
+// the fast tier by the feeder's mirroring lag, normally well under a second, so
+// a read that falls through here has the same staleness as a secondary read.
+// That is a timing difference, not an API difference, and no application has to
+// be rewritten for it.
+
+// firstBatchDefault matches the server's own default, so a driver that did not
+// ask for a batch size sees what it would see from mongod.
+const firstBatchDefault = 101
+
+// sessionFields belong to the client's conversation with the fast tier. Sending
+// them to the archive would attach this read to a session and a transaction
+// that exist on a different cluster.
+var sessionFields = map[string]bool{
+	"lsid": true, "txnNumber": true, "autocommit": true, "startTransaction": true,
+	"$clusterTime": true, "$db": true, "readConcern": true, "writeConcern": true,
+	"$readPreference": true, "apiVersion": true, "apiStrict": true, "apiDeprecationErrors": true,
+}
+
+// archiveCursor is a driver cursor we are serving getMore from.
+type archiveCursor struct {
+	cur *mongo.Cursor
+	ns  string
+}
+
+// cursorRegistry hands out ids for cursors this router owns rather than the
+// fast tier.
+//
+// Ids start high and climb, so they do not look like the small ids a test
+// server hands out, and every getMore is checked against the registry before it
+// is treated as ours. A real cursor id landing exactly on a live synthetic one
+// would need a random int64 collision, and the worst case is a getMore sent to
+// the wrong tier, which errors rather than returning wrong data.
+type cursorRegistry struct {
+	mu   sync.Mutex
+	next int64
+	open map[int64]*archiveCursor
+}
+
+func (reg *cursorRegistry) add(ac *archiveCursor) int64 {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if reg.open == nil {
+		reg.open = make(map[int64]*archiveCursor)
+		reg.next = 1 << 62
+	}
+	reg.next++
+	id := reg.next
+	reg.open[id] = ac
+	return id
+}
+
+func (reg *cursorRegistry) get(id int64) (*archiveCursor, bool) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	ac, ok := reg.open[id]
+	return ac, ok
+}
+
+func (reg *cursorRegistry) drop(ctx context.Context, id int64) {
+	reg.mu.Lock()
+	ac, ok := reg.open[id]
+	delete(reg.open, id)
+	reg.mu.Unlock()
+	if ok {
+		_ = ac.cur.Close(ctx)
+	}
+}
+
+func (reg *cursorRegistry) closeAll(ctx context.Context) {
+	reg.mu.Lock()
+	open := reg.open
+	reg.open = nil
+	reg.mu.Unlock()
+	for _, ac := range open {
+		_ = ac.cur.Close(ctx)
+	}
+}
+
+// answerFromArchive runs a find or aggregate against the archive and returns the
+// reply the client would have got from a single complete cluster.
+func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, coll string) (*wire.Message, error) {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return nil, err
+	}
+	rewritten, batchSize, err := rewriteForArchive(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
+	if err != nil {
+		return nil, err
+	}
+
+	ns := db + "." + coll
+	batch, more, err := readBatch(ctx, cur, batchSize)
+	if err != nil {
+		_ = cur.Close(ctx)
+		return nil, err
+	}
+
+	var id int64
+	if more {
+		id = c.cursors.add(&archiveCursor{cur: cur, ns: ns})
+	} else {
+		_ = cur.Close(ctx)
+	}
+
+	c.r.Stats.Archived.Add(1)
+	return cursorReply(msg.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", batch)
+}
+
+// serveOwnCursors answers getMore and killCursors for cursors this router
+// created, which the fast tier has never heard of.
+func (c *conn) serveOwnCursors(ctx context.Context, msg *wire.Message, name string) (bool, error) {
+	if name != "getMore" && name != "killCursors" {
+		return false, nil
+	}
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return false, nil
+	}
+
+	if name == "killCursors" {
+		if !c.archiveKillCursors(ctx, cmd) {
+			// Some or all belong to the fast tier, so let it do the work. Ours
+			// are already closed, and killing a closed cursor is not an error.
+			return false, nil
+		}
+		out, err := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{{Key: "ok", Value: 1.0}})
+		if err != nil {
+			return false, nil
+		}
+		return true, wire.Write(c.client, out)
+	}
+
+	reply, mine, err := c.archiveGetMore(ctx, msg, cmd)
+	if !mine {
+		return false, nil
+	}
+	if err != nil {
+		c.log.Warn("archive getMore failed", "err", err)
+		fail, ferr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: reading the next batch from the archive failed: "+err.Error())
+		if ferr != nil {
+			return true, ferr
+		}
+		return true, wire.Write(c.client, fail)
+	}
+	return true, wire.Write(c.client, reply)
+}
+
+// archiveGetMore serves the next batch of a cursor this router owns. The second
+// result reports whether the cursor was ours at all.
+func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.Raw) (*wire.Message, bool, error) {
+	idVal, err := cmd.LookupErr("getMore")
+	if err != nil {
+		return nil, false, nil
+	}
+	id, ok := idVal.Int64OK()
+	if !ok {
+		return nil, false, nil
+	}
+	ac, ok := c.cursors.get(id)
+	if !ok {
+		return nil, false, nil
+	}
+
+	size := firstBatchDefault
+	if v, err := cmd.LookupErr("batchSize"); err == nil {
+		if n, ok := intOf(v); ok && n > 0 {
+			size = n
+		}
+	}
+
+	batch, more, err := readBatch(ctx, ac.cur, size)
+	if err != nil {
+		c.cursors.drop(ctx, id)
+		return nil, true, err
+	}
+	out := id
+	if !more {
+		c.cursors.drop(ctx, id)
+		out = 0
+	}
+	reply, err := cursorReply(msg.Header.RequestID, msg.Header.RequestID, out, ac.ns, "nextBatch", batch)
+	return reply, true, err
+}
+
+// archiveKillCursors closes any of the named cursors that are ours, and reports
+// whether all of them were.
+func (c *conn) archiveKillCursors(ctx context.Context, cmd bson.Raw) bool {
+	val, err := cmd.LookupErr("cursors")
+	if err != nil {
+		return false
+	}
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return false
+	}
+	vals, err := arr.Values()
+	if err != nil || len(vals) == 0 {
+		return false
+	}
+	all := true
+	for _, v := range vals {
+		id, ok := v.Int64OK()
+		if !ok {
+			all = false
+			continue
+		}
+		if _, mine := c.cursors.get(id); mine {
+			c.cursors.drop(ctx, id)
+			continue
+		}
+		all = false
+	}
+	return all
+}
+
+// readBatch pulls up to size documents, reporting whether more remain.
+func readBatch(ctx context.Context, cur *mongo.Cursor, size int) (bson.A, bool, error) {
+	if size <= 0 {
+		size = firstBatchDefault
+	}
+	batch := bson.A{}
+	for len(batch) < size {
+		if !cur.Next(ctx) {
+			return batch, false, cur.Err()
+		}
+		var d bson.D
+		if err := bson.Unmarshal(cur.Current, &d); err != nil {
+			return batch, false, err
+		}
+		batch = append(batch, d)
+	}
+	// RemainingBatchLength is cheap and does not block; TryNext would fetch.
+	return batch, cur.RemainingBatchLength() > 0 || cur.ID() != 0, nil
+}
+
+// cursorReply builds the reply shape a driver expects from find, aggregate and
+// getMore.
+func cursorReply(requestID, responseTo int32, id int64, ns, field string, batch bson.A) (*wire.Message, error) {
+	return wire.NewMsg(requestID, responseTo, bson.D{
+		{Key: "cursor", Value: bson.D{
+			{Key: "id", Value: id},
+			{Key: "ns", Value: ns},
+			{Key: field, Value: batch},
+		}},
+		{Key: "ok", Value: 1.0},
+	})
+}
+
+// rewriteForArchive prepares a client's read for the archive.
+//
+// Two changes. Tombstoned documents are excluded, because the archive keeps
+// records the application deleted and returning one would resurrect it. And the
+// client's session and transaction fields are dropped, because they name a
+// conversation happening on the other cluster.
+func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	out := make(bson.D, 0, len(elems)+1)
+	batchSize := firstBatchDefault
+	sawFilter, sawPipeline := false, false
+
+	for _, e := range elems {
+		key := e.Key()
+		if sessionFields[key] {
+			continue
+		}
+		val := e.Value()
+
+		switch key {
+		case "filter":
+			sawFilter = true
+			out = append(out, bson.E{Key: "filter", Value: liveOnly(val)})
+			continue
+		case "pipeline":
+			sawPipeline = true
+			out = append(out, bson.E{Key: "pipeline", Value: livePipeline(val)})
+			continue
+		case "batchSize":
+			if n, ok := intOf(val); ok && n > 0 {
+				batchSize = n
+			}
+		case "cursor":
+			if doc, ok := val.DocumentOK(); ok {
+				if n, ok := intOf(doc.Lookup("batchSize")); ok && n > 0 {
+					batchSize = n
+				}
+			}
+		}
+		out = append(out, bson.E{Key: key, Value: val})
+	}
+
+	// A find with no filter at all still has to exclude tombstones.
+	if _, isFind := lookupString(cmd, "find"); isFind && !sawFilter {
+		out = append(out, bson.E{Key: "filter", Value: bson.D{meta.NotArchivedDeleted()}})
+	}
+	if _, isAgg := lookupString(cmd, "aggregate"); isAgg && !sawPipeline {
+		out = append(out, bson.E{Key: "pipeline", Value: bson.A{
+			bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}},
+		}})
+	}
+	return out, batchSize, nil
+}
+
+// liveOnly wraps a filter so it cannot match a tombstone.
+func liveOnly(filter bson.RawValue) bson.D {
+	doc, ok := filter.DocumentOK()
+	if !ok || len(doc) == 0 {
+		return bson.D{meta.NotArchivedDeleted()}
+	}
+	// $and rather than adding a field, because the original may already
+	// constrain the tombstone field or use $or at the top level.
+	return bson.D{{Key: "$and", Value: bson.A{doc, bson.D{meta.NotArchivedDeleted()}}}}
+}
+
+// livePipeline puts a tombstone filter in front of everything else, so no stage
+// ever sees a deleted record.
+func livePipeline(pipeline bson.RawValue) bson.A {
+	out := bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}
+	arr, ok := pipeline.ArrayOK()
+	if !ok {
+		return out
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return out
+	}
+	for _, v := range vals {
+		if doc, ok := v.DocumentOK(); ok {
+			out = append(out, doc)
+		}
+	}
+	return out
+}
+
+func lookupString(doc bson.Raw, key string) (string, bool) {
+	val, err := doc.LookupErr(key)
+	if err != nil {
+		return "", false
+	}
+	return val.StringValueOK()
+}
+
+// intOf reads a batch size, which drivers send as int32 or int64.
+func intOf(val bson.RawValue) (int, bool) {
+	switch val.Type {
+	case bson.TypeInt32:
+		return int(val.Int32()), true
+	case bson.TypeInt64:
+		return int(val.Int64()), true
+	case bson.TypeDouble:
+		return int(val.Double()), true
+	}
+	return 0, false
+}

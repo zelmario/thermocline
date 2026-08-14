@@ -245,6 +245,20 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+
+	// The archive holds every document, so it answers in full what the fast
+	// tier cannot. This is what keeps a query the application already had
+	// working, instead of turning it into an error nobody asked for.
+	if c.r.cfg.Completeness == config.Archive {
+		db, coll := splitNS(ns)
+		out, aerr := c.answerFromArchive(ctx, msg, db, coll)
+		if aerr == nil {
+			c.log.Debug("read answered from the archive", "ns", ns, "because", because)
+			return out, nil
+		}
+		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
+	}
+
 	if c.r.cfg.Completeness == config.Permissive {
 		c.log.Warn("answer may be short", "ns", ns, "because", because)
 		return reply, nil

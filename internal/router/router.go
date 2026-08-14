@@ -67,6 +67,7 @@ type Stats struct {
 	CopiedUp     atomic.Int64
 	Incomplete   atomic.Int64
 	Refused      atomic.Int64
+	Archived     atomic.Int64
 	ClientsOpen  atomic.Int64
 	ClientsTotal atomic.Int64
 }
@@ -151,6 +152,7 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		upstream: upstream,
 		log:      r.log,
 	}
+	defer c.cursors.closeAll(context.WithoutCancel(ctx))
 	if err := c.pump(ctx); err != nil && !isClosed(err) {
 		r.log.Debug("connection ended", "err", err)
 	}
@@ -162,6 +164,10 @@ type conn struct {
 	client   net.Conn
 	upstream net.Conn
 	log      *slog.Logger
+
+	// cursors this router owns, from reads answered by the archive. They are
+	// per connection because that is how the client will use them.
+	cursors cursorRegistry
 }
 
 func (c *conn) pump(ctx context.Context) error {
@@ -185,12 +191,20 @@ func (c *conn) pump(ctx context.Context) error {
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	name, db, nameErr := msg.CommandName()
 
+	// Cursors this router owns never existed on the fast tier, so their
+	// follow-ups have to be served here or the driver gets "cursor not found".
+	if nameErr == nil && !msg.MoreToCome() {
+		if handled, err := c.serveOwnCursors(ctx, msg, name); handled {
+			return err
+		}
+	}
+
 	// Aggregations are judged before they run, not on the way back. A pipeline
-	// can end in $out or $merge, and a refusal after the fact would leave a
+	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
 	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
-		if refusal, refused := c.guardAggregate(ctx, msg, db); refused {
-			return wire.Write(c.client, refusal)
+		if out, done := c.guardAggregate(ctx, msg, db); done {
+			return wire.Write(c.client, out)
 		}
 	}
 
