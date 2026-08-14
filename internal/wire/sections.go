@@ -115,6 +115,42 @@ func (m *Message) FirstOf(field string) (bson.Raw, bool) {
 	return sub, true
 }
 
+// AllOf returns every document of a bulk array, from wherever the driver put
+// it. Needed by anything that has to inspect a whole batch rather than decide
+// on its first statement, such as checking a multi-document insert for keys
+// that are already taken.
+func (m *Message) AllOf(field string) []bson.Raw {
+	if payloads := m.Payloads(); payloads != nil {
+		if docs, ok := payloads[field]; ok {
+			return docs
+		}
+	}
+
+	doc, err := m.CommandDoc()
+	if err != nil {
+		return nil
+	}
+	val, err := doc.LookupErr(field)
+	if err != nil {
+		return nil
+	}
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return nil
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return nil
+	}
+	out := make([]bson.Raw, 0, len(vals))
+	for _, v := range vals {
+		if sub, ok := v.DocumentOK(); ok {
+			out = append(out, sub)
+		}
+	}
+	return out
+}
+
 // CountOf reports how many documents a bulk array holds, from either place.
 func (m *Message) CountOf(field string) int {
 	if payloads := m.Payloads(); payloads != nil {

@@ -180,3 +180,18 @@ func matched(reply bson.Raw) int {
 		return -1
 	}
 }
+
+// writeFailed reports whether a write reply carries per-statement errors, which
+// a command can do while still reporting ok:1.
+func writeFailed(reply bson.Raw) bool {
+	val, err := reply.LookupErr("writeErrors")
+	if err != nil {
+		return false
+	}
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return false
+	}
+	vals, err := arr.Values()
+	return err == nil && len(vals) > 0
+}

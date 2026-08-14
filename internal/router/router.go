@@ -42,9 +42,10 @@ type Router struct {
 	primaryMu sync.RWMutex
 	primary   string
 
-	wmCache watermarkCache
-	addr    atomic.Value
-	Stats   Stats
+	wmCache  watermarkCache
+	idxCache indexCache
+	addr     atomic.Value
+	Stats    Stats
 }
 
 // Addr returns the address the router is listening on, once it is. Empty until
@@ -61,15 +62,17 @@ func (r *Router) Addr() string {
 // needs: copy-up rate says whether the boundary is cut too deep, and incomplete
 // says whether queries are being answered from a tier that cannot answer them.
 type Stats struct {
-	Commands     atomic.Int64
-	ReadMisses   atomic.Int64
-	WriteMisses  atomic.Int64
-	CopiedUp     atomic.Int64
-	Incomplete   atomic.Int64
-	Refused      atomic.Int64
-	Archived     atomic.Int64
-	ClientsOpen  atomic.Int64
-	ClientsTotal atomic.Int64
+	Commands      atomic.Int64
+	ReadMisses    atomic.Int64
+	WriteMisses   atomic.Int64
+	CopiedUp      atomic.Int64
+	Incomplete    atomic.Int64
+	Refused       atomic.Int64
+	Archived      atomic.Int64
+	TxnReplays    atomic.Int64
+	DuplicateKeys atomic.Int64
+	ClientsOpen   atomic.Int64
+	ClientsTotal  atomic.Int64
 }
 
 // New builds a Router. It does not listen or connect.
@@ -168,6 +171,10 @@ type conn struct {
 	// cursors this router owns, from reads answered by the archive. They are
 	// per connection because that is how the client will use them.
 	cursors cursorRegistry
+
+	// pendingKeys are unique key claims made for the insert now in flight, kept
+	// so they can be released if the fast tier rejects it.
+	pendingKeys []string
 }
 
 func (c *conn) pump(ctx context.Context) error {
@@ -208,6 +215,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// A unique key has to be claimed before the insert lands, or two inserts
+	// racing both see a free slot.
+	c.pendingKeys = nil
+	if nameErr == nil && name == "insert" && !msg.MoreToCome() {
+		if out, done := c.guardInsert(ctx, msg, db); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
 	if err := wire.Write(c.upstream, msg); err != nil {
 		return fmt.Errorf("forward to fast tier: %w", err)
 	}
@@ -223,6 +239,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	}
 	if nameErr != nil {
 		return wire.Write(c.client, reply)
+	}
+
+	// An insert the fast tier rejected never happened, so its key claims have
+	// to go back, or that value is blocked until something else collides.
+	if len(c.pendingKeys) > 0 {
+		if rdoc, derr := reply.ReplyDoc(); derr != nil || !replyOK(rdoc) || writeFailed(rdoc) {
+			c.r.releaseKeys(ctx, c.pendingKeys)
+		}
+		c.pendingKeys = nil
 	}
 
 	if isHello(name) {

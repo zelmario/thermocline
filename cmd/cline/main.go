@@ -40,6 +40,8 @@ Usage:
   cline router   --config FILE            serve both tiers on one address
   cline watermark --config FILE [--ns NS] [--clear | --complete-all | --complete-from T]
                                           show or edit what the fast tier claims to hold
+  cline keys     --config FILE [--rebuild]
+                                          unique keys that must survive eviction
   cline version
 
 Every subcommand takes --log-file PATH to append logs to a file instead of
@@ -73,6 +75,8 @@ func run() error {
 		return runRouter(os.Args[2:])
 	case "watermark":
 		return runWatermark(os.Args[2:])
+	case "keys":
+		return runKeys(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil
@@ -294,6 +298,8 @@ func reportRouterStats(ctx context.Context, r *router.Router, log *slog.Logger) 
 				"write_misses", r.Stats.WriteMisses.Load(),
 				"copied_up", r.Stats.CopiedUp.Load(),
 				"incomplete", r.Stats.Incomplete.Load(),
+				"from_archive", r.Stats.Archived.Load(),
+				"txn_replays", r.Stats.TxnReplays.Load(),
 				"refused", r.Stats.Refused.Load(),
 				"clients", r.Stats.ClientsOpen.Load())
 		}

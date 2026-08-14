@@ -78,6 +78,19 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 		return reply, nil
 	}
 
+	// Inside a transaction, answering from the archive would mix two clusters
+	// into one snapshot. Copy the document up and replay instead, so the whole
+	// transaction reads a fast tier that holds it.
+	if inTransaction(cmd) {
+		if _, cerr := c.r.copyUp(ctx, ns, id); cerr != nil {
+			return nil, cerr
+		}
+		c.r.Stats.TxnReplays.Add(1)
+		c.log.Debug("replaying a transaction after a read miss", "ns", ns)
+		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
+			"this transaction read a document that had been archived, and it has now been restored to the fast tier")
+	}
+
 	// Reply first, copy up afterwards. The caller already has what it asked
 	// for, and making it wait on a write it did not request would turn a 30 ms
 	// miss into a slower one for no benefit.
@@ -145,6 +158,15 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 		return reply, nil
 	}
 
+	// Inside a transaction the copy-up landed outside the caller's snapshot, so
+	// re-running the statement here would miss again. Ask for a replay instead.
+	if inTransaction(cmd) {
+		c.r.Stats.TxnReplays.Add(1)
+		c.log.Debug("replaying a transaction after a copy-up", "ns", ns)
+		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
+			"this transaction wrote to a document that had been archived, and it has now been restored to the fast tier")
+	}
+
 	return c.retry(msg)
 }
 
@@ -188,6 +210,12 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 	}
 	if !copied {
 		return reply, nil
+	}
+	if inTransaction(cmd) {
+		c.r.Stats.TxnReplays.Add(1)
+		c.log.Debug("replaying a transaction after a copy-up", "ns", ns)
+		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
+			"this transaction acted on a document that had been archived, and it has now been restored to the fast tier")
 	}
 	return c.retry(msg)
 }
@@ -245,6 +273,15 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+
+	// A transaction is the one place the archive fallback cannot go. Reading
+	// one tier inside the caller's snapshot and the other outside it is not a
+	// transaction any more, and no copy-up fixes a whole range.
+	if cmd, cerr := msg.CommandDoc(); cerr == nil && inTransaction(cmd) {
+		c.r.Stats.Refused.Add(1)
+		c.log.Warn("refused a transactional read that spans both tiers", "ns", ns, "because", because)
+		return c.r.txnCannotSpanTiers(reply.Header.RequestID, msg.Header.RequestID, ns, because)
+	}
 
 	// The archive holds every document, so it answers in full what the fast
 	// tier cannot. This is what keeps a query the application already had

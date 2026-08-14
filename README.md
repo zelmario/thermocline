@@ -31,6 +31,7 @@ One binary, `cline`, with a subcommand per component.
 | `warmer`  | **works** | Fills contiguous ranges in the fast tier and advances the completeness watermark |
 | `router`  | **works** | Speaks the wire protocol, answers from the right tier, copies documents up on demand |
 | `watermark` | **works** | Shows, declares and withdraws what the fast tier claims to hold |
+| `keys`    | **works** | Claims the unique keys that have to survive eviction |
 
 ## The rule everything rests on
 
@@ -124,9 +125,8 @@ Range queries are governed by the watermark below.
 - **Aggregations are completeness-checked but not miss-checked.** A pipeline is
   never resolved against the archive document by document; it is either safe to
   run on the fast tier or refused. See below.
-- **`getMore` is passed through**, so a cursor that started on the fast tier
-  stays there. Synthesised single-document replies carry cursor id zero, so no
-  `getMore` follows them.
+- **`getMore` on a fast tier cursor is passed through.** Cursors the router
+  creates for archive reads are served here instead, and tracked per connection.
 - **Bulk writes are only resolved one statement at a time.** A batch that
   matched nothing is left as the fast tier answered it.
 - **Authentication is proxied, not terminated.** Each client gets its own
@@ -192,6 +192,62 @@ refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
 `$out` and `$merge` are refused even under `completeness: permissive`. Returning
 a short answer is a wrong number on somebody's screen; writing one makes it the
 input to everything downstream.
+
+### Unique indexes
+
+A unique index only constrains the documents it can see. Evicting a document
+takes its index entry with it, so the fast tier stops knowing that value was
+ever used and a later insert of the same key succeeds. Nothing errors, and the
+collection ends up holding the two documents the index existed to prevent.
+
+Every insert now claims its unique keys in `_thermocline.keys` on the fast tier
+first, and that claim is what fails when a value is already taken, whichever
+tier the original is sitting in. The caller gets an ordinary `E11000`, which is
+what the application already handles.
+
+Claims are permanent, so a deleted document leaves one behind. That is resolved
+lazily rather than on the delete path: a claim only matters when something
+collides with it, and at that point the router checks whether the owning
+document still exists in either tier. If it does not, the new document takes the
+claim over. Deletes stay untouched and this costs nothing until there is a real
+conflict.
+
+**Before evicting anything from a database you adopted with data already in it,
+claim the keys it already holds:**
+
+```
+bin/cline keys --config cline.yaml              # which collections are enforced
+bin/cline keys --config cline.yaml --rebuild    # claim keys for existing documents
+```
+
+It is safe to re-run, and it is also how the registry comes back after a fast
+tier is rebuilt, since it lives there. If it finds one key held by two live
+documents it says so and picks no winner, because that means the constraint was
+already broken.
+
+Two limits worth knowing. **Sparse and partial unique indexes are not enforced
+across tiers**, because a registry cannot evaluate the same condition; the
+router says which ones it skipped. And **an update that changes a unique field
+to a value held by an evicted document is not caught yet**, only inserts are.
+
+### Transactions
+
+A transaction cannot span two clusters, so copying a document up and re-running
+the statement inside the caller's transaction does not work: the copy-up is an
+ordinary write outside it, and the transaction's snapshot was taken before it
+landed.
+
+The way out is the contract drivers already implement. The router copies the
+document up outside the transaction, then returns an error labelled
+`TransientTransactionError`, which every official driver's `withTransaction`
+helper retries from the start. The replay takes a fresh snapshot, the document
+is there, and the application never learns why. No code changes.
+
+A transaction whose read reaches past what the fast tier holds is a different
+matter, and is refused. No copy-up fixes a whole range, and answering it from
+the archive would leave the transaction reading two clusters at two points in
+time. That refusal is deliberately not labelled transient, so it fails rather
+than retrying forever.
 
 ## The completeness watermark
 
