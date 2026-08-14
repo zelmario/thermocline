@@ -8,6 +8,7 @@ import (
 
 	"github.com/zelmar/thermocline/internal/config"
 	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmar/thermocline/internal/watermark"
 )
 
 // The archive keeps documents the application deleted, marked with a tombstone.
@@ -110,16 +111,18 @@ func TestResumePoint(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		saved time.Time
+		saved watermark.Mark
 		want  time.Time
 		why   string
 	}{
-		{"no watermark starts at now", time.Time{}, now,
+		{"no watermark starts at now", watermark.Mark{}, now,
 			"a fresh namespace is complete only for what has been written since"},
-		{"saved watermark resumes there", earlier, earlier,
+		{"saved watermark resumes there", watermark.Mark{From: earlier, Claimed: true}, earlier,
 			"the watermark doubles as the cursor, so an interrupted warm continues"},
-		{"a future watermark is not trusted", now.Add(time.Hour), now,
+		{"a future watermark is not trusted", watermark.Mark{From: now.Add(time.Hour), Claimed: true}, now,
 			"clock skew must not make the walk skip a range it never filled"},
+		{"a claim of all history resumes at the zero time", watermark.Mark{Claimed: true}, time.Time{},
+			"a tier holding everything has nothing left to warm, and must not be confused with an absent claim"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

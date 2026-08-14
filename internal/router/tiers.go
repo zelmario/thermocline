@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmar/thermocline/internal/watermark"
 	"github.com/zelmar/thermocline/internal/wire"
 )
 
@@ -107,7 +108,7 @@ type watermarkCache struct {
 }
 
 type watermarkEntry struct {
-	from    time.Time
+	mark    watermark.Mark
 	known   bool
 	fetched time.Time
 }
@@ -117,17 +118,22 @@ type watermarkEntry struct {
 // and reading it per query would put a round trip on the hot path.
 const completenessTTL = 5 * time.Second
 
-// completeFrom returns how far back the fast tier is complete for ns.
-func (r *Router) completeFrom(ctx context.Context, ns string) (time.Time, bool) {
+// completeness returns what the fast tier claims to hold for ns, and whether
+// the claim could be read at all.
+//
+// A read failure is reported as unknown rather than folded into an unclaimed
+// Mark. Both refuse in strict mode, but they need different words: one is "warm
+// this namespace", the other is "the cold tier is unreachable".
+func (r *Router) completeness(ctx context.Context, ns string) (watermark.Mark, bool) {
 	r.wmCache.mu.RLock()
 	e, ok := r.wmCache.entries[ns]
 	r.wmCache.mu.RUnlock()
 	if ok && time.Since(e.fetched) < completenessTTL {
-		return e.from, e.known
+		return e.mark, e.known
 	}
 
-	from, err := r.marks.Load(ctx, ns)
-	entry := watermarkEntry{from: from, known: err == nil, fetched: time.Now()}
+	mark, err := r.marks.Load(ctx, ns)
+	entry := watermarkEntry{mark: mark, known: err == nil, fetched: time.Now()}
 	if err != nil {
 		r.log.Warn("could not read the completeness watermark", "ns", ns, "err", err)
 	}
@@ -139,15 +145,18 @@ func (r *Router) completeFrom(ctx context.Context, ns string) (time.Time, bool) 
 	r.wmCache.entries[ns] = entry
 	r.wmCache.mu.Unlock()
 
-	return entry.from, entry.known
+	return entry.mark, entry.known
 }
 
-// warnAboutMissingWatermarks says out loud what a missing watermark means.
+// warnAboutMissingWatermarks says out loud what an empty watermarks collection
+// means now: range queries get refused until something records a claim.
 //
-// No watermark is read as "nothing has been removed, so the fast tier holds
-// everything". That is right for a fast tier that was the original cluster, and
-// wrong for one that was built empty, where it would claim completeness the
-// tier does not have.
+// This used to be the other way round, and it was the wrong way round. An
+// absent watermark was read as "nothing has been removed, so the fast tier
+// holds everything", which is true only of a fast tier that was the original
+// cluster and false of every fast tier built empty. Since the cold start is the
+// adoption path this project recommends, the safe reading is that an absent
+// claim guarantees nothing.
 func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 	cur, err := r.cold.Database(meta.DB).Collection(meta.Watermarks).
 		Find(ctx, bson.D{}, options.Find().SetLimit(1))
@@ -158,8 +167,8 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 
 	if !cur.Next(ctx) {
 		r.log.Warn("no completeness watermarks recorded",
-			"meaning", "every namespace is treated as fully present in the fast tier",
-			"action", "if the fast tier was built empty, run the warmer before trusting range queries")
+			"meaning", "range queries will be refused, because nothing has claimed the fast tier is complete",
+			"action", "run the warmer, or declare it with: cline watermark --ns NS --complete-all")
 	}
 }
 

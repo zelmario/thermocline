@@ -68,7 +68,7 @@ func TestRaiseToNeverOverstatesCompleteness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !got.Equal(evictionBoundary) {
+	if !got.From.Equal(evictionBoundary) {
 		t.Fatalf("watermark = %v, want %v: eviction must shrink what the fast tier claims to hold",
 			got, evictionBoundary)
 	}
@@ -96,7 +96,7 @@ func TestRaiseToIsOneWay(t *testing.T) {
 	}
 
 	got, _ := s.Load(ctx, testNS)
-	if !got.Equal(later) {
+	if !got.From.Equal(later) {
 		t.Errorf("watermark moved earlier to %v, want it held at %v", got, later)
 	}
 }
@@ -116,12 +116,16 @@ func TestRaiseToCreatesWhenMissing(t *testing.T) {
 		t.Error("RaiseTo reported no change while creating the first watermark")
 	}
 	got, _ := s.Load(ctx, testNS)
-	if !got.Equal(boundary) {
+	if !got.From.Equal(boundary) {
 		t.Errorf("watermark = %v, want %v", got, boundary)
 	}
 }
 
 // A namespace nobody has warmed claims nothing, rather than claiming everything.
+//
+// This is the bug that made an empty fast tier answer range queries in full: a
+// missing watermark decoded to the zero time, and the router read a zero time
+// as "complete since the beginning of history".
 func TestLoadMissingClaimsNothing(t *testing.T) {
 	s, cleanup := testStore(t)
 	defer cleanup()
@@ -130,8 +134,89 @@ func TestLoadMissingClaimsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !got.IsZero() {
-		t.Errorf("Load of an unknown namespace = %v, want the zero time", got)
+	if got.Claimed {
+		t.Error("an unknown namespace reported a completeness claim")
+	}
+	if got.Complete(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Error("an unclaimed namespace answered Complete, which lets short results through as success")
+	}
+}
+
+// Clearing is how an operator recovers after the fast tier is rebuilt: the old
+// claim describes data that is no longer there.
+func TestClearWithdrawsTheClaim(t *testing.T) {
+	s, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := s.Set(ctx, testNS, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	existed, err := s.Clear(ctx, testNS)
+	if err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if !existed {
+		t.Error("Clear reported nothing to remove while a watermark existed")
+	}
+
+	got, err := s.Load(ctx, testNS)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Claimed {
+		t.Error("the claim survived Clear")
+	}
+
+	// Clearing again is not an error, so recovery scripts stay idempotent.
+	existed, err = s.Clear(ctx, testNS)
+	if err != nil {
+		t.Fatalf("second Clear: %v", err)
+	}
+	if existed {
+		t.Error("second Clear claimed to remove something")
+	}
+}
+
+// A tier that genuinely holds all of history says so, and that has to remain
+// expressible: it is the difference between a declared claim and an absent one.
+func TestCompleteSinceTheBeginningIsExpressible(t *testing.T) {
+	all := Mark{From: time.Time{}, Claimed: true}
+	if !all.Complete(time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Error("a tier claiming all of history refused a query reaching back to 1999")
+	}
+
+	if !all.CoversAll() {
+		t.Error("a tier claiming all of history did not report CoversAll, so unbounded queries get refused")
+	}
+
+	none := Mark{}
+	if none.Complete(time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Error("an absent claim behaved like a claim covering all of history")
+	}
+	if none.CoversAll() {
+		t.Error("an absent claim reported CoversAll")
+	}
+
+	// A claim part way through history cannot answer a query with no lower
+	// bound, because such a query can reach further back than the claim.
+	partial := Mark{From: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), Claimed: true}
+	if partial.CoversAll() {
+		t.Error("a partial claim reported CoversAll, which would let unbounded queries return short answers")
+	}
+}
+
+// The boundary itself is inside the claim, and one instant earlier is not.
+func TestCompleteBoundary(t *testing.T) {
+	from := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	m := Mark{From: from, Claimed: true}
+
+	if !m.Complete(from) {
+		t.Error("a query bounded exactly at the watermark was refused")
+	}
+	if m.Complete(from.Add(-time.Nanosecond)) {
+		t.Error("a query reaching one instant earlier than the watermark was allowed")
 	}
 }
 

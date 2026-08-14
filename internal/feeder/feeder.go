@@ -21,6 +21,7 @@ import (
 	"github.com/zelmar/thermocline/internal/checkpoint"
 	"github.com/zelmar/thermocline/internal/config"
 	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmar/thermocline/internal/watermark"
 )
 
 // metaDB is aliased so classify.go does not import meta for one constant.
@@ -32,11 +33,12 @@ var ErrUnannouncedDelete = errors.New("unannounced delete on the fast tier")
 
 // Feeder mirrors one fast tier into one cold tier.
 type Feeder struct {
-	hot  *mongo.Client
-	cold *mongo.Client
-	cfg  config.FeederConfig
-	cp   *checkpoint.Store
-	log  *slog.Logger
+	hot   *mongo.Client
+	cold  *mongo.Client
+	cfg   config.FeederConfig
+	cp    *checkpoint.Store
+	marks *watermark.Store
+	log   *slog.Logger
 
 	// buffered work, flushed together
 	pending []pendingOp
@@ -48,6 +50,33 @@ type Feeder struct {
 	// cached view of whether a warmer is running, see echo.go
 	warmActive    bool
 	warmCheckedAt time.Time
+}
+
+// withdrawCompleteness drops the fast tier's completeness claim for ns.
+//
+// A failure here is logged rather than returned. The alternative is stopping
+// mirroring over a bookkeeping write, and a feeder that keeps running is worth
+// more than a watermark that is briefly wrong: the warmer checks the claim
+// against reality as well, so this is the first of two defences, not the only
+// one.
+func (f *Feeder) withdrawCompleteness(ctx context.Context, ns string) {
+	if f.marks == nil {
+		// A Feeder assembled without an archive connection, which only happens
+		// in tests that exercise event classification on its own.
+		return
+	}
+	existed, err := f.marks.Clear(ctx, ns)
+	if err != nil {
+		f.log.Error("could not withdraw the completeness claim after a drop",
+			"ns", ns, "err", err,
+			"note", "the router may answer range queries from a fast tier that no longer holds them; "+
+				"clear it with: cline watermark --ns "+ns+" --clear")
+		return
+	}
+	if existed {
+		f.log.Warn("withdrew the completeness claim, the fast tier no longer holds this namespace",
+			"ns", ns, "note", "range queries fall through to the archive until the warmer refills it")
+	}
 }
 
 // pendingOp is one decoded change waiting to be written.
@@ -75,11 +104,12 @@ type changeEvent struct {
 // New builds a Feeder. It does not contact either cluster.
 func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Feeder {
 	return &Feeder{
-		hot:  hot,
-		cold: cold,
-		cfg:  cfg,
-		cp:   checkpoint.New(cold),
-		log:  log,
+		hot:   hot,
+		cold:  cold,
+		cfg:   cfg,
+		cp:    checkpoint.New(cold),
+		marks: watermark.New(cold),
+		log:   log,
 	}
 }
 
@@ -249,6 +279,13 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		f.log.Warn("ignoring operation that is never mirrored",
 			"ns", ns, "op", ev.OperationType,
 			"note", "the archive keeps its copy")
+		// The archive keeps its copy, but the fast tier just lost the whole
+		// collection, so any claim that it holds a range completely is now
+		// false. Withdraw it: the archive still has the documents, and the
+		// router must go there for them instead of answering from nothing.
+		if ev.OperationType == "drop" {
+			f.withdrawCompleteness(ctx, ns)
+		}
 		return nil
 	}
 

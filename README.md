@@ -30,6 +30,7 @@ One binary, `cline`, with a subcommand per component.
 | `evictor` | **works** | Removes documents the archive already holds, throttled on cluster health |
 | `warmer`  | **works** | Fills contiguous ranges in the fast tier and advances the completeness watermark |
 | `router`  | **works** | Speaks the wire protocol, answers from the right tier, copies documents up on demand |
+| `watermark` | **works** | Shows, declares and withdraws what the fast tier claims to hold |
 
 ## The rule everything rests on
 
@@ -121,7 +122,11 @@ Range queries are governed by the watermark below.
 ### What it does not do yet
 
 - **Aggregations are passed straight through.** They are not miss-checked and
-  not completeness-checked.
+  not completeness-checked. This is the largest hole in the completeness
+  guarantee, because every driver's `countDocuments` issues an `aggregate`:
+  measured against a partly filled fast tier it returned 1 where the answer was
+  45,904, and reported success. Until this is closed, the guarantee covers
+  `find` and nothing else.
 - **`getMore` is passed through**, so a cursor that started on the fast tier
   stays there. Synthesised single-document replies carry cursor id zero, so no
   `getMore` follows them.
@@ -154,6 +159,36 @@ An understated watermark costs one redundant lookup in the archive. An
 overstated one makes range queries return short results and report success. The
 evictor therefore raises the watermark *before* it deletes, so an interrupted
 sweep still leaves an honest claim.
+
+**No watermark means nothing is guaranteed**, not that everything is present.
+That distinction is the whole point: a fast tier built empty has no claim, and
+answering range queries from it would return short results and call them
+success. Range queries are refused until something records a claim.
+
+A fast tier that genuinely holds everything, because it is the original cluster
+rather than a new empty one, says so explicitly:
+
+```
+bin/cline watermark --config cline.yaml                        # show every claim
+bin/cline watermark --config cline.yaml --ns app.orders --complete-all
+bin/cline watermark --config cline.yaml --ns app.orders --clear
+```
+
+A claim also has to be withdrawn when the fast tier loses documents by any route
+the evictor did not drive, because the claim then describes data that is no
+longer there. Two things handle that:
+
+- **The feeder withdraws it on a `drop`,** since the fast tier just lost the
+  whole collection.
+- **The warmer checks it against reality.** A restore or a rebuild leaves no
+  change stream event at all, so the claim simply outlives its data. Before
+  trusting a claim, the warmer asks whether the fast tier holds anything in the
+  range; if it holds nothing while the archive does, the claim is discarded and
+  the window is warmed again.
+
+A partial loss is caught by neither. Telling "half the range is missing" from
+"half the range was legitimately deleted" needs a document by document
+comparison, which is a repair tool rather than a warm.
 
 Two more rules the warmer follows:
 

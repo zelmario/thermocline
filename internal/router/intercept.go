@@ -213,29 +213,46 @@ func (c *conn) retry(msg *wire.Message) (*wire.Message, error) {
 // and no indication that the rest exist. That looks exactly like success, which
 // is why the strict policy refuses rather than guesses.
 func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw, msg *wire.Message, reply *wire.Message) (*wire.Message, error) {
-	from, known := c.r.completeFrom(ctx, ns)
-	if !known || from.IsZero() {
-		// Nothing has been removed from this namespace, so the fast tier holds
-		// all of it and any answer is complete.
-		return reply, nil
+	mark, known := c.r.completeness(ctx, ns)
+
+	if known && mark.Claimed {
+		bound, bounded := lowerTimeBound(filter)
+		switch {
+		case bounded && mark.Complete(bound):
+			return reply, nil
+		case !bounded && mark.CoversAll():
+			// No lower bound, so the query may reach arbitrarily far back. Only
+			// a tier claiming all of history can answer that on its own.
+			return reply, nil
+		}
 	}
 
-	if bound, ok := lowerTimeBound(filter); ok && !bound.Before(from) {
-		return reply, nil
+	// Everything below this line is a query the fast tier cannot be shown to
+	// answer in full. The three reasons need different words, because they need
+	// different things done about them.
+	var because, remedy string
+	switch {
+	case !known:
+		because = "the completeness watermark could not be read"
+		remedy = "the archive is unreachable, so completeness cannot be established; retry once it is back"
+	case !mark.Claimed:
+		because = "nothing has recorded that the fast tier is complete for this namespace"
+		remedy = "run the warmer, or if the fast tier holds all of history run: cline watermark --ns " + ns + " --complete-all"
+	default:
+		because = "this query reaches earlier than " + mark.From.Format(time.RFC3339) +
+			", which the fast tier does not hold completely"
+		remedy = "bound the query to that range, or query the archive directly"
 	}
 
 	c.r.Stats.Incomplete.Add(1)
 	if c.r.cfg.Completeness == config.Permissive {
-		c.log.Warn("answer may be short, the query reaches past what the fast tier holds",
-			"ns", ns, "complete_from", from.Format(time.RFC3339))
+		c.log.Warn("answer may be short", "ns", ns, "because", because)
 		return reply, nil
 	}
 
 	c.r.Stats.Refused.Add(1)
-	c.log.Warn("refused a query that would return a short answer",
-		"ns", ns, "complete_from", from.Format(time.RFC3339))
+	c.log.Warn("refused a query that would return a short answer", "ns", ns, "because", because)
 	return c.r.errorReply(msg, reply, fmt.Sprintf(
-		"thermocline: this query reaches earlier than %s, which the fast tier does not hold completely. "+
-			"Bound the query to that range, query the archive directly, or set router.completeness to permissive to allow short answers.",
-		from.Format(time.RFC3339)))
+		"thermocline: refusing this query because %s. %s. To allow short answers instead, set router.completeness to permissive.",
+		because, remedy))
 }

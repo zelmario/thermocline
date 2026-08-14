@@ -12,6 +12,7 @@ package warmer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -104,6 +105,45 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 	return total, nil
 }
 
+// staleClaim reports whether a recorded watermark describes a fast tier that no
+// longer exists.
+//
+// Nothing tells the warmer that the fast tier was restored, rebuilt or emptied.
+// Those leave no change stream event behind, so the claim simply outlives the
+// data it described, and the warmer used to trust it and do nothing at all. The
+// decisive signal is cheap: a fast tier holding nothing whatsoever in a window
+// the archive can fill is a fast tier that lost its contents.
+//
+// A partial loss is not caught here. Telling "half the range is missing" from
+// "half the range was legitimately deleted" means comparing both tiers document
+// by document, which is a repair tool, not a warm.
+func (w *Warmer) staleClaim(ctx context.Context, rule config.WarmRule, floor time.Time) (bool, error) {
+	hotHas, err := w.anyInWindow(ctx, w.hot, rule, floor)
+	if err != nil || hotHas {
+		return false, err
+	}
+	return w.anyInWindow(ctx, w.cold, rule, floor)
+}
+
+// anyInWindow asks one tier whether it holds a single document at or after
+// floor. One indexed lookup, no count.
+func (w *Warmer) anyInWindow(ctx context.Context, client *mongo.Client, rule config.WarmRule, floor time.Time) (bool, error) {
+	filter, err := windowFilter(rule, floor)
+	if err != nil {
+		return false, err
+	}
+	db, coll := splitNS(rule.NS)
+	err = client.Database(db).Collection(coll).
+		FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probe %s: %w", rule.NS, err)
+	}
+	return true, nil
+}
+
 func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, error) {
 	var stats Stats
 	now := time.Now().UTC()
@@ -113,6 +153,27 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 	if err != nil {
 		return stats, err
 	}
+
+	if saved.Claimed {
+		stale, err := w.staleClaim(ctx, rule, floor)
+		if err != nil {
+			return stats, err
+		}
+		if stale {
+			w.log.Warn("discarding a completeness claim the fast tier cannot support",
+				"ns", rule.NS,
+				"claimed_complete_from", saved.From.Format(time.RFC3339),
+				"found", "the fast tier holds nothing in this window while the archive does",
+				"note", "the fast tier was rebuilt, restored or emptied; warming the whole window again")
+			if !w.dryRun {
+				if _, err := w.marks.Clear(ctx, rule.NS); err != nil {
+					return stats, err
+				}
+			}
+			saved = watermark.Mark{}
+		}
+	}
+
 	start := resumePoint(saved, now)
 
 	w.log.Info("warming",
@@ -129,8 +190,8 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 
 	// Resume by starting just past the last completed point.
 	before := bson.RawValue{}
-	if !saved.IsZero() && saved.Before(now) {
-		before = objectIDBound(saved)
+	if saved.Claimed && saved.From.Before(now) {
+		before = objectIDBound(saved.From)
 	}
 
 	for {

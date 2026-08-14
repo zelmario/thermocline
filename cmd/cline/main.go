@@ -38,6 +38,8 @@ Usage:
   cline warmer   --config FILE [--dry-run]
                                           fill the fast tier from the archive
   cline router   --config FILE            serve both tiers on one address
+  cline watermark --config FILE [--ns NS] [--clear | --complete-all | --complete-from T]
+                                          show or edit what the fast tier claims to hold
   cline version
 
 Every subcommand takes --log-file PATH to append logs to a file instead of
@@ -69,6 +71,8 @@ func run() error {
 		return runWarmer(os.Args[2:])
 	case "router":
 		return runRouter(os.Args[2:])
+	case "watermark":
+		return runWatermark(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil
