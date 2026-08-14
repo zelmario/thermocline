@@ -14,6 +14,20 @@ import (
 	"github.com/zelmar/thermocline/internal/meta"
 )
 
+// markCaughtUp records that the fast tier has nothing left to mirror.
+//
+// Lag is measured from the last event applied, which only moves when there is
+// an event. On a database that goes quiet, nights and weekends included, that
+// timestamp stops moving while the clock does not, so lag climbs without bound
+// even though the archive is perfectly up to date. The evictor reads that lag,
+// fails closed, and stops evicting for good. It looks exactly like a hang.
+//
+// An empty change stream poll means everything written so far has been applied,
+// so the honest lag at that moment is zero.
+func (f *Feeder) markCaughtUp() {
+	f.lastEventAt = time.Now().UTC()
+}
+
 // flushAndCheckpoint writes buffered work and saves the resume position, but
 // only saves as often as configured. Mirroring is idempotent, so repeating a
 // few seconds of work after a restart is cheaper than a checkpoint write per

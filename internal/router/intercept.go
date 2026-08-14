@@ -241,6 +241,14 @@ func (c *conn) retry(msg *wire.Message) (*wire.Message, error) {
 // and no indication that the rest exist. That looks exactly like success, which
 // is why the strict policy refuses rather than guesses.
 func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw, msg *wire.Message, reply *wire.Message) (*wire.Message, error) {
+	// A collection Thermocline does not tier lives only on the fast tier, so the
+	// fast tier is the whole of it and its answer is authoritative. Asking for a
+	// completeness claim it will never have would send the read to an archive
+	// that has never held a single one of its documents.
+	if !c.r.cfg.Manages(ns) {
+		return reply, nil
+	}
+
 	mark, known := c.r.completeness(ctx, ns)
 
 	if known && mark.Claimed {

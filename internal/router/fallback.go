@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -40,18 +41,24 @@ var sessionFields = map[string]bool{
 
 // archiveCursor is a driver cursor we are serving getMore from.
 type archiveCursor struct {
-	cur *mongo.Cursor
-	ns  string
+	cur      *mongo.Cursor
+	ns       string
+	lastUsed time.Time
 }
 
 // cursorRegistry hands out ids for cursors this router owns rather than the
 // fast tier.
 //
-// Ids start high and climb, so they do not look like the small ids a test
-// server hands out, and every getMore is checked against the registry before it
-// is treated as ours. A real cursor id landing exactly on a live synthetic one
-// would need a random int64 collision, and the worst case is a getMore sent to
-// the wrong tier, which errors rather than returning wrong data.
+// It belongs to the router, not to one client connection. A real MongoDB cursor
+// is server-scoped: any connection in a driver's pool may issue the getMore, and
+// drivers do exactly that. Keeping the registry per connection worked in a shell
+// and would have failed against a pooled application driver, with the getMore
+// falling through to a fast tier that has never heard of the cursor.
+//
+// Ids start high and climb, and every getMore is checked against the registry
+// before it is treated as ours. A real cursor id landing exactly on a live
+// synthetic one would need a random int64 collision, and the worst case is a
+// getMore sent to the wrong tier, which errors rather than returning wrong data.
 type cursorRegistry struct {
 	mu   sync.Mutex
 	next int64
@@ -67,6 +74,7 @@ func (reg *cursorRegistry) add(ac *archiveCursor) int64 {
 	}
 	reg.next++
 	id := reg.next
+	ac.lastUsed = time.Now()
 	reg.open[id] = ac
 	return id
 }
@@ -75,7 +83,30 @@ func (reg *cursorRegistry) get(id int64) (*archiveCursor, bool) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	ac, ok := reg.open[id]
+	if ok {
+		ac.lastUsed = time.Now()
+	}
 	return ac, ok
+}
+
+// reapIdle closes cursors nobody has come back for.
+//
+// A client that abandons a cursor without killing it would otherwise pin an
+// archive cursor forever. Ten minutes matches the server's own default timeout,
+// so an application sees the same behaviour it would from mongod.
+func (reg *cursorRegistry) reapIdle(ctx context.Context, idle time.Duration) {
+	var dead []*archiveCursor
+	reg.mu.Lock()
+	for id, ac := range reg.open {
+		if time.Since(ac.lastUsed) > idle {
+			dead = append(dead, ac)
+			delete(reg.open, id)
+		}
+	}
+	reg.mu.Unlock()
+	for _, ac := range dead {
+		_ = ac.cur.Close(ctx)
+	}
 }
 
 func (reg *cursorRegistry) drop(ctx context.Context, id int64) {
@@ -124,7 +155,7 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 
 	var id int64
 	if more {
-		id = c.cursors.add(&archiveCursor{cur: cur, ns: ns})
+		id = c.r.cursors.add(&archiveCursor{cur: cur, ns: ns})
 	} else {
 		_ = cur.Close(ctx)
 	}
@@ -184,7 +215,7 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 	if !ok {
 		return nil, false, nil
 	}
-	ac, ok := c.cursors.get(id)
+	ac, ok := c.r.cursors.get(id)
 	if !ok {
 		return nil, false, nil
 	}
@@ -198,12 +229,12 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 
 	batch, more, err := readBatch(ctx, ac.cur, size)
 	if err != nil {
-		c.cursors.drop(ctx, id)
+		c.r.cursors.drop(ctx, id)
 		return nil, true, err
 	}
 	out := id
 	if !more {
-		c.cursors.drop(ctx, id)
+		c.r.cursors.drop(ctx, id)
 		out = 0
 	}
 	reply, err := cursorReply(msg.Header.RequestID, msg.Header.RequestID, out, ac.ns, "nextBatch", batch)
@@ -232,8 +263,8 @@ func (c *conn) archiveKillCursors(ctx context.Context, cmd bson.Raw) bool {
 			all = false
 			continue
 		}
-		if _, mine := c.cursors.get(id); mine {
-			c.cursors.drop(ctx, id)
+		if _, mine := c.r.cursors.get(id); mine {
+			c.r.cursors.drop(ctx, id)
 			continue
 		}
 		all = false

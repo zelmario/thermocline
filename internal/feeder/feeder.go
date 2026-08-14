@@ -220,7 +220,24 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			return err
 		}
 
-		// Idle. Write out whatever is buffered and save our position.
+		// Idle. Everything the fast tier has written is in the archive, so say
+		// so before checkpointing: a quiet database must not look like a feeder
+		// that has fallen hours behind.
+		//
+		// The resume token has to be taken here as well. It otherwise only moves
+		// when an event arrives, and the checkpoint write is skipped when there
+		// is no token, so on a silent database nothing would be saved and the
+		// stale timestamp would sit there growing. MongoDB advances the token
+		// past an empty batch precisely so a reader can record progress it made
+		// without seeing anything, which also means a long quiet spell does not
+		// leave the feeder resuming from an ancient position.
+		if tok := stream.ResumeToken(); len(tok) > 0 {
+			f.lastToken = tok
+		}
+		if err := f.flush(ctx); err != nil {
+			return err
+		}
+		f.markCaughtUp()
 		if err := f.flushAndCheckpoint(ctx); err != nil {
 			return err
 		}

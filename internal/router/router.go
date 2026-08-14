@@ -44,6 +44,7 @@ type Router struct {
 
 	wmCache  watermarkCache
 	idxCache indexCache
+	cursors  cursorRegistry
 	addr     atomic.Value
 	Stats    Stats
 }
@@ -104,6 +105,7 @@ func (r *Router) Listen(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+	go r.reapCursors(ctx)
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),
@@ -127,7 +129,25 @@ func (r *Router) Listen(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
+	r.cursors.closeAll(context.WithoutCancel(ctx))
 	return nil
+}
+
+// cursorIdle matches the server's own default cursor timeout, so an abandoned
+// archive cursor is cleaned up on the same schedule mongod would use.
+const cursorIdle = 10 * time.Minute
+
+func (r *Router) reapCursors(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.cursors.reapIdle(ctx, cursorIdle)
+		}
+	}
 }
 
 // serve proxies one client connection for its lifetime.
@@ -155,7 +175,6 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		upstream: upstream,
 		log:      r.log,
 	}
-	defer c.cursors.closeAll(context.WithoutCancel(ctx))
 	if err := c.pump(ctx); err != nil && !isClosed(err) {
 		r.log.Debug("connection ended", "err", err)
 	}
@@ -167,10 +186,6 @@ type conn struct {
 	client   net.Conn
 	upstream net.Conn
 	log      *slog.Logger
-
-	// cursors this router owns, from reads answered by the archive. They are
-	// per connection because that is how the client will use them.
-	cursors cursorRegistry
 
 	// pendingKeys are unique key claims made for the insert now in flight, kept
 	// so they can be released if the fast tier rejects it.
