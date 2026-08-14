@@ -28,6 +28,16 @@ import (
 // rather than by time, so no partial watermark covers them: a joined collection
 // has to be whole, or the join quietly loses rows.
 
+// metadataStages describe the collection rather than read its documents, so no
+// completeness question arises. db.coll.stats() is an aggregate with $collStats
+// at the head, and refusing that breaks an ordinary administrative call for no
+// benefit: there are no documents in the answer to be short of.
+var metadataStages = map[string]bool{
+	"$collStats": true, "$indexStats": true, "$planCacheStats": true,
+	"$currentOp": true, "$listSessions": true, "$listLocalSessions": true,
+	"$shardedDataDistribution": true, "$documents": true,
+}
+
 // aggScope is what one aggregate command reads and writes.
 type aggScope struct {
 	primary   string
@@ -73,6 +83,12 @@ func scopeOfAggregate(cmd bson.Raw, db string) (aggScope, bool) {
 		}
 		name := elems[0].Key()
 		val := elems[0].Value()
+
+		// A pipeline that starts by describing the collection never reads its
+		// documents, whatever it does afterwards.
+		if i == 0 && metadataStages[name] {
+			return aggScope{}, false
+		}
 
 		if i == 0 && name == "$match" {
 			if mdoc, ok := val.DocumentOK(); ok {

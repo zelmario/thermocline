@@ -66,13 +66,26 @@ sed '/^warmer:/,/^router:/{/  rules:/,/    back:/d}' $CFG > /root/nowarm.yaml
 ok "no warmer rules"                    1 "rules is empty"    -- cline warmer --config /root/nowarm.yaml
 
 echo "== evictor =="
+# The evictor refuses to work while mirroring is stale, so this section needs a
+# feeder that has caught up. Without it these fail for the right reason at the
+# wrong time, which looks like a bug in the evictor and is not one.
+pkill -f 'cline feeder'; sleep 1
+cline feeder --config $CFG --log-file /var/log/cline/t_pre.log & PRE=$!
+COLDU='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+for i in $(seq 1 45); do
+  LAG=$(mongosh "$COLDU" --quiet --eval 'const c=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}); print(c?Math.round((Date.now()-c.eventAt.getTime())/1000):9999)' 2>/dev/null | tail -1)
+  [ "$LAG" -lt 20 ] 2>/dev/null && break
+  sleep 2
+done
 ok "--once --dry-run"                   0 "sweep complete"    -- cline evictor --config $CFG --once --dry-run
 ok "--once"                             0 "sweep complete"    -- cline evictor --config $CFG --once
 ok "--once -v"                          0 "sweep complete"    -- cline evictor --config $CFG --once -v
 ok "--once --health-timeout"            0 "sweep complete"    -- cline evictor --config $CFG --once --health-timeout 10s
 
+kill $PRE 2>/dev/null; wait $PRE 2>/dev/null
+
 echo "== daemons =="
-rm -f /var/log/cline/t_*.log
+rm -f /var/log/cline/t_[a-z]*.log
 cline feeder --config $CFG --log-file /var/log/cline/t_feeder.log &
 FP=$!; sleep 4
 grep -q "mirroring" /var/log/cline/t_feeder.log && { PASS=$((PASS+1)); echo "  PASS  feeder starts and mirrors"; } || { FAIL=$((FAIL+1)); FAILED+=("feeder start"); echo "  FAIL  feeder starts and mirrors"; }

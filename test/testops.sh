@@ -94,15 +94,12 @@ chk "estimatedDocumentCount"    "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS
 chk "count command"             "$TRUTH" "$(R "print(db.getSiblingDB('shop').runCommand({count:'$NS'}).n)")"
 chk "distinct n"                "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS.distinct('n').length)")"
 chk "count with a query"        "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({grp:'a',_tcDeletedAt:{\$exists:false}}))")" "$(R "print(db.getSiblingDB('shop').runCommand({count:'$NS',query:{grp:'a'}}).n)")"
-# put it back so the write battery below has its documents
-cline warmer --config $CFG >/dev/null 2>&1
-cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
-sleep 7
 
-echo "== write paths (fast tier holds everything) =="
+echo "== write paths, with the fast tier still short =="
+# Deliberately left incomplete. Declaring it complete here would be a lie the
+# router correctly believes, and updateMany would then quietly touch only the
+# resident documents, which is the bug this pass exists to catch.
 MODE="writes"
-cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
-sleep 7
 chk "updateOne"        "1"  "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{w:1}}).modifiedCount)")"
 chk "updateMany"       "14" "$(R "print(db.getSiblingDB('shop').$NS.updateMany({grp:'a'},{\$set:{w:2}}).modifiedCount)")"
 chk "replaceOne"       "1"  "$(R "print(db.getSiblingDB('shop').$NS.replaceOne({_id:2},{_id:2,n:2,grp:'b',replaced:true}).modifiedCount)")"

@@ -66,13 +66,25 @@ echo "== cursor paging through the archive =="
 chk "batched find returns every doc" "$LIVE" "$(R 'let n=0; const c=db.getSiblingDB("shop").tprobe.find({}).batchSize(2); while(c.hasNext()){c.next();n++} print(n)')"
 
 echo "== unique index across tiers =="
-H 'db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
+H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
+H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
 R 'db.getSiblingDB("shop").tacct.insertOne({_id:1,email:"z@x.com"})' >/dev/null
-sleep 3
-C 'db.getSiblingDB("shop").tacct.updateOne({_id:1},{$set:{email:"z@x.com"}},{upsert:true})' >/dev/null
+sleep 4
+# Simulate an eviction rather than a delete. Deleting through the router would
+# make the feeder tombstone the archive copy, which frees the key correctly and
+# tests the opposite thing. A real eviction leaves the archive copy live, so the
+# feeder must not see this removal at all.
+kill $FP 2>/dev/null; wait $FP 2>/dev/null
 H 'db.getSiblingDB("shop").tacct.deleteOne({_id:1})' >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+cline feeder --config $CFG --log-file /var/log/cline/f.log & FP=$!
+sleep 5
+chk "archive still holds the original"     "true"  "$(C 'const d=db.getSiblingDB("shop").tacct.findOne({_id:1}); print(!!d && !d._tcDeletedAt)')"
 chk "duplicate of an evicted key rejected" "11000" "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:2,email:"z@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,20))}')"
 chk "a fresh key is still accepted"        "ok"    "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:3,email:"new@x.com"});print("ok")}catch(e){print(e.code)}')"
+# And the other half: once the original is genuinely deleted the key frees up.
+C 'db.getSiblingDB("shop").tacct.updateOne({_id:1},{$set:{_tcDeletedAt:new Date()}})' >/dev/null
+chk "a deleted original frees its key"     "ok"    "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:4,email:"z@x.com"});print("ok")}catch(e){print(e.code)}')"
 
 echo "== bulk insert keeps mongod semantics =="
 H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null

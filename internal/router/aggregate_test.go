@@ -145,3 +145,26 @@ func TestDatabaseLevelAggregateHasNoScope(t *testing.T) {
 		t.Error("aggregate:1 was given a namespace to be complete about")
 	}
 }
+
+// db.coll.stats() is an aggregate with $collStats at the head. It reads no
+// documents, so refusing it for incompleteness breaks an ordinary admin call
+// and protects nothing.
+func TestMetadataPipelinesAreNotCompletenessChecked(t *testing.T) {
+	for _, stage := range []string{"$collStats", "$indexStats", "$planCacheStats"} {
+		cmd := aggCmd(t, "orders", bson.A{
+			bson.D{{Key: stage, Value: bson.D{}}},
+			bson.D{{Key: "$project", Value: bson.D{{Key: "storageStats", Value: 1}}}},
+		})
+		if _, ok := scopeOfAggregate(cmd, "shop"); ok {
+			t.Errorf("%s was treated as reading documents, so it would be refused when the fast tier is short", stage)
+		}
+	}
+}
+
+// A $match at the head still bounds a real read, so the exemption must not leak.
+func TestOrdinaryPipelineStillChecked(t *testing.T) {
+	cmd := aggCmd(t, "orders", bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "x", Value: 1}}}}})
+	if _, ok := scopeOfAggregate(cmd, "shop"); !ok {
+		t.Error("an ordinary pipeline stopped being completeness checked")
+	}
+}
