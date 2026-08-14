@@ -230,6 +230,23 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// count and distinct read documents the same way find does, so they need
+	// the same completeness check.
+	if nameErr == nil && (name == "count" || name == "distinct") && !msg.MoreToCome() {
+		if out, done := c.guardSimpleRead(ctx, msg, db, name); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
+	// A write naming many documents only reaches the ones the fast tier holds,
+	// so the rest have to come up before it runs. Before, not after: repeating
+	// the write after a copy-up would apply $inc twice.
+	if nameErr == nil && (name == "update" || name == "delete") && !msg.MoreToCome() {
+		if out, done := c.guardMultiWrite(ctx, msg, db, name); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
 	// A unique key has to be claimed before the insert lands, or two inserts
 	// racing both see a free slot.
 	c.pendingKeys = nil
@@ -343,20 +360,48 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 	return nil
 }
 
+// primaryWait is how long a new connection waits for the fast tier to have a
+// primary, mirroring a driver's serverSelectionTimeoutMS.
+//
+// This matters because of an asymmetry the proxy creates. Talking to a replica
+// set directly, a driver that loses the primary blocks in server selection
+// until a new one is elected, and the application sees a pause. Talking to the
+// router, the client only knows about one server and that server stays up, so
+// there is no server selection to do: a failed dial upstream came straight back
+// as an error and the write failed outright. Measured during an election, six
+// writes a second apart failed rather than pausing. Waiting here restores the
+// behaviour the application would have had without the proxy.
+const primaryWait = 20 * time.Second
+
 func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
-	addr := r.currentPrimary()
 	d := net.Dialer{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(primaryWait)
 
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err == nil {
-		return conn, nil
-	}
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		addr := r.currentPrimary()
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			if attempt > 0 {
+				r.log.Info("fast tier reachable again", "addr", addr, "waited", time.Since(deadline.Add(-primaryWait)).Round(time.Second))
+			}
+			return conn, nil
+		}
+		lastErr = err
 
-	// The address may be stale after a failover. Re-resolve once and retry.
-	if rerr := r.refreshPrimary(ctx); rerr != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		// The address is stale after a failover, and during the election there
+		// may be no primary at all to re-resolve to.
+		_ = r.refreshPrimary(ctx)
+
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return nil, fmt.Errorf("dial %s: %w", addr, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	return d.DialContext(ctx, "tcp", r.currentPrimary())
 }
 
 func isClosed(err error) bool {

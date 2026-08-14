@@ -127,11 +127,20 @@ Range queries are governed by the watermark below.
   run on the fast tier or refused. See below.
 - **`getMore` on a fast tier cursor is passed through.** Cursors the router
   creates for archive reads are served here instead, and tracked per connection.
-- **Bulk writes are only resolved one statement at a time.** A batch that
-  matched nothing is left as the fast tier answered it.
+- **Bulk writes are only miss-resolved one statement at a time.** A batch that
+  matched nothing is left as the fast tier answered it. Unique keys and
+  multi-document writes are handled across the whole batch.
 - **Authentication is proxied, not terminated.** Each client gets its own
   connection to the fast tier, so SCRAM works, at the cost of one upstream
-  connection per client.
+  connection per client. It also sets what happens during a fast tier election:
+  the router never sees the credentials, so it cannot re-authenticate a fresh
+  upstream and replay a command that was in flight. Writes issued while the fast
+  tier has no primary fail and the client has to retry, where a driver talking
+  to the replica set directly would block in server selection instead. Measured
+  during a real election: six writes a second apart were refused, every
+  acknowledged write was present, none was applied twice, and a retry finished
+  the job. A client reconnecting mid-election now waits up to 20 seconds for a
+  new primary rather than failing outright.
 - **TLS is not handled.** Terminate it in front, or add it before taking over a
   production address.
 
@@ -192,6 +201,27 @@ refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
 `$out` and `$merge` are refused even under `completeness: permissive`. Returning
 a short answer is a wrong number on somebody's screen; writing one makes it the
 input to everything downstream.
+
+### Writes that name many documents
+
+`updateMany` and `deleteMany` only ever reached the documents the fast tier
+happened to hold. Against a partly evicted collection one reported three
+modified where thirteen matched, and a delete reported two where twelve did,
+both as success. For a delete that is worse than a wrong number: records
+somebody asked to have removed stay readable.
+
+Reads solve this by going to the archive. A write cannot, because the archive is
+upsert only and the feeder is its only writer, so applying the change there
+directly would race mirroring and break the rule the design rests on. Instead
+the matching documents are brought up to the fast tier first, and then the
+client's own command runs, once, against a tier that now holds all of them.
+
+The order matters. Running the write first and repeating it after a copy-up
+would apply `$inc` twice.
+
+A sweep over an unbounded range could drag the whole archive up to satisfy one
+statement, so there is a ceiling of 10,000 documents. Past it the router refuses
+and says so, rather than doing part of the job and reporting success.
 
 ### Unique indexes
 

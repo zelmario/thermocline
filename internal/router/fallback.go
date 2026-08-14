@@ -8,6 +8,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmar/thermocline/internal/config"
 	"github.com/zelmar/thermocline/internal/meta"
 	"github.com/zelmar/thermocline/internal/wire"
 )
@@ -441,4 +442,141 @@ func intOf(val bson.RawValue) (int, bool) {
 		return int(val.Double()), true
 	}
 	return 0, false
+}
+
+// count and distinct read user documents just like find does, and were going
+// straight through. Against a partly filled fast tier, count returned 9 where
+// the answer was 41 and reported success, which is the same silent short answer
+// the completeness guard exists to prevent. They are guarded here rather than
+// with find because they reply with a plain document instead of a cursor, so
+// there is nothing to page and the whole answer comes back in one command.
+//
+// mapReduce is deliberately not covered. It is deprecated, rare, and its output
+// can land in a collection, which needs the same care $out gets.
+
+// simpleReadCollection returns the collection a count or distinct names.
+func simpleReadCollection(cmd bson.Raw, name string) (string, bool) {
+	return lookupString(cmd, name)
+}
+
+// guardSimpleRead completeness-checks count and distinct, and answers them from
+// the archive when the fast tier cannot.
+func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name string) (*wire.Message, bool) {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return nil, false
+	}
+	coll, ok := simpleReadCollection(cmd, name)
+	if !ok {
+		return nil, false
+	}
+	ns := db + "." + coll
+	if !c.r.cfg.Manages(ns) {
+		return nil, false
+	}
+
+	mark, known := c.r.completeness(ctx, ns)
+	if known && mark.Claimed {
+		bound, bounded := boundOfQueryField(cmd)
+		if (bounded && mark.Complete(bound)) || (!bounded && mark.CoversAll()) {
+			return nil, false
+		}
+	}
+
+	because := "the fast tier does not hold all of " + ns
+	switch {
+	case !known:
+		because = "the completeness watermark could not be read"
+	case !mark.Claimed:
+		because = "nothing has recorded that the fast tier is complete for " + ns
+	}
+
+	c.r.Stats.Incomplete.Add(1)
+
+	if inTransaction(cmd) {
+		c.r.Stats.Refused.Add(1)
+		out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, ns, because)
+		if terr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+
+	if c.r.cfg.Completeness == config.Archive {
+		out, aerr := c.answerSimpleFromArchive(ctx, msg, db, cmd)
+		if aerr == nil {
+			c.r.Stats.Archived.Add(1)
+			c.log.Debug("read answered from the archive", "ns", ns, "command", name, "because", because)
+			return out, true
+		}
+		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
+	}
+
+	if c.r.cfg.Completeness == config.Permissive {
+		c.log.Warn("answer may be short", "ns", ns, "because", because)
+		return nil, false
+	}
+
+	c.r.Stats.Refused.Add(1)
+	c.log.Warn("refused a query that would return a short answer", "ns", ns, "because", because)
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this query because "+because+
+			". Run the warmer, or set router.completeness to archive to answer it from the archive instead.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// boundOfQueryField reads a lower time bound from the `query` field that count
+// and distinct use in place of find's `filter`.
+func boundOfQueryField(cmd bson.Raw) (time.Time, bool) {
+	val, err := cmd.LookupErr("query")
+	if err != nil {
+		return time.Time{}, false
+	}
+	doc, ok := val.DocumentOK()
+	if !ok {
+		return time.Time{}, false
+	}
+	return lowerTimeBound(doc)
+}
+
+// answerSimpleFromArchive runs a count or distinct against the archive and
+// returns its answer verbatim.
+func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, db string, cmd bson.Raw) (*wire.Message, error) {
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, err
+	}
+	out := make(bson.D, 0, len(elems)+1)
+	sawQuery := false
+	for _, e := range elems {
+		if sessionFields[e.Key()] {
+			continue
+		}
+		if e.Key() == "query" {
+			out = append(out, bson.E{Key: "query", Value: liveOnly(e.Value())})
+			sawQuery = true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	if !sawQuery {
+		out = append(out, bson.E{Key: "query", Value: bson.D{meta.NotArchivedDeleted()}})
+	}
+
+	res := c.r.cold.Database(db).RunCommand(ctx, out)
+	if res.Err() != nil {
+		return nil, res.Err()
+	}
+	raw, err := res.Raw()
+	if err != nil {
+		return nil, err
+	}
+	var doc bson.D
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, doc)
 }

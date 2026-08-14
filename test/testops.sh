@@ -1,0 +1,141 @@
+#!/bin/bash
+# Breadth of MongoDB operations through the router.
+#
+# The same battery runs twice: once with the fast tier complete, so answers come
+# from it, and once with the watermark narrowed so everything falls through to
+# the archive. Both passes must agree, which is the whole promise in one test.
+CFG=/root/cline.yaml
+HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
+COLD='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+NS=tprobe
+PASS=0; FAIL=0; declare -a FAILED
+chk() {
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-44s %s\n' "$1" "$3"
+  else FAIL=$((FAIL+1)); FAILED+=("$MODE/$1"); printf '  FAIL  %-44s got=%s want=%s\n' "$1" "$3" "$2"; fi
+}
+R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
+
+echo "== setup =="
+pkill -f 'cline feeder|cline router'; sleep 2
+H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C 'db.getSiblingDB("_thermocline").watermarks.deleteMany({})' >/dev/null
+cline feeder --config $CFG --log-file /var/log/cline/ops_f.log & FP=$!
+cline router --config $CFG --log-file /var/log/cline/ops_r.log & RP=$!
+sleep 6
+
+# 40 documents with a secondary date field and a few shapes to query on.
+R "
+const c = db.getSiblingDB('shop').$NS;
+const docs = [];
+for (let i = 0; i < 40; i++) docs.push({
+  _id: i, n: i, grp: ['a','b','c'][i%3], name: 'item-'+i,
+  tags: ['t'+(i%4), 'all'], made: new Date(Date.UTC(2026,0,1+i)), nested: {v: i*2}
+});
+c.insertMany(docs);
+print('seeded ' + c.countDocuments({}));" >/dev/null
+sleep 5
+echo "  seeded, archive has $(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+
+battery() {
+  echo "-- $MODE --"
+  chk "countDocuments all"        "40"  "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+  chk "countDocuments filtered"   "14"  "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({grp:'a'}))")"
+  chk "find + itcount"            "40"  "$(R "print(db.getSiblingDB('shop').$NS.find({}).itcount())")"
+  chk "find with \$in"            "3"   "$(R "print(db.getSiblingDB('shop').$NS.find({n:{\$in:[1,2,3]}}).itcount())")"
+  chk "find with \$regex"         "4"   "$(R "print(db.getSiblingDB('shop').$NS.find({name:{\$regex:'^item-1[0-3]\$'}}).itcount())")"
+  chk "find on nested field"      "1"   "$(R "print(db.getSiblingDB('shop').$NS.find({'nested.v':10}).itcount())")"
+  chk "find on array member"      "10"  "$(R "print(db.getSiblingDB('shop').$NS.find({tags:'t0'}).itcount())")"
+  chk "find with date range"      "10"  "$(R "print(db.getSiblingDB('shop').$NS.find({made:{\$gte:new Date(Date.UTC(2026,0,31))}}).itcount())")"
+  chk "projection returns fields" "39"  "$(R "const d=db.getSiblingDB('shop').$NS.find({n:39},{name:1}).next(); print(d.name.split('-')[1])")"
+  chk "sort desc, first doc"      "39"  "$(R "print(db.getSiblingDB('shop').$NS.find({}).sort({n:-1}).limit(1).next().n)")"
+  chk "sort by secondary field"   "0"   "$(R "print(db.getSiblingDB('shop').$NS.find({}).sort({made:1}).limit(1).next().n)")"
+  chk "skip + limit"              "5"   "$(R "print(db.getSiblingDB('shop').$NS.find({}).sort({n:1}).skip(5).limit(1).next().n)")"
+  chk "distinct"                  "3"   "$(R "print(db.getSiblingDB('shop').$NS.distinct('grp').length)")"
+  chk "aggregate \$group"         "3"   "$(R "print(db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}}]).toArray().length)")"
+  chk "aggregate \$match+\$count" "14"  "$(R "const r=db.getSiblingDB('shop').$NS.aggregate([{\$match:{grp:'a'}},{\$count:'n'}]).toArray(); print(r.length?r[0].n:0)")"
+  chk "aggregate \$sort+\$limit"  "39"  "$(R "print(db.getSiblingDB('shop').$NS.aggregate([{\$sort:{n:-1}},{\$limit:1}]).toArray()[0].n)")"
+  chk "aggregate \$unwind"        "80"  "$(R "print(db.getSiblingDB('shop').$NS.aggregate([{\$unwind:'\$tags'},{\$count:'n'}]).toArray()[0].n)")"
+  chk "estimatedDocumentCount"    "40"  "$(R "print(db.getSiblingDB('shop').$NS.estimatedDocumentCount())")"
+  chk "cursor paging batchSize 7" "40"  "$(R "let n=0; const c=db.getSiblingDB('shop').$NS.find({}).batchSize(7); while(c.hasNext()){c.next();n++} print(n)")"
+  chk "explain runs"              "true" "$(R "print(!!db.getSiblingDB('shop').$NS.find({n:1}).explain())")"
+}
+
+MODE="fast tier complete"
+cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+sleep 7
+battery
+
+MODE="answered from the archive"
+cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+battery
+
+echo "== fast tier genuinely incomplete: every read command must still be whole =="
+# The two passes above both had the fast tier holding everything, so count and
+# distinct would have looked right even unguarded. Make it actually short.
+kill $RP $FP 2>/dev/null; wait $RP 2>/dev/null; wait $FP 2>/dev/null
+H "db.getSiblingDB('shop').$NS.deleteMany({n:{\$gte:10}})" >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+cline feeder --config $CFG --log-file /var/log/cline/ops_f.log & FP=$!
+cline router --config $CFG --log-file /var/log/cline/ops_r.log & RP=$!
+sleep 6
+cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+MODE="incomplete fast tier"
+HOTN=$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
+TRUTH=$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+echo "  fast tier holds $HOTN, archive holds $TRUTH"
+chk "find itcount"              "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS.find({}).itcount())")"
+chk "countDocuments"            "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+chk "estimatedDocumentCount"    "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS.estimatedDocumentCount())")"
+chk "count command"             "$TRUTH" "$(R "print(db.getSiblingDB('shop').runCommand({count:'$NS'}).n)")"
+chk "distinct n"                "$TRUTH" "$(R "print(db.getSiblingDB('shop').$NS.distinct('n').length)")"
+chk "count with a query"        "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({grp:'a',_tcDeletedAt:{\$exists:false}}))")" "$(R "print(db.getSiblingDB('shop').runCommand({count:'$NS',query:{grp:'a'}}).n)")"
+# put it back so the write battery below has its documents
+cline warmer --config $CFG >/dev/null 2>&1
+cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+sleep 7
+
+echo "== write paths (fast tier holds everything) =="
+MODE="writes"
+cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+sleep 7
+chk "updateOne"        "1"  "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{w:1}}).modifiedCount)")"
+chk "updateMany"       "14" "$(R "print(db.getSiblingDB('shop').$NS.updateMany({grp:'a'},{\$set:{w:2}}).modifiedCount)")"
+chk "replaceOne"       "1"  "$(R "print(db.getSiblingDB('shop').$NS.replaceOne({_id:2},{_id:2,n:2,grp:'b',replaced:true}).modifiedCount)")"
+chk "upsert creates"   "1"  "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:900},{\$set:{n:900}},{upsert:true}).upsertedCount)")"
+chk "findAndModify"    "1"  "$(R "const d=db.getSiblingDB('shop').$NS.findOneAndUpdate({_id:1},{\$set:{fam:1}},{returnDocument:'after'}); print(d?d.fam:'null')")"
+chk "findOneAndDelete" "901" "$(R "db.getSiblingDB('shop').$NS.insertOne({_id:901,n:901}); const d=db.getSiblingDB('shop').$NS.findOneAndDelete({_id:901}); print(d?d._id:'null')")"
+chk "findOneAndReplace" "true" "$(R "const d=db.getSiblingDB('shop').$NS.findOneAndReplace({_id:3},{_id:3,n:3,fr:true},{returnDocument:'after'}); print(d?!!d.fr:'null')")"
+chk "deleteOne"        "1"  "$(R "db.getSiblingDB('shop').$NS.insertOne({_id:902,n:902}); print(db.getSiblingDB('shop').$NS.deleteOne({_id:902}).deletedCount)")"
+chk "deleteMany"       "2"  "$(R "db.getSiblingDB('shop').$NS.insertMany([{_id:903,z:1},{_id:904,z:1}]); print(db.getSiblingDB('shop').$NS.deleteMany({z:1}).deletedCount)")"
+chk "bulkWrite mixed"  "3"  "$(R "const r=db.getSiblingDB('shop').$NS.bulkWrite([{insertOne:{document:{_id:905,n:905}}},{updateOne:{filter:{_id:905},update:{\$set:{b:1}}}},{deleteOne:{filter:{_id:905}}}]); print(r.insertedCount+r.modifiedCount+r.deletedCount)")"
+chk "\$inc operator"   "43" "$(R "db.getSiblingDB('shop').$NS.updateOne({_id:4},{\$inc:{n:39}}); print(db.getSiblingDB('shop').$NS.findOne({_id:4}).n)")"
+chk "\$push to array"  "3"  "$(R "db.getSiblingDB('shop').$NS.updateOne({_id:5},{\$push:{tags:'new'}}); print(db.getSiblingDB('shop').$NS.findOne({_id:5}).tags.length)")"
+
+echo "== metadata commands =="
+MODE="metadata"
+chk "listCollections"  "true" "$(R "print(db.getSiblingDB('shop').getCollectionNames().includes('$NS'))")"
+chk "listIndexes"      "true" "$(R "print(db.getSiblingDB('shop').$NS.getIndexes().length >= 1)")"
+chk "createIndex"      "true" "$(R "db.getSiblingDB('shop').$NS.createIndex({grp:1}); print(db.getSiblingDB('shop').$NS.getIndexes().some(i=>i.name=='grp_1'))")"
+chk "dropIndex"        "false" "$(R "db.getSiblingDB('shop').$NS.dropIndex('grp_1'); print(db.getSiblingDB('shop').$NS.getIndexes().some(i=>i.name=='grp_1'))")"
+chk "collStats"        "true" "$(R "print(db.getSiblingDB('shop').$NS.stats().count >= 0)")"
+chk "dbStats"          "true" "$(R "print(db.getSiblingDB('shop').stats().db == 'shop')")"
+chk "ping"             "1"    "$(R "print(db.adminCommand({ping:1}).ok)")"
+chk "buildInfo"        "true" "$(R "print(!!db.adminCommand({buildInfo:1}).version)")"
+
+echo "== writes reached the archive =="
+sleep 6
+chk "mirrored update"  "1"  "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d&&d.w?d.w:'no')")"
+chk "mirrored replace" "true" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:2}); print(d?!!d.replaced:'no')")"
+chk "mirrored upsert"  "900" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:900}); print(d?d.n:'no')")"
+
+kill $RP $FP 2>/dev/null; wait $RP 2>/dev/null; wait $FP 2>/dev/null
+echo
+echo "================================"
+echo "PASS $PASS   FAIL $FAIL"
+[ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
+exit $FAIL
