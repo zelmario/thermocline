@@ -26,7 +26,7 @@ FP=$!
 # The evictor's precondition is mirroring lag inside max_feeder_lag. After the
 # feeder has been down it has to catch up first, so wait for that rather than
 # racing it.
-COLD='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 for i in $(seq 1 60); do
   LAG=$(mongosh "$COLD" --quiet --eval 'const c=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}); print(c?Math.round((Date.now()-c.eventAt.getTime())/1000):9999)' 2>/dev/null | tail -1)
   [ "$LAG" -lt 20 ] 2>/dev/null && { echo "  (feeder caught up, lag ${LAG}s)"; break; }

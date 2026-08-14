@@ -5,8 +5,8 @@
 # from it, and once with the watermark narrowed so everything falls through to
 # the archive. Both passes must agree, which is the whole promise in one test.
 CFG=/root/cline.yaml
-HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
-COLD='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tprobe
 PASS=0; FAIL=0; declare -a FAILED
 chk() {

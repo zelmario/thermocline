@@ -170,6 +170,12 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 		return nil, err
 	}
 
+	// Every path that answers from the archive waits here, rather than each
+	// caller remembering to. A find waited and an aggregation did not, and
+	// countDocuments is an aggregation, so a document inserted a moment earlier
+	// was found by find and not counted by countDocuments.
+	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now())
+
 	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
 		return nil, err
@@ -565,6 +571,12 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	if !sawQuery {
 		out = append(out, bson.E{Key: "query", Value: bson.D{meta.NotArchivedDeleted()}})
 	}
+
+	coll, _ := stringField(cmd, "count")
+	if coll == "" {
+		coll, _ = stringField(cmd, "distinct")
+	}
+	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now())
 
 	res := c.r.cold.Database(db).RunCommand(ctx, out)
 	if res.Err() != nil {

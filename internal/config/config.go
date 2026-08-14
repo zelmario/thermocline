@@ -84,6 +84,18 @@ type RouterConfig struct {
 	Completeness Completeness `yaml:"completeness"`
 	// Residency is how long a copied-up document is protected from eviction.
 	Residency Duration `yaml:"residency"`
+	// ArchiveWait is how long a read that falls through to the archive will
+	// wait for mirroring to reach the moment the read started.
+	//
+	// The archive trails the fast tier by the feeder's lag, so without this a
+	// fallback read can miss a write that already returned, or return a
+	// document that was already deleted. Waiting costs nothing while the feeder
+	// keeps up, which is the normal case. Set it to zero to answer immediately
+	// and accept secondary-read freshness.
+	ArchiveWait Duration `yaml:"archive_wait"`
+	// FeederID names the checkpoint ArchiveWait reads, copied from feeder.id at
+	// load time rather than configured twice.
+	FeederID string `yaml:"-"`
 	// Managed lists the namespaces Thermocline mirrors, copied from
 	// feeder.namespaces at load time rather than configured twice.
 	//
@@ -247,6 +259,8 @@ func Default() Config {
 			Listen:       "127.0.0.1:27017",
 			Completeness: Archive,
 			Residency:    Duration(30 * 24 * time.Hour),
+			ArchiveWait:  Duration(5 * time.Second),
+			FeederID:     "default",
 		},
 	}
 }
@@ -263,6 +277,7 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
+	cfg.Router.FeederID = cfg.Feeder.ID
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}

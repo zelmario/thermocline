@@ -10,7 +10,6 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmar/thermocline/internal/meta"
 	"github.com/zelmar/thermocline/internal/wire"
@@ -48,6 +47,102 @@ const indexRefresh = time.Minute
 type uniqueIndex struct {
 	name   string
 	fields []string
+
+	// sparse and partial indexes constrain only some documents. A key is
+	// claimed for a document only when the index would have indexed it.
+	sparse  bool
+	partial bson.Raw
+
+	// partialFields are the fields the partial filter reads. Writing one of
+	// them can move a document into the index without touching an indexed
+	// field at all, and that is the moment its key has to be claimed.
+	partialFields []string
+}
+
+// partialFieldNames lists the fields a partial filter reads, descending through
+// the logical operators that hold nested filters.
+func partialFieldNames(filter bson.Raw) []string {
+	seen := map[string]bool{}
+	var walk func(bson.Raw)
+	walk = func(f bson.Raw) {
+		elems, err := f.Elements()
+		if err != nil {
+			return
+		}
+		for _, e := range elems {
+			if !strings.HasPrefix(e.Key(), "$") {
+				seen[e.Key()] = true
+				continue
+			}
+			// $and, $or and $nor carry arrays of further filters.
+			if arr, ok := e.Value().ArrayOK(); ok {
+				vals, verr := arr.Values()
+				if verr != nil {
+					continue
+				}
+				for _, v := range vals {
+					if d, dok := v.DocumentOK(); dok {
+						walk(d)
+					}
+				}
+				continue
+			}
+			if d, dok := e.Value().DocumentOK(); dok {
+				walk(d)
+			}
+		}
+	}
+	walk(filter)
+	out := make([]string, 0, len(seen))
+	for f := range seen {
+		out = append(out, f)
+	}
+	return out
+}
+
+// constrains reports whether idx would index doc at all, and so whether doc's
+// key has to be claimed.
+//
+// A partial index carries a query predicate, and reimplementing MongoDB's
+// matcher to evaluate it would be a source of bugs forever. The server is asked
+// instead: a collectionless aggregation feeds the candidate document through the
+// index's own partialFilterExpression, so the answer comes from the same code
+// that will decide whether to index it.
+func (r *Router) constrains(ctx context.Context, dbName string, idx uniqueIndex, doc bson.Raw) bool {
+	if idx.sparse {
+		// A compound sparse index still indexes a document that has any one of
+		// its fields, so only a document missing all of them is exempt.
+		any := false
+		for _, f := range idx.fields {
+			if _, ok := lookupPath(doc, f); ok {
+				any = true
+				break
+			}
+		}
+		if !any {
+			return false
+		}
+	}
+	if len(idx.partial) == 0 {
+		return true
+	}
+
+	cur, err := r.hot.Database(dbName).Aggregate(ctx, bson.A{
+		bson.D{{Key: "$documents", Value: bson.A{doc}}},
+		bson.D{{Key: "$match", Value: idx.partial}},
+		bson.D{{Key: "$limit", Value: 1}},
+	})
+	if err != nil {
+		// Could not ask. Enforcing anyway would reject writes the database
+		// itself allows, which is a visible failure caused by bookkeeping, so
+		// this stays out of the way and says so.
+		r.log.Warn("could not evaluate a partial unique index, not enforcing it across tiers",
+			"index", idx.name, "err", err,
+			"effect", "a duplicate of an archived document could be inserted")
+		return false
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	return cur.Next(ctx)
 }
 
 // indexCache remembers which namespaces have unique indexes.
@@ -59,11 +154,9 @@ type indexCache struct {
 
 // uniqueIndexes lists the unique indexes on ns, excluding _id.
 //
-// Sparse and partial unique indexes are skipped deliberately. They constrain
-// only a subset of documents, and a registry that cannot evaluate the same
-// condition would reject inserts the database itself would allow. Leaving them
-// out means they behave exactly as they do today, which is honest, and the
-// router says so once at startup.
+// Sparse and partial ones are included. They constrain only a subset of
+// documents, so each candidate document is tested against the same condition
+// the index itself uses before its key is claimed. See constrains.
 func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	r.idxCache.mu.RLock()
 	at, seen := r.idxCache.fetched[ns]
@@ -92,18 +185,16 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 			if !spec.Unique || spec.Name == "_id_" {
 				continue
 			}
-			if spec.Sparse || len(spec.PartialFilterExpression) > 0 {
-				r.log.Warn("unique index not enforced across tiers",
-					"ns", ns, "index", spec.Name,
-					"reason", "sparse and partial unique indexes constrain only some documents",
-					"effect", "a duplicate of an evicted document can still be inserted")
-				continue
-			}
 			elems, kerr := spec.Key.Elements()
 			if kerr != nil {
 				continue
 			}
-			ui := uniqueIndex{name: spec.Name}
+			ui := uniqueIndex{
+				name:          spec.Name,
+				sparse:        spec.Sparse,
+				partial:       spec.PartialFilterExpression,
+				partialFields: partialFieldNames(spec.PartialFilterExpression),
+			}
 			for _, e := range elems {
 				ui.fields = append(ui.fields, e.Key())
 			}
@@ -122,20 +213,58 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	return found
 }
 
+// forgetIndexes drops what is remembered about ns, so the next write re-lists.
+//
+// Without this a unique index created on a running system is not enforced
+// across tiers until the cache expires, and that window is exactly when it
+// matters: somebody has just decided this field must be unique.
+func (r *Router) forgetIndexes(ns string) {
+	r.idxCache.mu.Lock()
+	delete(r.idxCache.byNS, ns)
+	delete(r.idxCache.fetched, ns)
+	r.idxCache.mu.Unlock()
+}
+
+// indexDDL reports whether a command changes which indexes a collection has,
+// and on which collection.
+func indexDDL(cmd bson.Raw, name string) (string, bool) {
+	switch name {
+	case "createIndexes", "dropIndexes", "drop", "collMod":
+		coll, ok := stringField(cmd, name)
+		return coll, ok
+	}
+	return "", false
+}
+
 // keyID builds the registry id for one document's value of one index.
 //
 // A missing field is indexed as null by MongoDB, so it is encoded as null here
 // too, or two documents both missing the field would look like different keys
 // and both be allowed.
 func keyID(ns string, idx uniqueIndex, doc bson.Raw) (string, bool) {
-	key := make(bson.D, 0, len(idx.fields))
-	for _, f := range idx.fields {
+	vals := make([]any, len(idx.fields))
+	for i, f := range idx.fields {
 		val, err := doc.LookupErr(strings.Split(f, ".")...)
 		if err != nil {
-			key = append(key, bson.E{Key: f, Value: nil})
-			continue
+			continue // absent, which is a null key
 		}
-		key = append(key, bson.E{Key: f, Value: val})
+		vals[i] = val
+	}
+	return keyIDFromValues(ns, idx, vals)
+}
+
+// keyIDFromValues builds the same id from field values worked out some other
+// way, which is what the update path has to do: the document that will hold the
+// key does not exist yet. A nil entry means the field is absent, encoded exactly
+// as keyID encodes a missing field, or the two would disagree about the same
+// document.
+func keyIDFromValues(ns string, idx uniqueIndex, vals []any) (string, bool) {
+	if len(vals) != len(idx.fields) {
+		return "", false
+	}
+	key := make(bson.D, 0, len(idx.fields))
+	for i, f := range idx.fields {
+		key = append(key, bson.E{Key: f, Value: vals[i]})
 	}
 	raw, err := bson.Marshal(key)
 	if err != nil {
@@ -171,44 +300,25 @@ type keyClash struct {
 // whole batch were refused. Ordered stops at the first clash, again like mongod,
 // so nothing after it is claimed either.
 func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex, ordered bool) (claimed []string, clashes []keyClash, err error) {
-	now := time.Now().UTC()
+	dbName, _ := splitNS(ns)
 	for d, doc := range docs {
 		id, _ := doc.LookupErr("_id")
 		clashed := false
 		for i := range idxs {
+			if !r.constrains(ctx, dbName, idxs[i], doc) {
+				continue
+			}
 			kid, ok := keyID(ns, idxs[i], doc)
 			if !ok {
 				continue
 			}
-			_, ierr := r.keys().InsertOne(ctx, keyClaim{
-				ID: kid, NS: ns, Index: idxs[i].name, Doc: id, At: now,
-			})
-			if ierr == nil {
-				claimed = append(claimed, kid)
-				continue
-			}
-			if !mongo.IsDuplicateKeyError(ierr) {
-				return claimed, nil, ierr
-			}
-
-			// Somebody holds this key. Whether that is a real duplicate depends
-			// on whether their document still exists.
-			taken, terr := r.claimIsLive(ctx, ns, kid)
+			got, terr := r.tryClaim(ctx, ns, idxs[i], kid, id)
 			if terr != nil {
 				return claimed, nil, terr
 			}
-			if !taken {
-				// Stale. Take it over, unless somebody else just did.
-				res, uerr := r.keys().UpdateOne(ctx,
-					bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: bson.D{{Key: "$ne", Value: id}}}},
-					bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: id}, {Key: "at", Value: now}}}})
-				if uerr != nil {
-					return claimed, nil, uerr
-				}
-				if res.MatchedCount > 0 {
-					claimed = append(claimed, kid)
-					continue
-				}
+			if got {
+				claimed = append(claimed, kid)
+				continue
 			}
 			clashes = append(clashes, keyClash{doc: d, index: idxs[i].name})
 			clashed = true
@@ -223,30 +333,91 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 	return claimed, clashes, nil
 }
 
-// claimIsLive reports whether the document holding a claim still exists in
-// either tier. A claim whose owner is gone is a leftover from a delete and must
-// not block a new insert.
-func (r *Router) claimIsLive(ctx context.Context, ns, kid string) (bool, error) {
-	var claim keyClaim
-	err := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&claim)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		// Released between the failed insert and this read.
-		return false, nil
+// tryClaim reserves one key for one document, resolving a stale claim if that
+// is what stands in the way. It reports whether the key is now this document's.
+//
+// Both the insert and the update path go through here, so a value is reserved
+// the same way whichever command is about to write it.
+func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid string, owner bson.RawValue) (bool, error) {
+	now := time.Now().UTC()
+	_, err := r.keys().InsertOne(ctx, keyClaim{
+		ID: kid, NS: ns, Index: idx.name, Doc: owner, At: now,
+	})
+	if err == nil {
+		return true, nil
 	}
-	if err != nil {
+	if !mongo.IsDuplicateKeyError(err) {
 		return false, err
 	}
+
+	// Somebody holds this key. Whether that is a real duplicate depends on
+	// whether their document still exists and still carries this value.
+	var claim keyClaim
+	derr := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&claim)
+	if errors.Is(derr, mongo.ErrNoDocuments) {
+		// Released between the failed insert and this read. Try once more.
+		_, ierr := r.keys().InsertOne(ctx, keyClaim{
+			ID: kid, NS: ns, Index: idx.name, Doc: owner, At: now,
+		})
+		if ierr == nil {
+			return true, nil
+		}
+		if mongo.IsDuplicateKeyError(ierr) {
+			return false, nil
+		}
+		return false, ierr
+	}
+	if derr != nil {
+		return false, derr
+	}
+	// Already ours. An update that rewrites a field to the value it already has
+	// must not be rejected by the claim the same document made.
+	if !owner.IsZero() && claim.Doc.Equal(owner) {
+		return true, nil
+	}
+
+	live, lerr := r.claimIsLive(ctx, ns, idx, kid, claim)
+	if lerr != nil {
+		return false, lerr
+	}
+	if live {
+		return false, nil
+	}
+
+	// Stale. Take it over, unless somebody else just did.
+	res, uerr := r.keys().UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: bson.D{{Key: "$ne", Value: owner}}}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: owner}, {Key: "at", Value: now}}}})
+	if uerr != nil {
+		return false, uerr
+	}
+	return res.MatchedCount > 0, nil
+}
+
+// claimIsLive reports whether a claim still stands: its owning document must
+// still exist in one of the tiers, and must still carry the value the claim is
+// for.
+//
+// Checking only that the document exists is not enough. A document that moved
+// off a value leaves its old claim behind pointing at itself, and that claim
+// would then block a perfectly legitimate insert of a value nobody holds. So
+// the owner is read in full and its key recomputed, rather than probed for
+// existence.
+func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, kid string, claim keyClaim) (bool, error) {
 	if claim.Doc.IsZero() {
 		// No owner recorded, so nothing can be proven gone. Treat as taken.
 		return true, nil
 	}
 
 	db, coll := splitNS(ns)
+
+	// The fast tier is authoritative where it holds the document: the archive
+	// trails it by the feeder's mirroring lag and may still show the old value.
+	var owner bson.Raw
 	hotErr := r.hot.Database(db).Collection(coll).
-		FindOne(ctx, bson.D{{Key: "_id", Value: claim.Doc}},
-			options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+		FindOne(ctx, bson.D{{Key: "_id", Value: claim.Doc}}).Decode(&owner)
 	if hotErr == nil {
-		return true, nil
+		return r.stillHoldsKey(ctx, ns, idx, kid, owner), nil
 	}
 	if !errors.Is(hotErr, mongo.ErrNoDocuments) {
 		return true, hotErr
@@ -256,14 +427,31 @@ func (r *Router) claimIsLive(ctx context.Context, ns, kid string) (bool, error) 
 		FindOne(ctx, bson.D{
 			{Key: "_id", Value: claim.Doc},
 			meta.NotArchivedDeleted(),
-		}, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+		}).Decode(&owner)
 	if coldErr == nil {
-		return true, nil
+		return r.stillHoldsKey(ctx, ns, idx, kid, owner), nil
 	}
 	if !errors.Is(coldErr, mongo.ErrNoDocuments) {
 		return true, coldErr
 	}
 	return false, nil
+}
+
+// stillHoldsKey reports whether doc's current value for idx is the one kid was
+// issued for. A document that cannot be keyed is treated as still holding it,
+// because releasing a key on a guess is the one outcome that loses data.
+func (r *Router) stillHoldsKey(ctx context.Context, ns string, idx uniqueIndex, kid string, doc bson.Raw) bool {
+	dbName, _ := splitNS(ns)
+	// A document that has moved outside a sparse or partial index is no longer
+	// indexed by it, so it no longer holds the key either.
+	if !r.constrains(ctx, dbName, idx, doc) {
+		return false
+	}
+	got, ok := keyID(ns, idx, doc)
+	if !ok {
+		return true
+	}
+	return got == kid
 }
 
 // releaseKeys undoes claims after an insert that did not land.
@@ -543,6 +731,9 @@ func (r *Router) RebuildKeys(ctx context.Context, namespaces []string) (map[stri
 				doc := bson.Raw(cur.Current)
 				id, _ := doc.LookupErr("_id")
 				for i := range idxs {
+					if !r.constrains(ctx, db, idxs[i], doc) {
+						continue
+					}
 					kid, ok := keyID(ns, idxs[i], doc)
 					if !ok {
 						continue

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Functional tests of every router behaviour, through the wire protocol.
 CFG=/root/cline.yaml
-HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
-COLD='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
 chk() { # chk NAME EXPECTED ACTUAL
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-46s %s\n' "$1" "$3"
@@ -102,9 +102,16 @@ echo "== transactions =="
 C 'db.getSiblingDB("shop").tprobe.insertOne({_id:20,v:"txn"})' >/dev/null
 chk "transaction replays after a copy-up" "1" "$(R 'const s=db.getMongo().startSession(); let a=0; try{ s.withTransaction(()=>{a++; const r=s.getDatabase("shop").tprobe.updateOne({_id:20},{$set:{v:"txn2"}}); if(r.matchedCount!==1) throw new Error("miss");}); print(a>1?1:0);}catch(e){print("FAILED")} s.endSession()')"
 
-echo "== \$out is refused =="
-chk "\$out on incomplete input refused" "refused" "$(R 'try{db.getSiblingDB("shop").tprobe.aggregate([{$group:{_id:null,n:{$sum:1}}},{$out:"tprobe_out"}]).toArray(); print("ALLOWED")}catch(e){print(e.message.match(/refusing/)?"refused":"other")}')"
-chk "and nothing was written"           "false"   "$(H 'print(db.getSiblingDB("shop").getCollectionNames().includes("tprobe_out"))')"
+echo "== \$out runs against the archive =="
+# The input reaches past what the fast tier holds, so it is read from the
+# archive and the write stage is performed on the fast tier, where the
+# application will look for the result.
+chk "\$out on incomplete input runs"    "ok"    "$(R 'try{db.getSiblingDB("shop").tprobe.aggregate([{$group:{_id:null,n:{$sum:1}}},{$out:"tprobe_out"}]).toArray(); print("ok")}catch(e){print(e.message.substring(0,50))}')"
+chk "and the result is on the fast tier" "true"  "$(H 'print(db.getSiblingDB("shop").getCollectionNames().includes("tprobe_out"))')"
+# Recomputed here, not reused from earlier: the transaction section above adds
+# a document to the archive, so the count taken before it is already stale.
+NOWLIVE=$(C 'print(db.getSiblingDB("shop").tprobe.countDocuments({_tcDeletedAt:{$exists:false}}))')
+chk "and it counted every document"      "$NOWLIVE" "$(H 'const d=db.getSiblingDB("shop").tprobe_out.findOne({}); print(d?d.n:"MISSING")')"
 
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 

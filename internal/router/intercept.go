@@ -69,6 +69,10 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	}
 
 	c.r.Stats.ReadMisses.Add(1)
+	// A document deleted a moment ago is still live in the archive until the
+	// tombstone is mirrored, so a miss has to wait for mirroring before it can
+	// treat the archive's copy as the truth.
+	c.archiveReadIsFresh(ctx, ns, time.Now())
 	doc, found, err := c.r.readArchived(ctx, ns, id)
 	if err != nil {
 		return nil, err

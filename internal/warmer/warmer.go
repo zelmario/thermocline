@@ -37,6 +37,11 @@ type Warmer struct {
 	log    *slog.Logger
 	dryRun bool
 
+	// unannounced is the feeder's delete policy. Under "ignore" the archive
+	// keeps deleted documents readable, which makes a count comparison between
+	// the tiers meaningless.
+	unannounced config.UnannouncedDeletes
+
 	marks   *watermark.Store
 	limiter *limiter
 }
@@ -66,16 +71,17 @@ func (s Stats) LogArgs() []any {
 }
 
 // New builds a Warmer. It does not contact either cluster.
-func New(hot, cold *mongo.Client, cfg config.WarmerConfig, dryRun bool, log *slog.Logger) *Warmer {
+func New(hot, cold *mongo.Client, cfg config.WarmerConfig, unannounced config.UnannouncedDeletes, dryRun bool, log *slog.Logger) *Warmer {
 	return &Warmer{
-		hot:     hot,
-		cold:    cold,
-		cfg:     cfg,
-		check:   health.New(hot, cold, ""),
-		log:     log,
-		dryRun:  dryRun,
-		marks:   watermark.New(cold),
-		limiter: newLimiter(cfg.Rate),
+		hot:         hot,
+		cold:        cold,
+		cfg:         cfg,
+		unannounced: unannounced,
+		check:       health.New(hot, cold, ""),
+		log:         log,
+		dryRun:      dryRun,
+		marks:       watermark.New(cold),
+		limiter:     newLimiter(cfg.Rate),
 	}
 }
 
@@ -105,6 +111,69 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 	return total, nil
 }
 
+// verifyClaim checks that the fast tier still holds everything its watermark
+// says it does, and reports how far short it is.
+//
+// Telling a hole from a legitimate deletion looked like it needed a
+// document-by-document comparison, and it does not. The archive is upsert only:
+// a document the application deleted is tombstoned there, not removed. So the
+// documents live in the archive are exactly the documents the fast tier is
+// claiming to hold, and two counts answer the question.
+//
+// This matters because the alternative is silence. A fast tier missing half a
+// range still answers queries, still returns documents, and still reports
+// success. Nothing else in the system would ever notice.
+func (w *Warmer) verifyClaim(ctx context.Context, rule config.WarmRule, from time.Time) (short bool, hotN, coldN int64, err error) {
+	// With this policy the archive keeps deleted documents readable, so it
+	// legitimately holds more than the fast tier and the comparison means
+	// nothing. Worse, acting on it would warm deleted documents back to life.
+	if w.unannounced == config.Ignore {
+		return false, 0, 0, nil
+	}
+
+	hotN, coldN, err = w.countBothInWindow(ctx, rule, from)
+	if err != nil || hotN >= coldN {
+		return false, hotN, coldN, err
+	}
+
+	// A delete applied to the fast tier is tombstoned in the archive a moment
+	// later, so during that moment the archive legitimately shows more. Look
+	// again before discarding a claim over it.
+	select {
+	case <-ctx.Done():
+		return false, hotN, coldN, ctx.Err()
+	case <-time.After(recheckDelay):
+	}
+	hotN, coldN, err = w.countBothInWindow(ctx, rule, from)
+	if err != nil {
+		return false, hotN, coldN, err
+	}
+	return hotN < coldN, hotN, coldN, nil
+}
+
+// recheckDelay is how long verifyClaim waits before believing a shortfall.
+const recheckDelay = 3 * time.Second
+
+// countBothInWindow counts what each tier holds at or after from.
+func (w *Warmer) countBothInWindow(ctx context.Context, rule config.WarmRule, from time.Time) (int64, int64, error) {
+	filter, err := windowFilter(rule, from)
+	if err != nil {
+		return 0, 0, err
+	}
+	db, coll := splitNS(rule.NS)
+
+	hotN, err := w.hot.Database(db).Collection(coll).CountDocuments(ctx, filter)
+	if err != nil {
+		return 0, 0, fmt.Errorf("count %s on the fast tier: %w", rule.NS, err)
+	}
+	coldN, err := w.cold.Database(db).Collection(coll).
+		CountDocuments(ctx, append(filter, meta.NotArchivedDeleted()))
+	if err != nil {
+		return 0, 0, fmt.Errorf("count %s in the archive: %w", rule.NS, err)
+	}
+	return hotN, coldN, nil
+}
+
 // staleClaim reports whether a recorded watermark describes a fast tier that no
 // longer exists.
 //
@@ -112,11 +181,8 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 // Those leave no change stream event behind, so the claim simply outlives the
 // data it described, and the warmer used to trust it and do nothing at all. The
 // decisive signal is cheap: a fast tier holding nothing whatsoever in a window
-// the archive can fill is a fast tier that lost its contents.
-//
-// A partial loss is not caught here. Telling "half the range is missing" from
-// "half the range was legitimately deleted" means comparing both tiers document
-// by document, which is a repair tool, not a warm.
+// the archive can fill is a fast tier that lost its contents. verifyClaim
+// catches the subtler case of a range that is merely short.
 func (w *Warmer) staleClaim(ctx context.Context, rule config.WarmRule, floor time.Time) (bool, error) {
 	hotHas, err := w.anyInWindow(ctx, w.hot, rule, floor)
 	if err != nil || hotHas {
@@ -168,6 +234,28 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			if !w.dryRun {
 				if _, err := w.marks.Clear(ctx, rule.NS); err != nil {
 					return stats, err
+				}
+			}
+			saved = watermark.Mark{}
+		}
+	}
+
+	// The window is empty of neither tier, but it can still be full of holes.
+	if saved.Claimed {
+		short, hotN, coldN, verr := w.verifyClaim(ctx, rule, saved.From)
+		switch {
+		case verr != nil:
+			// Not being able to check is not a reason to stop warming.
+			w.log.Warn("could not verify the completeness claim", "ns", rule.NS, "err", verr)
+		case short:
+			w.log.Warn("discarding a completeness claim the fast tier cannot support",
+				"ns", rule.NS,
+				"claimed_complete_from", saved.From.Format(time.RFC3339),
+				"fast_tier", hotN, "archive", coldN, "missing", coldN-hotN,
+				"note", "documents are missing from a range claimed complete; warming it again")
+			if !w.dryRun {
+				if _, cerr := w.marks.Clear(ctx, rule.NS); cerr != nil {
+					return stats, cerr
 				}
 			}
 			saved = watermark.Mark{}

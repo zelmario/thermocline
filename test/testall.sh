@@ -1,6 +1,8 @@
 #!/bin/bash
 # Exercise every cline subcommand, flag and error path.
 CFG=/root/cline.yaml
+HOTU=${HOTU:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLDU=${COLDU:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0
 declare -a FAILED
 
@@ -40,6 +42,10 @@ sed '/^evictor:/,/^warmer:/{/rules:/,/older_than/d}' $CFG > /root/norules.yaml
 ok "evictor with no rules"              1 "rules is empty"    -- cline evictor --config /root/norules.yaml --once
 
 echo "== watermark =="
+# On a fresh archive there is nothing to list, so declare the claim this section
+# reads back. Without it "list all" fails on a clean environment and passes only
+# because some earlier run happened to leave a claim behind.
+cline watermark --config $CFG --ns shop.orders --complete-all >/dev/null
 ok "list all"                           0 "shop"              -- cline watermark --config $CFG
 ok "single namespace"                   0 "shop.orders"       -- cline watermark --config $CFG --ns shop.orders
 ok "unknown namespace claims nothing"   0 "claims nothing"    -- cline watermark --config $CFG --ns no.such
@@ -53,7 +59,17 @@ ok "--clear again is not an error"      0 "no claim"          -- cline watermark
 ok "--log-file accepted"                0 ""                  -- cline watermark --config $CFG --log-file /var/log/cline/wm.log
 test -s /var/log/cline/wm.log && { PASS=$((PASS+1)); echo "  PASS  watermark wrote its log file"; } || { FAIL=$((FAIL+1)); FAILED+=("watermark log file"); echo "  FAIL  watermark wrote its log file"; }
 
+cline watermark --config $CFG --ns shop.orders --clear >/dev/null
+
 echo "== keys =="
+# The key registry only has work to do when a tiered collection carries a unique
+# index, so give it one and a document to claim.
+mongosh "$HOTU" --quiet --eval '
+  const c = db.getSiblingDB("shop").tacct;
+  c.createIndex({email:1},{unique:true});
+  c.updateOne({_id:"keyprobe"},{$set:{email:"keyprobe@x.com"}},{upsert:true});' >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null 2>&1
+mongosh "$HOTU"  --quiet --eval 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null 2>&1
 ok "report"                             0 "unique indexes|nothing to enforce" -- cline keys --config $CFG
 ok "--rebuild"                          0 "claimed|nothing new" -- cline keys --config $CFG --rebuild
 ok "--rebuild is idempotent"            0 "claimed 0|nothing new" -- cline keys --config $CFG --rebuild
@@ -71,7 +87,6 @@ echo "== evictor =="
 # wrong time, which looks like a bug in the evictor and is not one.
 pkill -f 'cline feeder'; sleep 1
 cline feeder --config $CFG --log-file /var/log/cline/t_pre.log & PRE=$!
-COLDU='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
 for i in $(seq 1 45); do
   LAG=$(mongosh "$COLDU" --quiet --eval 'const c=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}); print(c?Math.round((Date.now()-c.eventAt.getTime())/1000):9999)' 2>/dev/null | tail -1)
   [ "$LAG" -lt 20 ] 2>/dev/null && break

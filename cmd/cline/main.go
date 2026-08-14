@@ -234,7 +234,7 @@ func runWarmer(args []string) error {
 	}
 	defer disconnect(cold, log)
 
-	w := warmer.New(hot, cold, cfg.Warmer, *dryRun, log)
+	w := warmer.New(hot, cold, cfg.Warmer, cfg.Feeder.UnannouncedDeletes, *dryRun, log)
 	stats, err := w.Run(ctx)
 	log.Info("warm complete", stats.LogArgs()...)
 	if err != nil {
@@ -311,6 +311,7 @@ func reportRouterStats(ctx context.Context, r *router.Router, log *slog.Logger) 
 				"copied_up", r.Stats.CopiedUp.Load(),
 				"incomplete", r.Stats.Incomplete.Load(),
 				"from_archive", r.Stats.Archived.Load(),
+				"stale_reads", r.Stats.StaleReads.Load(),
 				"txn_replays", r.Stats.TxnReplays.Load(),
 				"refused", r.Stats.Refused.Load(),
 				"clients", r.Stats.ClientsOpen.Load())

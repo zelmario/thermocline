@@ -24,6 +24,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmar/thermocline/internal/checkpoint"
 	"github.com/zelmar/thermocline/internal/config"
 	"github.com/zelmar/thermocline/internal/watermark"
 	"github.com/zelmar/thermocline/internal/wire"
@@ -41,6 +42,11 @@ type Router struct {
 	// re-resolved after a failure, so a failover is survivable.
 	primaryMu sync.RWMutex
 	primary   string
+
+	// checkpoints reads how far mirroring has got, so a read served from the
+	// archive can wait for it rather than answer from behind.
+	checkpoints *checkpoint.Store
+	ckptCache   checkpointCache
 
 	wmCache  watermarkCache
 	idxCache indexCache
@@ -72,6 +78,7 @@ type Stats struct {
 	Archived      atomic.Int64
 	TxnReplays    atomic.Int64
 	DuplicateKeys atomic.Int64
+	StaleReads    atomic.Int64
 	ClientsOpen   atomic.Int64
 	ClientsTotal  atomic.Int64
 }
@@ -79,11 +86,12 @@ type Stats struct {
 // New builds a Router. It does not listen or connect.
 func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Router {
 	return &Router{
-		cfg:   cfg,
-		hot:   hot,
-		cold:  cold,
-		marks: watermark.New(cold),
-		log:   log,
+		cfg:         cfg,
+		hot:         hot,
+		cold:        cold,
+		marks:       watermark.New(cold),
+		checkpoints: checkpoint.New(cold),
+		log:         log,
 	}
 }
 
@@ -247,12 +255,23 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
-	// A unique key has to be claimed before the insert lands, or two inserts
+	// A unique key has to be claimed before the write lands, or two writes
 	// racing both see a free slot.
 	c.pendingKeys = nil
-	if nameErr == nil && name == "insert" && !msg.MoreToCome() {
-		if out, done := c.guardInsert(ctx, msg, db); done {
-			return wire.Write(c.client, out)
+	if nameErr == nil && !msg.MoreToCome() {
+		switch name {
+		case "insert":
+			if out, done := c.guardInsert(ctx, msg, db); done {
+				return wire.Write(c.client, out)
+			}
+		case "update", "findAndModify", "findandmodify":
+			// An update can move a document onto a value an archived document
+			// holds, which the fast tier's unique index cannot see any more than
+			// it can for an insert. It runs after guardMultiWrite so the matched
+			// documents are all present to compute keys from.
+			if out, done := c.guardUpdateKeys(ctx, msg, db, name); done {
+				return wire.Write(c.client, out)
+			}
 		}
 	}
 
@@ -280,6 +299,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			c.r.releaseKeys(ctx, c.pendingKeys)
 		}
 		c.pendingKeys = nil
+	}
+
+	// An index change makes what this router remembers about the collection
+	// wrong, and the window that matters most is right after somebody declares
+	// a field unique.
+	if cmd, cerr := msg.CommandDoc(); cerr == nil {
+		if coll, ok := indexDDL(cmd, name); ok {
+			c.r.forgetIndexes(db + "." + coll)
+		}
 	}
 
 	if isHello(name) {

@@ -1,4 +1,4 @@
 bin/
 .dev/
-cline.yaml
+/cline.yaml
 *.log

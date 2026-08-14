@@ -203,18 +203,26 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	}
 
 	// The archive holds every document, so it can answer in full what the fast
-	// tier cannot. A pipeline that writes is the exception: $out and $merge
-	// would land the result on the archive rather than where the application
-	// expects it, so those still have to be refused.
-	if c.r.cfg.Completeness == config.Archive && !scope.writes {
+	// tier cannot.
+	if c.r.cfg.Completeness == config.Archive {
 		coll, _ := stringField(cmd, "aggregate")
-		out, err := c.answerFromArchive(ctx, msg, db, coll)
-		if err == nil {
-			c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
-			return out, true
+
+		// A pipeline that writes needs its two halves run on different
+		// clusters: the input read from the archive, the write performed on the
+		// fast tier, where the application will look for the result.
+		if scope.writes {
+			if out, done := c.runWritePipeline(ctx, msg, cmd, db, coll, scope); done {
+				return out, true
+			}
+		} else {
+			out, err := c.answerFromArchive(ctx, msg, db, coll)
+			if err == nil {
+				c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
+				return out, true
+			}
+			c.log.Warn("could not answer this aggregation from the archive, refusing instead",
+				"ns", scope.primary, "err", err)
 		}
-		c.log.Warn("could not answer this aggregation from the archive, refusing instead",
-			"ns", scope.primary, "err", err)
 	}
 
 	if c.r.cfg.Completeness == config.Permissive && !scope.writes {

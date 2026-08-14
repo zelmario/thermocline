@@ -72,3 +72,20 @@ func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt tim
 	}
 	return nil
 }
+
+// EventAt returns the cluster time of the last event the feeder applied, and
+// whether a checkpoint exists at all.
+//
+// It is how anything other than the feeder finds out how far behind mirroring
+// is. A read served from the archive is only as current as this instant.
+func (s *Store) EventAt(ctx context.Context, id string) (time.Time, bool, error) {
+	var rec Record
+	err := s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&rec)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("read checkpoint %q: %w", id, err)
+	}
+	return rec.EventAt, !rec.EventAt.IsZero(), nil
+}

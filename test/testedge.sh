@@ -1,8 +1,8 @@
 #!/bin/bash
 # Edge cases and config variants: the code paths the other suites never reach.
 CFG=/root/cline.yaml
-HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
-COLD='mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tprobe
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
@@ -51,12 +51,14 @@ sleep 4
 chk "and it reached the archive"    "1" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:{a:1,b:2}}); print(d&&d.touched?d.touched:'no')")"
 chk "an _id range is still a range" "0" "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:{\$gt:999999}},{\$set:{x:1}}).matchedCount)")"
 
-echo "== \$out and \$merge are refused on incomplete input =="
+echo "== \$out and \$merge run on incomplete input =="
 cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
-chk "\$out refused"           "refused" "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}},{\$out:'e_out'}]).toArray();print('ALLOWED')}catch(e){print(e.message.match(/refusing/)?'refused':'other')}")"
-chk "\$merge refused"         "refused" "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}},{\$merge:{into:'e_merge'}}]).toArray();print('ALLOWED')}catch(e){print(e.message.match(/refusing/)?'refused':'other')}")"
-chk "neither wrote anything"  "false"   "$(H "const n=db.getSiblingDB('shop').getCollectionNames(); print(n.includes('e_out')||n.includes('e_merge'))")"
+chk "\$out runs"              "ok"   "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}},{\$out:'e_out'}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
+# Grouped by a real field, not by null: \$merge refuses a null _id in mongod
+# itself, so asking for one here would be testing MongoDB's rule, not ours.
+chk "\$merge runs"            "ok"   "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:'\$v',n:{\$sum:1}}},{\$merge:{into:'e_merge'}}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
+chk "both wrote to the fast tier" "true" "$(H "const n=db.getSiblingDB('shop').getCollectionNames(); print(n.includes('e_out')&&n.includes('e_merge'))")"
 chk "collStats still allowed" "true"    "$(R "print(db.getSiblingDB('shop').$NS.stats().count >= 0)")"
 
 echo "== dry runs write nothing =="

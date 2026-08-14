@@ -1,0 +1,87 @@
+# The config the live suites run against, copied to /root/cline.yaml inside the
+# node that has cline installed. `make test-install` does that.
+#
+# Two single-node replica sets:
+#
+#   node1  rsHot   the fast tier
+#   node0  rsCold  the archive, and where cline and the suites run
+#
+# Minute-scale durations so a full lifecycle runs in minutes. Nothing in
+# Thermocline assumes days: older_than 40m behaves exactly like older_than 90d.
+#
+# The addresses are overridden at install time, so the ones here are only the
+# defaults for the documented layout.
+
+hot:
+  uri: "mongodb://dba:secret@172.24.0.3:27017/?replicaSet=rsHot&authSource=admin"
+
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+feeder:
+  id: "test"
+  # Every collection the suites tier. A collection missing from this list is not
+  # tiered at all, and the router correctly ignores it, so a test written against
+  # one proves nothing.
+  namespaces:
+    - "shop.orders"
+    - "shop.tprobe"
+    - "shop.tacct"
+    # testkeys.sh, one collection per section: the router caches a namespace's
+    # unique indexes for a minute, so a name reused with a different index is
+    # still enforced under the old one.
+    - "shop.tkupd"
+    - "shop.tkups"
+    - "shop.tkfree"
+    - "shop.tkcomp"
+    - "shop.tknull"
+    - "shop.tklate"
+    - "shop.tkspar"
+    - "shop.tkpart"
+    - "shop.tkddl"
+    - "shop.tkeval"
+    - "shop.tkeval2"
+    - "shop.rollup"
+    - "shop.merged"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 500ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "test"
+  rate: 500
+  batch_size: 100
+  max_feeder_lag: 30s
+  rules:
+    - ns: "shop.orders"
+      older_than: 40m
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05
+    min_write_tickets_free: 0.25
+    # A cluster built minutes ago has minutes of oplog. The 24h production
+    # default blocks eviction outright, which looks like a hang and is the first
+    # thing to trip anyone testing this.
+    min_oplog_window: 1m
+
+warmer:
+  rate: 500
+  batch_size: 50
+  residency: 5m
+  rules:
+    - ns: "shop.orders"
+      back: 40m
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05
+    min_write_tickets_free: 0.25
+    min_oplog_window: 1m
+
+router:
+  listen: "0.0.0.0:27100"
+  completeness: archive
+  residency: 5m
