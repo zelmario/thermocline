@@ -9,6 +9,7 @@ and start mongod on other containers.
     docker exec <node> bash /root/testevict.sh    # the evictor, including its fail-closed guard
     docker exec <node> bash /root/testrouter.sh   # router behaviour through the wire protocol
     docker exec <node> bash /root/testops.sh      # breadth of MongoDB operations, both tiers
+    docker exec <node> bash /root/testedge.sh     # edge cases and config variants
     bash test/testchaos.sh                        # kill things under load (host side, slow)
 
 `testops.sh` is the one that earns its keep: it runs the same battery of reads
@@ -28,3 +29,7 @@ Things these encode that are easy to get wrong when testing by hand:
 - **A complete fast tier hides completeness bugs.** Make it short on purpose.
 - **The feeder logs its change stream reopen at ERROR during a failover.** That
   is the recovery working, so the chaos suite excludes it by name.
+- **Removing documents through the router is a delete, not an eviction.** The
+  feeder tombstones them, which frees unique keys and hides them from archive
+  reads, so a test that means "evicted" has to remove them with the feeder
+  stopped and the checkpoint reset. `testedge.sh` has a helper for it.

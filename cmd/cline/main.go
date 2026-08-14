@@ -128,7 +128,7 @@ func runFeeder(args []string) error {
 
 	f := feeder.New(hot, cold, cfg.Feeder, log)
 	if err := f.Run(ctx); err != nil {
-		return err
+		return fatal(log, "feeder", err)
 	}
 	log.Info("feeder stopped", "lag_at_exit", f.Lag().Round(time.Millisecond))
 	return nil
@@ -184,9 +184,15 @@ func runEvictor(args []string) error {
 		e.SetMaxHealthWait(*healthWait)
 		stats, err := e.RunOnce(ctx)
 		log.Info("sweep complete", stats.LogArgs()...)
-		return err
+		if err != nil {
+			return fatal(log, "evictor", err)
+		}
+		return nil
 	}
-	return e.Run(ctx, *every)
+	if err := e.Run(ctx, *every); err != nil {
+		return fatal(log, "evictor", err)
+	}
+	return nil
 }
 
 func runWarmer(args []string) error {
@@ -231,7 +237,10 @@ func runWarmer(args []string) error {
 	w := warmer.New(hot, cold, cfg.Warmer, *dryRun, log)
 	stats, err := w.Run(ctx)
 	log.Info("warm complete", stats.LogArgs()...)
-	return err
+	if err != nil {
+		return fatal(log, "warmer", err)
+	}
+	return nil
 }
 
 func runRouter(args []string) error {
@@ -275,7 +284,10 @@ func runRouter(args []string) error {
 
 	r := router.New(hot, cold, cfg.Router, log)
 	go reportRouterStats(ctx, r, log)
-	return r.Listen(ctx)
+	if err := r.Listen(ctx); err != nil {
+		return fatal(log, "router", err)
+	}
+	return nil
 }
 
 // reportRouterStats logs the counters an operator watches. Copy-up rate says
@@ -304,6 +316,18 @@ func reportRouterStats(ctx context.Context, r *router.Router, log *slog.Logger) 
 				"clients", r.Stats.ClientsOpen.Load())
 		}
 	}
+}
+
+// fatal records why a daemon stopped, through the logger rather than only on
+// stderr.
+//
+// main prints the returned error to stderr, and stderr is not where the logs
+// go once log.file or --log-file is set. A feeder halting on an unannounced
+// delete would end its log file mid-sentence and say nothing about why, which
+// defeats the point of a policy whose whole job is to stop and alert.
+func fatal(log *slog.Logger, what string, err error) error {
+	log.Error(what+" stopped", "err", err)
+	return err
 }
 
 func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {

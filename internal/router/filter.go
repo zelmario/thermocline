@@ -1,6 +1,7 @@
 package router
 
 import (
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -23,6 +24,18 @@ func idFromFilter(filter bson.Raw) (bson.RawValue, bool) {
 	}
 
 	if doc, ok := val.DocumentOK(); ok {
+		// A document here is ambiguous: {$eq: x} is an operator, {a: 1} is an
+		// _id that happens to be a document. MongoDB tells them apart by the
+		// leading $, and so must this. Reading every document as an operator
+		// meant a compound _id was never recognised as naming one document, so
+		// an update to an archived one matched nothing and reported success.
+		elems, eerr := doc.Elements()
+		if eerr != nil {
+			return bson.RawValue{}, false
+		}
+		if len(elems) == 0 || !strings.HasPrefix(elems[0].Key(), "$") {
+			return val, true
+		}
 		eq, err := doc.LookupErr("$eq")
 		if err != nil {
 			// An operator other than $eq, so this is a range or a set rather

@@ -175,3 +175,35 @@ func TestFirstBatch(t *testing.T) {
 		t.Errorf("firstBatch = %d docs, want 0", len(batch))
 	}
 }
+
+// An _id that is itself a document names exactly one document, and has to be
+// told apart from an operator expression. Reading {a:1} as an operator meant a
+// compound _id was never recognised, so an update to an archived one matched
+// nothing and was reported to the driver as success.
+func TestIDFromFilterHandlesDocumentValuedIDs(t *testing.T) {
+	cases := []struct {
+		name   string
+		filter bson.D
+		want   bool
+		why    string
+	}{
+		{"plain value", bson.D{{Key: "_id", Value: 7}}, true, "an ordinary _id"},
+		{"document value", bson.D{{Key: "_id", Value: bson.D{{Key: "a", Value: 1}, {Key: "b", Value: 2}}}}, true,
+			"a compound _id names one document"},
+		{"empty document value", bson.D{{Key: "_id", Value: bson.D{}}}, true, "{} is a legal _id"},
+		{"$eq operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$eq", Value: 7}}}}, true, "$eq names one document"},
+		{"$gt operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: 7}}}}, false, "a range is many documents"},
+		{"$in operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: bson.A{1, 2}}}}}, false, "a set is many documents"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := bson.Marshal(tc.filter)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if _, got := idFromFilter(raw); got != tc.want {
+				t.Errorf("idFromFilter = %v, want %v: %s", got, tc.want, tc.why)
+			}
+		})
+	}
+}

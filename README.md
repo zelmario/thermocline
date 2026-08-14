@@ -361,8 +361,13 @@ Residency is a sidecar rather than a field on the document on purpose.
 Extending a document's stay rewrites 60 bytes instead of a 5 KB document.
 
 The one exception is `_tcDeletedAt`, set on archived copies whose original the
-application deleted. The router projects it out; until the router exists, filter
-on it yourself.
+application deleted. The router filters on it, so a tombstoned document is never
+returned and never copied back up.
+
+**`_tcDeletedAt` is therefore a reserved field name.** An application that sets
+it on its own documents will find them treated as deleted the moment they are
+served from the archive: still stored, no longer returned. Nothing detects this,
+so it is a name to avoid rather than a trap the code springs.
 
 ## Running it
 
