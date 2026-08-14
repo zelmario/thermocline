@@ -40,10 +40,38 @@ var sessionFields = map[string]bool{
 }
 
 // archiveCursor is a driver cursor we are serving getMore from.
+//
+// The mutex is not decoration. A driver may issue two getMore calls for the
+// same cursor from two connections in its pool, and a mongo.Cursor is not safe
+// for concurrent use: two readers would interleave batches and hand the client
+// a mangled result, or race the close. One reader at a time per cursor.
 type archiveCursor struct {
+	mu       sync.Mutex
 	cur      *mongo.Cursor
 	ns       string
 	lastUsed time.Time
+	closed   bool
+}
+
+// read pulls the next batch under the cursor's own lock.
+func (ac *archiveCursor) read(ctx context.Context, size int) (bson.A, bool, error) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if ac.closed {
+		return bson.A{}, false, nil
+	}
+	return readBatch(ctx, ac.cur, size)
+}
+
+// close is safe to call more than once, and waits for any read in flight.
+func (ac *archiveCursor) close(ctx context.Context) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if ac.closed {
+		return
+	}
+	ac.closed = true
+	_ = ac.cur.Close(ctx)
 }
 
 // cursorRegistry hands out ids for cursors this router owns rather than the
@@ -105,7 +133,7 @@ func (reg *cursorRegistry) reapIdle(ctx context.Context, idle time.Duration) {
 	}
 	reg.mu.Unlock()
 	for _, ac := range dead {
-		_ = ac.cur.Close(ctx)
+		ac.close(ctx)
 	}
 }
 
@@ -115,7 +143,7 @@ func (reg *cursorRegistry) drop(ctx context.Context, id int64) {
 	delete(reg.open, id)
 	reg.mu.Unlock()
 	if ok {
-		_ = ac.cur.Close(ctx)
+		ac.close(ctx)
 	}
 }
 
@@ -125,7 +153,7 @@ func (reg *cursorRegistry) closeAll(ctx context.Context) {
 	reg.open = nil
 	reg.mu.Unlock()
 	for _, ac := range open {
-		_ = ac.cur.Close(ctx)
+		ac.close(ctx)
 	}
 }
 
@@ -227,7 +255,7 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 		}
 	}
 
-	batch, more, err := readBatch(ctx, ac.cur, size)
+	batch, more, err := ac.read(ctx, size)
 	if err != nil {
 		c.r.cursors.drop(ctx, id)
 		return nil, true, err

@@ -157,15 +157,24 @@ func (r *Router) keys() *mongo.Collection {
 	return r.hot.Database(meta.DB).Collection(keysCollection)
 }
 
+// keyClash is one document in a batch whose unique key is already taken.
+type keyClash struct {
+	doc   int    // position in the client's batch
+	index string // the unique index that rejected it
+}
+
 // claimKeys reserves every unique key the batch needs.
 //
-// It returns the ids it managed to claim so a caller can release them if the
-// insert then fails, and the index name plus key of the first genuine
-// collision.
-func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex) (claimed []string, clash *uniqueIndex, err error) {
+// Rejection is per document, not per batch, because that is what mongod does. An
+// unordered insertMany with one duplicate still inserts the rest and reports one
+// error, and an application relying on that would silently lose documents if the
+// whole batch were refused. Ordered stops at the first clash, again like mongod,
+// so nothing after it is claimed either.
+func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex, ordered bool) (claimed []string, clashes []keyClash, err error) {
 	now := time.Now().UTC()
-	for _, doc := range docs {
+	for d, doc := range docs {
 		id, _ := doc.LookupErr("_id")
+		clashed := false
 		for i := range idxs {
 			kid, ok := keyID(ns, idxs[i], doc)
 			if !ok {
@@ -188,23 +197,30 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 			if terr != nil {
 				return claimed, nil, terr
 			}
-			if taken {
-				return claimed, &idxs[i], nil
+			if !taken {
+				// Stale. Take it over, unless somebody else just did.
+				res, uerr := r.keys().UpdateOne(ctx,
+					bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: bson.D{{Key: "$ne", Value: id}}}},
+					bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: id}, {Key: "at", Value: now}}}})
+				if uerr != nil {
+					return claimed, nil, uerr
+				}
+				if res.MatchedCount > 0 {
+					claimed = append(claimed, kid)
+					continue
+				}
 			}
-			// Stale. Take it over, but only if nobody else did in the meantime.
-			res, uerr := r.keys().UpdateOne(ctx,
-				bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: bson.D{{Key: "$ne", Value: id}}}},
-				bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: id}, {Key: "at", Value: now}}}})
-			if uerr != nil {
-				return claimed, nil, uerr
-			}
-			if res.MatchedCount == 0 {
-				return claimed, &idxs[i], nil
-			}
-			claimed = append(claimed, kid)
+			clashes = append(clashes, keyClash{doc: d, index: idxs[i].name})
+			clashed = true
+			break
+		}
+		if clashed && ordered {
+			// mongod stops an ordered batch at the first failure, so nothing
+			// after this point is inserted and nothing after it may be claimed.
+			break
 		}
 	}
-	return claimed, nil, nil
+	return claimed, clashes, nil
 }
 
 // claimIsLive reports whether the document holding a claim still exists in
@@ -266,7 +282,9 @@ func (r *Router) releaseKeys(ctx context.Context, ids []string) {
 
 // guardInsert enforces unique indexes across both tiers, before the insert runs.
 //
-// Returns a reply when the insert must not proceed.
+// Returns a reply when the router answered the insert itself, either because
+// every document was rejected or because it had to run a trimmed batch and
+// merge the rejections back into the answer.
 func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*wire.Message, bool) {
 	cmd, err := msg.CommandDoc()
 	if err != nil {
@@ -290,29 +308,180 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		return nil, false
 	}
 
-	claimed, clash, err := c.r.claimKeys(ctx, ns, docs, idxs)
+	ordered := true
+	if v, lerr := cmd.LookupErr("ordered"); lerr == nil {
+		if b, bok := v.BooleanOK(); bok {
+			ordered = b
+		}
+	}
+
+	claimed, clashes, err := c.r.claimKeys(ctx, ns, docs, idxs, ordered)
 	if err != nil {
 		// Never block a write because the registry is unhappy. Losing the
 		// cross-tier half of a unique index is bad; refusing every insert
 		// because a bookkeeping collection is unreachable is worse.
 		c.r.releaseKeys(ctx, claimed)
-		c.log.Warn("could not check unique keys, letting the insert through",
-			"ns", ns, "err", err)
+		c.log.Warn("could not check unique keys, letting the insert through", "ns", ns, "err", err)
 		return nil, false
 	}
-	if clash != nil {
+	if len(clashes) == 0 {
+		c.pendingKeys = claimed
+		return nil, false
+	}
+
+	c.r.Stats.DuplicateKeys.Add(int64(len(clashes)))
+	c.log.Debug("insert duplicates an archived document", "ns", ns, "rejected", len(clashes), "of", len(docs))
+
+	// Which documents still go through. Ordered stops at the first clash, the
+	// way mongod does; unordered keeps everything that did not clash.
+	rejected := map[int]string{}
+	for _, cl := range clashes {
+		rejected[cl.doc] = cl.index
+	}
+	limit := len(docs)
+	if ordered {
+		limit = clashes[0].doc
+	}
+	var keep []bson.Raw
+	var keepAt []int
+	for i := 0; i < limit; i++ {
+		if _, bad := rejected[i]; bad {
+			continue
+		}
+		keep = append(keep, docs[i])
+		keepAt = append(keepAt, i)
+	}
+
+	if len(keep) == 0 {
 		c.r.releaseKeys(ctx, claimed)
-		c.r.Stats.DuplicateKeys.Add(1)
-		c.log.Debug("rejected an insert duplicating an archived document", "ns", ns, "index", clash.name)
-		out, rerr := c.r.duplicateKeyReply(msg.Header.RequestID, msg.Header.RequestID, ns, clash.name)
+		out, rerr := c.r.insertErrorReply(msg, ns, 0, clashes, nil, nil)
 		if rerr != nil {
 			return nil, false
 		}
 		return out, true
 	}
 
-	c.pendingKeys = claimed
-	return nil, false
+	// Run the trimmed batch, then put the rejections back so the client sees the
+	// answer it would have had from one cluster.
+	trimmed, terr := rebuildInsert(cmd, keep)
+	if terr != nil {
+		c.r.releaseKeys(ctx, claimed)
+		return nil, false
+	}
+	fwd, ferr := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+	if ferr != nil {
+		c.r.releaseKeys(ctx, claimed)
+		return nil, false
+	}
+	if werr := wire.Write(c.upstream, fwd); werr != nil {
+		c.r.releaseKeys(ctx, claimed)
+		return nil, false
+	}
+	reply, rerr := wire.Read(c.upstream)
+	if rerr != nil {
+		c.r.releaseKeys(ctx, claimed)
+		return nil, false
+	}
+	rdoc, derr := reply.ReplyDoc()
+	if derr != nil {
+		return reply, true
+	}
+
+	n := 0
+	if v, lerr := rdoc.LookupErr("n"); lerr == nil {
+		if got, iok := intOf(v); iok {
+			n = got
+		}
+	}
+	out, merr := c.r.insertErrorReply(msg, ns, n, clashes, rdoc, keepAt)
+	if merr != nil {
+		return reply, true
+	}
+	return out, true
+}
+
+// rebuildInsert reproduces an insert command carrying only the documents that
+// are still going through. They go inline rather than in a payload sequence,
+// which is equally valid and much simpler to assemble.
+func rebuildInsert(cmd bson.Raw, docs []bson.Raw) (bson.D, error) {
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, err
+	}
+	arr := make(bson.A, 0, len(docs))
+	for _, d := range docs {
+		arr = append(arr, d)
+	}
+	out := make(bson.D, 0, len(elems)+1)
+	replaced := false
+	for _, e := range elems {
+		if e.Key() == "documents" {
+			out = append(out, bson.E{Key: "documents", Value: arr})
+			replaced = true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	if !replaced {
+		out = append(out, bson.E{Key: "documents", Value: arr})
+	}
+	return out, nil
+}
+
+// insertErrorReply builds the reply for a batch that was partly rejected.
+//
+// The client indexed its documents by their position in the batch it sent, so
+// every error has to carry that position: ours directly, and the fast tier's
+// mapped back through the documents that were kept.
+func (r *Router) insertErrorReply(msg *wire.Message, ns string, n int, clashes []keyClash, upstream bson.Raw, keepAt []int) (*wire.Message, error) {
+	errs := bson.A{}
+	for _, cl := range clashes {
+		errs = append(errs, bson.D{
+			{Key: "index", Value: int32(cl.doc)},
+			{Key: "code", Value: int32(11000)},
+			{Key: "errmsg", Value: "E11000 duplicate key error collection: " + ns + " index: " + cl.index +
+				" :: thermocline: the existing document with this key is in the archive, " +
+				"where the fast tier's unique index cannot see it"},
+		})
+	}
+	if len(upstream) > 0 && keepAt != nil {
+		if v, err := upstream.LookupErr("writeErrors"); err == nil {
+			if arr, ok := v.ArrayOK(); ok {
+				if vals, verr := arr.Values(); verr == nil {
+					for _, wv := range vals {
+						wd, dok := wv.DocumentOK()
+						if !dok {
+							continue
+						}
+						out := bson.D{}
+						for _, e := range mustElements(wd) {
+							if e.Key() == "index" {
+								if got, iok := intOf(e.Value()); iok && got < len(keepAt) {
+									out = append(out, bson.E{Key: "index", Value: int32(keepAt[got])})
+									continue
+								}
+							}
+							out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+						}
+						errs = append(errs, out)
+					}
+				}
+			}
+		}
+	}
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
+		{Key: "n", Value: int32(n)},
+		{Key: "writeErrors", Value: errs},
+		{Key: "ok", Value: 1.0},
+	})
+}
+
+func mustElements(d bson.Raw) []bson.RawElement {
+	e, err := d.Elements()
+	if err != nil {
+		return nil
+	}
+	return e
 }
 
 // duplicateKeyReply is the error the server would have produced if the original

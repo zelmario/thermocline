@@ -74,6 +74,18 @@ H 'db.getSiblingDB("shop").tacct.deleteOne({_id:1})' >/dev/null
 chk "duplicate of an evicted key rejected" "11000" "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:2,email:"z@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,20))}')"
 chk "a fresh key is still accepted"        "ok"    "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:3,email:"new@x.com"});print("ok")}catch(e){print(e.code)}')"
 
+echo "== bulk insert keeps mongod semantics =="
+H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
+H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
+R 'db.getSiblingDB("shop").tacct.insertOne({_id:"seed",email:"taken@x.com"})' >/dev/null
+R 'try{db.getSiblingDB("shop").tacct.insertMany([{_id:"b1",email:"n1@x.com"},{_id:"b2",email:"taken@x.com"},{_id:"b3",email:"n3@x.com"}],{ordered:false})}catch(e){}' >/dev/null
+chk "unordered inserts the good documents" "true,false,true" "$(H 'print(["b1","b2","b3"].map(i=>!!db.getSiblingDB("shop").tacct.findOne({_id:i})).join(","))')"
+H 'db.getSiblingDB("shop").tacct.deleteMany({_id:{$in:["b1","b3"]}})' >/dev/null
+H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
+R 'db.getSiblingDB("shop").tacct.insertOne({_id:"seed2",email:"taken2@x.com"})' >/dev/null
+R 'try{db.getSiblingDB("shop").tacct.insertMany([{_id:"o1",email:"p1@x.com"},{_id:"o2",email:"taken2@x.com"},{_id:"o3",email:"p3@x.com"}],{ordered:true})}catch(e){}' >/dev/null
+chk "ordered stops at the first clash" "true,false,false" "$(H 'print(["o1","o2","o3"].map(i=>!!db.getSiblingDB("shop").tacct.findOne({_id:i})).join(","))')"
+
 echo "== transactions =="
 C 'db.getSiblingDB("shop").tprobe.insertOne({_id:20,v:"txn"})' >/dev/null
 chk "transaction replays after a copy-up" "1" "$(R 'const s=db.getMongo().startSession(); let a=0; try{ s.withTransaction(()=>{a++; const r=s.getDatabase("shop").tprobe.updateOne({_id:20},{$set:{v:"txn2"}}); if(r.matchedCount!==1) throw new Error("miss");}); print(a>1?1:0);}catch(e){print("FAILED")} s.endSession()')"
