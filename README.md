@@ -196,6 +196,41 @@ cp cline.example.yaml cline.yaml     # then edit the two URIs
 bin/cline feeder --config cline.yaml
 ```
 
+### Logs
+
+Every daemon logs to stderr by default. Under systemd that is what you want,
+since journald captures the stream and rotates it for you.
+
+Outside a service manager, give each one a file:
+
+```
+bin/cline feeder --config cline.yaml --log-file /var/log/cline/feeder.log
+bin/cline router --config cline.yaml --log-file /var/log/cline/router.log
+```
+
+`log.file` in the config sets a default for all four, and `--log-file`
+overrides it per process, which is how you keep them in separate files. A
+configured file behaves like mongod's `systemLog.path`: everything goes to the
+file and nothing to the terminal.
+
+Rotation is logrotate's job, and it only works if you signal the process:
+
+```
+/var/log/cline/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    postrotate
+        pkill -HUP -f '^/usr/local/bin/cline' || true
+    endscript
+}
+```
+
+Without the SIGHUP the daemon keeps writing to the renamed inode, so the file
+you are tailing stays empty while the disk fills up.
+
 Both tiers must be replica sets, since the feeder uses change streams.
 MongoDB 4.2 or newer.
 
@@ -277,6 +312,6 @@ mongosh --port 28018 --eval '
 
 ## Design documents
 
-The architecture, sizing from 5 TB to 100 TB, and the alternatives worth ruling
+The architecture, sizing from 500 GB to 5 TB, and the alternatives worth ruling
 out first are written up separately, along with a phased rollout guide for
 adopting this on a database that is already serving traffic.

@@ -32,10 +32,22 @@ const (
 type Config struct {
 	Hot     Tier          `yaml:"hot"`
 	Cold    Tier          `yaml:"cold"`
+	Log     LogConfig     `yaml:"log"`
 	Feeder  FeederConfig  `yaml:"feeder"`
 	Evictor EvictorConfig `yaml:"evictor"`
 	Warmer  WarmerConfig  `yaml:"warmer"`
 	Router  RouterConfig  `yaml:"router"`
+}
+
+// LogConfig says where the daemons write their logs.
+type LogConfig struct {
+	// File is appended to, and created if missing. Empty means stderr, which
+	// is right under systemd because journald captures the stream.
+	//
+	// Setting it behaves like mongod's systemLog.path: everything goes to the
+	// file and nothing to the terminal. Rotation is logrotate's job; send
+	// SIGHUP after rotating and the daemon reopens the file.
+	File string `yaml:"file"`
 }
 
 // Completeness decides what the router does with a query whose answer the fast

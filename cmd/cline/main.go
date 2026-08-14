@@ -40,6 +40,10 @@ Usage:
   cline router   --config FILE            serve both tiers on one address
   cline version
 
+Every subcommand takes --log-file PATH to append logs to a file instead of
+stderr, overriding log.file in the config. Rotate it with logrotate and send
+SIGHUP; the daemon reopens the file.
+
 The feeder must be running before the evictor will remove anything.
 `
 
@@ -80,21 +84,22 @@ func run() error {
 func runFeeder(args []string) error {
 	fs := flag.NewFlagSet("feeder", flag.ExitOnError)
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
+	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every batch written")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
+
+	log, closeLog, err := setupLogging(*logPath, cfg, *verbose)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -129,16 +134,11 @@ func runEvictor(args []string) error {
 	every := fs.Duration("every", 5*time.Minute, "pause between sweeps when running continuously")
 	healthWait := fs.Duration("health-timeout", 2*time.Minute,
 		"with --once, give up if the cluster stays unfit to evict for this long")
+	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every batch")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -147,6 +147,12 @@ func runEvictor(args []string) error {
 	if len(cfg.Evictor.Rules) == 0 {
 		return errors.New("evictor.rules is empty, there is nothing to remove")
 	}
+
+	log, closeLog, err := setupLogging(*logPath, cfg, *verbose)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -179,16 +185,11 @@ func runWarmer(args []string) error {
 	fs := flag.NewFlagSet("warmer", flag.ExitOnError)
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied, copy nothing")
+	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every batch")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -197,6 +198,12 @@ func runWarmer(args []string) error {
 	if len(cfg.Warmer.Rules) == 0 {
 		return errors.New("warmer.rules is empty, there is nothing to fill")
 	}
+
+	log, closeLog, err := setupLogging(*logPath, cfg, *verbose)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -223,16 +230,11 @@ func runRouter(args []string) error {
 	fs := flag.NewFlagSet("router", flag.ExitOnError)
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
 	listen := fs.String("listen", "", "override router.listen")
+	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every routing decision")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -241,6 +243,12 @@ func runRouter(args []string) error {
 	if *listen != "" {
 		cfg.Router.Listen = *listen
 	}
+
+	log, closeLog, err := setupLogging(*logPath, cfg, *verbose)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

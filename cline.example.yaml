@@ -10,6 +10,23 @@ hot:
 cold:
   uri: "mongodb://rs-cold-1,rs-cold-2,rs-cold-3/?replicaSet=rsCold"
 
+log:
+  # Where the daemons write. Leave empty for stderr, which is what you want
+  # under systemd: journald captures the stream and rotation is not your
+  # problem.
+  #
+  # Setting a path behaves like mongod's systemLog.path. The file receives
+  # everything and the terminal receives nothing, so a one-shot
+  # `cline evictor --once --dry-run` prints nothing to your screen.
+  #
+  # All four daemons read this one value, so they would share a file. Give each
+  # its own with --log-file, which overrides this.
+  #
+  # Rotation is logrotate's job. Send SIGHUP after rotating and the daemon
+  # reopens the file; without that it keeps writing to the renamed inode and
+  # the file you are tailing stays empty while the disk fills.
+  file: ""
+
 feeder:
   # Names this feeder's checkpoint. Changing it starts mirroring from now,
   # skipping everything written before, so only change it deliberately.
