@@ -1,0 +1,149 @@
+#!/bin/bash
+# What each kind of query actually costs through the router.
+#
+# The design rests on a claim about cost: a read the fast tier can answer is
+# barely slower than talking to it directly, and a read it cannot answer is
+# slower but correct. That claim has never been measured, so this measures it.
+#
+# Read the numbers as ratios, not as absolutes. Both tiers here are single-node
+# replica sets on one machine, so every latency is optimistic and the archive is
+# not a big cheap cluster under load. What survives that is the shape: how much
+# the proxy adds, and how much falling through to the archive costs.
+CFG=/root/cline.yaml
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
+NS=bench
+N=${N:-20000}
+
+R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1; }
+H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
+
+stopDaemons() {
+  pkill -f 'cline feeder|cline router' 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
+startFeeder() {
+  cline feeder --config $CFG --log-file /var/log/cline/bench_f.log & FP=$!
+  for _ in $(seq 1 60); do
+    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    sleep 0.5
+  done
+}
+startRouter() {
+  cline router --config $CFG --log-file /var/log/cline/bench_r.log & RP=$!
+  for _ in $(seq 1 30); do
+    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "FATAL: the router never came up"; exit 2
+}
+
+echo "== setup: $N documents =="
+stopDaemons
+H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({})" >/dev/null
+startFeeder
+startRouter
+
+H "const c=db.getSiblingDB('shop').$NS;
+   for (let b=0; b<$N/1000; b++) {
+     const d=[];
+     for (let i=0;i<1000;i++){const n=b*1000+i; d.push({_id:n, n:n, grp:'g'+(n%50), name:'item-'+n});}
+     c.insertMany(d);
+   }
+   c.createIndex({n:1}); c.createIndex({grp:1});" >/dev/null
+echo "  loaded, waiting for mirroring"
+for _ in $(seq 1 600); do
+  [ "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "$N" ] && break
+  sleep 1
+done
+C "db.getSiblingDB('shop').$NS.createIndex({n:1}); db.getSiblingDB('shop').$NS.createIndex({grp:1})" >/dev/null
+echo "  archive holds $(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+
+BENCH='
+function bench(label, reps, fn) {
+  for (let w = 0; w < 5; w++) fn(w);            // warm up, ignore
+  const t = [];
+  for (let i = 0; i < reps; i++) {
+    const s = Date.now();
+    fn(i);
+    t.push(Date.now() - s);
+  }
+  t.sort((a, b) => a - b);
+  const sum = t.reduce((a, b) => a + b, 0);
+  print("  " + label.padEnd(44) +
+        " mean " + (sum / reps).toFixed(2).padStart(8) + " ms" +
+        "   p95 " + String(t[Math.floor(reps * 0.95)]).padStart(5) + " ms" +
+        "   max " + String(t[reps - 1]).padStart(5) + " ms");
+}
+const c = db.getSiblingDB("shop").NSNAME;
+'
+
+echo
+echo "== the fast tier can answer: what the proxy costs =="
+cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+sleep 7
+echo "-- direct to the fast tier, no router --"
+mongosh "$HOT" --quiet --eval "${BENCH//NSNAME/$NS}
+bench('point lookup by _id', 500, i => c.findOne({_id: i % $N}));
+bench('range, 100 documents', 200, i => c.find({n:{\$gte:(i*7)%($N-100), \$lt:((i*7)%($N-100))+100}}).toArray());
+bench('countDocuments, whole collection', 50, () => c.countDocuments({}));
+bench('aggregate \$group by 50 keys', 50, () => c.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}}]).toArray());
+"
+echo "-- through the router --"
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+bench('point lookup by _id', 500, i => c.findOne({_id: i % $N}));
+bench('range, 100 documents', 200, i => c.find({n:{\$gte:(i*7)%($N-100), \$lt:((i*7)%($N-100))+100}}).toArray());
+bench('countDocuments, whole collection', 50, () => c.countDocuments({}));
+bench('aggregate \$group by 50 keys', 50, () => c.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}}]).toArray());
+"
+
+echo
+echo "== the fast tier cannot answer: what falling through costs =="
+cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+bench('range, 100 documents, from archive', 200, i => c.find({n:{\$gte:(i*7)%($N-100), \$lt:((i*7)%($N-100))+100}}).toArray());
+bench('countDocuments, from archive', 50, () => c.countDocuments({}));
+bench('aggregate \$group, from archive', 50, () => c.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}}]).toArray());
+"
+
+echo
+echo "== a read miss: the document is only in the archive =="
+# Remove a slice from the fast tier without the feeder seeing it, so those
+# documents are archived rather than deleted. The first read of each is a miss.
+cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+pkill -f 'cline feeder'; sleep 1
+H "db.getSiblingDB('shop').$NS.deleteMany({n:{\$lt:1000}})" >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+sleep 3
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+// Each id is read once, so every one of these is a genuine miss.
+let miss = 0;
+bench('point lookup, miss then copy-up', 400, () => c.findOne({_id: miss++}));
+bench('point lookup, same ids again (now hot)', 400, i => c.findOne({_id: i % 400}));
+"
+
+echo
+echo "== writes =="
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+const u = db.getSiblingDB('shop').benchuniq;
+u.drop();
+let k = 0;
+bench('insert, no unique index', 500, () => c.insertOne({_id: 'w'+(k++), n: -1}));
+u.createIndex({email:1},{unique:true});
+let j = 0;
+bench('insert, one unique index (key claimed)', 500, () => u.insertOne({email:'u'+(j++)+'@x.com'}));
+let m = 0;
+bench('update, new key readable from the command', 300, () => u.updateOne({email:'u'+(m)+'@x.com'},{\$set:{email:'v'+(m++)+'@x.com'}}));
+let q = 0;
+bench('update, new key needs the dry run', 300, () => u.updateOne({email:'v'+(q)+'@x.com'},{\$rename:{email:'addr'+(q++)}}));
+"
+
+stopDaemons
+echo
+echo "Both tiers are single-node replica sets on one machine, so treat these as"
+echo "ratios rather than as production latencies."

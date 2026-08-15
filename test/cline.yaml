@@ -46,6 +46,14 @@ feeder:
     - "shop.tkeval2"
     - "shop.rollup"
     - "shop.merged"
+    - "shop.tres"
+    - "shop.tttl"
+    - "shop.tdrop"
+    - "shop.tbig"
+    - "shop.tconc"
+    - "shop.tbulk"
+    - "shop.bench"
+    - "shop.benchuniq"
   checkpoint_every: 1s
   batch_size: 500
   max_await: 500ms

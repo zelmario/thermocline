@@ -110,6 +110,46 @@ P() { mongosh --port 27103 -u dba -p secret --authenticationDatabase admin --qui
 chk "permissive refuses \$out" "refused" "$(P "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}},{\$out:'perm_out'}]).toArray();print('ALLOWED')}catch(e){print(e.message.match(/refusing/)?'refused':'other')}")"
 chk "and wrote nothing"        "false"   "$(H "print(db.getSiblingDB('shop').getCollectionNames().includes('perm_out'))")"
 
+# Back to the archive-completeness router on the usual port: the permissive one
+# above replaced it, and everything below expects the default behaviour.
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+startRouter
+
+echo "== a result far larger than one command can carry =="
+# The result used to be collected in memory and handed to the fast tier in a
+# single command, which capped it at what a command can hold. It is streamed in
+# batches now, so the only limit is what the tiers can store. 2500 documents of
+# six kilobytes is about 15 MB, comfortably past the old ceiling, and several
+# times the batch size so the batching itself is exercised.
+H "db.getSiblingDB('shop').tbulk.drop(); db.getSiblingDB('shop').bulkout.drop()" >/dev/null
+C "db.getSiblingDB('shop').tbulk.drop(); db.getSiblingDB('shop').bulkout.drop()" >/dev/null
+R "const c=db.getSiblingDB('shop').tbulk; const blob='y'.repeat(6*1024);
+   for(let b=0;b<5;b++){const d=[];for(let i=0;i<500;i++)d.push({_id:b*500+i,n:b*500+i,blob:blob});c.insertMany(d);}" >/dev/null
+for _ in $(seq 1 120); do
+  [ "$(C "print(db.getSiblingDB('shop').tbulk.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "2500" ] && break
+  sleep 1
+done
+chk "the bulk collection mirrored" "2500" "$(C "print(db.getSiblingDB('shop').tbulk.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+cline watermark --config $CFG --ns shop.tbulk --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+chk "\$out streams a 15 MB result"  "ok"   "$(R "try{db.getSiblingDB('shop').tbulk.aggregate([{\$project:{n:1,blob:1}},{\$out:'bulkout'}]).toArray();print('ok')}catch(e){print(e.message.substring(0,60))}")"
+chk "every document arrived"        "2500" "$(H "print(db.getSiblingDB('shop').bulkout.countDocuments({}))")"
+chk "and the payload survived"      "6144" "$(H "const d=db.getSiblingDB('shop').bulkout.findOne({n:1234}); print(d?d.blob.length:'MISSING')")"
+
+echo "== \$out into an untiered target is still atomic =="
+# An untiered target has nothing to mirror, so the replacement is built beside
+# it and renamed over the top, which is how mongod implements $out itself.
+chk "no temporary collection was left behind" "0" "$(H "print(db.getSiblingDB('shop').getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+# Re-running over a smaller input must replace, not merge into, the old contents.
+R "db.getSiblingDB('shop').tbulk.deleteMany({n:{\$gte:100}})" >/dev/null
+for _ in $(seq 1 120); do
+  [ "$(C "print(db.getSiblingDB('shop').tbulk.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "100" ] && break
+  sleep 1
+done
+R "db.getSiblingDB('shop').tbulk.aggregate([{\$project:{n:1}},{\$out:'bulkout'}]).toArray()" >/dev/null
+chk "the rerun replaced the collection"   "100" "$(H "print(db.getSiblingDB('shop').bulkout.countDocuments({}))")"
+chk "and left no temporary behind either" "0"   "$(H "print(db.getSiblingDB('shop').getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+
 stopDaemons
 echo
 echo "================================"

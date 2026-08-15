@@ -20,6 +20,7 @@ nothing.
     docker exec <node> bash /root/testwarm.sh      # completeness claims, and withdrawing one
     docker exec <node> bash /root/testfresh.sh     # archive reads must be as fresh as fast tier ones
     docker exec <node> bash /root/testaggwrite.sh  # $out and $merge over archived input
+    docker exec <node> bash /root/testlife.sh      # residency, drop, TTL, big documents, auth, concurrency
     bash test/testchaos.sh                         # kill things under load (host side, slow)
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
@@ -65,3 +66,10 @@ Things these encode that are easy to get wrong when testing by hand:
   integer `_id`s makes every window filter match nothing, because integers sort
   before every ObjectId in BSON, and a count of zero looks exactly like a tier
   with nothing missing.
+- **A copy-up only happens on a point lookup by `_id`.** Any other filter is
+  answered from the archive without promoting anything, so a residency test that
+  reads by a field proves nothing about residency.
+- **Never use a bare `wait`.** These suites start the feeder and the router as
+  background jobs of the same shell, so `wait` blocks on daemons that never
+  exit and the suite hangs with every check already passed. Collect the client
+  PIDs and wait on those.
