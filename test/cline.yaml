@@ -64,6 +64,10 @@ feeder:
     - "shop.ttxg"
     - "shop.ttxh"
     - "shop.ttxi"
+    - "shop.ttxj"
+    # testconcerns.sh
+    - "shop.tconc2"
+    - "shop.tconc2u"
     # traffic.sh, which drives the dashboard
     - "shop.tdash"
     - "shop.tdashu"

@@ -21,10 +21,16 @@ import (
 //
 // Tombstoned documents are excluded. The archive keeps records the application
 // deleted, and returning one here would resurrect it in the caller's hands.
-func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue) (bson.Raw, bool, error) {
+func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue, level string) (bson.Raw, bool, error) {
 	db, coll := splitNS(ns)
+	coll2 := r.cold.Database(db).Collection(coll)
+	// The caller's durability request follows the read onto the other cluster.
+	// Without this a point lookup asking for majority was answered locally.
+	if rc := archiveReadConcernFor(level); rc != nil {
+		coll2 = r.cold.Database(db).Collection(coll, options.Collection().SetReadConcern(rc))
+	}
 	var doc bson.Raw
-	err := r.cold.Database(db).Collection(coll).FindOne(ctx, bson.D{
+	err := coll2.FindOne(ctx, bson.D{
 		{Key: "_id", Value: id},
 		meta.NotArchivedDeleted(),
 	}).Decode(&doc)
@@ -41,7 +47,7 @@ func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue) 
 // copyUp moves one document from the archive into the fast tier and protects it
 // from the next eviction sweep. It reports whether the document existed.
 func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool, error) {
-	doc, found, err := r.readArchived(ctx, ns, id)
+	doc, found, err := r.readArchived(ctx, ns, id, "")
 	if err != nil || !found {
 		return false, err
 	}

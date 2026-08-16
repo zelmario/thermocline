@@ -179,7 +179,10 @@ bench('range, 100 documents, from archive', 20, i => c.find({n:{\$gte:(i*7)%($N-
 # archive_wait defaults to 5s as well, so once the checkpoint interval reaches
 # it, some reads give up waiting and answer stale rather than slow. That is the
 # barrier failing quietly, and it is worth counting.
-echo "  reads that gave up waiting: $(grep -c 'before mirroring caught up' /var/log/cline/bench_r.log 2>/dev/null || echo 0)"
+# grep -c prints 0 and exits 1 when nothing matches, so a `|| echo 0` fallback
+# printed the count and then a second zero underneath it.
+GAVEUP=$(grep -c 'before mirroring caught up' /var/log/cline/bench_r.log 2>/dev/null; true)
+echo "  reads that gave up waiting: ${GAVEUP:-0}"
 stopFeeder
 startFeeder
 
@@ -230,5 +233,11 @@ bench('update, new key needs the dry run', 300, () => u.updateOne({email:'v'+(q+
 
 stopDaemons
 echo
-echo "Both tiers are single-node replica sets on one machine, so treat these as"
-echo "ratios rather than as production latencies."
+# Say what was actually measured rather than asserting a topology. This claimed
+# single-node sets while running against three-member ones, and a benchmark that
+# misdescribes its own environment invites its numbers to be quoted somewhere
+# they do not apply.
+HOTN=$(H 'print(rs.status().members.length)')
+COLDN=$(C 'print(rs.status().members.length)')
+echo "Measured against rsHot with $HOTN member(s) and rsCold with $COLDN, all on one"
+echo "machine, so treat these as ratios rather than as production latencies."

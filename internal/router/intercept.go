@@ -68,13 +68,27 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 		return reply, nil
 	}
 
+	// Linearizable cannot be honoured by another cluster, and downgrading the
+	// strongest guarantee in the system without saying so is the one thing this
+	// must not do.
+	level, honourable := archiveLevel(cmd)
+	if !honourable {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a linearizable read that only the archive can answer", "ns", ns)
+		return c.r.commandError(reply.Header.RequestID, msg.Header.RequestID,
+			"thermocline: this document is in the archive, and readConcern linearizable cannot be "+
+				"answered from there: it promises a read confirmed on the primary that owns the "+
+				"document. Warm this range, or read it with majority.")
+	}
+
 	c.r.Stats.ReadMisses.Add(1)
 	c.cls = ClassMiss
 	// A document deleted a moment ago is still live in the archive until the
 	// tombstone is mirrored, so a miss has to wait for mirroring before it can
 	// treat the archive's copy as the truth.
-	c.archiveReadIsFresh(ctx, ns, time.Now())
-	doc, found, err := c.r.readArchived(ctx, ns, id)
+	c.archiveReadIsFresh(ctx, ns, time.Now(), maxTimeBudget(cmd))
+	doc, found, err := c.r.readArchived(ctx, ns, id, level)
 	if err != nil {
 		return nil, err
 	}

@@ -159,6 +159,30 @@ chk "a txn range read is answered in full"              "10"   "$(echo "$OUT5" |
 chk "and a replay is what made it possible"            "true" "$(echo "$OUT5" | awk '{print $2}')"
 chk "the documents are on the fast tier now"           "10"   "$(H 'print(db.getSiblingDB("shop").ttxe.countDocuments({}))')"
 
+echo "== countDocuments inside a txn is answered, not refused =="
+# Every driver implements countDocuments as an aggregate, so it takes the
+# aggregation guard rather than the find one. That guard refused inside a
+# transaction while find had already learned to warm and replay, which made the
+# most common read in the system after find the one shape a transaction could
+# not perform.
+fresh ttxj
+R "db.getSiblingDB('shop').ttxj.insertMany(Array.from({length:14},(_,i)=>({_id:i,grp:'g',n:i})))" >/dev/null
+waitMirrored ttxj 14
+evictBehindTheFeeder "db.getSiblingDB('shop').ttxj.deleteMany({})"
+OUTC=$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase('shop').ttxj;
+  let tries=0, n=-1;
+  try { s.withTransaction(() => { tries++; n=c.countDocuments({}); }); print(n+' '+(tries>1)); }
+  catch(e) { print('REFUSED '+(tries>1)); }")
+chk "countDocuments in a txn counts them all"          "14"   "$(echo "$OUTC" | awk '{print $1}')"
+chk "and a replay is what made it possible"           "true" "$(echo "$OUTC" | awk '{print $2}')"
+# A grouping pipeline is the same path with a different shape.
+chk "a \$group in a txn sees every document"          "14"   "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase('shop').ttxj;
+  let n=-1;
+  try { s.withTransaction(() => { n=c.aggregate([{\$group:{_id:'\$grp',t:{\$sum:1}}}]).toArray()[0].t; }); print(n); }
+  catch(e) { print('REFUSED'); }")"
+
 echo "== a multi-document write inside a txn reaches every document =="
 # The failure this prevents is the quiet one: updateMany reporting three
 # modified when thirteen matched, because ten of them were in the archive.

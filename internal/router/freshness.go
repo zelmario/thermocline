@@ -111,7 +111,17 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 
 // archiveReadIsFresh waits for mirroring and counts what it had to do, so the
 // two archive read paths behave the same way and report it the same way.
-func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.Time) {
+//
+// budget is the caller's own maxTimeMS, or zero when they set none. The wait
+// must not outlast it: a client that asked for an answer within fifty
+// milliseconds and got one after five hundred was told its deadline did not
+// apply here, which is not the proxy's decision to make.
+func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.Time, budget time.Duration) {
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
 	if c.r.waitForArchive(ctx, started) {
 		return
 	}

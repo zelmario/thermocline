@@ -92,3 +92,64 @@ func txnFilter(cmd bson.Raw, name string) (bson.Raw, bool) {
 	}
 	return doc, true
 }
+
+// warmScopeForTxn brings up everything an aggregation inside a transaction
+// reads, across every collection it touches.
+//
+// The primary collection is warmed through the pipeline's leading $match, which
+// is the same bound the completeness check uses. A joined collection is warmed
+// whole, because $lookup and $unionWith read by key rather than by time and
+// there is no range that can be shown to be enough. That makes a join against a
+// large archived collection exceed the cap and be refused, which is the honest
+// outcome: the alternative is dragging the collection into the fast tier to
+// answer one query.
+//
+// Everything is warmed before anything is replayed. Replaying after the first
+// namespace would work, since each attempt makes progress, but it would cost
+// one replay per collection instead of one for the statement.
+func (c *conn) warmScopeForTxn(ctx context.Context, msg *wire.Message, scope aggScope) (*wire.Message, txnWarm) {
+	seen := map[string]bool{}
+	moved := 0
+
+	warm := func(ns string, filter bson.Raw) txnWarm {
+		if ns == "" || seen[ns] || !c.r.cfg.Manages(ns) {
+			return txnWarmComplete
+		}
+		seen[ns] = true
+		n, err := c.r.copyUpMatching(ctx, ns, filter)
+		if err != nil {
+			c.log.Warn("could not bring this transaction's documents up from the archive, refusing instead",
+				"ns", ns, "err", err)
+			return txnWarmRefuse
+		}
+		moved += n
+		return txnWarmComplete
+	}
+
+	if res := warm(scope.primary, scope.match); res == txnWarmRefuse {
+		return nil, txnWarmRefuse
+	}
+	for _, ns := range scope.secondary {
+		// No filter: a joined collection has to be whole.
+		if res := warm(ns, bson.Raw{}); res == txnWarmRefuse {
+			return nil, txnWarmRefuse
+		}
+	}
+
+	if moved == 0 {
+		c.log.Debug("the fast tier already held everything this aggregation reads", "ns", scope.primary)
+		return nil, txnWarmComplete
+	}
+
+	c.r.Stats.WarmedForTxn.Add(1)
+	c.log.Info("copied documents up so a transaction could aggregate over them",
+		"ns", scope.primary, "documents", moved, "collections", len(seen))
+
+	out, err := c.r.replayTransaction(msg.Header.RequestID, msg.Header.RequestID,
+		"the documents this transaction aggregates over in "+scope.primary+
+			" were in the archive and have been brought back to the fast tier")
+	if err != nil {
+		return nil, txnWarmRefuse
+	}
+	return out, txnWarmReplay
+}

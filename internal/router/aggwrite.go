@@ -227,7 +227,10 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 		pipeline = append(pipeline, st)
 	}
 
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now())
+	// No budget: this is the reading half of an $out or $merge, which streams
+	// in batches and is expected to be long. Cutting its freshness wait to the
+	// caller's maxTimeMS would trade a slow pipeline for a stale one.
+	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), 0)
 
 	cur, err := c.r.cold.Database(db).Collection(coll).Aggregate(ctx, pipeline)
 	if err != nil {

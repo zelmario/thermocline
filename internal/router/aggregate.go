@@ -45,6 +45,9 @@ type aggScope struct {
 	bound     time.Time
 	bounded   bool
 	writes    bool
+	// match is the leading $match, kept so a transaction can be given the
+	// documents it selects rather than being refused.
+	match bson.Raw
 }
 
 // scopeOfAggregate reads an aggregate command into the parts completeness
@@ -93,6 +96,7 @@ func scopeOfAggregate(cmd bson.Raw, db string) (aggScope, bool) {
 		if i == 0 && name == "$match" {
 			if mdoc, ok := val.DocumentOK(); ok {
 				s.bound, s.bounded = lowerTimeBound(mdoc)
+				s.match = mdoc
 			}
 		}
 
@@ -190,9 +194,25 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 
 	c.r.Stats.Incomplete.Add(1)
 
-	// Same rule as a find: an aggregation inside a transaction cannot be sent
-	// to the other cluster without leaving the caller's snapshot behind.
+	// Same rule as a find: an aggregation inside a transaction cannot be sent to
+	// the other cluster without leaving the caller's snapshot behind. So it gets
+	// the same answer as a find, which is to move the documents to the tier the
+	// transaction is already reading and replay it.
+	//
+	// This is not a niche path. Every driver implements countDocuments as an
+	// aggregate, so without it the most common read in the system after find was
+	// the one shape a transaction could not perform.
 	if inTransaction(cmd) {
+		switch out, res := c.warmScopeForTxn(ctx, msg, scope); res {
+		case txnWarmReplay:
+			c.r.Stats.TxnReplays.Add(1)
+			c.cls = ClassTxnWarm
+			return out, true
+		case txnWarmComplete:
+			// Neither tier is missing anything this pipeline reads, so the fast
+			// tier can run it.
+			return nil, false
+		}
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a transactional aggregation that spans both tiers", "ns", scope.primary)

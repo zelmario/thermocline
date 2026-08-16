@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -174,7 +175,7 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// caller remembering to. A find waited and an aggregation did not, and
 	// countDocuments is an aggregation, so a document inserted a moment earlier
 	// was found by find and not counted by countDocuments.
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now())
+	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
 
 	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
@@ -353,9 +354,20 @@ func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
 		return nil, 0, err
 	}
 
-	out := make(bson.D, 0, len(elems)+1)
+	out := make(bson.D, 0, len(elems)+2)
 	batchSize := firstBatchDefault
 	sawFilter, sawPipeline := false, false
+
+	// Linearizable survives nothing: it promises a read confirmed on the
+	// primary that owns the document, which another cluster cannot say. Every
+	// path that answers from the archive comes through here, so refusing here
+	// covers all of them.
+	level, honourable := archiveLevel(cmd)
+	if !honourable {
+		return nil, 0, errors.New("readConcern linearizable cannot be answered from the archive: " +
+			"it promises a read confirmed on the primary that owns the document; " +
+			"warm this range, or read it with majority")
+	}
 
 	for _, e := range elems {
 		key := e.Key()
@@ -365,6 +377,15 @@ func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
 		val := e.Value()
 
 		switch key {
+		case "hint":
+			// A hint names an index, and the archive is expected to carry
+			// fewer of them: the rollout guide tells operators to drop the
+			// ones the cheap tier does not need. Passing it on turns a
+			// perfectly good query into "hint provided does not correspond to
+			// an existing index" the first time it falls through. A hint is a
+			// directive about how to answer, not about what the answer is, so
+			// dropping it changes the plan and not the result.
+			continue
 		case "filter":
 			sawFilter = true
 			out = append(out, bson.E{Key: "filter", Value: liveOnly(val)})
@@ -395,6 +416,17 @@ func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
 		out = append(out, bson.E{Key: "pipeline", Value: bson.A{
 			bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}},
 		}})
+	}
+
+	// The level carries over; afterClusterTime and atClusterTime do not, because
+	// they name instants on the fast tier's timeline.
+	//
+	// Appended last, never first. The opening element of a command document is
+	// the command name, so putting readConcern at the front produced a command
+	// called "readConcern", which the archive rejected, which made every
+	// fallback read look like a query the router had refused.
+	if rc, ok := archiveReadConcern(level); ok {
+		out = append(out, bson.E{Key: "readConcern", Value: rc})
 	}
 	return out, batchSize, nil
 }
@@ -592,7 +624,7 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	if coll == "" {
 		coll, _ = stringField(cmd, "distinct")
 	}
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now())
+	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
 
 	res := c.r.cold.Database(db).RunCommand(ctx, out)
 	if res.Err() != nil {
