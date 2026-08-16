@@ -182,11 +182,12 @@ text.val { fill: var(--ink); font-size: 11.5px; font-variant-numeric: tabular-nu
     </div>
 
     <div class="card">
-      <h2>Where the data lives</h2>
-      <p class="note">Documents held by each tier, from collection metadata.</p>
-      <div class="hero" id="fastshare">—<span class="unit">% on the fast tier</span></div>
-      <div class="heroline" id="dataline">reading collection sizes…</div>
+      <h2>What the fast tier has to hold</h2>
+      <p class="note">Share of the documents that need fast storage, from collection metadata. Lower is the win: it is the part you are paying for.</p>
+      <div class="hero" id="fastshare">—<span class="unit">% of documents kept hot</span></div>
+      <div class="heroline" id="leverage">waiting for traffic</div>
       <div class="bar2" id="databar"></div>
+      <div class="heroline" id="dataline">reading collection sizes…</div>
     </div>
   </section>
 
@@ -294,8 +295,9 @@ function drawHero(s) {
   const realTotal = REAL.reduce((a, c) => a + (cls[c.key] ? cls[c.key].count : 0), 0);
   const fastN = cls.fast ? cls.fast.count : 0;
 
+  const hitPct = realTotal > 0 ? fastN / realTotal * 100 : null;
   if (realTotal > 0) {
-    const pct = fastN / realTotal * 100;
+    const pct = hitPct;
     $("hitrate").innerHTML = (pct >= 99.95 ? "100" : pct.toFixed(1)) + '<span class="unit">%</span>';
     $("hitline").textContent = fmt(fastN) + " of " + fmt(realTotal) + " commands, " +
       fmt(realTotal - fastN) + " needed the archive";
@@ -346,15 +348,28 @@ function drawHero(s) {
   if (cold > 0) {
     const pct = hot / cold * 100;
     $("fastshare").innerHTML = (pct < 1 && pct > 0 ? pct.toFixed(2) : pct.toFixed(1)) +
-      '<span class="unit">% on the fast tier</span>';
+      '<span class="unit">% of documents kept hot</span>';
+    // The two shares side by side are the whole argument, and they are the only
+    // honest way to read either one. A tier holding 3% of the documents and
+    // answering 99% of the commands is the case this system exists for; one
+    // holding 73% and answering 93% is a boundary cut far too shallow, and the
+    // number alone does not say which of those you are looking at.
+    $("leverage").textContent = hitPct === null
+      ? "waiting for traffic to compare against"
+      : "answering " + hitPct.toFixed(1) + "% of commands" +
+        (pct > 0 && hitPct / pct >= 1.5
+          ? ""
+          : " — little better than keeping everything hot");
     $("dataline").textContent = fmt(hot) + " of " + fmt(cold) + " documents · " +
-      fmtBytes(hotB) + " of " + fmtBytes(coldB);
+      fmtBytes(hotB) + " of " + fmtBytes(coldB) +
+      " (archive counts include tombstoned copies)";
     const a1 = document.createElement("i"), a2 = document.createElement("i");
     a1.style.background = "var(--s1)"; a1.style.flex = Math.max(hot, cold * 0.004) + " 1 0";
     a2.style.background = "var(--s2)"; a2.style.flex = Math.max(cold - hot, 0) + " 1 0";
     db.appendChild(a1); db.appendChild(a2);
   } else {
-    $("fastshare").innerHTML = '—<span class="unit">% on the fast tier</span>';
+    $("fastshare").innerHTML = '—<span class="unit">% of documents kept hot</span>';
+    $("leverage").textContent = "";
     $("dataline").textContent = inv.length ? "both tiers are empty" : "no tiered collections configured";
   }
 }
