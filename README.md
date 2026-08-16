@@ -400,6 +400,29 @@ nothing does, because that storage is the saving. A unique index is called out
 separately, since cross-tier uniqueness is the key registry's job and its
 absence on the archive is expected.
 
+### Authorisation
+
+Authentication is proxied rather than terminated, so the fast tier holds the
+client's identity and decides what it may read. Almost everything reaches the
+fast tier, and a read it refuses comes back as an error rather than a miss, so
+nothing falls through.
+
+`count`, `distinct` and aggregations are judged **before** they run, because a
+pipeline can end in `$out` and refusing one afterwards would leave a truncated
+collection written. That means the fast tier never sees them, so before
+answering any of them from the archive the router asks the fast tier, over the
+client's own authenticated connection, whether that client may read the
+collection. The fast tier's own error is returned unchanged.
+
+Without that check a client with no access to a tiered collection could obtain
+its contents with a count, but only while the collection was incomplete, which
+is to say only while tiering was doing its job.
+
+The archive is reached with the router's own credentials, because the client has
+no session there and cannot be given one. **It should therefore be reachable
+only by the router**, which the operating rules already require for a different
+reason: the cheap tier is read-only to everyone except the feeder.
+
 ### Prometheus
 
 The same address serves `/metrics` in the Prometheus text format: commands and

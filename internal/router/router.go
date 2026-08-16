@@ -95,6 +95,7 @@ type Stats struct {
 	WarmedForTxn  atomic.Int64
 	DuplicateKeys atomic.Int64
 	ChangeStreams atomic.Int64
+	Unauthorized  atomic.Int64
 	Unreadable    atomic.Int64
 	EventsHidden  atomic.Int64
 	StaleReads    atomic.Int64

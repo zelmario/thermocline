@@ -646,6 +646,11 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	}
 
 	if c.r.cfg.Completeness == config.Archive {
+		// The archive is reached with the router's credentials, so the fast
+		// tier has to be asked whether this client was allowed to ask.
+		if denied, ok := c.mayRead(msg, db, coll); !ok {
+			return denied, true
+		}
 		out, aerr := c.answerSimpleFromArchive(ctx, msg, db, cmd)
 		if aerr == nil {
 			c.r.Stats.Archived.Add(1)

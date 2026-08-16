@@ -274,6 +274,12 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if c.r.cfg.Completeness == config.Archive {
 		coll, _ := stringField(cmd, "aggregate")
 
+		// Judged before it runs, so the fast tier has not seen it and nothing
+		// has consulted this client's permissions yet.
+		if denied, ok := c.mayRead(msg, db, coll); !ok {
+			return denied, true
+		}
+
 		// A pipeline that writes needs its two halves run on different
 		// clusters: the input read from the archive, the write performed on the
 		// fast tier, where the application will look for the result.

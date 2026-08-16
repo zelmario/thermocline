@@ -73,6 +73,8 @@ feeder:
     # testtypes.sh
     - "shop.tcap"
     - "shop.tts"
+    # testauth.sh
+    - "shop.tauth"
     # testindexes.sh
     - "shop.tidx"
     # testquery.sh
