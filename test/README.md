@@ -21,6 +21,7 @@ nothing.
     docker exec <node> bash /root/testfresh.sh     # archive reads must be as fresh as fast tier ones
     docker exec <node> bash /root/testaggwrite.sh  # $out and $merge over archived input
     docker exec <node> bash /root/testlife.sh      # residency, drop, TTL, big documents, auth, concurrency
+    docker exec <node> bash /root/testtxn.sh       # what a transaction is promised across two tiers
     bash test/testchaos.sh                         # kill things under load (host side, slow)
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
@@ -81,3 +82,46 @@ Things these encode that are easy to get wrong when testing by hand:
   the next run's inserts as warm echoes. Both are the product behaving correctly
   and both read as failures. Setup now drops `residency`, `warming` and the
   `warmerActive` marker alongside the checkpoint and the watermarks.
+- **A guard that takes a command over has to do everything that command needed.**
+  The in-transaction key check first owned the forwarding of the update it was
+  checking, which skipped the copy-up an update that matched nothing depends on.
+  The write then matched an archived document, modified nothing, and reported
+  success: the guard against one silent wrong answer had introduced another.
+  `testtxn.sh` covers it now, on a collection with a unique index so the guard
+  is actually armed. It runs before the reply, notes what the statement will
+  touch, and checks after it, without ever taking the command over.
+- **Test the transaction cases with `withTransaction`, not `startTransaction`.**
+  The router asks for a replay by returning `TransientTransactionError`, which
+  is a contract with the driver's retry helper. A hand-rolled
+  `startTransaction`/`commitTransaction` block has nothing to do the retrying,
+  so every transparent case reads as a failure.
+- **Never install a binary or run a second suite while a regression is running.**
+  Everything here shares one cluster and one `/usr/local/bin/cline`, and the
+  suites stop and start the daemons out from under each other. A run that had
+  the binary swapped mid-flight reported three failures in `testrouter`,
+  `testlife` and `testtxn` that no longer existed a minute later, which is worse
+  than no result: it costs an investigation into a product that is fine. Let the
+  regression finish, or stop it and start again.
+- **A dashboard address is a port like any other.** `router.dashboard` was set
+  to 27101, which `testrouter.sh` already uses for its strict-mode router; they
+  raced for the bind and the strict check failed for reasons entirely unrelated
+  to strictness. The config now refuses a dashboard on the same port as the
+  router, and the suites' ports are 27100-27103, 27110 and 27177.
+- **The first statement of a transaction takes a different code path.** It
+  carries `startTransaction`, and the router guards that one *before* the write
+  the way it guards ordinary traffic, because a transaction cannot have written
+  anything yet. Only a later statement takes the read-back-and-abort path. A
+  check whose transaction did one thing therefore tested the pre-flight guard
+  while claiming to test the other one, and passed against a build with the bug
+  still in it. Put a harmless write ahead of the statement under test.
+- **Prove a new check fails against the bug it describes.** The check above was
+  written for a real defect, passed immediately, and only turned out to be
+  testing the wrong path when it was run against a deliberately broken build.
+  Reverting the fix and watching the check go red takes two minutes and is the
+  only thing that distinguishes a regression test from a decoration.
+- **MongoDB's TTL monitor sweeps every 60 seconds, so anything racing it is
+  flaky roughly one run in fifteen.** `testlife.sh` inserted an already-expired
+  document into a collection that already carried the TTL index, then asserted
+  the archive held it. When a sweep landed in the gap the document was gone
+  before the feeder saw it and the archive correctly held nothing. Mirror the
+  document first, wait for it, and create the TTL index afterwards.

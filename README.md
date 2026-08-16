@@ -162,12 +162,37 @@ This covers the cases that used to need a decision before adoption: unbounded
 collection, and skip-based pagination. All of them now return the same answer
 they would from a single cluster.
 
-**The one difference a caller can observe is freshness.** The archive trails the
-fast tier by the feeder's mirroring lag, normally well under a second, so a read
-that falls through has the staleness of a secondary read. That is a timing
-difference rather than an API difference, but it is real: a read of something
-written milliseconds ago may not see it. Applications needing read-your-own-
-writes on old data should keep that range warm.
+**The one difference a caller can observe is freshness**, and the router closes
+it rather than documenting it away. The archive trails the fast tier by the
+feeder's mirroring lag, so before answering from the archive the router waits
+for mirroring to reach the instant the read began. Every write that completed
+before then is in the archive by the time it is read, which is why a fallback
+read cannot miss a write that already returned or hand back a document the
+caller has already deleted.
+
+That wait is only as precise as the position it waits on, and this is where it
+went wrong. It waited on the durable checkpoint, which moves once per
+`feeder.checkpoint_every`, so a fallback read paid a whole checkpoint interval
+even with the feeder perfectly caught up and nothing to wait for. Measured on an
+idle database: **1,142 ms with `checkpoint_every: 1s`, 4,531 ms at the shipped
+default of 5s, against 1.8 ms for the same query with the wait turned off.** At
+the default it was also worse than slow: the wait exceeded `archive_wait`, which
+also defaults to 5s, so reads gave up and answered stale anyway.
+
+Freshness now has its own record. The feeder publishes how far it has mirrored
+every `feeder.position_every` (250 ms by default) as one small document with no
+resume token at `w:1`, and the durable checkpoint goes back to meaning only what
+it says. The same read now takes **520 ms**, and the remaining cost is honest:
+on an idle database the feeder cannot know that time has passed until its change
+stream poll times out, so budget a fallback read at roughly
+`max_await + position_every` and lower both if such reads are on a user's path.
+
+A read of something written milliseconds ago is therefore seen, at the cost of
+that wait. A stopped feeder is the one case the barrier cannot hold, and there
+the router answers anyway and warns rather than turning a dead background daemon
+into failed queries. It notices quickly: the position record carries the cadence
+it promised, so four missed publications mark the publisher as gone instead of
+making every read wait out the full `archive_wait`.
 
 `router.completeness` chooses the behaviour: `archive` (the default), `strict`
 to refuse instead, `permissive` to return the fast tier's short answer.
@@ -273,11 +298,71 @@ document up outside the transaction, then returns an error labelled
 helper retries from the start. The replay takes a fresh snapshot, the document
 is there, and the application never learns why. No code changes.
 
-A transaction whose read reaches past what the fast tier holds is a different
-matter, and is refused. No copy-up fixes a whole range, and answering it from
-the archive would leave the transaction reading two clusters at two points in
-time. That refusal is deliberately not labelled transient, so it fails rather
-than retrying forever.
+A transaction whose read or multi-document write reaches past what the fast tier
+holds is the same problem one size larger, and it gets the same answer. The
+documents are copied up and the transaction is replayed. Reading the archive is
+still not on offer, because that would leave the transaction reading two
+clusters at two points in time; moving the documents to the tier it is already
+reading needs no such thing.
+
+The completeness watermark cannot decide this one. It records that a whole range
+was warmed, and copying documents up for a single query does not make that true,
+so a replay that re-checked the watermark would fail exactly as the first
+attempt did. What is true after the copy-up is narrower and stronger: the
+archive holds no live document matching this filter that the fast tier lacks.
+That is completeness established per query, and it is what lets the replay
+succeed. Past `maxCopyUpForWrite` documents the range is refused instead, with
+an error that is deliberately not labelled transient so it fails rather than
+retrying forever.
+
+**Unique keys are checked differently inside a transaction, and have to be.**
+Everywhere else the guard runs before the write, because once a write lands it
+is visible and a duplicate cannot be taken back. Inside a transaction nothing is
+visible until commit, so the guard runs after the write instead: the router
+reads back what the statement actually produced, from inside the caller's own
+session, and refuses by aborting the transaction if it duplicates a key an
+archived document holds.
+
+That ordering is not a preference. The router's own client cannot see a
+transaction's uncommitted writes, so a guard that ran first would compute keys
+for a document that is not there yet. It did, and a transaction that inserted a
+document and then moved it onto an archived document's unique value committed
+two live documents sharing one key, reported as success. Reading the post-image
+inside the caller's session removes the guess entirely: no evaluating a `$inc`
+or a pipeline update, and no dry run in a session of the router's own that
+deadlocks against the caller's locks.
+
+## The dashboard
+
+Set `router.dashboard` to an address and the router serves one page showing what
+each tier holds and how it is being used:
+
+```yaml
+router:
+  dashboard: "127.0.0.1:27101"
+```
+
+It answers the three questions the design makes claims about, with measurements
+rather than assertions:
+
+- **what share of commands the fast tier answered on its own**, against the ones
+  that needed the archive;
+- **what that is worth**, as the measured mean latency of a fast tier hit beside
+  the mean of a read that fell through, and the ratio between them;
+- **how little of the data has to be hot** to buy that, from collection metadata
+  on both tiers.
+
+Underneath are commands per second by how they were served, latency per class on
+a log scale, per-collection tier occupancy, and the counters an operator watches:
+copy-ups, refusals, stale reads and cross-tier duplicates stopped. Everything on
+the page is also available as a table, and as JSON at `/api/snapshot`.
+
+The page has no authentication of its own. It names collections and reports
+traffic, so bind it to an operator network rather than to the address the
+application dials.
+
+`test/traffic.sh` drives representative traffic down every path if you want to
+see it with something on it.
 
 ## The completeness watermark
 
@@ -350,7 +435,8 @@ lives in the `_thermocline` database on the cold tier:
 
 | Collection | Purpose |
 |---|---|
-| `checkpoints` | One change stream resume token per feeder |
+| `checkpoints` | One change stream resume token per feeder, for recovery |
+| `positions` | How far each feeder has mirrored, published far more often than the checkpoint because fallback reads wait on it |
 | `evicting` | Eviction announcements, expiring on a TTL index |
 | `residency` | How long a document should stay in the fast tier (used by the evictor and router) |
 | `warming` | Warming announcements, expiring on a TTL index |
@@ -359,6 +445,13 @@ lives in the `_thermocline` database on the cold tier:
 
 Residency is a sidecar rather than a field on the document on purpose.
 Extending a document's stay rewrites 60 bytes instead of a 5 KB document.
+
+`positions` and `checkpoints` look redundant and are not. A checkpoint is
+durable, majority-acknowledged and written every few seconds, because a stale
+one only costs re-mirrored work after a restart. A position is a `w:1` hint
+written several times a second, because a stale one costs every fallback read
+its wait. Answering both with one record made freshness as slow as durability
+was cheap.
 
 The one exception is `_tcDeletedAt`, set on archived copies whose original the
 application deleted. The router filters on it, so a tombstoned document is never
@@ -475,9 +568,10 @@ mongosh --port 28018 --eval '
 - **The first seconds of a warm are not suppressed.** The feeder caches its view
   of the warmer heartbeat for five seconds, so a little echo slips through at the
   start. Irrelevant for a warm lasting hours, worth knowing for a short one.
-- **Metrics.** Lag and sweep counters are computed and logged but not exported
-  to Prometheus. Mirroring lag is the first alert you should build, since
-  eviction safety and recovery both hang off it.
+- **Prometheus.** The router serves its own dashboard and a JSON snapshot at
+  `/api/snapshot`, which is trivial to scrape, but nothing exports the feeder,
+  evictor and warmer counters yet. Mirroring lag is the first alert you should
+  build, since eviction safety and recovery both hang off it.
 - **Eviction does not pause automatically during an archive restore.** It stops
   on mirroring lag, which usually covers it, but the restore case deserves an
   explicit check.

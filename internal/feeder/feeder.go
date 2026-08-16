@@ -37,6 +37,7 @@ type Feeder struct {
 	cold  *mongo.Client
 	cfg   config.FeederConfig
 	cp    *checkpoint.Store
+	pos   *checkpoint.Positions
 	marks *watermark.Store
 	log   *slog.Logger
 
@@ -46,6 +47,9 @@ type Feeder struct {
 	lastEventAt time.Time
 	lastToken   bson.Raw
 	lastSaved   time.Time
+	// lastPublished paces the position write, which is far more frequent than
+	// the checkpoint because a fallback read waits on it.
+	lastPublished time.Time
 
 	// cached view of whether a warmer is running, see echo.go
 	warmActive    bool
@@ -108,6 +112,7 @@ func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Fe
 		cold:  cold,
 		cfg:   cfg,
 		cp:    checkpoint.New(cold),
+		pos:   checkpoint.NewPositions(cold),
 		marks: watermark.New(cold),
 		log:   log,
 	}

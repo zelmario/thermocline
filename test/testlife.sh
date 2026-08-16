@@ -98,10 +98,22 @@ chk "a read after the drop is not silently empty" "3" "$(R "print(db.getSiblingD
 chk "and the watermark no longer claims it"       "false" "$(cline watermark --config $CFG --ns shop.tdrop 2>&1 | grep -qE 'newer than|all of history' && echo true || echo false)"
 
 echo "== a TTL index on a tiered collection =="
-H "db.getSiblingDB('shop').tttl.createIndex({at:1},{expireAfterSeconds:1})" >/dev/null
+# The document is mirrored before the TTL index exists, and the index is created
+# afterwards. Inserting an already-expired document into a collection that
+# already had the index is a race against MongoDB's TTL monitor: it sweeps every
+# 60 seconds, so roughly one run in fifteen had the document deleted before the
+# feeder mirrored it, and the archive then correctly held nothing while the
+# check demanded one. Creating the index last removes the race without changing
+# what is being tested, which is that a TTL delete is an unannounced delete.
 R "db.getSiblingDB('shop').tttl.insertOne({_id:1,at:new Date(Date.now()-120000),v:'expired'})" >/dev/null
-sleep 4
-chk "mirrored before expiry" "1" "$(C "print(db.getSiblingDB('shop').tttl.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+MIRRORED=""
+for _ in $(seq 1 60); do
+  MIRRORED=$(C "print(db.getSiblingDB('shop').tttl.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+  [ "$MIRRORED" = "1" ] && break
+  sleep 0.5
+done
+chk "mirrored before expiry" "1" "$MIRRORED"
+H "db.getSiblingDB('shop').tttl.createIndex({at:1},{expireAfterSeconds:1})" >/dev/null
 echo "  (waiting for the TTL monitor, up to 70s)"
 for _ in $(seq 1 35); do
   [ "$(H "print(db.getSiblingDB('shop').tttl.countDocuments({}))")" = "0" ] && break

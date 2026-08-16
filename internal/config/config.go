@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -93,6 +94,11 @@ type RouterConfig struct {
 	// keeps up, which is the normal case. Set it to zero to answer immediately
 	// and accept secondary-read freshness.
 	ArchiveWait Duration `yaml:"archive_wait"`
+	// Dashboard is the address the operator dashboard listens on, empty for
+	// off. It is deliberately a separate address from Listen: the page names
+	// collections and reports traffic, so it belongs on an operator network
+	// rather than wherever the application already connects.
+	Dashboard string `yaml:"dashboard"`
 	// FeederID names the checkpoint ArchiveWait reads, copied from feeder.id at
 	// load time rather than configured twice.
 	FeederID string `yaml:"-"`
@@ -210,6 +216,15 @@ type FeederConfig struct {
 	// CheckpointEvery bounds how much work a restart repeats. Mirroring is
 	// idempotent, so this trades duplicate writes against checkpoint writes.
 	CheckpointEvery time.Duration `yaml:"checkpoint_every"`
+	// PositionEvery is how often the feeder publishes how far it has mirrored.
+	//
+	// This is what a read falling through to the archive waits on, so it sets
+	// that read's floor latency. It is deliberately separate from
+	// CheckpointEvery: the two trade against different things. A stale
+	// checkpoint costs re-mirrored work after a restart; a stale position costs
+	// every fallback read its wait. Zero publishes nothing and falls back to
+	// the checkpoint, which is what a feeder from before this did.
+	PositionEvery time.Duration `yaml:"position_every"`
 	// BatchSize caps documents per bulk write to the cold tier.
 	BatchSize int `yaml:"batch_size"`
 	// MaxAwait is how long a change stream poll blocks before returning empty.
@@ -228,8 +243,9 @@ func Default() Config {
 		Feeder: FeederConfig{
 			ID:                 "default",
 			CheckpointEvery:    5 * time.Second,
+			PositionEvery:      250 * time.Millisecond,
 			BatchSize:          500,
-			MaxAwait:           time.Second,
+			MaxAwait:           500 * time.Millisecond,
 			UnannouncedDeletes: Tombstone,
 		},
 		Evictor: EvictorConfig{
@@ -335,6 +351,12 @@ func (r RouterConfig) Validate() error {
 	if r.Residency <= 0 {
 		return errors.New("router.residency must be positive, or the evictor removes what was just copied up")
 	}
+	if r.Dashboard != "" && samePort(r.Dashboard, r.Listen) {
+		// Both would bind it and one would lose, leaving either no dashboard or
+		// no router, with nothing but a bind error to say which.
+		return fmt.Errorf("router.dashboard %q is the address clients connect to; give the dashboard its own port",
+			r.Dashboard)
+	}
 	return nil
 }
 
@@ -407,4 +429,21 @@ func (e EvictorConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// samePort reports whether two listen addresses would fight for the same port.
+//
+// Only the port is compared. "0.0.0.0:27017" and ":27017" and "127.0.0.1:27017"
+// are different strings that collide in practice, and a wildcard bind takes the
+// port on every interface anyway.
+func samePort(a, b string) bool {
+	_, ap, err := net.SplitHostPort(a)
+	if err != nil {
+		return false
+	}
+	_, bp, err := net.SplitHostPort(b)
+	if err != nil {
+		return false
+	}
+	return ap == bp
 }

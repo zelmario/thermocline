@@ -83,6 +83,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 	}
 
 	c.r.Stats.Archived.Add(1)
+	c.cls = ClassArchive
 	c.log.Info("aggregation read from the archive and written to the fast tier",
 		"ns", s.primary, "into", sink.target, "documents", n, "how", sink.how)
 
@@ -97,6 +98,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 
 func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, err error) (*wire.Message, bool) {
 	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
 	c.log.Warn("a writing aggregation could not be completed", "ns", s.primary, "what", what, "err", err)
 	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
 		"thermocline: this aggregation's input reaches past what the fast tier holds, so it was run against "+

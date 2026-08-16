@@ -54,6 +54,19 @@ feeder:
     - "shop.tbulk"
     - "shop.bench"
     - "shop.benchuniq"
+    # testtxn.sh, one collection per section for the same index-cache reason.
+    - "shop.ttxa"
+    - "shop.ttxb"
+    - "shop.ttxc"
+    - "shop.ttxd"
+    - "shop.ttxe"
+    - "shop.ttxf"
+    - "shop.ttxg"
+    - "shop.ttxh"
+    - "shop.ttxi"
+    # traffic.sh, which drives the dashboard
+    - "shop.tdash"
+    - "shop.tdashu"
   checkpoint_every: 1s
   batch_size: 500
   max_await: 500ms
@@ -91,5 +104,9 @@ warmer:
 
 router:
   listen: "0.0.0.0:27100"
+  # 27100-27103 and 27177 are taken by routers the suites start, including one
+  # on 27101 that testrouter.sh points a client at. A dashboard bound there
+  # fights the router for the port and one of them loses.
+  dashboard: "0.0.0.0:27110"
   completeness: archive
   residency: 5m

@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermocline router</title>
+<style>
+:root {
+  color-scheme: light;
+  --plane:        #f9f9f7;
+  --surface:      #fcfcfb;
+  --ink:          #0b0b0b;
+  --ink-2:        #52514e;
+  --muted:        #898781;
+  --grid:         #e1e0d9;
+  --axis:         #c3c2b7;
+  --s1: #2a78d6;  /* fast     */
+  --s2: #eb6834;  /* archive  */
+  --s3: #1baf7a;  /* miss     */
+  --s4: #eda100;  /* txn warm */
+  --s5: #e87ba4;  /* refused  */
+  --admin: #b8b6ae;
+  --good:     #0ca30c;
+  --warning:  #fab219;
+  --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --plane:   #0d0d0d;
+    --surface: #1a1a19;
+    --ink:     #ffffff;
+    --ink-2:   #c3c2b7;
+    --muted:   #898781;
+    --grid:    #2c2c2a;
+    --axis:    #383835;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+    --admin: #55544f;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --plane:   #0d0d0d;
+  --surface: #1a1a19;
+  --ink:     #ffffff;
+  --ink-2:   #c3c2b7;
+  --muted:   #898781;
+  --grid:    #2c2c2a;
+  --axis:    #383835;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  --admin: #55544f;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 20px 56px; }
+
+header.bar {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 18px;
+  padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--grid);
+}
+h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; font-weight: 620; }
+.sub { color: var(--muted); font-size: 12.5px; }
+.sub b { color: var(--ink-2); font-weight: 550; }
+.spacer { flex: 1 1 auto; }
+.live { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.dot.paused { background: var(--muted); }
+button.ghost {
+  font: inherit; font-size: 12.5px; color: var(--ink-2); cursor: pointer;
+  background: none; border: 1px solid var(--axis); border-radius: 7px; padding: 3px 10px;
+}
+button.ghost:hover { border-color: var(--muted); color: var(--ink); }
+
+.grid { display: grid; gap: 14px; }
+.g3 { grid-template-columns: repeat(3, 1fr); }
+.g2 { grid-template-columns: 1.15fr 1fr; }
+@media (max-width: 900px) { .g3, .g2 { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface); border: 1px solid var(--grid);
+  border-radius: 12px; padding: 15px 16px 13px;
+}
+.card h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.055em;
+  color: var(--muted); margin: 0 0 3px; font-weight: 600;
+}
+.card .note { color: var(--muted); font-size: 12px; margin: 0 0 11px; }
+
+.hero { font-size: 38px; line-height: 1.08; font-weight: 640; letter-spacing: -0.022em; margin: 6px 0 2px; }
+.hero .unit { font-size: 17px; color: var(--ink-2); font-weight: 500; letter-spacing: 0; }
+.heroline { color: var(--ink-2); font-size: 12.5px; }
+.cmp { display: flex; align-items: baseline; gap: 10px; margin: 6px 0 2px; }
+.cmp .a { font-size: 30px; font-weight: 640; letter-spacing: -0.02em; }
+.cmp .vs { color: var(--muted); font-size: 12.5px; }
+.cmp .b { font-size: 20px; font-weight: 560; color: var(--ink-2); }
+
+.bar2 { display: flex; height: 8px; border-radius: 4px; overflow: hidden; gap: 2px; margin: 12px 0 8px; background: transparent; }
+.bar2 i { display: block; height: 100%; border-radius: 2px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 15px; margin: 9px 0 0; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+td.num { font-variant-numeric: tabular-nums; }
+td .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; }
+
+.counters { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+@media (max-width: 900px) { .counters { grid-template-columns: repeat(2, 1fr); } }
+.counter { background: var(--surface); border: 1px solid var(--grid); border-radius: 10px; padding: 11px 12px; }
+.counter .k { font-size: 11.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.counter .v { font-size: 21px; font-weight: 620; letter-spacing: -0.015em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.counter.alert .v { color: var(--critical); }
+.counter.warn .v { color: var(--warning); }
+.badge { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+
+svg { display: block; width: 100%; overflow: visible; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.axisline { stroke: var(--axis); stroke-width: 1; }
+text { fill: var(--muted); font-size: 11px; }
+text.lbl { fill: var(--ink-2); font-size: 11.5px; }
+text.val { fill: var(--ink); font-size: 11.5px; font-variant-numeric: tabular-nums; font-weight: 560; }
+
+.tip {
+  position: fixed; pointer-events: none; z-index: 20; opacity: 0;
+  transition: opacity .08s linear; background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 9px; padding: 8px 10px;
+  font-size: 12px; color: var(--ink); box-shadow: 0 6px 22px rgba(0,0,0,.14); min-width: 132px;
+}
+.tip h4 { margin: 0 0 5px; font-size: 11.5px; color: var(--muted); font-weight: 600; }
+.tip .row { display: flex; justify-content: space-between; gap: 14px; }
+.tip .row i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 6px; }
+.tip .row b { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.empty { color: var(--muted); font-size: 12.5px; padding: 18px 0 22px; text-align: center; }
+.hide { display: none; }
+.foot { color: var(--muted); font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="bar">
+    <h1>Thermocline</h1>
+    <span class="sub" id="idline">connecting…</span>
+    <span class="spacer"></span>
+    <span class="live"><span class="dot" id="livedot"></span><span id="livetxt">live</span></span>
+    <button class="ghost" id="pause">pause</button>
+    <button class="ghost" id="tabletoggle">table</button>
+  </header>
+
+  <!-- Hero row: the three things the design claims, each as a measured number. -->
+  <section class="grid g3" style="margin-bottom:14px">
+    <div class="card">
+      <h2>Served by the fast tier</h2>
+      <p class="note">Share of application commands answered without touching the archive.</p>
+      <div class="hero" id="hitrate">—<span class="unit">%</span></div>
+      <div class="heroline" id="hitline">no traffic yet</div>
+      <div class="bar2" id="hitbar"></div>
+      <div class="legend" id="hitlegend"></div>
+    </div>
+
+    <div class="card">
+      <h2>What that saves</h2>
+      <p class="note">Mean latency of a fast tier hit against a read that fell through.</p>
+      <div class="cmp">
+        <span class="a" id="fastms">—</span>
+        <span class="vs">vs</span>
+        <span class="b" id="archms">—</span>
+      </div>
+      <div class="heroline" id="speedline">waiting for both kinds of read</div>
+    </div>
+
+    <div class="card">
+      <h2>Where the data lives</h2>
+      <p class="note">Documents held by each tier, from collection metadata.</p>
+      <div class="hero" id="fastshare">—<span class="unit">% on the fast tier</span></div>
+      <div class="heroline" id="dataline">reading collection sizes…</div>
+      <div class="bar2" id="databar"></div>
+    </div>
+  </section>
+
+  <!-- Change over time. -->
+  <section class="card" style="margin-bottom:14px">
+    <h2>Commands per second, by how they were served</h2>
+    <p class="note">Last five minutes. Handshake and housekeeping traffic is drawn separately so it cannot flatter the rest.</p>
+    <div id="trafficwrap"><svg id="traffic" height="188" role="img" aria-label="Commands per second by class"></svg></div>
+    <div class="legend" id="trafficlegend"></div>
+  </section>
+
+  <section class="grid g2" style="margin-bottom:14px">
+    <div class="card">
+      <h2>What each kind of command costs</h2>
+      <p class="note">Dot is the mean; the bar runs from the median to the 95th percentile. Log scale, because a hit and a miss are orders of magnitude apart.</p>
+      <div id="latwrap"><svg id="latency" height="210" role="img" aria-label="Latency by class"></svg></div>
+    </div>
+
+    <div class="card">
+      <h2>Documents per tier</h2>
+      <p class="note">Per collection, fast tier against archive.</p>
+      <div id="nswrap"><svg id="nschart" height="210" role="img" aria-label="Documents per tier per namespace"></svg></div>
+      <div class="legend">
+        <span><i style="background:var(--s1)"></i>fast tier</span>
+        <span><i style="background:var(--s2)"></i>archive</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="counters" id="counters" style="margin-bottom:14px"></section>
+
+  <section class="card hide" id="tablecard">
+    <h2>Every number on this page</h2>
+    <p class="note">The charts above are colour-coded; this is the same data as text.</p>
+    <table id="classtable"></table>
+    <table id="nstable" style="margin-top:18px"></table>
+  </section>
+
+  <p class="foot" id="foot"></p>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+// Classes in the order the router reports them. The first five take categorical
+// slots in fixed order; admin is grey because it is not one of the outcomes
+// this system is trying to move traffic between.
+const CLASSES = [
+  {key:"fast",     label:"fast tier",       color:"var(--s1)", real:true},
+  {key:"archive",  label:"from archive",    color:"var(--s2)", real:true},
+  {key:"miss",     label:"miss, copied up", color:"var(--s3)", real:true},
+  {key:"txn_warm", label:"txn warmed",      color:"var(--s4)", real:true},
+  {key:"refused",  label:"refused",         color:"var(--s5)", real:true},
+  {key:"admin",    label:"handshake",       color:"var(--admin)", real:false},
+];
+const REAL = CLASSES.filter(c => c.real);
+
+const $ = id => document.getElementById(id);
+const tip = $("tip");
+let paused = false, snap = null;
+
+const fmt = n => n === null || n === undefined ? "—" : n.toLocaleString("en-US");
+const fmtMs = ms => {
+  if (ms === 0 || ms === null || ms === undefined) return "—";
+  if (ms < 1) return ms.toFixed(2) + " ms";
+  if (ms < 10) return ms.toFixed(2) + " ms";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(2) + " s";
+};
+const fmtBytes = b => {
+  if (!b) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)) + " " + u[i];
+};
+const dur = s => {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  return Math.floor(s/3600) + "h " + Math.floor((s%3600)/60) + "m";
+};
+const el = (tag, attrs, kids) => {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in (attrs||{})) n.setAttribute(k, attrs[k]);
+  (kids||[]).forEach(c => n.appendChild(c));
+  return n;
+};
+const txt = (s, attrs) => { const n = el("text", attrs); n.textContent = s; return n; };
+
+function showTip(html, ev) {
+  tip.innerHTML = html;
+  tip.style.opacity = "1";
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + w > innerWidth - 8) x = ev.clientX - w - pad;
+  if (y + h > innerHeight - 8) y = ev.clientY - h - pad;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+const hideTip = () => { tip.style.opacity = "0"; };
+
+// ---------------------------------------------------------------- hero row
+function drawHero(s) {
+  const cls = {};
+  s.metrics.classes.forEach(c => cls[c.name] = c);
+  const realTotal = REAL.reduce((a, c) => a + (cls[c.key] ? cls[c.key].count : 0), 0);
+  const fastN = cls.fast ? cls.fast.count : 0;
+
+  if (realTotal > 0) {
+    const pct = fastN / realTotal * 100;
+    $("hitrate").innerHTML = (pct >= 99.95 ? "100" : pct.toFixed(1)) + '<span class="unit">%</span>';
+    $("hitline").textContent = fmt(fastN) + " of " + fmt(realTotal) + " commands, " +
+      fmt(realTotal - fastN) + " needed the archive";
+  } else {
+    $("hitrate").innerHTML = '—<span class="unit">%</span>';
+    $("hitline").textContent = "no application traffic yet";
+  }
+
+  const bar = $("hitbar"), leg = $("hitlegend");
+  bar.innerHTML = ""; leg.innerHTML = "";
+  REAL.forEach(c => {
+    const n = cls[c.key] ? cls[c.key].count : 0;
+    if (!n) return;
+    const i = document.createElement("i");
+    i.style.background = c.color;
+    i.style.flex = n + " 1 0";
+    i.title = c.label + ": " + fmt(n);
+    bar.appendChild(i);
+    const sp = document.createElement("span");
+    sp.innerHTML = '<i style="background:' + c.color + '"></i>' + c.label + " " + fmt(n);
+    leg.appendChild(sp);
+  });
+  if (!bar.children.length) bar.innerHTML = '<i style="background:var(--grid);flex:1"></i>';
+
+  // The speed claim, measured rather than asserted.
+  const f = cls.fast, a = cls.archive, m = cls.miss;
+  const slow = (a && a.count) ? a : ((m && m.count) ? m : null);
+  $("fastms").textContent = f && f.count ? fmtMs(f.mean_ms) : "—";
+  $("archms").textContent = slow ? fmtMs(slow.mean_ms) : "—";
+  if (f && f.count && slow && slow.mean_ms > 0 && f.mean_ms > 0) {
+    const ratio = slow.mean_ms / f.mean_ms;
+    $("speedline").textContent =
+      (ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)) + "× slower when the fast tier cannot answer" +
+      " (" + (slow === a ? "read from the archive" : "miss, then copy-up") + ")";
+  } else {
+    $("speedline").textContent = f && f.count
+      ? "nothing has fallen through to the archive yet"
+      : "waiting for both kinds of read";
+  }
+
+  // Where the data lives.
+  const inv = s.inventory && s.inventory.namespaces ? s.inventory.namespaces : [];
+  const hot = inv.reduce((a, n) => a + n.fast_docs, 0);
+  const cold = inv.reduce((a, n) => a + n.archive_docs, 0);
+  const hotB = inv.reduce((a, n) => a + n.fast_bytes, 0);
+  const coldB = inv.reduce((a, n) => a + n.archive_bytes, 0);
+  const db = $("databar"); db.innerHTML = "";
+  if (cold > 0) {
+    const pct = hot / cold * 100;
+    $("fastshare").innerHTML = (pct < 1 && pct > 0 ? pct.toFixed(2) : pct.toFixed(1)) +
+      '<span class="unit">% on the fast tier</span>';
+    $("dataline").textContent = fmt(hot) + " of " + fmt(cold) + " documents · " +
+      fmtBytes(hotB) + " of " + fmtBytes(coldB);
+    const a1 = document.createElement("i"), a2 = document.createElement("i");
+    a1.style.background = "var(--s1)"; a1.style.flex = Math.max(hot, cold * 0.004) + " 1 0";
+    a2.style.background = "var(--s2)"; a2.style.flex = Math.max(cold - hot, 0) + " 1 0";
+    db.appendChild(a1); db.appendChild(a2);
+  } else {
+    $("fastshare").innerHTML = '—<span class="unit">% on the fast tier</span>';
+    $("dataline").textContent = inv.length ? "both tiers are empty" : "no tiered collections configured";
+  }
+}
+
+// ------------------------------------------------------- traffic over time
+function drawTraffic(s) {
+  const svg = $("traffic");
+  svg.innerHTML = "";
+  const hist = s.metrics.history || [];
+  const W = svg.clientWidth || 900, H = 188;
+  const m = {t: 10, r: 8, b: 22, l: 42};
+  const iw = Math.max(10, W - m.l - m.r), ih = H - m.t - m.b;
+
+  if (hist.length < 2) {
+    svg.appendChild(txt("waiting for traffic", {x: W/2, y: H/2, "text-anchor": "middle"}));
+    return;
+  }
+  const idx = CLASSES.map(c => s.metrics.classes.findIndex(x => x.name === c.key));
+  const totals = hist.map(h => idx.reduce((a, i) => a + (i >= 0 ? h.count[i] : 0), 0));
+  const peak = Math.max(1, ...totals);
+  const t0 = hist[0].at, t1 = hist[hist.length - 1].at;
+  const span = Math.max(1, t1 - t0);
+  const X = t => m.l + (t - t0) / span * iw;
+  const Y = v => m.t + ih - (v / peak) * ih;
+
+  // No axis-unit label: the title says per second, and a "cmd/s" caption here
+  // sat on top of the highest tick value.
+  for (let i = 0; i <= 3; i++) {
+    const v = peak * i / 3, y = Y(v);
+    svg.appendChild(el("line", {x1: m.l, y1: y, x2: m.l + iw, y2: y, class: "gridline"}));
+    svg.appendChild(txt(Math.round(v).toLocaleString("en-US"), {x: m.l - 7, y: y + 3.5, "text-anchor": "end"}));
+  }
+
+  // Stacked areas, drawn in class order so the stack order is stable.
+  const base = new Array(hist.length).fill(0);
+  CLASSES.forEach((c, ci) => {
+    const i = idx[ci];
+    if (i < 0) return;
+    if (!hist.some(h => h.count[i] > 0)) return;
+    let up = "", down = "";
+    hist.forEach((h, k) => {
+      const x = X(h.at), y = Y(base[k] + h.count[i]);
+      up += (k ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1);
+    });
+    for (let k = hist.length - 1; k >= 0; k--) {
+      down += "L" + X(hist[k].at).toFixed(1) + "," + Y(base[k]).toFixed(1);
+    }
+    svg.appendChild(el("path", {d: up + down + "Z", fill: c.color, "fill-opacity": 0.85,
+      stroke: "var(--surface)", "stroke-width": 1}));
+    hist.forEach((h, k) => base[k] += h.count[i]);
+  });
+
+  svg.appendChild(el("line", {x1: m.l, y1: m.t + ih, x2: m.l + iw, y2: m.t + ih, class: "axisline"}));
+  svg.appendChild(txt(dur(t1 - t0) + " ago", {x: m.l, y: H - 6}));
+  svg.appendChild(txt("now", {x: m.l + iw, y: H - 6, "text-anchor": "end"}));
+
+  // Crosshair and tooltip.
+  const hair = el("line", {y1: m.t, y2: m.t + ih, class: "axisline", opacity: 0});
+  svg.appendChild(hair);
+  const hit = el("rect", {x: m.l, y: m.t, width: iw, height: ih, fill: "transparent"});
+  svg.appendChild(hit);
+  hit.addEventListener("mousemove", ev => {
+    const bb = svg.getBoundingClientRect();
+    const t = t0 + (ev.clientX - bb.left - m.l) / iw * span;
+    let best = hist[0], bd = Infinity;
+    hist.forEach(h => { const d = Math.abs(h.at - t); if (d < bd) { bd = d; best = h; } });
+    hair.setAttribute("x1", X(best.at)); hair.setAttribute("x2", X(best.at));
+    hair.setAttribute("opacity", 1);
+    let rows = "", tot = 0;
+    CLASSES.forEach((c, ci) => {
+      const i = idx[ci]; if (i < 0) return;
+      const n = best.count[i]; if (!n) return;
+      tot += n;
+      rows += '<div class="row"><span><i style="background:' + c.color + '"></i>' + c.label +
+        '</span><b>' + fmt(n) + " · " + fmtMs(best.mean_ms[i]) + "</b></div>";
+    });
+    if (!rows) rows = '<div class="row"><span>idle</span><b>0</b></div>';
+    showTip("<h4>" + new Date(best.at * 1000).toLocaleTimeString() + " · " + fmt(tot) + " cmd/s</h4>" + rows, ev);
+  });
+  hit.addEventListener("mouseleave", () => { hideTip(); hair.setAttribute("opacity", 0); });
+
+  const leg = $("trafficlegend"); leg.innerHTML = "";
+  CLASSES.forEach(c => {
+    const sp = document.createElement("span");
+    sp.innerHTML = '<i style="background:' + c.color + '"></i>' + c.label;
+    leg.appendChild(sp);
+  });
+}
+
+// ------------------------------------------------------------- latency plot
+function drawLatency(s) {
+  const svg = $("latency");
+  svg.innerHTML = "";
+  const W = svg.clientWidth || 520;
+  const rows = REAL.map(c => ({c, d: s.metrics.classes.find(x => x.name === c.key)}))
+                   .filter(r => r.d && r.d.count > 0);
+  const pitch = rows.length <= 3 ? 46 : 36;
+  const H = Math.max(120, 34 + rows.length * pitch + 26);
+  svg.setAttribute("height", H);
+  if (!rows.length) {
+    svg.appendChild(txt("no commands recorded yet", {x: W/2, y: 60, "text-anchor": "middle"}));
+    return;
+  }
+  const m = {t: 16, r: 66, b: 26, l: 106};
+  const iw = Math.max(40, W - m.l - m.r);
+  const lo = 0.1, hi = Math.max(10, ...rows.map(r => r.d.p99_ms || r.d.max_ms || 1)) * 1.4;
+  const X = v => m.l + (Math.log10(Math.max(lo, v)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo)) * iw;
+
+  // Decade gridlines: the log scale has to be legible or it is a lie.
+  for (let e = Math.log10(lo); e <= Math.log10(hi) + 0.001; e++) {
+    const v = Math.pow(10, e), x = X(v);
+    svg.appendChild(el("line", {x1: x, y1: m.t - 6, x2: x, y2: H - m.b, class: "gridline"}));
+    svg.appendChild(txt(v < 1 ? v + " ms" : (v < 1000 ? v + " ms" : (v/1000) + " s"),
+      {x: x, y: H - m.b + 14, "text-anchor": "middle"}));
+  }
+
+  rows.forEach((r, i) => {
+    const y = m.t + i * pitch + 11;
+    svg.appendChild(txt(r.c.label, {x: m.l - 10, y: y + 4, "text-anchor": "end", class: "lbl"}));
+    const x50 = X(r.d.p50_ms || r.d.mean_ms), x95 = X(r.d.p95_ms || r.d.mean_ms), xm = X(r.d.mean_ms);
+    // Only when the spread is wide enough to read as a bar. A degenerate range,
+    // which is what a class with few samples in one bucket produces, drew a
+    // rounded stub that looked like a second data point.
+    if (x95 - x50 > 4) {
+      svg.appendChild(el("line", {x1: x50, y1: y, x2: x95, y2: y,
+        stroke: r.c.color, "stroke-width": 4, "stroke-linecap": "round", opacity: 0.42}));
+    }
+    svg.appendChild(el("circle", {cx: xm, cy: y, r: 5.5, fill: r.c.color,
+      stroke: "var(--surface)", "stroke-width": 2}));
+    // Direct label: light-mode contrast for three of these hues is below 3:1,
+    // so the number never depends on the colour being readable.
+    svg.appendChild(txt(fmtMs(r.d.mean_ms), {x: m.l + iw + 8, y: y + 4, class: "val"}));
+
+    const hit = el("rect", {x: m.l, y: y - pitch/2, width: iw, height: pitch, fill: "transparent"});
+    svg.appendChild(hit);
+    hit.addEventListener("mousemove", ev => showTip(
+      "<h4>" + r.c.label + "</h4>" +
+      '<div class="row"><span>commands</span><b>' + fmt(r.d.count) + "</b></div>" +
+      '<div class="row"><span>mean</span><b>' + fmtMs(r.d.mean_ms) + "</b></div>" +
+      '<div class="row"><span>median</span><b>' + fmtMs(r.d.p50_ms) + "</b></div>" +
+      '<div class="row"><span>p95</span><b>' + fmtMs(r.d.p95_ms) + "</b></div>" +
+      '<div class="row"><span>p99</span><b>' + fmtMs(r.d.p99_ms) + "</b></div>" +
+      '<div class="row"><span>max</span><b>' + fmtMs(r.d.max_ms) + "</b></div>", ev));
+    hit.addEventListener("mouseleave", hideTip);
+  });
+  svg.appendChild(el("line", {x1: m.l, y1: H - m.b, x2: m.l + iw, y2: H - m.b, class: "axisline"}));
+}
+
+// ------------------------------------------------------- namespaces per tier
+function drawNamespaces(s) {
+  const svg = $("nschart");
+  svg.innerHTML = "";
+  const W = svg.clientWidth || 500;
+  const inv = (s.inventory && s.inventory.namespaces ? s.inventory.namespaces : [])
+    .filter(n => n.archive_docs > 0 || n.fast_docs > 0)
+    .sort((a, b) => Math.max(b.archive_docs, b.fast_docs) - Math.max(a.archive_docs, a.fast_docs))
+    .slice(0, 8);
+  const H = Math.max(120, 18 + inv.length * 30 + 14);
+  svg.setAttribute("height", H);
+  if (!inv.length) {
+    svg.appendChild(txt("no tiered collections hold documents yet", {x: W/2, y: 60, "text-anchor": "middle"}));
+    return;
+  }
+  const m = {t: 10, r: 84, b: 6, l: 118};
+  const iw = Math.max(40, W - m.l - m.r);
+  const peak = Math.max(1, ...inv.map(n => Math.max(n.archive_docs, n.fast_docs)));
+
+  inv.forEach((n, i) => {
+    const y = m.t + i * 30;
+    const short = n.ns.length > 20 ? "…" + n.ns.slice(-19) : n.ns;
+    svg.appendChild(txt(short, {x: m.l - 10, y: y + 14, "text-anchor": "end", class: "lbl"}));
+    // Archive behind, fast tier in front: the archive holds everything, so this
+    // reads as "how much of the whole is kept hot" rather than as two totals.
+    const wA = Math.max(2, n.archive_docs / peak * iw);
+    const wF = Math.max(n.fast_docs > 0 ? 2 : 0, n.fast_docs / peak * iw);
+    svg.appendChild(el("rect", {x: m.l, y: y + 3, width: wA, height: 9, rx: 4, fill: "var(--s2)", "fill-opacity": 0.9}));
+    if (wF) svg.appendChild(el("rect", {x: m.l, y: y + 14, width: wF, height: 9, rx: 4, fill: "var(--s1)"}));
+    const pct = n.archive_docs > 0 ? (n.fast_docs / n.archive_docs * 100) : 0;
+    svg.appendChild(txt((pct >= 100 ? "100" : pct < 1 && pct > 0 ? pct.toFixed(1) : Math.round(pct)) + "% hot",
+      {x: m.l + iw + 8, y: y + 16, class: "val"}));
+
+    const hit = el("rect", {x: m.l, y: y, width: iw + 70, height: 28, fill: "transparent"});
+    svg.appendChild(hit);
+    hit.addEventListener("mousemove", ev => showTip(
+      "<h4>" + n.ns + "</h4>" +
+      '<div class="row"><span><i style="background:var(--s1)"></i>fast tier</span><b>' +
+        fmt(n.fast_docs) + " · " + fmtBytes(n.fast_bytes) + "</b></div>" +
+      '<div class="row"><span><i style="background:var(--s2)"></i>archive</span><b>' +
+        fmt(n.archive_docs) + " · " + fmtBytes(n.archive_bytes) + "</b></div>", ev));
+    hit.addEventListener("mouseleave", hideTip);
+  });
+}
+
+// ----------------------------------------------------------------- counters
+function drawCounters(s) {
+  const c = s.counters;
+  const items = [
+    {k: "read misses",     v: c.read_misses,    hint: "point lookups found in the archive and copied up"},
+    {k: "copied up",       v: c.copied_up,      hint: "documents brought back to the fast tier"},
+    {k: "from archive",    v: c.from_archive,   hint: "reads the fast tier could not answer in full"},
+    {k: "txn replays",     v: c.txn_replays,    hint: "transactions replayed after a copy-up", warn: false},
+    {k: "duplicates stopped", v: c.duplicate_keys, hint: "cross-tier unique key violations refused", good: true},
+    {k: "refused",         v: c.refused,        hint: "commands the router would not answer", alert: c.refused > 0},
+    {k: "stale reads",     v: c.stale_reads,    hint: "archive reads answered before mirroring caught up", warn: c.stale_reads > 0},
+    {k: "clients",         v: c.clients_open,   hint: "connections open now"},
+  ];
+  const wrap = $("counters");
+  wrap.innerHTML = "";
+  wrap.style.gridTemplateColumns = "repeat(" + Math.min(8, items.length) + ", 1fr)";
+  items.forEach(it => {
+    const d = document.createElement("div");
+    d.className = "counter" + (it.alert ? " alert" : it.warn ? " warn" : "");
+    const badge = it.alert ? '<span class="badge" style="background:var(--critical)"></span>'
+                : it.warn ? '<span class="badge" style="background:var(--warning)"></span>'
+                : it.good && it.v > 0 ? '<span class="badge" style="background:var(--good)"></span>' : "";
+    d.innerHTML = '<div class="k">' + badge + it.k + '</div><div class="v">' + fmt(it.v) + "</div>";
+    d.title = it.hint;
+    wrap.appendChild(d);
+  });
+  if (window.matchMedia("(max-width: 900px)").matches) wrap.style.gridTemplateColumns = "repeat(2, 1fr)";
+}
+
+// -------------------------------------------------------------- table view
+function drawTable(s) {
+  let h = "<tr><th>how it was served</th><th>commands</th><th>mean</th><th>median</th><th>p95</th><th>p99</th><th>max</th></tr>";
+  CLASSES.forEach(c => {
+    const d = s.metrics.classes.find(x => x.name === c.key);
+    if (!d) return;
+    h += "<tr><td><span class='swatch' style='background:" + c.color + "'></span>" + c.label + "</td>" +
+      "<td class='num'>" + fmt(d.count) + "</td><td class='num'>" + fmtMs(d.mean_ms) + "</td>" +
+      "<td class='num'>" + fmtMs(d.p50_ms) + "</td><td class='num'>" + fmtMs(d.p95_ms) + "</td>" +
+      "<td class='num'>" + fmtMs(d.p99_ms) + "</td><td class='num'>" + fmtMs(d.max_ms) + "</td></tr>";
+  });
+  $("classtable").innerHTML = h;
+
+  let n = "<tr><th>collection</th><th>fast docs</th><th>archive docs</th><th>fast size</th><th>archive size</th><th>hot</th></tr>";
+  (s.inventory.namespaces || []).forEach(x => {
+    const pct = x.archive_docs > 0 ? (x.fast_docs / x.archive_docs * 100) : 0;
+    n += "<tr><td>" + x.ns + "</td><td class='num'>" + fmt(x.fast_docs) + "</td><td class='num'>" +
+      fmt(x.archive_docs) + "</td><td class='num'>" + fmtBytes(x.fast_bytes) + "</td><td class='num'>" +
+      fmtBytes(x.archive_bytes) + "</td><td class='num'>" + (x.archive_docs ? pct.toFixed(1) + "%" : "—") + "</td></tr>";
+  });
+  $("nstable").innerHTML = n;
+}
+
+// --------------------------------------------------------------- the loop
+function render(s) {
+  snap = s;
+  $("idline").innerHTML = "listening on <b>" + (s.listen || "?") + "</b> · fast tier <b>" +
+    (s.fast_tier || "?") + "</b> · completeness <b>" + s.completeness + "</b> · feeder <b>" +
+    (s.feeder_id || "—") + "</b> · up <b>" + dur(s.uptime_s) + "</b>";
+  drawHero(s); drawTraffic(s); drawLatency(s); drawNamespaces(s); drawCounters(s); drawTable(s);
+  const inv = s.inventory && s.inventory.updated
+    ? "tier sizes read " + dur(Math.max(0, s.now - s.inventory.updated)) + " ago"
+    : "tier sizes not read yet";
+  $("foot").textContent = inv + " · archive reads wait up to " + s.archive_wait +
+    " for mirroring · page refreshes every 2s";
+}
+
+async function poll() {
+  if (paused) return;
+  try {
+    const r = await fetch("api/snapshot", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+    $("livedot").classList.remove("paused");
+    $("livetxt").textContent = "live";
+  } catch (e) {
+    $("livedot").classList.add("paused");
+    $("livetxt").textContent = "router unreachable";
+  }
+}
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "resume" : "pause";
+  $("livedot").classList.toggle("paused", paused);
+  $("livetxt").textContent = paused ? "paused" : "live";
+  if (!paused) poll();
+});
+$("tabletoggle").addEventListener("click", () => {
+  const c = $("tablecard");
+  c.classList.toggle("hide");
+  $("tabletoggle").textContent = c.classList.contains("hide") ? "table" : "hide table";
+});
+addEventListener("resize", () => { if (snap) { drawTraffic(snap); drawLatency(snap); drawNamespaces(snap); } });
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

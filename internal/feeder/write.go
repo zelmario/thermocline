@@ -36,6 +36,13 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	if err := f.flush(ctx); err != nil {
 		return err
 	}
+
+	// The position goes out first and on its own schedule. Everything buffered
+	// is now in the archive, which is exactly what a fallback read is waiting
+	// to hear, and making it wait for the checkpoint's slower cadence is what
+	// used to turn a two millisecond archive read into a one second one.
+	f.publishPosition(ctx)
+
 	if len(f.lastToken) == 0 {
 		return nil
 	}
@@ -201,3 +208,23 @@ func (f *Feeder) namespaceDescription() string {
 
 // compile-time guard that the policy constants stay in sync with classify.
 var _ = []config.UnannouncedDeletes{config.Tombstone, config.Ignore, config.Halt}
+
+// publishPosition tells everyone else how far mirroring has got.
+//
+// A failure here is logged at debug and otherwise ignored. The position is a
+// hint that makes fallback reads fast; losing one costs the next such read a
+// wait it would have had anyway, and stopping mirroring over it would be
+// absurd.
+func (f *Feeder) publishPosition(ctx context.Context) {
+	if f.cfg.PositionEvery <= 0 || f.lastEventAt.IsZero() {
+		return
+	}
+	if time.Since(f.lastPublished) < f.cfg.PositionEvery {
+		return
+	}
+	if err := f.pos.Save(ctx, f.cfg.ID, f.lastEventAt, f.cfg.PositionEvery); err != nil {
+		f.log.Debug("could not publish the mirroring position", "err", err)
+		return
+	}
+	f.lastPublished = time.Now()
+}

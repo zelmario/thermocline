@@ -69,6 +69,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	}
 
 	c.r.Stats.ReadMisses.Add(1)
+	c.cls = ClassMiss
 	// A document deleted a moment ago is still live in the archive until the
 	// tombstone is mirrored, so a miss has to wait for mirroring before it can
 	// treat the archive's copy as the truth.
@@ -90,6 +91,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 			return nil, cerr
 		}
 		c.r.Stats.TxnReplays.Add(1)
+		c.cls = ClassTxnWarm
 		c.log.Debug("replaying a transaction after a read miss", "ns", ns)
 		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
 			"this transaction read a document that had been archived, and it has now been restored to the fast tier")
@@ -161,11 +163,13 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 		// Not in the archive either, so matching nothing was the truth.
 		return reply, nil
 	}
+	c.cls = ClassMiss
 
 	// Inside a transaction the copy-up landed outside the caller's snapshot, so
 	// re-running the statement here would miss again. Ask for a replay instead.
 	if inTransaction(cmd) {
 		c.r.Stats.TxnReplays.Add(1)
+		c.cls = ClassTxnWarm
 		c.log.Debug("replaying a transaction after a copy-up", "ns", ns)
 		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
 			"this transaction wrote to a document that had been archived, and it has now been restored to the fast tier")
@@ -215,8 +219,10 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 	if !copied {
 		return reply, nil
 	}
+	c.cls = ClassMiss
 	if inTransaction(cmd) {
 		c.r.Stats.TxnReplays.Add(1)
+		c.cls = ClassTxnWarm
 		c.log.Debug("replaying a transaction after a copy-up", "ns", ns)
 		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
 			"this transaction acted on a document that had been archived, and it has now been restored to the fast tier")
@@ -288,9 +294,25 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 
 	// A transaction is the one place the archive fallback cannot go. Reading
 	// one tier inside the caller's snapshot and the other outside it is not a
-	// transaction any more, and no copy-up fixes a whole range.
+	// transaction any more. So rather than reading the archive, the documents
+	// are moved to the tier the transaction is already reading and it is
+	// replayed. Only a range too large to move is refused.
 	if cmd, cerr := msg.CommandDoc(); cerr == nil && inTransaction(cmd) {
+		if filter, fok := txnFilter(cmd, "find"); fok {
+			switch out, res := c.warmForTxn(ctx, ns, filter, reply.Header.RequestID, msg.Header.RequestID,
+				"the documents this transaction reads"); res {
+			case txnWarmReplay:
+				c.r.Stats.TxnReplays.Add(1)
+				c.cls = ClassTxnWarm
+				return out, nil
+			case txnWarmComplete:
+				// The archive holds nothing matching that the fast tier lacks,
+				// so the answer already in hand is the whole answer.
+				return reply, nil
+			}
+		}
 		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
 		c.log.Warn("refused a transactional read that spans both tiers", "ns", ns, "because", because)
 		return c.r.txnCannotSpanTiers(reply.Header.RequestID, msg.Header.RequestID, ns, because)
 	}
@@ -314,6 +336,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	}
 
 	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
 	c.log.Warn("refused a query that would return a short answer", "ns", ns, "because", because)
 	return c.r.errorReply(msg, reply, fmt.Sprintf(
 		"thermocline: refusing this query because %s. %s. To allow short answers instead, set router.completeness to permissive.",

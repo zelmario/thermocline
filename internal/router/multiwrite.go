@@ -89,7 +89,23 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		}
 
 		if inTransaction(cmd) {
+			// The copy-up is an ordinary write outside the transaction, so the
+			// transaction's snapshot was taken before it landed and repeating
+			// the statement now would still miss. Replaying the whole
+			// transaction is what makes the documents visible to it.
+			switch out, res := c.warmForTxn(ctx, ns, fdoc, msg.Header.RequestID, msg.Header.RequestID,
+				"the documents this transaction writes"); res {
+			case txnWarmReplay:
+				c.r.Stats.TxnReplays.Add(1)
+				c.cls = ClassTxnWarm
+				return out, true
+			case txnWarmComplete:
+				// Every document this statement matches is already on the fast
+				// tier, so the write reaches all of them.
+				continue
+			}
 			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
 			out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, ns,
 				"a multi-document write inside a transaction cannot reach documents the fast tier does not hold")
 			if terr != nil {
@@ -114,6 +130,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		}
 
 		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
 		c.log.Warn("refused a multi-document write that would only partly apply",
 			"ns", ns, "command", name, "err", cerr)
 		out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
@@ -149,6 +166,13 @@ func statementIsMulti(st bson.Raw, name string) bool {
 
 // copyUpMatching brings every archived document matching filter into the fast
 // tier, skipping the ones already there.
+//
+// It returns how many documents it actually moved, not how many it looked at.
+// The two are different whenever the fast tier already held some of them, and
+// the difference matters: a caller that reads a zero here has been told
+// something true and useful, that the fast tier is not missing anything this
+// filter matches. Counting documents examined instead made that answer
+// impossible, and a transaction waiting for it replayed itself forever.
 func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw) (int, error) {
 	db, coll := splitNS(ns)
 	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, liveOnly(bson.RawValue{
@@ -165,14 +189,19 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 	ids := make([]string, 0, 256)
 	var raw []bson.RawValue
 	copied := 0
+	moved := 0
 
 	flush := func() error {
 		if len(models) == 0 {
 			return nil
 		}
-		if _, err := hot.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+		res, err := hot.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+		if err != nil {
 			return fmt.Errorf("copy up into %s: %w", ns, err)
 		}
+		// Only the upserts moved a document. The rest matched a copy the fast
+		// tier already had, which $setOnInsert deliberately leaves alone.
+		moved += int(res.UpsertedCount)
 		if err := meta.ClearEvictionNotices(ctx, r.cold, ids); err != nil {
 			r.log.Warn("copied up but could not clear eviction notices", "ns", ns, "err", err)
 		}
@@ -182,7 +211,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 				break
 			}
 		}
-		r.Stats.CopiedUp.Add(int64(len(models)))
+		r.Stats.CopiedUp.Add(res.UpsertedCount)
 		models = models[:0]
 		ids = ids[:0]
 		raw = raw[:0]
@@ -191,7 +220,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 
 	for cur.Next(ctx) {
 		if copied >= maxCopyUpForWrite {
-			return copied, fmt.Errorf("more than %d documents would have to be brought back from the archive; "+
+			return moved, fmt.Errorf("more than %d documents would have to be brought back from the archive; "+
 				"warm that range first, or narrow the filter", maxCopyUpForWrite)
 		}
 		doc := bson.Raw(cur.Current)
@@ -210,15 +239,15 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 		copied++
 		if len(models) >= 256 {
 			if err := flush(); err != nil {
-				return copied, err
+				return moved, err
 			}
 		}
 	}
 	if err := cur.Err(); err != nil {
-		return copied, fmt.Errorf("read the archive: %w", err)
+		return moved, fmt.Errorf("read the archive: %w", err)
 	}
 	if err := flush(); err != nil {
-		return copied, err
+		return moved, err
 	}
-	return copied, nil
+	return moved, nil
 }

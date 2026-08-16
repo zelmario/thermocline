@@ -50,7 +50,19 @@ func (r *Router) mirroredThrough(ctx context.Context) (time.Time, bool) {
 	}
 	r.ckptCache.mu.Unlock()
 
-	at, known, err := r.checkpoints.EventAt(ctx, r.cfg.FeederID)
+	// The position first. It says the same thing the checkpoint's eventAt says,
+	// published on its own much faster cadence, and it is the difference
+	// between this wait costing a couple of milliseconds and costing a whole
+	// checkpoint interval. The checkpoint remains the fallback, for a feeder
+	// that publishes no position.
+	var at time.Time
+	var known bool
+	rec, ok, err := r.positions.At(ctx, r.cfg.FeederID)
+	if err == nil && ok && rec.Live(time.Now()) {
+		at, known = rec.At, true
+	} else {
+		at, known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
+	}
 	if err != nil {
 		return time.Time{}, false
 	}

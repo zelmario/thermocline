@@ -194,6 +194,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	// to the other cluster without leaving the caller's snapshot behind.
 	if inTransaction(cmd) {
 		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
 		c.log.Warn("refused a transactional aggregation that spans both tiers", "ns", scope.primary)
 		out, err := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, scope.primary, because)
 		if err != nil {
@@ -239,6 +240,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	}
 
 	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
 	c.log.Warn("refused an aggregation that would return a short answer",
 		"ns", scope.primary, "because", because, "writes", scope.writes)
 

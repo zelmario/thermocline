@@ -284,6 +284,15 @@ func runRouter(args []string) error {
 
 	r := router.New(hot, cold, cfg.Router, log)
 	go reportRouterStats(ctx, r, log)
+	if cfg.Router.Dashboard != "" {
+		go func() {
+			if derr := r.ServeDashboard(ctx, cfg.Router.Dashboard); derr != nil {
+				// A dashboard that cannot bind is not a reason to stop routing
+				// traffic. It is a reason to say so loudly.
+				log.Error("dashboard stopped", "err", derr)
+			}
+		}()
+	}
 	if err := r.Listen(ctx); err != nil {
 		return fatal(log, "router", err)
 	}

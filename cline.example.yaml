@@ -40,14 +40,42 @@ feeder:
 
   # How often the resume position is saved. Mirroring is idempotent, so this
   # trades repeated work after a restart against checkpoint writes.
+  #
+  # This used to set how long a read falling through to the archive waited, and
+  # it should not: with checkpoint_every at 5s such a read took 4.5 seconds
+  # against 1.8 ms for the query itself, because it was waiting for the next
+  # checkpoint rather than for mirroring. Freshness now has its own setting
+  # below and this one is back to meaning only what it says.
   checkpoint_every: 5s
+
+  # How often the feeder publishes how far it has mirrored.
+  #
+  # A read the fast tier cannot answer goes to the archive, and the archive
+  # trails the fast tier, so the router waits for mirroring to reach the instant
+  # the read began before answering. This is how often it can find that out, so
+  # it sets the floor on such a read's latency.
+  #
+  # The write is one small document with no resume token, at w:1, so several a
+  # second cost nothing. Lower it if fallback reads matter; raise it if they are
+  # rare and you would rather have the writes back. Zero turns it off and falls
+  # back to the checkpoint, which is where this information used to live.
+  position_every: 250ms
 
   # Documents per bulk write to the cold tier.
   batch_size: 500
 
   # How long a change stream poll blocks before returning empty. Also sets how
   # often an idle feeder flushes and checkpoints.
-  max_await: 1s
+  #
+  # On an idle database this is the floor under everything above. The feeder
+  # only learns that time has passed with nothing written when the poll times
+  # out and hands back an advanced resume token, so it cannot publish a position
+  # newer than that, and a fallback read cannot beat it. Budget a fallback read
+  # at roughly max_await + position_every.
+  #
+  # Lowering it costs one cheap getMore per interval against the fast tier and
+  # nothing else. Take it to 100ms if fallback reads are on a user's path.
+  max_await: 500ms
 
   # What to do with a delete on the fast tier that the evictor did not
   # announce. The evictor announces every document it removes, so an
@@ -149,3 +177,13 @@ router:
 
   # How long a copied-up document is protected from the evictor.
   residency: 30d
+
+  # The operator dashboard: one page showing what each tier is holding, how
+  # commands were served, and what each kind of command cost. Empty means off.
+  #
+  # Keep it off the address the application dials. The page names collections
+  # and reports traffic, and it has no authentication of its own, so it belongs
+  # on an operator network or behind whatever already fronts your internal
+  # tooling.
+  #
+  # dashboard: "127.0.0.1:27101"

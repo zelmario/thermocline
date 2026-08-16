@@ -196,6 +196,7 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	}
 
 	c.r.Stats.Archived.Add(1)
+	c.cls = ClassArchive
 	return cursorReply(msg.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", batch)
 }
 
@@ -500,7 +501,20 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	c.r.Stats.Incomplete.Add(1)
 
 	if inTransaction(cmd) {
+		if filter, fok := txnFilter(cmd, name); fok {
+			switch out, res := c.warmForTxn(ctx, ns, filter, msg.Header.RequestID, msg.Header.RequestID,
+				"the documents this transaction counts"); res {
+			case txnWarmReplay:
+				c.r.Stats.TxnReplays.Add(1)
+				c.cls = ClassTxnWarm
+				return out, true
+			case txnWarmComplete:
+				// Nothing is missing, so the fast tier can answer this itself.
+				return nil, false
+			}
+		}
 		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
 		out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, ns, because)
 		if terr != nil {
 			return nil, false
@@ -512,6 +526,7 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 		out, aerr := c.answerSimpleFromArchive(ctx, msg, db, cmd)
 		if aerr == nil {
 			c.r.Stats.Archived.Add(1)
+			c.cls = ClassArchive
 			c.log.Debug("read answered from the archive", "ns", ns, "command", name, "because", because)
 			return out, true
 		}
@@ -524,6 +539,7 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	}
 
 	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
 	c.log.Warn("refused a query that would return a short answer", "ns", ns, "because", because)
 	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
 		"thermocline: refusing this query because "+because+

@@ -31,6 +31,10 @@ const (
 	// Checkpoints stores one change stream resume token per feeder.
 	Checkpoints = "checkpoints"
 
+	// PositionsColl holds how far each feeder has mirrored, published far more
+	// often than the durable checkpoint because a fallback read waits on it.
+	PositionsColl = "positions"
+
 	// Warming is the announcement channel between warmer and feeder, mirroring
 	// what Evicting does in the other direction. A document copied up into the
 	// fast tier produces an insert that the feeder would otherwise mirror

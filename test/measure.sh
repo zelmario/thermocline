@@ -23,6 +23,10 @@ stopDaemons() {
   pkill -f 'cline feeder|cline router' 2>/dev/null
   for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
+stopFeeder() {
+  pkill -f 'cline feeder' 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
 startFeeder() {
   cline feeder --config $CFG --log-file /var/log/cline/bench_f.log & FP=$!
   for _ in $(seq 1 60); do
@@ -31,6 +35,10 @@ startFeeder() {
   done
 }
 startRouter() {
+  # Truncated, because the stale-read count below greps this file. Appending
+  # across runs made it report warnings from an hour ago as if this run had
+  # produced them.
+  rm -f /var/log/cline/bench_r.log
   cline router --config $CFG --log-file /var/log/cline/bench_r.log & RP=$!
   for _ in $(seq 1 30); do
     mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
@@ -44,6 +52,14 @@ echo "== setup: $N documents =="
 stopDaemons
 H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
 C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({})" >/dev/null
+# The write section's unique collection has to go from the archive and the key
+# registry too, not just the fast tier. Dropping it on one tier leaves the
+# mirrored copies live in the other, their key claims still point at owners that
+# exist there, and every insert in the next run is refused as an archived
+# duplicate. Correct behaviour, wrong fixture.
+H "db.getSiblingDB('shop').benchuniq.drop()" >/dev/null
+C "db.getSiblingDB('shop').benchuniq.drop()" >/dev/null
+H "db.getSiblingDB('_thermocline').keys.deleteMany({ns:'shop.benchuniq'})" >/dev/null
 startFeeder
 startRouter
 
@@ -111,15 +127,78 @@ bench('aggregate \$group, from archive', 50, () => c.aggregate([{\$group:{_id:'\
 "
 
 echo
+echo "== the same reads with the freshness barrier off =="
+# The numbers above are not the archive's speed. Before answering from the
+# archive the router waits for mirroring to reach the instant the read began,
+# and the checkpoint it waits on only moves every feeder.checkpoint_every. So a
+# fallback read pays up to one checkpoint interval no matter how fast the query
+# is. router.archive_wait: 0 turns that barrier off, which gives up the promise
+# that a fallback read sees your own last write, and isolates the query cost.
+python3 - <<'PY'
+s = open('/root/cline.yaml').read()
+s = s.replace('  completeness: archive', '  completeness: archive\n  archive_wait: 0s')
+open('/root/bench_nowait.yaml', 'w').write(s)
+PY
+pkill -f 'cline router' 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f 'cline router' >/dev/null 2>&1 || break; sleep 0.5; done
+cline router --config /root/bench_nowait.yaml --log-file /var/log/cline/bench_nw.log & RP=$!
+for _ in $(seq 1 30); do
+  mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+bench('range, 100 documents, from archive', 200, i => c.find({n:{\$gte:(i*7)%($N-100), \$lt:((i*7)%($N-100))+100}}).toArray());
+bench('countDocuments, from archive', 50, () => c.countDocuments({}));
+bench('aggregate \$group, from archive', 50, () => c.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}}]).toArray());
+"
+pkill -f 'cline router' 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f 'cline router' >/dev/null 2>&1 || break; sleep 0.5; done
+startRouter
+
+echo
+echo "== and with the shipped default checkpoint_every: 5s =="
+# This config uses 1s so the suites run in minutes. The default is 5s, and the
+# barrier can only be as precise as the checkpoint it waits on, so this is what
+# a fallback read costs out of the box. Few reps, because each one is slow by
+# construction: the point is the interval, not the sample size.
+python3 - <<'PY'
+s = open('/root/cline.yaml').read()
+s = s.replace('checkpoint_every: 1s', 'checkpoint_every: 5s')
+open('/root/bench_ckpt5.yaml', 'w').write(s)
+PY
+stopFeeder
+cline feeder --config /root/bench_ckpt5.yaml --log-file /var/log/cline/bench_c5.log & FP=$!
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
+bench('range, 100 documents, from archive', 20, i => c.find({n:{\$gte:(i*7)%($N-100), \$lt:((i*7)%($N-100))+100}}).toArray());
+"
+# archive_wait defaults to 5s as well, so once the checkpoint interval reaches
+# it, some reads give up waiting and answer stale rather than slow. That is the
+# barrier failing quietly, and it is worth counting.
+echo "  reads that gave up waiting: $(grep -c 'before mirroring caught up' /var/log/cline/bench_r.log 2>/dev/null || echo 0)"
+stopFeeder
+startFeeder
+
+echo
 echo "== a read miss: the document is only in the archive =="
 # Remove a slice from the fast tier without the feeder seeing it, so those
 # documents are archived rather than deleted. The first read of each is a miss.
 cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
-pkill -f 'cline feeder'; sleep 1
+# The feeder has to be gone before the delete, not merely asked to go. If it is
+# still watching, it tombstones these documents in the archive instead, every
+# read below misses in both tiers, and the "miss" numbers are timings of a
+# lookup that found nothing.
+stopFeeder
 H "db.getSiblingDB('shop').$NS.deleteMany({n:{\$lt:1000}})" >/dev/null
 C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
 startFeeder
-sleep 3
+GONE=$(H "print(db.getSiblingDB('shop').$NS.countDocuments({n:{\$lt:1000}}))")
+LIVE=$(C "print(db.getSiblingDB('shop').$NS.countDocuments({n:{\$lt:1000},_tcDeletedAt:{\$exists:false}}))")
+echo "  fast tier holds $GONE of the slice, archive holds $LIVE live (want 0 and 1000)"
 mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "${BENCH//NSNAME/$NS}
 // Each id is read once, so every one of these is a genuine miss.
 let miss = 0;
@@ -139,8 +218,14 @@ let j = 0;
 bench('insert, one unique index (key claimed)', 500, () => u.insertOne({email:'u'+(j++)+'@x.com'}));
 let m = 0;
 bench('update, new key readable from the command', 300, () => u.updateOne({email:'u'+(m)+'@x.com'},{\$set:{email:'v'+(m++)+'@x.com'}}));
+// A pipeline update: the new key is an expression, so it cannot be read off
+// the command and the router has to evaluate it against the fast tier first.
+// This was a \$rename, which emptied the field instead of moving it, and the
+// second document to lose it collided with the first on {email: null}: a
+// non-sparse unique index holds exactly one missing field. The failure was the
+// benchmark's, not the router's, and it stopped this section short.
 let q = 0;
-bench('update, new key needs the dry run', 300, () => u.updateOne({email:'v'+(q)+'@x.com'},{\$rename:{email:'addr'+(q++)}}));
+bench('update, new key needs the dry run', 300, () => u.updateOne({email:'v'+(q++)+'@x.com'},[{\$set:{email:{\$concat:['\$email','.x']}}}]));
 "
 
 stopDaemons

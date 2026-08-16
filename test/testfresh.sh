@@ -65,7 +65,7 @@ waitMirrored() {
 echo "== setup =="
 stopDaemons
 H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({})" >/dev/null
+C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').positions.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 R "const c=db.getSiblingDB('shop').$NS; const d=[];
@@ -102,13 +102,52 @@ chk "ten write-then-read pairs all agree" "ok" "$(R "
   }
   print('ok');")"
 
+echo "== a fallback read waits for mirroring, not for a checkpoint =="
+# The barrier can only be as precise as the position it waits on. While that
+# position was the durable checkpoint, a fallback read paid a whole
+# checkpoint_every even with the feeder perfectly caught up: 1.14 s at 1s, and
+# 4.53 s at the shipped default of 5s, against 1.8 ms for the query itself.
+START_MS=$(date +%s%3N)
+GOT=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
+READ_MS=$(( $(date +%s%3N) - START_MS ))
+chk "the fallback read is still correct"      "10"   "$GOT"
+chk "and it took well under a second"         "true" "$([ "$READ_MS" -lt 700 ] && echo true || echo false)"
+echo "      (fallback read took ${READ_MS} ms)"
+
+echo "== the position moves while the checkpoint stands still =="
+# Those are two different questions and they get two different records. A
+# checkpoint every 30s is a perfectly reasonable durability setting; it must not
+# also mean a 30 second read.
+stopDaemons
+sed 's/checkpoint_every: 1s/checkpoint_every: 30s/' $CFG > /root/fresh_pos.yaml
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"}); db.getSiblingDB("_thermocline").positions.deleteOne({_id:"test"})' >/dev/null
+cline feeder --config /root/fresh_pos.yaml --log-file /var/log/cline/fresh_p.log & FP=$!
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+POS1=$(C 'const d=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(d?d.at.getTime():0)')
+CKP1=$(C 'const d=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}); print(d&&d.eventAt?d.eventAt.getTime():0)')
+sleep 4
+POS2=$(C 'const d=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(d?d.at.getTime():0)')
+CKP2=$(C 'const d=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}); print(d&&d.eventAt?d.eventAt.getTime():0)')
+chk "the position advanced within four seconds" "true" "$([ "$POS2" -gt "$POS1" ] && echo true || echo false)"
+chk "the checkpoint did not"                    "true" "$([ "$CKP2" = "$CKP1" ] && echo true || echo false)"
+chk "the position says how often it is written" "true"     "$(C 'const d=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(!!(d&&d.everyMS>0))')"
+pkill -f 'cline feeder --config /root/fresh_pos' 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f 'cline feeder' >/dev/null 2>&1 || break; sleep 0.5; done
+# stopDaemons above took the router with it, and the section below reads through
+# it. Leaving it down made a fixture failure look like a refused query.
+startFeeder
+startRouter
+
 echo "== a stopped feeder must not become an outage =="
 # With no mirroring at all the router cannot be fresh. It has to answer anyway
 # and say so, because turning a stopped background daemon into failed queries
 # would be a worse failure than a stale read.
 pkill -f 'cline feeder' 2>/dev/null
 for _ in $(seq 1 20); do pgrep -f 'cline feeder' >/dev/null 2>&1 || break; sleep 0.5; done
-C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"}); db.getSiblingDB("_thermocline").positions.deleteOne({_id:"test"})' >/dev/null
 START=$(date +%s)
 GOT=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
 ELAPSED=$(( $(date +%s) - START ))

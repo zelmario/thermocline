@@ -46,6 +46,7 @@ type Router struct {
 	// checkpoints reads how far mirroring has got, so a read served from the
 	// archive can wait for it rather than answer from behind.
 	checkpoints *checkpoint.Store
+	positions   *checkpoint.Positions
 	ckptCache   checkpointCache
 
 	wmCache  watermarkCache
@@ -53,6 +54,14 @@ type Router struct {
 	cursors  cursorRegistry
 	addr     atomic.Value
 	Stats    Stats
+
+	// Metrics times commands by how they were served, which is what turns the
+	// counters into a picture of what the fast tier is actually saving.
+	Metrics *Metrics
+
+	// inv is what each tier is holding, refreshed on a timer.
+	inv     inventoryCache
+	started time.Time
 }
 
 // Addr returns the address the router is listening on, once it is. Empty until
@@ -77,6 +86,7 @@ type Stats struct {
 	Refused       atomic.Int64
 	Archived      atomic.Int64
 	TxnReplays    atomic.Int64
+	WarmedForTxn  atomic.Int64
 	DuplicateKeys atomic.Int64
 	StaleReads    atomic.Int64
 	ClientsOpen   atomic.Int64
@@ -91,7 +101,10 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 		cold:        cold,
 		marks:       watermark.New(cold),
 		checkpoints: checkpoint.New(cold),
+		positions:   checkpoint.NewPositions(cold),
 		log:         log,
+		Metrics:     NewMetrics(metricsWindow),
+		started:     time.Now(),
 	}
 }
 
@@ -195,9 +208,18 @@ type conn struct {
 	upstream net.Conn
 	log      *slog.Logger
 
+	// cls is how the command in flight was served. Every path that does
+	// something other than hand the command to the fast tier sets it, and pump
+	// files the timing under it once the reply has gone out.
+	cls Class
+
 	// pendingKeys are unique key claims made for the insert now in flight, kept
 	// so they can be released if the fast tier rejects it.
 	pendingKeys []string
+
+	// txnKeys is what an update inside a transaction left to be checked once
+	// the reply is back and the real post-image can be read.
+	txnKeys txnKeyCheck
 }
 
 func (c *conn) pump(ctx context.Context) error {
@@ -211,7 +233,13 @@ func (c *conn) pump(ctx context.Context) error {
 		}
 		c.r.Stats.Commands.Add(1)
 
-		if err := c.handle(ctx, msg); err != nil {
+		// Timed around the whole exchange, so what is recorded is what the
+		// client waited for and not what the router thinks it did.
+		started := time.Now()
+		c.cls = classOf(msg)
+		err = c.handle(ctx, msg)
+		c.r.Metrics.Record(c.cls, time.Since(started))
+		if err != nil {
 			return err
 		}
 	}
@@ -220,6 +248,12 @@ func (c *conn) pump(ctx context.Context) error {
 // handle forwards one message and decides whether the reply needs work.
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	name, db, nameErr := msg.CommandName()
+
+	// Cleared per command. An in-transaction key check that was armed and then
+	// never reached, because some path answered the command early, would
+	// otherwise be consumed by whatever command came next, against ids from a
+	// statement that has already finished.
+	c.txnKeys = txnKeyCheck{}
 
 	// Cursors this router owns never existed on the fast tier, so their
 	// follow-ups have to be served here or the driver gets "cursor not found".
@@ -269,7 +303,26 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// holds, which the fast tier's unique index cannot see any more than
 			// it can for an insert. It runs after guardMultiWrite so the matched
 			// documents are all present to compute keys from.
-			if out, done := c.guardUpdateKeys(ctx, msg, db, name); done {
+			//
+			// Once a transaction is open, the documents this update will touch
+			// can include ones the transaction has written and not committed,
+			// which are visible only from inside its own session. There the
+			// guard runs around the write instead of before it, and refuses by
+			// aborting. The statement that opens the transaction is not a
+			// special case for correctness, because a transaction cannot have
+			// written anything before its first command.
+			cmd, cmdErr := msg.CommandDoc()
+			t, inTxn := txnFields{}, false
+			if cmdErr == nil {
+				t, inTxn = txnOf(cmd)
+			}
+			if inTxn && t.open {
+				// Only notes what the statement is about to touch. The check
+				// itself happens after the reply, below, so that everything
+				// else this command needs, above all the copy-up an update
+				// that matched nothing depends on, still runs untouched.
+				c.prepareTxnKeyCheck(ctx, msg, cmd, db, name, t)
+			} else if out, done := c.guardUpdateKeys(ctx, msg, db, name); done {
 				return wire.Write(c.client, out)
 			}
 		}
@@ -319,6 +372,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		c.log.Warn("routing failed, returning the fast tier's answer",
 			"command", name, "err", err)
 		return wire.Write(c.client, reply)
+	}
+
+	// Inside a transaction the unique key guard runs here, on what the write
+	// actually produced, rather than on a guess made before it ran. Nothing is
+	// visible outside the transaction yet, so a duplicate can still be refused
+	// by aborting it.
+	if out, done := c.verifyTxnKeys(ctx, msg, rewritten, name); done {
+		return wire.Write(c.client, out)
 	}
 	return wire.Write(c.client, rewritten)
 }
