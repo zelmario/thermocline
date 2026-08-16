@@ -167,8 +167,11 @@ func bucketOf(ms float64) int {
 
 // ClassSnapshot is one class as the dashboard sees it.
 type ClassSnapshot struct {
-	Name    string  `json:"name"`
-	Count   int64   `json:"count"`
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+	// TotalMS is the summed latency, which a Prometheus histogram needs as its
+	// _sum. Deriving it from the mean would carry the mean's rounding.
+	TotalMS float64 `json:"total_ms"`
 	MeanMS  float64 `json:"mean_ms"`
 	P50MS   float64 `json:"p50_ms"`
 	P95MS   float64 `json:"p95_ms"`
@@ -206,6 +209,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		cs := ClassSnapshot{
 			Name:    ClassNames[i],
 			Count:   s.count,
+			TotalMS: round2(s.totalMS),
 			MaxMS:   round2(s.maxMS),
 			Buckets: append([]int64(nil), s.buckets[:]...),
 		}

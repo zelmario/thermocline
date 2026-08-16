@@ -115,13 +115,52 @@ func (c *Checker) Sample(ctx context.Context) Reading {
 	return r
 }
 
-// sampleFeederLag reads how far behind the archive is, from the feeder's own
-// checkpoint. No inter-process channel needed: the checkpoint is the signal.
+// sampleFeederLag reads how far behind the archive is, from what the feeder
+// publishes. No inter-process channel needed: the record is the signal.
+//
+// The position is preferred over the checkpoint because the checkpoint moves
+// only once per feeder.checkpoint_every, which would make eviction throughput
+// depend on a durability setting that has nothing to do with it. Raise
+// checkpoint_every to a minute for a large deployment and a perfectly healthy
+// feeder starts looking a minute behind.
+//
+// Reading the fresher record is safe here because it is not what makes eviction
+// safe. Nothing is removed unless the archive is confirmed to hold that
+// specific document, checked per batch against the cold tier; this lag gate is
+// a coarse net over that, for stopping a sweep while mirroring is struggling.
 func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 	var rec struct {
 		EventAt time.Time `bson:"eventAt"`
 		SavedAt time.Time `bson:"savedAt"`
 	}
+	var pos struct {
+		At      time.Time `bson:"at"`
+		SavedAt time.Time `bson:"savedAt"`
+		EveryMS int64     `bson:"everyMS"`
+	}
+	if perr := c.cold.Database(meta.DB).Collection(meta.PositionsColl).
+		FindOne(ctx, bson.D{{Key: "_id", Value: c.feederID}}).Decode(&pos); perr == nil && !pos.At.IsZero() {
+		// A position left behind by a feeder that has stopped must not read as
+		// "caught up". Four missed publications says the publisher is gone, and
+		// the checkpoint below is then the honest answer.
+		every := time.Duration(pos.EveryMS) * time.Millisecond
+		if every <= 0 {
+			every = time.Second
+		}
+		stale := 4 * every
+		if stale < 2*time.Second {
+			stale = 2 * time.Second
+		}
+		if time.Since(pos.SavedAt) <= stale {
+			latest := pos.At
+			if pos.SavedAt.After(latest) {
+				latest = pos.SavedAt
+			}
+			r.FeederLag = max(time.Since(latest), 0)
+			return
+		}
+	}
+
 	err := c.cold.Database(meta.DB).Collection(meta.Checkpoints).
 		FindOne(ctx, bson.D{{Key: "_id", Value: c.feederID}}).Decode(&rec)
 	if err != nil || rec.EventAt.IsZero() {

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -84,6 +86,16 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = w.Write(dashboardHTML)
+	})
+	// Prometheus scrapes this. It is on the dashboard's address rather than the
+	// router's, for the same reason the dashboard is: neither belongs on the
+	// address the application dials.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		var b strings.Builder
+		r.writeMetrics(req.Context(), &b)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(w, b.String())
 	})
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

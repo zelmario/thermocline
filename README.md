@@ -362,7 +362,29 @@ traffic, so bind it to an operator network rather than to the address the
 application dials.
 
 `test/traffic.sh` drives representative traffic down every path if you want to
-see it with something on it.
+see it with something on it, and `test/load.sh` keeps it running.
+
+### Prometheus
+
+The same address serves `/metrics` in the Prometheus text format: commands and
+latency as a histogram per class, the copy-up, refusal, duplicate-key and
+stale-read counters, documents and bytes per namespace and tier, and
+
+    thermocline_mirroring_lag_seconds
+
+which is the first alert to build. **It is exported by the router rather than by
+the feeder on purpose.** The router already reads the feeder's published
+position on every fallback read, so it knows the lag continuously, and a gauge
+published by the feeder itself goes silent exactly when the feeder dies, which
+is the moment the number matters. Scraped from the router, a dead feeder reads
+as lag climbing, which is what an alert can see.
+
+```yaml
+scrape_configs:
+  - job_name: thermocline
+    static_configs:
+      - targets: ["router-1.internal:27101"]
+```
 
 ## The completeness watermark
 
@@ -568,10 +590,10 @@ mongosh --port 28018 --eval '
 - **The first seconds of a warm are not suppressed.** The feeder caches its view
   of the warmer heartbeat for five seconds, so a little echo slips through at the
   start. Irrelevant for a warm lasting hours, worth knowing for a short one.
-- **Prometheus.** The router serves its own dashboard and a JSON snapshot at
-  `/api/snapshot`, which is trivial to scrape, but nothing exports the feeder,
-  evictor and warmer counters yet. Mirroring lag is the first alert you should
-  build, since eviction safety and recovery both hang off it.
+- **Prometheus for the background daemons.** The router exports itself and
+  mirroring lag at `/metrics`, but the evictor's and warmer's own counters, such
+  as documents swept per pass and why a pass backed off, still only reach a log
+  line.
 - **Eviction does not pause automatically during an archive restore.** It stops
   on mirroring lag, which usually covers it, but the restore case deserves an
   explicit check.
