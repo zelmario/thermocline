@@ -135,3 +135,21 @@ Things these encode that are easy to get wrong when testing by hand:
   passes for free at test scale and proves nothing. `testindexes.sh` tightens
   the archive to a 1 MB limit and then turns spilling off, which is a real
   configuration operators choose, and restores both afterwards.
+- **A probe script that starts daemons must stop them.** Two throwaway scripts
+  left routers running with `docker exec -d`, and the next suite reported "the
+  router survived the concurrency" got=5, which is a real check failing for a
+  reason that had nothing to do with the product. Trap EXIT and kill.
+- **`mongosh` needs an optional module for snappy but ships zlib with Node.**
+  A `compressors=snappy` URI fails to connect at all, so a compression test
+  written with it proves nothing; `compressors=zlib` actually negotiates.
+- **The test config is shared by every suite.** Adding an evictor rule for one
+  suite broke `testall`'s "evictor with no rules" fixture, whose sed range
+  ended at the first `older_than` and left the second rule orphaned. The check
+  then tested a parse error while claiming to test an empty rules list.
+- **Prove a guard is bypassed before claiming it is.** The compression bug was
+  argued from the code first and the initial evidence was an artifact of a
+  fixture whose namespace was missing from feeder.namespaces, so nothing
+  mirrored and every insert was legitimately accepted. The real proof needed a
+  binary that counted OP_COMPRESSED without preventing it: seven such messages,
+  and a duplicate accepted through zlib that an uncompressed client got 11000
+  for.

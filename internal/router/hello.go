@@ -34,6 +34,11 @@ func mongosIdentity(reply bson.Raw) (bson.D, error) {
 		"passive": true, "hidden": true, "tags": true,
 		"electionId": true, "lastWrite": true, "isreplicaset": true,
 		"topologyVersion": true,
+		// Not a replica set field, and dropped for a different reason: agreeing
+		// a compressor makes every later message an OP_COMPRESSED blob this
+		// proxy cannot read, which silently disables every guard it runs. See
+		// compression.go.
+		"compression": true,
 	}
 
 	out := make(bson.D, 0, len(elems)+1)

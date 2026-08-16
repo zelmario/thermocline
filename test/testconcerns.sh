@@ -161,6 +161,40 @@ pkill -f 'cline feeder --config /root/conc_slow' 2>/dev/null
 for _ in $(seq 1 20); do pgrep -f 'cline feeder' >/dev/null 2>&1 || break; sleep 0.5; done
 startFeeder
 
+echo "== a client asking for compression must not get it =="
+# Wire compression is negotiated in the handshake. If it is agreed, every later
+# message is an OP_COMPRESSED blob this router cannot read, so no guard runs at
+# all: no unique key claimed, no completeness checked, no document copied up.
+# Nothing looks wrong, because the bytes are forwarded either way.
+#
+# So the negotiation has to fail. The check is that a client which asks for
+# compressors still works and still gets guarded, which is what the duplicate
+# below proves: an unguarded router would accept it.
+H "db.getSiblingDB('shop').${NS}z.drop()" >/dev/null
+C "db.getSiblingDB('shop').${NS}z.drop()" >/dev/null
+H "db.getSiblingDB('_thermocline').keys.deleteMany({ns:'shop.${NS}z'})" >/dev/null
+H "db.getSiblingDB('shop').${NS}z.createIndex({email:1},{unique:true})" >/dev/null
+# zlib, not snappy: mongosh ships zlib with Node and needs an optional module
+# for snappy, so a snappy URI fails to connect and tests nothing at all.
+ZURI="mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&compressors=zlib&zlibCompressionLevel=6&directConnection=true"
+chk "a compressing client can still connect"           "1" \
+    "$(mongosh "$ZURI" --quiet --eval 'print(db.adminCommand({ping:1}).ok)' 2>&1 | tail -1)"
+mongosh "$ZURI" --quiet --eval "db.getSiblingDB('shop').${NS}z.insertOne({_id:1,email:'zip@x.com'})" >/dev/null 2>&1
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB('shop').${NS}z.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "1" ] && break
+  sleep 0.5
+done
+stopFeeder
+H "db.getSiblingDB('shop').${NS}z.deleteMany({})" >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+# The owner is in the archive only. A router that could not read the command
+# would let this through and leave two live documents holding one key.
+chk "and its writes are still guarded"                 "11000" \
+    "$(mongosh "$ZURI" --quiet --eval "
+       try { db.getSiblingDB('shop').${NS}z.insertOne({_id:2,email:'zip@x.com'}); print('ACCEPTED'); }
+       catch(e) { print(e.code||e.message.substring(0,40)); }" 2>&1 | tail -1)"
+
 echo "== concurrent writers on the same document =="
 # Two clients updating one document is an ordinary write conflict inside mongod.
 # What is not ordinary is that the router may be running a dry run of its own in

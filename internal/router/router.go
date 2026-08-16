@@ -95,6 +95,7 @@ type Stats struct {
 	WarmedForTxn  atomic.Int64
 	DuplicateKeys atomic.Int64
 	ChangeStreams atomic.Int64
+	Unreadable    atomic.Int64
 	EventsHidden  atomic.Int64
 	StaleReads    atomic.Int64
 	ClientsOpen   atomic.Int64
@@ -241,6 +242,17 @@ func (c *conn) pump(ctx context.Context) error {
 		}
 		c.r.Stats.Commands.Add(1)
 
+		// Nothing should arrive compressed, because the handshake never agrees
+		// a compressor. If one does, the command cannot be read and therefore
+		// cannot be guarded, and that has to be said rather than discovered.
+		if msg.Header.OpCode == wire.OpCompressed {
+			c.r.Stats.Unreadable.Add(1)
+			c.log.Warn("a compressed message arrived and cannot be inspected",
+				"effect", "no guard runs for it: unique keys, completeness and copy-up are all skipped",
+				"remedy", "remove compressors from the connection string, or put the router behind "+
+					"a client that does not compress")
+		}
+
 		// Timed around the whole exchange, so what is recorded is what the
 		// client waited for and not what the router thinks it did.
 		started := time.Now()
@@ -276,6 +288,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// truncated collection already written.
 	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
 		if out, done := c.guardAggregate(ctx, msg, db); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
+	// Renames split a tiered collection between the tiers, and mapReduce reads
+	// every document on whichever tier it runs. Neither can be made whole
+	// across two clusters, so both are refused rather than answered short.
+	if nameErr == nil && !msg.MoreToCome() &&
+		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce") {
+		if out, done := c.guardDDL(ctx, msg, db, name); done {
 			return wire.Write(c.client, out)
 		}
 	}
@@ -346,6 +368,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				return wire.Write(c.client, out)
 			}
 		}
+	}
+
+	// A handshake that agrees a compressor would make every later command
+	// unreadable here, and an unreadable command is an unguarded one.
+	if nameErr == nil && isHello(name) {
+		msg = c.unnegotiateCompression(msg)
 	}
 
 	if err := wire.Write(c.upstream, msg); err != nil {

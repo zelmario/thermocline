@@ -38,7 +38,11 @@ printf 'cold:\n  uri: "mongodb://x"\n' > /root/nohot.yaml
 ok "missing hot.uri"                    1 "hot.uri is required" -- cline warmer --config /root/nohot.yaml
 sed 's/completeness: archive/completeness: banana/' $CFG > /root/badcomp.yaml
 ok "invalid completeness value"         1 "must be archive, strict or permissive" -- cline router --config /root/badcomp.yaml
-sed '/^evictor:/,/^warmer:/{/rules:/,/older_than/d}' $CFG > /root/norules.yaml
+# Delete the whole rules block of the evictor, not just its first entry. The
+# old range stopped at the first older_than, so a config with two rules left the
+# second one orphaned under max_feeder_lag and this checked a parse error rather
+# than an empty rules list.
+sed '/^evictor:/,/^warmer:/{/^  rules:/,/^  backoff:/{/^  backoff:/!d}}' $CFG > /root/norules.yaml
 ok "evictor with no rules"              1 "rules is empty"    -- cline evictor --config /root/norules.yaml --once
 
 echo "== watermark =="

@@ -68,6 +68,8 @@ feeder:
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"
+    - "shop.tconc2z"
+    - "shop.zprobe"
     # testindexes.sh
     - "shop.tidx"
     # testquery.sh
@@ -79,6 +81,8 @@ feeder:
     - "shop.tbwm"
     # testchange.sh
     - "shop.tcs"
+    # testddl.sh
+    - "shop.tddl"
     # traffic.sh, which drives the dashboard
     - "shop.tdash"
     - "shop.tdashu"

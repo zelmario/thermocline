@@ -20,6 +20,9 @@ const (
 	OpReply = 1
 	OpQuery = 2004
 	OpMsg   = 2013
+	// OpCompressed wraps another message. Nothing here can read one, which is
+	// why the router refuses to negotiate compression at all.
+	OpCompressed = 2012
 )
 
 // HeaderLen is the fixed size of a wire protocol message header.
