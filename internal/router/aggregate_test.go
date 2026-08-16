@@ -117,6 +117,58 @@ func TestUnionWithObjectForm(t *testing.T) {
 	}
 }
 
+// A joined collection can be named from inside a sub-pipeline, where a scan of
+// the top-level stages never looks. $facet holds whole pipelines, and $lookup
+// and $unionWith each take one, so a tiered collection is reachable from a depth
+// the guard has to follow or it will pass an unchecked join as complete.
+func TestNestedJoinsAreFound(t *testing.T) {
+	cmd := aggCmd(t, "orders", bson.A{
+		bson.D{{Key: "$facet", Value: bson.D{
+			{Key: "byCustomer", Value: bson.A{
+				bson.D{{Key: "$lookup", Value: bson.D{{Key: "from", Value: "customers"}}}},
+			}},
+			{Key: "byReturn", Value: bson.A{
+				bson.D{{Key: "$lookup", Value: bson.D{
+					{Key: "from", Value: "returns"},
+					{Key: "pipeline", Value: bson.A{
+						bson.D{{Key: "$unionWith", Value: "refunds"}},
+					}},
+				}}},
+			}},
+		}}},
+	})
+	s, _ := scopeOfAggregate(cmd, "shop")
+
+	want := map[string]bool{"shop.customers": false, "shop.returns": false, "shop.refunds": false}
+	for _, ns := range s.secondary {
+		if _, ok := want[ns]; !ok {
+			t.Errorf("unexpected joined namespace %q", ns)
+			continue
+		}
+		want[ns] = true
+	}
+	for ns, seen := range want {
+		if !seen {
+			t.Errorf("joined namespace %q was missed at depth, so a short join would go unnoticed", ns)
+		}
+	}
+}
+
+// A field called coll inside a $match is data, not a namespace. Refusing a query
+// over a collection nobody tiers would be its own bug.
+func TestOnlyRealSubPipelinesAreFollowed(t *testing.T) {
+	cmd := aggCmd(t, "orders", bson.A{
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "coll", Value: "notacollection"},
+			{Key: "from", Value: "alsonot"},
+		}}},
+	})
+	s, _ := scopeOfAggregate(cmd, "shop")
+	if len(s.secondary) != 0 {
+		t.Errorf("secondary = %v, want none: those are field names, not collections", s.secondary)
+	}
+}
+
 // Writing a short answer is worse than returning one, because it becomes the
 // input to everything downstream.
 func TestWritingStagesAreFlagged(t *testing.T) {

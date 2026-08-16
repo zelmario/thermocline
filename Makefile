@@ -5,9 +5,12 @@ COLD_PORT := 28018
 
 .PHONY: build test check fmt clean dev dev-down dev-status
 
+# CGO_ENABLED=0 because the binary is built here and run in the test containers,
+# which carry an older glibc. A dynamically linked build fails there at exec with
+# a version error, which reads like the router refusing to start.
 build:
 	@mkdir -p bin
-	go build -o $(BIN) ./cmd/cline
+	CGO_ENABLED=0 go build -o $(BIN) ./cmd/cline
 	@echo "built $(BIN)"
 
 test:

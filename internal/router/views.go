@@ -139,6 +139,35 @@ func (r *Router) tieredBase(ctx context.Context, ns string) (base string, viaVie
 	return base, true, true
 }
 
+// resolveJoinedViews rewrites the collections an aggregation joins to the
+// collections their documents actually come from.
+//
+// $lookup, $graphLookup and $unionWith all accept a view, and a view is never in
+// feeder.namespaces, so a joined view passed the completeness check untested for
+// the same reason a queried view once did. The primary namespace was fixed;
+// these were not, and a pipeline reaches them by a name the guard did not
+// recognise just as easily.
+//
+// It matters twice. The check reads the wrong watermark, so an incomplete join
+// returns a short answer as success. And inside a transaction the scope is
+// warmed rather than refused, which would try to copy documents into a view.
+func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
+	for i, ns := range s.secondary {
+		if r.cfg.Manages(ns) {
+			continue
+		}
+		base, isView := r.viewBase(ctx, ns)
+		if !isView || base == ns {
+			continue
+		}
+		if s.named == nil {
+			s.named = map[string]string{}
+		}
+		s.secondary[i] = base
+		s.named[base] = " (joined as the view " + ns + ")"
+	}
+}
+
 // refuseView turns down a read through a view that the fast tier cannot answer
 // in full.
 //

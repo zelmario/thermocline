@@ -56,6 +56,10 @@ type aggScope struct {
 	// match is the leading $match, kept so a transaction can be given the
 	// documents it selects rather than being refused.
 	match bson.Raw
+	// named records, for a secondary that the pipeline reached through a view,
+	// how to say so in a refusal: the name the pipeline used, already formatted
+	// as a parenthesis. Empty for a collection named directly.
+	named map[string]string
 }
 
 // scopeOfAggregate reads an aggregate command into the parts completeness
@@ -109,22 +113,88 @@ func scopeOfAggregate(cmd bson.Raw, db string) (aggScope, bool) {
 		}
 
 		switch name {
-		case "$lookup", "$graphLookup":
-			if from, ok := stringField(subDoc(val), "from"); ok {
-				s.secondary = append(s.secondary, db+"."+from)
-			}
-		case "$unionWith":
-			// Both spellings: {$unionWith: "other"} and {$unionWith: {coll: "other"}}.
-			if c, ok := val.StringValueOK(); ok {
-				s.secondary = append(s.secondary, db+"."+c)
-			} else if from, ok := stringField(subDoc(val), "coll"); ok {
-				s.secondary = append(s.secondary, db+"."+from)
-			}
 		case "$out", "$merge":
 			s.writes = true
 		}
 	}
+	s.secondary = joinedCollections(stages, db, 0)
 	return s, true
+}
+
+// joinedCollections lists every collection a pipeline reads besides the one it
+// was run against.
+//
+// It recurses, because the stages that name another collection may be nested.
+// $facet holds whole sub-pipelines, and $lookup and $unionWith both take one, so
+// a tiered collection can be joined from a depth the top-level scan never
+// reaches. That is not a contrived pipeline: a $facet computing several
+// aggregates at once, each joining a reference collection, is ordinary
+// reporting, and reporting over history is the workload tiering is for.
+//
+// Only the positions that MongoDB defines as sub-pipelines are followed. A
+// blind walk would pick up a user field that happens to be called coll inside a
+// $match and refuse a query over a collection nobody is tiering.
+func joinedCollections(stages []bson.RawValue, db string, depth int) []string {
+	// A pipeline nested this deep is beyond anything MongoDB will plan, and the
+	// limit stops a hand-built document from recursing without end.
+	if depth > 10 {
+		return nil
+	}
+	var out []string
+
+	sub := func(val bson.RawValue) {
+		if arr, ok := val.ArrayOK(); ok {
+			if vals, err := arr.Values(); err == nil {
+				out = append(out, joinedCollections(vals, db, depth+1)...)
+			}
+		}
+	}
+
+	for _, st := range stages {
+		doc, ok := st.DocumentOK()
+		if !ok {
+			continue
+		}
+		elems, err := doc.Elements()
+		if err != nil || len(elems) == 0 {
+			continue
+		}
+		name, val := elems[0].Key(), elems[0].Value()
+
+		switch name {
+		case "$lookup", "$graphLookup":
+			d := subDoc(val)
+			if from, ok := stringField(d, "from"); ok {
+				out = append(out, db+"."+from)
+			}
+			if pv, perr := d.LookupErr("pipeline"); perr == nil {
+				sub(pv)
+			}
+		case "$unionWith":
+			// Both spellings: {$unionWith: "other"} and {$unionWith: {coll: "other"}}.
+			if c, ok := val.StringValueOK(); ok {
+				out = append(out, db+"."+c)
+				break
+			}
+			d := subDoc(val)
+			if from, ok := stringField(d, "coll"); ok {
+				out = append(out, db+"."+from)
+			}
+			if pv, perr := d.LookupErr("pipeline"); perr == nil {
+				sub(pv)
+			}
+		case "$facet":
+			// Each field is an independent pipeline over the same input.
+			fields, ferr := subDoc(val).Elements()
+			if ferr != nil {
+				continue
+			}
+			for _, f := range fields {
+				sub(f.Value())
+			}
+		}
+	}
+	return out
 }
 
 // subDoc returns val as a document, or an empty one when it is not.
@@ -171,7 +241,7 @@ func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remed
 				"the archive is unreachable; retry once it is back", false
 		}
 		if !mark.CoversAll() {
-			return "this pipeline joins " + ns + ", which is tiered and not held in full by the fast tier",
+			return "this pipeline joins " + ns + s.named[ns] + ", which is tiered and not held in full by the fast tier",
 				"a join reads by key rather than by time, so the joined collection has to be whole: warm all of " +
 					ns + ", or run the aggregation against the archive", false
 		}
@@ -211,6 +281,9 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if !ok {
 		return nil, false
 	}
+	// A joined view is as invisible to the completeness check as a queried one,
+	// and it is reached by the same kind of name.
+	c.r.resolveJoinedViews(ctx, &scope)
 
 	// A view names itself, not the collection it reads, so completeness has to
 	// be judged against the collection underneath it.

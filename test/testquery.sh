@@ -168,6 +168,58 @@ VIEWANS=$(R "
 chk "the view does not answer short"                   "true" \
     "$([ "$VIEWANS" = "10" ] || [ "$VIEWANS" = "REFUSED" ] && echo true || echo "false (got $VIEWANS)")"
 
+echo "== a pipeline that joins a view over a tiered collection =="
+# The same blindness, reached from the other side. $lookup, $graphLookup and
+# $unionWith all accept a view, and the joined namespace is checked by asking
+# whether it is managed, which a view never is. So the collection being read is
+# the ordinary untiered one, it passes its own check, and the tiered half of the
+# join comes in short.
+#
+# This is the shape reporting actually takes: a small dimension collection that
+# nobody tiers, joined to a reporting view over the large history that is the
+# whole reason tiering is here.
+H "db.getSiblingDB('shop').tqjoin.drop()" >/dev/null
+H "db.getSiblingDB('shop').tqjoin.insertOne({_id:1,grp:'g'})" >/dev/null
+JOINED=$(R "
+  try {
+    const r = db.getSiblingDB('shop').tqjoin.aggregate([
+      {\$lookup:{from:'vqview', localField:'grp', foreignField:'grp', as:'hits'}}
+    ]).toArray();
+    print(r[0].hits.length);
+  } catch(e) { print('REFUSED'); }")
+# Ten or a refusal are both honest. Three is the join silently missing history.
+chk "a joined view does not come in short"             "true" \
+    "$([ "$JOINED" = "10" ] || [ "$JOINED" = "REFUSED" ] && echo true || echo "false (got $JOINED)")"
+
+# $unionWith reads the same way and was checked the same way.
+UNIONED=$(R "
+  try {
+    print(db.getSiblingDB('shop').tqjoin.aggregate([
+      {\$unionWith:{coll:'vqview'}}, {\$count:'n'}
+    ]).toArray()[0].n);
+  } catch(e) { print('REFUSED'); }")
+chk "a unioned view does not come in short"            "true" \
+    "$([ "$UNIONED" = "11" ] || [ "$UNIONED" = "REFUSED" ] && echo true || echo "false (got $UNIONED)")"
+
+# A join can also be named from inside a sub-pipeline, where a scan of the
+# top-level stages never looks. $facet is the ordinary way to compute several
+# aggregates over one pass, and each of its fields is a whole pipeline.
+FACETED=$(R "
+  try {
+    print(db.getSiblingDB('shop').tqjoin.aggregate([
+      {\$facet:{tally:[{\$lookup:{from:'tqview',localField:'grp',foreignField:'grp',as:'h'}}]}}
+    ]).toArray()[0].tally[0].h.length);
+  } catch(e) { print('REFUSED'); }")
+chk "a join inside \$facet does not come in short"      "true" \
+    "$([ "$FACETED" = "10" ] || [ "$FACETED" = "REFUSED" ] && echo true || echo "false (got $FACETED)")"
+
+# And the guard must not have become a blanket refusal: with the collection
+# underneath the view whole again, the same join has to answer.
+cline watermark --config $CFG --ns shop.tqview --complete-all >/dev/null
+sleep 7
+chk "the same join answers once the tier is whole"     "true" \
+    "$([ "$(R "print(db.getSiblingDB('shop').tqjoin.aggregate([{\$lookup:{from:'vqview',localField:'grp',foreignField:'grp',as:'h'}}]).toArray()[0].h.length)")" != "REFUSED" ] && echo true || echo false)"
+
 stopDaemons
 echo
 echo "================================"
