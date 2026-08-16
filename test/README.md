@@ -73,3 +73,11 @@ Things these encode that are easy to get wrong when testing by hand:
   background jobs of the same shell, so `wait` blocks on daemons that never
   exit and the suite hangs with every check already passed. Collect the client
   PIDs and wait on those.
+- **Clear the bookkeeping a suite's own previous run left behind.** `testedge.sh`
+  ends its `date_field` section with a warm, which pins all 30 documents in
+  `residency` for five minutes and announces them in `warming`. A rerun inside
+  that window then watched the evictor keep 30 documents where the age rule says
+  8, because a residency hold outranks age, and could watch the feeder suppress
+  the next run's inserts as warm echoes. Both are the product behaving correctly
+  and both read as failures. Setup now drops `residency`, `warming` and the
+  `warmerActive` marker alongside the checkpoint and the watermarks.
