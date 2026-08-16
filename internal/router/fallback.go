@@ -32,6 +32,14 @@ import (
 // ask for a batch size sees what it would see from mongod.
 const firstBatchDefault = 101
 
+// maxBatchBytes bounds one batch of an archive answer.
+//
+// Eight megabytes, not sixteen, so that the one document allowed to cross the
+// budget cannot push the reply near the wire protocol's message limit: the
+// largest BSON document is sixteen megabytes, and eight plus sixteen is still
+// comfortably under the forty-eight a message may occupy.
+const maxBatchBytes = 8 * 1024 * 1024
+
 // sessionFields belong to the client's conversation with the fast tier. Sending
 // them to the archive would attach this read to a session and a transaction
 // that exist on a different cluster.
@@ -312,10 +320,16 @@ func (c *conn) archiveKillCursors(ctx context.Context, cmd bson.Raw) bool {
 
 // readBatch pulls up to size documents, reporting whether more remain.
 func readBatch(ctx context.Context, cur *mongo.Cursor, size int) (bson.A, bool, error) {
-	if size <= 0 {
+	if size < 0 {
 		size = firstBatchDefault
 	}
+	if size == 0 {
+		// The caller asked for a cursor and no documents. Report more so it is
+		// given one to come back to.
+		return bson.A{}, true, nil
+	}
 	batch := bson.A{}
+	used := 0
 	for len(batch) < size {
 		if !cur.Next(ctx) {
 			return batch, false, cur.Err()
@@ -325,6 +339,22 @@ func readBatch(ctx context.Context, cur *mongo.Cursor, size int) (bson.A, bool, 
 			return batch, false, err
 		}
 		batch = append(batch, d)
+
+		// A batch is bounded by bytes as well as by documents, which is what
+		// mongod itself does and what the count alone does not. A client asking
+		// for ten thousand documents of a megabyte each would otherwise have
+		// this assemble one reply of ten gigabytes: past the wire protocol's
+		// limit, and large enough to take the router down and every connection
+		// on it with it.
+		//
+		// The document that crosses the budget is kept rather than dropped,
+		// because the cursor has already yielded it and there is nowhere to put
+		// it back. The budget is set low enough that doing so cannot approach
+		// the message limit even when that document is the largest BSON allows.
+		used += len(cur.Current)
+		if used >= maxBatchBytes {
+			return batch, true, nil
+		}
 	}
 	// RemainingBatchLength is cheap and does not block; TryNext would fetch.
 	return batch, cur.RemainingBatchLength() > 0 || cur.ID() != 0, nil
@@ -397,12 +427,15 @@ func rewriteForArchive(cmd bson.Raw, collation bson.Raw) (bson.D, int, error) {
 			out = append(out, bson.E{Key: "pipeline", Value: livePipeline(val)})
 			continue
 		case "batchSize":
-			if n, ok := intOf(val); ok && n > 0 {
+			// Zero is a request, not an absence: a driver asks for it to get a
+			// cursor back without any documents yet, so answering with the
+			// default hundred and one is not what it asked for.
+			if n, ok := intOf(val); ok && n >= 0 {
 				batchSize = n
 			}
 		case "cursor":
 			if doc, ok := val.DocumentOK(); ok {
-				if n, ok := intOf(doc.Lookup("batchSize")); ok && n > 0 {
+				if n, ok := intOf(doc.Lookup("batchSize")); ok && n >= 0 {
 					batchSize = n
 				}
 			}

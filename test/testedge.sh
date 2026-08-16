@@ -188,7 +188,7 @@ H "db.getSiblingDB('shop').$NS.insertOne({_id:'sentinel'})" >/dev/null
 waitFor "the sentinel in the archive" "true" \
   "C \"print(!!db.getSiblingDB('shop').$NS.findOne({_id:'sentinel'}))\""
 chk "ignore leaves the archive readable" "no" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?(d._tcDeletedAt?'yes':'no'):'GONE')")"
-chk "and the feeder keeps running"       "1"  "$(pgrep -fc 'cline feeder --config /root/edge_ignore' || echo 0)"
+chk "and the feeder keeps running"       "1"  "$(pgrep -fc 'cline feeder --config /root/edge_ignore' || true)"
 
 stopFeeder
 C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null

@@ -124,6 +124,23 @@ AGGSORT=$(R "
   catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "a sorted aggregation is answered"          "1" "$AGGSORT"
 
+echo "== a big answer from the archive is split into batches =="
+# readBatch counted documents and not bytes, so a client asking for a large
+# batch of large documents had the router assemble one reply of arbitrary size:
+# past the wire protocol's limit, and large enough to take the proxy down and
+# every connection on it. mongod bounds a batch by bytes; so must this.
+#
+# 40,000 kilobyte documents is forty megabytes, and asking for all of them in
+# one batch is what a driver does when told batchSize.
+BIG=$(R "
+  try {
+    const c = db.getSiblingDB('shop').$NS.find({}).batchSize(40000);
+    let n = 0;
+    while (c.hasNext() && n < $N) { c.next(); n++; }
+    print(n);
+  } catch(e) { print('ERR '+e.message.substring(0,70)); }")
+chk "every document arrives across batches"      "$N" "$BIG"
+
 echo "== a query whose index exists only on the fast tier =="
 chk "a filter on an archive-unindexed field works" "4000" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({grp:'g3'}))")"
 

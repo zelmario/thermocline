@@ -150,6 +150,11 @@ func (f *Feeder) Run(ctx context.Context) error {
 	if err := f.EnsureIndexes(ctx); err != nil {
 		return err
 	}
+	// Before the first event, not after: a capped collection destroys archive
+	// history as it rolls, and by the time that shows up the history is gone.
+	if err := f.checkCollectionKinds(ctx); err != nil {
+		return err
+	}
 
 	for {
 		err := f.runOnce(ctx)

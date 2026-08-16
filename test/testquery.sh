@@ -111,6 +111,21 @@ TEXTANS=$(R "
 chk "a text search does not silently return none" "true" \
     "$([ "$TEXTANS" = "REFUSED" ] || [ "$TEXTANS" = "ANSWERED:1" ] && echo true || echo "false ($TEXTANS)")"
 
+echo "== batchSize zero asks for a cursor, not for documents =="
+# A driver sends batchSize 0 to get a cursor back without any documents in it.
+# Answering with the default hundred and one is not what it asked for, and the
+# archive fallback was doing exactly that.
+cline watermark --config $CFG --ns shop.tqcoll --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+chk "an empty first batch, then the documents"        "3" "$(R "
+  const r = db.getSiblingDB('shop').runCommand({find:'tqcoll', filter:{}, batchSize:0});
+  if (r.cursor.firstBatch.length !== 0) { print('first batch was '+r.cursor.firstBatch.length); }
+  else if (!r.cursor.id) { print('no cursor'); }
+  else {
+    const g = db.getSiblingDB('shop').runCommand({getMore:r.cursor.id, collection:'tqcoll'});
+    print(g.cursor.nextBatch.length);
+  }")"
+
 echo "== a view over a tiered collection =="
 # A view is a saved pipeline over another collection. The router decides whether
 # to guard a query by the namespace the query names, and that name is the

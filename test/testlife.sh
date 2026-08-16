@@ -89,7 +89,7 @@ cline watermark --config $CFG --ns shop.tdrop --complete-all >/dev/null
 sleep 7
 R "db.getSiblingDB('shop').tdrop.drop()" >/dev/null
 sleep 4
-chk "the feeder survived the drop" "1" "$(pgrep -fc 'cline feeder' || echo 0)"
+chk "the feeder survived the drop" "1" "$(pgrep -fc 'cline feeder' || true)"
 chk "the archive kept its copy"    "3" "$(C "print(db.getSiblingDB('shop').tdrop.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 # The collection is gone from the fast tier but the completeness claim is not.
 # If the router believes the claim it answers zero and calls it success, while
@@ -121,7 +121,7 @@ for _ in $(seq 1 35); do
 done
 chk "the TTL monitor removed it from the fast tier" "0" "$(H "print(db.getSiblingDB('shop').tttl.countDocuments({}))")"
 sleep 5
-chk "the feeder is still running"                   "1" "$(pgrep -fc 'cline feeder' || echo 0)"
+chk "the feeder is still running"                   "1" "$(pgrep -fc 'cline feeder' || true)"
 chk "the archive tombstoned it, not kept it live"   "0" "$(C "print(db.getSiblingDB('shop').tttl.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 
 echo "== a large document survives a copy-up =="

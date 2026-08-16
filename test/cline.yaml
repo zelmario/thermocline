@@ -70,6 +70,9 @@ feeder:
     - "shop.tconc2u"
     - "shop.tconc2z"
     - "shop.zprobe"
+    # testtypes.sh
+    - "shop.tcap"
+    - "shop.tts"
     # testindexes.sh
     - "shop.tidx"
     # testquery.sh

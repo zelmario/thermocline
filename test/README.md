@@ -153,3 +153,16 @@ Things these encode that are easy to get wrong when testing by hand:
   binary that counted OP_COMPRESSED without preventing it: seven such messages,
   and a duplicate accepted through zlib that an uncompressed client got 11000
   for.
+- **A test result is only about the binary you installed.** Twice now: once by
+  copying a new binary while a sweep was running, and once by editing code and
+  never rebuilding, so a sweep reported a fix failing that was never in it.
+  Build, install, then run, and never during.
+- **`pgrep -c` and `grep -c` print 0 and exit 1 when nothing matches**, so
+  `|| echo 0` appends a second zero and the check reads `got=0\n0`. Use
+  `|| true`. But not blindly: `... && echo mismatch || echo 0` is a different
+  idiom where the zero is the pass value, and replacing it there breaks a
+  passing check.
+- **A test for "does it refuse" must not assume it refuses.** The collection
+  type checks run the feeder in a subshell; without the guard the feeder simply
+  starts and runs, so the subshell never returns and the whole suite wedges.
+  Wrap it in `timeout`.

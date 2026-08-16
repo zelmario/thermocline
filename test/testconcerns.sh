@@ -218,7 +218,7 @@ done
 for pid in "${CLIENTS[@]}"; do wait "$pid" 2>/dev/null; done
 chk "every increment landed, none lost"          "72" "$(H "const d=db.getSiblingDB('shop').${NS}u.findOne({_id:1}); print(d?d.n:'MISSING')")"
 chk "the unique index still holds one document"  "1"  "$(H "print(db.getSiblingDB('shop').${NS}u.countDocuments({email:'c0@x.com'}))")"
-chk "the router survived the concurrency"        "1"  "$(pgrep -fc 'cline router' || echo 0)"
+chk "the router survived the concurrency"        "1"  "$(pgrep -fc 'cline router' || true)"
 
 echo "== concurrent inserts racing for one unique value =="
 # Only one may win, and the loser must be told. The registry claim is an atomic
@@ -232,7 +232,7 @@ for i in 1 2 3 4 5 6; do
   RACERS+=($!)
 done
 for pid in "${RACERS[@]}"; do wait "$pid" 2>/dev/null; done
-chk "exactly one insert won the race"            "1" "$(grep -c '^won$' /tmp/race.txt || echo 0)"
+chk "exactly one insert won the race"            "1" "$(grep -c '^won$' /tmp/race.txt || true)"
 chk "and only one document holds the value"      "1" "$(H "print(db.getSiblingDB('shop').${NS}u.countDocuments({email:'race@x.com'}))")"
 rm -f /tmp/race.txt
 

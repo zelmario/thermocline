@@ -124,7 +124,7 @@ kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
 cline evictor --config $CFG --every 2s --log-file /var/log/cline/t_evictor.log &
 EP=$!; sleep 7
-N=$(grep -c "sweep complete\|evicting" /var/log/cline/t_evictor.log 2>/dev/null || echo 0)
+N=$(grep -c "sweep complete\|evicting" /var/log/cline/t_evictor.log 2>/dev/null || true)
 [ "$N" -ge 2 ] && { PASS=$((PASS+1)); echo "  PASS  evictor --every loops ($N sweeps)"; } || { FAIL=$((FAIL+1)); FAILED+=("evictor --every"); echo "  FAIL  evictor --every loops (saw $N)"; }
 kill $EP 2>/dev/null; wait $EP 2>/dev/null
 
