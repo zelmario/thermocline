@@ -128,5 +128,6 @@ print('  hits ' + hits + '  misses ' + misses + '  archive reads ' + ranges +
 "
 
 echo
-echo "Traffic done. The dashboard is on port 27101 and keeps five minutes of history."
+echo "Traffic done. The dashboard is on router.dashboard (27110 in test/cline.yaml)"
+echo "and keeps five minutes of history."
 echo "Daemons are left running on purpose so the page has something live to show."

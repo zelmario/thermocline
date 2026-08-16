@@ -363,7 +363,7 @@ function drawHero(s) {
 function drawTraffic(s) {
   const svg = $("traffic");
   svg.innerHTML = "";
-  const hist = s.metrics.history || [];
+  let hist = s.metrics.history || [];
   const W = svg.clientWidth || 900, H = 188;
   const m = {t: 10, r: 8, b: 22, l: 42};
   const iw = Math.max(10, W - m.l - m.r), ih = H - m.t - m.b;
@@ -373,6 +373,21 @@ function drawTraffic(s) {
     return;
   }
   const idx = CLASSES.map(c => s.metrics.classes.findIndex(x => x.name === c.key));
+
+  // A second with no commands is never recorded, so the history has holes in
+  // it wherever the database was idle. Joining the points either side of a hole
+  // draws a straight ramp across it, which reads as steadily rising traffic
+  // when the truth is no traffic at all. Fill the holes with zeroes.
+  const dense = [];
+  const byAt = new Map(hist.map(h => [h.at, h]));
+  const from = hist[0].at, to = hist[hist.length - 1].at;
+  const empty = new Array(CLASSES.length).fill(0);
+  for (let t = from; t <= to; t++) {
+    dense.push(byAt.get(t) || {at: t, count: empty, mean_ms: empty});
+    if (dense.length > 900) break;   // a sanity bound, never reached at 300s
+  }
+  hist = dense;
+
   const totals = hist.map(h => idx.reduce((a, i) => a + (i >= 0 ? h.count[i] : 0), 0));
   const peak = Math.max(1, ...totals);
   const t0 = hist[0].at, t1 = hist[hist.length - 1].at;
