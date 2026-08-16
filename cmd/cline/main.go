@@ -40,6 +40,10 @@ Usage:
   cline router   --config FILE            serve both tiers on one address
   cline watermark --config FILE [--ns NS] [--clear | --complete-all | --complete-from T]
                                           show or edit what the fast tier claims to hold
+  cline indexes  --config FILE [--ns NS]
+                                          compare both tiers' indexes, so a
+                                          read that falls through is not left
+                                          scanning the archive
   cline keys     --config FILE [--rebuild]
                                           unique keys that must survive eviction
   cline version
@@ -77,6 +81,8 @@ func run() error {
 		return runWatermark(os.Args[2:])
 	case "keys":
 		return runKeys(os.Args[2:])
+	case "indexes":
+		return runIndexes(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil

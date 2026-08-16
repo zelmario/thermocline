@@ -407,6 +407,19 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 			SetUpdate(bson.D{{Key: "$setOnInsert", Value: d.raw}}).
 			SetUpsert(true)
 	}
+	// Residency is recorded before the write, not after.
+	//
+	// These writes are what a client's change stream sees, and it sees them
+	// immediately. The router hides a warmed document's insert by recognising
+	// it as a promotion, and it recognises it by the residency record, so
+	// recording afterwards leaves a window in which the application is told a
+	// years-old document was just created. Recording first for a warm that then
+	// fails costs nothing: residency for a document that is not there protects
+	// nothing.
+	if err := w.recordResidency(ctx, ns, docs); err != nil {
+		return 0, err
+	}
+
 	res, err := w.hot.Database(db).Collection(coll).
 		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	if err != nil {
@@ -423,9 +436,6 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		w.log.Warn("warmed but could not clear eviction notices", "ns", ns, "err", err)
 	}
 
-	if err := w.recordResidency(ctx, ns, docs); err != nil {
-		return int(res.UpsertedCount), err
-	}
 	w.log.Debug("warmed", "ns", ns, "inserted", res.UpsertedCount, "already_present", res.MatchedCount)
 	return int(res.UpsertedCount), nil
 }

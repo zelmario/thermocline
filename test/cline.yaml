@@ -68,6 +68,17 @@ feeder:
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"
+    # testindexes.sh
+    - "shop.tidx"
+    # testquery.sh
+    - "shop.tqcoll"
+    - "shop.tqtext"
+    - "shop.tqview"
+    # testbulk.sh
+    - "shop.tbwu"
+    - "shop.tbwm"
+    # testchange.sh
+    - "shop.tcs"
     # traffic.sh, which drives the dashboard
     - "shop.tdash"
     - "shop.tdashu"
@@ -83,6 +94,8 @@ evictor:
   max_feeder_lag: 30s
   rules:
     - ns: "shop.orders"
+      older_than: 40m
+    - ns: "shop.tcs"
       older_than: 40m
   backoff:
     max_replication_lag: 10s

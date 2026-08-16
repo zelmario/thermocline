@@ -364,6 +364,42 @@ application dials.
 `test/traffic.sh` drives representative traffic down every path if you want to
 see it with something on it, and `test/load.sh` keeps it running.
 
+### Indexes are not copied, in either direction
+
+Nothing synchronises indexes between the tiers, and nothing should. Index trees
+describe the whole collection, which is the cost tiering exists to avoid, so
+carrying every one of them on the archive gives most of the saving back. The
+fast tier holds the application's query plans; the archive is expected to hold
+far fewer.
+
+**The consequence is that a read which falls through runs with whatever indexes
+the archive happens to have.** For a filter that is slower. For a sort it can be
+worse: past the server's sort memory limit a blocking sort does not degrade, it
+fails. Archive reads therefore ask for `allowDiskUse`, so a sorted query that the
+fast tier answered from an index becomes slow rather than broken. An operator who
+would rather refuse expensive fallback reads than run them has
+`router.completeness: strict`, which refuses them all.
+
+`hint` is dropped for the same reason: it names an index the archive is not
+expected to have.
+
+To see the divergence rather than infer it:
+
+```
+$ cline indexes --config cline.yaml
+shop.orders
+  fast tier  6 index(es), archive  2
+  missing from the archive:
+    customer_1_createdAt_-1            {customer: 1, createdAt: -1}
+  a read that falls through and uses these will scan the archive
+```
+
+The rule it prints is the one to follow: keep an index on the archive when a
+query that falls through filters or sorts on its fields, and drop it when
+nothing does, because that storage is the saving. A unique index is called out
+separately, since cross-tier uniqueness is the key registry's job and its
+absence on the archive is expected.
+
 ### Prometheus
 
 The same address serves `/metrics` in the Prometheus text format: commands and

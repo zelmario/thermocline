@@ -60,6 +60,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"txn_replays":    r.Stats.TxnReplays.Load(),
 			"warmed_for_txn": r.Stats.WarmedForTxn.Load(),
 			"duplicate_keys": r.Stats.DuplicateKeys.Load(),
+			"change_streams": r.Stats.ChangeStreams.Load(),
 			"stale_reads":    r.Stats.StaleReads.Load(),
 			"clients_open":   r.Stats.ClientsOpen.Load(),
 			"clients_total":  r.Stats.ClientsTotal.Load(),

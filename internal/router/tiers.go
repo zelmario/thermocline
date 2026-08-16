@@ -52,6 +52,19 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 		return false, err
 	}
 
+	// Residency is recorded before the write, not after, the same way the
+	// evictor announces a removal before making it.
+	//
+	// The write is what a client's change stream sees, and it sees it
+	// immediately. Recording afterwards leaves a window in which the insert
+	// event has been delivered and nothing yet says it was a promotion, so an
+	// application is told a two year old document was just created. Recording
+	// first for a copy-up that then fails costs nothing: a residency record for
+	// a document that is not there protects nothing.
+	if err := r.recordResidency(ctx, ns, id); err != nil {
+		r.log.Warn("could not record residency before copying up", "ns", ns, "err", err)
+	}
+
 	db, coll := splitNS(ns)
 	// $setOnInsert, never a replace. If the fast tier gained this document
 	// while we were reading the archive, its copy is the newer one.
@@ -68,9 +81,6 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	// another eviction, and the archive would never tombstone it.
 	if err := meta.ClearEvictionNotices(ctx, r.cold, []string{meta.DocID(ns, id)}); err != nil {
 		r.log.Warn("copied up but could not clear the eviction notice", "ns", ns, "err", err)
-	}
-	if err := r.recordResidency(ctx, ns, id); err != nil {
-		r.log.Warn("copied up but could not record residency", "ns", ns, "err", err)
 	}
 	r.Stats.CopiedUp.Add(1)
 	return true, nil

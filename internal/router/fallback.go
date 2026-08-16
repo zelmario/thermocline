@@ -166,7 +166,8 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	if err != nil {
 		return nil, err
 	}
-	rewritten, batchSize, err := rewriteForArchive(cmd)
+	collation, _ := c.r.defaultCollation(ctx, db+"."+coll)
+	rewritten, batchSize, err := rewriteForArchive(cmd, collation)
 	if err != nil {
 		return nil, err
 	}
@@ -348,15 +349,16 @@ func cursorReply(requestID, responseTo int32, id int64, ns, field string, batch 
 // records the application deleted and returning one would resurrect it. And the
 // client's session and transaction fields are dropped, because they name a
 // conversation happening on the other cluster.
-func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
+func rewriteForArchive(cmd bson.Raw, collation bson.Raw) (bson.D, int, error) {
 	elems, err := cmd.Elements()
 	if err != nil {
 		return nil, 0, err
 	}
 
-	out := make(bson.D, 0, len(elems)+2)
+	out := make(bson.D, 0, len(elems)+4)
 	batchSize := firstBatchDefault
-	sawFilter, sawPipeline := false, false
+	sawFilter, sawPipeline, sawDiskUse := false, false, false
+	sawCollation := false
 
 	// Linearizable survives nothing: it promises a read confirmed on the
 	// primary that owns the document, which another cluster cannot say. Every
@@ -404,6 +406,13 @@ func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
 					batchSize = n
 				}
 			}
+		case "allowDiskUse":
+			// The caller said so themselves; theirs wins, and appending ours
+			// as well would put the same field in the document twice.
+			sawDiskUse = true
+		case "collation":
+			// An explicit collation travels with the command already.
+			sawCollation = true
 		}
 		out = append(out, bson.E{Key: key, Value: val})
 	}
@@ -416,6 +425,36 @@ func rewriteForArchive(cmd bson.Raw) (bson.D, int, error) {
 		out = append(out, bson.E{Key: "pipeline", Value: bson.A{
 			bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}},
 		}})
+	}
+
+	// Let the archive spill a sort to disk.
+	//
+	// The fast tier answers a sorted query from an index. The archive is
+	// expected not to have that index, because the rollout guide tells
+	// operators to drop the ones it does not need, so the same query becomes a
+	// blocking sort over the whole collection. Past the server's sort memory
+	// limit that does not get slower, it fails, and the caller sees a query
+	// that worked before adoption and does not after.
+	//
+	// Spilling is the right trade on the tier that exists to be cheap and slow.
+	// An operator who would rather refuse expensive fallback reads than run
+	// them already has router.completeness: strict, which refuses them all.
+	if !sawDiskUse {
+		if _, isFind := lookupString(cmd, "find"); isFind {
+			out = append(out, bson.E{Key: "allowDiskUse", Value: true})
+		} else if _, isAgg := lookupString(cmd, "aggregate"); isAgg {
+			out = append(out, bson.E{Key: "allowDiskUse", Value: true})
+		}
+	}
+
+	// The collection's own collation decides which documents match, and the
+	// archive's copy of the collection has none, because the feeder created it
+	// by upserting into it. Saying it explicitly makes the archive match the
+	// way the fast tier would have.
+	if !sawCollation && len(collation) > 0 {
+		if c := simplifyCollation(collation); len(c) > 0 {
+			out = append(out, bson.E{Key: "collation", Value: c})
+		}
 	}
 
 	// The level carries over; afterClusterTime and atClusterTime do not, because
@@ -510,11 +549,16 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 		return nil, false
 	}
 	ns := db + "." + coll
-	if !c.r.cfg.Manages(ns) {
+	base, viaView, tiered := c.r.tieredBase(ctx, ns)
+	if !tiered {
 		return nil, false
 	}
+	judged := ns
+	if viaView {
+		judged = base
+	}
 
-	mark, known := c.r.completeness(ctx, ns)
+	mark, known := c.r.completeness(ctx, judged)
 	if known && mark.Claimed {
 		bound, bounded := boundOfQueryField(cmd)
 		if (bounded && mark.Complete(bound)) || (!bounded && mark.CoversAll()) {
@@ -531,6 +575,20 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+
+	// The archive holds the documents but not the view, so it cannot be asked
+	// this question at all.
+	if viaView {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a read through a view over an incomplete collection",
+			"view", ns, "reads", base, "because", because)
+		out, verr := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, ns, base, because)
+		if verr != nil {
+			return nil, false
+		}
+		return out, true
+	}
 
 	if inTransaction(cmd) {
 		if filter, fok := txnFilter(cmd, name); fok {
@@ -603,8 +661,19 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	if err != nil {
 		return nil, err
 	}
-	out := make(bson.D, 0, len(elems)+1)
-	sawQuery := false
+	// count and distinct cross the same way find does, and for the same
+	// reasons: the level of the read concern is portable and its cluster times
+	// are not, an explicit collation travels but the collection's own does not,
+	// and linearizable cannot be answered by another cluster at all.
+	level, honourable := archiveLevel(cmd)
+	if !honourable {
+		return nil, errors.New("readConcern linearizable cannot be answered from the archive: " +
+			"it promises a read confirmed on the primary that owns the document; " +
+			"warm this range, or read it with majority")
+	}
+
+	out := make(bson.D, 0, len(elems)+3)
+	sawQuery, sawCollation := false, false
 	for _, e := range elems {
 		if sessionFields[e.Key()] {
 			continue
@@ -613,6 +682,9 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 			out = append(out, bson.E{Key: "query", Value: liveOnly(e.Value())})
 			sawQuery = true
 			continue
+		}
+		if e.Key() == "collation" {
+			sawCollation = true
 		}
 		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
 	}
@@ -623,6 +695,16 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	coll, _ := stringField(cmd, "count")
 	if coll == "" {
 		coll, _ = stringField(cmd, "distinct")
+	}
+	if !sawCollation {
+		if collation, ok := c.r.defaultCollation(ctx, db+"."+coll); ok {
+			if sc := simplifyCollation(collation); len(sc) > 0 {
+				out = append(out, bson.E{Key: "collation", Value: sc})
+			}
+		}
+	}
+	if rc, ok := archiveReadConcern(level); ok {
+		out = append(out, bson.E{Key: "readConcern", Value: rc})
 	}
 	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
 

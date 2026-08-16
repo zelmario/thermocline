@@ -51,6 +51,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("refused_total", "Commands the router would not answer.", snap.Counters["refused"])
 	counter("txn_replays_total", "Transactions asked to replay after documents were brought up for them.", snap.Counters["txn_replays"])
 	counter("duplicate_keys_total", "Writes refused because they would duplicate a key held in the archive.", snap.Counters["duplicate_keys"])
+	counter("change_streams_total", "Change streams opened on tiered collections. These report evictions as deletes and copy-ups as inserts.", snap.Counters["change_streams"])
 	counter("stale_reads_total", "Archive reads answered before mirroring caught up. Any of these is worth investigating.", snap.Counters["stale_reads"])
 	counter("clients_total", "Client connections accepted since start.", snap.Counters["clients_total"])
 	gauge("clients_open", "Client connections open now.", float64(snap.Counters["clients_open"]))

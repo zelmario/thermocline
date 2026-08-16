@@ -125,3 +125,13 @@ Things these encode that are easy to get wrong when testing by hand:
   the archive held it. When a sweep landed in the gap the document was gone
   before the feeder saw it and the archive correctly held nothing. Mirror the
   document first, wait for it, and create the TTL index afterwards.
+- **A multi-line command chained after a wait can be flattened into one line**
+  by the shell wrapper, turning `done` followed by a newline and `echo` into
+  `done echo ...`, which never runs. The suite it was supposed to launch simply
+  never started, and an empty output file looks exactly like a slow one. Put
+  anything with control flow in a script file and run that.
+- **PSMDB 8.0 defaults hide the sort problem.** `allowDiskUseByDefault` is true
+  and the blocking sort limit is 100 MB, so an unindexed sort on the archive
+  passes for free at test scale and proves nothing. `testindexes.sh` tightens
+  the archive to a 1 MB limit and then turns spilling off, which is a real
+  configuration operators choose, and restores both afterwards.

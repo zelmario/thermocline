@@ -195,6 +195,16 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 		if len(models) == 0 {
 			return nil
 		}
+		// Residency first, for the same reason copyUp does it first: these
+		// writes are what a client's change stream sees, and it must be able
+		// to tell a promotion from an insert the moment the event arrives.
+		for _, id := range raw {
+			if rerr := r.recordResidency(ctx, ns, id); rerr != nil {
+				r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
+				break
+			}
+		}
+
 		res, err := hot.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 		if err != nil {
 			return fmt.Errorf("copy up into %s: %w", ns, err)
@@ -204,12 +214,6 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 		moved += int(res.UpsertedCount)
 		if err := meta.ClearEvictionNotices(ctx, r.cold, ids); err != nil {
 			r.log.Warn("copied up but could not clear eviction notices", "ns", ns, "err", err)
-		}
-		for _, id := range raw {
-			if rerr := r.recordResidency(ctx, ns, id); rerr != nil {
-				r.log.Warn("copied up but could not record residency", "ns", ns, "err", rerr)
-				break
-			}
 		}
 		r.Stats.CopiedUp.Add(res.UpsertedCount)
 		models = models[:0]

@@ -36,6 +36,14 @@ var metadataStages = map[string]bool{
 	"$collStats": true, "$indexStats": true, "$planCacheStats": true,
 	"$currentOp": true, "$listSessions": true, "$listLocalSessions": true,
 	"$shardedDataDistribution": true, "$documents": true,
+	// A change stream reads events, not documents, so there is no set of
+	// documents for the answer to be short of and the completeness question
+	// does not arise. Sending it to the archive instead is not merely wrong,
+	// it is impossible: the archive rewrite puts a $match in front of the
+	// pipeline to hide tombstones, and $changeStream has to be the first
+	// stage, so the archive rejects it and the read is refused. Which is what
+	// happened to every change stream on a tiered collection.
+	"$changeStream": true,
 }
 
 // aggScope is what one aggregate command reads and writes.
@@ -182,9 +190,47 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if err != nil {
 		return nil, false
 	}
+	// A change stream now reaches the fast tier, which is where it belongs, but
+	// what it will report is not what the application expects, so say so rather
+	// than let it be discovered in production.
+	if coll, isCS := changeStreamCollection(cmd, db); isCS {
+		if c.r.cfg.Manages(coll) {
+			c.r.Stats.ChangeStreams.Add(1)
+			c.log.Info("a change stream was opened on a tiered collection",
+				"ns", coll,
+				"note", "eviction and copy-up move documents in and out of the fast tier, and the "+
+					"events for those are hidden from this stream so they cannot be read as "+
+					"application deletes and inserts",
+				"caveat", "an event whose announcement cannot be read is passed through rather "+
+					"than dropped, because missing a real delete would be worse than showing an eviction")
+		}
+		return nil, false
+	}
+
 	scope, ok := scopeOfAggregate(cmd, db)
 	if !ok {
 		return nil, false
+	}
+
+	// A view names itself, not the collection it reads, so completeness has to
+	// be judged against the collection underneath it.
+	if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
+		view := scope.primary
+		scope.primary = base
+		because, _, fine := c.r.checkAggregate(ctx, scope)
+		if fine {
+			return nil, false
+		}
+		c.r.Stats.Incomplete.Add(1)
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a read through a view over an incomplete collection",
+			"view", view, "reads", base, "because", because)
+		out, err := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, view, base, because)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
 	}
 
 	because, remedy, fine := c.r.checkAggregate(ctx, scope)
@@ -270,4 +316,38 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		return nil, false
 	}
 	return out, true
+}
+
+// changeStreamCollection reports whether an aggregate opens a change stream,
+// and on what.
+//
+// The database-wide and cluster-wide forms use `aggregate: 1` and have no
+// collection, and those are not tiered by definition, so only the collection
+// form is named here.
+func changeStreamCollection(cmd bson.Raw, db string) (string, bool) {
+	pv, err := cmd.LookupErr("pipeline")
+	if err != nil {
+		return "", false
+	}
+	arr, ok := pv.ArrayOK()
+	if !ok {
+		return "", false
+	}
+	vals, err := arr.Values()
+	if err != nil || len(vals) == 0 {
+		return "", false
+	}
+	first, ok := vals[0].DocumentOK()
+	if !ok {
+		return "", false
+	}
+	elems, err := first.Elements()
+	if err != nil || len(elems) == 0 || elems[0].Key() != "$changeStream" {
+		return "", false
+	}
+	coll, ok := stringField(cmd, "aggregate")
+	if !ok {
+		return "", true
+	}
+	return db + "." + coll, true
 }

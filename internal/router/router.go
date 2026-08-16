@@ -49,11 +49,17 @@ type Router struct {
 	positions   *checkpoint.Positions
 	ckptCache   checkpointCache
 
-	wmCache  watermarkCache
-	idxCache indexCache
-	cursors  cursorRegistry
-	addr     atomic.Value
-	Stats    Stats
+	wmCache   watermarkCache
+	idxCache  indexCache
+	collCache collationCache
+	viewCache viewCache
+
+	// changeStreams are the client cursors whose events need this system's own
+	// housekeeping filtered out of them.
+	changeStreams changeStreamRegistry
+	cursors       cursorRegistry
+	addr          atomic.Value
+	Stats         Stats
 
 	// Metrics times commands by how they were served, which is what turns the
 	// counters into a picture of what the fast tier is actually saving.
@@ -88,6 +94,8 @@ type Stats struct {
 	TxnReplays    atomic.Int64
 	WarmedForTxn  atomic.Int64
 	DuplicateKeys atomic.Int64
+	ChangeStreams atomic.Int64
+	EventsHidden  atomic.Int64
 	StaleReads    atomic.Int64
 	ClientsOpen   atomic.Int64
 	ClientsTotal  atomic.Int64
@@ -289,9 +297,21 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// bulkWrite is guarded before the switch below, because it is not shaped
+	// like the commands there: it names its collections in nsInfo and its
+	// operations point at them by position, so none of the per-command guards
+	// can find a collection to act on.
+	c.pendingKeys = nil
+	if nameErr == nil && name == "bulkWrite" && !msg.MoreToCome() {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			if out, done := c.guardBulkWrite(ctx, msg, cmd); done {
+				return wire.Write(c.client, out)
+			}
+		}
+	}
+
 	// A unique key has to be claimed before the write lands, or two writes
 	// racing both see a free slot.
-	c.pendingKeys = nil
 	if nameErr == nil && !msg.MoreToCome() {
 		switch name {
 		case "insert":
@@ -360,11 +380,36 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if cmd, cerr := msg.CommandDoc(); cerr == nil {
 		if coll, ok := indexDDL(cmd, name); ok {
 			c.r.forgetIndexes(db + "." + coll)
+			c.r.forgetView(db + "." + coll)
+			// A collection's collation is fixed at creation, so the only way it
+			// changes is a drop and a recreate, which comes through here.
+			c.r.forgetCollation(db + "." + coll)
 		}
 	}
 
 	if isHello(name) {
 		return c.replyHello(msg, reply)
+	}
+
+	// A change stream on a tiered collection reports the evictor's removals as
+	// deletes and copy-ups as inserts. Both are this system's own work, and
+	// neither happened as far as the application is concerned.
+	if name == "aggregate" {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			c.noteChangeStream(cmd, db, reply)
+		}
+	}
+	if name == "getMore" {
+		if out, filtered := c.filterChangeStream(ctx, msg, reply); filtered {
+			return wire.Write(c.client, out)
+		}
+	}
+	if name == "killCursors" {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			for _, id := range cursorIDsOf(cmd) {
+				c.r.changeStreams.drop(id)
+			}
+		}
 	}
 
 	rewritten, err := c.intercept(ctx, msg, name, db, reply)

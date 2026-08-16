@@ -269,11 +269,16 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// fast tier is the whole of it and its answer is authoritative. Asking for a
 	// completeness claim it will never have would send the read to an archive
 	// that has never held a single one of its documents.
-	if !c.r.cfg.Manages(ns) {
+	base, viaView, tiered := c.r.tieredBase(ctx, ns)
+	if !tiered {
 		return reply, nil
 	}
+	judged := ns
+	if viaView {
+		judged = base
+	}
 
-	mark, known := c.r.completeness(ctx, ns)
+	mark, known := c.r.completeness(ctx, judged)
 
 	if known && mark.Claimed {
 		bound, bounded := lowerTimeBound(filter)
@@ -305,6 +310,17 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+
+	// A view exists only on the fast tier, because the feeder mirrors documents
+	// and never collection definitions, so the archive cannot be asked this
+	// question however complete it is.
+	if viaView {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a read through a view over an incomplete collection",
+			"view", ns, "reads", base, "because", because)
+		return c.r.refuseView(reply.Header.RequestID, msg.Header.RequestID, ns, base, because)
+	}
 
 	// A transaction is the one place the archive fallback cannot go. Reading
 	// one tier inside the caller's snapshot and the other outside it is not a
