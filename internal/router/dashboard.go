@@ -63,6 +63,8 @@ func (r *Router) SnapshotAll() Snapshot {
 			"change_streams":     r.Stats.ChangeStreams.Load(),
 			"unauthorized":       r.Stats.Unauthorized.Load(),
 			"primary_only_reads": r.Stats.PrimaryOnlyReads.Load(),
+			"secondary_reads":    r.Stats.SecondaryReads.Load(),
+			"failover_replays":   r.Stats.FailoverReplays.Load(),
 			"unreadable":         r.Stats.Unreadable.Load(),
 			"stale_reads":        r.Stats.StaleReads.Load(),
 			"clients_open":       r.Stats.ClientsOpen.Load(),

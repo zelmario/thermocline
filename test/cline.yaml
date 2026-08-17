@@ -90,6 +90,8 @@ feeder:
     - "shop.tretry"
     # testpool.sh
     - "shop.tpool"
+    # testfailover.sh
+    - "shop.tfail"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

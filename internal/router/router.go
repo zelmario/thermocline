@@ -122,6 +122,10 @@ type Stats struct {
 	DuplicateKeys atomic.Int64
 	ChangeStreams atomic.Int64
 	Unauthorized  atomic.Int64
+	// FailoverReplays counts commands re-sent after the fast tier changed
+	// primary underneath them. Any value above zero is an election the clients
+	// did not have to see.
+	FailoverReplays atomic.Int64
 	// SecondaryReads counts reads that asked for a secondary and were sent to
 	// one. Together with PrimaryOnlyReads it says how much of the read load
 	// actually moved off the primary, which is the only way to tell the feature
@@ -558,35 +562,55 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		up = borrowed.conn
 	}
 
-	if err := wire.Write(up, msg); err != nil {
+	// A failover shows itself two ways, and both end here rather than at the
+	// client. The connection dies, because a primary stepping down closes them;
+	// or the connection survives and the command comes back refused. See
+	// failover.go for which commands may be sent again and which must not.
+	var reply *wire.Message
+	var err error
+
+	if werr := wire.Write(up, msg); werr != nil {
 		if fromPool {
 			// Half an exchange happened on it at most, so it cannot be reused.
 			borrowed.discard()
 			c.unpinExhausted(borrowed)
-		} else {
-			c.upstreamBroke()
+			return fmt.Errorf("forward to fast tier: %w", werr)
 		}
-		return fmt.Errorf("forward to fast tier: %w", err)
-	}
-	// Fire-and-forget writes expect no reply. Sending one would leave the
-	// connection a message out of step for everything that follows.
-	if msg.MoreToCome() {
-		return nil
-	}
-
-	reply, err := wire.Read(up)
-	if fromPool {
-		if err != nil {
-			borrowed.discard()
-			c.unpinExhausted(borrowed)
-		} else {
-			c.keepOrRelease(borrowed, reply)
-		}
-	} else if err != nil {
 		c.upstreamBroke()
-	}
-	if err != nil {
-		return fmt.Errorf("read from fast tier: %w", err)
+		out, replayed := c.replayAfterFailover(ctx, msg, name)
+		if !replayed {
+			return fmt.Errorf("forward to fast tier: %w", werr)
+		}
+		reply = out
+	} else {
+		// Fire-and-forget writes expect no reply. Sending one would leave the
+		// connection a message out of step for everything that follows.
+		if msg.MoreToCome() {
+			return nil
+		}
+
+		reply, err = wire.Read(up)
+		if fromPool {
+			if err != nil {
+				borrowed.discard()
+				c.unpinExhausted(borrowed)
+				return fmt.Errorf("read from fast tier: %w", err)
+			}
+			c.keepOrRelease(borrowed, reply)
+		} else if err != nil {
+			c.upstreamBroke()
+			out, replayed := c.replayAfterFailover(ctx, msg, name)
+			if !replayed {
+				return fmt.Errorf("read from fast tier: %w", err)
+			}
+			reply = out
+		} else if !fromPool {
+			if rdoc, derr := reply.ReplyDoc(); derr == nil && isFailoverReply(rdoc) {
+				if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
+					reply = out
+				}
+			}
+		}
 	}
 	if nameErr != nil {
 		return wire.Write(c.client, reply)

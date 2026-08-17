@@ -47,6 +47,7 @@ Or one at a time:
     docker exec <node> bash /root/testretry.sh     # $sample on a partial tier, and retryable writes
     docker exec <node> bash /root/testpool.sh      # whether idle clients still cost an upstream connection
     bash test/testchaos.sh                         # kill things under load (host side, slow)
+    bash test/testfailover.sh                      # a write across a change of primary (host side)
 
 `testconform.sh` is the one to extend. It asserts almost nothing by hand: two
 collections hold identical documents, one untiered and one tiered with half its
