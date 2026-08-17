@@ -165,7 +165,24 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 	fdoc, _ := fval.DocumentOK()
 	id, hasID := idFromFilter(fdoc)
 	if !hasID {
-		return reply, nil
+		// A filter on any other field names one document without saying which,
+		// and until now it was in neither resolving path. See singlewrite.go.
+		// A statement naming many documents is not this case: guardMultiWrite
+		// brought its documents up before the write, so a zero here is real.
+		if statementIsMulti(stmt, cmdField) {
+			return reply, nil
+		}
+		var resolved bool
+		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, nil)
+		if err != nil {
+			// Reporting zero here is what an erasure request must never be
+			// told, so the honest answer is that the archive could not be
+			// reached, not that there was nothing to reach.
+			return nil, err
+		}
+		if !resolved {
+			return reply, nil
+		}
 	}
 
 	c.r.Stats.WriteMisses.Add(1)
@@ -222,7 +239,18 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 	fdoc, _ := qval.DocumentOK()
 	id, hasID := idFromFilter(fdoc)
 	if !hasID {
-		return reply, nil
+		// findAndModify carries its own sort, which is how the caller says
+		// which of several matches it means. The archive has to be asked in
+		// that same order or the wrong document comes up. See singlewrite.go.
+		sort, _ := cmd.Lookup("sort").DocumentOK()
+		var resolved bool
+		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, sort)
+		if err != nil {
+			return nil, err
+		}
+		if !resolved {
+			return reply, nil
+		}
 	}
 
 	c.r.Stats.WriteMisses.Add(1)
