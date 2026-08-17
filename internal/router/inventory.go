@@ -23,6 +23,13 @@ import (
 // an eviction sweep or a warm, not individual writes.
 const inventoryEvery = 30 * time.Second
 
+// inventoryWorkers bounds how many namespaces are measured at once.
+//
+// Two round trips each, so this is the number of extra connections the dashboard
+// asks of each tier while it refreshes, and it is deliberately a small number
+// rather than a fast one.
+const inventoryWorkers = 8
+
 // NamespaceSize is one collection across both tiers.
 type NamespaceSize struct {
 	NS           string `json:"ns"`
@@ -75,14 +82,41 @@ func (r *Router) readInventory(ctx context.Context) {
 		Namespaces:  make([]NamespaceSize, 0, len(managed)),
 		UpdatedUnix: time.Now().Unix(),
 	}
-	for _, ns := range managed {
+	// Concurrently, bounded. collStats answers about one collection, so there is
+	// no batched form of it to reach for; what makes this affordable at a
+	// hundred namespaces is not asking one after another. Serially it was two
+	// round trips per namespace with everything else waiting, so the refresh
+	// took longer than the interval it runs on and the dashboard showed numbers
+	// that were minutes old while appearing to be seconds old.
+	//
+	// The bound matters as much as the concurrency. An unbounded fan-out over a
+	// few hundred namespaces opens a few hundred connections to each tier at
+	// once, on a timer, which is a good way to make an operator dashboard the
+	// thing that hurts the cluster.
+	sizes := make([]NamespaceSize, len(managed))
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, inventoryWorkers)
+	for i, ns := range managed {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
 			continue
 		}
-		size := NamespaceSize{NS: ns}
-		size.FastDocs, size.FastBytes = collSize(ctx, r, true, db, coll)
-		size.ArchiveDocs, size.ArchiveBytes = collSize(ctx, r, false, db, coll)
+		wg.Add(1)
+		go func(i int, ns, db, coll string) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			size := NamespaceSize{NS: ns}
+			size.FastDocs, size.FastBytes = collSize(ctx, r, true, db, coll)
+			size.ArchiveDocs, size.ArchiveBytes = collSize(ctx, r, false, db, coll)
+			sizes[i] = size
+		}(i, ns, db, coll)
+	}
+	wg.Wait()
+	for _, size := range sizes {
+		if size.NS == "" {
+			continue
+		}
 		out.Namespaces = append(out.Namespaces, size)
 	}
 

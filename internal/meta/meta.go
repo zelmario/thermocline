@@ -11,6 +11,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 const (
@@ -57,6 +58,18 @@ const (
 	// echoes entirely when no promotion has happened recently, which is the
 	// normal state of a system whose fast tier is holding what it should.
 	PromotingActiveMarker = "promotingActive"
+
+	// DaemonStats is where the background daemons publish what their last pass
+	// did, one document each.
+	//
+	// They are separate processes with no listening socket, so their counters
+	// only ever reached a log line, which nothing can alert on. Publishing here
+	// and exporting from the router is the same choice already made for
+	// mirroring lag, and for the same reason: a gauge a daemon scrapes from
+	// itself goes silent exactly when the daemon dies, while one read from
+	// elsewhere shows the time since its last pass climbing, which an alert can
+	// see.
+	DaemonStats = "daemonstats"
 
 	// Watermarks records how far back the fast tier is known to be complete,
 	// one per namespace. This is what lets a range query be answered from the
@@ -153,6 +166,46 @@ type WarmingNotice struct {
 
 // ActiveMarker is a heartbeat written by a daemon so others can cheaply tell
 // whether it is running.
+// DaemonReport is one background daemon's account of itself.
+//
+// Counters are cumulative since the daemon started, which is what a Prometheus
+// counter wants; a restart shows as a reset, which Prometheus already
+// understands. The names are the daemon's own, so a daemon can add a counter
+// without the router needing to know about it.
+type DaemonReport struct {
+	ID       string           `bson:"_id"`
+	At       time.Time        `bson:"at"`
+	DryRun   bool             `bson:"dryRun"`
+	Counters map[string]int64 `bson:"counters"`
+}
+
+// PublishDaemonReport records what a daemon has done so far.
+func PublishDaemonReport(ctx context.Context, cold *mongo.Client, id string, dryRun bool, counters map[string]int64) error {
+	_, err := cold.Database(DB).Collection(DaemonStats).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: id}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "at", Value: time.Now().UTC()},
+			{Key: "dryRun", Value: dryRun},
+			{Key: "counters", Value: counters},
+		}}},
+		options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// ReadDaemonReports returns what every daemon last published.
+func ReadDaemonReports(ctx context.Context, cold *mongo.Client) ([]DaemonReport, error) {
+	cur, err := cold.Database(DB).Collection(DaemonStats).Find(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	var out []DaemonReport
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 type ActiveMarker struct {
 	ID   string    `bson:"_id"`
 	Seen time.Time `bson:"seen"`

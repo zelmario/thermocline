@@ -84,6 +84,8 @@ feeder:
     - "shop.techo"
     # testmerge.sh: tmref is deliberately NOT here, it is the untiered reference
     - "shop.tmrg"
+    # testdaemonmetrics.sh
+    - "shop.tdmet"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

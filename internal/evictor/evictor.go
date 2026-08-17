@@ -42,6 +42,10 @@ type Evictor struct {
 	// should do. A one-shot run sets it so the command actually returns.
 	maxHealthWait time.Duration
 
+	// total accumulates across sweeps, because a counter that resets every pass
+	// tells an alert nothing.
+	total Stats
+
 	marks   *watermark.Store
 	limiter *limiter
 }
@@ -49,6 +53,31 @@ type Evictor struct {
 // SetMaxHealthWait bounds how long RunOnce waits for an unhealthy cluster
 // before giving up. Zero, the default, waits indefinitely.
 func (e *Evictor) SetMaxHealthWait(d time.Duration) { e.maxHealthWait = d }
+
+// publish records what this evictor has done so far, so it can be alerted on.
+//
+// Cumulative rather than per pass, because that is what a counter means. The
+// interesting alert is not any of these numbers, it is the time since the last
+// pass: an evictor that has stopped, or is failing closed on mirroring lag,
+// looks exactly like a healthy one from outside until somebody notices it has
+// not run.
+func (e *Evictor) publish(ctx context.Context, s Stats) {
+	e.total.Scanned += s.Scanned
+	e.total.Evicted += s.Evicted
+	e.total.Held += s.Held
+	e.total.Unconfirmed += s.Unconfirmed
+	e.total.Backoffs += s.Backoffs
+	counters := map[string]int64{
+		"scanned":     int64(e.total.Scanned),
+		"evicted":     int64(e.total.Evicted),
+		"held":        int64(e.total.Held),
+		"unconfirmed": int64(e.total.Unconfirmed),
+		"backoffs":    int64(e.total.Backoffs),
+	}
+	if err := meta.PublishDaemonReport(ctx, e.cold, "evictor", s.DryRun, counters); err != nil {
+		e.log.Warn("could not publish evictor statistics", "err", err)
+	}
+}
 
 // Stats reports one run. On a dry run, Evicted counts what would have been
 // removed.
@@ -111,6 +140,7 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 			return total, err
 		}
 	}
+	e.publish(ctx, total)
 	return total, nil
 }
 

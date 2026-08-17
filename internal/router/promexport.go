@@ -3,9 +3,12 @@ package router
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // Everything an operator needs to alert on is already computed here, and until
@@ -89,6 +92,45 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			lag.Seconds())
 	}
 
+	// The background daemons, which have no listening socket of their own.
+	//
+	// Each publishes what it has done into the archive after every pass, and the
+	// router reads it here. The counters are useful; the gauge is the one to
+	// alert on. An evictor that has stopped, or that is failing closed on
+	// mirroring lag, looks exactly like a healthy one from outside until
+	// somebody notices it has not run, and seconds_since_pass is that noticing.
+	if reports, rerr := r.daemonReports(ctx); rerr == nil && len(reports) > 0 {
+		sort.Slice(reports, func(i, j int) bool { return reports[i].ID < reports[j].ID })
+		fmt.Fprintf(b, "# HELP thermocline_daemon_seconds_since_pass How long since this daemon finished a pass. A daemon that has stopped shows this climbing.\n")
+		fmt.Fprintf(b, "# TYPE thermocline_daemon_seconds_since_pass gauge\n")
+		for _, rep := range reports {
+			fmt.Fprintf(b, "thermocline_daemon_seconds_since_pass{daemon=\"%s\"} %s\n",
+				promEscape(rep.ID), strconv.FormatFloat(time.Since(rep.At).Seconds(), 'f', -1, 64))
+		}
+		fmt.Fprintf(b, "# HELP thermocline_daemon_dry_run Whether this daemon is running without making changes.\n")
+		fmt.Fprintf(b, "# TYPE thermocline_daemon_dry_run gauge\n")
+		for _, rep := range reports {
+			dry := 0
+			if rep.DryRun {
+				dry = 1
+			}
+			fmt.Fprintf(b, "thermocline_daemon_dry_run{daemon=\"%s\"} %d\n", promEscape(rep.ID), dry)
+		}
+		fmt.Fprintf(b, "# HELP thermocline_daemon_documents_total Documents each daemon has handled since it started, by outcome.\n")
+		fmt.Fprintf(b, "# TYPE thermocline_daemon_documents_total counter\n")
+		for _, rep := range reports {
+			keys := make([]string, 0, len(rep.Counters))
+			for k := range rep.Counters {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				fmt.Fprintf(b, "thermocline_daemon_documents_total{daemon=\"%s\",outcome=\"%s\"} %d\n",
+					promEscape(rep.ID), promEscape(k), rep.Counters[k])
+			}
+		}
+	}
+
 	// What each tier is holding.
 	if len(snap.Inventory.Namespaces) > 0 {
 		fmt.Fprintf(b, "# HELP thermocline_tier_documents Documents held per namespace and tier.\n")
@@ -124,4 +166,15 @@ func (r *Router) mirroringLag(ctx context.Context) (time.Duration, bool) {
 		return 0, false
 	}
 	return time.Since(at), true
+}
+
+// daemonReports reads what the background daemons last published.
+//
+// Separated so the export can be rendered without a cluster behind it, which is
+// what the histogram test does.
+func (r *Router) daemonReports(ctx context.Context) ([]meta.DaemonReport, error) {
+	if r.cold == nil {
+		return nil, nil
+	}
+	return meta.ReadDaemonReports(ctx, r.cold)
 }

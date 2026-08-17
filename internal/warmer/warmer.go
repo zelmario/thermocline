@@ -43,8 +43,33 @@ type Warmer struct {
 	// the tiers meaningless.
 	unannounced config.UnannouncedDeletes
 
+	// total accumulates across runs, for the same reason the evictor keeps one:
+	// a counter that resets every pass tells an alert nothing.
+	total Stats
+
 	marks   *watermark.Store
 	limiter *limiter
+}
+
+// publish records what this warmer has done so far.
+//
+// The number worth alerting on is the time since the last run. A warmer that has
+// stopped leaves the fast tier's completeness claim slowly going out of date,
+// and nothing else in the system notices.
+func (w *Warmer) publish(ctx context.Context, s Stats) {
+	w.total.Scanned += s.Scanned
+	w.total.Warmed += s.Warmed
+	w.total.Present += s.Present
+	w.total.Backoffs += s.Backoffs
+	counters := map[string]int64{
+		"scanned":         int64(w.total.Scanned),
+		"warmed":          int64(w.total.Warmed),
+		"already_present": int64(w.total.Present),
+		"backoffs":        int64(w.total.Backoffs),
+	}
+	if err := meta.PublishDaemonReport(ctx, w.cold, "warmer", s.DryRun, counters); err != nil {
+		w.log.Warn("could not publish warmer statistics", "err", err)
+	}
 }
 
 // Stats reports one run.
@@ -109,6 +134,7 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 			return total, err
 		}
 	}
+	w.publish(ctx, total)
 	return total, nil
 }
 
