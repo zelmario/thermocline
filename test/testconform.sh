@@ -91,6 +91,34 @@ mkIndexes() { # collection, connection-fn
       c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});" >/dev/null
 }
 
+# waitFeederPast blocks until the feeder has processed everything written to the
+# fast tier so far, proved by a sentinel document reaching the archive.
+#
+# The feeder is running throughout this suite and it is always some way behind.
+# Two things in reseed depend on it having caught up, and both used to be a
+# sleep 1 that was usually but not always long enough:
+#
+# The archive seed raced the feeder's mirror of the previous reseed's fast tier
+# inserts. When that mirror landed after this reseed had dropped the archive
+# collection, the archive already held _id 1, and an ordered insertMany aborts on
+# the first duplicate without inserting any of the twenty. The archive was left
+# holding ten documents rather than twenty, so half the collection was missing
+# from every answer and checks failed with nothing wrong with the product. It hit
+# a different handful of checks on each run.
+#
+# The completeness claim raced the drop. The feeder withdraws the claim when it
+# sees a collection dropped on the fast tier, which is correct, but reseed writes
+# the claim moments later and the withdrawal can land after it.
+waitFeederPast() {
+  H "db.getSiblingDB('shop').tcon.insertOne({_id:'__sentinel'})" >/dev/null
+  for _ in $(seq 1 120); do
+    [ "$(C "print(db.getSiblingDB('shop').tcon.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
+    sleep 0.5
+  done
+  H "db.getSiblingDB('shop').tcon.deleteOne({_id:'__sentinel'})" >/dev/null
+  C "db.getSiblingDB('shop').tcon.deleteOne({_id:'__sentinel'})" >/dev/null
+}
+
 reseed() {
   H "db.getSiblingDB('shop').tcref.drop();
      db.getSiblingDB('shop').tcref.insertMany($DOCS);
@@ -100,14 +128,23 @@ reseed() {
   # 1 to 10 on both tiers, 11 to 20 only in the archive, which is what an evicted
   # document looks like.
   H "const all=$DOCS; db.getSiblingDB('shop').tcon.insertMany(all.slice(0,10))" >/dev/null
-  C "const all=$DOCS; db.getSiblingDB('shop').tcon.insertMany(all)" >/dev/null
+  # Upserts, not insertMany. A late mirror of the fast tier inserts above can put
+  # documents here first, and an ordered insert then abandons the whole seed on
+  # the first duplicate. This states the archive's contents rather than assuming
+  # it is empty, and replacing the whole document also clears any tombstone.
+  C "const all=$DOCS;
+     db.getSiblingDB('shop').tcon.bulkWrite(
+       all.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
+       {ordered:false})" >/dev/null
   H "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
   C "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
   mkIndexes tcref H
   mkIndexes tcon H
   mkIndexes tcon C
+  # The claim goes last, after the feeder has seen the drop and withdrawn the
+  # previous one. Writing it before that is what made the claim vanish.
+  waitFeederPast
   cline watermark --config $CFG --ns shop.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
-  sleep 1
 }
 
 echo "== setup =="
@@ -202,7 +239,11 @@ same '$replaceWith'  "print(JSON.stringify(COLL.aggregate([{\$replaceWith:'\$met
 same '$facet'        "print(JSON.stringify(COLL.aggregate([{\$facet:{a:[{\$count:'c'}],b:[{\$group:{_id:'\$grp',c:{\$sum:1}}},{\$sort:{_id:1}}]}}])$A"
 same '$bucket'       "print(JSON.stringify(COLL.aggregate([{\$bucket:{groupBy:'\$n',boundaries:[0,5,10,15,25],default:'other',output:{c:{\$sum:1}}}}])$A"
 same '$bucketAuto'   "print(JSON.stringify(COLL.aggregate([{\$bucketAuto:{groupBy:'\$n',buckets:4}}]).toArray().map(d=>d.count)))"
-same '$sortByCount'  "print(JSON.stringify(COLL.aggregate([{\$sortByCount:'\$grp'}])$A"
+# Both groups hold ten documents, and $sortByCount sorts by count alone, so the
+# order of a tie is MongoDB's to choose and the two tiers are free to disagree
+# about it without either being wrong. Sort the tie out here, or this compares
+# something undefined and fails about one run in two.
+same '$sortByCount'  "print(JSON.stringify(COLL.aggregate([{\$sortByCount:'\$grp'},{\$sort:{count:-1,_id:1}}])$A"
 same '$unionWith'    "print(JSON.stringify(COLL.aggregate([{\$unionWith:{coll:COLL.getName()}},{\$count:'c'}])$A"
 same '$setWindowFields' "print(JSON.stringify(COLL.aggregate([{\$setWindowFields:{sortBy:{n:1},output:{run:{\$sum:'\$n',window:{documents:['unbounded','current']}}}}},{\$sort:{n:1}}]).toArray().map(d=>d.run)))"
 # $sample is random by definition, so only its shape can be differential.
