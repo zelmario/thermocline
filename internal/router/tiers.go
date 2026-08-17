@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -66,13 +67,11 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	}
 
 	db, coll := splitNS(ns)
-	// $setOnInsert, never a replace. If the fast tier gained this document
-	// while we were reading the archive, its copy is the newer one.
-	_, err = r.hot.Database(db).Collection(coll).UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: id}},
-		bson.D{{Key: "$setOnInsert", Value: doc}},
-		options.UpdateOne().SetUpsert(true))
-	if err != nil {
+	// An insert, never a replace and never an upsert built from modifiers. If
+	// the fast tier gained this document while we were reading the archive, its
+	// copy is the newer one and the duplicate key says so. See package promote
+	// for why this is not written as $setOnInsert.
+	if _, err = promote.One(ctx, r.hot.Database(db).Collection(coll), doc); err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
 	}
 

@@ -5,11 +5,11 @@ import (
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -185,14 +185,14 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	hot := r.hot.Database(db).Collection(coll)
-	models := make([]mongo.WriteModel, 0, 256)
+	docs := make([]bson.Raw, 0, 256)
 	ids := make([]string, 0, 256)
 	var raw []bson.RawValue
 	copied := 0
 	moved := 0
 
 	flush := func() error {
-		if len(models) == 0 {
+		if len(docs) == 0 {
 			return nil
 		}
 		// Residency first, for the same reason copyUp does it first: these
@@ -205,18 +205,19 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 			}
 		}
 
-		res, err := hot.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+		// Only the inserts moved a document. The rest were refused as duplicates
+		// of a copy the fast tier already had, which is the case the old
+		// $setOnInsert expressed by matching and doing nothing.
+		n, err := promote.Many(ctx, hot, docs)
 		if err != nil {
 			return fmt.Errorf("copy up into %s: %w", ns, err)
 		}
-		// Only the upserts moved a document. The rest matched a copy the fast
-		// tier already had, which $setOnInsert deliberately leaves alone.
-		moved += int(res.UpsertedCount)
+		moved += n
 		if err := meta.ClearEvictionNotices(ctx, r.cold, ids); err != nil {
 			r.log.Warn("copied up but could not clear eviction notices", "ns", ns, "err", err)
 		}
-		r.Stats.CopiedUp.Add(res.UpsertedCount)
-		models = models[:0]
+		r.Stats.CopiedUp.Add(int64(n))
+		docs = docs[:0]
 		ids = ids[:0]
 		raw = raw[:0]
 		return nil
@@ -232,16 +233,14 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 		if lerr != nil {
 			continue
 		}
-		// $setOnInsert, never a replace: if the fast tier already holds this
-		// document its copy is the authoritative one.
-		models = append(models, mongo.NewUpdateOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(bson.D{{Key: "$setOnInsert", Value: doc}}).
-			SetUpsert(true))
+		// An insert, never a replace: if the fast tier already holds this
+		// document its copy is the authoritative one and the duplicate key
+		// leaves it alone.
+		docs = append(docs, doc)
 		ids = append(ids, meta.DocID(ns, id))
 		raw = append(raw, id)
 		copied++
-		if len(models) >= 256 {
+		if len(docs) >= 256 {
 			if err := flush(); err != nil {
 				return moved, err
 			}

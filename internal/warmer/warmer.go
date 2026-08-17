@@ -25,6 +25,7 @@ import (
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
 
@@ -397,15 +398,13 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	}
 
 	db, coll := splitNS(ns)
-	models := make([]mongo.WriteModel, len(docs))
+	// An insert, never a replace. The fast tier is authoritative: if it already
+	// holds this document, its copy is the newer one and the archive's must not
+	// overwrite it, which a duplicate key achieves without rewriting the
+	// document the way $setOnInsert did. See package promote.
+	raw := make([]bson.Raw, len(docs))
 	for i, d := range docs {
-		// $setOnInsert, never a replace. The fast tier is authoritative: if it
-		// already holds this document, its copy is the newer one and the
-		// archive's must not overwrite it.
-		models[i] = mongo.NewUpdateOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: d.id}}).
-			SetUpdate(bson.D{{Key: "$setOnInsert", Value: d.raw}}).
-			SetUpsert(true)
+		raw[i] = d.raw
 	}
 	// Residency is recorded before the write, not after.
 	//
@@ -420,8 +419,7 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return 0, err
 	}
 
-	res, err := w.hot.Database(db).Collection(coll).
-		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	inserted, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
 	if err != nil {
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
 	}
@@ -436,8 +434,8 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		w.log.Warn("warmed but could not clear eviction notices", "ns", ns, "err", err)
 	}
 
-	w.log.Debug("warmed", "ns", ns, "inserted", res.UpsertedCount, "already_present", res.MatchedCount)
-	return int(res.UpsertedCount), nil
+	w.log.Debug("warmed", "ns", ns, "inserted", inserted, "already_present", len(raw)-inserted)
+	return inserted, nil
 }
 
 // recordResidency protects warmed documents from the evictor for a while.
