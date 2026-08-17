@@ -11,6 +11,10 @@ nothing.
 
     docker cp test/*.sh <node>:/root/
     docker cp test/cline.yaml <node>:/root/cline.yaml
+    docker exec <node> bash /root/sweep.sh         # all of the below, serially, one log each
+
+Or one at a time:
+
     docker exec <node> bash /root/testall.sh       # every subcommand, flag and error path
     docker exec <node> bash /root/testevict.sh     # the evictor, including its fail-closed guard
     docker exec <node> bash /root/testrouter.sh    # router behaviour through the wire protocol
@@ -22,7 +26,28 @@ nothing.
     docker exec <node> bash /root/testaggwrite.sh  # $out and $merge over archived input
     docker exec <node> bash /root/testlife.sh      # residency, drop, TTL, big documents, auth, concurrency
     docker exec <node> bash /root/testtxn.sh       # what a transaction is promised across two tiers
+    docker exec <node> bash /root/testauth.sh      # whether a client's permissions still apply from the archive
+    docker exec <node> bash /root/testbulk.sh      # the bulkWrite command MongoDB 8.0 added
+    docker exec <node> bash /root/testchange.sh    # change streams opened by the application, through the router
+    docker exec <node> bash /root/testconcerns.sh  # write concern, read concern, and concurrent writers
+    docker exec <node> bash /root/testddl.sh       # commands that change a collection rather than its documents
+    docker exec <node> bash /root/testexplain.sh   # what explain says about a query the fast tier cannot answer
+    docker exec <node> bash /root/testindexes.sh   # what happens when the tiers have different indexes
+    docker exec <node> bash /root/testquery.sh     # query features that depend on something other than the documents
+    docker exec <node> bash /root/testreadpref.sh  # where a read asking for a secondary actually lands
+    docker exec <node> bash /root/testtypes.sh     # collection types that cannot be tiered
+    docker exec <node> bash /root/testupsert.sh    # an upsert whose document lives only in the archive
+    docker exec <node> bash /root/testsingle.sh    # single-document writes filtered on any other field
+    docker exec <node> bash /root/testconform.sh   # differential: the same answer MongoDB would give
     bash test/testchaos.sh                         # kill things under load (host side, slow)
+
+`testconform.sh` is the one to extend. It asserts almost nothing by hand: two
+collections hold identical documents, one untiered and one tiered with half its
+documents only in the archive, every operation runs against both, and the
+answers must match. A failure is the router disagreeing with MongoDB rather than
+with somebody's expectation. It found that every promoted document came back
+with its fields reordered, which twenty-three suites of hand-written checks had
+agreed with themselves about for months.
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
 them with `docker exec -e` when the topology is not the documented one.

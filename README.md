@@ -690,9 +690,16 @@ mongosh --port 28018 --eval '
 
 ## What is not handled yet
 
-- **Promotion echo from the router.** The warmer's echo is suppressed through
-  `_thermocline.warming` and a heartbeat marker; the router will need the same
-  treatment when it starts copying documents up on demand.
+- **Promotion echo from the router.** The router does copy documents up on
+  demand, and its promotions are not suppressed. The warmer announces into
+  `_thermocline.warming` and the feeder skips what it finds there; a router
+  copy-up records residency instead, which the suppression does not read. So the
+  feeder mirrors every promoted document straight back down into the archive it
+  was just read from. The document is identical, so this costs a redundant
+  archive write per promotion rather than a wrong answer, but it is write
+  amplification exactly where a read-heavy workload over archived data will feel
+  it. It was not always harmless: while promotion was written as `$setOnInsert`,
+  this echo is what made the reordered copy permanent.
 - **The first seconds of a warm are not suppressed.** The feeder caches its view
   of the warmer heartbeat for five seconds, so a little echo slips through at the
   start. Irrelevant for a warm lasting hours, worth knowing for a short one.
