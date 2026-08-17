@@ -166,3 +166,27 @@ Things these encode that are easy to get wrong when testing by hand:
   type checks run the feeder in a subshell; without the guard the feeder simply
   starts and runs, so the subshell never returns and the whole suite wedges.
   Wrap it in `timeout`.
+- **An uncaught error in `mongosh --eval` ends the script**, so everything after
+  it silently never runs. Enabling the profiler with
+  `setProfilingLevel(0); system.profile.drop(); setProfilingLevel(2)` throws on
+  the `drop()` on a secondary, so `setProfilingLevel(2)` never ran on the two
+  nodes the test was about. The suite then measured nothing and reported zero
+  everywhere, which reads exactly like a real finding. Guard each step, or check
+  afterwards that it took: `getProfilingStatus().was` should be 2.
+- **A control that records nothing proves nothing.** Following on from the
+  above: the first read-preference run showed the router serving every secondary
+  read from the primary, which was true, but its control showed zero on all
+  three nodes. That leaves "the profiler does not record on secondaries" as an
+  unexcluded explanation for the whole result. Do not report a measurement whose
+  control did not come back positive.
+- **`system.profile` is capped and cannot be dropped on a secondary**, so
+  entries survive between runs. A suite that filters profile output by a fixed
+  `comment` finds a stale entry from the previous run, on whichever node ran it
+  last, and reports the wrong node. `testreadpref.sh` failed four checks
+  including its own control the first time it ran inside a full sweep, for that
+  reason and no other. Tag each run's queries uniquely.
+- **`make build` sets `CGO_ENABLED=0`, so use it.** A plain `go build` links
+  against the host glibc, and the container's is older, so the binary dies at
+  exec with `GLIBC_2.34 not found`. That surfaces as `FATAL the router never
+  came up`, which looks like the router refusing to start rather than a build
+  problem. This cost two runs before the Makefile was fixed.
