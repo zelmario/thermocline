@@ -328,6 +328,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// An upsert that matches nothing does not wait to be put right on the way
+	// back: it creates a document in place of the archived one and the feeder
+	// then mirrors that over the archive. So it too is judged before it runs.
+	if nameErr == nil && !msg.MoreToCome() &&
+		(name == "update" || name == "findAndModify" || name == "findandmodify") {
+		if out, done := c.guardUpsert(ctx, msg, db, name); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
 	// bulkWrite is guarded before the switch below, because it is not shaped
 	// like the commands there: it names its collections in nsInfo and its
 	// operations point at them by position, so none of the per-command guards

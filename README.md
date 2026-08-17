@@ -447,6 +447,29 @@ no session there and cannot be given one. **It should therefore be reachable
 only by the router**, which the operating rules already require for a different
 reason: the cheap tier is read-only to everyone except the feeder.
 
+### Upserts
+
+An upsert is the one write shape that cannot be put right on the way back. Every
+other write that matches nothing on the fast tier is resolved afterwards, by
+copying the archived document up and running the write again. An upsert does not
+wait: matching nothing is its cue to create a document there and then, built from
+the filter's equalities and the update.
+
+That document carries the archived record's `_id` and almost none of its fields,
+and the feeder mirrors it up as an upsert, so **the archived record is
+overwritten by it**. `copyUp` uses `$setOnInsert` precisely so a promotion never
+clobbers a newer fast tier copy, which means it cannot undo this either.
+
+So an upsert on a tiered collection is judged before it runs. If the fast tier
+matches nothing, whatever the archive matches is copied up first, and the upsert
+then finds it and updates it, which is what the same statement would have done
+with no tiering underneath it.
+
+The cost is one indexed lookup on the fast tier per upsert, and only on a
+collection whose watermark does not already claim all of history. A fully warmed
+collection has nothing archived that is not also on the fast tier, so the guard
+returns immediately and costs nothing.
+
 ### Prometheus
 
 The same address serves `/metrics` in the Prometheus text format: commands and

@@ -79,6 +79,9 @@ feeder:
     - "shop.tidx"
     # testexplain.sh
     - "shop.texpl"
+    # testupsert.sh
+    - "shop.tups"
+    - "shop.tupsf"
     # testquery.sh
     - "shop.tqcoll"
     - "shop.tqtext"
