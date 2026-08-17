@@ -75,6 +75,9 @@ feeder:
     - "shop.tts"
     # testauth.sh
     - "shop.tauth"
+    # testauthterm.sh, its own collection so it cannot inherit testauth.sh's
+    # archived documents and count them into every answer.
+    - "shop.tatrm"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

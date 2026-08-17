@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -99,6 +100,27 @@ type RouterConfig struct {
 	// collections and reports traffic, so it belongs on an operator network
 	// rather than wherever the application already connects.
 	Dashboard string `yaml:"dashboard"`
+	// ServiceUser, ServicePass and ServiceAuthDB are the router's own
+	// credentials, copied from hot.uri at load time rather than configured
+	// twice. They are only used when TerminateAuth is on.
+	ServiceUser   string `yaml:"-"`
+	ServicePass   string `yaml:"-"`
+	ServiceAuthDB string `yaml:"-"`
+	// TerminateAuth makes the router authenticate clients itself instead of
+	// passing their SCRAM conversation through to the fast tier.
+	//
+	// Off by default, and it should stay off until the deployment has been
+	// tested with it on, because it moves the decision about who may read what
+	// from the database into this proxy. With it on the router verifies the
+	// client's password against the credentials mongod stores, loads that
+	// user's privileges, and refuses anything they do not cover. With it off
+	// the fast tier decides, as it always has, and read preference, failover
+	// writes and connection pooling remain limited by the single authenticated
+	// upstream connection.
+	//
+	// The router's own account then needs read on admin.system.users, to verify
+	// passwords, and it should have nothing else it does not already need.
+	TerminateAuth bool `yaml:"terminate_auth"`
 	// FeederID names the checkpoint ArchiveWait reads, copied from feeder.id at
 	// load time rather than configured twice.
 	FeederID string `yaml:"-"`
@@ -294,6 +316,11 @@ func Load(path string) (Config, error) {
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
 	cfg.Router.FeederID = cfg.Feeder.ID
+	// The router's own account, taken from the fast tier connection string
+	// rather than configured a second time. With terminate_auth on, the raw
+	// upstream connection is the router's rather than the client's, so the
+	// router has to authenticate it itself.
+	cfg.Router.ServiceUser, cfg.Router.ServicePass, cfg.Router.ServiceAuthDB = credentialsFromURI(cfg.Hot.URI)
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -446,4 +473,30 @@ func samePort(a, b string) bool {
 		return false
 	}
 	return ap == bp
+}
+
+// credentialsFromURI pulls the router's own account out of the fast tier
+// connection string.
+//
+// Taken from there rather than configured separately because they are the same
+// account: whatever the router already uses to mirror, evict and warm is what it
+// will use to hold the upstream connection when it terminates authentication.
+// Configuring them twice is a way for the two to drift apart, and the failure
+// when they do is a login that works everywhere except through the proxy.
+func credentialsFromURI(uri string) (user, pass, authDB string) {
+	u, err := url.Parse(uri)
+	if err != nil || u.User == nil {
+		return "", "", ""
+	}
+	user = u.User.Username()
+	pass, _ = u.User.Password()
+	authDB = u.Query().Get("authSource")
+	if authDB == "" {
+		// The driver's own default: the database named in the path, or admin.
+		authDB = strings.TrimPrefix(u.Path, "/")
+		if authDB == "" {
+			authDB = "admin"
+		}
+	}
+	return user, pass, authDB
 }

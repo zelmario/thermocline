@@ -24,6 +24,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmario/thermocline/internal/authn"
+	"github.com/zelmario/thermocline/internal/authz"
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/watermark"
@@ -42,6 +44,12 @@ type Router struct {
 	// re-resolved after a failure, so a failover is survivable.
 	primaryMu sync.RWMutex
 	primary   string
+
+	// creds and grants are how the router decides who a client is and what it
+	// may do, once it terminates authentication rather than proxying it. Both
+	// read from the fast tier, which is where the users are.
+	creds  *authn.Source
+	grants *authz.Source
 
 	// checkpoints reads how far mirroring has got, so a read served from the
 	// archive can wait for it rather than answer from behind.
@@ -118,6 +126,11 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 		log:         log,
 		Metrics:     NewMetrics(metricsWindow),
 		started:     time.Now(),
+		// Short on purpose. Both are on the path of authenticating and of every
+		// command, so they have to be cached, and a revoked role or a changed
+		// password has to take effect while somebody still cares.
+		creds:  authn.New(hot, 30*time.Second),
+		grants: authz.New(hot, 30*time.Second),
 	}
 }
 
@@ -203,6 +216,17 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 	}
 	defer func() { _ = upstream.Close() }()
 
+	// With authentication terminated the upstream connection is the router's
+	// own, so the router logs in on it. Doing it here, once per connection and
+	// before the client has sent anything, means no command can reach the fast
+	// tier over an anonymous connection.
+	if r.cfg.TerminateAuth {
+		if err := r.authenticateUpstream(upstream); err != nil {
+			r.log.Error("cannot authenticate to the fast tier", "err", err)
+			return
+		}
+	}
+
 	c := &conn{
 		r:        r,
 		client:   client,
@@ -233,6 +257,13 @@ type conn struct {
 	// txnKeys is what an update inside a transaction left to be checked once
 	// the reply is back and the real post-image can be read.
 	txnKeys txnKeyCheck
+
+	// auth is the SCRAM conversation in progress, and grants what the finished
+	// one established. grants being nil is what "not authenticated" means, and
+	// every command is refused until it is not.
+	auth        *authConv
+	grants      *authz.Grants
+	pendingUser string
 
 	// warnedReadPref remembers which non-primary read preferences this client
 	// has already been warned about, so a reporting client sending the same one
@@ -283,6 +314,22 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// otherwise be consumed by whatever command came next, against ids from a
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
+
+	// Authentication and authorization come first, before any guard, because
+	// every guard below this reads or writes data and none of them asks who is
+	// calling. See gate.go.
+	if c.r.cfg.TerminateAuth && nameErr == nil && !msg.MoreToCome() {
+		if isSASL(name) {
+			out, serr := c.handleSASL(ctx, msg, name, db)
+			if serr != nil {
+				return serr
+			}
+			return wire.Write(c.client, out)
+		}
+		if out, denied := c.gate(msg, name, db); denied {
+			return wire.Write(c.client, out)
+		}
+	}
 
 	// Cursors this router owns never existed on the fast tier, so their
 	// follow-ups have to be served here or the driver gets "cursor not found".
@@ -399,6 +446,13 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// unreadable here, and an unreadable command is an unguarded one.
 	if nameErr == nil && isHello(name) {
 		msg = c.unnegotiateCompression(msg)
+		// A driver embeds a saslStart in hello to save a round trip. Forwarded
+		// on the router's own connection it would try to authenticate that
+		// connection as the client, which is not what anybody wants. See
+		// stripSpeculativeAuth.
+		if c.r.cfg.TerminateAuth {
+			msg = c.dropSpeculativeAuth(msg)
+		}
 	}
 
 	if err := wire.Write(c.upstream, msg); err != nil {
@@ -499,6 +553,15 @@ func (c *conn) replyHello(msg, reply *wire.Message) error {
 	out, err := mongosIdentity(doc)
 	if err != nil {
 		return wire.Write(c.client, reply)
+	}
+	// A driver that embedded a saslStart in hello gets no speculative result
+	// back, so it falls back to an explicit conversation, which is the one this
+	// router terminates. The legacy OP_QUERY handshake cannot be rewritten on
+	// the way out to the fast tier, so this is where that case is caught: the
+	// saslStart reached the fast tier, nothing ever continues it there, and the
+	// upstream connection keeps the identity the router gave it.
+	if c.r.cfg.TerminateAuth {
+		out = dropSpeculativeResult(out)
 	}
 
 	var rewritten *wire.Message

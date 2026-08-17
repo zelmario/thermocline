@@ -39,6 +39,7 @@ Or one at a time:
     docker exec <node> bash /root/testupsert.sh    # an upsert whose document lives only in the archive
     docker exec <node> bash /root/testsingle.sh    # single-document writes filtered on any other field
     docker exec <node> bash /root/testconform.sh   # differential: the same answer MongoDB would give
+    docker exec <node> bash /root/testauthterm.sh  # the router authenticating clients itself
     bash test/testchaos.sh                         # kill things under load (host side, slow)
 
 `testconform.sh` is the one to extend. It asserts almost nothing by hand: two
