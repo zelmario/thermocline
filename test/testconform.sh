@@ -1,0 +1,410 @@
+#!/bin/bash
+# Differential conformance across the MongoDB surface an application uses.
+#
+# The promise this system makes is that no application changes. That is not a
+# promise about any one feature, it is a promise that the answer is the one you
+# would have had without it, so the honest way to test it is to ask for both
+# answers and compare.
+#
+# Two collections hold identical documents. shop.tcref is ordinary and untiered,
+# so the router passes it straight through and it is the reference. shop.tcon is
+# tiered, half its documents sit only in the archive, and its watermark says the
+# fast tier is incomplete, so every read has to be resolved across both tiers.
+# Each operation runs against both and the two results must match exactly.
+#
+# Almost nothing here asserts a value written by hand. A check that fails is the
+# router disagreeing with MongoDB, which is the only definition of a bug that
+# matters for a drop-in proxy. The few checks that cannot be differential, the
+# ones whose answer is random or is the current time, say so where they are.
+#
+# Both tiers of tcon get the same secondary indexes, because that is the
+# documented deployment: see "Indexes are not copied, in either direction" in
+# README, and `cline indexes` for the divergence report.
+CFG=/root/cline.yaml
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
+PASS=0; FAIL=0; declare -a FAILED
+chk() {
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-40s %.34s\n' "$1" "$3"
+  else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-40s\n          ref=%.150s\n          got=%.150s\n' "$1" "$2" "$3"; fi
+}
+R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
+
+# The heart of the suite. The expression names its collection as COLL; it runs
+# once against the reference and once against the tiered collection, both through
+# the router, and the answers must agree.
+same() {
+  local label="$1" expr="$2" ref got
+  ref=$(R "const c=db.getSiblingDB('shop').tcref; try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
+  got=$(R "const c=db.getSiblingDB('shop').tcon;  try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
+  chk "$label" "$ref" "$got"
+}
+# For writes, which need both collections put back first.
+samew() { reseed; same "$1" "$2"; }
+
+stopDaemons() {
+  pkill -f 'cline feeder|cline router' 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
+startFeeder() {
+  cline feeder --config $CFG --log-file /var/log/cline/conf_f.log & FP=$!
+  for _ in $(seq 1 60); do
+    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    sleep 0.5
+  done
+  echo "  WARN  the feeder never wrote a checkpoint"
+}
+startRouter() {
+  cline router --config $CFG --log-file /var/log/cline/conf_r.log & RP=$!
+  for _ in $(seq 1 30); do
+    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "  FATAL  the router never came up on 27100"; exit 2
+}
+
+# Twenty documents shaped to exercise every operator in the list: numbers, a
+# string, an array of scalars, an array of subdocuments, a subdocument, a date,
+# a point, a sentence for text search, and a field only some of them carry.
+DOCS='Array.from({length:20},(_,i)=>({
+  _id: i+1,
+  n: i+1,
+  f: (i+1)/4,
+  name: "user" + String(i+1).padStart(2,"0"),
+  grp: ["alpha","beta"][i%2],
+  tags: ["t"+((i%3)+1), "common"],
+  items: [{sku:"s"+(i%4), qty:i+1},{sku:"s9", qty:2}],
+  meta: {score: (i*7)%13, active: i%4!==0},
+  words: ["red apple pie","blue berry tart","green kiwi cake"][i%3],
+  loc: {type:"Point", coordinates:[(i%10)-5, (i%7)-3]},
+  when: new Date(Date.UTC(2024,i%12,1+(i%27),13,45,30,250))
+}))'
+OPT='[3,6,9,12,15,18]'
+
+mkIndexes() { # collection, connection-fn
+  $2 "const c=db.getSiblingDB('shop').$1;
+      c.createIndex({words:'text'});
+      c.createIndex({loc:'2dsphere'});
+      c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});" >/dev/null
+}
+
+reseed() {
+  H "db.getSiblingDB('shop').tcref.drop();
+     db.getSiblingDB('shop').tcref.insertMany($DOCS);
+     db.getSiblingDB('shop').tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  H "db.getSiblingDB('shop').tcon.drop()" >/dev/null
+  C "db.getSiblingDB('shop').tcon.drop()" >/dev/null
+  # 1 to 10 on both tiers, 11 to 20 only in the archive, which is what an evicted
+  # document looks like.
+  H "const all=$DOCS; db.getSiblingDB('shop').tcon.insertMany(all.slice(0,10))" >/dev/null
+  C "const all=$DOCS; db.getSiblingDB('shop').tcon.insertMany(all)" >/dev/null
+  H "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  C "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  mkIndexes tcref H
+  mkIndexes tcon H
+  mkIndexes tcon C
+  cline watermark --config $CFG --ns shop.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
+  sleep 1
+}
+
+echo "== setup =="
+stopDaemons
+C "db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({}); db.getSiblingDB('_thermocline').evicting.deleteMany({})" >/dev/null
+startFeeder
+startRouter
+reseed
+sleep 7
+chk "the reference holds twenty"                "20" "$(R "print(db.getSiblingDB('shop').tcref.countDocuments({}))")"
+chk "the tiered fast tier holds ten"            "10" "$(H "print(db.getSiblingDB('shop').tcon.countDocuments({}))")"
+chk "its archive holds twenty"                  "20" "$(C "print(db.getSiblingDB('shop').tcon.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+
+S='.sort({_id:1}).toArray()))'
+echo
+echo "== CRUD reads =="
+same 'find()'                 "print(JSON.stringify(COLL.find({})$S"
+same 'findOne()'              'print(JSON.stringify(COLL.findOne({_id:17})))'
+same 'find() projection'      "print(JSON.stringify(COLL.find({},{name:1,n:1})$S"
+
+echo
+echo "== query and filtering =="
+same '$eq'        "print(JSON.stringify(COLL.find({n:{\$eq:17}})$S"
+same '$ne'        "print(JSON.stringify(COLL.find({grp:{\$ne:'alpha'}})$S"
+same '$gt'        "print(JSON.stringify(COLL.find({n:{\$gt:14}})$S"
+same '$gte'       "print(JSON.stringify(COLL.find({n:{\$gte:14}})$S"
+same '$lt'        "print(JSON.stringify(COLL.find({n:{\$lt:6}})$S"
+same '$lte'       "print(JSON.stringify(COLL.find({n:{\$lte:6}})$S"
+same '$in'        "print(JSON.stringify(COLL.find({n:{\$in:[2,12,19]}})$S"
+same '$nin'       "print(JSON.stringify(COLL.find({n:{\$nin:[2,12,19]}})$S"
+same '$and'       "print(JSON.stringify(COLL.find({\$and:[{n:{\$gt:5}},{grp:'beta'}]})$S"
+same '$or'        "print(JSON.stringify(COLL.find({\$or:[{n:2},{n:18}]})$S"
+same '$nor'       "print(JSON.stringify(COLL.find({\$nor:[{grp:'alpha'},{n:{\$lt:5}}]})$S"
+same '$not'       "print(JSON.stringify(COLL.find({n:{\$not:{\$gt:10}}})$S"
+same '$exists'    "print(JSON.stringify(COLL.find({opt:{\$exists:true}})$S"
+same '$exists false' "print(JSON.stringify(COLL.find({opt:{\$exists:false}})$S"
+same '$type'      "print(JSON.stringify(COLL.find({when:{\$type:'date'}})$S"
+same '$type array' "print(JSON.stringify(COLL.find({tags:{\$type:'array'}})$S"
+same '$regex'     "print(JSON.stringify(COLL.find({name:{\$regex:'^user1'}})$S"
+same '$regex opts' "print(JSON.stringify(COLL.find({name:{\$regex:'USER0[1-3]',\$options:'i'}})$S"
+same '$text'      "print(JSON.stringify(COLL.find({\$text:{\$search:'berry'}}).sort({_id:1}).toArray().map(d=>d._id)))"
+same '$expr'      "print(JSON.stringify(COLL.find({\$expr:{\$gt:['\$n',{\$multiply:['\$f',3]}]}})$S"
+same '$all'       "print(JSON.stringify(COLL.find({tags:{\$all:['t2','common']}})$S"
+same '$elemMatch' "print(JSON.stringify(COLL.find({items:{\$elemMatch:{sku:'s1',qty:{\$gt:3}}}})$S"
+same '$size'      "print(JSON.stringify(COLL.find({tags:{\$size:2}})$S"
+same 'nested field' "print(JSON.stringify(COLL.find({'meta.active':true})$S"
+
+echo
+echo "== geospatial =="
+same '$geoWithin'    "print(JSON.stringify(COLL.find({loc:{\$geoWithin:{\$centerSphere:[[0,0],0.2]}}}).sort({_id:1}).toArray().map(d=>d._id)))"
+same '$geoIntersects' "print(JSON.stringify(COLL.find({loc:{\$geoIntersects:{\$geometry:{type:'Point',coordinates:[0,0]}}}}).sort({_id:1}).toArray().map(d=>d._id)))"
+same '$near'         "print(JSON.stringify(COLL.find({loc:{\$near:{\$geometry:{type:'Point',coordinates:[0,0]},\$maxDistance:500000}}}).toArray().map(d=>d._id)))"
+same '$nearSphere'   "print(JSON.stringify(COLL.find({loc:{\$nearSphere:{\$geometry:{type:'Point',coordinates:[0,0]},\$maxDistance:500000}}}).toArray().map(d=>d._id)))"
+
+echo
+echo "== query result operations =="
+same 'sort() ascending'   'print(JSON.stringify(COLL.find({}).sort({n:1}).toArray().map(d=>d.n)))'
+same 'sort() descending'  'print(JSON.stringify(COLL.find({}).sort({n:-1}).toArray().map(d=>d.n)))'
+same 'sort() on a string' 'print(JSON.stringify(COLL.find({}).sort({name:-1}).toArray().map(d=>d.name)))'
+same 'sort() compound'    'print(JSON.stringify(COLL.find({}).sort({grp:1,n:-1}).toArray().map(d=>d.n)))'
+same 'limit()'            'print(JSON.stringify(COLL.find({}).sort({n:1}).limit(4).toArray().map(d=>d.n)))'
+same 'skip()'             'print(JSON.stringify(COLL.find({}).sort({n:1}).skip(15).toArray().map(d=>d.n)))'
+same 'skip() and limit()' 'print(JSON.stringify(COLL.find({}).sort({n:1}).skip(8).limit(5).toArray().map(d=>d.n)))'
+same 'project()'          "print(JSON.stringify(COLL.find({}).projection({name:1,_id:0})$S"
+same 'countDocuments()'   'print(COLL.countDocuments({}))'
+same 'countDocuments() filtered' 'print(COLL.countDocuments({grp:"beta"}))'
+same 'distinct()'         'print(JSON.stringify(COLL.distinct("grp").sort()))'
+same 'distinct() on array' 'print(JSON.stringify(COLL.distinct("tags").sort()))'
+same 'distinct() with query' 'print(JSON.stringify(COLL.distinct("grp",{n:{$gt:12}}).sort()))'
+same 'estimatedDocumentCount()' 'print(COLL.estimatedDocumentCount())'
+
+A='.toArray()))'
+echo
+echo "== aggregation stages =="
+same '$match'        "print(JSON.stringify(COLL.aggregate([{\$match:{n:{\$gt:15}}},{\$sort:{_id:1}}])$A"
+same '$project'      "print(JSON.stringify(COLL.aggregate([{\$project:{name:1,double:{\$multiply:['\$n',2]}}},{\$sort:{_id:1}}])$A"
+same '$set'          "print(JSON.stringify(COLL.aggregate([{\$set:{flag:'y'}},{\$sort:{_id:1}}]).toArray().map(d=>d.flag)))"
+same '$addFields'    "print(JSON.stringify(COLL.aggregate([{\$addFields:{plus:{\$add:['\$n',100]}}},{\$sort:{_id:1}}]).toArray().map(d=>d.plus)))"
+same '$unset'        "print(JSON.stringify(COLL.aggregate([{\$unset:'tags'},{\$sort:{_id:1}}]).toArray().map(d=>d.tags===undefined)))"
+same '$group'        "print(JSON.stringify(COLL.aggregate([{\$group:{_id:'\$grp',total:{\$sum:'\$n'},c:{\$sum:1}}},{\$sort:{_id:1}}])$A"
+same '$count'        "print(JSON.stringify(COLL.aggregate([{\$count:'n'}])$A"
+same '$sort'         "print(JSON.stringify(COLL.aggregate([{\$sort:{n:-1}}]).toArray().map(d=>d.n)))"
+same '$limit'        "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$limit:5}]).toArray().map(d=>d.n)))"
+same '$skip'         "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$skip:16}]).toArray().map(d=>d.n)))"
+same '$unwind'       "print(JSON.stringify(COLL.aggregate([{\$unwind:'\$tags'},{\$sort:{_id:1,tags:1}}]).toArray().map(d=>d._id+':'+d.tags)))"
+same '$unwind opts'  "print(JSON.stringify(COLL.aggregate([{\$unwind:{path:'\$items',includeArrayIndex:'ix'}},{\$sort:{_id:1,ix:1}}]).toArray().length))"
+same '$lookup'       "print(JSON.stringify(COLL.aggregate([{\$match:{_id:3}},{\$lookup:{from:COLL.getName(),localField:'grp',foreignField:'grp',as:'p'}},{\$project:{c:{\$size:'\$p'}}}])$A"
+same '$lookup pipeline' "print(JSON.stringify(COLL.aggregate([{\$match:{_id:3}},{\$lookup:{from:COLL.getName(),pipeline:[{\$match:{n:{\$lt:4}}}],as:'p'}},{\$project:{c:{\$size:'\$p'}}}])$A"
+same '$graphLookup'  "print(JSON.stringify(COLL.aggregate([{\$match:{_id:1}},{\$graphLookup:{from:COLL.getName(),startWith:'\$grp',connectFromField:'grp',connectToField:'grp',as:'g'}},{\$project:{c:{\$size:'\$g'}}}])$A"
+same '$replaceRoot'  "print(JSON.stringify(COLL.aggregate([{\$replaceRoot:{newRoot:'\$meta'}},{\$sort:{score:1}}])$A"
+same '$replaceWith'  "print(JSON.stringify(COLL.aggregate([{\$replaceWith:'\$meta'},{\$sort:{score:1}}])$A"
+same '$facet'        "print(JSON.stringify(COLL.aggregate([{\$facet:{a:[{\$count:'c'}],b:[{\$group:{_id:'\$grp',c:{\$sum:1}}},{\$sort:{_id:1}}]}}])$A"
+same '$bucket'       "print(JSON.stringify(COLL.aggregate([{\$bucket:{groupBy:'\$n',boundaries:[0,5,10,15,25],default:'other',output:{c:{\$sum:1}}}}])$A"
+same '$bucketAuto'   "print(JSON.stringify(COLL.aggregate([{\$bucketAuto:{groupBy:'\$n',buckets:4}}]).toArray().map(d=>d.count)))"
+same '$sortByCount'  "print(JSON.stringify(COLL.aggregate([{\$sortByCount:'\$grp'}])$A"
+same '$unionWith'    "print(JSON.stringify(COLL.aggregate([{\$unionWith:{coll:COLL.getName()}},{\$count:'c'}])$A"
+same '$setWindowFields' "print(JSON.stringify(COLL.aggregate([{\$setWindowFields:{sortBy:{n:1},output:{run:{\$sum:'\$n',window:{documents:['unbounded','current']}}}}},{\$sort:{n:1}}]).toArray().map(d=>d.run)))"
+# $sample is random by definition, so only its shape can be differential.
+same '$sample size'  "print(COLL.aggregate([{\$sample:{size:6}}]).toArray().length)"
+same '$sample ids are real' "const s=COLL.aggregate([{\$sample:{size:6}}]).toArray(); print(s.every(d=>d._id>=1&&d._id<=20))"
+
+echo
+echo "== aggregation accumulators =="
+G() { echo "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:$1}}]).toArray().map(d=>d.v)))"; }
+same '$sum'         "$(G '{$sum:"$n"}')"
+same '$avg'         "$(G '{$avg:"$n"}')"
+same '$min'         "$(G '{$min:"$n"}')"
+same '$max'         "$(G '{$max:"$n"}')"
+same '$stdDevPop'   "$(G '{$stdDevPop:"$n"}')"
+same '$stdDevSamp'  "$(G '{$stdDevSamp:"$n"}')"
+same '$push'        "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$push:'\$n'}}}]).toArray().map(d=>d.v)))"
+same '$addToSet'    "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{\$addToSet:'\$grp'}}}]).toArray().map(d=>d.v.sort())))"
+same '$first'       "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$first:'\$n'}}}]).toArray().map(d=>d.v)))"
+same '$last'        "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$last:'\$n'}}}]).toArray().map(d=>d.v)))"
+same '$mergeObjects' "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$mergeObjects:'\$meta'}}}]).toArray().map(d=>d.v)))"
+same '$firstN'      "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$firstN:{input:'\$n',n:3}}}}]).toArray().map(d=>d.v)))"
+same '$lastN'       "print(JSON.stringify(COLL.aggregate([{\$sort:{n:1}},{\$group:{_id:null,v:{\$lastN:{input:'\$n',n:3}}}}]).toArray().map(d=>d.v)))"
+same '$top'         "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{\$top:{sortBy:{n:-1},output:'\$n'}}}}]).toArray().map(d=>d.v)))"
+same '$topN'        "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{\$topN:{sortBy:{n:-1},output:'\$n',n:3}}}}]).toArray().map(d=>d.v)))"
+same '$bottom'      "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{\$bottom:{sortBy:{n:-1},output:'\$n'}}}}]).toArray().map(d=>d.v)))"
+same '$bottomN'     "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{\$bottomN:{sortBy:{n:-1},output:'\$n',n:3}}}}]).toArray().map(d=>d.v)))"
+
+echo
+echo "== aggregation expressions =="
+E() { echo "print(JSON.stringify(COLL.aggregate([{\$sort:{_id:1}},{\$project:{v:$1}}]).toArray().map(d=>d.v)))"; }
+same '$add'          "$(E '{$add:["$n",5]}')"
+same '$subtract'     "$(E '{$subtract:["$n",5]}')"
+same '$multiply'     "$(E '{$multiply:["$n",3]}')"
+same '$divide'       "$(E '{$divide:["$n",4]}')"
+same '$mod'          "$(E '{$mod:["$n",5]}')"
+same '$abs'          "$(E '{$abs:{$subtract:["$n",10]}}')"
+same '$ceil'         "$(E '{$ceil:"$f"}')"
+same '$floor'        "$(E '{$floor:"$f"}')"
+same '$round'        "$(E '{$round:["$f",1]}')"
+same '$trunc'        "$(E '{$trunc:["$f",1]}')"
+same '$pow'          "$(E '{$pow:["$n",2]}')"
+same '$sqrt'         "$(E '{$sqrt:"$n"}')"
+same '$concat'       "$(E '{$concat:["$name","-","$grp"]}')"
+same '$toLower'      "$(E '{$toLower:"$grp"}')"
+same '$toUpper'      "$(E '{$toUpper:"$grp"}')"
+same '$trim'         "$(E '{$trim:{input:{$concat:["  ","$grp","  "]}}}')"
+same '$ltrim'        "$(E '{$ltrim:{input:{$concat:["  ","$grp"]}}}')"
+same '$rtrim'        "$(E '{$rtrim:{input:{$concat:["$grp","  "]}}}')"
+same '$split'        "$(E '{$split:["$words"," "]}')"
+same '$replaceOne'   "$(E '{$replaceOne:{input:"$words",find:"e",replacement:"E"}}')"
+same '$replaceAll'   "$(E '{$replaceAll:{input:"$words",find:"e",replacement:"E"}}')"
+same '$size expr'    "$(E '{$size:"$tags"}')"
+same '$arrayElemAt'  "$(E '{$arrayElemAt:["$tags",0]}')"
+same '$arrayToObject' "$(E '{$arrayToObject:[[{k:"a",v:"$n"}]]}')"
+same '$objectToArray' "$(E '{$objectToArray:"$meta"}')"
+same '$concatArrays' "$(E '{$concatArrays:["$tags",["z"]]}')"
+same '$filter'       "$(E '{$filter:{input:"$items",as:"i",cond:{$gt:["$$i.qty",2]}}}')"
+same '$map'          "$(E '{$map:{input:"$tags",as:"t",in:{$toUpper:"$$t"}}}')"
+same '$reduce'       "$(E '{$reduce:{input:"$items",initialValue:0,in:{$add:["$$value","$$this.qty"]}}}')"
+same '$range'        "$(E '{$range:[0,"$n",3]}')"
+same '$reverseArray' "$(E '{$reverseArray:"$tags"}')"
+same '$sortArray'    "$(E '{$sortArray:{input:"$items",sortBy:{qty:-1}}}')"
+same '$cond'         "$(E '{$cond:[{$gt:["$n",10]},"big","small"]}')"
+same '$ifNull'       "$(E '{$ifNull:["$opt","none"]}')"
+same '$switch'       "$(E '{$switch:{branches:[{case:{$lt:["$n",7]},then:"low"},{case:{$lt:["$n",14]},then:"mid"}],default:"high"}}')"
+same '$and expr'     "$(E '{$and:[{$gt:["$n",5]},{$lt:["$n",15]}]}')"
+same '$or expr'      "$(E '{$or:[{$lt:["$n",5]},{$gt:["$n",15]}]}')"
+same '$not expr'     "$(E '{$not:[{$gt:["$n",10]}]}')"
+same '$literal'      "$(E '{$literal:"$n"}')"
+
+echo
+echo "== date operations =="
+same '$year'         "$(E '{$year:"$when"}')"
+same '$month'        "$(E '{$month:"$when"}')"
+same '$week'         "$(E '{$week:"$when"}')"
+same '$dayOfYear'    "$(E '{$dayOfYear:"$when"}')"
+same '$dayOfMonth'   "$(E '{$dayOfMonth:"$when"}')"
+same '$dayOfWeek'    "$(E '{$dayOfWeek:"$when"}')"
+same '$hour'         "$(E '{$hour:"$when"}')"
+same '$minute'       "$(E '{$minute:"$when"}')"
+same '$second'       "$(E '{$second:"$when"}')"
+same '$millisecond'  "$(E '{$millisecond:"$when"}')"
+same '$dateToString' "$(E '{$dateToString:{date:"$when",format:"%Y-%m-%d %H:%M:%S"}}')"
+same '$dateFromString' "$(E '{$dateFromString:{dateString:{$dateToString:{date:"$when"}}}}')"
+same '$dateToParts'  "$(E '{$dateToParts:{date:"$when"}}')"
+same '$dateFromParts' "$(E '{$dateFromParts:{year:2024,month:3,day:9}}')"
+same '$dateAdd'      "$(E '{$dateAdd:{startDate:"$when",unit:"day",amount:10}}')"
+same '$dateSubtract' "$(E '{$dateSubtract:{startDate:"$when",unit:"month",amount:1}}')"
+same '$dateDiff'     "$(E '{$dateDiff:{startDate:"$when",endDate:new Date(Date.UTC(2025,0,1)),unit:"day"}}')"
+
+echo
+echo "== document and object operations =="
+same '$getField'     "$(E '{$getField:{field:"score",input:"$meta"}}')"
+same '$setField'     "$(E '{$setField:{field:"added",input:"$meta",value:1}}')"
+same '$unsetField'   "$(E '{$unsetField:{field:"score",input:"$meta"}}')"
+same '$mergeObjects expr' "$(E '{$mergeObjects:["$meta",{extra:true}]}')"
+
+echo
+echo "== update operators, on a document held only in the archive =="
+# _id 17 is archive only in the tiered collection and ordinary in the reference,
+# so every one of these has to reach across the tiers and land identically.
+upd() { samew "$1" "COLL.updateOne({_id:17},$2); print(JSON.stringify(COLL.findOne({_id:17})))"; }
+upd '$set'        '{$set:{name:"changed",extra:1}}'
+upd '$unset'      '{$unset:{grp:""}}'
+upd '$rename'     '{$rename:{name:"label"}}'
+upd '$inc'        '{$inc:{n:5}}'
+upd '$mul'        '{$mul:{n:3}}'
+upd '$min'        '{$min:{n:2}}'
+upd '$max'        '{$max:{n:99}}'
+upd '$push'       '{$push:{tags:"pushed"}}'
+upd '$pop'        '{$pop:{tags:1}}'
+upd '$pull'       '{$pull:{tags:"common"}}'
+upd '$pullAll'    '{$pullAll:{tags:["common","t3"]}}'
+upd '$addToSet'   '{$addToSet:{tags:"common"}}'
+upd '$each'       '{$push:{tags:{$each:["a","b"]}}}'
+upd '$position'   '{$push:{tags:{$each:["front"],$position:0}}}'
+upd '$slice'      '{$push:{tags:{$each:["x","y","z"],$slice:3}}}'
+upd '$sort modifier' '{$push:{items:{$each:[{sku:"s0",qty:99}],$sort:{qty:-1}}}}'
+# $currentDate cannot be differential, because the two runs happen at different
+# instants. What has to match is that it landed at all, and as a date.
+samew '$currentDate' 'COLL.updateOne({_id:17},{$currentDate:{seen:true}}); print(COLL.findOne({_id:17}).seen instanceof Date)'
+
+echo
+echo "== the write commands themselves =="
+samew 'insertOne()'          'COLL.insertOne({_id:77,n:77}); print(COLL.countDocuments({}))'
+samew 'insertMany()'         'COLL.insertMany([{_id:78,n:78},{_id:79,n:79}]); print(COLL.countDocuments({}))'
+samew 'insertOne() duplicate' 'try { COLL.insertOne({_id:15,dup:1}); print("ACCEPTED"); } catch(e) { print(/E11000|duplicate/i.test(e.message)?"DUPLICATE":"other: "+e.message.substring(0,40)); }'
+samew 'updateOne()'          'const r=COLL.updateOne({_id:14},{$set:{v:1}}); print(r.matchedCount+"/"+r.modifiedCount)'
+samew 'updateOne() by field' 'const r=COLL.updateOne({name:"user18"},{$set:{v:1}}); print(r.matchedCount+"/"+r.modifiedCount+"/"+COLL.countDocuments({v:1}))'
+samew 'updateMany()'         'const r=COLL.updateMany({grp:"beta"},{$set:{v:1}}); print(r.matchedCount+"/"+r.modifiedCount)'
+samew 'updateMany() applied' 'COLL.updateMany({n:{$gt:12}},{$inc:{n:1}}); print(JSON.stringify(COLL.find({}).sort({_id:1}).toArray().map(d=>d.n)))'
+samew 'updateOne() upsert existing' 'const r=COLL.updateOne({_id:17},{$set:{v:1}},{upsert:true}); print(r.matchedCount+"/"+r.upsertedCount+"/"+JSON.stringify(COLL.findOne({_id:17})))'
+samew 'updateOne() upsert new' 'const r=COLL.updateOne({_id:88},{$set:{v:1}},{upsert:true}); print(r.upsertedCount+"/"+COLL.countDocuments({}))'
+samew 'replaceOne()'         'COLL.replaceOne({_id:16},{_id:16,replaced:true}); print(JSON.stringify(COLL.findOne({_id:16})))'
+samew 'deleteOne() by _id'   'const r=COLL.deleteOne({_id:19}); print(r.deletedCount+"/"+COLL.countDocuments({}))'
+samew 'deleteOne() by field' 'const r=COLL.deleteOne({name:"user18"}); print(r.deletedCount+"/"+COLL.countDocuments({}))'
+samew 'deleteMany()'         'const r=COLL.deleteMany({n:{$gt:15}}); print(r.deletedCount+"/"+COLL.countDocuments({}))'
+samew 'findOneAndUpdate()'   'print(JSON.stringify(COLL.findOneAndUpdate({_id:13},{$set:{z:1}},{returnDocument:"after"})))'
+samew 'findOneAndReplace()'  'print(JSON.stringify(COLL.findOneAndReplace({_id:13},{_id:13,fresh:1},{returnDocument:"after"})))'
+samew 'findOneAndDelete()'   'print(JSON.stringify(COLL.findOneAndDelete({_id:13}))+"/"+COLL.countDocuments({}))'
+
+echo
+echo "== bulkWrite, every operation type =="
+samew 'bulkWrite insertOne'  'COLL.bulkWrite([{insertOne:{document:{_id:90,n:90}}}]); print(COLL.countDocuments({}))'
+samew 'bulkWrite updateOne'  'const r=COLL.bulkWrite([{updateOne:{filter:{_id:17},update:{$set:{b:1}}}}]); print(r.matchedCount+"/"+JSON.stringify(COLL.findOne({_id:17})))'
+samew 'bulkWrite updateMany' 'const r=COLL.bulkWrite([{updateMany:{filter:{grp:"beta"},update:{$set:{b:1}}}}]); print(r.matchedCount+"/"+COLL.countDocuments({b:1}))'
+samew 'bulkWrite replaceOne' 'COLL.bulkWrite([{replaceOne:{filter:{_id:16},replacement:{_id:16,r:1}}}]); print(JSON.stringify(COLL.findOne({_id:16})))'
+samew 'bulkWrite deleteOne'  'const r=COLL.bulkWrite([{deleteOne:{filter:{_id:19}}}]); print(r.deletedCount+"/"+COLL.countDocuments({}))'
+samew 'bulkWrite deleteMany' 'const r=COLL.bulkWrite([{deleteMany:{filter:{n:{$gt:15}}}}]); print(r.deletedCount+"/"+COLL.countDocuments({}))'
+samew 'bulkWrite mixed'      'const r=COLL.bulkWrite([{insertOne:{document:{_id:91,n:91}}},{updateOne:{filter:{_id:18},update:{$set:{m:1}}}},{deleteOne:{filter:{_id:20}}}]); print(r.insertedCount+"/"+r.matchedCount+"/"+r.deletedCount+"/"+COLL.countDocuments({}))'
+
+echo
+echo "== indexes =="
+reseed
+same 'createIndex()' 'print(COLL.createIndex({f:1},{name:"conf_f"}))'
+same 'getIndexes()'  'print(JSON.stringify(COLL.getIndexes().map(i=>i.name).sort()))'
+same 'dropIndex()'   'COLL.dropIndex("conf_f"); print(JSON.stringify(COLL.getIndexes().map(i=>i.name).sort()))'
+same 'dropIndexes()' 'COLL.dropIndexes(); print(JSON.stringify(COLL.getIndexes().map(i=>i.name).sort()))'
+
+echo
+echo "== database and collection commands =="
+reseed
+chk "show dbs lists shop"                       "true"  "$(R "print(db.adminCommand({listDatabases:1}).databases.some(d=>d.name==='shop'))")"
+chk "show collections lists the tiered one"     "true"  "$(R "print(db.getSiblingDB('shop').getCollectionNames().includes('tcon'))")"
+chk "db names the database"                     "shop"  "$(R "print(db.getSiblingDB('shop').getName())")"
+chk "createCollection()"                        "true"  "$(R "db.getSiblingDB('shop').tcnew.drop(); db.getSiblingDB('shop').createCollection('tcnew'); print(db.getSiblingDB('shop').getCollectionNames().includes('tcnew'))")"
+chk "drop()"                                    "false" "$(R "db.getSiblingDB('shop').tcnew.drop(); print(db.getSiblingDB('shop').getCollectionNames().includes('tcnew'))")"
+chk "dropDatabase()"                            "true"  "$(R "db.getSiblingDB('tcdropme').x.insertOne({a:1}); print(db.getSiblingDB('tcdropme').dropDatabase().ok===1)")"
+
+echo
+echo "== transactions =="
+reseed
+TXN=$(R "
+  const s=db.getMongo().startSession(); let out='';
+  for (let attempt=0; attempt<6; attempt++) {
+    try {
+      s.startTransaction();
+      const c=s.getDatabase('shop').tcon;
+      c.updateOne({_id:18},{\$set:{txn:1}});
+      const seen=c.countDocuments({txn:1});
+      s.commitTransaction();
+      out='committed-'+seen; break;
+    } catch(e) {
+      try { s.abortTransaction(); } catch(x) {}
+      if (e.errorLabels && e.errorLabels.includes('TransientTransactionError')) continue;
+      out='error: '+e.message.substring(0,60); break;
+    }
+  }
+  s.endSession(); print(out);")
+chk "startTransaction and commitTransaction"    "committed-1" "$TXN"
+chk "the commit is visible afterwards"          "1" "$(R "print(db.getSiblingDB('shop').tcon.countDocuments({txn:1}))")"
+ABORT=$(R "
+  const s=db.getMongo().startSession(); s.startTransaction();
+  try { s.getDatabase('shop').tcon.updateOne({_id:2},{\$set:{gone:1}}); } catch(e) {}
+  try { s.abortTransaction(); } catch(e) {}
+  s.endSession();
+  print(db.getSiblingDB('shop').tcon.countDocuments({gone:1}));")
+chk "abortTransaction leaves nothing behind"    "0" "$ABORT"
+
+stopDaemons
+echo
+echo "================================"
+echo "PASS $PASS   FAIL $FAIL"
+[ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
+exit $FAIL

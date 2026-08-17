@@ -16,6 +16,13 @@ HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 LOG=/var/log/cline/readpref_r.log
 NS=trdpref
+# Profile entries survive between runs: system.profile is capped and cannot be
+# dropped on a secondary, which is where half of this suite has to look. So every
+# run tags its queries uniquely, or a stale entry from the last run is found on
+# the wrong node and the measurement quietly reports the wrong answer. That is
+# exactly what happened the first time this ran inside the full sweep.
+TAG="r$$"
+
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-54s %s\n' "$1" "$3"
@@ -73,17 +80,17 @@ landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
 
 echo "== control: straight to the replica set, so the profiler is trusted =="
 mongosh "$HOT&readPreference=secondary" --quiet \
-  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-sec').itcount()" >/dev/null 2>&1
+  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-sec-$TAG').itcount()" >/dev/null 2>&1
 mongosh "$HOT&readPreference=primary" --quiet \
-  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-pri').itcount()" >/dev/null 2>&1
+  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-pri-$TAG').itcount()" >/dev/null 2>&1
 sleep 3
-chk "a secondary read lands on a secondary"             "secondary" "$(landed ctl-sec)"
-chk "a primary read lands on the primary"               "PRIMARY"   "$(landed ctl-pri)"
+chk "a secondary read lands on a secondary"             "secondary" "$(landed ctl-sec-$TAG)"
+chk "a primary read lands on the primary"               "PRIMARY"   "$(landed ctl-pri-$TAG)"
 
 echo "== through the router =="
 startRouter
 for mode in secondary secondaryPreferred nearest; do
-  P "$mode" "db.getSiblingDB('shop').$NS.find({}).comment('rt-$mode').itcount()" >/dev/null 2>&1
+  P "$mode" "db.getSiblingDB('shop').$NS.find({}).comment('rt-$mode-$TAG').itcount()" >/dev/null 2>&1
 done
 sleep 3
 # Correctness first: whatever node answers, the answer has to be right.
@@ -93,7 +100,7 @@ for mode in secondary secondaryPreferred nearest; do
 done
 # And then the documented limitation, pinned so it cannot change unnoticed.
 for mode in secondary secondaryPreferred nearest; do
-  chk "readPreference=$mode is served by the primary" "PRIMARY" "$(landed "rt-$mode")"
+  chk "readPreference=$mode is served by the primary" "PRIMARY" "$(landed "rt-$mode-$TAG")"
 done
 
 echo "== and the router says so rather than hiding it =="

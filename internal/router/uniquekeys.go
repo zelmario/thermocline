@@ -487,10 +487,6 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		return nil, false
 	}
 
-	idxs := c.r.uniqueIndexes(ctx, ns)
-	if len(idxs) == 0 {
-		return nil, false
-	}
 	docs := msg.AllOf("documents")
 	if len(docs) == 0 {
 		return nil, false
@@ -503,15 +499,38 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		}
 	}
 
-	claimed, clashes, err := c.r.claimKeys(ctx, ns, docs, idxs, ordered)
-	if err != nil {
-		// Never block a write because the registry is unhappy. Losing the
-		// cross-tier half of a unique index is bad; refusing every insert
-		// because a bookkeeping collection is unreachable is worse.
-		c.r.releaseKeys(ctx, claimed)
-		c.log.Warn("could not check unique keys, letting the insert through", "ns", ns, "err", err)
-		return nil, false
+	// _id first, and separately from the registry, because it needs no
+	// bookkeeping. The registry exists because a document can move off a unique
+	// value and leave a claim behind pointing at itself, so a claim has to be
+	// re-read against its owner. _id never moves, so the archive is the answer
+	// and one lookup settles it.
+	idClashes, ierr := c.r.archivedIDClashes(ctx, ns, docs)
+	if ierr != nil {
+		c.log.Warn("could not check inserted ids against the archive, letting the insert through",
+			"ns", ns, "err", ierr)
+		idClashes = nil
 	}
+
+	idxs := c.r.uniqueIndexes(ctx, ns)
+	var claimed []string
+	var clashes []keyClash
+	if len(idxs) > 0 {
+		var err error
+		claimed, clashes, err = c.r.claimKeys(ctx, ns, docs, idxs, ordered)
+		if err != nil {
+			// Never block a write because the registry is unhappy. Losing the
+			// cross-tier half of a unique index is bad; refusing every insert
+			// because a bookkeeping collection is unreachable is worse.
+			c.r.releaseKeys(ctx, claimed)
+			c.log.Warn("could not check unique keys, letting the insert through", "ns", ns, "err", err)
+			return nil, false
+		}
+	}
+
+	// One document can only be rejected once, and mongod reports the first
+	// reason. _id is checked first, so it wins.
+	clashes = mergeClashes(idClashes, clashes)
+
 	if len(clashes) == 0 {
 		c.pendingKeys = claimed
 		return nil, false

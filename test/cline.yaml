@@ -82,6 +82,12 @@ feeder:
     # testupsert.sh
     - "shop.tups"
     - "shop.tupsf"
+    # testconform.sh: tcref is deliberately NOT here, it is the untiered reference
+    - "shop.tcon"
+    # testsingle.sh
+    - "shop.tsdel"
+    - "shop.tsupd"
+    - "shop.tsins"
     # testquery.sh
     - "shop.tqcoll"
     - "shop.tqtext"
