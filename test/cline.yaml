@@ -86,6 +86,8 @@ feeder:
     - "shop.tmrg"
     # testdaemonmetrics.sh
     - "shop.tdmet"
+    # testretry.sh
+    - "shop.tretry"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

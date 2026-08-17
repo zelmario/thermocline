@@ -44,6 +44,7 @@ Or one at a time:
     docker exec <node> bash /root/testecho.sh      # the router's promotions must not be mirrored back
     docker exec <node> bash /root/testmerge.sh     # $merge into a target the fast tier cannot fully see
     docker exec <node> bash /root/testdaemonmetrics.sh # what the evictor and warmer report about themselves
+    docker exec <node> bash /root/testretry.sh     # $sample on a partial tier, and retryable writes
     bash test/testchaos.sh                         # kill things under load (host side, slow)
 
 `testconform.sh` is the one to extend. It asserts almost nothing by hand: two
@@ -215,6 +216,22 @@ Things these encode that are easy to get wrong when testing by hand:
   last, and reports the wrong node. `testreadpref.sh` failed four checks
   including its own control the first time it ran inside a full sweep, for that
   reason and no other. Tag each run's queries uniquely.
+- **Seeding the archive while the feeder runs needs upserts, not `insertMany`.**
+  The feeder mirrors the fast tier seed into the archive on its own schedule, so
+  it can land between a suite's `drop` and its archive seed. The archive then
+  already holds `_id` 1, an ordered `insertMany` abandons the whole batch on the
+  first duplicate, and the collection is left half seeded. Every read then
+  answers from half a collection, which reads as a product bug and is not one.
+  Two suites have now been written with this mistake, `testconform.sh` and
+  `testretry.sh`; state the archive's contents with unordered upserts instead of
+  assuming it is empty.
+- **A wait loop on `pgrep -f name` can match itself.** The bracket trick,
+  `pgrep -f "[t]estretry"`, stops the pattern matching its own literal text, and
+  it does not stop it matching the same name appearing anywhere else in that
+  shell's command line, such as the path of the script being edited. An
+  `until ! pgrep ...` loop written that way waits for itself and never returns.
+  Wait on the thing itself, or match a pattern that cannot appear in the waiting
+  command.
 - **`make build` sets `CGO_ENABLED=0`, so use it.** A plain `go build` links
   against the host glibc, and the container's is older, so the binary dies at
   exec with `GLIBC_2.34 not found`. That surfaces as `FATAL the router never
