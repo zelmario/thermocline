@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 func limits() config.BackoffConfig {

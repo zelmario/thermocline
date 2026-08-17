@@ -1,7 +1,7 @@
 package feeder
 
 import (
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // action is what the feeder does with one change event.

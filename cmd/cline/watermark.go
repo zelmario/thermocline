@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/watermark"
 )
 
 // runWatermark inspects and edits the completeness claims.

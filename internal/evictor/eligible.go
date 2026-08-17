@@ -6,7 +6,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // candidate is one document the age rule selected, before the archive has been

@@ -10,8 +10,8 @@ import (
 	"sort"
 	"syscall"
 
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/router"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/router"
 )
 
 // runKeys manages the unique key registry.

@@ -3,7 +3,7 @@ package router
 import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // A transaction cannot span two clusters, so copying a document up and re-running

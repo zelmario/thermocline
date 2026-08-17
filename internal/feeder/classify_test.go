@@ -3,7 +3,7 @@ package feeder
 import (
 	"testing"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 func TestClassifyOp(t *testing.T) {

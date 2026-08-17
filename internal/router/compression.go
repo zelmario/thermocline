@@ -3,7 +3,7 @@ package router
 import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // Wire compression is negotiated in the handshake, and if it is agreed this

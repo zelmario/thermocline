@@ -7,8 +7,8 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/meta"
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // A change stream watches the fast tier, and the fast tier is not where the

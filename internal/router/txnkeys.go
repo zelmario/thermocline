@@ -5,7 +5,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // Outside a transaction the unique key guard has to run before the write, because

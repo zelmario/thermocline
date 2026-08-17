@@ -6,7 +6,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 func cand(t *testing.T, ns string, id any) candidate {

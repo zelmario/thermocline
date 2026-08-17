@@ -22,10 +22,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/health"
-	"github.com/zelmar/thermocline/internal/meta"
-	"github.com/zelmar/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/health"
+	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/watermark"
 )
 
 // Warmer copies documents from the archive into the fast tier.

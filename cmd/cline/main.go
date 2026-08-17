@@ -22,11 +22,11 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/evictor"
-	"github.com/zelmar/thermocline/internal/feeder"
-	"github.com/zelmar/thermocline/internal/router"
-	"github.com/zelmar/thermocline/internal/warmer"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/evictor"
+	"github.com/zelmario/thermocline/internal/feeder"
+	"github.com/zelmario/thermocline/internal/router"
+	"github.com/zelmario/thermocline/internal/warmer"
 )
 
 const usage = `cline - storage tiering for MongoDB

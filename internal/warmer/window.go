@@ -6,9 +6,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/meta"
-	"github.com/zelmar/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/watermark"
 )
 
 // sourceFilter selects the next slice of the archive to copy up.

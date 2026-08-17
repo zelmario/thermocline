@@ -15,7 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // Record is one saved position.

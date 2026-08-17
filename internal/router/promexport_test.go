@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // A malformed histogram is not rejected by Prometheus, it is ingested and then

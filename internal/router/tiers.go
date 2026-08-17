@@ -12,9 +12,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/zelmar/thermocline/internal/meta"
-	"github.com/zelmar/thermocline/internal/watermark"
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // readArchived fetches one document from the archive.

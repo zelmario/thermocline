@@ -7,7 +7,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/zelmar/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // markerFresh is how recently the warmer must have checked in for its marker to

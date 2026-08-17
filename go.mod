@@ -1,4 +1,4 @@
-module github.com/zelmar/thermocline
+module github.com/zelmario/thermocline
 
 go 1.22.2
 

@@ -7,7 +7,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // Every guard decides whether to act by asking whether the namespace the query

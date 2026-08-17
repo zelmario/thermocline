@@ -24,10 +24,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/zelmar/thermocline/internal/checkpoint"
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/watermark"
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/checkpoint"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // Router accepts client connections and routes them between the tiers.

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // setupLogging picks where a daemon writes its logs.

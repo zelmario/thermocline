@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // The counters the router already kept answer "what happened". A dashboard has

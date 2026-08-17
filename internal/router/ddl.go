@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // Two commands that neither guard nor fallback can make transparent, and that

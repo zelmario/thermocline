@@ -5,7 +5,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
-	"github.com/zelmar/thermocline/internal/wire"
+	"github.com/zelmario/thermocline/internal/wire"
 )
 
 // MongoDB 8.0 added a second way to write, and it does not look like the first.

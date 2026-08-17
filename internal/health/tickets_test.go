@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zelmar/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // MongoDB 7.0 replaced the fixed pool of 128 write tickets with one sized to

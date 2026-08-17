@@ -18,10 +18,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-	"github.com/zelmar/thermocline/internal/checkpoint"
-	"github.com/zelmar/thermocline/internal/config"
-	"github.com/zelmar/thermocline/internal/meta"
-	"github.com/zelmar/thermocline/internal/watermark"
+	"github.com/zelmario/thermocline/internal/checkpoint"
+	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/watermark"
 )
 
 // metaDB is aliased so classify.go does not import meta for one constant.
