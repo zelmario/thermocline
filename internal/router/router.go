@@ -96,11 +96,14 @@ type Stats struct {
 	DuplicateKeys atomic.Int64
 	ChangeStreams atomic.Int64
 	Unauthorized  atomic.Int64
-	Unreadable    atomic.Int64
-	EventsHidden  atomic.Int64
-	StaleReads    atomic.Int64
-	ClientsOpen   atomic.Int64
-	ClientsTotal  atomic.Int64
+	// PrimaryOnlyReads counts reads that asked for a secondary and were served
+	// by the primary anyway. See readpref.go for why that cannot be honoured.
+	PrimaryOnlyReads atomic.Int64
+	Unreadable       atomic.Int64
+	EventsHidden     atomic.Int64
+	StaleReads       atomic.Int64
+	ClientsOpen      atomic.Int64
+	ClientsTotal     atomic.Int64
 }
 
 // New builds a Router. It does not listen or connect.
@@ -230,6 +233,11 @@ type conn struct {
 	// txnKeys is what an update inside a transaction left to be checked once
 	// the reply is back and the real post-image can be read.
 	txnKeys txnKeyCheck
+
+	// warnedReadPref remembers which non-primary read preferences this client
+	// has already been warned about, so a reporting client sending the same one
+	// on every query gets one line rather than thousands.
+	warnedReadPref map[string]bool
 }
 
 func (c *conn) pump(ctx context.Context) error {
@@ -369,6 +377,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				return wire.Write(c.client, out)
 			}
 		}
+	}
+
+	// Every read is served by the fast tier's primary. Say so, because this
+	// router answers as a mongos and a mongos would have routed it.
+	if nameErr == nil && !msg.MoreToCome() {
+		c.noteReadPreference(msg, name)
 	}
 
 	// A handshake that agrees a compressor would make every later command

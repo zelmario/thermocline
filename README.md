@@ -141,6 +141,30 @@ Range queries are governed by the watermark below.
   acknowledged write was present, none was applied twice, and a retry finished
   the job. A client reconnecting mid-election now waits up to 20 seconds for a
   new primary rather than failing outright.
+- **Read preference is not honoured. Every read is served by the primary.** This
+  follows from proxied authentication and is the one limitation to weigh before a
+  pilot. The router answers `hello` as a mongos, and a mongos routes by read
+  preference, so drivers attach `$readPreference` to reads and expect it to be
+  acted on. It cannot be: the client's SASL exchange is forwarded to one upstream
+  connection, and that connection is the only thing carrying the client's
+  identity. A second connection to a secondary would be authenticated as nobody,
+  SCRAM is nonce-bound and one-shot so the exchange cannot be replayed there, and
+  the router never sees a password to redo it with. Using the router's own
+  credentials instead is precisely the privilege bypass that Authorisation below
+  exists to close.
+
+  Nothing returns a wrong answer: a read served by the primary is strictly
+  fresher than one asked of a secondary. What changes is where the load lands. An
+  application that pins reporting to secondaries moves that entire read load onto
+  the fast tier's primary the day it goes behind this router. Measured on a
+  three-member fast tier with the profiler recording on every node:
+  `secondary`, `secondaryPreferred` and `nearest` each landed on the primary,
+  while the same query sent straight to the replica set landed on a secondary.
+
+  Each connection logs a warning the first time it asks for a non-primary read,
+  and `thermocline_primary_only_reads_total` counts them. Lifting the limitation
+  means terminating authentication in the router, which is an architectural
+  change rather than a fix.
 - **TLS is not handled.** Terminate it in front, or add it before taking over a
   production address.
 
