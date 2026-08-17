@@ -199,3 +199,47 @@ func TestReadRejectsImplausibleLength(t *testing.T) {
 		t.Error("Read accepted a message shorter than its own header")
 	}
 }
+
+// A legacy OP_QUERY names its database in the collection rather than in $db, so
+// reading only $db left it empty.
+//
+// That is not cosmetic. The router builds a namespace as db + "." + coll and
+// asks whether it is tiered; an empty database makes that ".orders", which
+// nothing manages, so the completeness guard and the copy-up were skipped and
+// the fast tier's partial answer went back as success.
+func TestOpQueryCarriesItsDatabaseInTheCollectionName(t *testing.T) {
+	cmd, err := bson.Marshal(bson.D{
+		{Key: "count", Value: "orders"},
+		{Key: "query", Value: bson.D{}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var body []byte
+	body = binary.LittleEndian.AppendUint32(body, 0) // flags
+	body = append(body, []byte("shop.$cmd")...)      // fullCollectionName
+	body = append(body, 0)
+	body = binary.LittleEndian.AppendUint32(body, 0) // numberToSkip
+	body = binary.LittleEndian.AppendUint32(body, 1) // numberToReturn
+	body = append(body, cmd...)
+
+	raw := make([]byte, HeaderLen)
+	binary.LittleEndian.PutUint32(raw[0:4], uint32(HeaderLen+len(body)))
+	binary.LittleEndian.PutUint32(raw[12:16], uint32(OpQuery))
+	raw = append(raw, body...)
+
+	m := &Message{Raw: raw}
+	m.Header.OpCode = OpQuery
+
+	name, db, err := m.CommandName()
+	if err != nil {
+		t.Fatalf("CommandName: %v", err)
+	}
+	if name != "count" {
+		t.Fatalf("name = %q, want count", name)
+	}
+	if db != "shop" {
+		t.Fatalf("db = %q, want shop; an empty database makes every tiering guard skip the namespace", db)
+	}
+}

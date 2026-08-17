@@ -370,6 +370,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
 	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
+		// The target of a $merge is judged first and separately from the input.
+		// A pipeline reading something untiered, or nothing at all, still writes
+		// into a collection that may be tiered, and the merge decides what to do
+		// by looking at what it can see there. See mergetarget.go.
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			if out, done := c.guardMergeTarget(ctx, msg, cmd, db); done {
+				return wire.Write(c.client, out)
+			}
+		}
 		if out, done := c.guardAggregate(ctx, msg, db); done {
 			return wire.Write(c.client, out)
 		}

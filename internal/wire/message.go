@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -181,6 +182,23 @@ func (m *Message) CommandName() (name, db string, err error) {
 
 	if v, lookupErr := doc.LookupErr("$db"); lookupErr == nil {
 		db, _ = v.StringValueOK()
+	}
+	// A legacy OP_QUERY does not carry $db. It names the database in the
+	// collection instead, as "shop.$cmd", and reading only $db therefore left
+	// the database empty for every command that arrived that way.
+	//
+	// That matters because the router builds a namespace as db + "." + coll and
+	// asks whether it is tiered. An empty database makes that ".orders", which
+	// is managed by nothing, so the completeness guard, the copy-up and the
+	// unique key checks were all skipped and the fast tier's partial answer went
+	// back as success. The authorization check fails closed on the same input,
+	// which is the right way round but hides the problem rather than showing it.
+	if db == "" && m.Header.OpCode == OpQuery {
+		if full, ok := m.OpQueryCollection(); ok {
+			if i := strings.IndexByte(full, '.'); i > 0 {
+				db = full[:i]
+			}
+		}
 	}
 	return name, db, nil
 }

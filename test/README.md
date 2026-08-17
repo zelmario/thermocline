@@ -42,6 +42,7 @@ Or one at a time:
     docker exec <node> bash /root/testauthterm.sh  # the router authenticating clients itself
     docker exec <node> bash /root/testreadprefterm.sh # reads landing on the node that was asked for
     docker exec <node> bash /root/testecho.sh      # the router's promotions must not be mirrored back
+    docker exec <node> bash /root/testmerge.sh     # $merge into a target the fast tier cannot fully see
     bash test/testchaos.sh                         # kill things under load (host side, slow)
 
 `testconform.sh` is the one to extend. It asserts almost nothing by hand: two
