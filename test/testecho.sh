@@ -134,6 +134,42 @@ chk "the replacement reached the archive"            "new" \
     "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:3}); print(d?d.v:'MISSING')")"
 chk "and it is live there, not tombstoned"           "true" "$(archived 3)"
 
+echo "== a copy-up that inserts nothing must not eat the next write =="
+# The regression this section exists for. A multi-document write copies up
+# everything its filter matches in the archive, and announces an echo for each,
+# but only the documents the fast tier was actually missing produce an insert.
+# The notices left standing for the rest were then spent on the mirrors of the
+# write itself, so the archive kept the old version of those documents while the
+# application had been told all of them were updated.
+#
+# Measured in testconform as bulkWrite updateMany reporting 10 matched and 5
+# updated in the archive.
+stopDaemons
+H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NS.insertMany([{_id:10,grp:'b',v:0},{_id:11,grp:'b',v:0}])" >/dev/null
+H "db.getSiblingDB('shop').$NS.insertOne({_id:10,grp:'b',v:0})" >/dev/null
+cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+startFeeder
+startRouter
+# _id 10 is on both tiers and _id 11 only in the archive, so the copy-up inserts
+# one document and skips the other.
+chk "the multi-document write matches both"          "2" \
+    "$(R "print(db.getSiblingDB('shop').$NS.updateMany({grp:'b'},{\$set:{v:1}}).matchedCount)")"
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({v:1}))")" = "2" ] && break
+  sleep 0.5
+done
+chk "and both updates reached the archive"           "2" \
+    "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({v:1}))")"
+# A notice can legitimately be left standing: the feeder caches its view of
+# whether anything is being promoted, so an echo arriving inside a stale "no" is
+# mirrored rather than suppressed, which costs one redundant write and leaves the
+# notice unconsumed. What matters is that a leftover cannot reach a later write,
+# which the two checks above measure directly, and that it expires.
+chk "any notice left behind is one the router wrote"  "true" \
+    "$(C "const n=db.getSiblingDB('_thermocline').residency.countDocuments({echoPending:true, promotedAt:{\$exists:false}}); print(n===0)")"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

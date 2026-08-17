@@ -95,6 +95,12 @@ type pendingOp struct {
 	id   bson.RawValue
 	doc  bson.Raw // full document, nil for deletes
 	kind action
+
+	// wasInsert records that the event was an insert rather than an update or a
+	// replace. Both arrive here as an upsert, because that is how they are
+	// mirrored, but only an insert can be the router copying a document up, and
+	// only inserts may be suppressed as promotion echoes.
+	wasInsert bool
 }
 
 // changeEvent is the subset of a change stream document the feeder reads.
@@ -345,6 +351,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 	}
 	f.pending = append(f.pending, pendingOp{
 		ns: ns, key: ev.DocumentKey, id: id, doc: ev.FullDocument, kind: actionUpsert,
+		wasInsert: ev.OperationType == "insert",
 	})
 	return nil
 }

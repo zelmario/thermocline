@@ -209,11 +209,24 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 		// Only the inserts moved a document. The rest were refused as duplicates
 		// of a copy the fast tier already had, which is the case the old
 		// $setOnInsert expressed by matching and doing nothing.
-		n, err := promote.Many(ctx, hot, docs)
+		n, skipped, err := promote.Many(ctx, hot, docs)
 		if err != nil {
 			return fmt.Errorf("copy up into %s: %w", ns, err)
 		}
 		moved += n
+		// Residency was recorded for every document considered, which announced
+		// an echo for each. The ones the fast tier already held produce no
+		// insert, so those announcements have to be withdrawn or they are spent
+		// on whatever write comes next. See withdrawEcho.
+		if len(skipped) > 0 {
+			stale := make([]string, 0, len(skipped))
+			for _, i := range skipped {
+				if i >= 0 && i < len(ids) {
+					stale = append(stale, ids[i])
+				}
+			}
+			r.withdrawEcho(ctx, stale)
+		}
 		if err := meta.ClearEvictionNotices(ctx, r.cold, ids); err != nil {
 			r.log.Warn("copied up but could not clear eviction notices", "ns", ns, "err", err)
 		}

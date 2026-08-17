@@ -60,9 +60,15 @@ func One(ctx context.Context, coll *mongo.Collection, doc bson.Raw) (bool, error
 // the difference: a zero means the fast tier was not missing any of them, and a
 // transaction waiting to be told that replayed itself forever when the count
 // included documents that were already there.
-func Many(ctx context.Context, coll *mongo.Collection, docs []bson.Raw) (int, error) {
+// It also reports the positions of the documents it did not insert, because the
+// caller has usually already announced that a promotion is coming for each of
+// them. A document the fast tier already held produces no insert and therefore
+// no echo, so an announcement left standing for it is spent on whatever write
+// comes next. That is not hypothetical: it silently swallowed the mirror of an
+// updateMany, and the archive kept the old version of half the documents.
+func Many(ctx context.Context, coll *mongo.Collection, docs []bson.Raw) (int, []int, error) {
 	if len(docs) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 	models := make([]mongo.WriteModel, len(docs))
 	for i, d := range docs {
@@ -76,33 +82,35 @@ func Many(ctx context.Context, coll *mongo.Collection, docs []bson.Raw) (int, er
 		inserted = int(res.InsertedCount)
 	}
 	if err == nil {
-		return inserted, nil
+		return inserted, nil, nil
 	}
-	if onlyDuplicates(err) {
-		return inserted, nil
+	if skipped, ok := duplicatePositions(err); ok {
+		return inserted, skipped, nil
 	}
-	return inserted, fmt.Errorf("promote into %s: %w", coll.Name(), err)
+	return inserted, nil, fmt.Errorf("promote into %s: %w", coll.Name(), err)
 }
 
-// onlyDuplicates reports whether a bulk write failed for no reason other than
-// documents the fast tier already held.
-func onlyDuplicates(err error) bool {
+// duplicatePositions reports which documents the fast tier already held, and
+// whether that was the only thing that went wrong.
+func duplicatePositions(err error) ([]int, bool) {
 	var bwe mongo.BulkWriteException
 	if !errors.As(err, &bwe) {
-		return false
+		return nil, false
 	}
 	if bwe.WriteConcernError != nil {
-		return false
+		return nil, false
 	}
 	if len(bwe.WriteErrors) == 0 {
-		return false
+		return nil, false
 	}
+	out := make([]int, 0, len(bwe.WriteErrors))
 	for _, we := range bwe.WriteErrors {
 		if we.Code != duplicateKey {
-			return false
+			return nil, false
 		}
+		out = append(out, we.Index)
 	}
-	return true
+	return out, true
 }
 
 const duplicateKey = 11000

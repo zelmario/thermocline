@@ -419,7 +419,9 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return 0, err
 	}
 
-	inserted, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
+	// The skipped positions matter only to callers that announced an echo per
+	// document; the warmer announces through _thermocline.warming instead.
+	inserted, _, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
 	if err != nil {
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
 	}

@@ -72,8 +72,14 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	// the fast tier gained this document while we were reading the archive, its
 	// copy is the newer one and the duplicate key says so. See package promote
 	// for why this is not written as $setOnInsert.
-	if _, err = promote.One(ctx, r.hot.Database(db).Collection(coll), doc); err != nil {
+	inserted, err := promote.One(ctx, r.hot.Database(db).Collection(coll), doc)
+	if err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
+	}
+	if !inserted {
+		// The fast tier already held it, so no insert happened and no echo is
+		// coming. See withdrawEcho for what leaving the notice would cost.
+		r.withdrawEcho(ctx, []string{meta.DocID(ns, id)})
 	}
 
 	// The document is back in the fast tier, so any eviction notice for it is
@@ -274,3 +280,24 @@ func (r *Router) notePromoting(ctx context.Context) {
 
 // promoteBeat is how often the promotion heartbeat is refreshed.
 const promoteBeat = 3 * time.Second
+
+// withdrawEcho removes the promise that a promotion is coming.
+//
+// Residency is recorded before the copy-up, which is what lets a change stream
+// consumer tell a promotion from an insert the moment the event arrives, and it
+// announces an echo at the same time. A document the fast tier turned out to
+// already hold produces no insert and therefore no echo, so the announcement has
+// to be taken back. Left standing it is spent on whatever write reaches that
+// document next, and that mirror is dropped: measured as an updateMany over ten
+// documents where the archive kept the old version of five of them.
+func (r *Router) withdrawEcho(ctx context.Context, docIDs []string) {
+	if len(docIDs) == 0 {
+		return
+	}
+	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})
+	if err != nil {
+		r.log.Warn("could not withdraw a promotion notice", "err", err)
+	}
+}

@@ -133,6 +133,10 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 // soon it arrives. Change events arrive in order, so the flag is consumed by the
 // insert it was written for.
 
+// echoWindow is how long a promotion notice is honoured. Past it, the echo it
+// described has either been mirrored already or is never coming.
+const echoWindow = 60 * time.Second
+
 // promotingActive reports whether the router has copied anything up recently.
 //
 // Same shape as warmingActive and for the same reason: the answer is almost
@@ -170,9 +174,13 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// Inserts only. A promotion is an insert, always, so an update or a replace
+	// can never be one, and letting them be considered is what allowed a notice
+	// left behind by a copy-up that inserted nothing to swallow an ordinary
+	// update's mirror instead.
 	var ids []string
 	for _, op := range f.pending {
-		if op.kind == actionUpsert {
+		if op.kind == actionUpsert && op.wasInsert {
 			ids = append(ids, meta.DocID(op.ns, op.id))
 		}
 	}
@@ -180,11 +188,22 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// Notices expire, because some of them are never consumed. The feeder caches
+	// its view of whether anything is being promoted for a few seconds, so an
+	// echo arriving inside a stale "no" is mirrored rather than suppressed, and
+	// its notice is left standing. That costs one redundant write, which is the
+	// trade the cache exists to make.
+	//
+	// What must not happen is that notice waiting indefinitely for an insert of
+	// the same document, which it would then suppress. Bounding it means a
+	// leftover can only affect writes in the seconds after the promotion, and a
+	// promotion's own echo arrives well inside that.
 	coll := f.cold.Database(meta.DB).Collection(meta.Residency)
 	cur, err := coll.Find(ctx,
 		bson.D{
 			{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
 			{Key: "echoPending", Value: true},
+			{Key: "promotedAt", Value: bson.D{{Key: "$gte", Value: time.Now().UTC().Add(-echoWindow)}}},
 		},
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
@@ -240,7 +259,7 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 	kept := f.pending[:0]
 	dropped := 0
 	for _, op := range f.pending {
-		if op.kind == actionUpsert {
+		if op.kind == actionUpsert && op.wasInsert {
 			id := meta.DocID(op.ns, op.id)
 			if _, ok := claimed[id]; ok {
 				delete(claimed, id)
