@@ -43,10 +43,12 @@ func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool)
 		return nil, true
 	}
 	if werr := wire.Write(c.upstream, probe); werr != nil {
+		c.upstreamBroke()
 		return nil, true
 	}
 	reply, rerr := wire.Read(c.upstream)
 	if rerr != nil {
+		c.upstreamBroke()
 		return nil, true
 	}
 	rdoc, derr := reply.ReplyDoc()

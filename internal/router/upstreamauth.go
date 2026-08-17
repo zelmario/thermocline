@@ -158,3 +158,22 @@ func saslReplyFields(doc bson.Raw) (convID int32, done bool, payload []byte, err
 	}
 	return convID, done, payload, nil
 }
+
+// helloUpstream introduces a new pooled connection as the router's own.
+//
+// One per connection, and it is what makes the metadata on every later hello
+// removable: the connection has already said who it is.
+func (r *Router) helloUpstream(conn net.Conn) (bson.Raw, error) {
+	return r.runUpstreamCommand(conn, bson.D{
+		{Key: "hello", Value: int32(1)},
+		{Key: "client", Value: bson.D{
+			{Key: "application", Value: bson.D{{Key: "name", Value: "thermocline"}}},
+			{Key: "driver", Value: bson.D{
+				{Key: "name", Value: "thermocline-router"},
+				{Key: "version", Value: "0.1.0-dev"},
+			}},
+			{Key: "os", Value: bson.D{{Key: "type", Value: "Linux"}}},
+		}},
+		{Key: "$db", Value: "admin"},
+	})
+}

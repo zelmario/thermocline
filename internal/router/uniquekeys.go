@@ -581,11 +581,13 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		return nil, false
 	}
 	if werr := wire.Write(c.upstream, fwd); werr != nil {
+		c.upstreamBroke()
 		c.r.releaseKeys(ctx, claimed)
 		return nil, false
 	}
 	reply, rerr := wire.Read(c.upstream)
 	if rerr != nil {
+		c.upstreamBroke()
 		c.r.releaseKeys(ctx, claimed)
 		return nil, false
 	}

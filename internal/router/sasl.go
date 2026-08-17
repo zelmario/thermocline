@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/xdg-go/scram"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -290,4 +291,103 @@ func dropSpeculativeResult(doc bson.D) bson.D {
 		out = append(out, e)
 	}
 	return out
+}
+
+// dropClientMetadata removes the metadata from a client's hello before it is
+// forwarded on a pooled connection.
+//
+// mongod accepts one client metadata document per connection, in the first
+// hello, and rejects the rest. A pooled connection has already introduced
+// itself, so every client handshake after that must arrive without one or the
+// borrower is refused outright. See helloUpstream.
+func (c *conn) dropClientMetadata(msg *wire.Message) *wire.Message {
+	if msg.Header.OpCode != wire.OpMsg {
+		return msg
+	}
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return msg
+	}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return msg
+	}
+	var found bool
+	out := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		if e.Key() == "client" {
+			found = true
+			continue
+		}
+		var v any
+		if uerr := e.Value().Unmarshal(&v); uerr != nil {
+			return msg
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: v})
+	}
+	if !found {
+		return msg
+	}
+	rebuilt, err := wire.NewMsg(msg.Header.RequestID, msg.Header.ResponseTo, out)
+	if err != nil {
+		return msg
+	}
+	return rebuilt
+}
+
+// answerHello replies to a handshake without forwarding it.
+//
+// On a pooled connection a client handshake cannot be forwarded at all. mongod
+// accepts one client metadata document per connection and refuses the rest, and
+// the legacy OP_QUERY handshake carries one that cannot be stripped on the way
+// out, because an OP_QUERY names its database in the collection and rebuilding
+// it as an OP_MSG produces a command the server rejects for a different reason.
+//
+// So the router answers instead. It has everything the answer needs: a hello
+// reply taken from the fast tier when the pooled connection was opened, which is
+// where the wire version, the document size limits and the session support come
+// from, and its own credential source for saslSupportedMechs. The client is
+// still told it is talking to a mongos, exactly as before.
+//
+// It also removes a round trip from every client's connect.
+func (c *conn) answerHello(ctx context.Context, msg *wire.Message) (*wire.Message, bool) {
+	tmpl, ok := c.r.helloTemplate()
+	if !ok {
+		return nil, false
+	}
+	out, err := mongosIdentity(tmpl)
+	if err != nil {
+		return nil, false
+	}
+	out = dropSpeculativeResult(out)
+
+	// saslSupportedMechs is how a driver learns what to authenticate with
+	// without a round trip of guessing, and it is per user, so it is answered
+	// from the same place the passwords are checked against.
+	if cmd, cerr := msg.CommandDoc(); cerr == nil {
+		if v, lerr := cmd.LookupErr("saslSupportedMechs"); lerr == nil {
+			if full, sok := v.StringValueOK(); sok {
+				db, user, found := strings.Cut(full, ".")
+				if found {
+					if creds, exists, lerr := c.r.creds.Lookup(ctx, db, user); lerr == nil && exists {
+						if mechs := authn.Mechanisms(creds); len(mechs) > 0 {
+							out = append(out, bson.E{Key: "saslSupportedMechs", Value: mechs})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var reply *wire.Message
+	var err2 error
+	if msg.Header.OpCode == wire.OpQuery {
+		reply, err2 = wire.NewReply(0, msg.Header.RequestID, out)
+	} else {
+		reply, err2 = wire.NewMsg(0, msg.Header.RequestID, out)
+	}
+	if err2 != nil {
+		return nil, false
+	}
+	return reply, true
 }

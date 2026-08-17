@@ -54,6 +54,10 @@ type Router struct {
 	pools  map[string]*upstreamPool
 	rr     uint64
 
+	// hello is the fast tier's own handshake reply, kept so a client handshake
+	// can be answered here rather than forwarded on a shared connection.
+	hello atomic.Value
+
 	// promotedAt throttles the heartbeat that tells the feeder copy-ups are
 	// happening.
 	promoteMu  sync.Mutex
@@ -160,6 +164,19 @@ func (r *Router) Listen(ctx context.Context) error {
 	}
 	r.warnAboutMissingWatermarks(ctx)
 
+	// Open one pooled connection before accepting anybody, so the first client's
+	// handshake can be answered from the fast tier's own reply. Without it that
+	// first handshake has nothing to answer from, falls through to being
+	// forwarded, and is refused for carrying a second client metadata document
+	// on a connection that has already introduced itself.
+	if r.cfg.TerminateAuth {
+		p, err := r.poolFor(r.currentPrimary()).get(ctx)
+		if err != nil {
+			return fmt.Errorf("open the first connection to the fast tier: %w", err)
+		}
+		p.release()
+	}
+
 	ln, err := net.Listen("tcp", r.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", r.cfg.Listen, err)
@@ -228,22 +245,21 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 	r.Stats.ClientsTotal.Add(1)
 	defer r.Stats.ClientsOpen.Add(-1)
 
-	upstream, err := r.dialPrimary(ctx)
-	if err != nil {
-		r.log.Error("cannot reach the fast tier", "err", err)
-		return
-	}
-	defer func() { _ = upstream.Close() }()
-
-	// With authentication terminated the upstream connection is the router's
-	// own, so the router logs in on it. Doing it here, once per connection and
-	// before the client has sent anything, means no command can reach the fast
-	// tier over an anonymous connection.
-	if r.cfg.TerminateAuth {
-		if err := r.authenticateUpstream(upstream); err != nil {
-			r.log.Error("cannot authenticate to the fast tier", "err", err)
+	// One dedicated upstream per client, but only while authentication is
+	// proxied. Then the connection carries the client's identity and cannot be
+	// anybody else's, so there is nothing to share.
+	//
+	// With authentication terminated it is borrowed per command from a pool
+	// instead, and an idle client holds nothing upstream. See pool.go.
+	var upstream net.Conn
+	if !r.cfg.TerminateAuth {
+		var err error
+		upstream, err = r.dialPrimary(ctx)
+		if err != nil {
+			r.log.Error("cannot reach the fast tier", "err", err)
 			return
 		}
+		defer func() { _ = upstream.Close() }()
 	}
 
 	c := &conn{
@@ -252,6 +268,17 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		upstream: upstream,
 		log:      r.log,
 	}
+	// A borrowed connection goes back when the client goes away, and one still
+	// holding an open transaction is closed rather than reused: the transaction
+	// is abandoned, and mongod should hear that from the socket rather than wait
+	// out its timeout with the connection handed to somebody else.
+	defer func() {
+		if c.txnOpen {
+			c.dropPrimary()
+			return
+		}
+		c.returnPrimary(false)
+	}()
 	// Connections still holding this client's cursors are closed rather than
 	// returned, which is what tells the fast tier to drop the cursors.
 	defer c.releasePinned()
@@ -288,9 +315,22 @@ type conn struct {
 	grants      *authz.Grants
 	pendingUser string
 
+	// txnOpen records that a transaction is in flight on the borrowed primary
+	// connection, which is the one thing that must not move between commands.
+	txnOpen bool
+
+	// dirty means an exchange on the borrowed connection did not finish, so it
+	// is closed rather than returned to the pool.
+	dirty bool
+
 	// pinned maps a cursor to the pooled connection that owns it. A cursor
 	// exists on one node, so its getMore has to go back there.
 	pinned map[int64]*pooled
+
+	// lease is the primary connection borrowed for the command in flight, or
+	// held across an open transaction. Nil when authentication is proxied,
+	// where this connection owns its upstream outright.
+	lease *pooled
 
 	// warnedReadPref remembers which non-primary read preferences this client
 	// has already been warned about, so a reporting client sending the same one
@@ -336,11 +376,28 @@ func (c *conn) pump(ctx context.Context) error {
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	name, db, nameErr := msg.CommandName()
 
+	// Borrow the primary for this command. Everything below reaches the fast
+	// tier through c.upstream, including the copy-up retry and the permission
+	// probe, so it is populated once here rather than threaded through them.
+	if err := c.borrowPrimary(ctx); err != nil {
+		return err
+	}
+	defer func() { c.returnPrimary(c.txnOpen) }()
+	c.noteTransaction(msg, name, nameErr)
+
 	// Cleared per command. An in-transaction key check that was armed and then
 	// never reached, because some path answered the command early, would
 	// otherwise be consumed by whatever command came next, against ids from a
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
+
+	// A handshake is answered here rather than forwarded, because a pooled
+	// connection can only carry one. See answerHello.
+	if c.r.cfg.TerminateAuth && nameErr == nil && isHello(name) && !msg.MoreToCome() {
+		if out, done := c.answerHello(ctx, msg); done {
+			return wire.Write(c.client, out)
+		}
+	}
 
 	// Authentication and authorization come first, before any guard, because
 	// every guard below this reads or writes data and none of them asks who is
@@ -488,6 +545,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		// stripSpeculativeAuth.
 		if c.r.cfg.TerminateAuth {
 			msg = c.dropSpeculativeAuth(msg)
+			msg = c.dropClientMetadata(msg)
 		}
 	}
 
@@ -505,6 +563,8 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// Half an exchange happened on it at most, so it cannot be reused.
 			borrowed.discard()
 			c.unpinExhausted(borrowed)
+		} else {
+			c.upstreamBroke()
 		}
 		return fmt.Errorf("forward to fast tier: %w", err)
 	}
@@ -522,6 +582,8 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		} else {
 			c.keepOrRelease(borrowed, reply)
 		}
+	} else if err != nil {
+		c.upstreamBroke()
 	}
 	if err != nil {
 		return fmt.Errorf("read from fast tier: %w", err)
@@ -668,11 +730,19 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 
 	r.primaryMu.Lock()
 	changed := r.primary != addr
+	old := r.primary
 	r.primary = addr
 	r.members = hello.Hosts
 	r.primaryMu.Unlock()
 
 	if changed {
+		// Idle connections to the member that is no longer primary are useless
+		// and worse than useless: handing one out means a write refused with
+		// "not primary" for a reason the client cannot act on. The pool for the
+		// new address fills itself on demand.
+		if old != "" {
+			r.closePool(old)
+		}
 		r.log.Info("fast tier primary resolved", "addr", addr)
 	}
 	return nil

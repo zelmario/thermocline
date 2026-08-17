@@ -276,10 +276,12 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 // document, and returns the fresh reply.
 func (c *conn) retry(msg *wire.Message) (*wire.Message, error) {
 	if err := wire.Write(c.upstream, msg); err != nil {
+		c.upstreamBroke()
 		return nil, fmt.Errorf("retry after copy-up: %w", err)
 	}
 	reply, err := wire.Read(c.upstream)
 	if err != nil {
+		c.upstreamBroke()
 		return nil, fmt.Errorf("read retry reply: %w", err)
 	}
 	return reply, nil

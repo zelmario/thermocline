@@ -88,6 +88,8 @@ feeder:
     - "shop.tdmet"
     # testretry.sh
     - "shop.tretry"
+    # testpool.sh
+    - "shop.tpool"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

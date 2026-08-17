@@ -83,10 +83,12 @@ func (c *conn) askInCallerTxn(t txnFields, db string, cmd bson.D) (bson.Raw, err
 		return nil, err
 	}
 	if err := wire.Write(c.upstream, msg); err != nil {
+		c.upstreamBroke()
 		return nil, fmt.Errorf("ask inside the caller's transaction: %w", err)
 	}
 	reply, err := wire.Read(c.upstream)
 	if err != nil {
+		c.upstreamBroke()
 		return nil, fmt.Errorf("read inside the caller's transaction: %w", err)
 	}
 	doc, err := reply.ReplyDoc()
