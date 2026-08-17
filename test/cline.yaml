@@ -78,6 +78,8 @@ feeder:
     # testauthterm.sh, its own collection so it cannot inherit testauth.sh's
     # archived documents and count them into every answer.
     - "shop.tatrm"
+    # testreadprefterm.sh
+    - "shop.trpterm"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh

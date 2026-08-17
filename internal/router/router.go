@@ -44,6 +44,15 @@ type Router struct {
 	// re-resolved after a failure, so a failover is survivable.
 	primaryMu sync.RWMutex
 	primary   string
+	// members is every node of the fast tier, so a read asking for a secondary
+	// can be sent to one.
+	members []string
+
+	// pools hold authenticated connections per member, which only became
+	// possible once authentication stopped being the client's.
+	poolMu sync.Mutex
+	pools  map[string]*upstreamPool
+	rr     uint64
 
 	// creds and grants are how the router decides who a client is and what it
 	// may do, once it terminates authentication rather than proxying it. Both
@@ -104,6 +113,11 @@ type Stats struct {
 	DuplicateKeys atomic.Int64
 	ChangeStreams atomic.Int64
 	Unauthorized  atomic.Int64
+	// SecondaryReads counts reads that asked for a secondary and were sent to
+	// one. Together with PrimaryOnlyReads it says how much of the read load
+	// actually moved off the primary, which is the only way to tell the feature
+	// working from the feature configured.
+	SecondaryReads atomic.Int64
 	// PrimaryOnlyReads counts reads that asked for a secondary and were served
 	// by the primary anyway. See readpref.go for why that cannot be honoured.
 	PrimaryOnlyReads atomic.Int64
@@ -233,6 +247,10 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		upstream: upstream,
 		log:      r.log,
 	}
+	// Connections still holding this client's cursors are closed rather than
+	// returned, which is what tells the fast tier to drop the cursors.
+	defer c.releasePinned()
+
 	if err := c.pump(ctx); err != nil && !isClosed(err) {
 		r.log.Debug("connection ended", "err", err)
 	}
@@ -264,6 +282,10 @@ type conn struct {
 	auth        *authConv
 	grants      *authz.Grants
 	pendingUser string
+
+	// pinned maps a cursor to the pooled connection that owns it. A cursor
+	// exists on one node, so its getMore has to go back there.
+	pinned map[int64]*pooled
 
 	// warnedReadPref remembers which non-primary read preferences this client
 	// has already been warned about, so a reporting client sending the same one
@@ -455,7 +477,21 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
-	if err := wire.Write(c.upstream, msg); err != nil {
+	// A read that asked for a secondary goes to one, when there is one to use
+	// and nothing about the command ties it to the primary. Everything else
+	// travels on this client's own primary connection exactly as before.
+	up := c.upstream
+	borrowed, fromPool := c.borrowUpstream(ctx, msg, name)
+	if fromPool {
+		up = borrowed.conn
+	}
+
+	if err := wire.Write(up, msg); err != nil {
+		if fromPool {
+			// Half an exchange happened on it at most, so it cannot be reused.
+			borrowed.discard()
+			c.unpinExhausted(borrowed)
+		}
 		return fmt.Errorf("forward to fast tier: %w", err)
 	}
 	// Fire-and-forget writes expect no reply. Sending one would leave the
@@ -464,7 +500,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		return nil
 	}
 
-	reply, err := wire.Read(c.upstream)
+	reply, err := wire.Read(up)
+	if fromPool {
+		if err != nil {
+			borrowed.discard()
+			c.unpinExhausted(borrowed)
+		} else {
+			c.keepOrRelease(borrowed, reply)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("read from fast tier: %w", err)
 	}
@@ -590,8 +634,9 @@ func (r *Router) currentPrimary() string {
 // being permanent.
 func (r *Router) refreshPrimary(ctx context.Context) error {
 	var hello struct {
-		Primary string `bson:"primary"`
-		Me      string `bson:"me"`
+		Primary string   `bson:"primary"`
+		Me      string   `bson:"me"`
+		Hosts   []string `bson:"hosts"`
 	}
 	err := r.hot.Database("admin").
 		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
@@ -610,6 +655,7 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 	r.primaryMu.Lock()
 	changed := r.primary != addr
 	r.primary = addr
+	r.members = hello.Hosts
 	r.primaryMu.Unlock()
 
 	if changed {
