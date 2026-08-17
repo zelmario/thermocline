@@ -46,6 +46,11 @@ Usage:
                                           scanning the archive
   cline keys     --config FILE [--rebuild]
                                           unique keys that must survive eviction
+  cline pause    --config FILE [--reason WHY]
+                                          stop the evictor removing anything, for
+                                          as long as the archive cannot be
+                                          trusted, such as while it is restored
+  cline resume   --config FILE            let the evictor remove again
   cline version
 
 Every subcommand takes --log-file PATH to append logs to a file instead of
@@ -81,6 +86,10 @@ func run() error {
 		return runWatermark(os.Args[2:])
 	case "keys":
 		return runKeys(os.Args[2:])
+	case "pause":
+		return runPause(os.Args[2:], true)
+	case "resume":
+		return runPause(os.Args[2:], false)
 	case "indexes":
 		return runIndexes(os.Args[2:])
 	case "version":

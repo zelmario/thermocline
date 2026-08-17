@@ -124,6 +124,25 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 	stop := w.startHeartbeat(ctx)
 	defer stop()
 
+	// Wait for the feeder to notice before copying anything.
+	//
+	// The feeder caches its answer to "is a warm running" for a few seconds, so
+	// a warm that starts copying immediately spends that window being mirrored
+	// straight back into the archive it is reading from. Every document moved in
+	// those first seconds costs a redundant cold tier write, during the one
+	// operation that moves the most data.
+	//
+	// Waiting once, here, closes it completely. A warm runs for hours; this
+	// costs it a few seconds at the start, and it is the difference between the
+	// suppression working and the suppression working eventually.
+	if !w.dryRun {
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(feederMarkerCache):
+		}
+	}
+
 	for _, rule := range w.cfg.Rules {
 		s, err := w.runRule(ctx, rule)
 		total.Scanned += s.Scanned
@@ -137,6 +156,11 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 	w.publish(ctx, total)
 	return total, nil
 }
+
+// feederMarkerCache is how long the feeder trusts its last look at the warmer's
+// heartbeat. Kept in step with the feeder's own markerCache: if that grows and
+// this does not, the gap this closes reopens silently.
+const feederMarkerCache = 5 * time.Second
 
 // verifyClaim checks that the fast tier still holds everything its watermark
 // says it does, and reports how far short it is.

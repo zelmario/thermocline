@@ -25,7 +25,14 @@ H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 M() { curl -s http://127.0.0.1:27110/metrics 2>/dev/null; }
 
-cleanup() { pkill -9 -f 'cline router' 2>/dev/null; pkill -9 -f 'cline feeder' 2>/dev/null; }
+# The hold has to be lifted whatever happens here. A pause left behind stops the
+# evictor for every suite that runs afterwards, and testevict would then fail for
+# a reason that has nothing to do with it.
+cleanup() {
+  cline resume --config $CFG >/dev/null 2>&1
+  pkill -9 -f 'cline router' 2>/dev/null
+  pkill -9 -f 'cline feeder' 2>/dev/null
+}
 trap cleanup EXIT
 
 stopDaemons() {
@@ -60,14 +67,23 @@ cline warmer --config $CFG --dry-run >/dev/null 2>&1
 chk "the warmer published one too"                     "1" \
     "$(C "print(db.getSiblingDB('_thermocline').daemonstats.countDocuments({_id:'warmer'}))")"
 
-echo "== the counters accumulate rather than reset =="
-BEFORE=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.counters.scanned)")
+echo "== a later pass republishes =="
+# Number(), because the counters are int64 and mongosh prints those as Long("0"),
+# which is not a number as far as the shell is concerned.
+#
+# What cannot be checked from here is accumulation across passes. Each --once is
+# a new process and starts its own total at zero, so two invocations cannot show
+# a total growing; that property lives in the daemon and is visible only to a
+# long-running one. What is checked instead is that a pass republishes, which is
+# what keeps seconds_since_pass meaningful.
+FIRSTAT=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
+sleep 2
 cline evictor --config $CFG --dry-run --once >/dev/null 2>&1
-AFTER=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.counters.scanned)")
-# A second process starts its own total from zero, so what is checked is that a
-# report is a total and not a delta, which is what a counter has to be.
-chk "a report carries a total, not a delta"            "true" \
-    "$([ -n "$AFTER" ] && [ "$AFTER" -ge 0 ] 2>/dev/null && echo true || echo false)"
+LATERAT=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
+chk "the counter is a number"                          "true" \
+    "$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(Number.isFinite(Number(d.counters.scanned)))")"
+chk "and a later pass moves the timestamp on"          "true" \
+    "$(awk -v a="$FIRSTAT" -v b="$LATERAT" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
 
 echo "== the router exports them =="
 cline router --config $CFG --log-file /var/log/cline/dmet_r.log &
@@ -91,6 +107,26 @@ sleep 3
 SECOND=$(M | awk -F' ' '/^thermocline_daemon_seconds_since_pass\{daemon="evictor"\}/{print $2}')
 chk "and it climbs while the daemon is not running"    "true" \
     "$(awk -v a="$FIRST" -v b="$SECOND" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
+
+echo "== an operator can hold eviction, and the hold is visible =="
+# The case this exists for is a restored archive. The evictor's own check is per
+# document and presence only, so an archive holding an older version of a
+# document confirms as present and the fast tier's newer copy is removed.
+cline pause --config $CFG --reason "restoring the archive" >/dev/null 2>&1
+chk "the hold is recorded"                             "restoring the archive" \
+    "$(C "const d=db.getSiblingDB('_thermocline').markers.findOne({_id:'evictionPaused'}); print(d?d.reason:'MISSING')")"
+cline evictor --config $CFG --once >/dev/null 2>&1
+chk "the evictor removed nothing while held"           "5" \
+    "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+sleep 2
+chk "and the hold is exported"                         "1" \
+    "$(M | awk -F' ' '/^thermocline_eviction_paused /{print $2}')"
+chk "with how long it has been held"                   "true" \
+    "$(M | grep -q '^thermocline_eviction_paused_seconds ' && echo true || echo false)"
+cline resume --config $CFG >/dev/null 2>&1
+sleep 2
+chk "resuming lifts it"                                "0" \
+    "$(M | awk -F' ' '/^thermocline_eviction_paused /{print $2}')"
 
 echo "== the dashboard inventory still reports every namespace =="
 # Measured concurrently now, so the risk is a lost or duplicated entry rather

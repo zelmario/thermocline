@@ -6,6 +6,7 @@ package meta
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -49,6 +50,21 @@ const (
 
 	// WarmerActiveMarker is the _id of the warmer's heartbeat in Markers.
 	WarmerActiveMarker = "warmerActive"
+
+	// EvictionPausedMarker is the _id of an operator's hold on eviction.
+	//
+	// The evictor's own safety check is per document and it is presence only:
+	// nothing is removed unless the archive is confirmed to hold that document.
+	// That is exactly right when the archive is merely behind, and not enough
+	// when it has been restored. A restore can leave the archive holding an
+	// older version of a document, which the check confirms as present, and the
+	// fast tier's newer copy is then removed. Mirroring lag usually makes this
+	// impossible, because a restored checkpoint sends the feeder back over the
+	// gap, but a restore of the data alone leaves the lag looking healthy.
+	//
+	// So it is an explicit switch rather than something inferred. Set it before
+	// restoring and clear it afterwards.
+	EvictionPausedMarker = "evictionPaused"
 
 	// PromotingActiveMarker is the _id of the router's heartbeat in Markers.
 	//
@@ -204,6 +220,46 @@ func ReadDaemonReports(ctx context.Context, cold *mongo.Client) ([]DaemonReport,
 		return nil, err
 	}
 	return out, nil
+}
+
+// PauseRecord is an operator's hold on eviction.
+type PauseRecord struct {
+	ID     string    `bson:"_id"`
+	Since  time.Time `bson:"since"`
+	Reason string    `bson:"reason"`
+}
+
+// PauseEviction stops the evictor until it is resumed.
+func PauseEviction(ctx context.Context, cold *mongo.Client, reason string) error {
+	_, err := cold.Database(DB).Collection(Markers).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: EvictionPausedMarker}},
+		bson.D{
+			{Key: "$set", Value: bson.D{{Key: "reason", Value: reason}}},
+			{Key: "$setOnInsert", Value: bson.D{{Key: "since", Value: time.Now().UTC()}}},
+		},
+		options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// ResumeEviction lifts the hold.
+func ResumeEviction(ctx context.Context, cold *mongo.Client) error {
+	_, err := cold.Database(DB).Collection(Markers).
+		DeleteOne(ctx, bson.D{{Key: "_id", Value: EvictionPausedMarker}})
+	return err
+}
+
+// EvictionPaused reports whether eviction is held, and why.
+func EvictionPaused(ctx context.Context, cold *mongo.Client) (PauseRecord, bool, error) {
+	var rec PauseRecord
+	err := cold.Database(DB).Collection(Markers).
+		FindOne(ctx, bson.D{{Key: "_id", Value: EvictionPausedMarker}}).Decode(&rec)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return PauseRecord{}, false, nil
+	}
+	if err != nil {
+		return PauseRecord{}, false, err
+	}
+	return rec, true, nil
 }
 
 type ActiveMarker struct {

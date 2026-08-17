@@ -131,6 +131,27 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		}
 	}
 
+	// An operator hold on eviction, exported because a hold that is forgotten is
+	// its own outage: the fast tier fills up with everything that should have
+	// been removed, and nothing else says why. A pause is meant to be visible
+	// and temporary, and this is what makes it the first.
+	if r.cold != nil {
+		if rec, paused, perr := meta.EvictionPaused(ctx, r.cold); perr == nil {
+			held := 0.0
+			if paused {
+				held = 1
+			}
+			gauge("eviction_paused",
+				"Whether an operator has stopped the evictor removing anything. A hold left on fills the fast tier.",
+				held)
+			if paused {
+				gauge("eviction_paused_seconds",
+					"How long eviction has been held. Alert on this being long rather than on it being set.",
+					time.Since(rec.Since).Seconds())
+			}
+		}
+	}
+
 	// What each tier is holding.
 	if len(snap.Inventory.Namespaces) > 0 {
 		fmt.Fprintf(b, "# HELP thermocline_tier_documents Documents held per namespace and tier.\n")

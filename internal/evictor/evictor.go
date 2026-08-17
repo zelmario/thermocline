@@ -124,6 +124,23 @@ func New(hot, cold *mongo.Client, cfg config.EvictorConfig, dryRun bool, log *sl
 // RunOnce walks every rule once and returns when there is nothing left to
 // remove at the current boundary.
 func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
+	// An operator hold comes first, before any candidate is even looked at.
+	// See meta.EvictionPausedMarker for the case it exists for: an archive that
+	// has been restored can hold an older version of a document, which the
+	// per-document check confirms as present, and the fast tier's newer copy is
+	// then removed.
+	if rec, paused, err := meta.EvictionPaused(ctx, e.cold); err != nil {
+		e.log.Warn("could not read the eviction hold, not evicting", "err", err)
+		return Stats{DryRun: e.dryRun}, nil
+	} else if paused {
+		e.log.Warn("eviction is paused by an operator, removing nothing",
+			"since", rec.Since, "reason", rec.Reason,
+			"remedy", "cline resume --config <file> when the archive is trustworthy again")
+		s := Stats{DryRun: e.dryRun}
+		e.publish(ctx, s)
+		return s, nil
+	}
+
 	total := Stats{DryRun: e.dryRun}
 	if e.dryRun {
 		e.log.Info("dry run, nothing will be removed")
