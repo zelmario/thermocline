@@ -204,6 +204,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw)
 				break
 			}
 		}
+		r.notePromoting(ctx)
 
 		// Only the inserts moved a document. The rest were refused as duplicates
 		// of a copy the fast tier already had, which is the case the old

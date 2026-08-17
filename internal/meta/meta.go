@@ -49,6 +49,15 @@ const (
 	// WarmerActiveMarker is the _id of the warmer's heartbeat in Markers.
 	WarmerActiveMarker = "warmerActive"
 
+	// PromotingActiveMarker is the _id of the router's heartbeat in Markers.
+	//
+	// The router copies documents up on a miss, and each of those inserts is a
+	// change event the feeder would mirror straight back into the archive it was
+	// just read from. This marker is what lets the feeder skip looking for those
+	// echoes entirely when no promotion has happened recently, which is the
+	// normal state of a system whose fast tier is holding what it should.
+	PromotingActiveMarker = "promotingActive"
+
 	// Watermarks records how far back the fast tier is known to be complete,
 	// one per namespace. This is what lets a range query be answered from the
 	// fast tier alone rather than falling through to the archive.

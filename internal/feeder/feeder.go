@@ -54,6 +54,11 @@ type Feeder struct {
 	// cached view of whether a warmer is running, see echo.go
 	warmActive    bool
 	warmCheckedAt time.Time
+
+	// The same pair for the router's promotions. See promotion echoes in
+	// echo.go for what they are and why suppressing them has to be one-shot.
+	promoteActive    bool
+	promoteCheckedAt time.Time
 }
 
 // withdrawCompleteness drops the fast tier's completeness claim for ns.

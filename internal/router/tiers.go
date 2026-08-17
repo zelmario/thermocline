@@ -65,6 +65,7 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	if err := r.recordResidency(ctx, ns, id); err != nil {
 		r.log.Warn("could not record residency before copying up", "ns", ns, "err", err)
 	}
+	r.notePromoting(ctx)
 
 	db, coll := splitNS(ns)
 	// An insert, never a replace and never an upsert built from modifiers. If
@@ -111,6 +112,13 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 			{Key: "doc", Value: id},
 			{Key: "hotUntil", Value: until},
 			{Key: "promotedAt", Value: time.Now().UTC()},
+			// The insert this record precedes is about to appear on the feeder's
+			// change stream, and mirroring it would write the archive's own
+			// document back into the archive. This says one is expected, and the
+			// feeder clears it as it suppresses, so only that one insert is
+			// suppressed and a later genuine one is not. See promotion echoes in
+			// the feeder.
+			{Key: "echoPending", Value: true},
 		}}},
 		options.UpdateOne().SetUpsert(true))
 	return err
@@ -233,3 +241,36 @@ func splitNS(ns string) (db, coll string) {
 	db, coll, _ = strings.Cut(ns, ".")
 	return db, coll
 }
+
+// notePromoting tells the feeder that copy-ups are happening, so it starts
+// looking for the echoes they produce.
+//
+// Throttled, because the marker is a heartbeat and not a count: writing one per
+// promotion would add a cold tier write to the very path this exists to make
+// cheaper. The feeder treats a marker it has not seen move for a while as
+// nobody promoting, so this only has to beat often enough to stay inside that
+// window.
+func (r *Router) notePromoting(ctx context.Context) {
+	now := time.Now()
+	r.promoteMu.Lock()
+	if now.Sub(r.promotedAt) < promoteBeat {
+		r.promoteMu.Unlock()
+		return
+	}
+	r.promotedAt = now
+	r.promoteMu.Unlock()
+
+	_, err := r.cold.Database(meta.DB).Collection(meta.Markers).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: meta.PromotingActiveMarker}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: now.UTC()}}}},
+		options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		// Not fatal. Failing to announce costs the redundant mirror writes this
+		// was going to save, and stopping a copy-up over a heartbeat would cost
+		// the client its answer.
+		r.log.Warn("could not announce that documents are being promoted", "err", err)
+	}
+}
+
+// promoteBeat is how often the promotion heartbeat is refreshed.
+const promoteBeat = 3 * time.Second

@@ -1,0 +1,140 @@
+#!/bin/bash
+# The router's promotions must not be mirrored back into the archive they came
+# from, and suppressing them must not lose a genuine write.
+#
+# A copy-up inserts an archived document into the fast tier. That is a change
+# event like any other, so the feeder mirrored it straight back down, writing the
+# archive's own document into the archive. Identical content, so nothing was ever
+# wrong with the answer; what it cost was a cold tier write for every document
+# the fast tier had to fetch.
+#
+# Measuring it is the interesting part, because a suppressed echo and a completed
+# echo leave exactly the same document behind. So the archive copy is marked
+# directly, after the promotion and before the feeder runs, with a field the fast
+# tier's copy does not have. A mirror is a whole-document replace, so it wipes
+# that field; suppression leaves it. The first section proves the marker can see
+# a mirror at all, because a measurement whose control does not come back
+# positive proves nothing.
+#
+# The last section is the one that matters most. Suppressing every mirror for a
+# recently promoted document would also swallow a genuine insert, if the
+# application deleted that document and created it again in the window, and the
+# archive would keep the tombstone while the new document never arrived. So the
+# suppression is one-shot, and this checks that the shot is spent on the
+# promotion and not on the write that follows it.
+CFG=/root/cline.yaml
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
+NS=techo
+PASS=0; FAIL=0; declare -a FAILED
+chk() {
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-52s %s\n' "$1" "$3"
+  else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-52s got=%s want=%s\n' "$1" "$3" "$2"; fi
+}
+H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+
+cleanup() { pkill -9 -f 'cline feeder' 2>/dev/null; pkill -9 -f 'cline router' 2>/dev/null; }
+trap cleanup EXIT
+
+stopDaemons() {
+  pkill -f 'cline feeder|cline router' 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
+startFeeder() {
+  cline feeder --config $CFG --log-file /var/log/cline/echo_f.log &
+  for _ in $(seq 1 60); do
+    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    sleep 0.5
+  done
+  echo "  WARN  the feeder never wrote a checkpoint"
+}
+startRouter() {
+  cline router --config $CFG --log-file /var/log/cline/echo_r.log &
+  for _ in $(seq 1 30); do
+    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "  FATAL  the router never came up on 27100"; exit 2
+}
+# The archive copy's marker, or ABSENT. This is the whole measurement.
+marker() { C "const d=db.getSiblingDB('shop').$NS.findOne({_id:$1}); print(d&&d.marker?d.marker:'ABSENT')"; }
+archived() { C "const d=db.getSiblingDB('shop').$NS.findOne({_id:$1}); print(!!d && !d._tcDeletedAt)"; }
+
+echo "== setup =="
+stopDaemons
+C "db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'});
+   db.getSiblingDB('_thermocline').residency.deleteMany({});
+   db.getSiblingDB('_thermocline').markers.deleteMany({})" >/dev/null
+H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
+startFeeder
+startRouter
+
+echo "== control: a mirror does wipe the marker =="
+# Without this, everything below could pass because nothing was ever written.
+H "db.getSiblingDB('shop').$NS.insertOne({_id:1,v:'a'})" >/dev/null
+for _ in $(seq 1 40); do [ "$(archived 1)" = "true" ] && break; sleep 0.5; done
+chk "the document reached the archive"               "true" "$(archived 1)"
+stopDaemons
+C "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{marker:'control'}})" >/dev/null
+chk "the archive copy carries a marker"              "control" "$(marker 1)"
+H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:'b'}})" >/dev/null
+startFeeder
+for _ in $(seq 1 40); do [ "$(marker 1)" = "ABSENT" ] && break; sleep 0.5; done
+chk "a mirrored write replaces the archive copy"     "ABSENT" "$(marker 1)"
+
+echo "== a promotion is not mirrored back =="
+stopDaemons
+# Archive only, which is what an evicted document looks like.
+H "db.getSiblingDB('shop').$NS.deleteOne({_id:2})" >/dev/null
+C "db.getSiblingDB('shop').$NS.deleteOne({_id:2})" >/dev/null
+C "db.getSiblingDB('shop').$NS.insertOne({_id:2,v:'archived'})" >/dev/null
+startRouter
+# A point read by _id is the only thing that promotes.
+chk "the archived document is served"                "archived" \
+    "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:2}); print(d?d.v:'MISSING')")"
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:2}))")" = "1" ] && break
+  sleep 0.5
+done
+chk "and is now on the fast tier"                    "1" \
+    "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:2}))")"
+# Mark the archive copy before the feeder ever sees the promotion.
+C "db.getSiblingDB('shop').$NS.updateOne({_id:2},{\$set:{marker:'kept'}})" >/dev/null
+startFeeder
+sleep 8
+chk "the promotion did not overwrite the archive"    "kept" "$(marker 2)"
+chk "and the archived document is still live"        "true" "$(archived 2)"
+
+echo "== the suppression is spent on the promotion, not on the next write =="
+# The hazard: delete the promoted document and create a different one with the
+# same id before the feeder has caught up. The insert of the new document must
+# reach the archive, or it is lost there while the application believes it is
+# stored.
+stopDaemons
+H "db.getSiblingDB('shop').$NS.deleteOne({_id:3})" >/dev/null
+C "db.getSiblingDB('shop').$NS.deleteOne({_id:3})" >/dev/null
+C "db.getSiblingDB('shop').$NS.insertOne({_id:3,v:'old'})" >/dev/null
+startRouter
+chk "the second archived document is served"         "old" \
+    "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:3}); print(d?d.v:'MISSING')")"
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:3}))")" = "1" ] && break
+  sleep 0.5
+done
+# Now, with the feeder still stopped, replace it on the fast tier.
+H "db.getSiblingDB('shop').$NS.deleteOne({_id:3})" >/dev/null
+H "db.getSiblingDB('shop').$NS.insertOne({_id:3,v:'new'})" >/dev/null
+startFeeder
+sleep 10
+chk "the replacement reached the archive"            "new" \
+    "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:3}); print(d?d.v:'MISSING')")"
+chk "and it is live there, not tombstoned"           "true" "$(archived 3)"
+
+echo
+echo "================================"
+echo "PASS $PASS   FAIL $FAIL"
+if [ $FAIL -gt 0 ]; then echo "failed: ${FAILED[*]}"; exit $FAIL; fi

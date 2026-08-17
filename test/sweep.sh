@@ -12,7 +12,7 @@ mkdir -p "$OUT"
 SUITES="testall testevict testrouter testops testkeys testwarm testfresh
         testaggwrite testlife testedge testtxn testauth testbulk testchange
         testconcerns testddl testexplain testindexes testquery testreadpref
-        testtypes testupsert testsingle testconform testauthterm testreadprefterm"
+        testtypes testupsert testsingle testconform testauthterm testreadprefterm testecho"
 : > "$OUT/summary.txt"
 for s in $SUITES; do
   [ -f "/root/$s.sh" ] || { echo "$s MISSING" >> "$OUT/summary.txt"; continue; }

@@ -73,6 +73,11 @@ func (f *Feeder) flush(ctx context.Context) error {
 	} else if dropped > 0 {
 		f.log.Debug("suppressed warmed documents", "count", dropped)
 	}
+	if dropped, err := f.suppressPromotionEchoes(ctx); err != nil {
+		return err
+	} else if dropped > 0 {
+		f.log.Debug("suppressed promoted documents", "count", dropped)
+	}
 
 	now := time.Now().UTC()
 	byNS := make(map[string][]mongo.WriteModel)

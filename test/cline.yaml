@@ -80,6 +80,8 @@ feeder:
     - "shop.tatrm"
     # testreadprefterm.sh
     - "shop.trpterm"
+    # testecho.sh
+    - "shop.techo"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh
