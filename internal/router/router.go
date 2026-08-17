@@ -455,6 +455,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// An explain describes the fast tier, which may not be where the query it
+	// explains would run. Say so beside the plan rather than instead of it.
+	if name == "explain" {
+		if out, done := c.annotateExplain(ctx, msg, db, reply); done {
+			return wire.Write(c.client, out)
+		}
+	}
+
 	rewritten, err := c.intercept(ctx, msg, name, db, reply)
 	if err != nil {
 		c.log.Warn("routing failed, returning the fast tier's answer",

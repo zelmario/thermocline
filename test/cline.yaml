@@ -77,6 +77,8 @@ feeder:
     - "shop.tauth"
     # testindexes.sh
     - "shop.tidx"
+    # testexplain.sh
+    - "shop.texpl"
     # testquery.sh
     - "shop.tqcoll"
     - "shop.tqtext"
