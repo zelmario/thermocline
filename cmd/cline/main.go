@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -366,7 +367,50 @@ func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {
 	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
 		return nil, fmt.Errorf("ping %s tier: %w", name, err)
 	}
+
+	// A sharded fast tier is refused here rather than discovered later.
+	//
+	// Everything this system does to a fast tier assumes a replica set. The
+	// router proxies bytes to one primary address, which a mongos does not
+	// report: measured, its hello answers {msg: "isdbgrid", isWritablePrimary:
+	// true} and nothing else, so the router failed to start with "fast tier
+	// reported no primary address", which is true and says nothing about the
+	// cause. The daemons were worse off, because they started.
+	//
+	// Every reading the evictor holds itself back on comes from a replica set.
+	// Measured against a mongos: replSetGetStatus is "not supported through
+	// mongos", the local database cannot be reached at all so there is no oplog
+	// window, and serverStatus carries no wiredTiger section so neither cache
+	// dirty nor write tickets exist. A reading that cannot be taken does not
+	// block, so four of the five backoffs quietly did nothing: a dry run with
+	// candidates reported would_evict=5 and backoffs=0 on a cluster it could
+	// tell nothing about.
+	//
+	// So this says no, with the reason. Supporting a sharded fast tier is a
+	// feature, and the first thing it needs is health readings that mean
+	// something there.
+	if name == "hot" {
+		if sharded, err := isMongos(pingCtx, client); err == nil && sharded {
+			return nil, fmt.Errorf("the fast tier is a mongos, and sharded fast tiers are not supported: " +
+				"this proxies to one primary address, which a mongos does not have, and every health " +
+				"reading the evictor pauses on is a replica set's. Point cline at a replica set")
+		}
+	}
 	return client, nil
+}
+
+// isMongos reports whether a connection lands on a router rather than a replica
+// set. mongos identifies itself in hello with msg: "isdbgrid", which is the
+// same field a driver uses to decide it is talking to a sharded cluster.
+func isMongos(ctx context.Context, client *mongo.Client) (bool, error) {
+	var hello struct {
+		Msg string `bson:"msg"`
+	}
+	if err := client.Database("admin").
+		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
+		return false, err
+	}
+	return hello.Msg == "isdbgrid", nil
 }
 
 func disconnect(client *mongo.Client, log *slog.Logger) {

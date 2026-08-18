@@ -50,6 +50,7 @@ Or one at a time:
     go run ./test/exhaust 127.0.0.1:27600 router    # the OP_MSG exhaust bit (host side, see exhaust/README.md)
     go run ./test/cursorowner 127.0.0.1:27600      # whether one client can read another's cursor
     go run ./test/compressed 127.0.0.1:27600       # a client that compresses without being invited to
+    bash test/testsharded.sh                       # a mongos fast tier, which is refused (host side)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
 

@@ -886,7 +886,26 @@ mongosh --port 28018 --eval '
 
 ## What is not handled yet
 
-- **Sharded fast tiers.** Untested.
+- **Sharded fast tiers are refused, with the reason.** Everything here assumes
+  the fast tier is a replica set. The router proxies bytes to one primary
+  address and a mongos does not have one: measured, its `hello` answers
+  `{msg: "isdbgrid", isWritablePrimary: true}` and nothing else. Every reading
+  the evictor holds itself back on is a replica set's, and a mongos has none of
+  them: `replSetGetStatus` is "not supported through mongos", the `local`
+  database cannot be reached at all, and `serverStatus` carries no `wiredTiger`
+  section, so cache pressure and write tickets are unknown too.
+
+  A reading that cannot be taken does not block, so before this was refused the
+  daemons ran against a mongos holding themselves back on nothing: an evictor
+  dry run with five eligible documents reported `would_evict=5` and
+  `backoffs=0`. The router did stop, with "fast tier reported no primary
+  address", which is true and says nothing about the cause.
+
+  All four commands now refuse a mongos fast tier and name it.
+  `test/testsharded.sh` builds a config server, a shard and a mongos on the host
+  and checks each one. Supporting a sharded fast tier is a feature rather than a
+  fix, and the first thing it needs is health readings that mean something
+  there.
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server
