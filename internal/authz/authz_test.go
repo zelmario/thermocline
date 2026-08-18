@@ -145,3 +145,103 @@ func TestEmptyGrantsAllowNothing(t *testing.T) {
 		t.Fatal("an empty grant allowed something")
 	}
 }
+
+// An explain carries the privileges of the command it wraps. Judged by name it
+// would be refused, which turns every driver's explain into an error; judged as
+// harmless it would hand a user the shape of a collection they may not read.
+func TestExplainNeedsWhatItExplains(t *testing.T) {
+	raw := func(d bson.D) bson.Raw {
+		b, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+
+	cmd := raw(bson.D{
+		{Key: "explain", Value: bson.D{
+			{Key: "find", Value: "salaries"},
+			{Key: "filter", Value: bson.D{}},
+		}},
+		{Key: "verbosity", Value: "queryPlanner"},
+	})
+	needs, err := Needs("explain", "payroll", cmd)
+	if err != nil {
+		t.Fatalf("explain of a find: %v", err)
+	}
+	if len(needs) != 1 || needs[0].DB != "payroll" || needs[0].Coll != "salaries" ||
+		len(needs[0].Actions) != 1 || needs[0].Actions[0] != "find" {
+		t.Fatalf("needs = %+v", needs)
+	}
+
+	// A write explained is still a write as far as authorization goes.
+	del := raw(bson.D{{Key: "explain", Value: bson.D{
+		{Key: "delete", Value: "salaries"},
+		{Key: "deletes", Value: bson.A{bson.D{{Key: "q", Value: bson.D{}}, {Key: "limit", Value: 1}}}},
+	}}})
+	needs, err = Needs("explain", "payroll", del)
+	if err != nil {
+		t.Fatalf("explain of a delete: %v", err)
+	}
+	if len(needs) != 1 || needs[0].Actions[0] != "remove" {
+		t.Fatalf("needs = %+v", needs)
+	}
+
+	// The inner command may name its own database, and that is the one the
+	// privilege is about.
+	other := raw(bson.D{{Key: "explain", Value: bson.D{
+		{Key: "find", Value: "salaries"},
+		{Key: "$db", Value: "payroll"},
+	}}})
+	needs, err = Needs("explain", "shop", other)
+	if err != nil {
+		t.Fatalf("explain naming its own database: %v", err)
+	}
+	if needs[0].DB != "payroll" {
+		t.Fatalf("db = %q, want payroll", needs[0].DB)
+	}
+
+	// And an inner command this package cannot judge is still refused.
+	unknown := raw(bson.D{{Key: "explain", Value: bson.D{{Key: "thisIsNotACommand", Value: 1}}}})
+	if _, err := Needs("explain", "shop", unknown); err == nil {
+		t.Fatal("an explain of an unknown command was allowed")
+	}
+}
+
+// An aggregation whose first stage produces its own input never reads the
+// collection it was sent to, and mongod does not ask for find on it. Asking
+// anyway refuses an ordinary db.coll.stats() from a user who holds collStats
+// and nothing else.
+func TestInitialSourcesDoNotNeedFind(t *testing.T) {
+	raw := func(d bson.D) bson.Raw {
+		b, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+	agg := func(stages bson.A) bson.Raw {
+		return raw(bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: stages}})
+	}
+
+	for _, stage := range []string{"$collStats", "$indexStats", "$planCacheStats", "$documents", "$changeStream"} {
+		needs, err := Needs("aggregate", "shop", agg(bson.A{bson.D{{Key: stage, Value: bson.D{}}}}))
+		if err != nil {
+			t.Fatalf("%s: %v", stage, err)
+		}
+		if len(needs) != 0 {
+			t.Errorf("%s asked for %+v, want nothing from the base check", stage, needs)
+		}
+	}
+
+	// Everything else reads the collection, including an empty pipeline.
+	for _, stages := range []bson.A{{}, {bson.D{{Key: "$match", Value: bson.D{}}}}} {
+		needs, err := Needs("aggregate", "shop", agg(stages))
+		if err != nil {
+			t.Fatalf("reading pipeline: %v", err)
+		}
+		if len(needs) != 1 || needs[0].Actions[0] != "find" {
+			t.Errorf("needs = %+v, want find", needs)
+		}
+	}
+}

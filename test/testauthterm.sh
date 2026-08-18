@@ -107,6 +107,180 @@ H "db.getSiblingDB('shop').tatrm.deleteOne({_id:1})" >/dev/null
 chk "an archived document is still served"      "one"    "$(AS dba secret 'const d=db.getSiblingDB("shop").tatrm.findOne({_id:1}); print(d?d.v:"MISSING")')"
 chk "and refused to a user without the grant"   "DENIED" "$(denied "$(AS limited limpass 'const d=db.getSiblingDB("payroll").salaries.findOne({_id:1}); print(d?d.who:"MISSING")')")"
 
+# A command names more collections than the one it is sent to.
+#
+# The gate judges an aggregate by the collection in the `aggregate` field, and
+# that is not the only namespace an aggregation touches. $lookup, $unionWith and
+# $graphLookup read another collection; $out and $merge write one. mongod
+# requires find on every collection read and insert, update or remove on every
+# collection written, and it checks each of them.
+#
+# With authentication proxied none of this mattered, because the fast tier saw
+# the command with the client's own identity on it and applied its own rules.
+# With terminate_auth on, the upstream connection is the router's and the fast
+# tier will do whatever it is asked, so a namespace the gate does not judge is a
+# namespace with no check on it at all.
+#
+# The reference is the same user sending the same command straight to the fast
+# tier. Anything the router allows that mongod refuses is a privilege bypass,
+# and for the writing stages it is a destructive one.
+HOTAS() { local uri=${HOT/dba:secret/$1:$2}; mongosh "$uri" --quiet --eval "$3" 2>&1 | tail -1; }
+
+echo "== the collections a command names besides its own =="
+H "db.getSiblingDB('shop').tazopen.drop();
+   db.getSiblingDB('shop').tazopen.insertMany([{_id:1,v:'open'},{_id:2,v:'open2'}]);
+   db.getSiblingDB('shop').tazsecret.drop();
+   db.getSiblingDB('shop').tazsecret.insertMany([{_id:1,pay:100},{_id:2,pay:200}])" >/dev/null
+H "try { db.getSiblingDB('admin').dropUser('narrow') } catch(e) {}
+   try { db.getSiblingDB('shop').dropRole('tazreader') } catch(e) {}
+   db.getSiblingDB('shop').createRole({role:'tazreader',
+     privileges:[{resource:{db:'shop',collection:'tazopen'},actions:['find','insert','update','remove']}], roles:[]});
+   db.getSiblingDB('admin').createUser({user:'narrow',pwd:'narrowpass',roles:[{role:'tazreader',db:'shop'}]})" >/dev/null
+seedTaz() {
+  H "db.getSiblingDB('shop').tazsecret.deleteMany({});
+     db.getSiblingDB('shop').tazsecret.insertMany([{_id:1,pay:100},{_id:2,pay:200}])" >/dev/null
+}
+secretNow() { H "print(db.getSiblingDB('shop').tazsecret.find().sort({_id:1}).toArray().map(d=>d._id+':'+d.pay).join(','))"; }
+
+chk "the narrow user reads its own collection"      "2" \
+    "$(AS narrow narrowpass 'print(db.getSiblingDB("shop").tazopen.countDocuments({}))')"
+chk "and cannot read the other one"                 "DENIED" \
+    "$(denied "$(AS narrow narrowpass 'print(db.getSiblingDB("shop").tazsecret.countDocuments({}))')")"
+
+LKP='print(db.getSiblingDB("shop").tazopen.aggregate([{$lookup:{from:"tazsecret",localField:"_id",foreignField:"_id",as:"j"}}]).toArray().map(d=>d.j.length).join(","))'
+chk "a \$lookup joining it matches mongod"           "$(denied "$(HOTAS narrow narrowpass "$LKP")")" \
+    "$(denied "$(AS narrow narrowpass "$LKP")")"
+
+UNI='print(db.getSiblingDB("shop").tazopen.aggregate([{$unionWith:"tazsecret"}]).toArray().length)'
+chk "a \$unionWith of it matches mongod"             "$(denied "$(HOTAS narrow narrowpass "$UNI")")" \
+    "$(denied "$(AS narrow narrowpass "$UNI")")"
+
+GRP='print(db.getSiblingDB("shop").tazopen.aggregate([{$graphLookup:{from:"tazsecret",startWith:"$_id",connectFromField:"_id",connectToField:"_id",as:"j"}}]).toArray().map(d=>d.j.length).join(","))'
+chk "a \$graphLookup into it matches mongod"         "$(denied "$(HOTAS narrow narrowpass "$GRP")")" \
+    "$(denied "$(AS narrow narrowpass "$GRP")")"
+
+seedTaz
+MRG='db.getSiblingDB("shop").tazopen.aggregate([{$project:{pay:{$literal:-1}}},{$merge:{into:"tazsecret",whenMatched:"replace",whenNotMatched:"insert"}}]).toArray(); print("WROTE")'
+REFMRG=$(denied "$(HOTAS narrow narrowpass "$MRG")")
+REFSTATE=$(secretNow)
+seedTaz
+chk "a \$merge into it matches mongod"               "$REFMRG" "$(denied "$(AS narrow narrowpass "$MRG")")"
+chk "and leaves the collection as mongod left it"   "$REFSTATE" "$(secretNow)"
+
+seedTaz
+OUT='db.getSiblingDB("shop").tazopen.aggregate([{$project:{pay:{$literal:-2}}},{$out:"tazsecret"}]).toArray(); print("WROTE")'
+REFOUT=$(denied "$(HOTAS narrow narrowpass "$OUT")")
+REFOSTATE=$(secretNow)
+seedTaz
+chk "an \$out over it matches mongod"                "$REFOUT" "$(denied "$(AS narrow narrowpass "$OUT")")"
+chk "and it still holds what mongod left"           "$REFOSTATE" "$(secretNow)"
+echo "== commands that carry another command inside them =="
+# explain runs nothing itself, so judging it by name refuses every explain a
+# driver sends, and treating it as harmless hands a user the shape and the index
+# bounds of a collection they may not read. It needs what the command inside it
+# needs, which is what mongod does.
+EXPOPEN='print(db.getSiblingDB("shop").tazopen.find({_id:1}).explain().queryPlanner.namespace)'
+chk "an explain of a permitted find is allowed"     "$(HOTAS narrow narrowpass "$EXPOPEN")" \
+    "$(denied "$(AS narrow narrowpass "$EXPOPEN")")"
+EXPSEC='print(db.getSiblingDB("shop").tazsecret.find({_id:1}).explain().queryPlanner.namespace)'
+chk "an explain of a forbidden find matches mongod" "$(denied "$(HOTAS narrow narrowpass "$EXPSEC")")" \
+    "$(denied "$(AS narrow narrowpass "$EXPSEC")")"
+
+# bulkWrite is the 8.0 write path. It is sent to admin and names its collections
+# in nsInfo, so there is no collection where authorization would look for one.
+H 'db.getSiblingDB("shop").tazopen.deleteMany({_id:{$gte:900}})' >/dev/null
+BWOPEN='print(db.getSiblingDB("admin").runCommand({bulkWrite:1, ops:[{insert:0, document:{_id:900,v:"bw"}}], nsInfo:[{ns:"shop.tazopen"}]}).ok)'
+chk "a permitted bulkWrite is allowed"              "1" \
+    "$(denied "$(AS narrow narrowpass "$BWOPEN")")"
+BWSEC='print(db.getSiblingDB("admin").runCommand({bulkWrite:1, ops:[{insert:0, document:{_id:901,pay:-3}}], nsInfo:[{ns:"shop.tazsecret"}]}).ok)'
+chk "a forbidden bulkWrite matches mongod"          "$(denied "$(HOTAS narrow narrowpass "$BWSEC")")" \
+    "$(denied "$(AS narrow narrowpass "$BWSEC")")"
+chk "and it wrote nothing there"                    "0" \
+    "$(H 'print(db.getSiblingDB("shop").tazsecret.countDocuments({_id:901}))')"
+echo "== a write that asks for no acknowledgement is still a write =="
+# An unacknowledged write, w:0, is sent with the wire protocol's moreToCome flag
+# and the client never waits for an answer. There is therefore nowhere to put a
+# refusal, and that is a reason to not perform the write, not a reason to skip
+# asking whether it is allowed. Forwarding it would be the quietest privilege
+# bypass in the system: no error anywhere, and the document lands.
+UNACK='db.getSiblingDB("payroll").salaries.insertOne({_id:777,who:"unack"},{writeConcern:{w:0}}); print("sent")'
+H 'db.getSiblingDB("payroll").salaries.deleteMany({_id:777})' >/dev/null
+HOTAS limited limpass "$UNACK" >/dev/null 2>&1
+sleep 2
+REFUNACK=$(H 'print(db.getSiblingDB("payroll").salaries.countDocuments({_id:777}))')
+H 'db.getSiblingDB("payroll").salaries.deleteMany({_id:777})' >/dev/null
+AS limited limpass "$UNACK" >/dev/null 2>&1
+sleep 2
+chk "an unacknowledged forbidden write matches mongod" "$REFUNACK" \
+    "$(H 'print(db.getSiblingDB("payroll").salaries.countDocuments({_id:777}))')"
+H 'db.getSiblingDB("payroll").salaries.deleteMany({_id:777})' >/dev/null
+
+# And the permitted one still has to work, because refusing every unacknowledged
+# write would be a fix that broke the feature.
+H 'db.getSiblingDB("shop").tatrm.deleteMany({_id:778})' >/dev/null
+AS writer writepass 'db.getSiblingDB("shop").tatrm.insertOne({_id:778,v:"unack"},{writeConcern:{w:0}}); print("sent")' >/dev/null 2>&1
+sleep 2
+chk "an unacknowledged permitted write still lands"   "1" \
+    "$(H 'print(db.getSiblingDB("shop").tatrm.countDocuments({_id:778}))')"
+H 'db.getSiblingDB("shop").tatrm.deleteMany({_id:778})' >/dev/null
+echo "== the privilege a stage asks for itself =="
+# mongod judges an aggregation stage by stage. A pipeline that starts by
+# describing the collection never reads it, so find is not what it needs:
+# $indexStats needs indexStats, $collStats needs collStats, $planCacheStats
+# needs planCacheRead, and a change stream needs changeStream as well as find.
+# Judging all of them as "find on the collection" is wrong in both directions,
+# and one of them hands a user metadata mongod would have refused.
+H "try { db.getSiblingDB('admin').dropUser('finder') } catch(e) {}
+   try { db.getSiblingDB('shop').dropRole('tazfinder') } catch(e) {}
+   db.getSiblingDB('shop').createRole({role:'tazfinder',
+     privileges:[{resource:{db:'shop',collection:'tazopen'},actions:['find']}], roles:[]});
+   db.getSiblingDB('admin').createUser({user:'finder',pwd:'findpass',roles:[{role:'tazfinder',db:'shop'}]})" >/dev/null
+H "try { db.getSiblingDB('admin').dropUser('statser') } catch(e) {}
+   try { db.getSiblingDB('shop').dropRole('tazstats') } catch(e) {}
+   db.getSiblingDB('shop').createRole({role:'tazstats',
+     privileges:[{resource:{db:'shop',collection:'tazopen'},actions:['collStats']}], roles:[]});
+   db.getSiblingDB('admin').createUser({user:'statser',pwd:'statspass',roles:[{role:'tazstats',db:'shop'}]})" >/dev/null
+
+IDX='print(db.getSiblingDB("shop").tazopen.aggregate([{$indexStats:{}}]).toArray().length>0)'
+chk "\$indexStats on find alone matches mongod"      "$(denied "$(HOTAS finder findpass "$IDX")")" \
+    "$(denied "$(AS finder findpass "$IDX")")"
+CS='const cs=db.getSiblingDB("shop").tazopen.watch(); cs.close(); print("OPENED")'
+chk "a change stream on find alone matches mongod"  "$(denied "$(HOTAS finder findpass "$CS")")" \
+    "$(denied "$(AS finder findpass "$CS")")"
+STATS='print(db.getSiblingDB("shop").tazopen.aggregate([{$collStats:{storageStats:{}}}]).toArray().length)'
+chk "\$collStats without find matches mongod"        "$(denied "$(HOTAS statser statspass "$STATS")")" \
+    "$(denied "$(AS statser statspass "$STATS")")"
+chk "and find alone cannot ask for it"              "$(denied "$(HOTAS finder findpass "$STATS")")" \
+    "$(denied "$(AS finder findpass "$STATS")")"
+
+echo "== a \$merge asks only for what it can do =="
+# whenNotMatched: discard means the merge can never insert, and mongod asks only
+# for update. Asking for both refuses a user who may update the collection and
+# may not insert into it.
+H "try { db.getSiblingDB('admin').dropUser('updater') } catch(e) {}
+   try { db.getSiblingDB('shop').dropRole('tazupdater') } catch(e) {}
+   db.getSiblingDB('shop').createRole({role:'tazupdater',
+     privileges:[{resource:{db:'shop',collection:'tazopen'},actions:['find']},
+                 {resource:{db:'shop',collection:'tazsecret'},actions:['update']}], roles:[]});
+   db.getSiblingDB('admin').createUser({user:'updater',pwd:'updpass',roles:[{role:'tazupdater',db:'shop'}]})" >/dev/null
+seedTaz
+MRGU='db.getSiblingDB("shop").tazopen.aggregate([{$project:{pay:{$literal:9}}},{$merge:{into:"tazsecret",whenMatched:"merge",whenNotMatched:"discard"}}]).toArray(); print("WROTE")'
+REFU=$(denied "$(HOTAS updater updpass "$MRGU")")
+REFUSTATE=$(secretNow)
+seedTaz
+chk "a merge that can only update matches mongod"   "$REFU" "$(denied "$(AS updater updpass "$MRGU")")"
+chk "and left the collection the same way"          "$REFUSTATE" "$(secretNow)"
+
+echo "== skipping a collection's own validation rules =="
+# bypassDocumentValidation asks the server to write what the collection says is
+# invalid, and mongod requires a privilege for it that write access does not
+# imply.
+BYP='print(db.getSiblingDB("shop").tazopen.insertOne({_id:950,v:"byp"},{bypassDocumentValidation:true}).acknowledged)'
+H 'db.getSiblingDB("shop").tazopen.deleteMany({_id:950})' >/dev/null
+REFBYP=$(denied "$(HOTAS narrow narrowpass "$BYP")")
+H 'db.getSiblingDB("shop").tazopen.deleteMany({_id:950})' >/dev/null
+chk "bypassing validation matches mongod"           "$REFBYP" "$(denied "$(AS narrow narrowpass "$BYP")")"
+H 'db.getSiblingDB("shop").tazopen.deleteMany({_id:950})' >/dev/null
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

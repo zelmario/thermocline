@@ -58,10 +58,25 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 
 	switch name {
 	// Reads.
-	case "find", "count", "distinct", "aggregate":
-		// aggregate can end in $out or $merge, which writes. The router already
-		// has to understand those stages for tiering, and the write target is
-		// checked separately by the caller, which knows how to resolve them.
+	case "find", "count", "distinct":
+		return []Need{{DB: db, Coll: coll(), Actions: []string{"find"}}}, nil
+	case "aggregate":
+		// mongod requires find on the collection an aggregation reads, and an
+		// aggregation whose first stage is an initial source does not read it:
+		// it describes the collection, or produces its own documents. From
+		// getPrivilegesForAggregate: find is required when the pipeline is
+		// empty, or when "the first stage of the pipeline is not an initial
+		// source", in which case "the pipeline is implicitly reading documents
+		// from the underlying collection".
+		//
+		// Everything a pipeline needs beyond that comes from its stages, one at
+		// a time, and the caller adds those: the collections a $lookup or a
+		// $unionWith reads, the target an $out or a $merge writes, and the
+		// actions a stage declares for itself. See aggregateNeeds in the
+		// router.
+		if startsWithInitialSource(cmd) {
+			return nil, nil
+		}
 		return []Need{{DB: db, Coll: coll(), Actions: []string{"find"}}}, nil
 	case "getMore":
 		// The namespace travels in the command, not the cursor, so it can be
@@ -76,7 +91,7 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 
 	// Writes.
 	case "insert":
-		return []Need{{DB: db, Coll: coll(), Actions: []string{"insert"}}}, nil
+		return []Need{{DB: db, Coll: coll(), Actions: bypassing(cmd, "insert")}}, nil
 	case "update":
 		// An update carrying upsert:true can create, which mongod requires
 		// insert for as well as update.
@@ -84,7 +99,7 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 		if anyStatementUpserts(cmd, "updates") {
 			actions = append(actions, "insert")
 		}
-		return []Need{{DB: db, Coll: coll(), Actions: actions}}, nil
+		return []Need{{DB: db, Coll: coll(), Actions: bypassing(cmd, actions...)}}, nil
 	case "delete":
 		return []Need{{DB: db, Coll: coll(), Actions: []string{"remove"}}}, nil
 	case "findAndModify", "findandmodify":
@@ -94,7 +109,7 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 		if boolField(cmd, "upsert") {
 			actions = append(actions, "insert")
 		}
-		return []Need{{DB: db, Coll: coll(), Actions: actions}}, nil
+		return []Need{{DB: db, Coll: coll(), Actions: bypassing(cmd, actions...)}}, nil
 
 	// Collection and index management.
 	case "create":
@@ -120,6 +135,38 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 	case "dropDatabase":
 		return []Need{{DB: db, Actions: []string{"dropDatabase"}}}, nil
 
+	// explain runs nothing itself: it asks the planner what the command inside
+	// it would do, and mongod requires exactly the privileges of that command.
+	// Judging it by name alone would refuse every explain a driver sends, and
+	// judging it as harmless would let a user read a collection's shape and its
+	// index bounds through a command they may not run.
+	case "explain":
+		inner, ierr := cmd.LookupErr("explain")
+		if ierr != nil {
+			return nil, fmt.Errorf("thermocline: refusing an explain whose command could not be read")
+		}
+		doc, dok := inner.DocumentOK()
+		if !dok {
+			return nil, fmt.Errorf("thermocline: refusing an explain whose command could not be read")
+		}
+		elems, eerr := doc.Elements()
+		if eerr != nil || len(elems) == 0 {
+			return nil, fmt.Errorf("thermocline: refusing an explain whose command could not be read")
+		}
+		innerName := elems[0].Key()
+		if innerName == "explain" {
+			return nil, fmt.Errorf("thermocline: refusing an explain of an explain")
+		}
+		// The inner command carries its own database in $db when the driver
+		// sends one, and otherwise belongs to the database the explain went to.
+		innerDB := db
+		if v, verr := doc.LookupErr("$db"); verr == nil {
+			if s, sok := v.StringValueOK(); sok && s != "" {
+				innerDB = s
+			}
+		}
+		return Needs(innerName, innerDB, doc)
+
 	// Cluster level.
 	case "listDatabases":
 		return []Need{{Cluster: true, Actions: []string{"listDatabases"}}}, nil
@@ -127,6 +174,69 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 
 	return nil, fmt.Errorf("thermocline: refusing %q because it does not know what privilege the command requires, "+
 		"and running it against the fast tier on the router's own connection would skip the check entirely", name)
+}
+
+// InitialSources are the stages that produce their own input, so a pipeline
+// beginning with one never reads the collection it was sent to.
+//
+// Taken from the stages whose LiteParsed reports isInitialSource. Each declares
+// what it needs for itself, which is not find: $indexStats needs indexStats,
+// $planCacheStats needs planCacheRead, $collStats needs collStats.
+var InitialSources = map[string]bool{
+	"$collStats": true, "$indexStats": true, "$planCacheStats": true,
+	"$currentOp": true, "$listSessions": true, "$listLocalSessions": true,
+	"$listCatalog": true, "$shardedDataDistribution": true,
+	"$documents": true, "$changeStream": true, "$queue": true,
+}
+
+// startsWithInitialSource reports whether the pipeline's first stage produces
+// its own input.
+func startsWithInitialSource(cmd bson.Raw) bool {
+	first, ok := firstStageName(cmd)
+	if !ok {
+		// No pipeline, or one this cannot read. An empty pipeline reads the
+		// collection, and an unreadable one is judged as if it did.
+		return false
+	}
+	return InitialSources[first]
+}
+
+// firstStageName returns the name of a pipeline's first stage.
+func firstStageName(cmd bson.Raw) (string, bool) {
+	pv, err := cmd.LookupErr("pipeline")
+	if err != nil {
+		return "", false
+	}
+	arr, ok := pv.ArrayOK()
+	if !ok {
+		return "", false
+	}
+	vals, verr := arr.Values()
+	if verr != nil || len(vals) == 0 {
+		return "", false
+	}
+	doc, dok := vals[0].DocumentOK()
+	if !dok {
+		return "", false
+	}
+	elems, eerr := doc.Elements()
+	if eerr != nil || len(elems) == 0 {
+		return "", false
+	}
+	return elems[0].Key(), true
+}
+
+// bypassing adds the privilege that skipping document validation requires.
+//
+// A command carrying bypassDocumentValidation: true asks the server to write
+// documents its own schema rules would reject, and mongod requires the
+// bypassDocumentValidation action for it. Ignoring the field would let a user
+// who may write a collection write into it what the collection says is invalid.
+func bypassing(cmd bson.Raw, actions ...string) []string {
+	if boolField(cmd, "bypassDocumentValidation") {
+		return append(actions, "bypassDocumentValidation")
+	}
+	return actions
 }
 
 // anyStatementUpserts reports whether any statement in a write command creates

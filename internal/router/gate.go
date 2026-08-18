@@ -48,7 +48,24 @@ func (c *conn) gate(msg *wire.Message, name, db string) (*wire.Message, bool) {
 		return out, true
 	}
 
-	needs, err := authz.Needs(name, db, cmd)
+	// bulkWrite is judged from its own parts, because it names no collection
+	// where authorization would look for one. See bulkWriteNeeds.
+	var needs []authz.Need
+	if name == "bulkWrite" {
+		bn, readable := bulkWriteNeeds(cmd, msg)
+		if !readable {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			out, rerr := c.unauthorized(msg, "the bulkWrite could not be read, so it could not be authorized")
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
+		}
+		needs = bn
+	} else {
+		needs, err = authz.Needs(name, db, cmd)
+	}
 	if err != nil {
 		// Deny by default. See package authz for why an unknown command is
 		// refused rather than guessed at.
@@ -61,6 +78,13 @@ func (c *conn) gate(msg *wire.Message, name, db string) (*wire.Message, bool) {
 			return nil, false
 		}
 		return out, true
+	}
+
+	// An aggregation reaches namespaces its own name does not mention, and
+	// every one of them is a namespace mongod would have judged separately. An
+	// explain of one reaches exactly the same namespaces.
+	if aggCmd, aggDB, isAgg := aggregateCommand(name, db, cmd); isAgg {
+		needs = append(needs, aggregateNeeds(aggCmd, aggDB)...)
 	}
 
 	for _, need := range needs {
