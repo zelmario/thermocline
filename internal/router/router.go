@@ -99,8 +99,13 @@ type Router struct {
 	// nextConnID names connections, which is the identity a cached answer is
 	// keyed by while authentication is proxied.
 	nextConnID atomic.Uint64
-	addr       atomic.Value
-	Stats      Stats
+
+	// watching is whether the cache's change stream is currently open. False
+	// means the cache is back to its learned TTL alone as the bound on a write
+	// this router did not make, which the dashboard says out loud.
+	watching atomic.Bool
+	addr     atomic.Value
+	Stats    Stats
 
 	// Metrics times commands by how they were served, which is what turns the
 	// counters into a picture of what the fast tier is actually saving.

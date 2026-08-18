@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -75,6 +76,20 @@ func cacheableRead(name string, cmd bson.Raw, db string) (ns string, ok bool) {
 			}
 		}
 	}
+	// A read that asks for a secondary is asking for different consistency, and
+	// with terminate_auth on it gets one: the answer may come from a member
+	// behind the primary. Holding that and handing it to a reader who asked for
+	// the primary would give them something staler than they asked for, which
+	// is the one direction a cache must not move a read in.
+	//
+	// The reverse is harmless, and it is not worth the complication of keying by
+	// mode to exploit it: a read asking for a secondary is asking to be cheap,
+	// not to be stale, and an answer from the primary satisfies it. So these are
+	// left out entirely.
+	if mode, ok := readPrefMode(cmd); ok && mode != "primary" {
+		return "", false
+	}
+
 	coll, cok := stringField(cmd, name)
 	if !cok {
 		// A collectionless aggregate has no collection to invalidate on, so
@@ -221,6 +236,16 @@ func (c *conn) cacheInvalidate(name, db string, cmd bson.Raw) {
 		return
 	}
 	for _, ns := range writtenNamespaces(name, db, cmd) {
+		// A whole database, which is what a dropDatabase and an unreadable
+		// target both come back as: forgetting too much costs a lookup and
+		// forgetting too little costs a wrong answer.
+		if strings.HasSuffix(ns, ".*") {
+			if n := c.r.cache.InvalidateDatabase(strings.TrimSuffix(ns, ".*")); n > 0 {
+				c.log.Debug("a command dropped cached answers for a whole database",
+					"db", strings.TrimSuffix(ns, ".*"), "entries", n)
+			}
+			continue
+		}
 		if n := c.r.cache.Invalidate(ns); n > 0 {
 			c.log.Debug("a write dropped cached answers", "ns", ns, "entries", n)
 		}
@@ -275,11 +300,29 @@ func writtenNamespaces(name, db string, cmd bson.Raw) []string {
 			}
 		}
 		return nil
-	case "drop", "create", "renameCollection", "dropDatabase", "collMod", "createIndexes", "dropIndexes":
+	case "renameCollection":
+		// It names both sides in full, as db.collection, because it is run
+		// against admin. Prepending the database again produced
+		// "admin.shop.orders", which is nobody's namespace, so neither side was
+		// dropped. The change stream covers a rename as well, so this was only
+		// ever the hole when that is not running.
+		var out []string
+		if from, ok := stringField(cmd, "renameCollection"); ok {
+			out = append(out, from)
+		}
+		if to, ok := lookupString(cmd, "to"); ok {
+			out = append(out, to)
+		}
+		return out
+	case "drop", "create", "collMod", "createIndexes", "dropIndexes":
 		// DDL changes what a query would answer as surely as a write does.
 		if coll, ok := stringField(cmd, name); ok {
 			return []string{db + "." + coll}
 		}
+		return []string{db + ".*"}
+	case "dropDatabase":
+		// Everything in it, which Invalidate cannot express: the caller expands
+		// this one.
 		return []string{db + ".*"}
 	}
 	return nil

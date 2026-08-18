@@ -48,12 +48,15 @@ type Snapshot struct {
 // they need for that decision are the ones they cannot get by turning it on and
 // hoping.
 type CacheSnapshot struct {
-	Enabled bool          `json:"enabled"`
-	Shapes  int           `json:"shapes"`
-	Hits    uint64        `json:"hits"`
-	Misses  uint64        `json:"misses"`
-	HitRate float64       `json:"hit_rate"`
-	Advice  []CacheAdvice `json:"advice"`
+	Enabled bool `json:"enabled"`
+	// Watching is whether the change stream that drops answers other writers
+	// made stale is open. Without it the learned TTL is the only bound.
+	Watching bool          `json:"watching"`
+	Shapes   int           `json:"shapes"`
+	Hits     uint64        `json:"hits"`
+	Misses   uint64        `json:"misses"`
+	HitRate  float64       `json:"hit_rate"`
+	Advice   []CacheAdvice `json:"advice"`
 }
 
 // CacheAdvice is one row: a query, how often it is asked, how long its answer
@@ -69,7 +72,7 @@ type CacheAdvice struct {
 
 // cacheSnapshot reads what the cache and the advisor know.
 func (r *Router) cacheSnapshot() CacheSnapshot {
-	out := CacheSnapshot{Enabled: r.cache != nil}
+	out := CacheSnapshot{Enabled: r.cache != nil, Watching: r.watching.Load()}
 	if r.cache != nil {
 		out.Hits, out.Misses = r.cache.Counters()
 		if total := out.Hits + out.Misses; total > 0 {

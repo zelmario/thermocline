@@ -107,11 +107,19 @@ echo "== a fallback read waits for mirroring, not for a checkpoint =="
 # position was the durable checkpoint, a fallback read paid a whole
 # checkpoint_every even with the feeder perfectly caught up: 1.14 s at 1s, and
 # 4.53 s at the shipped default of 5s, against 1.8 ms for the query itself.
-START_MS=$(date +%s%3N)
-GOT=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
-READ_MS=$(( $(date +%s%3N) - START_MS ))
+# Timed inside the shell rather than around it. Timing the whole mongosh
+# invocation adds its startup and connection to the number, which is a few
+# hundred milliseconds of noise on a busy machine and has nothing to do with the
+# barrier being measured: it failed at 957 ms on a host that was running a full
+# regression at the time, with the read itself well inside the budget.
+TIMED=$(R "const t=Date.now();
+           const n=db.getSiblingDB('shop').$NS.countDocuments({});
+           print(n + ' ' + (Date.now()-t));")
+GOT=${TIMED%% *}
+READ_MS=${TIMED##* }
 chk "the fallback read is still correct"      "10"   "$GOT"
-chk "and it took well under a second"         "true" "$([ "$READ_MS" -lt 700 ] && echo true || echo false)"
+echo "      the fallback read itself took ${READ_MS} ms"
+chk "and it took well under a second"         "true" "$([ "${READ_MS:-9999}" -lt 700 ] && echo true || echo false)"
 echo "      (fallback read took ${READ_MS} ms)"
 
 echo "== the position moves while the checkpoint stands still =="

@@ -41,20 +41,38 @@ const invalidationBackoff = 2 * time.Second
 
 // watchForInvalidation keeps the cache honest about writes this router did not
 // make.
+//
+// When it cannot run, the cache is not wrong, it is weaker: back to the learned
+// TTL as the only bound on somebody else's write. That has to be visible rather
+// than assumed, because an operator who turned this on believes they have the
+// stronger promise. The first failure is an ERROR, the dashboard says whether it
+// is watching, and it keeps trying.
 func (r *Router) watchForInvalidation(ctx context.Context) {
 	if r.cache == nil {
 		return
 	}
 	r.log.Info("watching the fast tier for changes the cache has to hear about",
 		"why", "a write by anybody else drops the answers it would have made stale")
+	first := true
 	for ctx.Err() == nil {
-		if err := r.followChanges(ctx); err != nil && ctx.Err() == nil {
+		err := r.followChanges(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		r.watching.Store(false)
+		if first {
+			r.log.Error("the cache cannot watch the fast tier for changes, so it is back to the "+
+				"learned TTL alone as the bound on a write this router did not make",
+				"err", err, "remedy", "this router's own account needs to open a change stream, "+
+					"or set router.cache.enabled to false")
+			first = false
+		} else {
 			r.log.Warn("the cache's change stream ended, reopening", "err", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(invalidationBackoff):
-			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(invalidationBackoff):
 		}
 	}
 }
@@ -74,6 +92,7 @@ func (r *Router) followChanges(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = cs.Close(context.WithoutCancel(ctx)) }()
+	r.watching.Store(true)
 
 	for cs.Next(ctx) {
 		var ev struct {

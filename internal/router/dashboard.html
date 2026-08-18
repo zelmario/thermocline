@@ -662,9 +662,12 @@ function drawCache(s) {
   if (c.enabled) {
     const total = (c.hits || 0) + (c.misses || 0);
     const pct = total ? (100 * (c.hits || 0) / total).toFixed(1) : "0.0";
+    const watch = c.watching
+      ? "following the fast tier's changes"
+      : "<b style='color:var(--s5,#c0392b)'>not following changes: TTL only</b>";
     state.innerHTML = "Cache <b>on</b> · " + fmt(c.hits || 0) + " served, " +
       fmt(c.misses || 0) + " asked through · <b>" + pct + "%</b> · watching " +
-      fmt(c.shapes || 0) + " query shapes";
+      fmt(c.shapes || 0) + " query shapes · " + watch;
   } else {
     state.innerHTML = "Cache <b>off</b>, measuring only · watching " + fmt(c.shapes || 0) +
       " query shapes · set <code>router.cache.enabled</code> to serve these from memory";
