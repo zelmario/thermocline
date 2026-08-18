@@ -103,6 +103,9 @@ type RouterConfig struct {
 	// TLS is the certificate clients connect with, empty for a plaintext
 	// listener.
 	TLS TLSConfig `yaml:"tls"`
+	// Cache holds query results for as long as they have been observed to stay
+	// the same. Off unless enabled.
+	Cache CacheConfig `yaml:"cache"`
 	// HotTLS says the fast tier requires TLS, taken from hot.uri at load time.
 	// The driver reads that option for its own connections; the router also
 	// proxies raw bytes over a connection it opens itself, and that one has to
@@ -317,6 +320,14 @@ func Default() Config {
 			Residency:    Duration(30 * 24 * time.Hour),
 			ArchiveWait:  Duration(5 * time.Second),
 			FeederID:     "default",
+			Cache: CacheConfig{
+				// Off. The bounds apply when it is turned on: a thousand
+				// queries is a large working set for one router, and a minute
+				// is short enough that a writer this router cannot see is
+				// never far ahead of it.
+				MaxQueries: 1000,
+				MaxTTL:     Duration(time.Minute),
+			},
 		},
 	}
 }
@@ -502,6 +513,23 @@ func samePort(a, b string) bool {
 // will use to hold the upstream connection when it terminates authentication.
 // Configuring them twice is a way for the two to drift apart, and the failure
 // when they do is a login that works everywhere except through the proxy.
+// CacheConfig is the learned-TTL query cache.
+//
+// Nothing here is a TTL. The point of the feature is that the router works out
+// how long each query's result stays the same and caches it for a little less
+// than that, so the only numbers configured are the bounds: how many queries to
+// watch, and the longest any answer may be held however stable it has looked.
+type CacheConfig struct {
+	// Enabled turns the cache on. Off by default, because a cache is the one
+	// thing in this system that can answer without asking.
+	Enabled bool `yaml:"enabled"`
+	// MaxQueries bounds how many distinct queries are watched at once.
+	MaxQueries int `yaml:"max_queries"`
+	// MaxTTL is the ceiling on a learned TTL. A query that has not changed
+	// since the router started is not proof that it never will.
+	MaxTTL Duration `yaml:"max_ttl"`
+}
+
 // TLSConfig is the certificate a router presents to its clients, and what it
 // asks of theirs.
 //

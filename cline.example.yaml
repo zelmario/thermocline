@@ -188,6 +188,23 @@ router:
   #
   # dashboard: "127.0.0.1:27101"
 
+  # The learned cache.
+  #
+  # The router records the shape of every read, a hash of its parameters and a
+  # hash of its result, and works out how long each query's answer stays the
+  # same. `cline cache` prints what it found and what TTL that justifies, ten
+  # per cent inside the observed stability. That measuring always happens; this
+  # switch is only about whether the answers are then served from memory.
+  #
+  # Turn it on against the report rather than in hope. A write through the
+  # router drops what it learned about that collection, so the writer never
+  # reads its own stale answer; a writer that does not come through the router
+  # is bounded by the learned TTL and by max_ttl.
+  # cache:
+  #   enabled: false
+  #   max_queries: 1000
+  #   max_ttl: 1m
+
   # TLS for the clients that connect here.
   #
   # This takes over an address the application already dials, so whatever that

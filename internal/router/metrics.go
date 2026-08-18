@@ -43,11 +43,16 @@ const (
 	// ClassAdmin is handshake and housekeeping traffic. Counted separately so
 	// it cannot flatter the latency of real work.
 	ClassAdmin
+	// ClassCached is a read answered from the learned cache, without asking
+	// either tier. Separate from ClassFast because a cache that is working
+	// makes the fast tier look faster than it is, which is exactly the number
+	// somebody sizing the fast tier must not be given.
+	ClassCached
 	numClasses
 )
 
 // ClassNames are the labels the dashboard shows, in the order it shows them.
-var ClassNames = [numClasses]string{"fast", "archive", "miss", "txn_warm", "refused", "admin"}
+var ClassNames = [numClasses]string{"fast", "archive", "miss", "txn_warm", "refused", "admin", "cached"}
 
 // bucketsMS are latency histogram edges in milliseconds. They are logarithmic
 // because the two cases this has to separate are three orders of magnitude

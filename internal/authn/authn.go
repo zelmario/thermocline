@@ -62,10 +62,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xdg-go/scram"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"github.com/xdg-go/scram"
 )
 
 // Mechanisms the router can terminate, strongest first. SCRAM-SHA-1 is still

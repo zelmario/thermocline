@@ -777,6 +777,71 @@ scrape_configs:
       - targets: ["router-1.internal:27101"]
 ```
 
+## Which queries are worth caching
+
+The router sees every read and every answer, which is what a cache advisor
+needs. For each read it records three things: the **shape** of the query, a hash
+of its **parameters**, and a hash of the **result**. Nothing of the query's own
+data is kept, only hashes.
+
+    db.users.countDocuments({country: "UY"})
+    db.users.countDocuments({country: "AR"})
+
+is one shape asked twice, not two queries, and the split is what makes the
+question answerable. From it the router works out, in this order:
+
+1. Which shapes are asked repeatedly at all. A query asked once is not a
+   candidate however stable its answer is.
+2. Among those, which parameters repeat. A shape asked a thousand times with a
+   thousand different values has no repetition to exploit, and saying so is a
+   finding.
+3. For those, how long the same result kept coming back for the same
+   parameters.
+4. A suggested TTL, ten per cent inside that, so the suggestion is always
+   within the evidence for it.
+
+`cline cache` prints it, most valuable first, ranked by how often a query is
+asked weighted by how long each answer would survive:
+
+    SUGGEST   STABLE    ASKED   VALUES QUERY
+    4m30s     5m0s      312     3      count shop.users query={country:?}
+    1.4s      1.6s      880     47     find shop.orders filter={customer:?} sort={at:?}
+
+A count that returned 3,512,345 for five minutes, then 3,512,344 for fifteen,
+then 3,512,346 for ten is stable for five and suggested at four and a half: the
+shortest stretch decides, because a query that usually holds for an hour and
+sometimes for a second is a query that changes every second as far as anybody
+reading it is concerned.
+
+**The measuring runs whether or not the caching does.** The advice is the reason
+to turn caching on, so it cannot require caching to be on already. With
+`router.cache.enabled` the same measurements drive the TTLs.
+
+### What the cache will not do
+
+A cache is the one thing here that can answer without asking, so what it refuses
+matters more than what it serves. Never cached: anything inside a transaction,
+because a transaction reads a snapshot and an answer from before it began is not
+in that snapshot; a read concern naming a cluster time, or asking for snapshot or
+linearizable, because those are promises about a position in an oplog or a
+confirmation from a primary; and a reply that leaves a cursor open, because half
+an answer is not an answer.
+
+**A write through the router drops what was learned about that collection**,
+rather than waiting out a timer. That is what makes this correct for the writer
+rather than merely fast: the ordinary pattern of writing and then reading the
+same collection is right immediately. What the router cannot see is another
+writer, and the learned TTL is the whole of that exposure, bounded again by
+`max_ttl`.
+
+**The key carries who is asking**, or one client would be served another's
+documents, which is a bypass this system has had once already. With
+`terminate_auth` on that is the verified user, and answers are shared between
+that user's connections. With authentication proxied the router does not know
+who the client is, so the connection is the identity: the cache then helps an
+application that repeats itself on a connection, which is what a pooled driver
+does, and never one client with another's answer.
+
 ## The completeness watermark
 
 Traffic alone fills the fast tier sparsely, one document at a time. That serves

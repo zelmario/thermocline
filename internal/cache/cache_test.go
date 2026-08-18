@@ -1,0 +1,170 @@
+package cache
+
+import (
+	"testing"
+	"time"
+)
+
+// clock lets a test move time the way the cache experiences it, since every
+// decision here is about how long something held still.
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time      { return c.t }
+func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
+
+func newTestCache(max int, maxTTL time.Duration) (*Cache, *clock) {
+	c := New(max, maxTTL)
+	k := &clock{t: time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)}
+	c.now = k.now
+	return c, k
+}
+
+// A query seen once has no evidence behind it, and evidence is the whole idea.
+func TestNothingIsCachedWithoutEvidence(t *testing.T) {
+	c, _ := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("3512345"))
+	if _, ok := c.Get("q"); ok {
+		t.Fatal("a query seen once was cached")
+	}
+	if ttl := c.TTLOf("q"); ttl != 0 {
+		t.Fatalf("ttl = %s, want 0", ttl)
+	}
+}
+
+// A query whose answer never changes is the one a cache exists for, and the
+// first version of this never cached it: it learned only from changes. How long
+// the answer in hand has already held is evidence too.
+func TestAnAnswerThatNeverChangesIsStillLearned(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("3512345"))
+	k.add(10 * time.Minute)
+	c.Observe("q", "shop.orders", []byte("3512345"))
+
+	if got, want := c.TTLOf("q"), 9*time.Minute; got != want {
+		t.Fatalf("ttl = %s, want %s", got, want)
+	}
+	if _, ok := c.Get("q"); !ok {
+		t.Error("an answer that had held for ten minutes was not cached")
+	}
+}
+
+// And a change still counts against it, even a much later one.
+func TestAShortLifeLowersATTLLearnedFromALongOne(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	k.add(time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	if c.TTLOf("q") != 54*time.Minute {
+		t.Fatalf("ttl = %s, want 54m", c.TTLOf("q"))
+	}
+	// It changes, then changes again a second later.
+	c.Observe("q", "shop.orders", []byte("b"))
+	k.add(time.Second)
+	c.Observe("q", "shop.orders", []byte("c"))
+	if got := c.TTLOf("q"); got > time.Second {
+		t.Fatalf("ttl = %s, want no more than the second it held", got)
+	}
+}
+
+// The worked example: a count that holds for five minutes should be cached for
+// four and a half.
+func TestTTLIsNineTenthsOfWhatWasObserved(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("3512345"))
+	k.add(5 * time.Minute)
+	c.Observe("q", "shop.orders", []byte("3512345"))
+	// It changed, so five minutes of stability is now evidence.
+	c.Observe("q", "shop.orders", []byte("3512344"))
+
+	if got, want := c.TTLOf("q"), 4*time.Minute+30*time.Second; got != want {
+		t.Fatalf("ttl = %s, want %s", got, want)
+	}
+	reply, ok := c.Get("q")
+	if !ok || string(reply) != "3512344" {
+		t.Fatalf("cached = %q, %v", reply, ok)
+	}
+	k.add(4 * time.Minute)
+	if _, ok := c.Get("q"); !ok {
+		t.Error("the entry expired before its learned ttl")
+	}
+	k.add(time.Minute)
+	if _, ok := c.Get("q"); ok {
+		t.Error("the entry outlived its learned ttl")
+	}
+}
+
+// A query that usually holds for an hour and sometimes for a second is a query
+// that changes every second, as far as anybody reading it is concerned.
+func TestTheShortestObservationWins(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	k.add(time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	c.Observe("q", "shop.orders", []byte("b"))
+	k.add(2 * time.Second)
+	c.Observe("q", "shop.orders", []byte("b"))
+	c.Observe("q", "shop.orders", []byte("c"))
+
+	if got, want := c.TTLOf("q"), 1800*time.Millisecond; got != want {
+		t.Fatalf("ttl = %s, want %s", got, want)
+	}
+}
+
+// A ceiling, because a query that has not changed since the router started is
+// not proof that it never will.
+func TestTheCeilingApplies(t *testing.T) {
+	c, k := newTestCache(10, time.Minute)
+	c.Observe("q", "shop.orders", []byte("a"))
+	k.add(10 * time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	c.Observe("q", "shop.orders", []byte("b"))
+	if got := c.TTLOf("q"); got != time.Minute {
+		t.Fatalf("ttl = %s, want the ceiling of 1m", got)
+	}
+}
+
+// A write through the router is not a timer running out, it is the answer
+// becoming wrong. The entry goes immediately, and so does what was learned:
+// stability measured before a write says nothing about after it.
+func TestAWriteDropsTheAnswerAndTheEvidence(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	c.Observe("q", "shop.orders", []byte("a"))
+	k.add(5 * time.Minute)
+	c.Observe("q", "shop.orders", []byte("a"))
+	c.Observe("q", "shop.orders", []byte("b"))
+	if _, ok := c.Get("q"); !ok {
+		t.Fatal("nothing was cached to invalidate")
+	}
+
+	if n := c.Invalidate("shop.orders"); n != 1 {
+		t.Errorf("invalidated %d entries, want 1", n)
+	}
+	if _, ok := c.Get("q"); ok {
+		t.Error("the answer survived a write to its collection")
+	}
+	if ttl := c.TTLOf("q"); ttl != 0 {
+		t.Errorf("the learned ttl survived a write: %s", ttl)
+	}
+	// And a write to somebody else's collection leaves it alone.
+	c.Observe("q2", "shop.other", []byte("x"))
+	k.add(time.Minute)
+	c.Observe("q2", "shop.other", []byte("x"))
+	c.Observe("q2", "shop.other", []byte("y"))
+	c.Invalidate("shop.orders")
+	if _, ok := c.Get("q2"); !ok {
+		t.Error("a write to one collection dropped another's answer")
+	}
+}
+
+// Bounded, because a router serving ten thousand distinct queries must not hold
+// ten thousand answers.
+func TestItStaysWithinItsBound(t *testing.T) {
+	c, k := newTestCache(3, time.Hour)
+	for _, q := range []string{"a", "b", "c", "d", "e"} {
+		c.Observe(q, "shop.orders", []byte(q))
+		k.add(time.Second)
+	}
+	if got := c.Len(); got > 3 {
+		t.Fatalf("holding %d queries, want at most 3", got)
+	}
+}

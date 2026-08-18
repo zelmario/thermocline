@@ -318,7 +318,7 @@ func (c *conn) serveOwnCursors(ctx context.Context, msg *wire.Message, name stri
 		if err != nil {
 			return false, nil
 		}
-		return true, wire.Write(c.client, out)
+		return true, c.send(out)
 	}
 
 	reply, mine, err := c.archiveGetMore(ctx, msg, cmd)
@@ -332,9 +332,9 @@ func (c *conn) serveOwnCursors(ctx context.Context, msg *wire.Message, name stri
 		if ferr != nil {
 			return true, ferr
 		}
-		return true, wire.Write(c.client, fail)
+		return true, c.send(fail)
 	}
-	return true, wire.Write(c.client, reply)
+	return true, c.send(reply)
 }
 
 // archiveGetMore serves the next batch of a cursor this router owns. The second

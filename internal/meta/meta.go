@@ -87,6 +87,12 @@ const (
 	// see.
 	DaemonStats = "daemonstats"
 
+	// CacheAdvice is where the router publishes what it has learned about which
+	// queries would be worth caching. It lives on the cold tier like every
+	// other piece of bookkeeping, so `cline cache` can read it without needing
+	// to reach the router itself.
+	CacheAdvice = "cacheadvice"
+
 	// Watermarks records how far back the fast tier is known to be complete,
 	// one per namespace. This is what lets a range query be answered from the
 	// fast tier alone rather than falling through to the archive.
@@ -265,4 +271,68 @@ func EvictionPaused(ctx context.Context, cold *mongo.Client) (PauseRecord, bool,
 type ActiveMarker struct {
 	ID   string    `bson:"_id"`
 	Seen time.Time `bson:"seen"`
+}
+
+// CacheSuggestion is one row of what the router learned about a query: how
+// often it is asked, how long its answer stays the same, and what TTL that
+// justifies.
+//
+// Published rather than only logged, because the question it answers ("what
+// would caching be worth here") is one an operator asks days after the traffic
+// happened.
+type CacheSuggestion struct {
+	Shape      string        `bson:"shape"`
+	NS         string        `bson:"ns"`
+	Executions uint64        `bson:"executions"`
+	Repeats    uint64        `bson:"repeats"`
+	Params     int           `bson:"params"`
+	Changes    uint64        `bson:"changes"`
+	StableMS   int64         `bson:"stableMs"`
+	SuggestMS  int64         `bson:"suggestMs"`
+	Stable     time.Duration `bson:"-"`
+	Suggested  time.Duration `bson:"-"`
+}
+
+// CacheAdviceReport is one router's whole answer, replaced each time it
+// publishes.
+type CacheAdviceReport struct {
+	ID          string            `bson:"_id"`
+	At          time.Time         `bson:"at"`
+	Shapes      int               `bson:"shapes"`
+	Hits        uint64            `bson:"hits"`
+	Misses      uint64            `bson:"misses"`
+	Enabled     bool              `bson:"enabled"`
+	Suggestions []CacheSuggestion `bson:"suggestions"`
+}
+
+// PublishCacheAdvice records what one router has learned.
+func PublishCacheAdvice(ctx context.Context, cold *mongo.Client, rep CacheAdviceReport) error {
+	rep.At = time.Now().UTC()
+	for i := range rep.Suggestions {
+		rep.Suggestions[i].StableMS = rep.Suggestions[i].Stable.Milliseconds()
+		rep.Suggestions[i].SuggestMS = rep.Suggestions[i].Suggested.Milliseconds()
+	}
+	_, err := cold.Database(DB).Collection(CacheAdvice).ReplaceOne(ctx,
+		bson.D{{Key: "_id", Value: rep.ID}}, rep, options.Replace().SetUpsert(true))
+	return err
+}
+
+// ReadCacheAdvice returns what every router has published.
+func ReadCacheAdvice(ctx context.Context, cold *mongo.Client) ([]CacheAdviceReport, error) {
+	cur, err := cold.Database(DB).Collection(CacheAdvice).Find(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	var out []CacheAdviceReport
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		for j := range out[i].Suggestions {
+			out[i].Suggestions[j].Stable = time.Duration(out[i].Suggestions[j].StableMS) * time.Millisecond
+			out[i].Suggestions[j].Suggested = time.Duration(out[i].Suggestions[j].SuggestMS) * time.Millisecond
+		}
+	}
+	return out, nil
 }

@@ -39,6 +39,7 @@ Or one at a time:
     docker exec <node> bash /root/testupsert.sh    # an upsert whose document lives only in the archive
     docker exec <node> bash /root/testsingle.sh    # single-document writes filtered on any other field
     docker exec <node> bash /root/testunack.sh     # writes that ask for no acknowledgement
+    docker exec <node> bash /root/testcache.sh    # the learned cache, and the advice it gives
     docker exec <node> bash /root/testconform.sh   # differential: the same answer MongoDB would give
     docker exec <node> bash /root/testauthterm.sh  # the router authenticating clients itself
     docker exec <node> bash /root/testreadprefterm.sh # reads landing on the node that was asked for

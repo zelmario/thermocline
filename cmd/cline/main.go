@@ -42,6 +42,7 @@ Usage:
   cline watermark --config FILE [--ns NS] [--clear | --complete-all | --complete-from T]
                                           show or edit what the fast tier claims to hold
   cline indexes  --config FILE [--ns NS]
+  cline cache    --config FILE [--top N] [--ns NS]
                                           compare both tiers' indexes, so a
                                           read that falls through is not left
                                           scanning the archive
@@ -93,6 +94,8 @@ func run() error {
 		return runPause(os.Args[2:], false)
 	case "indexes":
 		return runIndexes(os.Args[2:])
+	case "cache":
+		return runCache(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil

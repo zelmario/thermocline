@@ -26,6 +26,7 @@ import (
 
 	"github.com/zelmario/thermocline/internal/authn"
 	"github.com/zelmario/thermocline/internal/authz"
+	"github.com/zelmario/thermocline/internal/cache"
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/watermark"
@@ -84,8 +85,22 @@ type Router struct {
 	// housekeeping filtered out of them.
 	changeStreams changeStreamRegistry
 	cursors       cursorRegistry
-	addr          atomic.Value
-	Stats         Stats
+
+	// cache holds answers for as long as each query has been observed to keep
+	// giving the same one. Nil unless router.cache.enabled. See querycache.go.
+	cache *cache.Cache
+
+	// advisor watches every read and works out which queries would be worth
+	// caching and for how long. It runs whether or not the cache does, because
+	// the recommendation is what a decision to turn caching on should be made
+	// from. See package cache.
+	advisor *cache.Advisor
+
+	// nextConnID names connections, which is the identity a cached answer is
+	// keyed by while authentication is proxied.
+	nextConnID atomic.Uint64
+	addr       atomic.Value
+	Stats      Stats
 
 	// Metrics times commands by how they were served, which is what turns the
 	// counters into a picture of what the fast tier is actually saving.
@@ -162,7 +177,32 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 }
 
 // Listen serves until ctx is cancelled.
+// enableCache builds the query cache when the configuration asks for one.
+func (r *Router) enableCache() {
+	// The advisor always runs. It answers "what would caching be worth here",
+	// which is a question worth having an answer to before anybody turns the
+	// cache on, and it costs a hash and a map entry per read.
+	r.advisor = cache.NewAdvisor(r.cfg.Cache.MaxQueries, maxParamsPerShape, r.cfg.Cache.MaxTTL.D())
+
+	if !r.cfg.Cache.Enabled {
+		r.log.Info("query cache off, still measuring",
+			"note", "run `cline cache` to see which queries would be worth caching and for how long")
+		return
+	}
+	r.cache = cache.New(r.cfg.Cache.MaxQueries, r.cfg.Cache.MaxTTL.D())
+	r.log.Info("query cache on",
+		"max_queries", r.cfg.Cache.MaxQueries,
+		"max_ttl", r.cfg.Cache.MaxTTL.D(),
+		"note", "each query is cached for a little less than it has been observed to stay the same")
+}
+
+// maxParamsPerShape bounds how many distinct parameter sets are remembered for
+// one query shape. A shape asked with more than this many different values has
+// little repetition to exploit, and saying so is the finding.
+const maxParamsPerShape = 200
+
 func (r *Router) Listen(ctx context.Context) error {
+	r.enableCache()
 	if err := r.refreshPrimary(ctx); err != nil {
 		return err
 	}
@@ -198,6 +238,7 @@ func (r *Router) Listen(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 	go r.reapCursors(ctx)
+	go r.reportAdvice(ctx)
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),
@@ -279,6 +320,7 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		client:   client,
 		upstream: upstream,
 		log:      r.log,
+		id:       r.nextConnID.Add(1),
 	}
 	// A borrowed connection goes back when the client goes away, and one still
 	// holding an open transaction is closed rather than reused: the transaction
@@ -324,6 +366,14 @@ type conn struct {
 	// perform. The archive follows it once the fast tier has said yes, so its
 	// own authorization decides whether it happens at all. See ddl.go.
 	rename *pendingRename
+
+	// id identifies this connection, which is the identity a cached answer is
+	// keyed by while authentication is proxied and the user is unknown here.
+	id uint64
+
+	// cacheOf is the key the read in flight will be learned under, set when the
+	// cache decided the command was one it could hold. See querycache.go.
+	cacheOf cachePending
 
 	// auth is the SCRAM conversation in progress, and grants what the finished
 	// one established. grants being nil is what "not authenticated" means, and
@@ -394,7 +444,7 @@ func (c *conn) pump(ctx context.Context) error {
 					"so none of its tiering guards could run for it. The handshake does not agree a "+
 					"compressor for exactly this reason; remove compressors from the connection string.")
 			if cerr == nil {
-				_ = wire.Write(c.client, out)
+				_ = c.send(out)
 			}
 			return fmt.Errorf("compressed message on a connection that never negotiated one")
 		}
@@ -436,7 +486,7 @@ func (c *conn) answer(msg, out *wire.Message) error {
 	if msg.MoreToCome() {
 		return nil
 	}
-	return wire.Write(c.client, out)
+	return c.send(out)
 }
 
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
@@ -462,7 +512,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// connection can only carry one. See answerHello.
 	if c.r.cfg.TerminateAuth && nameErr == nil && isHello(name) && !msg.MoreToCome() {
 		if out, done := c.answerHello(ctx, msg); done {
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 	}
 
@@ -475,7 +525,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			if serr != nil {
 				return serr
 			}
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 		if out, denied := c.gate(msg, name, db); denied {
 			// An unacknowledged write carries moreToCome: the client is not
@@ -493,7 +543,25 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 					"command", name, "db", db, "user", user)
 				return nil
 			}
-			return wire.Write(c.client, out)
+			return c.send(out)
+		}
+	}
+
+	// A cached answer is the whole answer, so it is served before any guard
+	// runs: deciding completeness for it would be deciding about a read that is
+	// not happening. Authorization has already run above, and the key carries
+	// who is asking. See querycache.go.
+	if nameErr == nil && !msg.MoreToCome() {
+		if out, hit := c.cacheLookup(msg, name, db); hit {
+			return c.send(out)
+		}
+	}
+
+	// A write drops what was learned about the collection it changed, which is
+	// what makes this cache correct for the writer rather than merely fast.
+	if nameErr == nil {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			c.cacheInvalidate(name, db, cmd)
 		}
 	}
 
@@ -534,12 +602,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// decides what to do by looking at what it can see there. See
 			// mergetarget.go.
 			if out, done := c.guardMergeTarget(ctx, msg, cmd, db); done {
-				return wire.Write(c.client, out)
+				return c.send(out)
 			}
 		}
 		if !explainOnly {
 			if out, done := c.guardAggregate(ctx, msg, db); done {
-				return wire.Write(c.client, out)
+				return c.send(out)
 			}
 		}
 	}
@@ -550,7 +618,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if nameErr == nil && !msg.MoreToCome() &&
 		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 	}
 
@@ -558,7 +626,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// the same completeness check.
 	if nameErr == nil && (name == "count" || name == "distinct") && !msg.MoreToCome() {
 		if out, done := c.guardSimpleRead(ctx, msg, db, name); done {
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 	}
 
@@ -748,7 +816,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 	if nameErr != nil {
-		return wire.Write(c.client, reply)
+		return c.send(reply)
 	}
 
 	// An insert the fast tier rejected never happened, so its key claims have
@@ -787,7 +855,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	}
 	if name == "getMore" {
 		if out, filtered := c.filterChangeStream(ctx, msg, reply); filtered {
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 	}
 	if name == "killCursors" {
@@ -808,7 +876,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 	if name == "explain" || (name == "aggregate" && inlineExplainOf(msg)) {
 		if out, done := c.annotateExplain(ctx, msg, db, reply); done {
-			return wire.Write(c.client, out)
+			return c.send(out)
 		}
 	}
 
@@ -816,7 +884,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if err != nil {
 		c.log.Warn("routing failed, returning the fast tier's answer",
 			"command", name, "err", err)
-		return wire.Write(c.client, reply)
+		return c.send(reply)
 	}
 
 	// Inside a transaction the unique key guard runs here, on what the write
@@ -824,20 +892,23 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// visible outside the transaction yet, so a duplicate can still be refused
 	// by aborting it.
 	if out, done := c.verifyTxnKeys(ctx, msg, rewritten, name); done {
-		return wire.Write(c.client, out)
+		return c.send(out)
 	}
-	return wire.Write(c.client, rewritten)
+	// What the client is actually given is what is learned from, whichever tier
+	// it came from and whatever was rewritten on the way.
+	c.cacheStore(rewritten)
+	return c.send(rewritten)
 }
 
 // replyHello rewrites the handshake so the driver stays with this proxy.
 func (c *conn) replyHello(msg, reply *wire.Message) error {
 	doc, err := reply.ReplyDoc()
 	if err != nil {
-		return wire.Write(c.client, reply)
+		return c.send(reply)
 	}
 	out, err := mongosIdentity(doc)
 	if err != nil {
-		return wire.Write(c.client, reply)
+		return c.send(reply)
 	}
 	// A driver that embedded a saslStart in hello gets no speculative result
 	// back, so it falls back to an explicit conversation, which is the one this
@@ -856,9 +927,9 @@ func (c *conn) replyHello(msg, reply *wire.Message) error {
 		rewritten, err = wire.NewMsg(reply.Header.RequestID, msg.Header.RequestID, out)
 	}
 	if err != nil {
-		return wire.Write(c.client, reply)
+		return c.send(reply)
 	}
-	return wire.Write(c.client, rewritten)
+	return c.send(rewritten)
 }
 
 // currentPrimary returns the fast tier address raw connections use.
