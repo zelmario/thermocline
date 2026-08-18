@@ -80,13 +80,19 @@ chk "the router owns this cursor"          "true"     "$(awk -v id="$CID" 'BEGIN
 # A second mongosh is a second connection and a second session, which is exactly
 # what mongod refuses: "for cursors created inside a session, you cannot call
 # getMore outside the session".
-STEAL=$(R "const r=db.getSiblingDB('shop').runCommand({getMore:NumberLong('$CID'),collection:'tprobe'}); print(r.ok===1?'READ '+r.cursor.nextBatch.length:r.code+' '+r.codeName)")
+# mongosh throws on ok:0 rather than returning the reply, so the code has to be
+# read off the exception. A check written without this catch can never pass, and
+# reads as the product failing.
+STEAL=$(R "try{ const r=db.getSiblingDB('shop').runCommand({getMore:NumberLong('$CID'),collection:'tprobe'});
+             print(r.ok===1?'READ '+r.cursor.nextBatch.length:r.code+' '+r.codeName) }
+           catch(e){ print(e.code+' '+e.codeName) }")
 chk "another session cannot read it"       "13 Unauthorized" "$STEAL"
 # And the collection has to be the cursor's. mongod has refused a mismatch since
 # at least 6.0, measured.
 WRONGNS=$(R "const r=db.getSiblingDB('shop').runCommand({find:'tprobe',filter:{},batchSize:2});
-             const g=db.getSiblingDB('shop').runCommand({getMore:r.cursor.id,collection:'tprobeXX'});
-             print(g.ok===1?'READ':g.code+' '+g.codeName)")
+             try{ const g=db.getSiblingDB('shop').runCommand({getMore:r.cursor.id,collection:'tprobeXX'});
+                  print(g.ok===1?'READ':g.code+' '+g.codeName) }
+             catch(e){ print(e.code+' '+e.codeName) }")
 chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
 # The control: one client, one session, its own cursor, paged to the end. This is
 # the case the three checks above must not have broken.
@@ -94,7 +100,8 @@ OWN=$(R "let n=0; const db2=db.getSiblingDB('shop');
          let r=db2.runCommand({find:'tprobe',filter:{},batchSize:2});
          n+=r.cursor.firstBatch.length;
          let id=r.cursor.id;
-         while(id.toString()!=='0'){ const g=db2.runCommand({getMore:id,collection:'tprobe',batchSize:2});
+         while(id.toString()!=='0'){ let g;
+           try{ g=db2.runCommand({getMore:id,collection:'tprobe',batchSize:2}) }catch(e){ n=-1; break }
            if(g.ok!==1){ n=-1; break } n+=g.cursor.nextBatch.length; id=g.cursor.id }
          print(n)")
 chk "its own session pages to the end"     "$LIVE" "$OWN"
