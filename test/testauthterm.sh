@@ -197,6 +197,16 @@ chk "a forbidden bulkWrite matches mongod"          "$(denied "$(HOTAS narrow na
     "$(denied "$(AS narrow narrowpass "$BWSEC")")"
 chk "and it wrote nothing there"                    "0" \
     "$(H 'print(db.getSiblingDB("shop").tazsecret.countDocuments({_id:901}))')"
+echo "== renaming, which mongod judges by the database =="
+# A same-database rename needs renameCollectionSameDB on the database, which
+# readWrite carries and read does not. Across databases mongod wants privileges
+# on both sides that this does not know how to check, so that stays refused by
+# name rather than guessed at.
+chk "a read only user cannot rename"                "DENIED"     "$(denied "$(AS limited limpass 'db.adminCommand({renameCollection:"shop.tazopen",to:"shop.tazmoved"}); print("RENAMED")')")"
+chk "a readWrite user can"                          "RENAMED"     "$(denied "$(AS writer writepass 'db.adminCommand({renameCollection:"shop.tazopen",to:"shop.tazmoved"}); print("RENAMED")')")"
+H 'db.adminCommand({renameCollection:"shop.tazmoved",to:"shop.tazopen"})' >/dev/null 2>&1
+chk "a rename across databases is refused by name"  "REFUSED"     "$(refused "$(AS dba secret 'db.adminCommand({renameCollection:"shop.tazopen",to:"payroll.tazopen"}); print("RENAMED")')")"
+
 echo "== a write that asks for no acknowledgement is still a write =="
 # An unacknowledged write, w:0, is sent with the wire protocol's moreToCome flag
 # and the client never waits for an answer. There is therefore nowhere to put a

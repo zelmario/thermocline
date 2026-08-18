@@ -2,6 +2,7 @@ package authz
 
 import (
 	"fmt"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -122,6 +123,24 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 		return []Need{{DB: db, Coll: coll(), Actions: []string{"dropIndex"}}}, nil
 	case "listIndexes":
 		return []Need{{DB: db, Coll: coll(), Actions: []string{"listIndexes"}}}, nil
+	case "renameCollection":
+		// mongod asks for renameCollectionSameDB on the database when both
+		// names are in it. A rename across databases needs a compound set on
+		// both sides, and this does not know how to judge that, so it stays
+		// refused by name rather than guessed at.
+		from, fok := stringField(cmd, "renameCollection")
+		to, tok := stringField(cmd, "to")
+		if !fok || !tok {
+			return nil, fmt.Errorf("thermocline: refusing a renameCollection whose names could not be read")
+		}
+		fromDB, _, _ := strings.Cut(from, ".")
+		toDB, _, _ := strings.Cut(to, ".")
+		if fromDB == "" || fromDB != toDB {
+			return nil, fmt.Errorf("thermocline: refusing to judge a renameCollection across databases, " +
+				"which needs privileges on both sides that this does not know how to check")
+		}
+		return []Need{{DB: fromDB, Actions: []string{"renameCollectionSameDB"}}}, nil
+
 	case "collMod":
 		return []Need{{DB: db, Coll: coll(), Actions: []string{"collMod"}}}, nil
 
@@ -224,6 +243,15 @@ func firstStageName(cmd bson.Raw) (string, bool) {
 		return "", false
 	}
 	return elems[0].Key(), true
+}
+
+// stringField returns a string-valued field of a command.
+func stringField(cmd bson.Raw, key string) (string, bool) {
+	v, err := cmd.LookupErr(key)
+	if err != nil {
+		return "", false
+	}
+	return v.StringValueOK()
 }
 
 // bypassing adds the privilege that skipping document validation requires.

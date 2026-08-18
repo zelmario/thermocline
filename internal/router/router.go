@@ -312,6 +312,11 @@ type conn struct {
 	// the reply is back and the real post-image can be read.
 	txnKeys txnKeyCheck
 
+	// rename is a rename of a tiered collection the fast tier has been asked to
+	// perform. The archive follows it once the fast tier has said yes, so its
+	// own authorization decides whether it happens at all. See ddl.go.
+	rename *pendingRename
+
 	// auth is the SCRAM conversation in progress, and grants what the finished
 	// one established. grants being nil is what "not authenticated" means, and
 	// every command is refused until it is not.
@@ -443,6 +448,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// otherwise be consumed by whatever command came next, against ids from a
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
+	c.rename = nil
 
 	// A handshake is answered here rather than forwarded, because a pooled
 	// connection can only carry one. See answerHello.
@@ -786,6 +792,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 	// An explain describes the fast tier, which may not be where the query it
 	// explains would run. Say so beside the plan rather than instead of it.
+	// A rename the fast tier accepted has an archive to move behind it.
+	if c.rename != nil && name == "renameCollection" {
+		rdoc, derr := reply.ReplyDoc()
+		c.finishRename(ctx, derr == nil && replyOK(rdoc))
+	}
+
 	if name == "explain" || (name == "aggregate" && inlineExplainOf(msg)) {
 		if out, done := c.annotateExplain(ctx, msg, db, reply); done {
 			return wire.Write(c.client, out)

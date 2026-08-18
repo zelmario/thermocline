@@ -125,8 +125,11 @@ feeder:
     - "shop.tbwm"
     # testchange.sh
     - "shop.tcs"
-    # testddl.sh
+    # testddl.sh. tddl2 is the target of the rename, and it has to be tiered
+    # too: a rename into a name the namespace list does not carry is refused,
+    # because it would stop the tiering with nothing saying so.
     - "shop.tddl"
+    - "shop.tddl2"
     # traffic.sh, which drives the dashboard
     - "shop.tdash"
     - "shop.tdashu"

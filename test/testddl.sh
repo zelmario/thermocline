@@ -46,6 +46,20 @@ startRouter() {
   done
   echo "  FATAL  the router never came up on 27100"; exit 2
 }
+# The rename of a tiered collection refuses while mirroring is behind, because a
+# write to the old name that has not reached the archive has nowhere to go once
+# the archive collection is renamed. A sentinel proves the feeder is current;
+# sleeping for a guess does not.
+feederCaughtUp() {
+  H "db.getSiblingDB('shop').$NS.insertOne({_id:'__sentinel'})" >/dev/null
+  for _ in $(seq 1 120); do
+    [ "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
+    sleep 0.5
+  done
+  H "db.getSiblingDB('shop').$NS.deleteOne({_id:'__sentinel'})" >/dev/null
+  C "db.getSiblingDB('shop').$NS.deleteOne({_id:'__sentinel'})" >/dev/null
+  sleep 1
+}
 waitMirrored() {
   local n=""
   for _ in $(seq 1 60); do
@@ -77,18 +91,47 @@ sleep 7
 chk "the fast tier holds three, the archive ten"        "3" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
 chk "and a normal read still answers in full"           "10" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
 
-echo "== renaming a tiered collection =="
-# The feeder ignores renames on purpose, so the fast tier would move and the
-# archive would not. Reads of the new name are not tiered at all and answer from
-# whatever the fast tier holds; reads of the old name find an empty fast tier and
-# answer from an archive nothing writes to any more. The collection is split in
-# two and neither half says so.
+echo "== renaming a tiered collection into a name nobody tiers =="
+# The namespace list is configuration. A rename into a name it does not carry
+# stops the tiering with nothing saying so: reads of the new name answer from
+# whatever the fast tier holds, and reads of the old one from an archive nothing
+# writes to any more. The collection is split in two and neither half says so.
 RENAMED=$(R "
-  try { db.adminCommand({renameCollection:'shop.$NS', to:'shop.${NS}_renamed'}); print('ALLOWED'); }
+  try { db.adminCommand({renameCollection:'shop.$NS', to:'shop.${NS}_untiered'}); print('ALLOWED'); }
   catch(e) { print('REFUSED'); }")
-chk "renaming a tiered collection is refused"           "REFUSED" "$RENAMED"
+chk "renaming into an untiered name is refused"         "REFUSED" "$RENAMED"
 chk "and the collection is still where it was"          "3" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
 chk "the archive was not split"                         "10" "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+
+echo "== renaming one tiered collection to another =="
+# Both names tiered, so the tiering survives the move. The fast tier renames
+# first, with the client's own authorization deciding, and the archive follows.
+H "db.getSiblingDB('shop').${NS}2.drop()" >/dev/null
+C "db.getSiblingDB('shop').${NS}2.drop()" >/dev/null
+feederCaughtUp
+MOVED=$(R "
+  try { const r=db.adminCommand({renameCollection:'shop.$NS', to:'shop.${NS}2'}); print(r.ok===1?'MOVED':'ok='+r.ok); }
+  catch(e) { print('REFUSED: '+e.message.substring(0,60)); }")
+chk "renaming to another tiered name is allowed"        "MOVED" "$MOVED"
+sleep 2
+chk "the fast tier moved"                               "3"  "$(H "print(db.getSiblingDB('shop').${NS}2.countDocuments({}))")"
+chk "and the archive moved with it"                     "10" "$(C "print(db.getSiblingDB('shop').${NS}2.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chk "nothing is left under the old name"                "0"  "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+# The claim belongs to the collection, not to its name, so a read of the new
+# name still answers in full rather than falling back to a watermark it lost.
+chk "a read of the new name answers in full"            "10" "$(R "print(db.getSiblingDB('shop').${NS}2.countDocuments({}))")"
+
+echo "== a dropTarget that would destroy archived documents =="
+# On the fast tier dropTarget is the client's business. In the archive it is the
+# one thing no fast tier command is allowed to do.
+C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').$NS.insertOne({_id:99,v:'archived only'})" >/dev/null
+H "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').$NS.insertOne({_id:99,v:'hot'})" >/dev/null
+feederCaughtUp
+DT=$(R "
+  try { db.adminCommand({renameCollection:'shop.${NS}2', to:'shop.$NS', dropTarget:true}); print('ALLOWED'); }
+  catch(e) { print('REFUSED'); }")
+chk "dropTarget over archived documents is refused"     "REFUSED" "$DT"
+chk "and they are still there"                          "1"     "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 
 echo "== mapReduce over a tiered collection =="
 # Deprecated, rare, and it reads every document it is pointed at. Run against a

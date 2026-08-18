@@ -371,6 +371,38 @@ the bulkWrite path and the `$merge` target rerun, and the fast tier's own
 pre-flight check for an upsert asks with the collation too. `testconform.sh`
 compares each against the untiered reference.
 
+### Renaming a tiered collection
+
+A rename moves two collections, not one, and the feeder ignores renames on
+purpose: replaying collection-level changes is what would let an accident on the
+fast tier reach the archive. So a rename used to be refused outright, with the
+remedy spelled out for the operator to run by hand. Refusing is safe and it is
+not the same as working, and rotating collections by name is ordinary.
+
+It is done properly now, when it can be done safely:
+
+- **Both names have to be tiered.** The namespace list is configuration, and a
+  rename into a name it does not carry stops the tiering with nothing saying so.
+- **Mirroring has to be caught up**, within two seconds. A write to the old name
+  that has not reached the archive has nowhere to go once the archive collection
+  is renamed. The window cannot be closed entirely from here, so it is made
+  small and stated rather than assumed.
+- **A `dropTarget` that would destroy archived documents is refused.** On the
+  fast tier that flag is the client's business; in the archive it is the one
+  thing no fast tier command may do.
+
+The fast tier renames first, forwarded exactly as the client sent it, so its own
+authorization decides whether it happens at all. Only once it has said yes does
+the archive follow, and the completeness watermark and the unique key claims
+follow with it, because both belong to the collection rather than to its name.
+Residency records are dropped rather than rewritten, since they carry the
+namespace inside their own id: the cost is that a document promoted moments ago
+may be evicted early, which is a delay and not a loss.
+
+If the archive rename fails after the fast tier's succeeded, the tiers are split
+and the log says so at ERROR with the exact command to put it right. That is the
+one case where an operator has to finish the job.
+
 ### An explain must not do the thing it explains
 
 An aggregation can carry `explain: true` in the command itself rather than being
@@ -915,7 +947,13 @@ mongosh --port 28018 --eval '
   tens of thousands of clients. With `router.terminate_auth` on the connections
   are pooled instead: measured, eight idle clients cost zero extra connections to
   the primary, against thirty two with it off.
-- **Resharding and collection-level DDL** are logged and ignored, never replayed.
+- **Collection DDL other than rename** is logged and ignored, never replayed.
+  A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
+  its documents, and the completeness claim is withdrawn, so the collection
+  still answers from the archive afterwards. That is the rule working rather
+  than failing, because replaying a drop is exactly how one accident on the fast
+  tier would destroy the archive. Removing archived documents is deliberately a
+  separate act.
 - **`terminate_auth` has never met traffic that was not a test.** Everything it
   lifts is lifted in principle only while it is off by default, and the
   security-critical half of it is an authorization gate. That gate is the only
