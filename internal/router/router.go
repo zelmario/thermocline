@@ -377,6 +377,33 @@ func (c *conn) pump(ctx context.Context) error {
 }
 
 // handle forwards one message and decides whether the reply needs work.
+// answer sends a guard's reply, unless the client asked for no reply at all.
+//
+// A write with moreToCome set is unacknowledged: the client is not waiting and
+// there is nowhere to put a refusal. That is a reason not to perform the write,
+// and it was being treated as a reason not to ask whether the write was safe.
+// Every guard was skipped for those messages, which is the compression finding's
+// shape: a flag the client sets for reasons of its own turning off the copy-up,
+// the unique key claim and the upsert judgement all at once, invisibly.
+//
+// Measured on a collection holding {_id: 5, name: "alice", tier: "gold",
+// balance: 100} in the archive only: an unacknowledged
+// updateOne({_id:5},{$set:{balance:200}},{upsert:true}) left {_id:5,
+// balance:200} on both tiers, an unacknowledged insert of an _id the archive
+// still held replaced the archived document, and an unacknowledged deleteMany
+// left nine of twelve documents readable after an erasure. All three are shapes
+// that were fixed on the acknowledged path long ago.
+//
+// So the guards now run for these too, and where one would have answered, the
+// command is simply not performed. A dropped write is what w:0 already means to
+// an application: it asked not to be told.
+func (c *conn) answer(msg, out *wire.Message) error {
+	if msg.MoreToCome() {
+		return nil
+	}
+	return wire.Write(c.client, out)
+}
+
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	name, db, nameErr := msg.CommandName()
 
@@ -406,8 +433,8 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// Authentication and authorization come first, before any guard, because
 	// every guard below this reads or writes data and none of them asks who is
 	// calling. See gate.go.
-	if c.r.cfg.TerminateAuth && nameErr == nil && !msg.MoreToCome() {
-		if isSASL(name) {
+	if c.r.cfg.TerminateAuth && nameErr == nil {
+		if isSASL(name) && !msg.MoreToCome() {
 			out, serr := c.handleSASL(ctx, msg, name, db)
 			if serr != nil {
 				return serr
@@ -415,6 +442,21 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			return wire.Write(c.client, out)
 		}
 		if out, denied := c.gate(msg, name, db); denied {
+			// An unacknowledged write carries moreToCome: the client is not
+			// waiting for an answer, so there is nowhere to put the refusal.
+			// That is a reason not to perform the write, and not a reason to
+			// skip asking whether it was allowed. Letting it past because the
+			// refusal has nowhere to go would be the quietest bypass in the
+			// system: no error anywhere, and the document lands.
+			if msg.MoreToCome() {
+				user := "unauthenticated"
+				if c.grants != nil {
+					user = c.grants.User
+				}
+				c.log.Warn("dropped an unauthorized unacknowledged command",
+					"command", name, "db", db, "user", user)
+				return nil
+			}
 			return wire.Write(c.client, out)
 		}
 	}
@@ -466,19 +508,19 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// A write naming many documents only reaches the ones the fast tier holds,
 	// so the rest have to come up before it runs. Before, not after: repeating
 	// the write after a copy-up would apply $inc twice.
-	if nameErr == nil && (name == "update" || name == "delete") && !msg.MoreToCome() {
+	if nameErr == nil && (name == "update" || name == "delete") {
 		if out, done := c.guardMultiWrite(ctx, msg, db, name); done {
-			return wire.Write(c.client, out)
+			return c.answer(msg, out)
 		}
 	}
 
 	// An upsert that matches nothing does not wait to be put right on the way
 	// back: it creates a document in place of the archived one and the feeder
 	// then mirrors that over the archive. So it too is judged before it runs.
-	if nameErr == nil && !msg.MoreToCome() &&
+	if nameErr == nil &&
 		(name == "update" || name == "findAndModify" || name == "findandmodify") {
 		if out, done := c.guardUpsert(ctx, msg, db, name); done {
-			return wire.Write(c.client, out)
+			return c.answer(msg, out)
 		}
 	}
 
@@ -487,21 +529,21 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// operations point at them by position, so none of the per-command guards
 	// can find a collection to act on.
 	c.pendingKeys = nil
-	if nameErr == nil && name == "bulkWrite" && !msg.MoreToCome() {
+	if nameErr == nil && name == "bulkWrite" {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
 			if out, done := c.guardBulkWrite(ctx, msg, cmd); done {
-				return wire.Write(c.client, out)
+				return c.answer(msg, out)
 			}
 		}
 	}
 
 	// A unique key has to be claimed before the write lands, or two writes
 	// racing both see a free slot.
-	if nameErr == nil && !msg.MoreToCome() {
+	if nameErr == nil {
 		switch name {
 		case "insert":
 			if out, done := c.guardInsert(ctx, msg, db); done {
-				return wire.Write(c.client, out)
+				return c.answer(msg, out)
 			}
 		case "update", "findAndModify", "findandmodify":
 			// An update can move a document onto a value an archived document
@@ -528,7 +570,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// that matched nothing depends on, still runs untouched.
 				c.prepareTxnKeyCheck(ctx, msg, cmd, db, name, t)
 			} else if out, done := c.guardUpdateKeys(ctx, msg, db, name); done {
-				return wire.Write(c.client, out)
+				return c.answer(msg, out)
 			}
 		}
 	}
@@ -537,6 +579,19 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// router answers as a mongos and a mongos would have routed it.
 	if nameErr == nil && !msg.MoreToCome() {
 		c.noteReadPreference(msg, name)
+	}
+
+	// A client that asked for exhaust replies is answered once instead.
+	//
+	// The server sends several replies to one request when this bit is set, and
+	// this proxy reads one. The others stay in the socket and answer whatever
+	// command comes next. Measured: one getMore with the bit set produced five
+	// replies from mongod, and through the router the answer to the following
+	// ping was a batch of that cursor's documents. See ClearExhaustAllowed.
+	if msg.ExhaustAllowed() {
+		c.log.Debug("clearing the exhaust bit; this proxy answers one reply per request",
+			"command", name)
+		msg = msg.ClearExhaustAllowed()
 	}
 
 	// A handshake that agrees a compressor would make every later command
@@ -585,11 +640,34 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	} else {
 		// Fire-and-forget writes expect no reply. Sending one would leave the
 		// connection a message out of step for everything that follows.
+		//
+		// Any unique key this write claimed stays claimed. Whether the write
+		// landed is exactly what an unacknowledged write does not say, and of
+		// the two ways to be wrong, holding a value that turned out to be free
+		// costs a later collision to clear, while releasing one the write did
+		// take would hand the same value to somebody else.
 		if msg.MoreToCome() {
 			return nil
 		}
 
 		reply, err = wire.Read(up)
+		// A reply that says more is coming means the server is mid-stream and
+		// this connection has messages on it that belong to the request just
+		// made. The exhaust bit is cleared on the way out so this should be
+		// unreachable, and if it is ever reached the connection cannot be
+		// handed to anybody else: the next borrower would be answered with
+		// these documents. Throw it away instead.
+		if err == nil && reply.MoreToCome() {
+			c.log.Error("the fast tier answered with more replies to come; discarding the connection",
+				"command", name)
+			if fromPool {
+				borrowed.discard()
+				c.unpinExhausted(borrowed)
+			} else {
+				c.upstreamBroke()
+			}
+			return fmt.Errorf("unexpected exhaust reply from the fast tier for %q", name)
+		}
 		if fromPool {
 			if err != nil {
 				borrowed.discard()

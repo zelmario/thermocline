@@ -132,6 +132,43 @@ gotfail=$(R "try{db.getSiblingDB('shop').aggregate([{\$documents:[{_id:5,balance
    {\$merge:{into:'$NS', whenMatched:'fail', whenNotMatched:'insert'}}]).toArray(); print('ACCEPTED')}catch(e){print('FAILED')}")
 chk "whenMatched fail behaves the same on both"       "$reffail" "$gotfail"
 
+# A $merge names its target with `into`, and `into` can carry a database. The
+# guard above resolves that, but every check so far has merged into a collection
+# in the same database as the aggregation, so the resolution itself was never
+# exercised: a guard that read only the collection name would have passed all of
+# them and still destroyed archived data one database over.
+XNS=tmrgx
+XREF=tmrefx
+xdoc() { R "const d=db.getSiblingDB('wh').$1.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+xcold5() { C "const d=db.getSiblingDB('wh').$XNS.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+reseedX() {
+  local doc5='{_id:5, name:"alice", tier:"gold", balance:100}'
+  H "db.getSiblingDB('wh').$XREF.drop(); db.getSiblingDB('wh').$XREF.insertMany([$doc5,{_id:6,name:'bob',tier:'silver',balance:50}])" >/dev/null
+  H "db.getSiblingDB('wh').$XNS.drop()" >/dev/null
+  C "db.getSiblingDB('wh').$XNS.drop()" >/dev/null
+  H "db.getSiblingDB('wh').$XNS.insertOne({_id:6,name:'bob',tier:'silver',balance:50})" >/dev/null
+  C "db.getSiblingDB('wh').$XNS.bulkWrite([
+       {replaceOne:{filter:{_id:5},replacement:$doc5,upsert:true}},
+       {replaceOne:{filter:{_id:6},replacement:{_id:6,name:'bob',tier:'silver',balance:50},upsert:true}}],{ordered:false})" >/dev/null
+  cline watermark --config $CFG --ns wh.$XNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+  sleep 1
+}
+mergeIntoX() { # collection in wh, merged into from an aggregation running in shop
+  R "db.getSiblingDB('shop').aggregate([
+       {\$documents:[{_id:5, balance:200}]},
+       {\$merge:{into:{db:'wh',coll:'$1'}, whenMatched:'merge', whenNotMatched:'insert'}}
+     ]).toArray(); print('done')" >/dev/null 2>&1
+}
+
+echo "== \$merge into a tiered collection in another database =="
+reseedX
+chk "the cross-database fast tier lacks it"           "0" "$(H "print(db.getSiblingDB('wh').$XNS.countDocuments({_id:5}))")"
+chk "its archive holds it"                            "1" "$(C "print(db.getSiblingDB('wh').$XNS.countDocuments({_id:5}))")"
+mergeIntoX $XREF
+mergeIntoX $XNS
+sleep 6
+chk "the cross-database merge matches the reference"  "$(xdoc $XREF)" "$(xdoc $XNS)"
+chk "and its archive kept the fields it had"          "$(xdoc $XREF)" "$(xcold5)"
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

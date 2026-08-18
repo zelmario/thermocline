@@ -387,6 +387,13 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 			c.log.Debug("read answered from the archive", "ns", ns, "because", because)
 			return out, nil
 		}
+		// An error the archive itself returned is MongoDB's answer to this
+		// command, so it goes back as it stands. Only a failure to reach the
+		// archive falls through to the refusal below.
+		if out, passed := c.r.serverErrorReply(reply.Header.RequestID, msg.Header.RequestID, aerr); passed {
+			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
+			return out, nil
+		}
 		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
 	}
 

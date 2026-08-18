@@ -366,6 +366,11 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 				c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
 				return out, true
 			}
+			if out, passed := c.r.serverErrorReply(msg.Header.RequestID, msg.Header.RequestID, err); passed {
+				c.log.Debug("the archive rejected this aggregation; returning its own error",
+					"ns", scope.primary, "err", err)
+				return out, true
+			}
 			c.log.Warn("could not answer this aggregation from the archive, refusing instead",
 				"ns", scope.primary, "err", err)
 		}

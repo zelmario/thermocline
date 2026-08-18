@@ -136,6 +136,25 @@ chk "it reads back through the router" "8388608" "$(R "const d=db.getSiblingDB('
 sleep 4
 chk "and it was copied up whole"       "8388608" "$(H "const d=db.getSiblingDB('shop').tbig.findOne({_id:1}); print(d?d.blob.length:'MISSING')")"
 
+echo "== a whole reply of large documents, answered from the archive =="
+# One large document is a document; several are a reply. An archive answer is
+# assembled here rather than by mongod, so the batch that carries it is this
+# router's to bound. Six documents of three megabytes is more than the sixteen a
+# single BSON document may occupy and more than one batch can hold, so it can
+# only come back as several, and the client must still see all six intact.
+#
+# Getting this wrong does not look like a wrong answer, it looks like a dead
+# connection: a message past the wire protocol's limit is one mongod's own
+# drivers refuse to read.
+C "db.getSiblingDB('shop').tbig.deleteMany({_id:{\$gte:101}});
+   const blob='y'.repeat(3*1024*1024);
+   db.getSiblingDB('shop').tbig.insertMany(Array.from({length:6},(_,i)=>({_id:101+i, big:1, blob:blob})))" >/dev/null
+chk "six large documents are in the archive" "6" "$(C "print(db.getSiblingDB('shop').tbig.countDocuments({big:1}))")"
+chk "and none of them on the fast tier"      "0" "$(H "print(db.getSiblingDB('shop').tbig.countDocuments({big:1}))")"
+BIGREAD=$(R "let n=0, bytes=0; db.getSiblingDB('shop').tbig.find({big:1}).batchSize(50).forEach(d=>{n++; bytes+=d.blob.length}); print(n+' '+bytes)")
+chk "the router returns every one of them"   "6 18874368" "$BIGREAD"
+C "db.getSiblingDB('shop').tbig.deleteMany({_id:{\$gte:101}})" >/dev/null
+
 echo "== authentication failures pass through =="
 chk "a wrong password is rejected" "true" "$(mongosh --port 27100 -u dba -p wrongpassword --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed|AuthenticationFailed' && echo true || echo false)"
 chk "an unknown user is rejected"  "true" "$(mongosh --port 27100 -u nosuchuser -p x --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed|AuthenticationFailed' && echo true || echo false)"

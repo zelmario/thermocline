@@ -84,18 +84,29 @@ feeder:
     - "shop.techo"
     # testmerge.sh: tmref is deliberately NOT here, it is the untiered reference
     - "shop.tmrg"
+    # testmerge.sh again, in another database, because $merge resolves its
+    # target through `into: {db, coll}` and that resolution is what a guard
+    # reading only the collection name would get wrong. tmrefx is the untiered
+    # reference and is deliberately not listed.
+    - "wh.tmrgx"
     # testdaemonmetrics.sh
     - "shop.tdmet"
     # testretry.sh
     - "shop.tretry"
     # testpool.sh
     - "shop.tpool"
-    # testfailover.sh
+    # testfailover.sh. tfocu is deliberately not here: it is the untiered
+    # collection whose cursor the router only forwards.
     - "shop.tfail"
+    - "shop.tfoc"
     # testindexes.sh
     - "shop.tidx"
     # testexplain.sh
     - "shop.texpl"
+    # testunack.sh, the writes that ask for no acknowledgement
+    - "shop.tunku"
+    - "shop.tunki"
+    - "shop.tunkm"
     # testupsert.sh
     - "shop.tups"
     - "shop.tupsf"

@@ -38,6 +38,7 @@ Or one at a time:
     docker exec <node> bash /root/testtypes.sh     # collection types that cannot be tiered
     docker exec <node> bash /root/testupsert.sh    # an upsert whose document lives only in the archive
     docker exec <node> bash /root/testsingle.sh    # single-document writes filtered on any other field
+    docker exec <node> bash /root/testunack.sh     # writes that ask for no acknowledgement
     docker exec <node> bash /root/testconform.sh   # differential: the same answer MongoDB would give
     docker exec <node> bash /root/testauthterm.sh  # the router authenticating clients itself
     docker exec <node> bash /root/testreadprefterm.sh # reads landing on the node that was asked for
@@ -46,6 +47,7 @@ Or one at a time:
     docker exec <node> bash /root/testdaemonmetrics.sh # what the evictor and warmer report about themselves
     docker exec <node> bash /root/testretry.sh     # $sample on a partial tier, and retryable writes
     docker exec <node> bash /root/testpool.sh      # whether idle clients still cost an upstream connection
+    go run ./test/exhaust 127.0.0.1:27600 router    # the OP_MSG exhaust bit (host side, see exhaust/README.md)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
 
@@ -234,6 +236,12 @@ Things these encode that are easy to get wrong when testing by hand:
   `until ! pgrep ...` loop written that way waits for itself and never returns.
   Wait on the thing itself, or match a pattern that cannot appear in the waiting
   command.
+- **No driver in this harness sets every wire protocol flag, so some findings
+  need a client written for the purpose.** `mongosh` will not negotiate snappy,
+  will not send OP_COMPRESSED on demand, and will not ask for exhaust replies.
+  Two real defects sat behind exactly those gaps. `test/exhaust` is the client
+  that found the second one; write another when a flag matters and nothing here
+  can set it.
 - **`make build` sets `CGO_ENABLED=0`, so use it.** A plain `go build` links
   against the host glibc, and the container's is older, so the binary dies at
   exec with `GLIBC_2.34 not found`. That surfaces as `FATAL the router never

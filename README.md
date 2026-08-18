@@ -130,7 +130,18 @@ Range queries are governed by the watermark below.
 - **Bulk writes are only miss-resolved one statement at a time.** A batch that
   matched nothing is left as the fast tier answered it. Unique keys and
   multi-document writes are handled across the whole batch.
-- **Authentication is proxied, not terminated.** Each client gets its own
+- **Authentication is proxied by default, and can be terminated.** Everything in
+  the next two bullets describes the default. Setting `router.terminate_auth`
+  changes the architecture: the router verifies the client's password itself,
+  from the salt and stored keys mongod keeps in `admin.system.users`, loads that
+  user's privileges with `usersInfo`, and reaches both tiers on connections it
+  owns. That lifts all three limitations below at once, and it moves the
+  decision about who may read what from the fast tier into this process, where
+  Authorisation is then the only thing between a client and somebody else's
+  data. **It is off by default and should stay off until it has run somewhere
+  real.**
+
+  Proxied, which is the default: each client gets its own
   connection to the fast tier, so SCRAM works, at the cost of one upstream
   connection per client. It also sets what happens during a fast tier election:
   the router never sees the credentials, so it cannot re-authenticate a fresh
@@ -162,9 +173,10 @@ Range queries are governed by the watermark below.
   while the same query sent straight to the replica set landed on a secondary.
 
   Each connection logs a warning the first time it asks for a non-primary read,
-  and `thermocline_primary_only_reads_total` counts them. Lifting the limitation
-  means terminating authentication in the router, which is an architectural
-  change rather than a fix.
+  and `thermocline_primary_only_reads_total` counts them. With
+  `router.terminate_auth` on, read preference is honoured: measured with the
+  profiler recording on all three fast tier members, `secondary`,
+  `secondaryPreferred` and `nearest` each landed on a secondary.
 - **TLS is not handled.** Terminate it in front, or add it before taking over a
   production address.
 
@@ -221,6 +233,21 @@ making every read wait out the full `archive_wait`.
 `router.completeness` chooses the behaviour: `archive` (the default), `strict`
 to refuse instead, `permissive` to return the fast tier's short answer.
 
+**An error the archive returns is MongoDB's answer, and it is passed back
+unchanged.** It used to be replaced by a generic `CommandFailed` carrying a
+sentence about completeness, which is the wrong answer twice over: an
+application branches on `e.code` and not on the prose, and a client whose own
+query was malformed was told this proxy had refused it. `count`, `distinct` and
+aggregations are judged before they run, so those are the paths where it showed:
+an unknown pipeline stage came back as 125 where MongoDB says 40324, and a bad
+filter as 125 where MongoDB says 2. The codes now match, which `testconform.sh`
+compares against an untiered reference for twenty error shapes.
+
+Two kinds of failure keep the refusal, because they are not MongoDB's answer to
+the client's command: a failure to reach the archive at all, and an
+authorization error, which describes the router's own credentials rather than
+the caller's and would otherwise send whoever investigates to the wrong cluster.
+
 ### Aggregations
 
 Every driver's `countDocuments` is an `aggregate`, so leaving pipelines
@@ -271,6 +298,90 @@ would apply `$inc` twice.
 A sweep over an unbounded range could drag the whole archive up to satisfy one
 statement, so there is a ceiling of 10,000 documents. Past it the router refuses
 and says so, rather than doing part of the job and reporting success.
+
+### Writes that ask for no acknowledgement
+
+A write sent with `{w:0}` carries the wire protocol's moreToCome flag: the
+client does not wait, and there is no reply to correct. Every guard above used
+to be skipped for those, which is the same shape as a client negotiating
+compression and turning them all off invisibly. It is worse in one respect, in
+that `{w:0}` is chosen by ordinary applications for ordinary reasons, in metrics
+writers and log ingesters, and needs no unusual driver options.
+
+Measured on a collection holding `{_id: 5, name: "alice", tier: "gold",
+balance: 100}` in the archive only: an unacknowledged
+`updateOne({_id:5},{$set:{balance:200}},{upsert:true})` left `{_id:5,
+balance:200}` on **both** tiers, an unacknowledged insert of an `_id` the
+archive still held replaced the archived document entirely, and an
+unacknowledged `deleteMany` left nine of twelve documents readable after an
+erasure that reported nothing. All three are shapes that were fixed on the
+acknowledged path long ago and reached again through this door.
+
+The guards run for these writes too. The copy-up and the key claim happen the
+same way, so an unacknowledged write now pays that latency, which is a real cost
+on a path chosen for speed. Where a guard would have refused, the command is not
+performed and nothing is sent back, because there is nowhere to send it.
+
+`testunack.sh` pins all three, along with the control that an ordinary
+unacknowledged write still lands on both tiers.
+
+### Replies the client asked to have several of
+
+The same flag exists in the other direction. A client that sets `exhaustAllowed`
+on a `getMore` is telling the server it will accept several replies to that one
+request, each but the last carrying moreToCome, and the server obliges: measured
+against a real mongod, one such `getMore` produced **five** replies.
+
+This proxy reads one reply per request. The other four stayed in the socket, and
+the next command on that connection was answered by them. Measured through the
+router: the reply to a `ping` sent afterwards came back as `responseTo=75`
+carrying documents 4 and 5 of the cursor. With upstream connections pooled that
+connection then goes back to the pool, so the next borrower is a different
+client, reading somebody else's documents in answer to its own command.
+
+The bit is cleared on the way through, which the wire protocol allows: setting
+it never guaranteed more than one reply. An exhaust-capable driver loses a
+round-trip optimisation and gets the same documents. This is the compression
+remedy again, and for the same reason: a flag the client sets for itself must
+not decide whether this proxy can still follow the conversation. As a second
+line, a reply that arrives with moreToCome set anyway costs that connection its
+place in the pool rather than being handed on.
+
+No driver in the test harness can set the bit, so `test/exhaust` is a client
+written to do it.
+
+### Whose cursor is it
+
+A cursor over an archive answer is this router's, not the fast tier's, so it is
+served from a registry here. That registry belongs to the router rather than to
+one connection, which is right: a real MongoDB cursor is server-scoped, and a
+driver's pool sends the `getMore` from whichever connection is free. Nothing else
+scoped it, and the ids ran in sequence from a fixed start, so the first cursor
+was always 2^62+1.
+
+Measured with two connections to one router: the second, which had opened
+nothing, sent a `getMore` for that id and was given the first client's documents
+along with their real namespace. Naming a different collection in the command
+changed nothing, because the batch comes from the cursor and not from the name.
+That is also what made it reach past authorisation, which judges the name the
+client supplied.
+
+Three things now hold, each of them mongod's own rule:
+
+- **Ids are random**, in the top quarter of the range so they stay clear of the
+  server's own, so no id can be counted off.
+- **A cursor belongs to whoever opened it.** The user when this router knows it,
+  and the session whenever the client sends one, which every driver since 3.6
+  does. mongod: "If authentication is enabled, you can only run getMore against
+  cursors you created. Additionally, for cursors created inside a session, you
+  cannot call getMore outside the session." With neither a user nor a session,
+  the cursor is scoped to the connection, which is stricter than mongod and only
+  reachable with no authentication at all.
+- **The collection named has to be the cursor's.** mongod has refused a mismatch
+  since at least 6.0, and the router now returns the same error word for word.
+
+Refusals use mongod's code 13, so a driver sees the error it already handles.
+`test/cursorowner` is the client that found this.
 
 ### Unique indexes
 
@@ -446,6 +557,35 @@ The archive is reached with the router's own credentials, because the client has
 no session there and cannot be given one. **It should therefore be reachable
 only by the router**, which the operating rules already require for a different
 reason: the cheap tier is read-only to everyone except the feeder.
+
+**With `router.terminate_auth` on, none of the above applies and this section is
+the whole of the protection.** The upstream connections belong to the router, so
+the fast tier will do whatever they ask, and the router decides instead. It
+denies by default: a command whose required privilege is not in the mapping is
+refused by name rather than guessed at, which is why an unusual client meets
+refusals rather than a hole.
+
+Judging a command by the collection it was sent to is not enough, because a
+command can name more collections than its own. `$lookup`, `$unionWith` and
+`$graphLookup` read another one, `$out` and `$merge` write one, an `explain`
+carries a whole command inside it, and a `bulkWrite` names its collections in
+`nsInfo` and refers to them by position. Every one of those is judged
+separately, the way mongod judges it: find on each collection read, insert and
+remove on an `$out` target, insert and update on a `$merge` target, and for an
+explain exactly what the command inside it would need.
+
+Measured against the same user sending the same command straight to the fast
+tier, with a user holding find on one collection and nothing else: before those
+namespaces were judged, a `$lookup` returned the other collection's documents,
+a `$unionWith` returned its rows, and `$merge` and `$out` **overwrote it**,
+leaving `1:-1,2:-1` where mongod had left `1:100,2:200`.
+
+**A write that asks for no acknowledgement is still a write.** An unacknowledged
+write, `{w:0}`, carries the wire protocol's moreToCome flag and the client never
+waits for a reply. There is nowhere to put a refusal, and that is a reason not
+to perform the write rather than a reason to skip asking. It is judged like any
+other, and where the answer is no the command is dropped, which is what `{w:0}`
+already means to an application: it asked not to be told.
 
 ### Upserts
 
@@ -690,35 +830,25 @@ mongosh --port 28018 --eval '
 
 ## What is not handled yet
 
-- **Promotion echo from the router.** The router does copy documents up on
-  demand, and its promotions are not suppressed. The warmer announces into
-  `_thermocline.warming` and the feeder skips what it finds there; a router
-  copy-up records residency instead, which the suppression does not read. So the
-  feeder mirrors every promoted document straight back down into the archive it
-  was just read from. The document is identical, so this costs a redundant
-  archive write per promotion rather than a wrong answer, but it is write
-  amplification exactly where a read-heavy workload over archived data will feel
-  it. It was not always harmless: while promotion was written as `$setOnInsert`,
-  this echo is what made the reordered copy permanent.
-- **The first seconds of a warm are not suppressed.** The feeder caches its view
-  of the warmer heartbeat for five seconds, so a little echo slips through at the
-  start. Irrelevant for a warm lasting hours, worth knowing for a short one.
-- **Prometheus for the background daemons.** The router exports itself and
-  mirroring lag at `/metrics`, but the evictor's and warmer's own counters, such
-  as documents swept per pass and why a pass backed off, still only reach a log
-  line.
-- **Eviction does not pause automatically during an archive restore.** It stops
-  on mirroring lag, which usually covers it, but the restore case deserves an
-  explicit check.
 - **Sharded fast tiers.** Untested.
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server
   reported a fixed 128.
-- **Router connection pooling.** One upstream connection per client is simple
-  and correct for authentication, and it will not scale to tens of thousands of
-  clients.
+- **Router connection pooling, with authentication proxied.** One upstream
+  connection per client is simple and correct for SCRAM, and it will not scale to
+  tens of thousands of clients. With `router.terminate_auth` on the connections
+  are pooled instead: measured, eight idle clients cost zero extra connections to
+  the primary, against thirty two with it off.
 - **Resharding and collection-level DDL** are logged and ignored, never replayed.
+- **`terminate_auth` has never met traffic that was not a test.** Everything it
+  lifts is lifted in principle only while it is off by default, and the
+  security-critical half of it is an authorization gate. That gate is the only
+  thing between a client and somebody else's data in that mode, it denies by
+  default, and it has thirty three checks behind it in `testauthterm.sh`,
+  including the ones that caught it allowing a `$lookup`, a `$merge` and an
+  unacknowledged write it should have refused. It is still a judgement call
+  rather than a finished feature.
 
 ## Design documents
 

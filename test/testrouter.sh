@@ -65,6 +65,40 @@ chk "sort+skip+limit works"              "1"     "$(R 'print(db.getSiblingDB("sh
 echo "== cursor paging through the archive =="
 chk "batched find returns every doc" "$LIVE" "$(R 'let n=0; const c=db.getSiblingDB("shop").tprobe.find({}).batchSize(2); while(c.hasNext()){c.next();n++} print(n)')"
 
+echo "== whose cursor is it =="
+# A cursor over an archive answer belongs to this router, and it is served from a
+# registry shared by every connection, because a real MongoDB cursor is
+# server-scoped and a driver's pool sends the getMore from whichever connection
+# is free. What has to scope it is what scopes it in mongod: the user, the
+# session, and the collection named.
+#
+# The ids used to run in sequence from 2^62, so the first was always 2^62+1, and
+# nothing else was checked. A second connection could name it and be handed the
+# first client's documents. See test/cursorowner for the client that found it.
+CID=$(R 'const r=db.getSiblingDB("shop").runCommand({find:"tprobe",filter:{},batchSize:2}); print(r.cursor.id.toString())')
+chk "the router owns this cursor"          "true"     "$(awk -v id="$CID" 'BEGIN{print (id+0 > 4611686018427387904) ? "true" : "false"}')"
+# A second mongosh is a second connection and a second session, which is exactly
+# what mongod refuses: "for cursors created inside a session, you cannot call
+# getMore outside the session".
+STEAL=$(R "const r=db.getSiblingDB('shop').runCommand({getMore:NumberLong('$CID'),collection:'tprobe'}); print(r.ok===1?'READ '+r.cursor.nextBatch.length:r.code+' '+r.codeName)")
+chk "another session cannot read it"       "13 Unauthorized" "$STEAL"
+# And the collection has to be the cursor's. mongod has refused a mismatch since
+# at least 6.0, measured.
+WRONGNS=$(R "const r=db.getSiblingDB('shop').runCommand({find:'tprobe',filter:{},batchSize:2});
+             const g=db.getSiblingDB('shop').runCommand({getMore:r.cursor.id,collection:'tprobeXX'});
+             print(g.ok===1?'READ':g.code+' '+g.codeName)")
+chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
+# The control: one client, one session, its own cursor, paged to the end. This is
+# the case the three checks above must not have broken.
+OWN=$(R "let n=0; const db2=db.getSiblingDB('shop');
+         let r=db2.runCommand({find:'tprobe',filter:{},batchSize:2});
+         n+=r.cursor.firstBatch.length;
+         let id=r.cursor.id;
+         while(id.toString()!=='0'){ const g=db2.runCommand({getMore:id,collection:'tprobe',batchSize:2});
+           if(g.ok!==1){ n=-1; break } n+=g.cursor.nextBatch.length; id=g.cursor.id }
+         print(n)")
+chk "its own session pages to the end"     "$LIVE" "$OWN"
+
 echo "== unique index across tiers =="
 H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
 H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null

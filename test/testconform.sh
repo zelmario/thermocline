@@ -414,6 +414,34 @@ chk "drop()"                                    "false" "$(R "db.getSiblingDB('s
 chk "dropDatabase()"                            "true"  "$(R "db.getSiblingDB('tcdropme').x.insertOne({a:1}); print(db.getSiblingDB('tcdropme').dropDatabase().ok===1)")"
 
 echo
+echo "== errors the server itself would return =="
+# A drop-in proxy has to fail the way MongoDB fails, not just succeed the way it
+# succeeds. An application branches on e.code, and a retry helper branches on the
+# error label, so an error rewritten on the way out is a wrong answer with an
+# ok:0 on it. Every check here prints the code and the codeName rather than the
+# message, because that is what a driver acts on.
+reseed
+E='catch(e){print(e.code+" "+e.codeName)}'
+same 'unknown top-level operator'  "try{COLL.find({\$nosuchop:1}).toArray();print('no error')}$E"
+same 'unknown field operator'      "try{COLL.find({n:{\$badop:1}}).toArray();print('no error')}$E"
+same 'invalid regular expression'  "try{COLL.find({name:{\$regex:'('}}).toArray();print('no error')}$E"
+same 'mixed projection'            "try{COLL.find({},{name:1,grp:0}).toArray();print('no error')}$E"
+same 'bad sort specification'      "try{COLL.find({}).sort({n:'up'}).toArray();print('no error')}$E"
+same 'negative skip'               "try{COLL.find({}).skip(-1).toArray();print('no error')}$E"
+same 'hint naming no index'        "try{COLL.find({}).hint('tc_no_such_index').toArray();print('no error')}$E"
+same 'unknown pipeline stage'      "try{COLL.aggregate([{\$nosuchstage:{}}]).toArray();print('no error')}$E"
+same 'unknown accumulator'         "try{COLL.aggregate([{\$group:{_id:null,x:{\$nosuchacc:'\$n'}}}]).toArray();print('no error')}$E"
+same 'unknown expression operator' "try{COLL.aggregate([{\$project:{x:{\$nosuchexpr:['\$n',1]}}}]).toArray();print('no error')}$E"
+same 'divide by zero'              "try{COLL.aggregate([{\$project:{x:{\$divide:['\$n',0]}}}]).toArray();print('no error')}$E"
+same 'zero $limit'                 "try{COLL.aggregate([{\$limit:0}]).toArray();print('no error')}$E"
+same 'count with a bad filter'     "try{print(COLL.count({\$badop:1}))}$E"
+same 'distinct with a bad filter'  "try{print(COLL.distinct('grp',{\$badop:1}).length)}$E"
+same 'countDocuments bad filter'   "try{print(COLL.countDocuments({\$badop:1}))}$E"
+same 'update with a bad operator'  "try{print(COLL.updateOne({_id:17},{\$nosuchup:{x:1}}).modifiedCount)}$E"
+same 'update conflicting paths'    "try{print(COLL.updateOne({_id:17},{\$set:{'a.b':1,'a':2}}).modifiedCount)}$E"
+same 'insert duplicate _id'        "try{print(COLL.insertOne({_id:17}).acknowledged)}$E"
+same 'findAndModify bad operator'  "try{print(JSON.stringify(COLL.findAndModify({query:{_id:17},update:{\$nosuchup:{x:1}}})))}$E"
+echo
 echo "== transactions =="
 reseed
 TXN=$(R "

@@ -122,6 +122,79 @@ chk "a proxied write across a failover fails"          "failed" "$PROXRES"
 chk "and nothing was applied twice"                    "true" \
     "$(H "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d && d.v <= 101)")"
 
+# A cursor open across a change of primary.
+#
+# Two cursors are involved in one tiered read and they live on different
+# clusters. A cursor the client holds against the fast tier is an ordinary
+# MongoDB cursor on the node that made it. A cursor over an archive answer is
+# one this router owns: the client is given an id from the router's own
+# registry, and the driver cursor behind it sits on the archive's primary. Both
+# die when the node under them stops being primary, and the question is not
+# whether they die, it is what the client is told when they do.
+#
+# The one outcome that must not happen is a short answer with no error. A cursor
+# that stops early and reports itself exhausted hands the application half a
+# collection and an ok:1, which is the failure mode this whole system is built
+# to avoid. Either every document arrives, or the read fails loudly enough for
+# the driver to retry it.
+COLDU=${COLDU:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
+CNS=tfoc
+CNSU=tfocu
+C() { docker exec $NODE mongosh "$COLDU" --quiet --eval "$1" 2>&1 | tail -1; }
+
+# Read a cursor in two halves, moving a primary in between, and report what the
+# client saw: how many documents arrived and whether it was told anything.
+readAcrossStepDown() { # collection, uri-of-the-set-to-step-down
+  docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" --quiet --eval "
+    const c = db.getSiblingDB('shop').$1;
+    const cur = c.find({}).sort({_id:1}).batchSize(5);
+    let n = 0, err = '';
+    while (n < 5 && cur.hasNext()) { cur.next(); n++; }
+    try {
+      const other = new Mongo('$2');
+      try { other.getDB('admin').runCommand({replSetStepDown: 20, force: true}); } catch (e) {}
+    } catch (e) {}
+    try { while (cur.hasNext()) { cur.next(); n++; } }
+    catch (e) { err = e.codeName || String(e.code) || 'error'; }
+    print(n + ' ' + (err === '' ? 'no-error' : err));
+  " 2>&1 | tail -1
+}
+# 40 documents, either all of them or a failure. Anything else is a truncation.
+verdict() { # "count word"
+  local n=${1%% *} err=${1##* }
+  if [ "$n" = "40" ]; then echo complete
+  elif [ "$err" = "no-error" ]; then echo "TRUNCATED at $n"
+  else echo "failed at $n"; fi
+}
+
+echo "== a cursor over an archive answer, across a change of the archive's primary =="
+stopRouter
+docker exec $NODE mongosh "$HOT" --quiet --eval "db.getSiblingDB('shop').$CNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB('shop').$CNS.drop();
+   db.getSiblingDB('shop').$CNS.insertMany(Array.from({length:40},(_,i)=>({_id:i+1,v:i})))" >/dev/null 2>&1
+docker exec $NODE cline watermark --config $BASE --ns shop.$CNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+chk "the fast tier holds none of it"                   "0" \
+    "$(docker exec $NODE mongosh "$HOT" --quiet --eval "print(db.getSiblingDB('shop').$CNS.countDocuments({}))" 2>&1 | tail -1)"
+chk "the archive holds all forty"                      "40" \
+    "$(C "print(db.getSiblingDB('shop').$CNS.countDocuments({}))")"
+startRouter $BASE
+ARCH=$(readAcrossStepDown $CNS "$COLDU")
+echo "      the client saw: $ARCH"
+chk "an archive cursor is not silently truncated"      "true" \
+    "$([ "$(verdict "$ARCH")" != "TRUNCATED at ${ARCH%% *}" ] && echo true || echo false)"
+waitForPrimary
+
+echo "== a cursor over the fast tier, across a change of its primary =="
+stopRouter
+docker exec $NODE mongosh "$HOT" --quiet --eval \
+  "db.getSiblingDB('shop').$CNSU.drop();
+   db.getSiblingDB('shop').$CNSU.insertMany(Array.from({length:40},(_,i)=>({_id:i+1,v:i})))" >/dev/null 2>&1
+startRouter $FOCFG
+FAST=$(readAcrossStepDown $CNSU "$HOT")
+echo "      the client saw: $FAST"
+chk "a fast tier cursor is not silently truncated"     "true" \
+    "$([ "$(verdict "$FAST")" != "TRUNCATED at ${FAST%% *}" ] && echo true || echo false)"
+waitForPrimary
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

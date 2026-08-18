@@ -243,3 +243,59 @@ func (m *Message) ReplyDoc() (bson.Raw, error) {
 		return nil, ErrNotCommand
 	}
 }
+
+// flagExhaustAllowed tells the server the sender will accept several replies to
+// one request, each but the last carrying moreToCome.
+const flagExhaustAllowed = 1 << 16
+
+// ExhaustAllowed reports whether the sender asked for exhaust replies.
+func (m *Message) ExhaustAllowed() bool {
+	if m.Header.OpCode != OpMsg || len(m.Raw) < HeaderLen+4 {
+		return false
+	}
+	flags := binary.LittleEndian.Uint32(m.Raw[HeaderLen : HeaderLen+4])
+	return flags&flagExhaustAllowed != 0
+}
+
+// ClearExhaustAllowed returns the message with the exhaust bit cleared, so the
+// server answers it once.
+//
+// A server sends multiple replies to one request only when this bit is set, and
+// this proxy reads exactly one reply per request. The rest stay in the socket,
+// and every later command on that connection is answered by the one before it.
+// Measured against a real mongod: one getMore with the bit set produced five
+// replies, and through the router the answer to the following ping was a batch
+// of documents from the cursor. With upstream connections pooled, that
+// connection then carries another client's documents to whoever borrows it
+// next.
+//
+// So the bit is cleared on the way through, which the wire protocol allows:
+// setting it never guaranteed multiple replies. An exhaust-capable driver loses
+// a round-trip optimisation and gets the same documents. This is the same
+// remedy as stripping the compressor list, and for the same reason: a flag the
+// client sets for itself must not decide whether this proxy can still follow
+// the conversation.
+//
+// A checksum covers the flags, so one present is removed along with the bit.
+// mongod accepts a message without one, and the router is a new hop that never
+// forwarded the client's bytes unchanged anyway.
+func (m *Message) ClearExhaustAllowed() *Message {
+	if !m.ExhaustAllowed() {
+		return m
+	}
+	raw := make([]byte, len(m.Raw))
+	copy(raw, m.Raw)
+
+	flags := binary.LittleEndian.Uint32(raw[HeaderLen : HeaderLen+4])
+	flags &^= flagExhaustAllowed
+	if flags&flagChecksumPresent != 0 && len(raw) >= HeaderLen+4+4 {
+		flags &^= flagChecksumPresent
+		raw = raw[:len(raw)-4]
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(len(raw)))
+	}
+	binary.LittleEndian.PutUint32(raw[HeaderLen:HeaderLen+4], flags)
+
+	out := *m
+	out.Raw = raw
+	return &out
+}

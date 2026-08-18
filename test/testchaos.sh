@@ -8,8 +8,21 @@
 #   bash test/testchaos.sh
 #
 # Slower than the rest because it waits on real elections.
+#
+# It runs in either authentication mode, because every check here is stated
+# against what the client was told rather than against a fixed number: every
+# acknowledged write is present, none is applied twice, a retry finishes the
+# job. With authentication proxied, writes issued while the fast tier has no
+# primary fail and the client retries. With `terminate_auth` on, the router owns
+# its upstream connections and pools them, so those writes are replayed onto a
+# fresh primary instead, and this is the only thing that exercises that pool
+# during a real election rather than one write at a time:
+#
+#   docker exec thermocline-zelmar-node0 sh -c \
+#     "sed 's/^  listen:/  terminate_auth: true\n  listen:/' /root/cline.yaml > /root/cline_chaos_ta.yaml"
+#   CFG=/root/cline_chaos_ta.yaml bash test/testchaos.sh
 NODE=thermocline-zelmar-node0
-CFG=/root/cline.yaml
+CFG=${CFG:-/root/cline.yaml}
 NS=tprobe
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
@@ -32,6 +45,7 @@ feederUp() { docker exec -d $NODE cline feeder --config $CFG --log-file /var/log
 routerUp() { docker exec -d $NODE cline router --config $CFG --log-file /var/log/cline/chaos_r.log; }
 
 echo "== setup =="
+echo "  config $CFG, terminate_auth $(docker exec $NODE grep -c 'terminate_auth: true' $CFG 2>/dev/null | tail -1)"
 docker exec $NODE pkill -f 'cline feeder|cline router' 2>/dev/null; sleep 2
 docker exec $NODE sh -c 'rm -f /var/log/cline/chaos_*.log'
 H "db.getSiblingDB('shop').$NS.drop()" >/dev/null

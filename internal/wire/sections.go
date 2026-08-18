@@ -74,6 +74,15 @@ func (m *Message) Payloads() map[string][]bson.Raw {
 			if out == nil {
 				out = make(map[string][]bson.Raw, 1)
 			}
+			// One identifier, one sequence. A second sequence with the same
+			// name replaces the first here rather than adding to it, which
+			// would matter if a client could split a write's documents across
+			// two of them and have the guards judge only half. It cannot: the
+			// spec says "each identifier MUST be unique per message", and
+			// measured against mongod 6.0 the server refuses such a message
+			// outright with 40431 "Duplicate document sequence: documents". The
+			// router forwards it and the client gets that error, so nothing
+			// lands on either tier.
 			out[id] = docs
 			pos = secEnd
 		default:

@@ -2,7 +2,10 @@ package router
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -49,6 +52,67 @@ var sessionFields = map[string]bool{
 	"$readPreference": true, "apiVersion": true, "apiStrict": true, "apiDeprecationErrors": true,
 }
 
+// cursorOwner is who a cursor belongs to.
+//
+// A cursor this router owns is served from a registry shared by every
+// connection, because that is what a real MongoDB cursor is: server-scoped, so
+// a driver's pool may send the getMore from whichever connection is free.
+// Nothing else scoped it, and the ids were handed out in sequence from a known
+// starting point, so any client could ask for 2^62+1 and be given the next
+// batch of somebody else's read. Measured: a second connection that had opened
+// nothing named that id, named a collection of its own alongside it, and was
+// answered with the first client's documents and their real namespace.
+//
+// mongod's rule, which this follows: "If authentication is enabled, you can
+// only run getMore against cursors you created. Additionally, for cursors
+// created inside a session, you cannot call getMore outside the session, and
+// for cursors created outside a session, you cannot call getMore inside a
+// session."
+//
+// The user is known only when this router terminates authentication. The
+// session is known whenever the client sends one, which every driver since 3.6
+// does for every command. When there is neither, the cursor is scoped to the
+// connection that opened it, which is stricter than mongod: that combination
+// means a deployment with no authentication and a driver old enough to have no
+// sessions, and the alternative there is handing one client's documents to
+// another.
+type cursorOwner struct {
+	user string
+	lsid string
+	conn *conn
+}
+
+// sameAs reports whether a request may read a cursor this owner opened.
+func (o cursorOwner) sameAs(other cursorOwner) bool {
+	if o.user != other.user {
+		return false
+	}
+	if o.lsid != "" || other.lsid != "" {
+		return o.lsid == other.lsid
+	}
+	if o.user != "" {
+		// Authenticated and sessionless: the user is the whole of the scope,
+		// as it is in mongod.
+		return true
+	}
+	return o.conn == other.conn
+}
+
+// owner is who this connection is, for the purpose of opening and reading
+// cursors.
+func (c *conn) owner(cmd bson.Raw) cursorOwner {
+	o := cursorOwner{conn: c}
+	if c.grants != nil {
+		o.user = c.grants.User
+	}
+	if v, err := cmd.LookupErr("lsid"); err == nil {
+		if doc, ok := v.DocumentOK(); ok {
+			o.lsid = string(doc)
+		}
+	}
+	return o
+}
+
 // archiveCursor is a driver cursor we are serving getMore from.
 //
 // The mutex is not decoration. A driver may issue two getMore calls for the
@@ -59,6 +123,7 @@ type archiveCursor struct {
 	mu       sync.Mutex
 	cur      *mongo.Cursor
 	ns       string
+	owner    cursorOwner
 	lastUsed time.Time
 	closed   bool
 }
@@ -108,13 +173,35 @@ func (reg *cursorRegistry) add(ac *archiveCursor) int64 {
 	defer reg.mu.Unlock()
 	if reg.open == nil {
 		reg.open = make(map[int64]*archiveCursor)
-		reg.next = 1 << 62
 	}
-	reg.next++
-	id := reg.next
+	// The top bit of the range keeps these clear of the ids mongod is handing
+	// out, and the rest is random so that nobody can name one they were not
+	// given. They used to run in sequence from a fixed start, which meant the
+	// first cursor was always 2^62+1 and the second always 2^62+2. Ownership is
+	// checked as well, and this is the half that costs nothing.
+	var id int64
+	for {
+		id = 1<<62 | (randomInt63() >> 1)
+		if _, taken := reg.open[id]; !taken && id > 0 {
+			break
+		}
+	}
 	ac.lastUsed = time.Now()
 	reg.open[id] = ac
 	return id
+}
+
+// randomInt63 returns a non-negative random int64.
+func randomInt63() int64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice, and a predictable id is worth
+		// refusing to produce, so fall back to something that still cannot be
+		// counted off: the clock, which an attacker would have to guess to the
+		// nanosecond.
+		return time.Now().UnixNano()
+	}
+	return int64(binary.BigEndian.Uint64(b[:]) &^ (1 << 63))
 }
 
 func (reg *cursorRegistry) get(id int64) (*archiveCursor, bool) {
@@ -200,7 +287,7 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 
 	var id int64
 	if more {
-		id = c.r.cursors.add(&archiveCursor{cur: cur, ns: ns})
+		id = c.r.cursors.add(&archiveCursor{cur: cur, ns: ns, owner: c.owner(cmd)})
 	} else {
 		_ = cur.Close(ctx)
 	}
@@ -265,6 +352,33 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 	if !ok {
 		return nil, false, nil
 	}
+	// The name has to be the cursor's name. mongod has refused a mismatch since
+	// at least 6.0, measured: "Requested getMore on namespace 'probe.wrongname',
+	// but cursor belongs to a different namespace probe.plain", code 13. This
+	// answered with the cursor's documents under the cursor's namespace, which
+	// is not a wrong answer but is a different one, and it matters beyond
+	// conformance: the authorization gate judges the collection the client
+	// named, so accepting a name the cursor does not have means the check and
+	// the documents are about two different collections.
+	if named, ok := stringField(cmd, "collection"); ok {
+		_, wantColl := splitNS(ac.ns)
+		if named != wantColl {
+			out, cerr := c.wrongCursorNamespace(msg, db(cmd)+"."+named, ac.ns)
+			return out, true, cerr
+		}
+	}
+
+	// A cursor belongs to whoever opened it. Naming somebody else's id is how a
+	// client read another client's documents, and the command's own collection
+	// name is no protection: the batch comes from the cursor, not from the name.
+	if !ac.owner.sameAs(c.owner(cmd)) {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a getMore for a cursor this client did not open",
+			"ns", ac.ns, "cursor", id)
+		out, cerr := c.notYourCursor(msg, id)
+		return out, true, cerr
+	}
 
 	size := firstBatchDefault
 	if v, err := cmd.LookupErr("batchSize"); err == nil {
@@ -285,6 +399,41 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 	}
 	reply, err := cursorReply(msg.Header.RequestID, msg.Header.RequestID, out, ac.ns, "nextBatch", batch)
 	return reply, true, err
+}
+
+// wrongCursorNamespace answers a getMore whose collection is not the cursor's,
+// word for word as mongod does.
+func (c *conn) wrongCursorNamespace(msg *wire.Message, asked, actual string) (*wire.Message, error) {
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: fmt.Sprintf(
+			"Requested getMore on namespace '%s', but cursor belongs to a different namespace %s",
+			asked, actual)},
+		{Key: "code", Value: int32(13)},
+		{Key: "codeName", Value: "Unauthorized"},
+	})
+}
+
+// db reads the database a command was sent to.
+func db(cmd bson.Raw) string {
+	if v, err := cmd.LookupErr("$db"); err == nil {
+		if s, ok := v.StringValueOK(); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// notYourCursor answers the way mongod does when a getMore names a cursor the
+// caller did not open, so a driver sees the error it already handles.
+func (c *conn) notYourCursor(msg *wire.Message, id int64) (*wire.Message, error) {
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: fmt.Sprintf(
+			"cursor id %d was not created by the authenticated user or was created in another session", id)},
+		{Key: "code", Value: int32(13)},
+		{Key: "codeName", Value: "Unauthorized"},
+	})
 }
 
 // archiveKillCursors closes any of the named cursors that are ours, and reports
@@ -309,7 +458,18 @@ func (c *conn) archiveKillCursors(ctx context.Context, cmd bson.Raw) bool {
 			all = false
 			continue
 		}
-		if _, mine := c.r.cursors.get(id); mine {
+		if ac, mine := c.r.cursors.get(id); mine {
+			// Killing is scoped like reading. Otherwise one client could close
+			// another's cursors by counting through ids, and the owner would
+			// see its read stop halfway with no explanation.
+			if !ac.owner.sameAs(c.owner(cmd)) {
+				c.log.Warn("ignored a killCursors for a cursor this client did not open",
+					"ns", ac.ns, "cursor", id)
+				// mongod reports an id it will not act on under cursorsNotFound
+				// rather than failing the command, and this is ours to answer,
+				// so say it is not here.
+				continue
+			}
 			c.r.cursors.drop(ctx, id)
 			continue
 		}
@@ -658,6 +818,10 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 			c.log.Debug("read answered from the archive", "ns", ns, "command", name, "because", because)
 			return out, true
 		}
+		if out, passed := c.r.serverErrorReply(msg.Header.RequestID, msg.Header.RequestID, aerr); passed {
+			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
+			return out, true
+		}
 		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
 	}
 
@@ -759,4 +923,63 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 		return nil, err
 	}
 	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, doc)
+}
+
+// serverErrorReply rebuilds an error the archive returned, so the client sees
+// what MongoDB said rather than what this proxy made of it.
+//
+// The archive is a MongoDB cluster holding the same collection, so a command it
+// rejects is a command MongoDB rejects. An unknown operator, a malformed
+// projection, a duplicate key: the answer to all of those is the server's own,
+// and an application branches on the code, not on the prose. Replacing them with
+// a generic CommandFailed and a sentence about completeness turned the
+// application's own bug into an infrastructure mystery, and turned an error a
+// driver knows how to act on into one it does not.
+//
+// Only errors carrying a server code are passed through. A timeout or a dropped
+// connection to the archive is this system failing to answer, not MongoDB
+// refusing to, and those still take the caller's refusal path.
+func (r *Router) serverErrorReply(requestID, responseTo int32, err error) (*wire.Message, bool) {
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) {
+		return nil, false
+	}
+	if ce.Code == 0 {
+		return nil, false
+	}
+	// A network error the driver wrapped in a CommandError is still a network
+	// error: it belongs to the connection to the archive and not to the command.
+	if ce.HasErrorLabel("NetworkError") {
+		return nil, false
+	}
+	// The archive is reached with the router's own credentials, so an
+	// authorization failure there is a statement about this deployment's
+	// configuration and not about the caller. Handing it to the client would
+	// tell an application it lacks a privilege it does in fact hold, and send
+	// whoever investigates to the wrong cluster. The caller's refusal, which
+	// names what an operator can do, is the honest answer to those.
+	switch ce.Code {
+	case 13, 18: // Unauthorized, AuthenticationFailed
+		return nil, false
+	}
+	out := bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: ce.Message},
+		{Key: "code", Value: ce.Code},
+	}
+	if ce.Name != "" {
+		out = append(out, bson.E{Key: "codeName", Value: ce.Name})
+	}
+	if len(ce.Labels) > 0 {
+		labels := make(bson.A, 0, len(ce.Labels))
+		for _, l := range ce.Labels {
+			labels = append(labels, l)
+		}
+		out = append(out, bson.E{Key: "errorLabels", Value: labels})
+	}
+	msg, merr := wire.NewMsg(requestID, responseTo, out)
+	if merr != nil {
+		return nil, false
+	}
+	return msg, true
 }
