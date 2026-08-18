@@ -350,6 +350,25 @@ place in the pool rather than being handed on.
 No driver in the test harness can set the bit, so `test/exhaust` is a client
 written to do it.
 
+### A client that compresses uninvited
+
+The compressor list is removed from the handshake in both directions, so the
+negotiation never succeeds and a conforming driver never compresses. A client
+that compresses anyway is a different question, and the answer used to be that
+the message was logged and forwarded, which is every guard off for that command.
+
+Measured against a collection whose documents were only in the archive: an
+insert of an `_id` the archive still held was refused with E11000 when sent
+plainly, and accepted when the same insert was wrapped in OP_COMPRESSED, landing
+on the fast tier for the feeder to mirror over the archived record. That is the
+original compression finding still live, reached by ignoring the negotiation
+rather than by winning it.
+
+A compressed message is now refused, in an uncompressed reply that names the
+remedy, and the connection ends with it: there is no way to know whether what
+follows is readable either. `test/compressed` is the client that compresses
+uninvited, since no driver in the harness will.
+
 ### Whose cursor is it
 
 A cursor over an archive answer is this router's, not the fast tier's, so it is

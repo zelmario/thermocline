@@ -354,14 +354,36 @@ func (c *conn) pump(ctx context.Context) error {
 		c.r.Stats.Commands.Add(1)
 
 		// Nothing should arrive compressed, because the handshake never agrees
-		// a compressor. If one does, the command cannot be read and therefore
-		// cannot be guarded, and that has to be said rather than discovered.
+		// a compressor: the list is removed from the client's hello and from
+		// the reply. A client that compresses anyway is sending something this
+		// proxy cannot read, and a command it cannot read is a command with no
+		// guard on it.
+		//
+		// It used to be logged and forwarded. Measured against a client that
+		// compressed uninvited: an insert of an _id the archive still held was
+		// refused with E11000 when sent plainly, and accepted when sent through
+		// zlib, landing on the fast tier for the feeder to mirror over the
+		// archived record. That is the compression finding still live, reached
+		// by ignoring the negotiation rather than by winning it.
+		//
+		// So it is refused, and the connection goes with it. The client is told
+		// why in an uncompressed reply, which the protocol allows, and the
+		// connection ends because there is no way to know whether what follows
+		// is readable either. A conforming driver never reaches this.
 		if msg.Header.OpCode == wire.OpCompressed {
 			c.r.Stats.Unreadable.Add(1)
-			c.log.Warn("a compressed message arrived and cannot be inspected",
-				"effect", "no guard runs for it: unique keys, completeness and copy-up are all skipped",
-				"remedy", "remove compressors from the connection string, or put the router behind "+
-					"a client that does not compress")
+			c.r.Stats.Refused.Add(1)
+			c.log.Error("refused a compressed message and closed the connection",
+				"why", "this proxy cannot read OP_COMPRESSED, so no guard could run for it",
+				"remedy", "remove compressors from the connection string")
+			out, cerr := c.r.commandError(0, msg.Header.RequestID,
+				"thermocline: refusing a compressed message. This proxy cannot read OP_COMPRESSED, "+
+					"so none of its tiering guards could run for it. The handshake does not agree a "+
+					"compressor for exactly this reason; remove compressors from the connection string.")
+			if cerr == nil {
+				_ = wire.Write(c.client, out)
+			}
+			return fmt.Errorf("compressed message on a connection that never negotiated one")
 		}
 
 		// Timed around the whole exchange, so what is recorded is what the

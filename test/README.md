@@ -48,6 +48,8 @@ Or one at a time:
     docker exec <node> bash /root/testretry.sh     # $sample on a partial tier, and retryable writes
     docker exec <node> bash /root/testpool.sh      # whether idle clients still cost an upstream connection
     go run ./test/exhaust 127.0.0.1:27600 router    # the OP_MSG exhaust bit (host side, see exhaust/README.md)
+    go run ./test/cursorowner 127.0.0.1:27600      # whether one client can read another's cursor
+    go run ./test/compressed 127.0.0.1:27600       # a client that compresses without being invited to
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
 
