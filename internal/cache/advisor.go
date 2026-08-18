@@ -86,6 +86,10 @@ type Advisor struct {
 	maxParams int
 	now       func() time.Time
 	maxTTL    time.Duration
+
+	// cached is the last ranking worked out, and when. See Report.
+	cached   []Advice
+	cachedAt time.Time
 }
 
 // NewAdvisor returns an advisor bounded to maxShapes query shapes, each
@@ -115,6 +119,7 @@ func (a *Advisor) Observe(shape, ns string, params, result uint64) {
 	}
 	s.executions++
 	s.lastSeen = now
+	a.cached = nil
 
 	p, ok := s.params[params]
 	if !ok {
@@ -186,6 +191,16 @@ func (a *Advisor) Report(limit int) []Advice {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Held briefly, because the dashboard asks every two seconds and this walks
+	// every shape and every parameter set it has ever seen, then sorts them. At
+	// the bound that is a hundred thousand rows sorted twice a second to render
+	// twelve of them, which is a strange amount of work for a page that is
+	// watching for something to happen. A report a second old is the same
+	// report.
+	if a.cached != nil && a.now().Sub(a.cachedAt) < reportFor {
+		return capReport(a.cached, limit)
+	}
+
 	var out []Advice
 	for shape, s := range a.shapes {
 		for _, p := range s.params {
@@ -219,10 +234,26 @@ func (a *Advisor) Report(limit int) []Advice {
 		}
 		return out[i].Shape < out[j].Shape
 	})
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	// Only the head is kept: nobody reads past the first page of a ranking, and
+	// holding the whole thing to satisfy a limit of twelve is the same waste in
+	// a different place.
+	a.cached = capReport(out, reportKeep)
+	a.cachedAt = a.now()
+	return capReport(a.cached, limit)
+}
+
+// reportFor is how long a report stands before it is worked out again.
+const reportFor = time.Second
+
+// reportKeep is how many rows are held between recomputations. More than any
+// caller asks for, few enough that holding them costs nothing.
+const reportKeep = 100
+
+func capReport(rows []Advice, limit int) []Advice {
+	if limit > 0 && len(rows) > limit {
+		return rows[:limit]
 	}
-	return out
+	return rows
 }
 
 // stabilityOf is the shortest period this answer was observed to hold, or how

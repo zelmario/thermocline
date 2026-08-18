@@ -140,3 +140,47 @@ func TestShapeSeparatesTheQueryFromItsValues(t *testing.T) {
 		t.Errorf("the session changed the shape:\n%s\n%s", s1, s4)
 	}
 }
+
+// The dashboard asks twice a second and this walks every shape and every
+// parameter set, then sorts them. A report a second old is the same report.
+func TestTheReportIsNotRecomputedForEveryLook(t *testing.T) {
+	a := NewAdvisor(100, 100, time.Hour)
+	k := &clock{t: time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)}
+	a.now = k.now
+
+	for i := 0; i < 4; i++ {
+		a.Observe("count shop.users query={}", "shop.users", 1, 7)
+		k.add(time.Second)
+	}
+	first := a.Report(10)
+	if len(first) != 1 {
+		t.Fatalf("rows = %d, want 1", len(first))
+	}
+
+	// Nothing observed, no time passed: the same rows come back without the
+	// work being done again.
+	if a.cached == nil {
+		t.Fatal("the report was not held at all")
+	}
+	held := a.cached
+	_ = a.Report(10)
+	if &held[0] != &a.cached[0] {
+		t.Error("the report was worked out again for a second look in the same second")
+	}
+
+	// A new observation makes it stale, because a report that cannot change is
+	// worse than one that costs something.
+	a.Observe("count shop.users query={}", "shop.users", 1, 8)
+	if a.cached != nil {
+		t.Error("an observation left a stale report standing")
+	}
+
+	// And a second later it is worked out again regardless.
+	_ = a.Report(10)
+	k.add(2 * time.Second)
+	before := a.cachedAt
+	_ = a.Report(10)
+	if !a.cachedAt.After(before) {
+		t.Error("the report was never refreshed after it went stale")
+	}
+}

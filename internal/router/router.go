@@ -213,7 +213,11 @@ func (r *Router) enableCache() {
 // maxParamsPerShape bounds how many distinct parameter sets are remembered for
 // one query shape. A shape asked with more than this many different values has
 // little repetition to exploit, and saying so is the finding.
-const maxParamsPerShape = 200
+//
+// Fifty rather than two hundred, because this multiplies: the bound on watched
+// queries times this is the bound on rows held, and at a thousand shapes the
+// larger number is a hundred thousand of them for no more insight.
+const maxParamsPerShape = 50
 
 func (r *Router) Listen(ctx context.Context) error {
 	r.enableCache()
