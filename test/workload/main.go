@@ -82,6 +82,7 @@ func main() {
 
 	dbName, collName := split(*ns)
 	coll := client.Database(dbName).Collection(collName)
+	marker := client.Database(dbName).Collection(collName + "_workload")
 	period := time.Duration(*days) * 24 * time.Hour
 	start := time.Now().Add(-period)
 
@@ -90,6 +91,27 @@ func main() {
 		if err := loadDocs(ctx, coll, *load, start, period); err != nil {
 			die("load: %v", err)
 		}
+		if err := writeMarker(ctx, marker, start, *load, *days); err != nil {
+			die("record what was loaded: %v", err)
+		}
+	} else {
+		// The ids carry the timestamps they were built with, so a later run has
+		// to rebuild exactly the same ones. Deriving the window from "now"
+		// again silently shifts every id by however long passed since the load,
+		// and then every point lookup misses.
+		//
+		// That is not a hypothetical: it made a whole run meaningless. The
+		// router reported 90% of reads as "the archive, then copied up", which
+		// was not tiering being exercised, it was 18,064 lookups of documents
+		// that had never existed.
+		ms, err := readMarker(ctx, marker)
+		if err != nil {
+			die("this collection was not loaded by this tool, so the ids cannot be rebuilt: %v", err)
+		}
+		start, *load, *days = ms.Start, ms.N, ms.Days
+		period = time.Duration(*days) * 24 * time.Hour
+		fmt.Printf("reusing the load of %s documents over %d days from %s\n",
+			commas(*load), *days, ms.Start.Format(time.RFC3339))
 	}
 
 	fmt.Printf("reading: %s reads, %d clients, %.0f%% of them in the newest tenth (exponent %.1f), %.0f%% ranges\n",
@@ -103,6 +125,28 @@ func main() {
 	after := readClasses(*snapshot)
 	res.report(*load, *days)
 	reportClasses(before, after)
+}
+
+// marker records what a load did, so a later read phase rebuilds the same ids
+// rather than deriving them from a clock that has moved on.
+type marker struct {
+	Start time.Time `bson:"start"`
+	N     int       `bson:"n"`
+	Days  int       `bson:"days"`
+}
+
+func writeMarker(ctx context.Context, coll *mongo.Collection, start time.Time, n, days int) error {
+	_, err := coll.ReplaceOne(ctx,
+		bson.D{{Key: "_id", Value: "run"}},
+		marker{Start: start, N: n, Days: days},
+		options.Replace().SetUpsert(true))
+	return err
+}
+
+func readMarker(ctx context.Context, coll *mongo.Collection) (marker, error) {
+	var m marker
+	err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: "run"}}).Decode(&m)
+	return m, err
 }
 
 // loadDocs writes documents whose ids carry their age, which is how the evictor
@@ -254,6 +298,12 @@ func decile(seq, n int) int {
 
 func (r *result) report(n, days int) {
 	total := len(r.lat) + len(r.rangeLat)
+	if total == 0 {
+		// A load-only run. There is nothing to say about reads that were not
+		// made, and saying it as NaN per cent helps nobody.
+		fmt.Println("\nloaded, no reads asked for")
+		return
+	}
 	fmt.Printf("\n%s reads in %s, %.0f/s, %d errors\n",
 		commas(total), r.elapsed.Round(time.Millisecond),
 		float64(total)/r.elapsed.Seconds(), r.errs)

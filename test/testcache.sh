@@ -181,15 +181,25 @@ chk "some reads were served from the cache"        "true" \
 echo "== with the cache off, it still measures =="
 # The advice is the reason to turn caching on, so it cannot need caching to be
 # on already.
+#
+# The config is derived with caching explicitly off rather than by assuming the
+# shared one has it off, because the whole sweep can be run with it on and then
+# this section was testing the opposite of what it says.
+OFFCFG=/root/cline_cacheoff.yaml
+if grep -q '^  cache:' $CFG; then
+  sed 's/^\( *\)enabled: true/\1enabled: false/' $CFG > $OFFCFG
+else
+  cp $CFG $OFFCFG
+fi
 C 'db.getSiblingDB("_thermocline").cacheadvice.deleteMany({})' >/dev/null
-startRouter $CFG
+startRouter $OFFCFG
 for _ in $(seq 1 4); do
   R "db.getSiblingDB('shop').$NS.countDocuments({country:'BR'})" >/dev/null
   sleep 1
 done
 stopDaemons
 sleep 2
-OFF=$(cline cache --config $CFG --top 5 2>&1)
+OFF=$(cline cache --config $OFFCFG --top 5 2>&1)
 chk "it publishes with the cache off"              "true" \
     "$(echo "$OFF" | grep -q 'measuring only' && echo true || echo false)"
 chk "and still has something to suggest"           "true" \
