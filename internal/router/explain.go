@@ -38,7 +38,12 @@ func (c *conn) annotateExplain(ctx context.Context, msg *wire.Message, db string
 	}
 	inner, ok := cmd.Lookup("explain").DocumentOK()
 	if !ok {
-		return nil, false
+		// The inline form explains the command it is part of, so that command
+		// is its own inner one.
+		if !inlineExplain(cmd) {
+			return nil, false
+		}
+		inner = cmd
 	}
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
@@ -163,4 +168,34 @@ func explainBound(inner bson.Raw, name string) (bound time.Time, bounded bool) {
 		return time.Time{}, false
 	}
 	return lowerTimeBound(doc)
+}
+
+// inlineExplain reports whether a command plans instead of running.
+//
+// aggregate takes explain: true in the command itself rather than being wrapped
+// in an explain command, and both forms are ordinary: the shell sends the
+// wrapped one and several drivers send this. A command that only plans must not
+// have anything done on its behalf.
+func inlineExplain(cmd bson.Raw) bool {
+	v, err := cmd.LookupErr("explain")
+	if err != nil {
+		return false
+	}
+	if b, ok := v.BooleanOK(); ok {
+		return b
+	}
+	// Some drivers send a document carrying the verbosity. Anything but a false
+	// boolean is an explain.
+	_, isDoc := v.DocumentOK()
+	return isDoc
+}
+
+// inlineExplainOf is inlineExplain for a message whose command has not been
+// read yet.
+func inlineExplainOf(msg *wire.Message) bool {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return false
+	}
+	return inlineExplain(cmd)
 }

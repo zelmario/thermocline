@@ -495,17 +495,38 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
 	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
-		// The target of a $merge is judged first and separately from the input.
-		// A pipeline reading something untiered, or nothing at all, still writes
-		// into a collection that may be tiered, and the merge decides what to do
-		// by looking at what it can see there. See mergetarget.go.
-		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+		// An aggregation can carry explain: true instead of being wrapped in an
+		// explain command, and then it plans rather than runs. Every guard below
+		// exists to make a pipeline that runs come out right, and each of them
+		// does something to make that so: the merge target guard copies archived
+		// documents up, and the completeness guard runs a writing pipeline
+		// itself when the input is archived.
+		//
+		// Doing any of that for an explain is a side effect mongod does not
+		// have. Measured: aggregate with $out and explain: true wrote nothing on
+		// mongod, and through the router it wrote all ten documents into the
+		// target and returned no plan at all. The client asked what would happen
+		// and was told nothing, having had it happen.
+		//
+		// So an explained aggregation is forwarded untouched and its plan is
+		// annotated on the way back, which is what the explain command already
+		// does.
+		cmd, cerr := msg.CommandDoc()
+		explainOnly := cerr == nil && inlineExplain(cmd)
+		if cerr == nil && !explainOnly {
+			// The target of a $merge is judged first and separately from the
+			// input. A pipeline reading something untiered, or nothing at all,
+			// still writes into a collection that may be tiered, and the merge
+			// decides what to do by looking at what it can see there. See
+			// mergetarget.go.
 			if out, done := c.guardMergeTarget(ctx, msg, cmd, db); done {
 				return wire.Write(c.client, out)
 			}
 		}
-		if out, done := c.guardAggregate(ctx, msg, db); done {
-			return wire.Write(c.client, out)
+		if !explainOnly {
+			if out, done := c.guardAggregate(ctx, msg, db); done {
+				return wire.Write(c.client, out)
+			}
 		}
 	}
 
@@ -765,7 +786,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 	// An explain describes the fast tier, which may not be where the query it
 	// explains would run. Say so beside the plan rather than instead of it.
-	if name == "explain" {
+	if name == "explain" || (name == "aggregate" && inlineExplainOf(msg)) {
 		if out, done := c.annotateExplain(ctx, msg, db, reply); done {
 			return wire.Write(c.client, out)
 		}

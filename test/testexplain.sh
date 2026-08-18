@@ -113,6 +113,30 @@ chk "an explained count is annotated"                   "false" \
 chk "an explained distinct is annotated"                "false" \
     "$(R "const e=db.getSiblingDB('shop').runCommand({explain:{distinct:'$NS',key:'grp'}}); print(e.thermocline.fastTierComplete)")"
 
+echo "== an explain must not do the thing it is explaining =="
+# An aggregation can carry explain: true in the command itself instead of being
+# wrapped in an explain command, and then it plans rather than runs. Every guard
+# on the aggregate path does something on the pipeline's behalf: the merge target
+# guard copies archived documents up, and the completeness guard runs a writing
+# pipeline itself when the input is archived. Doing either for an explain is a
+# side effect mongod does not have.
+#
+# Measured before the fix: aggregate with $out and explain: true wrote all ten
+# documents into the target and returned no plan at all. mongod wrote nothing.
+H "db.getSiblingDB('shop').texplout.drop()" >/dev/null
+EXPOUT=$(R "const r=db.getSiblingDB('shop').runCommand({aggregate:'$NS',
+              pipeline:[{\$match:{}},{\$out:'texplout'}], explain:true});
+            print((r.ok===1 && (!!r.stages || !!r.queryPlanner)) ? 'planned' : 'no plan')")
+chk "an explained \$out comes back as a plan"           "planned" "$EXPOUT"
+chk "and it wrote nothing"                              "0"     "$(H "print(db.getSiblingDB('shop').texplout.countDocuments({}))")"
+chk "the plan is annotated like any other"              "false"     "$(R "const r=db.getSiblingDB('shop').runCommand({aggregate:'$NS',
+            pipeline:[{\$match:{}},{\$group:{_id:null,n:{\$sum:1}}}], explain:true});
+          print(r.thermocline.fastTierComplete)")"
+# The control. Without cursor and explain the same pipeline still runs, or the
+# fix would have turned every writing aggregation into a plan.
+chk "the same pipeline still runs when asked to"        "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"     "$(R "db.getSiblingDB('shop').runCommand({aggregate:'$NS',pipeline:[{\$match:{}},{\$out:'texplout'}],cursor:{}});
+          print(db.getSiblingDB('shop').texplout.countDocuments({}))")"
+
 echo "== and a collection nobody tiers is never touched =="
 H "db.getSiblingDB('shop').texplfree.drop(); db.getSiblingDB('shop').texplfree.insertOne({_id:1})" >/dev/null
 chk "an untiered collection's explain is untouched"     "false" \

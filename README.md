@@ -350,6 +350,22 @@ place in the pool rather than being handed on.
 No driver in the test harness can set the bit, so `test/exhaust` is a client
 written to do it.
 
+### An explain must not do the thing it explains
+
+An aggregation can carry `explain: true` in the command itself rather than being
+wrapped in an `explain` command, and then it plans rather than runs. Every guard
+on that path does something on the pipeline's behalf: the merge target guard
+copies archived documents up, and the completeness guard runs a writing pipeline
+itself when the input is archived.
+
+Measured: `aggregate` with `$out` and `explain: true` wrote nothing on mongod,
+and through the router it wrote all ten documents into the target and returned no
+plan at all. The client asked what would happen and was told nothing, having had
+it happen.
+
+An explained aggregation is forwarded untouched now and its plan is annotated on
+the way back, which is what the wrapped form already got.
+
 ### A client that compresses uninvited
 
 The compressor list is removed from the handshake in both directions, so the
