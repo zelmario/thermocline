@@ -42,10 +42,13 @@ Usage:
   cline watermark --config FILE [--ns NS] [--clear | --complete-all | --complete-from T]
                                           show or edit what the fast tier claims to hold
   cline indexes  --config FILE [--ns NS]
-  cline cache    --config FILE [--top N] [--ns NS]
                                           compare both tiers' indexes, so a
                                           read that falls through is not left
                                           scanning the archive
+  cline cache    --config FILE [--top N] [--ns NS]
+                                          which queries would be worth caching,
+                                          and for how long, from what the router
+                                          has watched go past
   cline keys     --config FILE [--rebuild]
                                           unique keys that must survive eviction
   cline pause    --config FILE [--reason WHY]

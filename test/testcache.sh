@@ -47,7 +47,15 @@ echo "== setup =="
 stopDaemons
 # The cache is off in the shared config, so this one is derived rather than
 # edited: every other suite runs without it and must keep doing so.
-sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' $CFG > $CCFG
+#
+# Unless the whole sweep is being run with it on, which is a thing worth doing
+# and would otherwise leave two cache blocks in one file. Then the base config
+# is already what this suite wants.
+if grep -q '^  cache:' $CFG; then
+  sed 's/^\( *\)enabled: false/\1enabled: true/' $CFG > $CCFG
+else
+  sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' $CFG > $CCFG
+fi
 chk "the derived config turns the cache on" "1" "$(grep -c 'enabled: true' $CCFG)"
 H "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').$NS.insertMany(
    Array.from({length:60},(_,i)=>({_id:i, country:['UY','AR','BR'][i%3], n:i})))" >/dev/null
@@ -88,7 +96,9 @@ echo "== a cached answer still expires =="
 #
 # What must hold is that a steady stream of reads keeps going back to the tiers.
 TCFG=/root/cline_cachettl.yaml
-sed 's/    max_ttl: 60s/    max_ttl: 2s/' $CCFG > $TCFG
+# Whatever the ceiling was, two seconds for this one: the check is that a steady
+# read loop keeps going back to the tiers as it expires.
+sed 's/^\( *\)max_ttl: .*/\1max_ttl: 2s/' $CCFG > $TCFG
 stopDaemons
 startRouter $TCFG
 STEADY=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
