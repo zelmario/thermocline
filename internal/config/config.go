@@ -528,6 +528,23 @@ type CacheConfig struct {
 	// MaxTTL is the ceiling on a learned TTL. A query that has not changed
 	// since the router started is not proof that it never will.
 	MaxTTL Duration `yaml:"max_ttl"`
+	// Measure keeps watching queries even when nothing is being cached, which
+	// is what makes `cline cache` and the dashboard able to say whether caching
+	// would be worth turning on. On by default.
+	//
+	// It is a switch of its own because it is not free: a hash of every reply
+	// and a bounded table of shapes. An operator who has decided against
+	// caching, or who is counting every megabyte, can have neither half.
+	Measure *bool `yaml:"measure"`
+}
+
+// Measuring reports whether the advisor should run. Absent means yes, which is
+// why this is a pointer: "off" has to be distinguishable from "not mentioned".
+func (c CacheConfig) Measuring() bool {
+	if c.Measure == nil {
+		return true
+	}
+	return *c.Measure
 }
 
 // TLSConfig is the certificate a router presents to its clients, and what it

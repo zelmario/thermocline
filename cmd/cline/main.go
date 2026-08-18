@@ -393,27 +393,61 @@ func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {
 	// feature, and the first thing it needs is health readings that mean
 	// something there.
 	if name == "hot" {
-		if sharded, err := isMongos(pingCtx, client); err == nil && sharded {
+		kind, herr := kindOfTier(pingCtx, client)
+		switch {
+		case herr != nil:
+			// Unreadable rather than wrong: say so and let the caller decide.
+			return nil, fmt.Errorf("ask the fast tier what it is: %w", herr)
+		case kind == tierMongos:
 			return nil, fmt.Errorf("the fast tier is a mongos, and sharded fast tiers are not supported: " +
 				"this proxies to one primary address, which a mongos does not have, and every health " +
 				"reading the evictor pauses on is a replica set's. Point cline at a replica set")
+		case kind == tierStandalone:
+			// A standalone has no oplog, so no change stream, so nothing to
+			// mirror from: the feeder used to sit there retrying and the router
+			// stopped with "fast tier reported no primary address", which is
+			// true and explains nothing. One member is enough, and that is what
+			// the development pair is.
+			return nil, fmt.Errorf("the fast tier is a standalone mongod, and this needs a replica set: " +
+				"the feeder mirrors from a change stream and a standalone has no oplog to open one on. " +
+				"A single-member replica set is enough. Run rs.initiate() on it, or start it with --replSet")
 		}
 	}
 	return client, nil
 }
 
-// isMongos reports whether a connection lands on a router rather than a replica
-// set. mongos identifies itself in hello with msg: "isdbgrid", which is the
-// same field a driver uses to decide it is talking to a sharded cluster.
-func isMongos(ctx context.Context, client *mongo.Client) (bool, error) {
+// tierKind is what a connection landed on, which decides whether this can work
+// against it at all.
+type tierKind int
+
+const (
+	tierReplicaSet tierKind = iota
+	tierMongos
+	tierStandalone
+)
+
+// tierKind asks the server what it is.
+//
+// mongos says so in hello with msg: "isdbgrid", which is the same field a
+// driver reads to decide it is talking to a sharded cluster. A replica set
+// member names its set in setName. Anything else is a standalone.
+func kindOfTier(ctx context.Context, client *mongo.Client) (tierKind, error) {
 	var hello struct {
-		Msg string `bson:"msg"`
+		Msg     string `bson:"msg"`
+		SetName string `bson:"setName"`
 	}
 	if err := client.Database("admin").
 		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
-		return false, err
+		return tierReplicaSet, err
 	}
-	return hello.Msg == "isdbgrid", nil
+	switch {
+	case hello.Msg == "isdbgrid":
+		return tierMongos, nil
+	case hello.SetName == "":
+		return tierStandalone, nil
+	default:
+		return tierReplicaSet, nil
+	}
 }
 
 func disconnect(client *mongo.Client, log *slog.Logger) {

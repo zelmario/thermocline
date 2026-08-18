@@ -179,14 +179,22 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 // Listen serves until ctx is cancelled.
 // enableCache builds the query cache when the configuration asks for one.
 func (r *Router) enableCache() {
-	// The advisor always runs. It answers "what would caching be worth here",
-	// which is a question worth having an answer to before anybody turns the
-	// cache on, and it costs a hash and a map entry per read.
-	r.advisor = cache.NewAdvisor(r.cfg.Cache.MaxQueries, maxParamsPerShape, r.cfg.Cache.MaxTTL.D())
+	// The advisor runs by default, whether or not anything is cached: it
+	// answers "what would caching be worth here", which is the question a
+	// decision to turn the cache on should be made from. It costs a hash and a
+	// bounded table, and router.cache.measure turns even that off.
+	if r.cfg.Cache.Measuring() {
+		r.advisor = cache.NewAdvisor(r.cfg.Cache.MaxQueries, maxParamsPerShape, r.cfg.Cache.MaxTTL.D())
+	}
 
 	if !r.cfg.Cache.Enabled {
-		r.log.Info("query cache off, still measuring",
-			"note", "run `cline cache` to see which queries would be worth caching and for how long")
+		if r.advisor == nil {
+			r.log.Info("query cache off, and not measuring either",
+				"note", "set router.cache.measure to have it say what caching would be worth")
+		} else {
+			r.log.Info("query cache off, still measuring",
+				"note", "run `cline cache` to see which queries would be worth caching and for how long")
+		}
 		return
 	}
 	r.cache = cache.New(r.cfg.Cache.MaxQueries, r.cfg.Cache.MaxTTL.D())
@@ -239,6 +247,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	}()
 	go r.reapCursors(ctx)
 	go r.reportAdvice(ctx)
+	go r.watchForInvalidation(ctx)
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),

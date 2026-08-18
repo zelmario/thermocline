@@ -215,6 +215,29 @@ func (c *Cache) Counters() (hits, misses uint64) {
 	return c.Hits, c.Misses
 }
 
+// InvalidateDatabase drops everything learned for every collection in a
+// database, which is what a dropDatabase means: the answers it was holding are
+// answers about data that no longer exists.
+func (c *Cache) InvalidateDatabase(db string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := db + "."
+	n := 0
+	for ns, keys := range c.byNS {
+		if len(ns) <= len(prefix) || ns[:len(prefix)] != prefix {
+			continue
+		}
+		for k := range keys {
+			if h, ok := c.byKey[k]; ok && h.entry != nil {
+				n++
+			}
+			delete(c.byKey, k)
+		}
+		delete(c.byNS, ns)
+	}
+	return n
+}
+
 // Len reports how many queries are being watched.
 func (c *Cache) Len() int {
 	c.mu.Lock()

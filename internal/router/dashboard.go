@@ -37,7 +37,65 @@ type Snapshot struct {
 	Counters    map[string]int64 `json:"counters"`
 	Metrics     MetricsSnapshot  `json:"metrics"`
 	Inventory   Inventory        `json:"inventory"`
+	Cache       CacheSnapshot    `json:"cache"`
 }
+
+// CacheSnapshot is what the dashboard shows about the learned cache: whether it
+// is serving, how well, and which queries it thinks are worth caching.
+//
+// The advice is there whether or not the cache is on, because it is the reason
+// to turn it on. An operator looking at this page is deciding, and the numbers
+// they need for that decision are the ones they cannot get by turning it on and
+// hoping.
+type CacheSnapshot struct {
+	Enabled bool          `json:"enabled"`
+	Shapes  int           `json:"shapes"`
+	Hits    uint64        `json:"hits"`
+	Misses  uint64        `json:"misses"`
+	HitRate float64       `json:"hit_rate"`
+	Advice  []CacheAdvice `json:"advice"`
+}
+
+// CacheAdvice is one row: a query, how often it is asked, how long its answer
+// holds, and what that justifies caching it for.
+type CacheAdvice struct {
+	Shape      string `json:"shape"`
+	NS         string `json:"ns"`
+	Executions uint64 `json:"executions"`
+	Params     int    `json:"params"`
+	StableMS   int64  `json:"stable_ms"`
+	SuggestMS  int64  `json:"suggest_ms"`
+}
+
+// cacheSnapshot reads what the cache and the advisor know.
+func (r *Router) cacheSnapshot() CacheSnapshot {
+	out := CacheSnapshot{Enabled: r.cache != nil}
+	if r.cache != nil {
+		out.Hits, out.Misses = r.cache.Counters()
+		if total := out.Hits + out.Misses; total > 0 {
+			out.HitRate = float64(out.Hits) / float64(total)
+		}
+	}
+	if r.advisor == nil {
+		return out
+	}
+	out.Shapes = r.advisor.Shapes()
+	for _, a := range r.advisor.Report(dashboardAdviceRows) {
+		out.Advice = append(out.Advice, CacheAdvice{
+			Shape:      a.Shape,
+			NS:         a.NS,
+			Executions: a.Executions,
+			Params:     a.Params,
+			StableMS:   a.Stable.Milliseconds(),
+			SuggestMS:  a.Suggested.Milliseconds(),
+		})
+	}
+	return out
+}
+
+// dashboardAdviceRows is how many suggestions the page shows. Enough to act on,
+// few enough to read without scrolling past the rest of the page.
+const dashboardAdviceRows = 12
 
 // SnapshotAll gathers everything the dashboard needs in one read.
 func (r *Router) SnapshotAll() Snapshot {
@@ -47,6 +105,7 @@ func (r *Router) SnapshotAll() Snapshot {
 		Listen:      r.Addr(),
 		FastTier:    r.currentPrimary(),
 		Completenes: string(r.cfg.Completeness),
+		Cache:       r.cacheSnapshot(),
 		FeederID:    r.cfg.FeederID,
 		ArchiveWait: r.cfg.ArchiveWait.String(),
 		Counters: map[string]int64{

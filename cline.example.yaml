@@ -204,6 +204,15 @@ router:
   #   enabled: false
   #   max_queries: 1000
   #   max_ttl: 1m
+  #   # The measuring is a switch of its own, because it is not free: a hash of
+  #   # every reply and a bounded table of query shapes. On by default, so the
+  #   # report is there when you go looking; set it to false to have neither
+  #   # half.
+  #   measure: true
+
+  # The operator dashboard is off unless router.dashboard names an address, and
+  # turning it off costs nothing else: the page and its snapshot are only built
+  # when something asks for them.
 
   # TLS for the clients that connect here.
   #

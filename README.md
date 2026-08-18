@@ -815,7 +815,15 @@ reading it is concerned.
 
 **The measuring runs whether or not the caching does.** The advice is the reason
 to turn caching on, so it cannot require caching to be on already. With
-`router.cache.enabled` the same measurements drive the TTLs.
+`router.cache.enabled` the same measurements drive the TTLs. The dashboard shows
+the same table, so the decision can be made from the page rather than the
+command line.
+
+**All of it can be turned off.** The dashboard is off unless `router.dashboard`
+names an address; the caching is off unless `router.cache.enabled`; and the
+measuring, which costs a hash of every reply and a bounded table of shapes, is
+off with `router.cache.measure: false`. A router with all three off does exactly
+what it did before any of this existed.
 
 ### What the cache will not do
 
@@ -830,9 +838,19 @@ an answer is not an answer.
 **A write through the router drops what was learned about that collection**,
 rather than waiting out a timer. That is what makes this correct for the writer
 rather than merely fast: the ordinary pattern of writing and then reading the
-same collection is right immediately. What the router cannot see is another
-writer, and the learned TTL is the whole of that exposure, bounded again by
-`max_ttl`.
+same collection is right immediately.
+
+**And a write by anybody else drops it too.** The fast tier publishes every
+change it makes and this system is built on reading that, so with the cache on
+the router follows the same change stream and drops the answers a write made
+stale, whoever made it: another application, a migration script, a person in a
+shell. Measured: a client's cached answer of 31 became 32 within a second of
+another connection inserting a document straight into the fast tier, without
+waiting out the TTL. That is the difference between a cache that expires and one
+that is kept honest, and it costs one change stream while the cache is on.
+
+The learned TTL is what remains: a backstop for the moments before the stream
+catches up, bounded again by `max_ttl`.
 
 **The key carries who is asking**, or one client would be served another's
 documents, which is a bypass this system has had once already. With

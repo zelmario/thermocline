@@ -92,6 +92,9 @@ button.ghost:hover { border-color: var(--muted); color: var(--ink); }
   color: var(--muted); margin: 0 0 3px; font-weight: 600;
 }
 .card .note { color: var(--muted); font-size: 12px; margin: 0 0 11px; }
+/* Query shapes are long and full of punctuation, and reading them as prose is
+   harder than it needs to be. */
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 
 .hero { font-size: 38px; line-height: 1.08; font-weight: 640; letter-spacing: -0.022em; margin: 6px 0 2px; }
 .hero .unit { font-size: 17px; color: var(--ink-2); font-weight: 500; letter-spacing: 0; }
@@ -162,8 +165,8 @@ text.val { fill: var(--ink); font-size: 11.5px; font-variant-numeric: tabular-nu
   <!-- Hero row: the three things the design claims, each as a measured number. -->
   <section class="grid g3" style="margin-bottom:14px">
     <div class="card">
-      <h2>Served by the fast tier</h2>
-      <p class="note">Share of application commands answered without touching the archive.</p>
+      <h2>Answered without the archive</h2>
+      <p class="note">Share of application commands answered without touching the archive, by the fast tier or from the cache.</p>
       <div class="hero" id="hitrate">—<span class="unit">%</span></div>
       <div class="heroline" id="hitline">no traffic yet</div>
       <div class="bar2" id="hitbar"></div>
@@ -219,6 +222,13 @@ text.val { fill: var(--ink); font-size: 11.5px; font-variant-numeric: tabular-nu
 
   <section class="counters" id="counters" style="margin-bottom:14px"></section>
 
+  <section class="card" id="cachecard" style="margin-bottom:14px">
+    <h2>What would be worth caching</h2>
+    <p class="note" id="cachestate"></p>
+    <table id="cachetable"></table>
+    <p class="note" id="cachefoot" style="margin-top:10px"></p>
+  </section>
+
   <section class="card hide" id="tablecard">
     <h2>Every number on this page</h2>
     <p class="note">The charts above are colour-coded; this is the same data as text.</p>
@@ -243,6 +253,7 @@ const CLASSES = [
   {key:"txn_warm", label:"txn warmed",      color:"var(--s4)", real:true},
   {key:"refused",  label:"refused",         color:"var(--s5)", real:true},
   {key:"admin",    label:"handshake",       color:"var(--admin)", real:false},
+  {key:"cached",   label:"from cache",      color:"var(--s6, #8b6fd1)", real:true},
 ];
 const REAL = CLASSES.filter(c => c.real);
 
@@ -295,12 +306,20 @@ function drawHero(s) {
   const realTotal = REAL.reduce((a, c) => a + (cls[c.key] ? cls[c.key].count : 0), 0);
   const fastN = cls.fast ? cls.fast.count : 0;
 
-  const hitPct = realTotal > 0 ? fastN / realTotal * 100 : null;
+  // A cached read never reached either tier, so counting it as "needed the
+  // archive" is wrong, and counting it as a fast tier hit would flatter the
+  // fast tier with work it did not do. It is named separately.
+  const cachedN = cls.cached ? cls.cached.count : 0;
+  const archiveN = Math.max(0, realTotal - fastN - cachedN);
+
+  const hitPct = realTotal > 0 ? (fastN + cachedN) / realTotal * 100 : null;
   if (realTotal > 0) {
     const pct = hitPct;
     $("hitrate").innerHTML = (pct >= 99.95 ? "100" : pct.toFixed(1)) + '<span class="unit">%</span>';
-    $("hitline").textContent = fmt(fastN) + " of " + fmt(realTotal) + " commands, " +
-      fmt(realTotal - fastN) + " needed the archive";
+    const parts = [fmt(fastN) + " of " + fmt(realTotal) + " commands"];
+    if (cachedN) parts.push(fmt(cachedN) + " from cache");
+    parts.push(fmt(archiveN) + " needed the archive");
+    $("hitline").textContent = parts.join(", ");
   } else {
     $("hitrate").innerHTML = '—<span class="unit">%</span>';
     $("hitline").textContent = "no application traffic yet";
@@ -633,12 +652,65 @@ function drawTable(s) {
 }
 
 // --------------------------------------------------------------- the loop
+// The cache panel answers one question: would caching be worth turning on, and
+// for which queries. It is drawn whether or not the cache is on, because that
+// is the decision it exists to inform.
+function drawCache(s) {
+  const c = s.cache || {};
+  const rows = c.advice || [];
+  const state = $("cachestate");
+  if (c.enabled) {
+    const total = (c.hits || 0) + (c.misses || 0);
+    const pct = total ? (100 * (c.hits || 0) / total).toFixed(1) : "0.0";
+    state.innerHTML = "Cache <b>on</b> · " + fmt(c.hits || 0) + " served, " +
+      fmt(c.misses || 0) + " asked through · <b>" + pct + "%</b> · watching " +
+      fmt(c.shapes || 0) + " query shapes";
+  } else {
+    state.innerHTML = "Cache <b>off</b>, measuring only · watching " + fmt(c.shapes || 0) +
+      " query shapes · set <code>router.cache.enabled</code> to serve these from memory";
+  }
+
+  const t = $("cachetable");
+  if (!rows.length) {
+    t.innerHTML = "<tr><td class='note'>Nothing repeats often enough yet to be worth caching.</td></tr>";
+    $("cachefoot").textContent = "";
+    return;
+  }
+  let html = "<tr><th>suggest</th><th>stable</th><th>asked</th><th>values</th><th>query</th></tr>";
+  for (const r of rows) {
+    html += "<tr><td><b>" + ms(r.suggest_ms) + "</b></td><td>" + ms(r.stable_ms) + "</td><td>" +
+      fmt(r.executions) + "</td><td>" + fmt(r.params) + "</td><td class='mono'>" +
+      esc(r.shape) + "</td></tr>";
+  }
+  t.innerHTML = html;
+  $("cachefoot").textContent =
+    "Suggest is ten per cent inside stable, which is the shortest stretch the same answer was " +
+    "observed to hold. Values is how many different parameters the shape was asked with: a large " +
+    "one means there is little repetition to exploit.";
+}
+
+// ms renders a duration the way the report does.
+function ms(v) {
+  v = v || 0;
+  if (v >= 60000) return (v / 60000).toFixed(1) + "m";
+  if (v >= 1000) return (v / 1000).toFixed(1) + "s";
+  return v + "ms";
+}
+
+// esc keeps a query shape from being read as markup. Shapes carry field names
+// from the application, and this page is not the place to trust them.
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, function (ch) {
+    return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[ch];
+  });
+}
+
 function render(s) {
   snap = s;
   $("idline").innerHTML = "listening on <b>" + (s.listen || "?") + "</b> · fast tier <b>" +
     (s.fast_tier || "?") + "</b> · completeness <b>" + s.completeness + "</b> · feeder <b>" +
     (s.feeder_id || "—") + "</b> · up <b>" + dur(s.uptime_s) + "</b>";
-  drawHero(s); drawTraffic(s); drawLatency(s); drawNamespaces(s); drawCounters(s); drawTable(s);
+  drawHero(s); drawTraffic(s); drawLatency(s); drawNamespaces(s); drawCounters(s); drawCache(s); drawTable(s);
   const inv = s.inventory && s.inventory.updated
     ? "tier sizes read " + dur(Math.max(0, s.now - s.inventory.updated)) + " ago"
     : "tier sizes not read yet";

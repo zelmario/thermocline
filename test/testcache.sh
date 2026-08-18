@@ -78,6 +78,30 @@ R "db.getSiblingDB('shop').$NS.deleteOne({_id:5001})" >/dev/null
 BACK=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
 chk "and falls again on the delete"                "$BEFORE" "$BACK"
 
+echo "== a write by somebody else drops it too =="
+# A cache that only knows about its own writes has a staleness window for
+# everybody else: another application, a migration script, a person in a shell.
+# The fast tier publishes every change it makes and this system is built on
+# reading that, so the router follows the same stream and drops the answers a
+# write made stale. The window becomes the change stream's latency rather than
+# the TTL.
+#
+# The claim makes this a fast tier read, so the write is visible in the truth as
+# well as in the cache.
+cline watermark --config $CCFG --ns shop.$NS --complete-all >/dev/null 2>&1
+sleep 2
+OTHER=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB('shop').$NS;
+  for (let i = 0; i < 5; i++) { c.countDocuments({country:'UY'}); sleep(200); }
+  print(c.countDocuments({country:'UY'}));" 2>&1 | tail -1)
+H "db.getSiblingDB('shop').$NS.insertOne({_id:6001,country:'UY',n:6001})" >/dev/null
+sleep 2
+AFTEROTHER=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
+chk "a write straight to the fast tier is seen"    "$((OTHER+1))" "$AFTEROTHER"
+H "db.getSiblingDB('shop').$NS.deleteOne({_id:6001})" >/dev/null
+sleep 2
+cline watermark --config $CCFG --ns shop.$NS --clear >/dev/null 2>&1
+
 echo "== who a cached answer may be given to =="
 # The key carries who is asking, or one client would be served another's
 # documents. With authentication terminated that is the verified user; with it
