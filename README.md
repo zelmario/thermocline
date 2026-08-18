@@ -177,8 +177,15 @@ Range queries are governed by the watermark below.
   `router.terminate_auth` on, read preference is honoured: measured with the
   profiler recording on all three fast tier members, `secondary`,
   `secondaryPreferred` and `nearest` each landed on a secondary.
-- **TLS is not handled.** Terminate it in front, or add it before taking over a
-  production address.
+- **TLS is handled, in both directions.** `router.tls.cert` and `key` make the
+  listener speak it, `ca` checks client certificates, and
+  `require_client_cert` insists on one. Whether the fast tier needs TLS is read
+  from `hot.uri`, where it is already written for the driver, rather than
+  configured a second place for the two to drift apart: the raw connection this
+  proxies bytes over is wrapped the same way the driver wraps its own. The
+  startup line says which halves are encrypted, because an operator who has just
+  moved an application onto this address needs to know it still speaks what the
+  application expects.
 
 ### Reads the fast tier cannot answer
 

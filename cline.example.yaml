@@ -187,3 +187,24 @@ router:
   # tooling.
   #
   # dashboard: "127.0.0.1:27101"
+
+  # TLS for the clients that connect here.
+  #
+  # This takes over an address the application already dials, so whatever that
+  # connection was has to keep working: a driver told tls=true insists on it and
+  # will not connect to a plaintext proxy at all. cert and key are the router's
+  # own, in PEM, and it is both or neither.
+  #
+  # ca is the authority client certificates are checked against, and setting it
+  # is what makes client certificates possible at all. require_client_cert then
+  # refuses a client that presents none, which needs ca to check against.
+  #
+  # Whether the fast tier itself requires TLS is not configured here. It is read
+  # from hot.uri, where the driver already needs it written, so the two cannot
+  # drift apart: tls=true, tlsCAFile and tlsInsecure are all honoured for the
+  # raw connection this proxies bytes over as well as for the driver's own.
+  # tls:
+  #   cert: "/etc/thermocline/router.pem"
+  #   key: "/etc/thermocline/router-key.pem"
+  #   ca: "/etc/thermocline/ca.pem"
+  #   require_client_cert: false

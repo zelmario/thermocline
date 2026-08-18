@@ -100,6 +100,24 @@ type RouterConfig struct {
 	// collections and reports traffic, so it belongs on an operator network
 	// rather than wherever the application already connects.
 	Dashboard string `yaml:"dashboard"`
+	// TLS is the certificate clients connect with, empty for a plaintext
+	// listener.
+	TLS TLSConfig `yaml:"tls"`
+	// HotTLS says the fast tier requires TLS, taken from hot.uri at load time.
+	// The driver reads that option for its own connections; the router also
+	// proxies raw bytes over a connection it opens itself, and that one has to
+	// be wrapped the same way or it speaks plaintext at a server that will not
+	// answer.
+	HotTLS bool `yaml:"-"`
+	// HotTLSInsecure says the fast tier's certificate is not to be verified,
+	// taken from tlsInsecure or tlsAllowInvalidCertificates in hot.uri. Self
+	// signed certificates are ordinary inside a private network and refusing
+	// them here would only mean the option is set in one place and not the
+	// other.
+	HotTLSInsecure bool `yaml:"-"`
+	// HotTLSCAFile is the authority the fast tier's certificate is checked
+	// against, from tlsCAFile in hot.uri.
+	HotTLSCAFile string `yaml:"-"`
 	// ServiceUser, ServicePass and ServiceAuthDB are the router's own
 	// credentials, copied from hot.uri at load time rather than configured
 	// twice. They are only used when TerminateAuth is on.
@@ -321,6 +339,7 @@ func Load(path string) (Config, error) {
 	// upstream connection is the router's rather than the client's, so the
 	// router has to authenticate it itself.
 	cfg.Router.ServiceUser, cfg.Router.ServicePass, cfg.Router.ServiceAuthDB = credentialsFromURI(cfg.Hot.URI)
+	cfg.Router.HotTLS, cfg.Router.HotTLSInsecure, cfg.Router.HotTLSCAFile = tlsFromURI(cfg.Hot.URI)
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -483,6 +502,58 @@ func samePort(a, b string) bool {
 // will use to hold the upstream connection when it terminates authentication.
 // Configuring them twice is a way for the two to drift apart, and the failure
 // when they do is a login that works everywhere except through the proxy.
+// TLSConfig is the certificate a router presents to its clients, and what it
+// asks of theirs.
+//
+// The router takes over the address an application already dials, so whatever
+// that application expected of the connection it has to keep getting. A
+// deployment that required TLS to the replica set cannot be handed a plaintext
+// proxy and be told it is a drop-in replacement.
+type TLSConfig struct {
+	// Cert and Key are the router's own certificate and private key, in PEM.
+	// Both or neither.
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+	// CA is the authority client certificates are checked against. Setting it
+	// is what makes client certificates possible at all.
+	CA string `yaml:"ca"`
+	// RequireClientCert rejects a client that presents no certificate. It needs
+	// CA, because there is nothing to check against otherwise.
+	RequireClientCert bool `yaml:"require_client_cert"`
+}
+
+// Enabled reports whether the listener should speak TLS.
+func (t TLSConfig) Enabled() bool { return t.Cert != "" || t.Key != "" }
+
+// tlsFromURI reads what a connection string says about TLS.
+//
+// The driver parses this for its own connections and gives no way to ask it
+// afterwards, so it is read here for the raw connection the router opens
+// itself. Both spellings, because tls and ssl are the same option and drivers
+// have accepted either for years.
+func tlsFromURI(uri string) (enabled, insecure bool, caFile string) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false, false, ""
+	}
+	q := u.Query()
+	yes := func(keys ...string) bool {
+		for _, k := range keys {
+			if v := q.Get(k); v != "" {
+				return strings.EqualFold(v, "true")
+			}
+		}
+		return false
+	}
+	enabled = yes("tls", "ssl")
+	insecure = yes("tlsInsecure", "tlsAllowInvalidCertificates", "sslInsecure")
+	caFile = q.Get("tlsCAFile")
+	if caFile == "" {
+		caFile = q.Get("sslCAFile")
+	}
+	return enabled, insecure, caFile
+}
+
 func credentialsFromURI(uri string) (user, pass, authDB string) {
 	u, err := url.Parse(uri)
 	if err != nil || u.User == nil {

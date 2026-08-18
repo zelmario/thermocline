@@ -79,6 +79,11 @@ func (p *upstreamPool) get(ctx context.Context) (*pooled, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", p.addr, err)
 	}
+	// A pooled connection carries the same raw bytes as any other, so it needs
+	// the same wrapping when the fast tier requires TLS. See tls.go.
+	if conn, err = p.r.upstreamTLS(conn, p.addr); err != nil {
+		return nil, err
+	}
 	// The handshake belongs to the connection, not to the client, and it happens
 	// exactly once here.
 	//

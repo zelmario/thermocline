@@ -185,6 +185,11 @@ func (r *Router) Listen(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", r.cfg.Listen, err)
 	}
+	// The address this takes over is one an application already dials, so
+	// whatever that connection was has to keep working. See tls.go.
+	if ln, err = listenerFor(ln, r.cfg.TLS); err != nil {
+		return err
+	}
 	defer func() { _ = ln.Close() }()
 	r.addr.Store(ln.Addr().String())
 
@@ -197,7 +202,10 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),
 		"fast_tier", r.currentPrimary(),
-		"completeness", string(r.cfg.Completeness))
+		"completeness", string(r.cfg.Completeness),
+		// An operator who has just moved an application onto this address needs
+		// to know whether it still speaks what the application expects.
+		"connections", describeTLS(r.cfg.TLS, r.cfg.HotTLS))
 
 	var wg sync.WaitGroup
 	for {
@@ -927,10 +935,14 @@ func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 		addr := r.currentPrimary()
 		conn, err := d.DialContext(ctx, "tcp", addr)
 		if err == nil {
+			secured, terr := r.upstreamTLS(conn, addr)
+			if terr != nil {
+				return nil, terr
+			}
 			if attempt > 0 {
 				r.log.Info("fast tier reachable again", "addr", addr, "waited", time.Since(deadline.Add(-primaryWait)).Round(time.Second))
 			}
-			return conn, nil
+			return secured, nil
 		}
 		lastErr = err
 
