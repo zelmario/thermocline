@@ -92,7 +92,7 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		return nil, false
 	}
 
-	n, cerr := c.r.copyUpMatching(ctx, target, keys, letOf(cmd))
+	n, cerr := c.r.copyUpMatching(ctx, target, keys, copyUpOptions{let: letOf(cmd), collation: docField(cmd, "collation")})
 	if cerr != nil {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
@@ -205,11 +205,18 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 	if err := aggVal.Unmarshal(&aggAny); err != nil {
 		return nil, fmt.Errorf("read the aggregate target: %w", err)
 	}
-	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, bson.D{
+	// The pipeline is the client's own, so it runs with the client's own
+	// variables. A $lookup or a $match in it may refer to them, and a rerun
+	// without them fails on a pipeline the client wrote correctly.
+	rerun := bson.D{
 		{Key: "aggregate", Value: aggAny},
 		{Key: "pipeline", Value: read},
 		{Key: "cursor", Value: bson.D{}},
-	})
+	}
+	if let := letOf(cmd); len(let) > 0 {
+		rerun = append(rerun, bson.E{Key: "let", Value: let})
+	}
+	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, rerun)
 	if err != nil {
 		return nil, fmt.Errorf("run the pipeline to find what it would merge: %w", err)
 	}

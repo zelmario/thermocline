@@ -426,6 +426,24 @@ samew 'update with a let variable'   'const r=db.getSiblingDB("shop").runCommand
 samew 'delete with a let variable'   'const r=db.getSiblingDB("shop").runCommand({delete:COLL.getName(),
      deletes:[{q:{$expr:{$eq:["$_id","$$t"]}},limit:0}],let:{t:18}});
    print(r.n+"/"+COLL.countDocuments({_id:18}))'
+# Collation decides what equal means. The documents are named user01 to user20
+# and 11 to 20 are in the archive only, so a case-insensitive filter for USER17
+# matches one document the fast tier cannot see. Asking the archive the same
+# filter without the collation asks a different question, and the write then
+# reaches some of what it matched and reports success. Measured before the fix
+# on a collection holding alice and ALICE in the archive: n=1 where an untiered
+# reference gave n=2.
+samew 'update with a collation'      'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+     updates:[{q:{name:"USER17"},u:{$set:{colhit:1}},multi:true,
+               collation:{locale:"en",strength:2}}]});
+   print(r.n+"/"+r.nModified)'
+samew 'delete with a collation'      'const r=db.getSiblingDB("shop").runCommand({delete:COLL.getName(),
+     deletes:[{q:{name:"USER18"},limit:0,collation:{locale:"en",strength:2}}]});
+   print(r.n+"/"+COLL.countDocuments({}))'
+samew 'upsert with a collation'      'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+     updates:[{q:{name:"USER19"},u:{$set:{colups:1}},upsert:true,
+               collation:{locale:"en",strength:2}}]});
+   print(r.n+"/"+(r.upserted?r.upserted.length:0)+"/"+COLL.countDocuments({}))'
 
 echo
 echo "== errors the server itself would return =="

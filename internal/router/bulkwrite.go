@@ -107,10 +107,11 @@ func parseBulkWrite(cmd bson.Raw, msg *wire.Message) ([]bulkOp, bool) {
 			}
 			b.ns = namespaces[idx]
 			b.stmt = updateStatement{
-				filter: subDoc(op.Lookup("filter")),
-				update: op.Lookup("updateMods"),
-				multi:  boolField(op, "multi"),
-				upsert: boolField(op, "upsert"),
+				filter:    subDoc(op.Lookup("filter")),
+				update:    op.Lookup("updateMods"),
+				multi:     boolField(op, "multi"),
+				upsert:    boolField(op, "upsert"),
+				collation: docField(op, "collation"),
 			}
 			b.stmt.arrayFilters = op.Lookup("arrayFilters")
 		case hasKey(op, "delete"):
@@ -121,8 +122,9 @@ func parseBulkWrite(cmd bson.Raw, msg *wire.Message) ([]bulkOp, bool) {
 			}
 			b.ns = namespaces[idx]
 			b.stmt = updateStatement{
-				filter: subDoc(op.Lookup("filter")),
-				multi:  boolField(op, "multi"),
+				filter:    subDoc(op.Lookup("filter")),
+				collation: docField(op, "collation"),
+				multi:     boolField(op, "multi"),
 			}
 		default:
 			// An operation shape this router does not know. Guarding what it
@@ -199,7 +201,7 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			}
 			return out, true
 		}
-		if n, cerr := c.r.copyUpMatching(ctx, op.ns, op.stmt.filter, letOf(cmd)); cerr != nil {
+		if n, cerr := c.r.copyUpMatching(ctx, op.ns, op.stmt.filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation}); cerr != nil {
 			c.r.Stats.Refused.Add(1)
 			c.cls = ClassRefused
 			c.log.Warn("refused a bulkWrite that would only partly apply", "ns", op.ns, "err", cerr)

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -120,7 +119,10 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 			continue
 		}
 
-		n, cerr := c.r.copyUpMatching(ctx, ns, fdoc, letOf(cmd))
+		n, cerr := c.r.copyUpMatching(ctx, ns, fdoc, copyUpOptions{
+			let:       letOf(cmd),
+			collation: docField(st, "collation"),
+		})
 		if cerr == nil {
 			if n > 0 {
 				c.log.Info("copied documents up so a multi-document write could reach them",
@@ -173,6 +175,31 @@ func statementIsMulti(st bson.Raw, name string) bool {
 // something true and useful, that the fast tier is not missing anything this
 // filter matches. Counting documents examined instead made that answer
 // impossible, and a transaction waiting for it replayed itself forever.
+// copyUpOptions are the parts of a command that decide which documents its
+// filter matches, and therefore have to travel with the copy-up's own query.
+//
+// Two of them so far, and both were found the same way: a field the client sets
+// that this router did not read. Variables, because a filter refers to them.
+// Collation, because it decides what "equal" means, and asking the archive the
+// same filter under a different collation asks a different question.
+type copyUpOptions struct {
+	let       bson.Raw
+	collation bson.Raw
+}
+
+// docField returns a document-valued field, or nil when it is absent.
+func docField(doc bson.Raw, key string) bson.Raw {
+	v, err := doc.LookupErr(key)
+	if err != nil {
+		return nil
+	}
+	d, ok := v.DocumentOK()
+	if !ok {
+		return nil
+	}
+	return d
+}
+
 // letOf returns a command's let document, which its filters may refer to.
 func letOf(cmd bson.Raw) bson.Raw {
 	v, err := cmd.LookupErr("let")
@@ -195,16 +222,26 @@ func letOf(cmd bson.Raw) bson.Raw {
 // query is the same filter asked of the archive, so it needs the same
 // variables. Without them the archive rejects the filter, the copy-up fails and
 // the write is refused: safe, and a working statement turned into an error.
-func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw, let bson.Raw) (int, error) {
+func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw, opts copyUpOptions) (int, error) {
 	db, coll := splitNS(ns)
-	opts := options.Find().SetLimit(maxCopyUpForWrite + 1)
-	if len(let) > 0 {
-		opts = opts.SetLet(let)
+	// Built as a find command rather than through the driver's options, so
+	// anything the client sent that decides matching can be carried across
+	// verbatim rather than translated.
+	find := bson.D{
+		{Key: "find", Value: coll},
+		{Key: "filter", Value: liveOnly(bson.RawValue{
+			Type:  bson.TypeEmbeddedDocument,
+			Value: filter,
+		})},
+		{Key: "limit", Value: int64(maxCopyUpForWrite + 1)},
 	}
-	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, liveOnly(bson.RawValue{
-		Type:  bson.TypeEmbeddedDocument,
-		Value: filter,
-	}), opts)
+	if len(opts.let) > 0 {
+		find = append(find, bson.E{Key: "let", Value: opts.let})
+	}
+	if len(opts.collation) > 0 {
+		find = append(find, bson.E{Key: "collation", Value: opts.collation})
+	}
+	cur, err := r.cold.Database(db).RunCommandCursor(ctx, find)
 	if err != nil {
 		return 0, fmt.Errorf("read the archive: %w", err)
 	}

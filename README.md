@@ -350,6 +350,27 @@ place in the pool rather than being handed on.
 No driver in the test harness can set the bit, so `test/exhaust` is a client
 written to do it.
 
+### What decides which documents a filter matches
+
+A multi-document write on a tiered collection is resolved by asking the archive
+the same filter and bringing up what it matches. Same filter is not enough: the
+question has to be asked the same way.
+
+Two things decide that and neither was carried across. Variables, because since
+MongoDB 5.0 a filter refers to a `let` document as `$$name`; without them the
+archive rejects the filter, the copy-up fails and the write is refused, which is
+safe and is still an ordinary statement turned into an error. And collation,
+because it decides what equal means. Measured on a collection holding `alice`
+and `ALICE` in the archive only: a case-insensitive `updateMany` for `ALICE`
+modified **one** document where an untiered reference modified two, and reported
+success. The copy-up had asked the archive case-sensitively, so the other
+document was never brought up.
+
+Both travel with the copy-up now, on the multi-document path, the upsert path,
+the bulkWrite path and the `$merge` target rerun, and the fast tier's own
+pre-flight check for an upsert asks with the collation too. `testconform.sh`
+compares each against the untiered reference.
+
 ### An explain must not do the thing it explains
 
 An aggregation can carry `explain: true` in the command itself rather than being

@@ -46,6 +46,10 @@ type updateStatement struct {
 	upsert bool
 	multi  bool
 
+	// collation decides what equal means for the filter, so anything that asks
+	// the same filter of the other tier has to ask it the same way.
+	collation bson.Raw
+
 	// sort is findAndModify's, which decides which document it acts on.
 	sort         bson.Raw
 	arrayFilters bson.RawValue

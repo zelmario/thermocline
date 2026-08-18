@@ -71,11 +71,11 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 		return nil, false
 	}
 
-	for _, st := range upsertFilters(msg, cmd, name) {
+	for _, st := range upsertStatements(msg, cmd, name) {
 		// The fast tier deciding it has a match is the end of it: the update
 		// applies there and no document is created. Asking it first also keeps
 		// the archive out of the common path, where the document is hot.
-		has, herr := c.r.fastTierMatches(ctx, ns, st)
+		has, herr := c.r.fastTierMatches(ctx, ns, st.filter, st.collation)
 		if herr != nil {
 			c.log.Warn("could not check the fast tier before an upsert, letting it through",
 				"ns", ns, "err", herr)
@@ -89,7 +89,7 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 			// The copy-up is an ordinary write outside the transaction, so the
 			// caller's snapshot was taken before it landed and the statement
 			// would still match nothing. Replaying is what makes it visible.
-			switch out, res := c.warmForTxn(ctx, ns, st, msg.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, ns, st.filter, msg.Header.RequestID, msg.Header.RequestID,
 				"the document this transaction upserts"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)
@@ -109,7 +109,10 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 			return out, true
 		}
 
-		n, cerr := c.r.copyUpMatching(ctx, ns, st, nil)
+		// An upsert's filter may refer to the command's let variables just as a
+		// multi-document write's may, and this asks the archive that filter.
+		n, cerr := c.r.copyUpMatching(ctx, ns, st.filter,
+			copyUpOptions{let: letOf(cmd), collation: st.collation})
 		if cerr != nil {
 			// Letting it through would write the stub. Refusing is the honest
 			// answer: the alternative is silent loss of an archived record.
@@ -137,7 +140,15 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 
 // upsertFilters returns the filter of every statement in this command that would
 // create a document when it matches nothing.
-func upsertFilters(msg *wire.Message, cmd bson.Raw, name string) []bson.Raw {
+// upsertStatement is one upsert's filter and the collation that decides what it
+// matches. The two travel together because asking the other tier the same
+// filter under a different collation asks a different question.
+type upsertStatement struct {
+	filter    bson.Raw
+	collation bson.Raw
+}
+
+func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStatement {
 	if name != "update" {
 		// findAndModify carries one statement, in the command itself.
 		if !boolField(cmd, "upsert") {
@@ -147,10 +158,10 @@ func upsertFilters(msg *wire.Message, cmd bson.Raw, name string) []bson.Raw {
 		if !ok {
 			return nil
 		}
-		return []bson.Raw{doc}
+		return []upsertStatement{{filter: doc, collation: docField(cmd, "collation")}}
 	}
 
-	var out []bson.Raw
+	var out []upsertStatement
 	for _, st := range msg.AllOf("updates") {
 		if !boolField(st, "upsert") {
 			continue
@@ -159,17 +170,28 @@ func upsertFilters(msg *wire.Message, cmd bson.Raw, name string) []bson.Raw {
 		if !ok {
 			continue
 		}
-		out = append(out, doc)
+		out = append(out, upsertStatement{filter: doc, collation: docField(st, "collation")})
 	}
 	return out
 }
 
 // fastTierMatches reports whether the fast tier holds anything the filter
 // selects, which is what decides whether an upsert creates a document.
-func (r *Router) fastTierMatches(ctx context.Context, ns string, filter bson.Raw) (bool, error) {
+func (r *Router) fastTierMatches(ctx context.Context, ns string, filter, collation bson.Raw) (bool, error) {
 	db, coll := splitNS(ns)
+	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
+	if len(collation) > 0 {
+		// The same question the client's own statement will ask, asked the same
+		// way. Without this the fast tier is searched case-sensitively for a
+		// statement that is not, and an upsert that would have matched here is
+		// judged as matching nothing.
+		var c options.Collation
+		if err := bson.Unmarshal(collation, &c); err == nil {
+			opts = opts.SetCollation(&c)
+		}
+	}
 	err := r.hot.Database(db).Collection(coll).
-		FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).
+		FindOne(ctx, filter, opts).
 		Err()
 	if err == nil {
 		return true, nil
