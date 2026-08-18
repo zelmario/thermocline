@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -127,11 +128,20 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	}
 
 	keep, dropped := c.r.sieveEvents(ctx, ns, events)
-	if dropped == 0 {
+	// A lookup the fast tier could not answer is asked of the archive, because
+	// null means deleted and this document is not. See fillLookups.
+	keep, filled := c.r.fillLookups(ctx, ns, keep)
+	if dropped == 0 && filled == 0 {
 		return nil, false
 	}
-	c.r.Stats.EventsHidden.Add(int64(dropped))
-	c.log.Info("hid tiering events from a change stream", "ns", ns, "hidden", dropped)
+	if dropped > 0 {
+		c.r.Stats.EventsHidden.Add(int64(dropped))
+		c.log.Info("hid tiering events from a change stream", "ns", ns, "hidden", dropped)
+	}
+	if filled > 0 {
+		c.log.Debug("answered a change stream's document lookups from the archive",
+			"ns", ns, "filled", filled)
+	}
 
 	out, berr := replaceNextBatch(rdoc, keep, msg.Header.RequestID)
 	if berr != nil {
@@ -345,4 +355,152 @@ func cursorIDsOf(cmd bson.Raw) []int64 {
 		}
 	}
 	return out
+}
+
+// A change stream that asks for the document gets null when the fast tier no
+// longer holds it.
+//
+// fullDocument: "updateLookup" tells the server to fetch the document as it
+// stands when the event is delivered. That lookup happens on the fast tier,
+// which is the one place that does not hold every document, so an update to a
+// document that has since been evicted comes back with fullDocument: null.
+//
+// Null does not mean "somewhere else", it means gone. Measured: a change stream
+// reported an update with fullDocument: null while a read of that same document
+// through the router returned it. An application watching a collection to keep
+// a cache or a search index in step would delete the entry, and the document is
+// still there.
+//
+// So a null lookup is asked of the archive, and answered from it when the
+// archive holds the document live. A document the application really deleted is
+// tombstoned there, so it stays null, which is the answer that was right all
+// along.
+//
+// The copy may be a moment behind the fast tier, because the archive trails it.
+// updateLookup never promised the post-image: it fetches whatever the document
+// is when the event is read, which may already be a later version or nothing at
+// all. A copy a moment old is within that, and "deleted" is not.
+
+// fillLookups replaces null fullDocument fields with the archive's copy.
+//
+// The second result counts how many were filled, for the log line that says the
+// stream was answered across both tiers.
+func (r *Router) fillLookups(ctx context.Context, ns string, events bson.A) (bson.A, int) {
+	type pending struct {
+		index int
+		id    bson.RawValue
+	}
+	var want []pending
+	for i, ev := range events {
+		raw, ok := ev.(bson.RawValue)
+		if !ok {
+			continue
+		}
+		doc, dok := raw.DocumentOK()
+		if !dok {
+			continue
+		}
+		// Present and null. Absent means the client never asked for the lookup,
+		// and inventing the field would be answering a question nobody put.
+		fd, ferr := doc.LookupErr("fullDocument")
+		if ferr != nil || fd.Type != bson.TypeNull {
+			continue
+		}
+		op, _ := lookupString(doc, "operationType")
+		if op != "update" && op != "replace" {
+			continue
+		}
+		key, kerr := doc.LookupErr("documentKey")
+		if kerr != nil {
+			continue
+		}
+		kdoc, kok := key.DocumentOK()
+		if !kok {
+			continue
+		}
+		idv, ierr := kdoc.LookupErr("_id")
+		if ierr != nil {
+			continue
+		}
+		want = append(want, pending{index: i, id: idv})
+	}
+	if len(want) == 0 {
+		return events, 0
+	}
+
+	ids := make(bson.A, 0, len(want))
+	for _, w := range want {
+		ids = append(ids, w.id)
+	}
+	db, coll := splitNS(ns)
+	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
+		meta.NotArchivedDeleted(),
+	})
+	if err != nil {
+		r.log.Warn("could not ask the archive for a change stream's documents; they stay null",
+			"ns", ns, "err", err)
+		return events, 0
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	found := make(map[string]bson.Raw, len(want))
+	for cur.Next(ctx) {
+		doc := bson.Raw(append([]byte(nil), cur.Current...))
+		if idv, ierr := doc.LookupErr("_id"); ierr == nil {
+			found[string(idv.Value)+string(rune(idv.Type))] = doc
+		}
+	}
+
+	filled := 0
+	out := make(bson.A, len(events))
+	copy(out, events)
+	for _, w := range want {
+		doc, ok := found[string(w.id.Value)+string(rune(w.id.Type))]
+		if !ok {
+			continue
+		}
+		raw, _ := events[w.index].(bson.RawValue)
+		rebuilt, rerr := withFullDocument(raw, doc)
+		if rerr != nil {
+			continue
+		}
+		out[w.index] = rebuilt
+		filled++
+	}
+	return out, filled
+}
+
+// withFullDocument rebuilds an event with its fullDocument replaced, leaving
+// every other field where the driver expects it.
+func withFullDocument(ev bson.RawValue, doc bson.Raw) (bson.RawValue, error) {
+	src, ok := ev.DocumentOK()
+	if !ok {
+		return ev, fmt.Errorf("event is not a document")
+	}
+	elems, err := src.Elements()
+	if err != nil {
+		return ev, err
+	}
+	out := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		if e.Key() == "fullDocument" {
+			var v bson.D
+			if uerr := bson.Unmarshal(doc, &v); uerr != nil {
+				return ev, uerr
+			}
+			out = append(out, bson.E{Key: "fullDocument", Value: v})
+			continue
+		}
+		var v any
+		if uerr := e.Value().Unmarshal(&v); uerr != nil {
+			return ev, uerr
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: v})
+	}
+	raw, merr := bson.Marshal(out)
+	if merr != nil {
+		return ev, merr
+	}
+	return bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw}, nil
 }

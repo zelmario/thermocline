@@ -28,6 +28,10 @@ stopDaemons() {
   pkill -f 'cline feeder|cline router' 2>/dev/null
   for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
+stopFeeder() {
+  pkill -f 'cline feeder' 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0; sleep 0.5; done
+}
 startFeeder() {
   cline feeder --config $CFG --log-file /var/log/cline/cs_f.log & FP=$!
   for _ in $(seq 1 60); do
@@ -142,6 +146,45 @@ chk "the archive still holds the evicted document"     "true" \
     "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(!!d && !d._tcDeletedAt)")"
 chk "a read through the router still finds it"         "old" \
     "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'MISSING')")"
+
+echo "== a lookup the fast tier cannot answer =="
+# fullDocument: "updateLookup" fetches the document as it stands when the event
+# is read, and that lookup happens on the fast tier, which is the one place that
+# does not hold every document. An update to a document that has since left it
+# came back with fullDocument: null, and null does not mean "somewhere else", it
+# means gone. An application watching a collection to keep a cache or a search
+# index in step would delete the entry while the document is still there.
+#
+# Measured before the fix: the stream said null while a read of that same
+# document through the router returned it.
+rm -f /tmp/cs_events3.txt
+mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB('shop').$NS.watch([], {fullDocument:'updateLookup'});
+  let out='no event';
+  for (let i=0;i<60;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = e.fullDocument ? 'HAS '+ (e.fullDocument.v||'?') : 'NULL'; break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" > /tmp/cs_events3.txt 2>&1 &
+WATCHER3=$!
+sleep 3
+# Update it, let that reach the archive, then take it off the fast tier the way
+# an eviction does, with the feeder blind to it so the archive keeps it live.
+R "db.getSiblingDB('shop').$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up'}})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'')")" = "looked up" ] && break
+  sleep 0.5
+done
+stopFeeder
+H "db.getSiblingDB('shop').$NS.deleteOne({_id:ObjectId('$OID')})" >/dev/null
+C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+for _ in $(seq 1 60); do kill -0 $WATCHER3 2>/dev/null || break; sleep 0.5; done
+kill $WATCHER3 2>/dev/null
+LOOKUP=$(tail -1 /tmp/cs_events3.txt 2>/dev/null)
+echo "  the watcher saw: ${LOOKUP:-nothing}"
+chk "a lookup is answered from the archive"            "HAS looked up" "$LOOKUP"
+startFeeder
 
 stopDaemons
 echo

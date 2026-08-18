@@ -378,6 +378,29 @@ the bulkWrite path and the `$merge` target rerun, and the fast tier's own
 pre-flight check for an upsert asks with the collation too. `testconform.sh`
 compares each against the untiered reference.
 
+### A change stream that asks for the document
+
+`fullDocument: "updateLookup"` tells the server to fetch the document as it
+stands when the event is read, and that lookup happens on the fast tier, which
+is the one place that does not hold every document. An update to a document that
+has since been evicted came back with `fullDocument: null`.
+
+Null does not mean "somewhere else", it means gone. Measured: a change stream
+reported an update with `fullDocument: null` while a read of that same document
+through the router returned it. An application watching a collection to keep a
+cache or a search index in step would have deleted the entry, and the document is
+still there.
+
+A null lookup is asked of the archive now, and answered from it when the archive
+holds the document live. A document the application really deleted is tombstoned
+there, so it stays null, which was the right answer all along, and
+`testchange.sh` checks both.
+
+The copy may be a moment behind the fast tier, because the archive trails it.
+`updateLookup` never promised the post-image: it fetches whatever the document is
+when the event is read, which may already be a later version or nothing at all.
+A copy a moment old is within that, and "deleted" is not.
+
 ### Renaming a tiered collection
 
 A rename moves two collections, not one, and the feeder ignores renames on
