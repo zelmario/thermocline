@@ -92,7 +92,7 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		return nil, false
 	}
 
-	n, cerr := c.r.copyUpMatching(ctx, target, keys)
+	n, cerr := c.r.copyUpMatching(ctx, target, keys, letOf(cmd))
 	if cerr != nil {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused

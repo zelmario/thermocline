@@ -414,6 +414,20 @@ chk "drop()"                                    "false" "$(R "db.getSiblingDB('s
 chk "dropDatabase()"                            "true"  "$(R "db.getSiblingDB('tcdropme').x.insertOne({a:1}); print(db.getSiblingDB('tcdropme').dropDatabase().ok===1)")"
 
 echo
+echo "== let variables, which a filter may refer to =="
+# MongoDB 5.0 gave update, delete and findAndModify a let document, and a filter
+# refers to it as $$name. The copy-up that lets a multi-document write reach
+# archived documents asks the archive the same filter, so it has to carry the
+# same variables. Without them the archive rejects the filter and the write is
+# refused: safe, and an ordinary statement turned into an error.
+samew 'update with a let variable'   'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+     updates:[{q:{$expr:{$eq:["$_id","$$t"]}},u:{$set:{lethit:1}},multi:true}],let:{t:17}});
+   print(r.n+"/"+r.nModified)'
+samew 'delete with a let variable'   'const r=db.getSiblingDB("shop").runCommand({delete:COLL.getName(),
+     deletes:[{q:{$expr:{$eq:["$_id","$$t"]}},limit:0}],let:{t:18}});
+   print(r.n+"/"+COLL.countDocuments({_id:18}))'
+
+echo
 echo "== errors the server itself would return =="
 # A drop-in proxy has to fail the way MongoDB fails, not just succeed the way it
 # succeeds. An application branches on e.code, and a retry helper branches on the

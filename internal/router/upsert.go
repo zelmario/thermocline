@@ -109,7 +109,7 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 			return out, true
 		}
 
-		n, cerr := c.r.copyUpMatching(ctx, ns, st)
+		n, cerr := c.r.copyUpMatching(ctx, ns, st, nil)
 		if cerr != nil {
 			// Letting it through would write the stub. Refusing is the honest
 			// answer: the alternative is silent loss of an archived record.

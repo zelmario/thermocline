@@ -49,7 +49,7 @@ const (
 // document matching this filter that the fast tier lacks. That is completeness
 // for this query, established per query, and it is what these two answers mean.
 func (c *conn) warmForTxn(ctx context.Context, ns string, filter bson.Raw, requestID, responseTo int32, what string) (*wire.Message, txnWarm) {
-	n, err := c.r.copyUpMatching(ctx, ns, filter)
+	n, err := c.r.copyUpMatching(ctx, ns, filter, nil)
 	if err != nil {
 		c.log.Warn("could not bring this transaction's documents up from the archive, refusing instead",
 			"ns", ns, "err", err)
@@ -116,7 +116,7 @@ func (c *conn) warmScopeForTxn(ctx context.Context, msg *wire.Message, scope agg
 			return txnWarmComplete
 		}
 		seen[ns] = true
-		n, err := c.r.copyUpMatching(ctx, ns, filter)
+		n, err := c.r.copyUpMatching(ctx, ns, filter, nil)
 		if err != nil {
 			c.log.Warn("could not bring this transaction's documents up from the archive, refusing instead",
 				"ns", ns, "err", err)

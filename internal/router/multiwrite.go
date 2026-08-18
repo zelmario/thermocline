@@ -120,7 +120,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 			continue
 		}
 
-		n, cerr := c.r.copyUpMatching(ctx, ns, fdoc)
+		n, cerr := c.r.copyUpMatching(ctx, ns, fdoc, letOf(cmd))
 		if cerr == nil {
 			if n > 0 {
 				c.log.Info("copied documents up so a multi-document write could reach them",
@@ -173,12 +173,38 @@ func statementIsMulti(st bson.Raw, name string) bool {
 // something true and useful, that the fast tier is not missing anything this
 // filter matches. Counting documents examined instead made that answer
 // impossible, and a transaction waiting for it replayed itself forever.
-func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw) (int, error) {
+// letOf returns a command's let document, which its filters may refer to.
+func letOf(cmd bson.Raw) bson.Raw {
+	v, err := cmd.LookupErr("let")
+	if err != nil {
+		return nil
+	}
+	doc, ok := v.DocumentOK()
+	if !ok {
+		return nil
+	}
+	return doc
+}
+
+// copyUpMatching brings the archived documents a filter matches up to the fast
+// tier, so the client's own write reaches all of them.
+//
+// let carries the command's variables, or nil when it has none. A filter may
+// refer to them, and since MongoDB 5.0 an ordinary application writes one that
+// does: update with let: {target: 5} and $expr comparing against $$target. This
+// query is the same filter asked of the archive, so it needs the same
+// variables. Without them the archive rejects the filter, the copy-up fails and
+// the write is refused: safe, and a working statement turned into an error.
+func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw, let bson.Raw) (int, error) {
 	db, coll := splitNS(ns)
+	opts := options.Find().SetLimit(maxCopyUpForWrite + 1)
+	if len(let) > 0 {
+		opts = opts.SetLet(let)
+	}
 	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, liveOnly(bson.RawValue{
 		Type:  bson.TypeEmbeddedDocument,
 		Value: filter,
-	}), options.Find().SetLimit(maxCopyUpForWrite+1))
+	}), opts)
 	if err != nil {
 		return 0, fmt.Errorf("read the archive: %w", err)
 	}
