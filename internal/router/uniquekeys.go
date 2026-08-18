@@ -506,9 +506,38 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 	// and one lookup settles it.
 	idClashes, ierr := c.r.archivedIDClashes(ctx, ns, docs)
 	if ierr != nil {
-		c.log.Warn("could not check inserted ids against the archive, letting the insert through",
-			"ns", ns, "err", ierr)
-		idClashes = nil
+		// An insert that cannot be checked is refused, because the failure this
+		// check exists to stop destroys data that is already safe.
+		//
+		// It used to be let through. Measured with the archive stopped: an
+		// insert of an _id the archive held was accepted after the lookup timed
+		// out, landed on the fast tier, and the feeder then mirrored it over the
+		// archived record. {_id: 500, v: "archived, precious", tier: "gold"}
+		// came back as {_id: 500, v: "clobber"}. Nothing anywhere said so.
+		//
+		// The one case that stays safe is a fast tier claiming all of history:
+		// there is nothing archived it does not also hold, so its own _id index
+		// is the whole answer and the archive has nothing to add.
+		if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed && mark.CoversAll() {
+			c.log.Warn("could not check inserted ids against the archive; the fast tier claims "+
+				"all of history, so its own _id index is the whole answer",
+				"ns", ns, "err", ierr)
+			idClashes = nil
+		} else {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Error("refused an insert because the archive could not be checked",
+				"ns", ns, "err", ierr)
+			out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: refusing this insert because the archive could not be reached to check "+
+					"whether it already holds these ids. An insert of an id the archive holds is "+
+					"mirrored over the archived document, which destroys it. Retry once the archive "+
+					"is back, or warm this namespace so the fast tier holds all of history.")
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
+		}
 	}
 
 	idxs := c.r.uniqueIndexes(ctx, ns)

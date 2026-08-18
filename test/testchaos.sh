@@ -102,6 +102,41 @@ if [ -z "$HN" ]; then echo "  SKIP  fast tier primary not resolved"; else
   chk "the client can finish by retrying"   "25"   "$(R "for(let i=1000;i<1025;i++){ try{ db.getSiblingDB('shop').$NS.insertOne({_id:i,fo:1}); }catch(e){} } print(db.getSiblingDB('shop').$NS.countDocuments({fo:1}))")"
 fi
 
+echo "== an insert while the archive is unreachable =="
+# The check that stops an insert duplicating an _id the archive still holds has
+# to reach the archive. When it could not, the insert used to be let through:
+# measured on a pair with the archive stopped, {_id:500, v:"archived, precious",
+# tier:"gold"} came back as {_id:500, v:"clobber"} once the feeder mirrored the
+# new document over the archived one. Nothing anywhere said so.
+#
+# This is the only place that can test it. The router pings both tiers at
+# startup and will not start without the archive, so the outage has to happen
+# to a router that is already running, which means stopping mongod on other
+# containers.
+CLDNODES=""
+for m in $(C 'print(rs.status().members.map(m=>m.name.split(":")[0]).join(" "))'); do
+  n=$(nodeFor "$m")
+  [ -n "$n" ] && CLDNODES="$CLDNODES $n"
+done
+echo "  the archive runs on:$CLDNODES"
+if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
+  C "db.getSiblingDB('shop').$NS.deleteMany({_id:'outage'}); db.getSiblingDB('shop').$NS.insertOne({_id:'outage',v:'archived, precious'})" >/dev/null
+  H "db.getSiblingDB('shop').$NS.deleteMany({_id:'outage'})" >/dev/null
+  for n in $CLDNODES; do docker exec $n systemctl stop mongod; done
+  sleep 3
+  OUT=$(docker exec $NODE mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+    try { db.getSiblingDB('shop').$NS.insertOne({_id:'outage',v:'clobber'}); print('ACCEPTED'); }
+    catch(e) { print(e.message.indexOf('archive could not be reached') >= 0 ? 'REFUSED' : 'OTHER: '+e.message.substring(0,50)); }" 2>&1 | tail -1)
+  chk "an insert is refused while the archive is down" "REFUSED" "$OUT"
+  chk "and nothing landed on the fast tier"            "0"       "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:'outage'}))")"
+  for n in $CLDNODES; do docker exec $n systemctl start mongod; done
+  for _ in $(seq 1 60); do
+    [ "$(C 'print(rs.status().members.filter(m=>m.stateStr=="PRIMARY").length)' 2>/dev/null)" = "1" ] && break
+    sleep 2
+  done
+  chk "and the archive kept what it had"              "archived, precious"       "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:'outage'}); print(d?d.v:'MISSING')")"
+fi
+
 echo "== every daemon at once under client load =="
 docker exec -d $NODE cline evictor --config $CFG --every 3s --log-file /var/log/cline/chaos_ev.log
 docker exec -d $NODE sh -c "for i in 1 2 3 4 5 6; do cline warmer --config $CFG --log-file /var/log/cline/chaos_wm.log >/dev/null 2>&1; sleep 3; done"

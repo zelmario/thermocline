@@ -378,6 +378,33 @@ the bulkWrite path and the `$merge` target rerun, and the fast tier's own
 pre-flight check for an upsert asks with the collation too. `testconform.sh`
 compares each against the untiered reference.
 
+### An insert the archive cannot be asked about
+
+The check that stops an insert duplicating an `_id` the archive still holds has
+to reach the archive. When it could not, the insert was let through.
+
+Measured with the archive stopped: an insert of an `_id` the archive held was
+accepted once the lookup timed out, landed on the fast tier, and the feeder
+mirrored it over the archived record.
+`{_id: 500, v: "archived, precious", tier: "gold"}` came back as
+`{_id: 500, v: "clobber"}`. Nothing anywhere said so.
+
+It is refused now, and says why. The exception is a fast tier claiming all of
+history: there is nothing archived it does not also hold, so its own `_id` index
+is the whole answer and the archive has nothing to add. The refusal costs the
+driver's server selection timeout first, because that is how long the lookup
+takes to fail, so an archive outage is felt as slow writes before it is felt as
+refused ones.
+
+The unique key registry fails the other way on purpose, and the difference is
+worth stating. It lives on the fast tier, its failure means two live documents
+could share a value that should be unique, and refusing every insert because a
+bookkeeping collection is unreachable is worse than that. Losing an archived
+document is not in the same class.
+
+`testchaos.sh` stops every archive member and checks all three: the insert is
+refused, nothing lands, and the archived document is still there afterwards.
+
 ### A change stream that asks for the document
 
 `fullDocument: "updateLookup"` tells the server to fetch the document as it
