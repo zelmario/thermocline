@@ -153,6 +153,30 @@ func (a *Advisor) Observe(shape, ns string, params, result uint64) {
 	p.lastSeen = now
 }
 
+// ObserveHit records that a query was asked and answered from a cache, without
+// treating the answer as evidence of anything.
+//
+// How often a query is asked is half of what makes it worth caching, so a hit
+// counts. What the answer was is not evidence: it came from this system's own
+// memory, and measuring stability against it would be measuring a belief
+// against itself.
+func (a *Advisor) ObserveHit(shape, ns string, params uint64) {
+	now := a.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	s, ok := a.shapes[shape]
+	if !ok {
+		return
+	}
+	s.executions++
+	s.lastSeen = now
+	if p, ok := s.params[params]; ok {
+		p.executions++
+		s.repeats++
+	}
+}
+
 // Report returns what is worth caching, most valuable first.
 //
 // One row per shape and parameter set, because that is the unit a TTL applies

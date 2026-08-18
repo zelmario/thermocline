@@ -54,29 +54,62 @@ type history struct {
 	entry *Entry
 }
 
+// MaxEntryBytes is the largest answer worth holding.
+//
+// A count is a few bytes and a find can be megabytes, and the second is both
+// the less likely to repeat and the more expensive to be wrong about. One
+// oversized reply would also blow the whole budget on a single query.
+const MaxEntryBytes = 256 * 1024
+
+// DefaultMaxBytes is how much memory the answers may occupy in total. Counting
+// entries is not a bound: a thousand replies of a megabyte each is a gigabyte,
+// and nothing in a count says which of those it is.
+const DefaultMaxBytes = 64 * 1024 * 1024
+
 // Cache is a bounded set of learned queries and their most recent answers.
 type Cache struct {
-	mu      sync.Mutex
-	byKey   map[string]*history
-	byNS    map[string]map[string]struct{}
-	max     int
-	maxTTL  time.Duration
-	now     func() time.Time
-	Hits    uint64
-	Misses  uint64
-	Learned uint64
+	mu       sync.Mutex
+	byKey    map[string]*history
+	byNS     map[string]map[string]struct{}
+	max      int
+	maxBytes int
+	bytes    int
+	maxTTL   time.Duration
+	now      func() time.Time
+	Hits     uint64
+	Misses   uint64
+	Learned  uint64
+	// Rejected counts answers too large to hold, which is worth knowing: a
+	// cache that looks idle may simply be being handed things it will not keep.
+	Rejected uint64
 }
 
-// New returns a cache holding at most max queries, with no entry ever living
-// longer than maxTTL however stable it has looked.
+// New returns a cache holding at most max queries and maxBytes of answers, with
+// no entry ever living longer than maxTTL however stable it has looked.
 func New(max int, maxTTL time.Duration) *Cache {
-	return &Cache{
-		byKey:  make(map[string]*history),
-		byNS:   make(map[string]map[string]struct{}),
-		max:    max,
-		maxTTL: maxTTL,
-		now:    time.Now,
+	return NewWithBytes(max, DefaultMaxBytes, maxTTL)
+}
+
+// NewWithBytes is New with the memory budget stated.
+func NewWithBytes(max, maxBytes int, maxTTL time.Duration) *Cache {
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxBytes
 	}
+	return &Cache{
+		byKey:    make(map[string]*history),
+		byNS:     make(map[string]map[string]struct{}),
+		max:      max,
+		maxBytes: maxBytes,
+		maxTTL:   maxTTL,
+		now:      time.Now,
+	}
+}
+
+// Bytes reports how much the held answers occupy.
+func (c *Cache) Bytes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes
 }
 
 // Get returns a cached reply when one is still within its learned TTL.
@@ -171,9 +204,20 @@ func (c *Cache) ObserveResult(key, ns string, reply []byte, h uint64) {
 	if e.ttl <= 0 {
 		return
 	}
+	if len(reply) > MaxEntryBytes {
+		// Learned from, not held. What it answered still counts as evidence of
+		// how stable this query is; it is simply too large to keep.
+		c.Rejected++
+		return
+	}
 	stored := make([]byte, len(reply))
 	copy(stored, reply)
+	if e.entry != nil {
+		c.bytes -= len(e.entry.Reply)
+	}
 	e.entry = &Entry{Reply: stored, StoredAt: now, TTL: e.ttl}
+	c.bytes += len(stored)
+	c.evictForBytes()
 }
 
 // TTLOf reports what has been learned for a query, for the dashboard and for
@@ -201,6 +245,7 @@ func (c *Cache) Invalidate(ns string) int {
 	for k := range keys {
 		if h, ok := c.byKey[k]; ok && h.entry != nil {
 			n++
+			c.bytes -= len(h.entry.Reply)
 		}
 		delete(c.byKey, k)
 	}
@@ -230,6 +275,7 @@ func (c *Cache) InvalidateDatabase(db string) int {
 		for k := range keys {
 			if h, ok := c.byKey[k]; ok && h.entry != nil {
 				n++
+				c.bytes -= len(h.entry.Reply)
 			}
 			delete(c.byKey, k)
 		}
@@ -268,6 +314,30 @@ func (c *Cache) ttlFrom(stable []time.Duration) time.Duration {
 	return ttl
 }
 
+// evictForBytes drops held answers, oldest first, until the memory budget is
+// met. The query stays: what was learned about it costs almost nothing, and
+// throwing it away would mean learning it again.
+func (c *Cache) evictForBytes() {
+	for c.bytes > c.maxBytes {
+		var oldestKey string
+		var oldest time.Time
+		for k, h := range c.byKey {
+			if h.entry == nil {
+				continue
+			}
+			if oldestKey == "" || h.entry.StoredAt.Before(oldest) {
+				oldestKey, oldest = k, h.entry.StoredAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		h := c.byKey[oldestKey]
+		c.bytes -= len(h.entry.Reply)
+		h.entry = nil
+	}
+}
+
 // evictIfFull makes room by forgetting the query whose answer was seen longest
 // ago, which is the one least likely to be asked again.
 func (c *Cache) evictIfFull() {
@@ -282,6 +352,9 @@ func (c *Cache) evictIfFull() {
 		}
 	}
 	if oldestKey != "" {
+		if h := c.byKey[oldestKey]; h != nil && h.entry != nil {
+			c.bytes -= len(h.entry.Reply)
+		}
 		delete(c.byKey, oldestKey)
 		for _, keys := range c.byNS {
 			delete(keys, oldestKey)

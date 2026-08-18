@@ -164,6 +164,23 @@ func (c *conn) cacheLookup(msg *wire.Message, name, db string) (*wire.Message, b
 	if rerr != nil {
 		return nil, false
 	}
+	// Nothing is learned from an answer this cache produced itself.
+	//
+	// The reply goes back through the same funnel every answer does, and that
+	// funnel learns from what it sends. Left alone, every hit was recorded as a
+	// fresh observation of the same value: the entry's age was reset, so a
+	// query asked steadily was never re-fetched at all. Measured with a two
+	// second ceiling and thirteen seconds of reads, the router asked the fast
+	// tier four times and served forty one from memory, when it should have
+	// gone back roughly every two seconds. The TTL was not bounding anything.
+	//
+	// Stability has to be measured against the database, not against a copy of
+	// what this already believed. The execution still counts, because how often
+	// a query is asked is the other half of what makes it worth caching.
+	c.cacheOf = cachePending{}
+	if c.r.advisor != nil {
+		c.r.advisor.ObserveHit(shape, ns, params)
+	}
 	c.cls = ClassCached
 	c.log.Debug("answered from the cache", "ns", ns, "command", name)
 	return out, true

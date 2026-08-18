@@ -326,6 +326,7 @@ func Default() Config {
 				// is short enough that a writer this router cannot see is
 				// never far ahead of it.
 				MaxQueries: 1000,
+				MaxBytes:   64 * 1024 * 1024,
 				MaxTTL:     Duration(time.Minute),
 			},
 		},
@@ -528,6 +529,10 @@ type CacheConfig struct {
 	// MaxTTL is the ceiling on a learned TTL. A query that has not changed
 	// since the router started is not proof that it never will.
 	MaxTTL Duration `yaml:"max_ttl"`
+	// MaxBytes is how much memory the held answers may occupy in total.
+	// Counting queries is not a memory bound: a thousand replies of a megabyte
+	// each is a gigabyte, and nothing in a count says which of those it is.
+	MaxBytes int `yaml:"max_bytes"`
 	// Measure keeps watching queries even when nothing is being cached, which
 	// is what makes `cline cache` and the dashboard able to say whether caching
 	// would be worth turning on. On by default.

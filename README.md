@@ -825,6 +825,24 @@ measuring, which costs a hash of every reply and a bounded table of shapes, is
 off with `router.cache.measure: false`. A router with all three off does exactly
 what it did before any of this existed.
 
+### What it costs, and what bounds it
+
+`max_queries` bounds how many queries are watched and `max_bytes` how much the
+held answers may occupy, because counting entries is not a memory bound: a
+thousand replies of a megabyte each is a gigabyte, and nothing in a count says
+which of those it is. A single answer larger than 256 KB is learned from and
+never held, since a large result is both less likely to repeat and more
+expensive to be wrong about.
+
+**Nothing is learned from an answer the cache produced itself.** The reply goes
+back through the same funnel every answer does, and that funnel learns from what
+it sends, so every hit was being recorded as a fresh observation of the same
+value: the entry's age was reset and a query asked steadily was never re-fetched.
+Measured with a two second ceiling and thirteen seconds of reads, the router
+asked the fast tier four times and served forty one from memory. Now it asks
+eleven times, which is what a two second TTL means. Stability is measured against
+the database, never against what this already believed.
+
 ### What the cache will not do
 
 A cache is the one thing here that can answer without asking, so what it refuses

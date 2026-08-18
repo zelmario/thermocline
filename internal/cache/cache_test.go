@@ -168,3 +168,49 @@ func TestItStaysWithinItsBound(t *testing.T) {
 		t.Fatalf("holding %d queries, want at most 3", got)
 	}
 }
+
+// Counting entries is not a memory bound. A thousand replies of a megabyte each
+// is a gigabyte, and nothing in a count says which of those it is.
+func TestTheMemoryBudgetIsInBytes(t *testing.T) {
+	big := make([]byte, 200*1024)
+	c, k := newTestCache(1000, time.Hour)
+	c.maxBytes = 1024 * 1024 // room for five of them
+
+	for i := 0; i < 20; i++ {
+		key := "q" + string(rune('a'+i))
+		c.Observe(key, "shop.orders", big)
+		k.add(time.Second)
+		c.Observe(key, "shop.orders", big) // held a second, so now it is cached
+		k.add(time.Second)
+	}
+	if got := c.Bytes(); got > 1024*1024 {
+		t.Fatalf("holding %d bytes, over the budget of %d", got, 1024*1024)
+	}
+	if c.Bytes() == 0 {
+		t.Fatal("holding nothing at all, which is a different bug")
+	}
+}
+
+// One reply larger than the whole budget must not be held, and must not stop
+// the query being learned from either.
+func TestAnOversizedAnswerIsLearnedFromButNotHeld(t *testing.T) {
+	huge := make([]byte, MaxEntryBytes+1)
+	c, k := newTestCache(10, time.Hour)
+
+	c.Observe("q", "shop.orders", huge)
+	k.add(time.Minute)
+	c.Observe("q", "shop.orders", huge)
+
+	if _, ok := c.Get("q"); ok {
+		t.Error("an oversized answer was held")
+	}
+	if c.Bytes() != 0 {
+		t.Errorf("holding %d bytes of something too large to hold", c.Bytes())
+	}
+	if c.TTLOf("q") == 0 {
+		t.Error("nothing was learned about a query just because its answer is large")
+	}
+	if c.Rejected == 0 {
+		t.Error("the rejection was not counted, so an idle-looking cache says nothing about why")
+	}
+}

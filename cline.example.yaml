@@ -203,6 +203,10 @@ router:
   # cache:
   #   enabled: false
   #   max_queries: 1000
+  #   # How much memory the held answers may occupy. Counting queries is not a
+  #   # bound: a thousand replies of a megabyte each is a gigabyte. A single
+  #   # answer larger than 256 KB is learned from but never held.
+  #   max_bytes: 67108864
   #   max_ttl: 1m
   #   # The measuring is a switch of its own, because it is not free: a hash of
   #   # every reply and a bounded table of query shapes. On by default, so the

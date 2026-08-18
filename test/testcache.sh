@@ -78,6 +78,31 @@ R "db.getSiblingDB('shop').$NS.deleteOne({_id:5001})" >/dev/null
 BACK=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
 chk "and falls again on the delete"                "$BEFORE" "$BACK"
 
+echo "== a cached answer still expires =="
+# The reply goes back through the same funnel every answer does, and that funnel
+# learns from what it sends. Left alone, every hit was recorded as a fresh
+# observation of the same value, so the entry's age was reset and a query asked
+# steadily was never re-fetched at all: measured with a two second ceiling and
+# thirteen seconds of reads, the router asked the fast tier four times and served
+# forty one from memory. The TTL was not bounding anything.
+#
+# What must hold is that a steady stream of reads keeps going back to the tiers.
+TCFG=/root/cline_cachettl.yaml
+sed 's/    max_ttl: 60s/    max_ttl: 2s/' $CCFG > $TCFG
+stopDaemons
+startRouter $TCFG
+STEADY=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB('shop').$NS;
+  for (let i = 0; i < 30; i++) { c.countDocuments({country:'UY'}); sleep(300); }
+  print('done');" 2>&1 | tail -1)
+chk "the steady read loop finished"                "done" "$STEADY"
+stopDaemons
+sleep 2
+ASKED=$(cline cache --config $TCFG --top 1 2>&1 | grep -oE '[0-9]+ misses' | grep -oE '^[0-9]+')
+# Nine seconds of reads with a two second ceiling has to go back several times.
+chk "it went back to the tiers as the ttl expired" "true"     "$(awk -v n="${ASKED:-0}" 'BEGIN{print (n+0 >= 3) ? "true" : "false"}')"
+startRouter $CCFG
+
 echo "== a write by somebody else drops it too =="
 # A cache that only knows about its own writes has a staleness window for
 # everybody else: another application, a migration script, a person in a shell.

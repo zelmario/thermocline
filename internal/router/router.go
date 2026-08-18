@@ -197,10 +197,11 @@ func (r *Router) enableCache() {
 		}
 		return
 	}
-	r.cache = cache.New(r.cfg.Cache.MaxQueries, r.cfg.Cache.MaxTTL.D())
+	r.cache = cache.NewWithBytes(r.cfg.Cache.MaxQueries, r.cfg.Cache.MaxBytes, r.cfg.Cache.MaxTTL.D())
 	r.log.Info("query cache on",
 		"max_queries", r.cfg.Cache.MaxQueries,
 		"max_ttl", r.cfg.Cache.MaxTTL.D(),
+		"max_bytes", r.cfg.Cache.MaxBytes,
 		"note", "each query is cached for a little less than it has been observed to stay the same")
 }
 
