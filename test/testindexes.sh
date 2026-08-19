@@ -165,6 +165,54 @@ chk "a filter on an archive-unindexed field works" "4000" "$(R "print(db.getSibl
 C 'db.adminCommand({setParameter:1, internalQueryMaxBlockingSortMemoryUsageBytes: 104857600})' >/dev/null
 C 'db.adminCommand({setParameter:1, allowDiskUseByDefault: true})' >/dev/null
 
+echo "== what cline indexes reports, and what it refuses to suggest =="
+# The report is what an operator decides from, and --commands is what they will
+# paste into an archive, so both are checked against a collection whose indexes
+# are known rather than against prose.
+#
+# Two of the fast tier's index options must never cross. A unique index on the
+# archive can refuse a write the feeder has to make, because a value deleted and
+# written again collides with the tombstoned copy of the old one. A TTL index
+# would delete the copies the archive exists to keep, and nothing would report
+# it: the documents would simply stop being there.
+IXNS=tidxrep
+H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+H "const c=db.getSiblingDB(process.env.TC_DB).$IXNS;
+   c.insertOne({_id:1, customer:1, createdAt:new Date(), email:'a@x', nested:{path:1}});
+   c.createIndex({customer:1, createdAt:-1});
+   c.createIndex({email:1},{unique:true});
+   c.createIndex({createdAt:1},{expireAfterSeconds:3600, name:'ttl_idx'});
+   c.createIndex({'nested.path':1});" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.insertOne({_id:1})" >/dev/null
+
+REP=$(cline indexes --config $CFG --ns $DB.$IXNS 2>&1)
+chk "the report names an index the archive lacks" "true" \
+    "$(grep -q 'customer_1_createdAt_-1' <<<"$REP" && echo true || echo false)"
+chk "and warns about the TTL one by name"        "true" \
+    "$(grep -qE 'ttl_idx.*would delete' <<<"$REP" && echo true || echo false)"
+
+CMDS=$(cline indexes --config $CFG --ns $DB.$IXNS --commands 2>&1 | grep 'createIndex(')
+chk "--commands offers the missing ones"          "3" "$(grep -c 'createIndex(' <<<"$CMDS" || true)"
+chk "and never the TTL one"                       "0" "$(grep -c 'ttl_idx' <<<"$CMDS" || true)"
+chk "and never carries unique across"             "0" "$(grep -c 'unique' <<<"$CMDS" || true)"
+# A nested path has a dot in its field name, so an unquoted key is not valid
+# JavaScript and the whole block would fail to run.
+chk "a nested path is quoted"                     "true" \
+    "$(grep -q '"nested.path"' <<<"$CMDS" && echo true || echo false)"
+
+# The strongest check: the output is not merely plausible, it runs.
+echo "$CMDS" | mongosh "$COLD" --quiet >/dev/null 2>&1
+chk "the commands run against the archive"        "4" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$IXNS.getIndexes().length)")"
+chk "and none of them arrived unique or expiring" "true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$IXNS.getIndexes().every(i=>!i.unique && i.expireAfterSeconds===undefined))")"
+AFTER=$(cline indexes --config $CFG --ns $DB.$IXNS 2>&1)
+chk "the report then shows only the TTL one left" "true" \
+    "$(grep -qE 'ttl_idx' <<<"$AFTER" && ! grep -q 'customer_1_createdAt_-1' <<<"$AFTER" && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

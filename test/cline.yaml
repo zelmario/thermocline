@@ -111,6 +111,9 @@ feeder:
     - "shop.tfoc"
     # testindexes.sh
     - "shop.tidx"
+    # testindexes.sh again, for what `cline indexes` reports and what it
+    # refuses to suggest creating on the archive.
+    - "shop.tidxrep"
     # testexplain.sh
     - "shop.texpl"
     # testunack.sh, the writes that ask for no acknowledgement

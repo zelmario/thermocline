@@ -52,12 +52,24 @@ type indexInfo struct {
 	// enforces uniqueness across the tiers, the key registry is, so its absence
 	// there is expected rather than a finding.
 	unique bool
+	// ttl says the index expires documents. It is the one index that must
+	// never be copied to the archive: the archive exists to keep what the fast
+	// tier has stopped holding, and a TTL index there would delete exactly
+	// that. An operator copying the fast tier's indexes across by hand would
+	// take this one with the rest, so it is named rather than left to be
+	// noticed.
+	ttl bool
+	// keyJSON is the key pattern quoted so it can be pasted into a command.
+	// spec is the readable form and is not always valid JavaScript, because an
+	// index on a nested path has a dot in its field name.
+	keyJSON string
 }
 
 func runIndexes(args []string) error {
 	fs := flag.NewFlagSet("indexes", flag.ExitOnError)
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
 	only := fs.String("ns", "", "one namespace as db.collection, default every managed one")
+	commands := fs.Bool("commands", false, "also print createIndex commands for what the archive is missing")
 	fs.Usage = func() { fmt.Print(indexesUsage); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -93,6 +105,7 @@ func runIndexes(args []string) error {
 	sort.Strings(namespaces)
 
 	missingTotal := 0
+	var toCreate []nsMissing
 	for _, ns := range namespaces {
 		db, coll := splitNamespace(ns)
 		if db == "" || coll == "" {
@@ -141,10 +154,15 @@ func runIndexes(args []string) error {
 				note = "   (unique: uniqueness across the tiers is the key registry's job," +
 					" so this one is only about speed)"
 			}
+			if m.ttl {
+				note = "   (TTL: do NOT create this one on the archive, it would delete" +
+					" the copies the archive exists to keep)"
+			}
 			fmt.Printf("    %-34s %s%s\n", m.name, m.spec, note)
 			missingTotal++
 		}
 		fmt.Printf("  a read that falls through and uses these will scan the archive\n\n")
+		toCreate = append(toCreate, nsMissing{ns: ns, missing: missing})
 	}
 
 	if missingTotal == 0 {
@@ -163,7 +181,63 @@ its fields. Drop it when nothing does, because that storage is the saving.
 The router counts fallback reads per namespace on its dashboard, which is the
 number to look at before deciding.
 `)
+	if *commands {
+		printCreateCommands(toCreate)
+	}
 	return nil
+}
+
+// printCreateCommands writes the createIndex calls for what the archive is
+// missing, so the decision stays with the operator and the transcription does
+// not.
+//
+// Two things the fast tier's index carries are deliberately left out, and both
+// would be taken along by anyone copying the definitions across by hand.
+//
+// A TTL index is not emitted at all. The archive exists to keep what the fast
+// tier has stopped holding, and a TTL index there would delete exactly that.
+// Nothing would report it: the documents would simply stop being there.
+//
+// unique is not emitted either. Uniqueness across the tiers is the key
+// registry's job, and a unique index on the archive can refuse a write the
+// feeder has to make: a document deleted and written again under the same
+// value collides with the tombstoned copy of the old one, and mirroring stops
+// on a collection that is behaving perfectly.
+func printCreateCommands(groups []nsMissing) {
+	printed := false
+	for _, g := range groups {
+		for _, m := range g.missing {
+			if m.ttl {
+				continue
+			}
+			if !printed {
+				fmt.Print("\nRun these against the archive to create what it is missing:\n\n")
+				printed = true
+			}
+			db, coll := splitNamespace(g.ns)
+			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, {name: %q})\n",
+				db, coll, m.keyJSON, m.name)
+		}
+	}
+	if !printed {
+		return
+	}
+	fmt.Print(`
+Neither unique nor expireAfterSeconds is carried across, on purpose. Uniqueness
+between the tiers is the key registry's job, and a unique index on the archive
+can refuse a write the feeder has to make. A TTL index is not listed at all: the
+archive keeps what the fast tier has stopped holding, and expiring it there
+would delete exactly that.
+
+Build them with the archive under no other load, and remember that an index the
+archive does not need is storage the tiering was supposed to save.
+`)
+}
+
+// nsMissing is one namespace's indexes that the archive does not have.
+type nsMissing struct {
+	ns      string
+	missing []indexInfo
 }
 
 // indexesOf reads one collection's indexes from one tier.
@@ -184,9 +258,12 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 		if name == "" {
 			continue
 		}
-		info := indexInfo{name: name, spec: keyPattern(raw)}
+		info := indexInfo{name: name, spec: keyPattern(raw), keyJSON: keyPatternJSON(raw)}
 		if u, ok := raw.Lookup("unique").BooleanOK(); ok && u {
 			info.unique = true
+		}
+		if _, err := raw.LookupErr("expireAfterSeconds"); err == nil {
+			info.ttl = true
 		}
 		out[name] = info
 	}
@@ -210,6 +287,31 @@ func keyPattern(raw bson.Raw) string {
 	parts := make([]string, 0, len(elems))
 	for _, e := range elems {
 		parts = append(parts, fmt.Sprintf("%s: %s", e.Key(), keyDirection(e.Value())))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// keyPatternJSON renders the key pattern so it can be pasted into a command.
+//
+// Field names are quoted, which keyPattern does not do because it is meant to
+// be read. An index on a nested path has a dot in its field name, and
+// {a.b: 1} is not valid JavaScript.
+func keyPatternJSON(raw bson.Raw) string {
+	key, err := raw.LookupErr("key")
+	if err != nil {
+		return "{}"
+	}
+	doc, ok := key.DocumentOK()
+	if !ok {
+		return "{}"
+	}
+	elems, err := doc.Elements()
+	if err != nil {
+		return "{}"
+	}
+	parts := make([]string, 0, len(elems))
+	for _, e := range elems {
+		parts = append(parts, fmt.Sprintf("%q: %s", e.Key(), keyDirection(e.Value())))
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }
