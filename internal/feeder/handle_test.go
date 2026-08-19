@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,5 +121,49 @@ func TestHandleSkipsInternalNamespaces(t *testing.T) {
 		if len(f.pending) != 0 {
 			t.Errorf("db %q: buffered %d operations, want 0", db, len(f.pending))
 		}
+	}
+}
+
+// An application writing Thermocline's own field is reported once per
+// collection, because its documents become indistinguishable from ones the
+// application deleted the moment a read falls through to the archive. The
+// README used to call this a name to avoid and say nothing detects it.
+func TestReservedFieldIsReportedOncePerNamespace(t *testing.T) {
+	var buf strings.Builder
+	f := &Feeder{log: slog.New(slog.NewTextHandler(&buf, nil))}
+
+	doc := func(d bson.D) bson.Raw {
+		raw, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return raw
+	}
+
+	clean := pendingOp{ns: "shop.orders", doc: doc(bson.D{{Key: "_id", Value: 1}})}
+	f.warnReservedField(clean)
+	if strings.Contains(buf.String(), "reserves") {
+		t.Fatal("an ordinary document was reported")
+	}
+
+	dirty := pendingOp{ns: "shop.orders", doc: doc(bson.D{
+		{Key: "_id", Value: 2}, {Key: meta.TombstoneField, Value: time.Now()}})}
+	f.warnReservedField(dirty)
+	if n := strings.Count(buf.String(), "reserves"); n != 1 {
+		t.Fatalf("reported %d times, want 1", n)
+	}
+
+	// Again, and from a second document in the same collection, stays at one.
+	f.warnReservedField(dirty)
+	f.warnReservedField(pendingOp{ns: "shop.orders", doc: doc(bson.D{
+		{Key: "_id", Value: 3}, {Key: meta.BodyDroppedField, Value: true}})})
+	if n := strings.Count(buf.String(), "reserves"); n != 1 {
+		t.Fatalf("one collection reported %d times, want 1", n)
+	}
+
+	// A different collection is its own report.
+	f.warnReservedField(pendingOp{ns: "shop.other", doc: dirty.doc})
+	if n := strings.Count(buf.String(), "reserves"); n != 2 {
+		t.Fatalf("two collections reported %d times, want 2", n)
 	}
 }

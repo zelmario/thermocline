@@ -1021,6 +1021,8 @@ configurable as `meta.db`:
 | `watermarks` | How far back the fast tier is complete, one per namespace |
 | `markers` | Daemon heartbeats, currently just the warmer's |
 
+`_tcBodyDropped` marks the second of those, and is described below.
+
 The unique key registry is the one piece that lives on the *fast* tier instead,
 in a database of the same name, because it has to be written in the same place
 as the data it constrains.
@@ -1049,10 +1051,29 @@ The one exception is `_tcDeletedAt`, set on archived copies whose original the
 application deleted. The router filters on it, so a tombstoned document is never
 returned and never copied back up.
 
-**`_tcDeletedAt` is therefore a reserved field name.** An application that sets
-it on its own documents will find them treated as deleted the moment they are
-served from the archive: still stored, no longer returned. Nothing detects this,
-so it is a name to avoid rather than a trap the code springs.
+**A document already at the 16 MB limit cannot take that field**, and what
+happens then is a decision rather than an accident. The mark does not fit, so
+the archive's copy is replaced by a minimal tombstone carrying the `_id`, the
+mark and `_tcBodyDropped: true`, and the feeder says so at WARN naming the
+document.
+
+Losing one document's audit copy is much cheaper than either alternative.
+Leaving it unmarked means the archive holds a live copy of a document the
+application deleted, and a later read hands it back: measured, a 16 MB document
+deleted on the fast tier came back through the router in full. And the batch
+carrying that mark never succeeds, so the feeder reopens its change stream on
+the same event again and again and **all** mirroring stops behind it, which was
+thirteen identical failures before the run was killed.
+
+**`_tcDeletedAt` is therefore a reserved field name**, along with
+`_tcBodyDropped`. An application that sets either on its own documents will find
+them treated as deleted the moment they are served from the archive: still
+stored, no longer returned, and only when a read reaches past what the fast tier
+holds, which is the hardest shape of bug to notice.
+
+The feeder now says so, once per collection, naming the field and what it costs.
+It reports rather than refuses, because refusing would stop mirroring that
+collection, which is a larger failure than the one being reported.
 
 ## Running it
 

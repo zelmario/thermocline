@@ -114,6 +114,10 @@ const (
 	// TombstoneField marks a cold document whose original the application
 	// deleted. The document stays for auditing, but reads must not return it.
 	TombstoneField = "_tcDeletedAt"
+
+	// BodyDroppedField marks a tombstone that could not keep the document it
+	// stands for. See MinimalTombstone.
+	BodyDroppedField = "_tcBodyDropped"
 )
 
 // SetDB names the bookkeeping database for this process.
@@ -185,6 +189,30 @@ func ClearEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []stri
 // deletes its original.
 func Tombstone(at time.Time) bson.D {
 	return bson.D{{Key: "$set", Value: bson.D{{Key: TombstoneField, Value: at}}}}
+}
+
+// BodyDroppedField marks a tombstone that could not keep the document it
+// stands for.
+//
+// An archived document at the 16 MB limit has no room for TombstoneField, so
+// marking it deleted fails and the archive keeps a live copy of a document the
+// application has removed. A later read then hands it back, which the design
+// calls out as worse than staleness: deleting a document and then finding it
+// again is not a slow answer, it is a wrong one. Worse, the feeder cannot get
+// past the event at all, so all mirroring stops.
+//
+// So correctness wins over the audit copy: the body is dropped to make room for
+// the mark, and this field says that is what happened, for the one document in
+// a deployment that is ever likely to hit it.
+// MinimalTombstone is what an archived document becomes when it is too large to
+// be marked deleted any other way. It keeps the identity and the mark and
+// nothing else.
+func MinimalTombstone(id bson.RawValue, at time.Time) bson.D {
+	return bson.D{
+		{Key: "_id", Value: id},
+		{Key: TombstoneField, Value: at},
+		{Key: BodyDroppedField, Value: true},
+	}
 }
 
 // NotArchivedDeleted matches archived documents whose original is still live.

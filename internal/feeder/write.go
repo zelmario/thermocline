@@ -2,6 +2,7 @@ package feeder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -135,12 +136,16 @@ func (f *Feeder) flush(ctx context.Context) error {
 
 	now := time.Now().UTC()
 	byNS := make(map[string][]mongo.WriteModel)
+	// opsByNS mirrors byNS position for position, so a write error's index can
+	// be turned back into the document it was about.
+	opsByNS := make(map[string][]pendingOp)
 	var order []string
 
 	for _, op := range f.pending {
 		var model mongo.WriteModel
 		switch op.kind {
 		case actionUpsert:
+			f.warnReservedField(op)
 			model = mongo.NewReplaceOneModel().
 				SetFilter(op.key).
 				SetReplacement(op.doc).
@@ -159,12 +164,11 @@ func (f *Feeder) flush(ctx context.Context) error {
 			order = append(order, op.ns)
 		}
 		byNS[op.ns] = append(byNS[op.ns], model)
+		opsByNS[op.ns] = append(opsByNS[op.ns], op)
 	}
 
 	for _, ns := range order {
-		db, coll := splitNS(ns)
-		res, err := f.cold.Database(db).Collection(coll).
-			BulkWrite(ctx, byNS[ns], options.BulkWrite().SetOrdered(true))
+		res, err := f.writeBatch(ctx, ns, byNS[ns], opsByNS[ns], now)
 		if err != nil {
 			return fmt.Errorf("mirror %s: %w", ns, err)
 		}
@@ -286,4 +290,113 @@ func (f *Feeder) publishPosition(ctx context.Context) {
 		return
 	}
 	f.lastPublished = time.Now()
+}
+
+// bsonObjectTooLarge is what MongoDB answers when an update would push a
+// document past the 16 MB limit. Measured against PSMDB 8.0: code 10334,
+// "Resulting document after update is larger than 16777216".
+const bsonObjectTooLarge = 10334
+
+// writeBatch mirrors one namespace's batch, repairing the one failure it can
+// repair rather than retrying it for ever.
+//
+// A document already at the limit has no room for the tombstone field, so
+// marking it deleted fails. Left alone that is two failures at once: the
+// archive keeps a live copy of a document the application deleted, and a later
+// read hands it back; and the batch never succeeds, so the feeder reopens its
+// change stream on the same event again and again and *all* mirroring stops.
+// Measured before this: thirteen identical reopens, and a 16 MB document the
+// application had deleted came back through the router in full.
+//
+// So the body is dropped to make room for the mark. That loses the archive's
+// audit copy of one document, which is worth much less than never returning a
+// deleted one, and it is said out loud rather than inferred.
+func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.WriteModel,
+	ops []pendingOp, now time.Time) (*mongo.BulkWriteResult, error) {
+
+	db, coll := splitNS(ns)
+	c := f.cold.Database(db).Collection(coll)
+
+	// Ordered, so MongoDB stops at the first failure and reports its index.
+	// One repair per pass therefore makes progress; the bound is the batch
+	// itself, so a failure this does not understand still surfaces.
+	for attempt := 0; attempt <= len(models); attempt++ {
+		res, err := c.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(true))
+		if err == nil {
+			return res, nil
+		}
+		op, ok := oversizedTombstone(err, ops)
+		if !ok {
+			return nil, err
+		}
+		f.log.Warn("an archived document is too large to mark deleted, dropping its body",
+			"ns", ns,
+			"id", op.id.String(),
+			"reason", "the document is at the 16MB limit and the tombstone field does not fit",
+			"effect", "the archive keeps the deletion but not the document it stood for",
+			"why", "leaving it unmarked would return a deleted document to a later read, and stop all mirroring")
+		if _, rerr := c.ReplaceOne(ctx, op.key, meta.MinimalTombstone(op.id, now)); rerr != nil {
+			return nil, fmt.Errorf("replace oversized tombstone: %w", rerr)
+		}
+	}
+	return nil, fmt.Errorf("mirroring %s made no progress", ns)
+}
+
+// oversizedTombstone reports whether a bulk write failed because a tombstone
+// did not fit, and which document it was about.
+func oversizedTombstone(err error, ops []pendingOp) (pendingOp, bool) {
+	var bwe mongo.BulkWriteException
+	if !errors.As(err, &bwe) {
+		return pendingOp{}, false
+	}
+	for _, we := range bwe.WriteErrors {
+		if we.Code != bsonObjectTooLarge {
+			continue
+		}
+		if we.Index < 0 || we.Index >= len(ops) {
+			continue
+		}
+		if op := ops[we.Index]; op.kind == actionTombstone {
+			return op, true
+		}
+	}
+	return pendingOp{}, false
+}
+
+// warnReservedField reports an application writing Thermocline's own field.
+//
+// A document on the fast tier carrying _tcDeletedAt is mirrored faithfully, and
+// the archive's copy then looks exactly like a document the application
+// deleted. Reads answered by the fast tier still return it and reads that fall
+// through do not, so the collection appears to lose documents only when it is
+// read past the fast tier's reach. The README calls this a name to avoid; this
+// is what turns it from a name to avoid into something an operator is told
+// about.
+//
+// Once per namespace per feeder run. The alternative to warning is refusing,
+// and refusing would stop mirroring the collection, which is a larger failure
+// than the one being reported.
+func (f *Feeder) warnReservedField(op pendingOp) {
+	if len(op.doc) == 0 || f.warnedReserved[op.ns] {
+		return
+	}
+	field := ""
+	if _, err := op.doc.LookupErr(meta.TombstoneField); err == nil {
+		field = meta.TombstoneField
+	} else if _, err := op.doc.LookupErr(meta.BodyDroppedField); err == nil {
+		field = meta.BodyDroppedField
+	}
+	if field == "" {
+		return
+	}
+	if f.warnedReserved == nil {
+		f.warnedReserved = map[string]bool{}
+	}
+	f.warnedReserved[op.ns] = true
+	f.log.Warn("a document carries a field name Thermocline reserves",
+		"ns", op.ns,
+		"field", field,
+		"effect", "the archive's copy of this document is indistinguishable from one the application deleted, "+
+			"so a read the fast tier cannot answer will not return it",
+		"action", "rename the field; mirroring continues either way, and this is reported once per collection")
 }

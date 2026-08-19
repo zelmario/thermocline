@@ -53,6 +53,11 @@ type Feeder struct {
 	// the checkpoint because a fallback read waits on it.
 	lastPublished time.Time
 
+	// warnedReserved remembers which namespaces have already been reported for
+	// carrying Thermocline's reserved field, so one application doing it does
+	// not fill the log.
+	warnedReserved map[string]bool
+
 	// cached view of whether a warmer is running, see echo.go
 	warmActive    bool
 	warmCheckedAt time.Time

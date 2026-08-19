@@ -203,6 +203,44 @@ BIGREAD=$(R "let n=0, bytes=0; db.getSiblingDB(process.env.TC_DB).tbig.find({big
 chk "the router returns every one of them"   "6 18874368" "$BIGREAD"
 C "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:{\$gte:101}})" >/dev/null
 
+echo "== deleting a document that is already at the size limit =="
+# A document at 16MB has no room for the tombstone field, so marking it deleted
+# fails. Left alone that is two failures at once: the archive keeps a live copy
+# of a document the application deleted and a later read hands it back, and the
+# batch never succeeds, so the feeder reopens its change stream on the same
+# event for ever and all mirroring stops. Measured before the fix: thirteen
+# identical reopens and a 16MB document returned in full through the router.
+#
+# Sized by hand because mongosh has no bsonsize. For {_id:<int32>, blob:<str>}
+# the envelope is 25 bytes.
+H "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:777})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:777})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:777, blob:'x'.repeat(16777216-25-2)})" >/dev/null
+waitBig() { for _ in $(seq 1 120); do
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:777}))")" = "$1" ] && return 0; sleep 0.5; done; }
+waitBig 1
+chk "the document at the limit mirrored" "1" "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:777}))")"
+H "db.getSiblingDB(process.env.TC_DB).tbig.deleteOne({_id:777})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(!!db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:777,_tcDeletedAt:{\$exists:true}}))")" = "true" ] && break
+  sleep 0.5
+done
+chk "the archive marked it deleted"      "true" \
+    "$(C "print(!!db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:777,_tcDeletedAt:{\$exists:true}}))")"
+chk "and it says the body was dropped"   "true" \
+    "$(C "print(!!db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:777,_tcBodyDropped:true}))")"
+chk "a deleted document does not come back" "MISSING" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:777}); print(d?'RESURRECTED':'MISSING')")"
+# The point of the repair is that mirroring carries on. A feeder stuck on one
+# event stops mirroring everything, which is far worse than the one document.
+chk "and the feeder is still mirroring"  "1" "$(pgrep -fc "cline feeder --config $WDIR/" || true)"
+R "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:778, after:1})" >/dev/null
+waitBig2() { for _ in $(seq 1 60); do
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:778}))")" = "1" ] && return 0; sleep 0.5; done; }
+waitBig2
+chk "a later write still reaches the archive" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:778}))")"
+
 echo "== authentication failures pass through =="
 chk "a wrong password is rejected" "true" "$(mongosh --port $PORT -u dba -p wrongpassword --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed|AuthenticationFailed' && echo true || echo false)"
 chk "an unknown user is rejected"  "true" "$(mongosh --port $PORT -u nosuchuser -p x --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed|AuthenticationFailed' && echo true || echo false)"
