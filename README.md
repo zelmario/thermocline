@@ -1215,6 +1215,18 @@ mongosh --port 28018 --eval '
   tens of thousands of clients. With `router.terminate_auth` on the connections
   are pooled instead: measured, eight idle clients cost zero extra connections to
   the primary, against thirty two with it off.
+- **`$out` into a tiered collection is the one place the router removes archived
+  data**, and it is deliberate rather than an oversight. Clearing the fast tier
+  only reaches what the fast tier holds, so an evicted document lives in the
+  archive alone and would come back beside the result: measured, a `$out`
+  promising exactly one document answered with two. `$out` says the target holds
+  the result and nothing else, so the archive's live copies are marked deleted
+  too. A drop is not replayed into the archive precisely so one accident cannot
+  destroy it; a `$out` is not an accident, it is an application saying what this
+  collection should now contain. The archived documents are tombstoned rather
+  than removed, so what they were is still there to look at, and the archive is
+  cleared after the fast tier, so a failure leaves the collection reading as
+  what it held rather than half replaced.
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection

@@ -147,8 +147,30 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		if _, err := coll.DeleteMany(ctx, bson.D{}); err != nil {
 			return nil, fmt.Errorf("clear %s: %w", target, err)
 		}
+		// Clearing the fast tier only reaches what the fast tier holds. A
+		// document that has been evicted lives in the archive alone, so nothing
+		// above deletes it and a read after this would return it beside the
+		// result. Measured: a $out promising exactly one document answered with
+		// two, the extra one being an evicted document from before it ran.
+		//
+		// $out says the target holds the result and nothing else, so the
+		// archive's live copies are marked deleted as well. This is the one
+		// place the router removes archived data, and it is deliberate: a drop
+		// is not replayed into the archive precisely so that one accident
+		// cannot destroy it, and a $out is not an accident, it is an
+		// application saying what this collection should now contain.
+		//
+		// After the fast tier, not before. If this fails, the collection still
+		// reads as what it held, because the archive is what answers once the
+		// fast tier is empty, and the caller gets an error rather than a
+		// half-replaced collection reported as success.
+		archived := c.r.cold.Database(outDB).Collection(outColl)
+		if _, err := archived.UpdateMany(ctx,
+			bson.D{meta.NotArchivedDeleted()}, meta.Tombstone(time.Now().UTC())); err != nil {
+			return nil, fmt.Errorf("clear the archive's copy of %s: %w", target, err)
+		}
 		return &writeSink{
-			r: c.r, how: "replaced in place, so the result mirrors to the archive",
+			r: c.r, how: "replaced on both tiers, so the result is all that is left",
 			target: target, outColl: coll,
 		}, nil
 	}

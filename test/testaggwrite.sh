@@ -167,6 +167,33 @@ R "db.getSiblingDB(process.env.TC_DB).tbulk.aggregate([{\$project:{n:1}},{\$out:
 chk "the rerun replaced the collection"   "100" "$(H "print(db.getSiblingDB(process.env.TC_DB).bulkout.countDocuments({}))")"
 chk "and left no temporary behind either" "0"   "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 
+echo "== \$out into a tiered target leaves nothing of what was there =="
+# $out says the target holds the result and nothing else. Clearing the fast tier
+# only reaches what the fast tier holds, so a document that has been evicted
+# lives in the archive alone and nothing above deletes it. Measured before the
+# fix: a $out promising exactly one document answered with two, the extra one
+# being an evicted document from before it ran.
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+# One document on both tiers, and one that has been evicted: live in the
+# archive, absent from the fast tier, which is what eviction leaves behind.
+H "db.getSiblingDB(process.env.TC_DB).rollup.insertOne({_id:2, v:'on both tiers'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.insertOne({_id:2, v:'on both tiers'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.insertOne({_id:1, v:'evicted long ago'})" >/dev/null
+chk "the router sees both to begin with" "[1,2]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))")"
+R "db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:99, v:'from the pipeline'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{\$match:{_id:99}},{\$out:'rollup'}]).toArray()" >/dev/null
+sleep 5
+chk "the target is exactly the result"   "[99]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))")"
+chk "and the archive holds only that"    "[99]" \
+    "$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+# The archived document is marked deleted rather than removed, so what it was is
+# still there to be looked at.
+chk "the evicted one is tombstoned, not gone" "true" \
+    "$(C "print(!!db.getSiblingDB(process.env.TC_DB).rollup.findOne({_id:1,_tcDeletedAt:{\$exists:true}}))")"
+
 stopDaemons
 echo
 echo "================================"
