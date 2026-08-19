@@ -262,7 +262,23 @@ measured on a read that falls through to the archive:
 A fallback read costs about the cadence plus seven milliseconds. Below 20 ms it
 stops paying for itself: ten buys six milliseconds and makes the tail worse, so
 20 ms is the default and `feeder.max_await` with `feeder.position_every` are
-there for a deployment that would rather spend the round trips. There is no
+there for a deployment that would rather spend the round trips.
+
+**What that is worth to an application**, measured on the shop against a
+5,000,000 order archive with the fast tier empty, so nearly every read falls
+through. Same data, same run, only the cadence differing:
+
+| | 100 ms | 20 ms |
+|---|---|---|
+| throughput | 60/s | **71/s** |
+| a customer's order history | 167 ms | **84 ms** |
+| count a customer's orders | 152 ms | **89 ms** |
+| read an order by date | 162 ms | **80 ms** |
+
+The cadence is not free on the archive: it is more round trips to the tier that
+is already answering the reads this is trying to speed up, and two of the three
+99th percentiles move the wrong way, from about 300 ms to about 440 ms, while
+the worst of them halves. It is a good trade here and it is a trade. There is no
 point setting `position_every` slower than `max_await`, because the position can
 only move when a poll finds the stream empty.
 
