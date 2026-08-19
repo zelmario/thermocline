@@ -76,6 +76,18 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	if err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
 	}
+	// The first document of a namespace to arrive here is the cheapest moment
+	// to build that namespace's indexes: the collection is empty or nearly so.
+	// Not on this read's path though. The copy-up happens inside a client's
+	// query, and a collection that already holds a lot of this namespace would
+	// make the client wait out an index build it did not ask for.
+	//
+	// Detached from the request context for the same reason: the read returns
+	// immediately, and cancelling it must not abandon the build half done.
+	if inserted {
+		ns := ns
+		go r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+	}
 	if !inserted {
 		// The fast tier already held it, so no insert happened and no echo is
 		// coming. See withdrawEcho for what leaving the notice would cost.

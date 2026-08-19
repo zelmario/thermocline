@@ -689,13 +689,52 @@ application dials.
 `test/traffic.sh` drives representative traffic down every path if you want to
 see it with something on it, and `test/load.sh` keeps it running.
 
-### Indexes are not copied, in either direction
+### Indexes go up, never down
 
-Nothing synchronises indexes between the tiers, and nothing should. Index trees
+The archive is expected to hold far fewer indexes than the fast tier. Index trees
 describe the whole collection, which is the cost tiering exists to avoid, so
-carrying every one of them on the archive gives most of the saving back. The
-fast tier holds the application's query plans; the archive is expected to hold
-far fewer.
+carrying every one of them on the archive gives most of the saving back. Nothing
+copies an index from the fast tier down to the archive, and nothing should.
+
+**Upward is the opposite case, and it was wrong for the whole of adoption.** The
+fast tier is filled by copying documents, and an index is not a document, so a
+tier that has just been built holds everything the application asks for and no
+way to find any of it except by `_id`. That is the shape of every adoption: the
+existing cluster becomes the archive carrying the application's indexes, and the
+new fast tier starts bare.
+
+Measured on a 5,000,000 order shop, archive 1.32 GB against a 1 GB cache, hot
+window 30 days:
+
+| | fast tier bare | indexes built |
+|---|---|---|
+| throughput | 35/s | **78/s** |
+| a customer's order history | 501 ms | **160 ms** |
+| read an order by date | 543 ms | **159 ms** |
+| a monthly revenue report | 1.23 s | **680 ms** |
+| the warm itself | 672 s | **639 s** |
+
+Day one, before any warm, was 62/s. So warming a bare fast tier *cost* 44% of
+the throughput: it moved reads onto a tier that scans 411,000 documents while
+the archive it was relieving was seeking an index. Building them costs nothing,
+because an index built on an empty collection is free and one built on a full
+one is a scan.
+
+Both fillers do it, through one implementation in `internal/promote`: the warmer
+before it fills a namespace, and the router the first time it copies a document
+up, which is the only path for a collection no warm rule covers. Once built,
+never again.
+
+It is not only speed. The router reads the **fast tier's** unique indexes to
+know which values it must protect across the tiers, so a bare fast tier means
+neither mongod nor the registry is enforcing one, and a constraint the
+application has relied on for years quietly stops holding on the day it is
+adopted.
+
+A TTL index is the one that does not travel. Expiring documents on the fast tier
+would have the feeder read those expiries as application deletes and tombstone
+the archive's copies, so an index whose job is to remove data would reach into
+the tier that exists to keep it. The archive goes on expiring its own copies.
 
 **The consequence is that a read which falls through runs with whatever indexes
 the archive happens to have.** For a filter that is slower. For a sort it can be

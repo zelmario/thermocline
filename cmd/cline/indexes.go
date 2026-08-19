@@ -121,29 +121,38 @@ func runIndexes(args []string) error {
 			continue
 		}
 
-		var missing []indexInfo
-		for _, h := range hotIdx {
-			if _, ok := coldIdx[h.name]; ok {
-				continue
-			}
-			// Match on the key pattern too: the same index under a different
-			// name is still that index.
-			found := false
-			for _, c := range coldIdx {
-				if c.spec == h.spec {
-					found = true
-					break
-				}
-			}
-			if !found {
-				missing = append(missing, h)
-			}
-		}
+		missing := absentFrom(hotIdx, coldIdx)
+		// And the other way round, which is the direction that matters on the
+		// day a deployment starts. The existing cluster becomes the archive
+		// carrying every index the application has; the fast tier is new and
+		// filled by the warmer, and an index is not a document. Reporting only
+		// what the archive lacks would print "the archive can answer anything
+		// the fast tier can" about a fast tier that can answer nothing except
+		// by _id, which is true and useless.
+		bare := absentFrom(coldIdx, hotIdx)
 
 		fmt.Printf("%s\n", ns)
 		fmt.Printf("  fast tier %2d index(es), archive %2d\n", len(hotIdx), len(coldIdx))
+
+		if len(bare) > 0 {
+			sort.Slice(bare, func(i, j int) bool { return bare[i].name < bare[j].name })
+			fmt.Printf("  missing from the FAST TIER:\n")
+			for _, m := range bare {
+				note := ""
+				if m.ttl {
+					note = "   (TTL: expiring on the fast tier would delete the archive's" +
+						" copies too, through the feeder)"
+				}
+				fmt.Printf("    %-34s %s%s\n", m.name, m.spec, note)
+			}
+			fmt.Printf("  the fast tier scans for these, which is the tier that exists not to\n")
+		}
+
 		if len(missing) == 0 {
-			fmt.Printf("  the archive can answer anything the fast tier can\n\n")
+			if len(bare) == 0 {
+				fmt.Printf("  the archive can answer anything the fast tier can\n")
+			}
+			fmt.Print("\n")
 			continue
 		}
 		sort.Slice(missing, func(i, j int) bool { return missing[i].name < missing[j].name })
@@ -162,7 +171,7 @@ func runIndexes(args []string) error {
 			missingTotal++
 		}
 		fmt.Printf("  a read that falls through and uses these will scan the archive\n\n")
-		toCreate = append(toCreate, nsMissing{ns: ns, missing: missing})
+		toCreate = append(toCreate, nsMissing{ns: ns, missing: missing, bare: bare})
 	}
 
 	if missingTotal == 0 {
@@ -204,6 +213,44 @@ number to look at before deciding.
 // value collides with the tombstoned copy of the old one, and mirroring stops
 // on a collection that is behaving perfectly.
 func printCreateCommands(groups []nsMissing) {
+	// The fast tier first, because that is the one a new deployment is missing
+	// and the one whose scans the application feels.
+	//
+	// unique is carried here and not to the archive, and the asymmetry is the
+	// point. The fast tier holds a subset, and a subset of unique values is
+	// unique, so the constraint is satisfiable; more than that, the router
+	// reads the fast tier's unique indexes to learn what it must protect across
+	// both tiers, so a fast tier without them means nothing is enforcing the
+	// application's constraint at all.
+	fastPrinted := false
+	for _, g := range groups {
+		for _, m := range g.bare {
+			if m.ttl {
+				continue
+			}
+			if !fastPrinted {
+				fmt.Print("\nRun these against the fast tier, which is missing them:\n\n")
+				fastPrinted = true
+			}
+			db, coll := splitNamespace(g.ns)
+			opts := fmt.Sprintf("{name: %q", m.name)
+			if m.unique {
+				opts += ", unique: true"
+			}
+			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, %s})\n",
+				db, coll, m.keyJSON, opts)
+		}
+	}
+	if fastPrinted {
+		fmt.Print(`
+The warmer builds these itself when it fills a namespace, so this list is for
+collections it has no rule for. A TTL index is never listed: expiring documents
+on the fast tier would have the feeder read those expiries as application
+deletes and tombstone the archive's copies, so an index whose job is to remove
+data would reach into the tier that exists to keep it.
+`)
+	}
+
 	printed := false
 	for _, g := range groups {
 		for _, m := range g.missing {
@@ -237,7 +284,35 @@ archive does not need is storage the tiering was supposed to save.
 // nsMissing is one namespace's indexes that the archive does not have.
 type nsMissing struct {
 	ns      string
-	missing []indexInfo
+	missing []indexInfo // the archive does not have these
+	bare    []indexInfo // the fast tier does not have these
+}
+
+// absentFrom returns the indexes in have that want does not carry.
+//
+// Matched on the key pattern as well as the name, because the same index under
+// a different name is still that index.
+func absentFrom(have, want map[string]indexInfo) []indexInfo {
+	var out []indexInfo
+	for _, h := range have {
+		if h.name == "_id_" {
+			continue
+		}
+		if _, ok := want[h.name]; ok {
+			continue
+		}
+		found := false
+		for _, w := range want {
+			if w.spec == h.spec {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // indexesOf reads one collection's indexes from one tier.

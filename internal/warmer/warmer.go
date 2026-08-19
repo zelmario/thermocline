@@ -49,6 +49,10 @@ type Warmer struct {
 
 	marks   *watermark.Store
 	limiter *limiter
+	// indexer gives the fast tier the archive's indexes, so a tier this fills
+	// can seek for the reads the archive was already seeking for. See
+	// promote/indexes.go.
+	indexer *promote.Indexer
 }
 
 // publish records what this warmer has done so far.
@@ -108,6 +112,7 @@ func New(hot, cold *mongo.Client, cfg config.WarmerConfig, unannounced config.Un
 		dryRun:      dryRun,
 		marks:       watermark.New(cold),
 		limiter:     newLimiter(cfg.Rate),
+		indexer:     promote.NewIndexer(hot, cold, log),
 	}
 }
 
@@ -314,6 +319,13 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 	}
 
 	start := resumePoint(saved, now)
+
+	// Before the documents, not after: an index built on an empty collection
+	// costs nothing and one built on a full one costs a scan. See indexes.go
+	// for why a warmed tier has none of its own.
+	if !w.dryRun {
+		w.indexer.Ensure(ctx, rule.NS)
+	}
 
 	w.log.Info("warming",
 		"ns", rule.NS,

@@ -29,6 +29,7 @@ import (
 	"github.com/zelmario/thermocline/internal/cache"
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -87,6 +88,11 @@ type Router struct {
 	// whose hint decides which documents are looked at rather than how. See
 	// hint.go.
 	hintCache hintCache
+	// indexer gives the fast tier the archive's indexes the first time a
+	// document is copied up into a namespace. A copy-up is the other way the
+	// fast tier gains documents, and the only way for a namespace no warmer
+	// rule covers. See promote/indexes.go.
+	indexer   *promote.Indexer
 	collCache collationCache
 	viewCache viewCache
 
@@ -179,6 +185,7 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 		marks:       watermark.New(cold),
 		checkpoints: checkpoint.New(cold),
 		positions:   checkpoint.NewPositions(cold),
+		indexer:     promote.NewIndexer(hot, cold, log),
 		log:         log,
 		Metrics:     NewMetrics(metricsWindow),
 		started:     time.Now(),
