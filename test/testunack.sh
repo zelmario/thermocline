@@ -23,7 +23,24 @@
 # Refusing has nowhere to go, so where the guard would have refused the right
 # thing is to not perform the write. A dropped write is what w:0 already means to
 # an application: it asked not to be told.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
@@ -31,37 +48,37 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-56s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-56s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
-cleanup() { pkill -9 -f 'cline feeder' 2>/dev/null; pkill -9 -f 'cline router' 2>/dev/null; }
+cleanup() { pkill -9 -f "cline feeder --config $WDIR/" 2>/dev/null; pkill -9 -f "cline router --config $WDIR/" 2>/dev/null; }
 trap cleanup EXIT
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/unack_f.log &
+  cline feeder --config $CFG --log-file $LOGDIR/unack_f.log &
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/unack_r.log &
+  cline router --config $CFG --log-file $LOGDIR/unack_r.log &
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 stopFeeder() {
-  pkill -f 'cline feeder' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 # Remove documents from the fast tier the way an eviction does, with the feeder
 # blind to it, so the archive keeps a live copy. Doing it with the feeder running
@@ -70,31 +87,31 @@ stopFeeder() {
 evictBehindTheFeeder() {
   stopFeeder
   H "$1" >/dev/null
-  C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+  C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
   startFeeder
 }
 # The feeder has to have caught up before a check reads the archive, and it is
 # always some way behind. Waiting on a sentinel beats sleeping for a guess.
 waitFeeder() {
-  H "db.getSiblingDB('shop').tunku.insertOne({_id:'__sentinel'})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tunku.insertOne({_id:'__sentinel'})" >/dev/null
   for _ in $(seq 1 120); do
-    [ "$(C "print(db.getSiblingDB('shop').tunku.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tunku.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
     sleep 0.5
   done
-  H "db.getSiblingDB('shop').tunku.deleteOne({_id:'__sentinel'})" >/dev/null
-  C "db.getSiblingDB('shop').tunku.deleteOne({_id:'__sentinel'})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tunku.deleteOne({_id:'__sentinel'})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).tunku.deleteOne({_id:'__sentinel'})" >/dev/null
 }
 
 echo "== setup =="
 stopDaemons
 for t in tunku tunki tunkm; do
-  H "db.getSiblingDB('shop').$t.drop()" >/dev/null
-  C "db.getSiblingDB('shop').$t.drop()" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
 done
-C "db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'});
-   db.getSiblingDB('_thermocline').watermarks.deleteMany({});
-   db.getSiblingDB('_thermocline').residency.deleteMany({});
-   db.getSiblingDB('_thermocline').evicting.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'});
+   db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).residency.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 
@@ -102,56 +119,56 @@ echo "== an unacknowledged upsert over a document only the archive holds =="
 # On one cluster this updates the existing document and nothing is lost. Here the
 # fast tier cannot see it, so an unjudged upsert creates a stub in its place and
 # the feeder mirrors that over the archived record.
-C "db.getSiblingDB('shop').tunku.insertOne({_id:5, name:'alice', tier:'gold', balance:100})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tunku.insertOne({_id:5, name:'alice', tier:'gold', balance:100})" >/dev/null
 chk "the fast tier has never held it"                      "0" \
-    "$(H "print(db.getSiblingDB('shop').tunku.countDocuments({_id:5}))")"
-R "db.getSiblingDB('shop').tunku.updateOne({_id:5},{\$set:{balance:200}},{upsert:true,writeConcern:{w:0}})" >/dev/null 2>&1
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunku.countDocuments({_id:5}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunku.updateOne({_id:5},{\$set:{balance:200}},{upsert:true,writeConcern:{w:0}})" >/dev/null 2>&1
 sleep 3
 waitFeeder
 chk "the fields it could not see survived"                 "alice-gold-200" \
-    "$(R "const d=db.getSiblingDB('shop').tunku.findOne({_id:5}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tunku.findOne({_id:5}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
 chk "and the archive was not overwritten by a stub"        "alice-gold-200" \
-    "$(C "const d=db.getSiblingDB('shop').tunku.findOne({_id:5}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tunku.findOne({_id:5}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
 
 echo "== an unacknowledged insert of an _id the archive still holds =="
 # On one cluster this is a duplicate key error and the existing document is
 # untouched. The client asked not to be told, but it did not ask for the
 # archived document to be replaced.
-C "db.getSiblingDB('shop').tunki.insertOne({_id:9, name:'carol', tier:'silver', balance:70})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tunki.insertOne({_id:9, name:'carol', tier:'silver', balance:70})" >/dev/null
 chk "the archive holds it and the fast tier does not"      "0" \
-    "$(H "print(db.getSiblingDB('shop').tunki.countDocuments({_id:9}))")"
-R "db.getSiblingDB('shop').tunki.insertOne({_id:9, v:'overwrite'},{writeConcern:{w:0}})" >/dev/null 2>&1
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunki.countDocuments({_id:9}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunki.insertOne({_id:9, v:'overwrite'},{writeConcern:{w:0}})" >/dev/null 2>&1
 sleep 3
 waitFeeder
 chk "the archived document is still whole"                 "carol-silver-70" \
-    "$(C "const d=db.getSiblingDB('shop').tunki.findOne({_id:9}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tunki.findOne({_id:9}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
 
 echo "== an unacknowledged deleteMany that reaches archived documents =="
 # On one cluster this removes all twelve. Here nine of them are only in the
 # archive, and without the copy-up the delete never sees them: they stay
 # readable through the router afterwards, which is an erasure that did not erase.
-H "db.getSiblingDB('shop').tunkm.insertMany(Array.from({length:12},(_,i)=>({_id:i+1,grp:'g',n:i})))" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tunkm.insertMany(Array.from({length:12},(_,i)=>({_id:i+1,grp:'g',n:i})))" >/dev/null
 waitFeeder
 # Take nine away from the fast tier only, which is what eviction leaves behind.
-evictBehindTheFeeder "db.getSiblingDB('shop').tunkm.deleteMany({_id:{\$gt:3}})"
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tunkm.deleteMany({_id:{\$gt:3}})"
 chk "the fast tier holds three of twelve"                  "3" \
-    "$(H "print(db.getSiblingDB('shop').tunkm.countDocuments({}))")"
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkm.countDocuments({}))")"
 chk "the archive still holds all twelve"                   "12" \
-    "$(C "print(db.getSiblingDB('shop').tunkm.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
-R "db.getSiblingDB('shop').tunkm.deleteMany({grp:'g'},{writeConcern:{w:0}})" >/dev/null 2>&1
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tunkm.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunkm.deleteMany({grp:'g'},{writeConcern:{w:0}})" >/dev/null 2>&1
 sleep 4
 waitFeeder
 chk "nothing matching is left to read"                     "0" \
-    "$(R "print(db.getSiblingDB('shop').tunkm.countDocuments({grp:'g'}))")"
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tunkm.countDocuments({grp:'g'}))")"
 
 echo "== and an ordinary unacknowledged write still lands =="
 # The fix must not turn every w:0 write into a dropped one.
-R "db.getSiblingDB('shop').tunku.insertOne({_id:50, v:'plain'},{writeConcern:{w:0}})" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).tunku.insertOne({_id:50, v:'plain'},{writeConcern:{w:0}})" >/dev/null 2>&1
 sleep 2
 chk "a write with nothing to judge is performed"           "plain" \
-    "$(H "const d=db.getSiblingDB('shop').tunku.findOne({_id:50}); print(d?d.v:'MISSING')")"
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).tunku.findOne({_id:50}); print(d?d.v:'MISSING')")"
 chk "and it reaches the archive too"                       "plain" \
-    "$(C "const d=db.getSiblingDB('shop').tunku.findOne({_id:50}); print(d?d.v:'MISSING')")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tunku.findOne({_id:50}); print(d?d.v:'MISSING')")"
 
 stopDaemons
 echo

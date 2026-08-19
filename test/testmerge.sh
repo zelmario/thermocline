@@ -19,7 +19,24 @@
 # untiered reference holding the same documents, every merge runs against both,
 # and the answers have to match. A failure is the router disagreeing with
 # MongoDB.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tmrg
@@ -31,80 +48,80 @@ chk() {
 }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 
-cleanup() { pkill -9 -f 'cline feeder' 2>/dev/null; pkill -9 -f 'cline router' 2>/dev/null; }
+cleanup() { pkill -9 -f "cline feeder --config $WDIR/" 2>/dev/null; pkill -9 -f "cline router --config $WDIR/" 2>/dev/null; }
 trap cleanup EXIT
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/merge_f.log &
+  cline feeder --config $CFG --log-file $LOGDIR/merge_f.log &
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/merge_r.log &
+  cline router --config $CFG --log-file $LOGDIR/merge_r.log &
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 # The document as the application would see it, with volatile fields removed.
-doc() { R "const d=db.getSiblingDB('shop').$1.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+doc() { R "const d=db.getSiblingDB(process.env.TC_DB).$1.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
 # And as the archive holds it, which is where the loss would be.
-cold5() { C "const d=db.getSiblingDB('shop').$NS.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+cold5() { C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
 
 # reseed puts the reference whole on the fast tier, and the tiered one with _id 5
 # living only in the archive, which is what an evicted document looks like.
 reseed() {
   local doc5='{_id:5, name:"alice", tier:"gold", balance:100}'
-  H "db.getSiblingDB('shop').$REF.drop(); db.getSiblingDB('shop').$REF.insertMany([$doc5,{_id:6,name:'bob',tier:'silver',balance:50}])" >/dev/null
-  H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-  C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-  H "db.getSiblingDB('shop').$NS.insertOne({_id:6,name:'bob',tier:'silver',balance:50})" >/dev/null
-  C "db.getSiblingDB('shop').$NS.bulkWrite([
+  H "db.getSiblingDB(process.env.TC_DB).$REF.drop(); db.getSiblingDB(process.env.TC_DB).$REF.insertMany([$doc5,{_id:6,name:'bob',tier:'silver',balance:50}])" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:6,name:'bob',tier:'silver',balance:50})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$NS.bulkWrite([
        {replaceOne:{filter:{_id:5},replacement:$doc5,upsert:true}},
        {replaceOne:{filter:{_id:6},replacement:{_id:6,name:'bob',tier:'silver',balance:50},upsert:true}}],{ordered:false})" >/dev/null
-  cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+  cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
   sleep 1
 }
 
 echo "== setup =="
 stopDaemons
-C "db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'});
-   db.getSiblingDB('_thermocline').watermarks.deleteMany({});
-   db.getSiblingDB('_thermocline').residency.deleteMany({});
-   db.getSiblingDB('_thermocline').markers.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'});
+   db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).residency.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).markers.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 reseed
-chk "the tiered fast tier does not hold it"           "0" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:5}))")"
-chk "but the archive does"                            "1" "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_id:5}))")"
+chk "the tiered fast tier does not hold it"           "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:5}))")"
+chk "but the archive does"                            "1" "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:5}))")"
 # By a field, never by _id. A point lookup by _id is the one read that promotes,
 # so checking the fixture that way brings the document to the fast tier and every
 # merge below then finds it there, testing nothing. That is how the first two
 # sections of this suite passed while the archived case was untested.
 chk "and the router can still see it"                 "alice" \
-    "$(R "const d=db.getSiblingDB('shop').$NS.findOne({name:'alice'}); print(d?d.name:'MISSING')")"
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({name:'alice'}); print(d?d.name:'MISSING')")"
 
 mergeInto() { # collection -> run the same $merge against it
-  R "db.getSiblingDB('shop').aggregate([
+  R "db.getSiblingDB(process.env.TC_DB).aggregate([
        {\$documents:[{_id:5, balance:200}]},
        {\$merge:{into:'$1', whenMatched:'merge', whenNotMatched:'insert'}}
      ]).toArray(); print('done')" >/dev/null 2>&1
 }
 
 echo "== whenMatched merge, against a document only the archive holds =="
-chk "the fast tier still does not hold it"            "0" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:5}))")"
+chk "the fast tier still does not hold it"            "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:5}))")"
 mergeInto $REF
 mergeInto $NS
 sleep 6
@@ -113,11 +130,11 @@ chk "and the archive kept the fields it had"          "$(doc $REF)" "$(cold5)"
 
 echo "== whenMatched replace =="
 reseed
-R "db.getSiblingDB('shop').aggregate([
+R "db.getSiblingDB(process.env.TC_DB).aggregate([
      {\$documents:[{_id:5, balance:300}]},
      {\$merge:{into:'$REF', whenMatched:'replace', whenNotMatched:'insert'}}
    ]).toArray()" >/dev/null 2>&1
-R "db.getSiblingDB('shop').aggregate([
+R "db.getSiblingDB(process.env.TC_DB).aggregate([
      {\$documents:[{_id:5, balance:300}]},
      {\$merge:{into:'$NS', whenMatched:'replace', whenNotMatched:'insert'}}
    ]).toArray()" >/dev/null 2>&1
@@ -126,9 +143,9 @@ chk "a replacing merge matches the reference"         "$(doc $REF)" "$(doc $NS)"
 
 echo "== whenMatched fail, which must fail rather than insert =="
 reseed
-reffail=$(R "try{db.getSiblingDB('shop').aggregate([{\$documents:[{_id:5,balance:400}]},
+reffail=$(R "try{db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:5,balance:400}]},
    {\$merge:{into:'$REF', whenMatched:'fail', whenNotMatched:'insert'}}]).toArray(); print('ACCEPTED')}catch(e){print('FAILED')}")
-gotfail=$(R "try{db.getSiblingDB('shop').aggregate([{\$documents:[{_id:5,balance:400}]},
+gotfail=$(R "try{db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:5,balance:400}]},
    {\$merge:{into:'$NS', whenMatched:'fail', whenNotMatched:'insert'}}]).toArray(); print('ACCEPTED')}catch(e){print('FAILED')}")
 chk "whenMatched fail behaves the same on both"       "$reffail" "$gotfail"
 
@@ -139,31 +156,31 @@ chk "whenMatched fail behaves the same on both"       "$reffail" "$gotfail"
 # them and still destroyed archived data one database over.
 XNS=tmrgx
 XREF=tmrefx
-xdoc() { R "const d=db.getSiblingDB('wh').$1.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
-xcold5() { C "const d=db.getSiblingDB('wh').$XNS.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+xdoc() { R "const d=db.getSiblingDB(process.env.TC_DB2).$1.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
+xcold5() { C "const d=db.getSiblingDB(process.env.TC_DB2).$XNS.findOne({_id:5}); if(!d){print('MISSING')}else{delete d._tcDeletedAt; print(JSON.stringify(d))}"; }
 reseedX() {
   local doc5='{_id:5, name:"alice", tier:"gold", balance:100}'
-  H "db.getSiblingDB('wh').$XREF.drop(); db.getSiblingDB('wh').$XREF.insertMany([$doc5,{_id:6,name:'bob',tier:'silver',balance:50}])" >/dev/null
-  H "db.getSiblingDB('wh').$XNS.drop()" >/dev/null
-  C "db.getSiblingDB('wh').$XNS.drop()" >/dev/null
-  H "db.getSiblingDB('wh').$XNS.insertOne({_id:6,name:'bob',tier:'silver',balance:50})" >/dev/null
-  C "db.getSiblingDB('wh').$XNS.bulkWrite([
+  H "db.getSiblingDB(process.env.TC_DB2).$XREF.drop(); db.getSiblingDB(process.env.TC_DB2).$XREF.insertMany([$doc5,{_id:6,name:'bob',tier:'silver',balance:50}])" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB2).$XNS.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB2).$XNS.drop()" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB2).$XNS.insertOne({_id:6,name:'bob',tier:'silver',balance:50})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB2).$XNS.bulkWrite([
        {replaceOne:{filter:{_id:5},replacement:$doc5,upsert:true}},
        {replaceOne:{filter:{_id:6},replacement:{_id:6,name:'bob',tier:'silver',balance:50},upsert:true}}],{ordered:false})" >/dev/null
-  cline watermark --config $CFG --ns wh.$XNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+  cline watermark --config $CFG --ns $DB2.$XNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
   sleep 1
 }
 mergeIntoX() { # collection in wh, merged into from an aggregation running in shop
-  R "db.getSiblingDB('shop').aggregate([
+  R "db.getSiblingDB(process.env.TC_DB).aggregate([
        {\$documents:[{_id:5, balance:200}]},
-       {\$merge:{into:{db:'wh',coll:'$1'}, whenMatched:'merge', whenNotMatched:'insert'}}
+       {\$merge:{into:{db:'$DB2',coll:'$1'}, whenMatched:'merge', whenNotMatched:'insert'}}
      ]).toArray(); print('done')" >/dev/null 2>&1
 }
 
 echo "== \$merge into a tiered collection in another database =="
 reseedX
-chk "the cross-database fast tier lacks it"           "0" "$(H "print(db.getSiblingDB('wh').$XNS.countDocuments({_id:5}))")"
-chk "its archive holds it"                            "1" "$(C "print(db.getSiblingDB('wh').$XNS.countDocuments({_id:5}))")"
+chk "the cross-database fast tier lacks it"           "0" "$(H "print(db.getSiblingDB(process.env.TC_DB2).$XNS.countDocuments({_id:5}))")"
+chk "its archive holds it"                            "1" "$(C "print(db.getSiblingDB(process.env.TC_DB2).$XNS.countDocuments({_id:5}))")"
 mergeIntoX $XREF
 mergeIntoX $XNS
 sleep 6

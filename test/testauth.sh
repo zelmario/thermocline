@@ -13,7 +13,24 @@
 # acting after the fact would leave a truncated collection written. Judged
 # before they run means the fast tier never sees them, which means nothing ever
 # checks whether this client was allowed to ask.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tauth
@@ -22,41 +39,41 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-54s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-54s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 # The restricted client, through the router.
-L() { mongosh "mongodb://limited:limited@127.0.0.1:27100/?authSource=admin&directConnection=true" --quiet --eval "$1" 2>&1 | tail -1; }
+L() { mongosh "mongodb://limited:limited@127.0.0.1:$PORT/?authSource=admin&directConnection=true" --quiet --eval "$1" 2>&1 | tail -1; }
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 stopFeeder() {
-  pkill -f 'cline feeder' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/auth_f.log & FP=$!
+  cline feeder --config $CFG --log-file $LOGDIR/auth_f.log & FP=$!
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/auth_r.log & RP=$!
+  cline router --config $CFG --log-file $LOGDIR/auth_r.log & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 waitMirrored() {
   local n=""
   for _ in $(seq 1 60); do
-    n=$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+    n=$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
     [ "$n" = "$1" ] && return 0
     sleep 0.5
   done
@@ -65,8 +82,8 @@ waitMirrored() {
 
 echo "== setup =="
 stopDaemons
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
 
 # A user who may read one database and not the one being tiered. Created on the
 # fast tier, which is where the router sends the handshake.
@@ -77,37 +94,37 @@ chk "the restricted user exists"                        "1" \
 
 startFeeder
 startRouter
-R "db.getSiblingDB('shop').$NS.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i,grp:'g'})))" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i,grp:'g'})))" >/dev/null
 waitMirrored 10
 
 echo "== the fast tier still refuses what it should =="
 # The fast tier holds everything here, so nothing falls through and the client's
 # own permissions decide, as they always have.
-cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
+cline watermark --config $CFG --ns $DB.$NS --complete-all >/dev/null
 sleep 7
 chk "a restricted find is refused"                      "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.find({}).itcount()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted count is refused"                     "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.count()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.count()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 
 echo "== and it must still refuse when the answer would come from the archive =="
 # Now the fast tier cannot answer, so these are the reads that fall through. The
 # archive is reached with the router's credentials, not this client's, so unless
 # something checks, a client with no access to the collection is handed its
 # contents.
-cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
-chk "the fallback works for an allowed client"          "10" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+chk "the fallback works for an allowed client"          "10" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 chk "a restricted find still refused"                   "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.find({}).itcount()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted count still refused"                  "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.count()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.count()); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted countDocuments still refused"         "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.countDocuments({})); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({})); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted distinct still refused"               "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.distinct('grp').length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.distinct('grp').length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted aggregation still refused"            "DENIED" "$(L "
-  try { print(db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}}]).toArray().length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}}]).toArray().length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 
 H "db.getSiblingDB('admin').dropUser('limited')" >/dev/null 2>&1
 stopDaemons

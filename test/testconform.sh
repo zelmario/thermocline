@@ -20,7 +20,24 @@
 # Both tiers of tcon get the same secondary indexes, because that is the
 # documented deployment: see "Indexes are not copied, in either direction" in
 # README, and `cline indexes` for the divergence report.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
@@ -28,7 +45,7 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-40s %.34s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-40s\n          ref=%.150s\n          got=%.150s\n' "$1" "$2" "$3"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
@@ -37,33 +54,33 @@ C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 # the router, and the answers must agree.
 same() {
   local label="$1" expr="$2" ref got
-  ref=$(R "const c=db.getSiblingDB('shop').tcref; try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
-  got=$(R "const c=db.getSiblingDB('shop').tcon;  try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
+  ref=$(R "const c=db.getSiblingDB(process.env.TC_DB).tcref; try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
+  got=$(R "const c=db.getSiblingDB(process.env.TC_DB).tcon;  try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
   chk "$label" "$ref" "$got"
 }
 # For writes, which need both collections put back first.
 samew() { reseed; same "$1" "$2"; }
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/conf_f.log & FP=$!
+  cline feeder --config $CFG --log-file $LOGDIR/conf_f.log & FP=$!
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/conf_r.log & RP=$!
+  cline router --config $CFG --log-file $LOGDIR/conf_r.log & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 # Twenty documents shaped to exercise every operator in the list: numbers, a
@@ -85,7 +102,7 @@ DOCS='Array.from({length:20},(_,i)=>({
 OPT='[3,6,9,12,15,18]'
 
 mkIndexes() { # collection, connection-fn
-  $2 "const c=db.getSiblingDB('shop').$1;
+  $2 "const c=db.getSiblingDB(process.env.TC_DB).$1;
       c.createIndex({words:'text'});
       c.createIndex({loc:'2dsphere'});
       c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});" >/dev/null
@@ -110,53 +127,53 @@ mkIndexes() { # collection, connection-fn
 # sees a collection dropped on the fast tier, which is correct, but reseed writes
 # the claim moments later and the withdrawal can land after it.
 waitFeederPast() {
-  H "db.getSiblingDB('shop').tcon.insertOne({_id:'__sentinel'})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tcon.insertOne({_id:'__sentinel'})" >/dev/null
   for _ in $(seq 1 120); do
-    [ "$(C "print(db.getSiblingDB('shop').tcon.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
     sleep 0.5
   done
-  H "db.getSiblingDB('shop').tcon.deleteOne({_id:'__sentinel'})" >/dev/null
-  C "db.getSiblingDB('shop').tcon.deleteOne({_id:'__sentinel'})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tcon.deleteOne({_id:'__sentinel'})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).tcon.deleteOne({_id:'__sentinel'})" >/dev/null
 }
 
 reseed() {
-  H "db.getSiblingDB('shop').tcref.drop();
-     db.getSiblingDB('shop').tcref.insertMany($DOCS);
-     db.getSiblingDB('shop').tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
-  H "db.getSiblingDB('shop').tcon.drop()" >/dev/null
-  C "db.getSiblingDB('shop').tcon.drop()" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tcref.drop();
+     db.getSiblingDB(process.env.TC_DB).tcref.insertMany($DOCS);
+     db.getSiblingDB(process.env.TC_DB).tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tcon.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).tcon.drop()" >/dev/null
   # 1 to 10 on both tiers, 11 to 20 only in the archive, which is what an evicted
   # document looks like.
-  H "const all=$DOCS; db.getSiblingDB('shop').tcon.insertMany(all.slice(0,10))" >/dev/null
+  H "const all=$DOCS; db.getSiblingDB(process.env.TC_DB).tcon.insertMany(all.slice(0,10))" >/dev/null
   # Upserts, not insertMany. A late mirror of the fast tier inserts above can put
   # documents here first, and an ordered insert then abandons the whole seed on
   # the first duplicate. This states the archive's contents rather than assuming
   # it is empty, and replacing the whole document also clears any tombstone.
   C "const all=$DOCS;
-     db.getSiblingDB('shop').tcon.bulkWrite(
+     db.getSiblingDB(process.env.TC_DB).tcon.bulkWrite(
        all.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
        {ordered:false})" >/dev/null
-  H "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
-  C "db.getSiblingDB('shop').tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
   mkIndexes tcref H
   mkIndexes tcon H
   mkIndexes tcon C
   # The claim goes last, after the feeder has seen the drop and withdrawn the
   # previous one. Writing it before that is what made the claim vanish.
   waitFeederPast
-  cline watermark --config $CFG --ns shop.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
+  cline watermark --config $CFG --ns $DB.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
 }
 
 echo "== setup =="
 stopDaemons
-C "db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({}); db.getSiblingDB('_thermocline').evicting.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({}); db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 reseed
 sleep 7
-chk "the reference holds twenty"                "20" "$(R "print(db.getSiblingDB('shop').tcref.countDocuments({}))")"
-chk "the tiered fast tier holds ten"            "10" "$(H "print(db.getSiblingDB('shop').tcon.countDocuments({}))")"
-chk "its archive holds twenty"                  "20" "$(C "print(db.getSiblingDB('shop').tcon.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chk "the reference holds twenty"                "20" "$(R "print(db.getSiblingDB(process.env.TC_DB).tcref.countDocuments({}))")"
+chk "the tiered fast tier holds ten"            "10" "$(H "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({}))")"
+chk "its archive holds twenty"                  "20" "$(C "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 
 S='.sort({_id:1}).toArray()))'
 echo
@@ -406,11 +423,11 @@ same 'dropIndexes()' 'COLL.dropIndexes(); print(JSON.stringify(COLL.getIndexes()
 echo
 echo "== database and collection commands =="
 reseed
-chk "show dbs lists shop"                       "true"  "$(R "print(db.adminCommand({listDatabases:1}).databases.some(d=>d.name==='shop'))")"
-chk "show collections lists the tiered one"     "true"  "$(R "print(db.getSiblingDB('shop').getCollectionNames().includes('tcon'))")"
-chk "db names the database"                     "shop"  "$(R "print(db.getSiblingDB('shop').getName())")"
-chk "createCollection()"                        "true"  "$(R "db.getSiblingDB('shop').tcnew.drop(); db.getSiblingDB('shop').createCollection('tcnew'); print(db.getSiblingDB('shop').getCollectionNames().includes('tcnew'))")"
-chk "drop()"                                    "false" "$(R "db.getSiblingDB('shop').tcnew.drop(); print(db.getSiblingDB('shop').getCollectionNames().includes('tcnew'))")"
+chk "show dbs lists the database"                       "true"  "$(R "print(db.adminCommand({listDatabases:1}).databases.some(d=>d.name==='$DB'))")"
+chk "show collections lists the tiered one"     "true"  "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('tcon'))")"
+chk "db names the database"                     "$DB"  "$(R "print(db.getSiblingDB(process.env.TC_DB).getName())")"
+chk "createCollection()"                        "true"  "$(R "db.getSiblingDB(process.env.TC_DB).tcnew.drop(); db.getSiblingDB(process.env.TC_DB).createCollection('tcnew'); print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('tcnew'))")"
+chk "drop()"                                    "false" "$(R "db.getSiblingDB(process.env.TC_DB).tcnew.drop(); print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('tcnew'))")"
 chk "dropDatabase()"                            "true"  "$(R "db.getSiblingDB('tcdropme').x.insertOne({a:1}); print(db.getSiblingDB('tcdropme').dropDatabase().ok===1)")"
 
 echo
@@ -420,10 +437,10 @@ echo "== let variables, which a filter may refer to =="
 # archived documents asks the archive the same filter, so it has to carry the
 # same variables. Without them the archive rejects the filter and the write is
 # refused: safe, and an ordinary statement turned into an error.
-samew 'update with a let variable'   'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+samew 'update with a let variable'   'const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:COLL.getName(),
      updates:[{q:{$expr:{$eq:["$_id","$$t"]}},u:{$set:{lethit:1}},multi:true}],let:{t:17}});
    print(r.n+"/"+r.nModified)'
-samew 'delete with a let variable'   'const r=db.getSiblingDB("shop").runCommand({delete:COLL.getName(),
+samew 'delete with a let variable'   'const r=db.getSiblingDB(process.env.TC_DB).runCommand({delete:COLL.getName(),
      deletes:[{q:{$expr:{$eq:["$_id","$$t"]}},limit:0}],let:{t:18}});
    print(r.n+"/"+COLL.countDocuments({_id:18}))'
 # Collation decides what equal means. The documents are named user01 to user20
@@ -433,14 +450,14 @@ samew 'delete with a let variable'   'const r=db.getSiblingDB("shop").runCommand
 # reaches some of what it matched and reports success. Measured before the fix
 # on a collection holding alice and ALICE in the archive: n=1 where an untiered
 # reference gave n=2.
-samew 'update with a collation'      'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+samew 'update with a collation'      'const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:COLL.getName(),
      updates:[{q:{name:"USER17"},u:{$set:{colhit:1}},multi:true,
                collation:{locale:"en",strength:2}}]});
    print(r.n+"/"+r.nModified)'
-samew 'delete with a collation'      'const r=db.getSiblingDB("shop").runCommand({delete:COLL.getName(),
+samew 'delete with a collation'      'const r=db.getSiblingDB(process.env.TC_DB).runCommand({delete:COLL.getName(),
      deletes:[{q:{name:"USER18"},limit:0,collation:{locale:"en",strength:2}}]});
    print(r.n+"/"+COLL.countDocuments({}))'
-samew 'upsert with a collation'      'const r=db.getSiblingDB("shop").runCommand({update:COLL.getName(),
+samew 'upsert with a collation'      'const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:COLL.getName(),
      updates:[{q:{name:"USER19"},u:{$set:{colups:1}},upsert:true,
                collation:{locale:"en",strength:2}}]});
    print(r.n+"/"+(r.upserted?r.upserted.length:0)+"/"+COLL.countDocuments({}))'
@@ -481,7 +498,7 @@ TXN=$(R "
   for (let attempt=0; attempt<6; attempt++) {
     try {
       s.startTransaction();
-      const c=s.getDatabase('shop').tcon;
+      const c=s.getDatabase(process.env.TC_DB).tcon;
       c.updateOne({_id:18},{\$set:{txn:1}});
       const seen=c.countDocuments({txn:1});
       s.commitTransaction();
@@ -494,13 +511,13 @@ TXN=$(R "
   }
   s.endSession(); print(out);")
 chk "startTransaction and commitTransaction"    "committed-1" "$TXN"
-chk "the commit is visible afterwards"          "1" "$(R "print(db.getSiblingDB('shop').tcon.countDocuments({txn:1}))")"
+chk "the commit is visible afterwards"          "1" "$(R "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({txn:1}))")"
 ABORT=$(R "
   const s=db.getMongo().startSession(); s.startTransaction();
-  try { s.getDatabase('shop').tcon.updateOne({_id:2},{\$set:{gone:1}}); } catch(e) {}
+  try { s.getDatabase(process.env.TC_DB).tcon.updateOne({_id:2},{\$set:{gone:1}}); } catch(e) {}
   try { s.abortTransaction(); } catch(e) {}
   s.endSession();
-  print(db.getSiblingDB('shop').tcon.countDocuments({gone:1}));")
+  print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({gone:1}));")
 chk "abortTransaction leaves nothing behind"    "0" "$ABORT"
 
 stopDaemons

@@ -17,8 +17,26 @@
 # connections pooled and thirty two proxied, the second number being larger than
 # eight because a client opens several connections of its own and every one of
 # them became an upstream.
-BASE=/root/cline.yaml
-POOLCFG=/root/cline_pool.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+export DB WDIR
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+BASE=$WDIR/cline.yaml
+POOLCFG=$WDIR/cline_pool.yaml
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 CLIENTS=8
 PASS=0; FAIL=0; declare -a FAILED
@@ -29,23 +47,23 @@ chk() {
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 
 cleanup() {
-  pkill -9 -f 'cline router' 2>/dev/null
-  pkill -9 -f 'mongosh --port 27100' 2>/dev/null
+  pkill -9 -f "cline router --config $WDIR/" 2>/dev/null
+  pkill -9 -f "mongosh --port $PORT" 2>/dev/null
 }
 trap cleanup EXIT
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startRouter() { # config
-  cline router --config "$1" --log-file /var/log/cline/pool_r.log &
+  cline router --config "$1" --log-file $LOGDIR/pool_r.log &
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 # Every connection the primary currently holds.
@@ -59,13 +77,13 @@ conns() { H 'print(db.serverStatus().connections.current)'; }
 # Hold CLIENTS connections open, each doing nothing at all.
 holdClients() {
   for _ in $(seq 1 $CLIENTS); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'sleep(20000)' >/dev/null 2>&1 &
   done
   sleep 6
 }
 dropClients() {
-  pkill -9 -f 'mongosh --port 27100' 2>/dev/null
+  pkill -9 -f "mongosh --port $PORT" 2>/dev/null
   sleep 2
 }
 
@@ -108,9 +126,9 @@ chk "and pooling is measurably cheaper"                "true" \
 echo "== and a transaction keeps the connection it started on =="
 startRouter $POOLCFG
 chk "a transaction commits through the pool"           "committed" \
-    "$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval '
+    "$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval '
         const s=db.getMongo().startSession();
-        s.withTransaction(()=>{ const c=s.getDatabase("shop").tpool;
+        s.withTransaction(()=>{ const c=s.getDatabase(process.env.TC_DB).tpool;
           c.insertOne({_id:new ObjectId(),v:1}); c.find({v:1}).itcount(); });
         s.endSession(); print("committed")' 2>&1 | tail -1)"
 

@@ -12,7 +12,24 @@
 # So the value worth checking is not any counter, it is seconds_since_pass. A
 # daemon that has stopped, or that is failing closed on mirroring lag, looks
 # exactly like a healthy one from outside until somebody notices it has not run.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tdmet
@@ -23,49 +40,49 @@ chk() {
 }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
-M() { curl -s http://127.0.0.1:27110/metrics 2>/dev/null; }
+M() { curl -s http://127.0.0.1:$PDASH/metrics 2>/dev/null; }
 
 # The hold has to be lifted whatever happens here. A pause left behind stops the
 # evictor for every suite that runs afterwards, and testevict would then fail for
 # a reason that has nothing to do with it.
 cleanup() {
   cline resume --config $CFG >/dev/null 2>&1
-  pkill -9 -f 'cline router' 2>/dev/null
-  pkill -9 -f 'cline feeder' 2>/dev/null
+  pkill -9 -f "cline router --config $WDIR/" 2>/dev/null
+  pkill -9 -f "cline feeder --config $WDIR/" 2>/dev/null
 }
 trap cleanup EXIT
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 
 echo "== setup =="
 stopDaemons
-C "db.getSiblingDB('_thermocline').daemonstats.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).daemonstats.deleteMany({})" >/dev/null
 chk "no daemon has reported yet"                       "0" \
-    "$(C "print(db.getSiblingDB('_thermocline').daemonstats.countDocuments({}))")"
+    "$(C "print(db.getSiblingDB(process.env.TC_META).daemonstats.countDocuments({}))")"
 
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-H "db.getSiblingDB('shop').$NS.insertMany(Array.from({length:5},(_,i)=>({_id:i,n:i})))" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:5},(_,i)=>({_id:i,n:i})))" >/dev/null
 
 echo "== a daemon reports after a pass =="
 # A dry run, so this suite changes nothing about what the tiers hold. What is
 # being tested is the reporting, not the sweeping.
 cline evictor --config $CFG --dry-run --once >/dev/null 2>&1
 chk "the evictor published a report"                   "1" \
-    "$(C "print(db.getSiblingDB('_thermocline').daemonstats.countDocuments({_id:'evictor'}))")"
+    "$(C "print(db.getSiblingDB(process.env.TC_META).daemonstats.countDocuments({_id:'evictor'}))")"
 chk "and said it was a dry run"                        "true" \
-    "$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(!!d && d.dryRun===true)")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(!!d && d.dryRun===true)")"
 chk "and stamped when it ran"                          "true" \
-    "$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(!!d && !!d.at)")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(!!d && !!d.at)")"
 chk "and carried its counters"                         "true" \
-    "$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(!!d && d.counters && d.counters.scanned !== undefined)")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(!!d && d.counters && d.counters.scanned !== undefined)")"
 
 cline warmer --config $CFG --dry-run >/dev/null 2>&1
 chk "the warmer published one too"                     "1" \
-    "$(C "print(db.getSiblingDB('_thermocline').daemonstats.countDocuments({_id:'warmer'}))")"
+    "$(C "print(db.getSiblingDB(process.env.TC_META).daemonstats.countDocuments({_id:'warmer'}))")"
 
 echo "== a later pass republishes =="
 # Number(), because the counters are int64 and mongosh prints those as Long("0"),
@@ -76,19 +93,19 @@ echo "== a later pass republishes =="
 # a total growing; that property lives in the daemon and is visible only to a
 # long-running one. What is checked instead is that a pass republishes, which is
 # what keeps seconds_since_pass meaningful.
-FIRSTAT=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
+FIRSTAT=$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
 sleep 2
 cline evictor --config $CFG --dry-run --once >/dev/null 2>&1
-LATERAT=$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
+LATERAT=$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(d.at.getTime())")
 chk "the counter is a number"                          "true" \
-    "$(C "const d=db.getSiblingDB('_thermocline').daemonstats.findOne({_id:'evictor'}); print(Number.isFinite(Number(d.counters.scanned)))")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(Number.isFinite(Number(d.counters.scanned)))")"
 chk "and a later pass moves the timestamp on"          "true" \
     "$(awk -v a="$FIRSTAT" -v b="$LATERAT" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
 
 echo "== the router exports them =="
-cline router --config $CFG --log-file /var/log/cline/dmet_r.log &
+cline router --config $CFG --log-file $LOGDIR/dmet_r.log &
 for _ in $(seq 1 30); do
-  mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
     --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
   sleep 1
 done
@@ -114,10 +131,10 @@ echo "== an operator can hold eviction, and the hold is visible =="
 # document confirms as present and the fast tier's newer copy is removed.
 cline pause --config $CFG --reason "restoring the archive" >/dev/null 2>&1
 chk "the hold is recorded"                             "restoring the archive" \
-    "$(C "const d=db.getSiblingDB('_thermocline').markers.findOne({_id:'evictionPaused'}); print(d?d.reason:'MISSING')")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).markers.findOne({_id:'evictionPaused'}); print(d?d.reason:'MISSING')")"
 cline evictor --config $CFG --once >/dev/null 2>&1
 chk "the evictor removed nothing while held"           "5" \
-    "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 sleep 2
 chk "and the hold is exported"                         "1" \
     "$(M | awk -F' ' '/^thermocline_eviction_paused /{print $2}')"
@@ -132,11 +149,11 @@ echo "== the dashboard inventory still reports every namespace =="
 # Measured concurrently now, so the risk is a lost or duplicated entry rather
 # than a slow one.
 sleep 3
-COUNT=$(curl -s http://127.0.0.1:27110/api/snapshot 2>/dev/null | grep -o '"ns":' | wc -l)
+COUNT=$(curl -s http://127.0.0.1:$PDASH/api/snapshot 2>/dev/null | grep -o '"ns":' | wc -l)
 MANAGED=$(grep -c '^    - "' $CFG)
 chk "every managed namespace appears exactly once"     "$MANAGED" "$COUNT"
 chk "and the one this suite made is among them"        "true" \
-    "$(curl -s http://127.0.0.1:27110/api/snapshot 2>/dev/null | grep -q "shop.$NS" && echo true || echo false)"
+    "$(curl -s http://127.0.0.1:$PDASH/api/snapshot 2>/dev/null | grep -q "$DB.$NS" && echo true || echo false)"
 
 echo
 echo "================================"

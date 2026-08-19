@@ -13,8 +13,25 @@
 #   - a write through the router drops what was learned, so the writer never
 #     reads its own stale answer
 #   - the measuring half runs whether or not the caching half does
-CFG=/root/cline.yaml
-CCFG=/root/cline_cache.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
+CCFG=$WDIR/cline_cache.yaml
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tcache
@@ -23,24 +40,24 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-50s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-50s got=%.80s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
-cleanup() { pkill -9 -f 'cline router' 2>/dev/null; pkill -9 -f 'cline feeder' 2>/dev/null; }
+cleanup() { pkill -9 -f "cline router --config $WDIR/" 2>/dev/null; pkill -9 -f "cline feeder --config $WDIR/" 2>/dev/null; }
 trap cleanup EXIT
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startRouter() { # config
-  cline router --config "$1" --log-file /var/log/cline/cache_r.log &
+  cline router --config "$1" --log-file $LOGDIR/cache_r.log &
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 echo "== setup =="
@@ -57,19 +74,19 @@ else
   sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' $CFG > $CCFG
 fi
 chk "the derived config turns the cache on" "1" "$(grep -c 'enabled: true' $CCFG)"
-H "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').$NS.insertMany(
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).$NS.insertMany(
    Array.from({length:60},(_,i)=>({_id:i, country:['UY','AR','BR'][i%3], n:i})))" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C 'db.getSiblingDB("_thermocline").cacheadvice.deleteMany({})' >/dev/null
-cline feeder --config $CCFG --log-file /var/log/cline/cache_f.log &
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).cacheadvice.deleteMany({})' >/dev/null
+cline feeder --config $CCFG --log-file $LOGDIR/cache_f.log &
 sleep 3
 startRouter $CCFG
 
 echo "== the answer is the answer, cached or not =="
-FIRST=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
-SECOND=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
-THIRD=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
-DIRECT=$(H "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
+FIRST=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
+SECOND=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
+THIRD=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
+DIRECT=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
 chk "the first answer is the fast tier's"          "$DIRECT" "$FIRST"
 chk "and so is the third, whatever served it"      "$DIRECT" "$THIRD"
 chk "and the second"                               "$DIRECT" "$SECOND"
@@ -78,12 +95,12 @@ echo "== a write drops what was learned =="
 # The reader that wrote must never be served its own stale answer, and this is
 # what a TTL alone cannot promise. The router sees the write, so it does not
 # have to wait for a timer.
-BEFORE=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
-AFTER=$(R "db.getSiblingDB('shop').$NS.insertOne({_id:5001,country:'UY',n:5001});
-           print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
+BEFORE=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
+AFTER=$(R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:5001,country:'UY',n:5001});
+           print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
 chk "the count rises the moment the write lands"   "$((BEFORE+1))" "$AFTER"
-R "db.getSiblingDB('shop').$NS.deleteOne({_id:5001})" >/dev/null
-BACK=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:5001})" >/dev/null
+BACK=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
 chk "and falls again on the delete"                "$BEFORE" "$BACK"
 
 echo "== a cached answer still expires =="
@@ -95,14 +112,14 @@ echo "== a cached answer still expires =="
 # forty one from memory. The TTL was not bounding anything.
 #
 # What must hold is that a steady stream of reads keeps going back to the tiers.
-TCFG=/root/cline_cachettl.yaml
+TCFG=$WDIR/cline_cachettl.yaml
 # Whatever the ceiling was, two seconds for this one: the check is that a steady
 # read loop keeps going back to the tiers as it expires.
 sed 's/^\( *\)max_ttl: .*/\1max_ttl: 2s/' $CCFG > $TCFG
 stopDaemons
 startRouter $TCFG
-STEADY=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const c = db.getSiblingDB('shop').$NS;
+STEADY=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
   for (let i = 0; i < 30; i++) { c.countDocuments({country:'UY'}); sleep(300); }
   print('done');" 2>&1 | tail -1)
 chk "the steady read loop finished"                "done" "$STEADY"
@@ -123,19 +140,19 @@ echo "== a write by somebody else drops it too =="
 #
 # The claim makes this a fast tier read, so the write is visible in the truth as
 # well as in the cache.
-cline watermark --config $CCFG --ns shop.$NS --complete-all >/dev/null 2>&1
+cline watermark --config $CCFG --ns $DB.$NS --complete-all >/dev/null 2>&1
 sleep 2
-OTHER=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const c = db.getSiblingDB('shop').$NS;
+OTHER=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
   for (let i = 0; i < 5; i++) { c.countDocuments({country:'UY'}); sleep(200); }
   print(c.countDocuments({country:'UY'}));" 2>&1 | tail -1)
-H "db.getSiblingDB('shop').$NS.insertOne({_id:6001,country:'UY',n:6001})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:6001,country:'UY',n:6001})" >/dev/null
 sleep 2
-AFTEROTHER=$(R "print(db.getSiblingDB('shop').$NS.countDocuments({country:'UY'}))")
+AFTEROTHER=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
 chk "a write straight to the fast tier is seen"    "$((OTHER+1))" "$AFTEROTHER"
-H "db.getSiblingDB('shop').$NS.deleteOne({_id:6001})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:6001})" >/dev/null
 sleep 2
-cline watermark --config $CCFG --ns shop.$NS --clear >/dev/null 2>&1
+cline watermark --config $CCFG --ns $DB.$NS --clear >/dev/null 2>&1
 
 echo "== who a cached answer may be given to =="
 # The key carries who is asking, or one client would be served another's
@@ -147,8 +164,8 @@ echo "== who a cached answer may be given to =="
 # Every check above used a fresh mongosh, which is a fresh connection, so none
 # of them could hit. This one repeats on a single connection, which is what an
 # application does.
-HITS=$(mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const c = db.getSiblingDB('shop').$NS;
+HITS=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
   let answers = {};
   for (let i = 0; i < 8; i++) { answers[c.countDocuments({country:'BR'})] = 1; sleep(150); }
   print(Object.keys(answers).join(','));" 2>&1 | tail -1)
@@ -160,15 +177,15 @@ chk "one connection asking eight times agrees with itself" "20" "$HITS"
 echo "== what it learned, and what it suggests =="
 # Enough repeats for a stability to be measured at all.
 for _ in $(seq 1 6); do
-  R "db.getSiblingDB('shop').$NS.countDocuments({country:'AR'})" >/dev/null
+  R "db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'AR'})" >/dev/null
   sleep 1
 done
 stopDaemons
 sleep 2
-ADVICE=$(cline cache --config $CCFG --ns shop.$NS --top 5 2>&1)
+ADVICE=$(cline cache --config $CCFG --ns $DB.$NS --top 5 2>&1)
 echo "$ADVICE" | sed 's/^/  | /' | head -8
 chk "the report names the collection"              "true" \
-    "$(echo "$ADVICE" | grep -q "shop.$NS" && echo true || echo false)"
+    "$(echo "$ADVICE" | grep -q "$DB.$NS" && echo true || echo false)"
 chk "and suggests a ttl for it"                    "true" \
     "$(echo "$ADVICE" | grep -qE '^  [0-9]+(\.[0-9]+)?(ms|s|m)' && echo true || echo false)"
 chk "and reports hits"                             "true" \
@@ -185,16 +202,16 @@ echo "== with the cache off, it still measures =="
 # The config is derived with caching explicitly off rather than by assuming the
 # shared one has it off, because the whole sweep can be run with it on and then
 # this section was testing the opposite of what it says.
-OFFCFG=/root/cline_cacheoff.yaml
+OFFCFG=$WDIR/cline_cacheoff.yaml
 if grep -q '^  cache:' $CFG; then
   sed 's/^\( *\)enabled: true/\1enabled: false/' $CFG > $OFFCFG
 else
   cp $CFG $OFFCFG
 fi
-C 'db.getSiblingDB("_thermocline").cacheadvice.deleteMany({})' >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).cacheadvice.deleteMany({})' >/dev/null
 startRouter $OFFCFG
 for _ in $(seq 1 4); do
-  R "db.getSiblingDB('shop').$NS.countDocuments({country:'BR'})" >/dev/null
+  R "db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'BR'})" >/dev/null
   sleep 1
 done
 stopDaemons
@@ -203,7 +220,7 @@ OFF=$(cline cache --config $OFFCFG --top 5 2>&1)
 chk "it publishes with the cache off"              "true" \
     "$(echo "$OFF" | grep -q 'measuring only' && echo true || echo false)"
 chk "and still has something to suggest"           "true" \
-    "$(echo "$OFF" | grep -q "shop.$NS" && echo true || echo false)"
+    "$(echo "$OFF" | grep -q "$DB.$NS" && echo true || echo false)"
 
 echo
 echo "================================"

@@ -1,6 +1,23 @@
 #!/bin/bash
 # Functional tests of every router behaviour, through the wire protocol.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
@@ -8,20 +25,20 @@ chk() { # chk NAME EXPECTED ACTUAL
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-46s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-46s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
-H 'db.getSiblingDB("shop").tprobe_out.drop()' >/dev/null 2>&1
+H 'db.getSiblingDB(process.env.TC_DB).tprobe_out.drop()' >/dev/null 2>&1
 echo "== setup: clean collections, feeder + router running =="
-pkill -f 'cline feeder|cline router'; sleep 2
-H 'db.getSiblingDB("shop").tprobe.drop(); db.getSiblingDB("shop").tacct.drop()' >/dev/null
-C 'db.getSiblingDB("shop").tprobe.drop(); db.getSiblingDB("shop").tacct.drop()' >/dev/null
-C 'db.getSiblingDB("_thermocline").watermarks.deleteMany({})' >/dev/null
-H 'db.getSiblingDB("_thermocline").keys.deleteMany({})' >/dev/null
-cline feeder --config $CFG --log-file /var/log/cline/f.log &
+pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"; sleep 2
+H 'db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tacct.drop()' >/dev/null
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tacct.drop()' >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({})' >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/f.log &
 FP=$!
-cline router --config $CFG --log-file /var/log/cline/r.log &
+cline router --config $CFG --log-file $LOGDIR/r.log &
 RP=$!
 sleep 6
 
@@ -30,40 +47,40 @@ chk "presents as mongos (isdbgrid)" "isdbgrid" "$(R 'print(db.hello().msg)')"
 chk "hides the replica set name"    "undefined" "$(R 'print(typeof db.hello().setName)')"
 
 echo "== writes and mirroring =="
-R 'db.getSiblingDB("shop").tprobe.insertMany([{_id:1,v:"a"},{_id:2,v:"b"},{_id:3,v:"c"}])' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tprobe.insertMany([{_id:1,v:"a"},{_id:2,v:"b"},{_id:3,v:"c"}])' >/dev/null
 sleep 4
-chk "insert reaches the fast tier"  "3" "$(H 'print(db.getSiblingDB("shop").tprobe.countDocuments({}))')"
-chk "feeder mirrors to the archive" "3" "$(C 'print(db.getSiblingDB("shop").tprobe.countDocuments({}))')"
+chk "insert reaches the fast tier"  "3" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')"
+chk "feeder mirrors to the archive" "3" "$(C 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')"
 
 echo "== read miss and copy-up =="
-H 'db.getSiblingDB("shop").tprobe.deleteOne({_id:2})' >/dev/null   # feeder will tombstone; use an archive-only doc instead
-C 'db.getSiblingDB("shop").tprobe.insertOne({_id:9,v:"archived-only"})' >/dev/null
-chk "point lookup finds an archived doc" "archived-only" "$(R 'const d=db.getSiblingDB("shop").tprobe.findOne({_id:9}); print(d?d.v:"MISSING")')"
+H 'db.getSiblingDB(process.env.TC_DB).tprobe.deleteOne({_id:2})' >/dev/null   # feeder will tombstone; use an archive-only doc instead
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:9,v:"archived-only"})' >/dev/null
+chk "point lookup finds an archived doc" "archived-only" "$(R 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:9}); print(d?d.v:"MISSING")')"
 sleep 2
-chk "and it was copied up"          "archived-only" "$(H 'const d=db.getSiblingDB("shop").tprobe.findOne({_id:9}); print(d?d.v:"MISSING")')"
+chk "and it was copied up"          "archived-only" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:9}); print(d?d.v:"MISSING")')"
 
 echo "== write miss and copy-up =="
-C 'db.getSiblingDB("shop").tprobe.insertOne({_id:10,v:"old"})' >/dev/null
-chk "update on an archived doc matches 1" "1" "$(R 'print(db.getSiblingDB("shop").tprobe.updateOne({_id:10},{$set:{v:"new"}}).matchedCount)')"
-chk "and the fast tier now holds it"      "new" "$(H 'const d=db.getSiblingDB("shop").tprobe.findOne({_id:10}); print(d?d.v:"MISSING")')"
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:10,v:"old"})' >/dev/null
+chk "update on an archived doc matches 1" "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.updateOne({_id:10},{$set:{v:"new"}}).matchedCount)')"
+chk "and the fast tier now holds it"      "new" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:10}); print(d?d.v:"MISSING")')"
 
 echo "== tombstones are not resurrected =="
-R 'db.getSiblingDB("shop").tprobe.deleteOne({_id:1})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tprobe.deleteOne({_id:1})' >/dev/null
 sleep 4
-chk "archive keeps a deleted doc"   "true"  "$(C 'print(!!db.getSiblingDB("shop").tprobe.findOne({_id:1}))')"
-chk "but marks it deleted"          "true"  "$(C 'print(!!db.getSiblingDB("shop").tprobe.findOne({_id:1})._tcDeletedAt)')"
-chk "and the router will not return it" "null" "$(R 'print(db.getSiblingDB("shop").tprobe.findOne({_id:1}))')"
+chk "archive keeps a deleted doc"   "true"  "$(C 'print(!!db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:1}))')"
+chk "but marks it deleted"          "true"  "$(C 'print(!!db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:1})._tcDeletedAt)')"
+chk "and the router will not return it" "null" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:1}))')"
 
 echo "== completeness: archive fallback =="
-cline watermark --config $CFG --ns shop.tprobe --complete-from 2030-01-01T00:00:00Z >/dev/null
+cline watermark --config $CFG --ns $DB.tprobe --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
-LIVE=$(C 'print(db.getSiblingDB("shop").tprobe.countDocuments({_tcDeletedAt:{$exists:false}}))')
-chk "countDocuments matches the archive" "$LIVE" "$(R 'print(db.getSiblingDB("shop").tprobe.countDocuments({}))')"
-chk "find itcount matches"               "$LIVE" "$(R 'print(db.getSiblingDB("shop").tprobe.find({}).itcount())')"
-chk "sort+skip+limit works"              "1"     "$(R 'print(db.getSiblingDB("shop").tprobe.find({}).sort({_id:1}).skip(1).limit(1).itcount())')"
+LIVE=$(C 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_tcDeletedAt:{$exists:false}}))')
+chk "countDocuments matches the archive" "$LIVE" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')"
+chk "find itcount matches"               "$LIVE" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount())')"
+chk "sort+skip+limit works"              "1"     "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).sort({_id:1}).skip(1).limit(1).itcount())')"
 
 echo "== cursor paging through the archive =="
-chk "batched find returns every doc" "$LIVE" "$(R 'let n=0; const c=db.getSiblingDB("shop").tprobe.find({}).batchSize(2); while(c.hasNext()){c.next();n++} print(n)')"
+chk "batched find returns every doc" "$LIVE" "$(R 'let n=0; const c=db.getSiblingDB(process.env.TC_DB).tprobe.find({}).batchSize(2); while(c.hasNext()){c.next();n++} print(n)')"
 
 echo "== whose cursor is it =="
 # A cursor over an archive answer belongs to this router, and it is served from a
@@ -75,7 +92,7 @@ echo "== whose cursor is it =="
 # The ids used to run in sequence from 2^62, so the first was always 2^62+1, and
 # nothing else was checked. A second connection could name it and be handed the
 # first client's documents. See test/cursorowner for the client that found it.
-CID=$(R 'const r=db.getSiblingDB("shop").runCommand({find:"tprobe",filter:{},batchSize:2}); print(r.cursor.id.toString())')
+CID=$(R 'const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:"tprobe",filter:{},batchSize:2}); print(r.cursor.id.toString())')
 chk "the router owns this cursor"          "true"     "$(awk -v id="$CID" 'BEGIN{print (id+0 > 4611686018427387904) ? "true" : "false"}')"
 # A second mongosh is a second connection and a second session, which is exactly
 # what mongod refuses: "for cursors created inside a session, you cannot call
@@ -83,20 +100,20 @@ chk "the router owns this cursor"          "true"     "$(awk -v id="$CID" 'BEGIN
 # mongosh throws on ok:0 rather than returning the reply, so the code has to be
 # read off the exception. A check written without this catch can never pass, and
 # reads as the product failing.
-STEAL=$(R "try{ const r=db.getSiblingDB('shop').runCommand({getMore:NumberLong('$CID'),collection:'tprobe'});
+STEAL=$(R "try{ const r=db.getSiblingDB(process.env.TC_DB).runCommand({getMore:NumberLong('$CID'),collection:'tprobe'});
              print(r.ok===1?'READ '+r.cursor.nextBatch.length:r.code+' '+r.codeName) }
            catch(e){ print(e.code+' '+e.codeName) }")
 chk "another session cannot read it"       "13 Unauthorized" "$STEAL"
 # And the collection has to be the cursor's. mongod has refused a mismatch since
 # at least 6.0, measured.
-WRONGNS=$(R "const r=db.getSiblingDB('shop').runCommand({find:'tprobe',filter:{},batchSize:2});
-             try{ const g=db.getSiblingDB('shop').runCommand({getMore:r.cursor.id,collection:'tprobeXX'});
+WRONGNS=$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'tprobe',filter:{},batchSize:2});
+             try{ const g=db.getSiblingDB(process.env.TC_DB).runCommand({getMore:r.cursor.id,collection:'tprobeXX'});
                   print(g.ok===1?'READ':g.code+' '+g.codeName) }
              catch(e){ print(e.code+' '+e.codeName) }")
 chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
 # The control: one client, one session, its own cursor, paged to the end. This is
 # the case the three checks above must not have broken.
-OWN=$(R "let n=0; const db2=db.getSiblingDB('shop');
+OWN=$(R "let n=0; const db2=db.getSiblingDB(process.env.TC_DB);
          let r=db2.runCommand({find:'tprobe',filter:{},batchSize:2});
          n+=r.cursor.firstBatch.length;
          let id=r.cursor.id;
@@ -107,70 +124,70 @@ OWN=$(R "let n=0; const db2=db.getSiblingDB('shop');
 chk "its own session pages to the end"     "$LIVE" "$OWN"
 
 echo "== unique index across tiers =="
-H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
-H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
-R 'db.getSiblingDB("shop").tacct.insertOne({_id:1,email:"z@x.com"})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_DB).tacct.drop(); db.getSiblingDB(process.env.TC_DB).tacct.createIndex({email:1},{unique:true})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+".tacct"})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:1,email:"z@x.com"})' >/dev/null
 sleep 4
 # Simulate an eviction rather than a delete. Deleting through the router would
 # make the feeder tombstone the archive copy, which frees the key correctly and
 # tests the opposite thing. A real eviction leaves the archive copy live, so the
 # feeder must not see this removal at all.
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
-H 'db.getSiblingDB("shop").tacct.deleteOne({_id:1})' >/dev/null
-C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
-cline feeder --config $CFG --log-file /var/log/cline/f.log & FP=$!
+H 'db.getSiblingDB(process.env.TC_DB).tacct.deleteOne({_id:1})' >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/f.log & FP=$!
 sleep 5
-chk "archive still holds the original"     "true"  "$(C 'const d=db.getSiblingDB("shop").tacct.findOne({_id:1}); print(!!d && !d._tcDeletedAt)')"
-chk "duplicate of an evicted key rejected" "11000" "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:2,email:"z@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,20))}')"
-chk "a fresh key is still accepted"        "ok"    "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:3,email:"new@x.com"});print("ok")}catch(e){print(e.code)}')"
+chk "archive still holds the original"     "true"  "$(C 'const d=db.getSiblingDB(process.env.TC_DB).tacct.findOne({_id:1}); print(!!d && !d._tcDeletedAt)')"
+chk "duplicate of an evicted key rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:2,email:"z@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,20))}')"
+chk "a fresh key is still accepted"        "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:3,email:"new@x.com"});print("ok")}catch(e){print(e.code)}')"
 # And the other half: once the original is genuinely deleted the key frees up.
-C 'db.getSiblingDB("shop").tacct.updateOne({_id:1},{$set:{_tcDeletedAt:new Date()}})' >/dev/null
-chk "a deleted original frees its key"     "ok"    "$(R 'try{db.getSiblingDB("shop").tacct.insertOne({_id:4,email:"z@x.com"});print("ok")}catch(e){print(e.code)}')"
+C 'db.getSiblingDB(process.env.TC_DB).tacct.updateOne({_id:1},{$set:{_tcDeletedAt:new Date()}})' >/dev/null
+chk "a deleted original frees its key"     "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:4,email:"z@x.com"});print("ok")}catch(e){print(e.code)}')"
 
 echo "== bulk insert keeps mongod semantics =="
-H 'db.getSiblingDB("shop").tacct.drop(); db.getSiblingDB("shop").tacct.createIndex({email:1},{unique:true})' >/dev/null
-H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
-R 'db.getSiblingDB("shop").tacct.insertOne({_id:"seed",email:"taken@x.com"})' >/dev/null
-R 'try{db.getSiblingDB("shop").tacct.insertMany([{_id:"b1",email:"n1@x.com"},{_id:"b2",email:"taken@x.com"},{_id:"b3",email:"n3@x.com"}],{ordered:false})}catch(e){}' >/dev/null
-chk "unordered inserts the good documents" "true,false,true" "$(H 'print(["b1","b2","b3"].map(i=>!!db.getSiblingDB("shop").tacct.findOne({_id:i})).join(","))')"
-H 'db.getSiblingDB("shop").tacct.deleteMany({_id:{$in:["b1","b3"]}})' >/dev/null
-H 'db.getSiblingDB("_thermocline").keys.deleteMany({ns:"shop.tacct"})' >/dev/null
-R 'db.getSiblingDB("shop").tacct.insertOne({_id:"seed2",email:"taken2@x.com"})' >/dev/null
-R 'try{db.getSiblingDB("shop").tacct.insertMany([{_id:"o1",email:"p1@x.com"},{_id:"o2",email:"taken2@x.com"},{_id:"o3",email:"p3@x.com"}],{ordered:true})}catch(e){}' >/dev/null
-chk "ordered stops at the first clash" "true,false,false" "$(H 'print(["o1","o2","o3"].map(i=>!!db.getSiblingDB("shop").tacct.findOne({_id:i})).join(","))')"
+H 'db.getSiblingDB(process.env.TC_DB).tacct.drop(); db.getSiblingDB(process.env.TC_DB).tacct.createIndex({email:1},{unique:true})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+".tacct"})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:"seed",email:"taken@x.com"})' >/dev/null
+R 'try{db.getSiblingDB(process.env.TC_DB).tacct.insertMany([{_id:"b1",email:"n1@x.com"},{_id:"b2",email:"taken@x.com"},{_id:"b3",email:"n3@x.com"}],{ordered:false})}catch(e){}' >/dev/null
+chk "unordered inserts the good documents" "true,false,true" "$(H 'print(["b1","b2","b3"].map(i=>!!db.getSiblingDB(process.env.TC_DB).tacct.findOne({_id:i})).join(","))')"
+H 'db.getSiblingDB(process.env.TC_DB).tacct.deleteMany({_id:{$in:["b1","b3"]}})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+".tacct"})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tacct.insertOne({_id:"seed2",email:"taken2@x.com"})' >/dev/null
+R 'try{db.getSiblingDB(process.env.TC_DB).tacct.insertMany([{_id:"o1",email:"p1@x.com"},{_id:"o2",email:"taken2@x.com"},{_id:"o3",email:"p3@x.com"}],{ordered:true})}catch(e){}' >/dev/null
+chk "ordered stops at the first clash" "true,false,false" "$(H 'print(["o1","o2","o3"].map(i=>!!db.getSiblingDB(process.env.TC_DB).tacct.findOne({_id:i})).join(","))')"
 
 echo "== transactions =="
-C 'db.getSiblingDB("shop").tprobe.insertOne({_id:20,v:"txn"})' >/dev/null
-chk "transaction replays after a copy-up" "1" "$(R 'const s=db.getMongo().startSession(); let a=0; try{ s.withTransaction(()=>{a++; const r=s.getDatabase("shop").tprobe.updateOne({_id:20},{$set:{v:"txn2"}}); if(r.matchedCount!==1) throw new Error("miss");}); print(a>1?1:0);}catch(e){print("FAILED")} s.endSession()')"
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:20,v:"txn"})' >/dev/null
+chk "transaction replays after a copy-up" "1" "$(R 'const s=db.getMongo().startSession(); let a=0; try{ s.withTransaction(()=>{a++; const r=s.getDatabase(process.env.TC_DB).tprobe.updateOne({_id:20},{$set:{v:"txn2"}}); if(r.matchedCount!==1) throw new Error("miss");}); print(a>1?1:0);}catch(e){print("FAILED")} s.endSession()')"
 
 echo "== \$out runs against the archive =="
 # The input reaches past what the fast tier holds, so it is read from the
 # archive and the write stage is performed on the fast tier, where the
 # application will look for the result.
-chk "\$out on incomplete input runs"    "ok"    "$(R 'try{db.getSiblingDB("shop").tprobe.aggregate([{$group:{_id:null,n:{$sum:1}}},{$out:"tprobe_out"}]).toArray(); print("ok")}catch(e){print(e.message.substring(0,50))}')"
-chk "and the result is on the fast tier" "true"  "$(H 'print(db.getSiblingDB("shop").getCollectionNames().includes("tprobe_out"))')"
+chk "\$out on incomplete input runs"    "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{$group:{_id:null,n:{$sum:1}}},{$out:"tprobe_out"}]).toArray(); print("ok")}catch(e){print(e.message.substring(0,50))}')"
+chk "and the result is on the fast tier" "true"  "$(H 'print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes("tprobe_out"))')"
 # Recomputed here, not reused from earlier: the transaction section above adds
 # a document to the archive, so the count taken before it is already stale.
-NOWLIVE=$(C 'print(db.getSiblingDB("shop").tprobe.countDocuments({_tcDeletedAt:{$exists:false}}))')
-chk "and it counted every document"      "$NOWLIVE" "$(H 'const d=db.getSiblingDB("shop").tprobe_out.findOne({}); print(d?d.n:"MISSING")')"
+NOWLIVE=$(C 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_tcDeletedAt:{$exists:false}}))')
+chk "and it counted every document"      "$NOWLIVE" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tprobe_out.findOne({}); print(d?d.n:"MISSING")')"
 
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
 echo "== completeness: strict =="
-sed 's/completeness: archive/completeness: strict/' $CFG > /root/strict.yaml
-cline router --config /root/strict.yaml --listen 0.0.0.0:27101 --log-file /var/log/cline/rs.log &
+sed 's/completeness: archive/completeness: strict/' $CFG > $WDIR/strict.yaml
+cline router --config $WDIR/strict.yaml --listen 0.0.0.0:$P1 --log-file $LOGDIR/rs.log &
 SP=$!; sleep 5
-S() { mongosh --port 27101 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
-chk "strict refuses an incomplete find" "refused" "$(S 'try{db.getSiblingDB("shop").tprobe.find({}).itcount(); print("ALLOWED")}catch(e){print(e.message.match(/refusing/)?"refused":"other")}')"
+S() { mongosh --port $P1 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+chk "strict refuses an incomplete find" "refused" "$(S 'try{db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount(); print("ALLOWED")}catch(e){print(e.message.match(/refusing/)?"refused":"other")}')"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
 
 echo "== completeness: permissive =="
-sed 's/completeness: archive/completeness: permissive/' $CFG > /root/perm.yaml
-cline router --config /root/perm.yaml --listen 0.0.0.0:27102 --log-file /var/log/cline/rp.log &
+sed 's/completeness: archive/completeness: permissive/' $CFG > $WDIR/perm.yaml
+cline router --config $WDIR/perm.yaml --listen 0.0.0.0:$P2 --log-file $LOGDIR/rp.log &
 PP=$!; sleep 5
-P() { mongosh --port 27102 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
-HOTN=$(H 'print(db.getSiblingDB("shop").tprobe.countDocuments({}))')
-chk "permissive returns the fast tier answer" "$HOTN" "$(P 'print(db.getSiblingDB("shop").tprobe.find({}).itcount())')"
+P() { mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+HOTN=$(H 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')
+chk "permissive returns the fast tier answer" "$HOTN" "$(P 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount())')"
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
 
 kill $FP 2>/dev/null; wait $FP 2>/dev/null

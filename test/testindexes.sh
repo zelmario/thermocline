@@ -10,7 +10,24 @@
 # The line that matters is between slow and broken. A fallback read that scans
 # is fine. A fallback read that errors is an application that worked before
 # adoption and does not after, which is the promise this whole system makes.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tidx
@@ -20,68 +37,68 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-52s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-52s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/idx_f.log & FP=$!
+  cline feeder --config $CFG --log-file $LOGDIR/idx_f.log & FP=$!
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/idx_r.log & RP=$!
+  cline router --config $CFG --log-file $LOGDIR/idx_r.log & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 echo "== setup: $N documents with a kilobyte each =="
 stopDaemons
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 
 # A kilobyte of padding each, so a blocking sort over the collection is well
 # past the 32 MB in-memory sort limit. That limit is the thing being probed:
 # with an index the sort is free, without one it has to be spilled or refused.
-H "const c=db.getSiblingDB('shop').$NS; const pad='x'.repeat(1024);
+H "const c=db.getSiblingDB(process.env.TC_DB).$NS; const pad='x'.repeat(1024);
    for (let b=0; b<$N/2000; b++) {
      const d=[];
      for (let i=0;i<2000;i++){ const n=b*2000+i; d.push({_id:n, sortme:($N-n), grp:'g'+(n%10), body:pad}); }
      c.insertMany(d);
    }" >/dev/null
 for _ in $(seq 1 300); do
-  [ "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "$N" ] && break
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "$N" ] && break
   sleep 1
 done
-echo "  archive holds $(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+echo "  archive holds $(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
 echo "== indexes are not copied, in either direction =="
 # Stated as a check rather than a comment, because somebody will eventually
 # assume otherwise and this says so out loud.
-H "db.getSiblingDB('shop').$NS.createIndex({sortme:1},{name:'fast_sortme'})" >/dev/null
-R "db.getSiblingDB('shop').$NS.createIndex({grp:1},{name:'via_router_grp'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({sortme:1},{name:'fast_sortme'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({grp:1},{name:'via_router_grp'})" >/dev/null
 sleep 4
-chk "the fast tier has the index"               "true"  "$(H "print(db.getSiblingDB('shop').$NS.getIndexes().some(i=>i.name=='fast_sortme'))")"
-chk "the archive did not get it"                "false" "$(C "print(db.getSiblingDB('shop').$NS.getIndexes().some(i=>i.name=='fast_sortme'))")"
-chk "nor one created through the router"        "false" "$(C "print(db.getSiblingDB('shop').$NS.getIndexes().some(i=>i.name=='via_router_grp'))")"
+chk "the fast tier has the index"               "true"  "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().some(i=>i.name=='fast_sortme'))")"
+chk "the archive did not get it"                "false" "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().some(i=>i.name=='fast_sortme'))")"
+chk "nor one created through the router"        "false" "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().some(i=>i.name=='via_router_grp'))")"
 
 echo "== every read below falls through to the archive =="
-cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
-chk "an unsorted fallback read is answered"     "$N" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+chk "an unsorted fallback read is answered"     "$N" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
 echo "== a sort the archive has no index for =="
 # PSMDB 8.0 ships allowDiskUseByDefault true and a 100 MB sort limit, so the
@@ -96,14 +113,14 @@ C 'db.adminCommand({setParameter:1, internalQueryMaxBlockingSortMemoryUsageBytes
 # query that worked before adoption must not start failing after it.
 SORTED=$(R "
   try {
-    const c=db.getSiblingDB('shop').$NS.find({}).sort({sortme:1}).limit(3).toArray();
+    const c=db.getSiblingDB(process.env.TC_DB).$NS.find({}).sort({sortme:1}).limit(3).toArray();
     print(c.length===3 ? c[0].sortme : 'SHORT:'+c.length);
   } catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "a sorted fallback read is answered"        "1" "$SORTED"
 # And the whole thing, not just the first page, since a limit lets the server
 # use a top-k sort that fits in memory whatever the collection size.
 BIGSORT=$(R "
-  try { print(db.getSiblingDB('shop').$NS.find({}).sort({sortme:1}).itcount()); }
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.find({}).sort({sortme:1}).itcount()); }
   catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "a full sorted scan is answered"            "$N" "$BIGSORT"
 
@@ -113,14 +130,14 @@ echo "== the same, with the archive refusing to spill =="
 # the fast tier answers from an index becomes an error on the archive.
 C 'db.adminCommand({setParameter:1, allowDiskUseByDefault: false})' >/dev/null
 NODISK=$(R "
-  try { print(db.getSiblingDB('shop').$NS.find({}).sort({sortme:1}).itcount()); }
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.find({}).sort({sortme:1}).itcount()); }
   catch(e) { print('ERR '+e.message.substring(0,60)); }")
 chk "a sorted read works even with spilling off" "$N" "$NODISK"
 C 'db.adminCommand({setParameter:1, allowDiskUseByDefault: true})' >/dev/null
 
 echo "== an aggregation sort, which has its own rules =="
 AGGSORT=$(R "
-  try { print(db.getSiblingDB('shop').$NS.aggregate([{\$sort:{sortme:1}},{\$limit:1}]).toArray()[0].sortme); }
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$sort:{sortme:1}},{\$limit:1}]).toArray()[0].sortme); }
   catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "a sorted aggregation is answered"          "1" "$AGGSORT"
 
@@ -134,7 +151,7 @@ echo "== a big answer from the archive is split into batches =="
 # one batch is what a driver does when told batchSize.
 BIG=$(R "
   try {
-    const c = db.getSiblingDB('shop').$NS.find({}).batchSize(40000);
+    const c = db.getSiblingDB(process.env.TC_DB).$NS.find({}).batchSize(40000);
     let n = 0;
     while (c.hasNext() && n < $N) { c.next(); n++; }
     print(n);
@@ -142,7 +159,7 @@ BIG=$(R "
 chk "every document arrives across batches"      "$N" "$BIG"
 
 echo "== a query whose index exists only on the fast tier =="
-chk "a filter on an archive-unindexed field works" "4000" "$(R "print(db.getSiblingDB('shop').$NS.countDocuments({grp:'g3'}))")"
+chk "a filter on an archive-unindexed field works" "4000" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'g3'}))")"
 
 # Put the archive back the way it was found.
 C 'db.adminCommand({setParameter:1, internalQueryMaxBlockingSortMemoryUsageBytes: 104857600})' >/dev/null

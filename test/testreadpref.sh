@@ -11,10 +11,27 @@
 # Nothing here returns a wrong answer, because the primary is strictly fresher
 # than the secondary that was asked for. What this suite pins down is that the
 # reads still work, and that the router reports the fact rather than hiding it.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
-LOG=/var/log/cline/readpref_r.log
+LOG=$LOGDIR/readpref_r.log
 NS=trdpref
 # Profile entries survive between runs: system.profile is capped and cannot be
 # dropped on a secondary, which is where half of this suite has to look. So every
@@ -30,48 +47,48 @@ chk() {
 }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 # Through the router, with a read preference.
-P() { mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&readPreference=$1" --quiet --eval "$2" 2>&1 | tail -1; }
+P() { mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin&readPreference=$1" --quiet --eval "$2" 2>&1 | tail -1; }
 # Direct to one node, to ask which one ran the query.
 N() { mongosh "mongodb://dba:secret@$1:27017/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
 
 NODES=$(mongosh "$HOT" --quiet --eval 'print(db.hello().hosts.map(h=>h.split(":")[0]).join(" "))' 2>/dev/null | tail -1)
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startRouter() {
   cline router --config $CFG --log-file $LOG & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
 echo "== setup =="
 stopDaemons
 rm -f $LOG
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-H "db.getSiblingDB('shop').$NS.insertMany(Array.from({length:20},(_,i)=>({_id:i,n:i})),{writeConcern:{w:3}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:20},(_,i)=>({_id:i,n:i})),{writeConcern:{w:3}})" >/dev/null
 chk "the fast tier holds the documents"                 "20" \
-    "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
 # Profiling is per node and not replicated, so it records on whichever node ran
 # the query. Enabling it needs its own command per node; do not try to drop
 # system.profile first, which throws on a secondary and ends the script.
-for n in $NODES; do N "$n" "db.getSiblingDB('shop').setProfilingLevel(2)" >/dev/null; done
+for n in $NODES; do N "$n" "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(2)" >/dev/null; done
 ON=0
 for n in $NODES; do
-  [ "$(N "$n" "print(db.getSiblingDB('shop').getProfilingStatus().was)")" = "2" ] && ON=$((ON+1))
+  [ "$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).getProfilingStatus().was)")" = "2" ] && ON=$((ON+1))
 done
 chk "the profiler is recording on every node"           "3" "$ON"
 
 landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
   local where="none"
   for n in $NODES; do
-    if [ "$(N "$n" "print(db.getSiblingDB('shop').system.profile.countDocuments({ns:'shop.$NS','command.comment':'$1'}))")" != "0" ]; then
+    if [ "$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")" != "0" ]; then
       where=$(N "$n" 'print(db.hello().isWritablePrimary ? "PRIMARY" : "secondary")')
     fi
   done
@@ -80,9 +97,9 @@ landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
 
 echo "== control: straight to the replica set, so the profiler is trusted =="
 mongosh "$HOT&readPreference=secondary" --quiet \
-  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-sec-$TAG').itcount()" >/dev/null 2>&1
+  --eval "db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('ctl-sec-$TAG').itcount()" >/dev/null 2>&1
 mongosh "$HOT&readPreference=primary" --quiet \
-  --eval "db.getSiblingDB('shop').$NS.find({}).comment('ctl-pri-$TAG').itcount()" >/dev/null 2>&1
+  --eval "db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('ctl-pri-$TAG').itcount()" >/dev/null 2>&1
 sleep 3
 chk "a secondary read lands on a secondary"             "secondary" "$(landed ctl-sec-$TAG)"
 chk "a primary read lands on the primary"               "PRIMARY"   "$(landed ctl-pri-$TAG)"
@@ -90,13 +107,13 @@ chk "a primary read lands on the primary"               "PRIMARY"   "$(landed ct
 echo "== through the router =="
 startRouter
 for mode in secondary secondaryPreferred nearest; do
-  P "$mode" "db.getSiblingDB('shop').$NS.find({}).comment('rt-$mode-$TAG').itcount()" >/dev/null 2>&1
+  P "$mode" "db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('rt-$mode-$TAG').itcount()" >/dev/null 2>&1
 done
 sleep 3
 # Correctness first: whatever node answers, the answer has to be right.
 for mode in secondary secondaryPreferred nearest; do
   chk "readPreference=$mode still returns everything" "20" \
-      "$(P "$mode" "print(db.getSiblingDB('shop').$NS.find({}).itcount())")"
+      "$(P "$mode" "print(db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount())")"
 done
 # And then the documented limitation, pinned so it cannot change unnoticed.
 for mode in secondary secondaryPreferred nearest; do
@@ -114,27 +131,27 @@ chk "the log names the limitation"                      "true" \
 # queries, so this issues thirty reads from one client and expects a handful of
 # lines at most: a driver keeps a pool, so the number is not exactly one.
 BEFORE=$(warnings)
-P secondary "for (let i=0;i<30;i++) db.getSiblingDB('shop').$NS.find({}).itcount()" >/dev/null 2>&1
+P secondary "for (let i=0;i<30;i++) db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount()" >/dev/null 2>&1
 sleep 1
 ADDED=$(( $(warnings) - BEFORE ))
 chk "thirty reads warn a handful of times, not thirty" "true" \
     "$([ "$ADDED" -ge 1 ] && [ "$ADDED" -le 5 ] && echo true || echo "false (got $ADDED)")"
 
 chk "the counter is exported"                           "true" \
-    "$(curl -s http://127.0.0.1:27110/metrics 2>/dev/null | grep -q "thermocline_primary_only_reads_total" && echo true || echo false)"
-COUNTED=$(curl -s http://127.0.0.1:27110/metrics 2>/dev/null | awk '/^thermocline_primary_only_reads_total /{print $2}')
+    "$(curl -s http://127.0.0.1:$PDASH/metrics 2>/dev/null | grep -q "thermocline_primary_only_reads_total" && echo true || echo false)"
+COUNTED=$(curl -s http://127.0.0.1:$PDASH/metrics 2>/dev/null | awk '/^thermocline_primary_only_reads_total /{print $2}')
 # The counter counts reads, not warnings, so it has to be well past the warnings.
 chk "the counter counts every read, not every warning"  "true" \
     "$([ "${COUNTED:-0}" -ge 30 ] 2>/dev/null && echo true || echo "false (got ${COUNTED:-none})")"
 
 # primaryPreferred is satisfied by the primary, so there is nothing to say.
 BEFORE=$(warnings)
-P primaryPreferred "db.getSiblingDB('shop').$NS.find({}).itcount()" >/dev/null 2>&1
+P primaryPreferred "db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount()" >/dev/null 2>&1
 sleep 1
 chk "primaryPreferred is not warned about"              "0" \
     "$(( $(warnings) - BEFORE ))"
 
-for n in $NODES; do N "$n" "db.getSiblingDB('shop').setProfilingLevel(0)" >/dev/null; done
+for n in $NODES; do N "$n" "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(0)" >/dev/null; done
 stopDaemons
 echo
 echo "================================"

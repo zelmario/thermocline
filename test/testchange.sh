@@ -11,7 +11,24 @@
 # tombstone a row in a warehouse, would be told a document was deleted when it
 # was only moved. That is not a slow answer or a refused one. It is the system
 # reporting an event that never happened.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tcs
@@ -20,39 +37,39 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-54s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-54s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 stopFeeder() {
-  pkill -f 'cline feeder' 2>/dev/null
-  for _ in $(seq 1 30); do pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0; sleep 0.5; done
+  pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+  for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || return 0; sleep 0.5; done
 }
 startFeeder() {
-  cline feeder --config $CFG --log-file /var/log/cline/cs_f.log & FP=$!
+  cline feeder --config $CFG --log-file $LOGDIR/cs_f.log & FP=$!
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/cs_r.log & RP=$!
+  cline router --config $CFG --log-file $LOGDIR/cs_r.log & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100"; exit 2
+  echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 waitMirrored() {
   local n=""
   for _ in $(seq 1 60); do
-    n=$(C "print(db.getSiblingDB('shop').$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+    n=$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
     [ "$n" = "$1" ] && return 0
     sleep 0.5
   done
@@ -61,23 +78,23 @@ waitMirrored() {
 
 echo "== setup =="
 stopDaemons
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({}); db.getSiblingDB('_thermocline').evicting.deleteMany({})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({}); db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
 startFeeder
 startRouter
 
 echo "== a change stream can be opened at all =="
 # Two hours old, so the evictor's forty minute rule will take them later.
 OPENED=$(R "
-  try { const cs=db.getSiblingDB('shop').$NS.watch(); cs.close(); print('opened'); }
+  try { const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch(); cs.close(); print('opened'); }
   catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "watch() is accepted on a tiered collection"       "opened" "$OPENED"
 
 echo "== it reports the application's own writes =="
 SEEN=$(R "
-  const cs=db.getSiblingDB('shop').$NS.watch();
-  db.getSiblingDB('shop').$NS.insertOne({_id:1, v:'a'});
-  db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:'b'}});
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:1, v:'a'});
+  db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:1},{\$set:{v:'b'}});
   let ops=[];
   for (let i=0;i<40 && ops.length<2;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
   cs.close();
@@ -90,7 +107,7 @@ echo "== an eviction must not look like a deletion =="
 # deleted would drop its cache entry, emit a deletion event, or tombstone a row
 # in a warehouse, for a document that still exists.
 OID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 771)
-R "db.getSiblingDB('shop').$NS.insertOne({_id:ObjectId('$OID'), v:'old'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID'), v:'old'})" >/dev/null
 waitMirrored 2
 
 # The watcher runs in its own client and writes what it saw to a file, because
@@ -98,8 +115,8 @@ waitMirrored 2
 # waited on by name: a bare wait here would also wait for the feeder and the
 # router, which are background jobs of this shell and never exit.
 rm -f /tmp/cs_events.txt
-mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB('shop').$NS.watch();
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+(e.documentKey?JSON.stringify(e.documentKey._id):'')); else sleep(250); }
   cs.close();
@@ -110,7 +127,7 @@ cline evictor --config $CFG --once >/dev/null 2>&1
 for _ in $(seq 1 40); do kill -0 $WATCHER 2>/dev/null || break; sleep 0.5; done
 kill $WATCHER 2>/dev/null
 EVENTS=$(tail -1 /tmp/cs_events.txt 2>/dev/null)
-LEFT=$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
+LEFT=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
 echo "  the fast tier now holds $LEFT of 2, the watcher saw: ${EVENTS:-nothing}"
 # An error is not an answer. Without this, a build that refuses change streams
 # outright passes both of these: it saw no delete because it saw nothing at all.
@@ -124,8 +141,8 @@ echo "== a copy-up must not look like an insert =="
 # is only being moved back; an application acting on inserts would treat it as
 # new.
 rm -f /tmp/cs_events2.txt
-mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB('shop').$NS.watch();
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
   cs.close();
@@ -133,7 +150,7 @@ mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --e
 WATCHER2=$!
 sleep 3
 # A point lookup of the evicted document copies it back up.
-R "db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')})" >/dev/null
 for _ in $(seq 1 40); do kill -0 $WATCHER2 2>/dev/null || break; sleep 0.5; done
 kill $WATCHER2 2>/dev/null
 EVENTS2=$(tail -1 /tmp/cs_events2.txt 2>/dev/null)
@@ -143,9 +160,9 @@ chk "the second watcher was actually watching"         "true" \
 chk "a copy-up is not reported as an insert"           "true" \
     "$(echo "${EVENTS2:-none}" | grep -q insert && echo false || echo true)"
 chk "the archive still holds the evicted document"     "true" \
-    "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(!!d && !d._tcDeletedAt)")"
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(!!d && !d._tcDeletedAt)")"
 chk "a read through the router still finds it"         "old" \
-    "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'MISSING')")"
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'MISSING')")"
 
 echo "== a lookup the fast tier cannot answer =="
 # fullDocument: "updateLookup" fetches the document as it stands when the event
@@ -158,8 +175,8 @@ echo "== a lookup the fast tier cannot answer =="
 # Measured before the fix: the stream said null while a read of that same
 # document through the router returned it.
 rm -f /tmp/cs_events3.txt
-mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB('shop').$NS.watch([], {fullDocument:'updateLookup'});
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {fullDocument:'updateLookup'});
   let out='no event';
   for (let i=0;i<60;i++) {
     const e=cs.tryNext();
@@ -171,14 +188,14 @@ WATCHER3=$!
 sleep 3
 # Update it, let that reach the archive, then take it off the fast tier the way
 # an eviction does, with the feeder blind to it so the archive keeps it live.
-R "db.getSiblingDB('shop').$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up'}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up'}})" >/dev/null
 for _ in $(seq 1 60); do
-  [ "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'')")" = "looked up" ] && break
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'')")" = "looked up" ] && break
   sleep 0.5
 done
 stopFeeder
-H "db.getSiblingDB('shop').$NS.deleteOne({_id:ObjectId('$OID')})" >/dev/null
-C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID')})" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
 for _ in $(seq 1 60); do kill -0 $WATCHER3 2>/dev/null || break; sleep 0.5; done
 kill $WATCHER3 2>/dev/null
 LOOKUP=$(tail -1 /tmp/cs_events3.txt 2>/dev/null)

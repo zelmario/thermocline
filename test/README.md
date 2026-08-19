@@ -12,6 +12,11 @@ nothing.
     docker cp test/*.sh <node>:/root/
     docker cp test/cline.yaml <node>:/root/cline.yaml
     docker exec <node> bash /root/sweep.sh         # all of the below, serially, one log each
+    docker exec -e WORKERS=4 <node> bash /root/psweep.sh   # the same list, four at a time
+
+`psweep.sh` is the one to use. `sweep.sh` takes over forty minutes, which is why
+measurements were getting skipped, and a forty minute feedback loop costs more
+than it saves. See "Running them in parallel" below for what a worker is.
 
 Or one at a time:
 
@@ -82,6 +87,97 @@ with the fast tier complete and again with everything falling through to the
 archive, so the two paths have to agree. A third pass makes the fast tier
 genuinely short, which is the only way `count` and `distinct` bugs show up at
 all: with a complete fast tier they return the right answer even unguarded.
+
+## Running them in parallel
+
+The obstacle was never scheduling. Every suite shared one pair of databases, one
+bookkeeping database, one config and one set of ports, and the suites stop and
+start the daemons out from under each other.
+
+A worker is a slot with its own of each. `psweep.sh` gives worker N:
+
+    shop_wN, wh_wN      its databases
+    _thermocline_wN     its bookkeeping, set by the config's new meta.db
+    27200 + 20N         a port block, offsets 0 to 17, clear of the 27100 a
+                        suite run by hand still uses
+    /root/wN            its configs and logs
+
+Suites are claimed from a shared queue rather than dealt out in advance, because
+they range from under a minute to several and a worker that finishes early
+should take the next one.
+
+**Every knob defaults to the single-worker layout**, so `sweep.sh` still works
+and a suite run by hand behaves exactly as it always has. That is deliberate:
+it is what makes a serial control run comparable to a parallel one, and the only
+way to tell a suite this change broke from a suite parallelism broke.
+
+Things this encodes, each of which cost a wrong result first:
+
+- **Separate databases, not prefixed collections.** Two feeders watching one
+  namespace is not merely duplicated work. The second feeder sees the first
+  worker's eviction as an *unannounced* delete, because the announcement is in
+  the other worker's bookkeeping database, and tombstones a document that was
+  only being tiered. Renaming the database is what stops two feeders ever
+  sharing a namespace.
+- **The bookkeeping database has to be per worker, and that needed a product
+  change.** Nearly every suite wipes `watermarks`, `residency`, `evicting` and
+  `markers` wholesale in its setup. Scoping those wipes by namespace does not
+  work, because `warmerActive`, `promotingActive` and `evictionPaused` are
+  singletons with no namespace to scope by. `meta.db` in the config is the
+  answer, and it is a real deployment option too: two Thermocline deployments
+  sharing one pair of tiers would each have read the other's state as its own.
+- **mongosh is node, so the suites read their database names from
+  `process.env`, not from the shell.** Half the eval strings are single-quoted
+  at the shell, where `$DB` never expands and the suite would silently query the
+  wrong database. `process.env.TC_DB` works in both quoting styles.
+- **`$WDIR` inside a single-quoted `pkill -f` pattern never expands**, so the
+  pattern matches nothing, the kill is a no-op and the next suite on that worker
+  inherits a running router. Every scoped pattern is double-quoted.
+- **A quoted heredoc expands nothing at all.** `testedge.sh` edits its config in
+  `python3 - <<'PY'`, which is right, and it therefore has to read the database
+  and directory from `os.environ` rather than from the shell.
+- **Do not export `CFG` from the driver.** Several suites name their own config:
+  `testauthterm.sh` writes a `terminate_auth` one, `testreadprefterm.sh` its
+  own, `testcache.sh` a pair. Exporting `CFG` overrode all of them, and
+  testauthterm ran against the plain config and failed its first check and every
+  one that depended on it. Every suite already defaults `CFG` to
+  `$WDIR/cline.yaml`, so the driver only has to set `WDIR`.
+- **The profiler needs nothing extra.** MongoDB's profiler level and its
+  `system.profile` are per database, so the three suites that use it are
+  isolated by the database rename with no further work.
+- **A rewrite of the suites can rewrite its own preamble.** The port
+  substitution ran after the preamble was inserted, so `PORT=${PORT:-27100}`
+  became `PORT=${PORT:-$PORT}` in all thirty three suites. With `PORT` unset it
+  expanded to nothing, `mongosh --port` took the next argument, and every check
+  went straight to mongod instead of through the router. That reads as the
+  product having no guards at all: `testtxn.sh` reported twelve failures about
+  key claims not being enforced and archived documents not being found, and the
+  binary was fine. **The control that caught it was running the suite from
+  `git show HEAD:` against the same binary**, which passed 23/0. Do that before
+  believing a suite that starts failing after the suite itself was edited.
+- **A session names its own database, and `getSiblingDB` is not the only way
+  to reach one.** Renaming the database caught 904 `getSiblingDB('shop')` and
+  missed 16 `s.getDatabase('shop')`, which is how every transaction test
+  reaches its collection. The result was that exactly the transaction checks
+  failed, in four separate suites, and they failed by *succeeding* differently:
+  a read answered straight from the archive rather than through a replay looks
+  like the router being cleverer, not like a test pointed at the wrong
+  database. Also missed: an eval string nested inside another one, where the
+  quotes are escaped (`getSiblingDB(\"shop\")`), `stats().db == 'shop'`,
+  `$merge`'s `into: {db: ...}`, and a `listDatabases` check naming the database
+  it expected to see. **The bisect that found it** was two configs differing in
+  one thing each: rename only the bookkeeping database (passed 23/0), rename
+  only the user database (failed 10). Do that before suspecting the product.
+- **A namespace built from a shell variable is missed by a rename that matches
+  literal names.** `keys.deleteMany({ns:'shop.$1'})` survived a substitution
+  that caught every `shop.tkupd`, so `fresh()` cleared key claims under a
+  database no worker used and left the real ones standing. Grep for the
+  variable forms separately.
+- **`mkworker.sh` asserts what a worker's config should say, not what it should
+  not.** The first version looked for the shared database and port instead, and
+  fired on the one worker whose port legitimately equalled the default. A guard
+  that reports a problem the run does not have costs as much as one that misses
+  a problem it does.
 
 Things these encode that are easy to get wrong when testing by hand:
 

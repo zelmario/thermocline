@@ -6,7 +6,25 @@
 # now a wait for the thing itself: a daemon that answers, a document that has
 # landed, a process that has gone. The one remaining sleep is the router's
 # completeness cache, which is a constant in the code rather than a race.
-CFG=/root/cline.yaml
+# Parallel-safe knobs. Every default reproduces the single-worker layout, so a
+# suite run by hand behaves exactly as it always has. psweep.sh sets them per
+# worker: its own databases, its own bookkeeping database, its own port block,
+# and its own directory for configs and logs. That directory is also what scopes
+# the pkills below to this worker's daemons, because every one of them carries
+# --config $WDIR/... on its command line.
+WDIR=${WDIR:-/root}
+LOGDIR=${LOGDIR:-/var/log/cline}
+PORT=${PORT:-27100}
+DB=${DB:-shop}
+DB2=${DB2:-wh}
+META=${META:-_thermocline}
+# mongosh is node, so the suites reach these through process.env rather than
+# shell expansion. Half the eval strings are single-quoted at the shell, where a
+# $VAR would not expand and would silently query the wrong database.
+export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+export DB WDIR
+P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
+CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tprobe
@@ -15,7 +33,7 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-46s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-46s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-R() { mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
@@ -24,17 +42,17 @@ C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 CLAIM_TTL=7
 
 stopDaemons() {
-  pkill -f 'cline feeder|cline router' 2>/dev/null
+  pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
   for _ in $(seq 1 30); do
-    pgrep -f 'cline feeder|cline router' >/dev/null 2>&1 || return 0
+    pgrep -f "cline feeder --config $WDIR/|cline router --config $WDIR/" >/dev/null 2>&1 || return 0
     sleep 0.5
   done
 }
 # The router outlives most sections here, so the feeder is stopped on its own.
 stopFeeder() {
-  pkill -f 'cline feeder' 2>/dev/null
+  pkill -f "cline feeder --config $WDIR/" 2>/dev/null
   for _ in $(seq 1 30); do
-    pgrep -f 'cline feeder' >/dev/null 2>&1 || return 0
+    pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || return 0
     sleep 0.5
   done
 }
@@ -43,22 +61,22 @@ stopFeeder() {
 # Sleeping a fixed few seconds instead lets the writes that follow land before
 # it is listening, and they are then never mirrored.
 startFeeder() {
-  cline feeder --config "$1" --log-file "/var/log/cline/$2" & FP=$!
+  cline feeder --config "$1" --log-file "$LOGDIR/$2" & FP=$!
   for _ in $(seq 1 60); do
-    [ "$(C 'print(!!db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
+    [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && return 0
     sleep 0.5
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file /var/log/cline/edge_r.log & RP=$!
+  cline router --config $CFG --log-file $LOGDIR/edge_r.log & RP=$!
   for _ in $(seq 1 30); do
-    mongosh --port 27100 -u dba -p secret --authenticationDatabase admin \
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin \
       --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "  FATAL  the router never came up on 27100, so nothing below would mean anything"
-  tail -5 /var/log/cline/edge_r.log
+  echo "  FATAL  the router never came up on $PORT, so nothing below would mean anything"
+  tail -5 $LOGDIR/edge_r.log
   exit 2
 }
 # waitFor WHAT EXPECTED COMMAND: poll until the command prints EXPECTED.
@@ -75,15 +93,15 @@ waitFor() {
 # documents. A fixed sleep here is what made this suite report mirroring
 # failures that were only the feeder still catching up.
 waitMirrored() {
-  waitFor "shop.$1 in the archive" "$2" \
-    "C \"print(db.getSiblingDB('shop').$1.countDocuments({_tcDeletedAt:{\\\$exists:false}}))\""
+  waitFor "$DB.$1 in the archive" "$2" \
+    "C \"print(db.getSiblingDB(process.env.TC_DB).$1.countDocuments({_tcDeletedAt:{\\\$exists:false}}))\""
 }
 # Remove documents from the fast tier the way an eviction does, with the feeder
 # blind to it, so the archive keeps a live copy.
 evictBehindTheFeeder() {
   stopFeeder
   H "$1" >/dev/null
-  C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
+  C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
   startFeeder $CFG edge_f.log
 }
 
@@ -95,111 +113,118 @@ echo "== setup =="
 # document that was just warmed, and the feeder correctly suppress an echo of a
 # document that was just announced. Both look exactly like product bugs.
 stopDaemons
-H "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').dated.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('shop').dated.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'}); db.getSiblingDB('_thermocline').watermarks.deleteMany({}); db.getSiblingDB('_thermocline').residency.deleteMany({}); db.getSiblingDB('_thermocline').warming.deleteMany({}); db.getSiblingDB('_thermocline').markers.deleteOne({_id:'warmerActive'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).dated.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).dated.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({}); db.getSiblingDB(process.env.TC_META).warming.deleteMany({}); db.getSiblingDB(process.env.TC_META).markers.deleteOne({_id:'warmerActive'})" >/dev/null
 startFeeder $CFG edge_f.log
 startRouter
 
 echo "== _id types other than ObjectId =="
-R "db.getSiblingDB('shop').$NS.insertMany([
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([
   {_id:'str-key',v:'s'},{_id:12345,v:'i'},{_id:{a:1,b:2},v:'c'},{_id:new Date('2026-01-01'),v:'d'}])" >/dev/null
 waitMirrored $NS 4
-evictBehindTheFeeder "db.getSiblingDB('shop').$NS.deleteMany({})"
-chk "string _id read miss"    "s" "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:'str-key'}); print(d?d.v:'MISSING')")"
-chk "int _id read miss"       "i" "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:12345}); print(d?d.v:'MISSING')")"
-chk "document _id read miss"  "c" "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:{a:1,b:2}}); print(d?d.v:'MISSING')")"
-chk "date _id read miss"      "d" "$(R "const d=db.getSiblingDB('shop').$NS.findOne({_id:new Date('2026-01-01')}); print(d?d.v:'MISSING')")"
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({})"
+chk "string _id read miss"    "s" "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:'str-key'}); print(d?d.v:'MISSING')")"
+chk "int _id read miss"       "i" "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:12345}); print(d?d.v:'MISSING')")"
+chk "document _id read miss"  "c" "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:{a:1,b:2}}); print(d?d.v:'MISSING')")"
+chk "date _id read miss"      "d" "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:new Date('2026-01-01')}); print(d?d.v:'MISSING')")"
 # copyUpAsync replies first and copies afterwards, so the fourth read returning
 # is not the fourth copy-up landing.
-waitFor "copies up" "4" "H \"print(db.getSiblingDB('shop').$NS.countDocuments({}))\""
-chk "all four copied up"      "4" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+waitFor "copies up" "4" "H \"print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))\""
+chk "all four copied up"      "4" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
 # A document-valued _id is a literal, not an operator expression. Reading it as
 # an operator meant an update to an archived one matched nothing and reported
 # success, losing the write silently.
-evictBehindTheFeeder "db.getSiblingDB('shop').$NS.deleteMany({})"
-chk "write miss on a document _id"  "1" "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:{a:1,b:2}},{\$set:{touched:1}}).matchedCount)")"
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({})"
+chk "write miss on a document _id"  "1" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:{a:1,b:2}},{\$set:{touched:1}}).matchedCount)")"
 waitFor "the touched update in the archive" "1" \
-  "C \"const d=db.getSiblingDB('shop').$NS.findOne({_id:{a:1,b:2}}); print(d&&d.touched?d.touched:'no')\""
-chk "and it reached the archive"    "1" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:{a:1,b:2}}); print(d&&d.touched?d.touched:'no')")"
-chk "an _id range is still a range" "0" "$(R "print(db.getSiblingDB('shop').$NS.updateOne({_id:{\$gt:999999}},{\$set:{x:1}}).matchedCount)")"
+  "C \"const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:{a:1,b:2}}); print(d&&d.touched?d.touched:'no')\""
+chk "and it reached the archive"    "1" "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:{a:1,b:2}}); print(d&&d.touched?d.touched:'no')")"
+chk "an _id range is still a range" "0" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:{\$gt:999999}},{\$set:{x:1}}).matchedCount)")"
 
 echo "== \$out and \$merge run on incomplete input =="
-cline watermark --config $CFG --ns shop.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
+cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep $CLAIM_TTL
-chk "\$out runs"              "ok"   "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}},{\$out:'e_out'}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
+chk "\$out runs"              "ok"   "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}},{\$out:'e_out'}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
 # Grouped by a real field, not by null: \$merge refuses a null _id in mongod
 # itself, so asking for one here would be testing MongoDB's rule, not ours.
-chk "\$merge runs"            "ok"   "$(R "try{db.getSiblingDB('shop').$NS.aggregate([{\$group:{_id:'\$v',n:{\$sum:1}}},{\$merge:{into:'e_merge'}}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
-chk "both wrote to the fast tier" "true" "$(H "const n=db.getSiblingDB('shop').getCollectionNames(); print(n.includes('e_out')&&n.includes('e_merge'))")"
-chk "collStats still allowed" "true"    "$(R "print(db.getSiblingDB('shop').$NS.stats().count >= 0)")"
+chk "\$merge runs"            "ok"   "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$v',n:{\$sum:1}}},{\$merge:{into:'e_merge'}}]).toArray();print('ok')}catch(e){print(e.message.substring(0,50))}")"
+chk "both wrote to the fast tier" "true" "$(H "const n=db.getSiblingDB(process.env.TC_DB).getCollectionNames(); print(n.includes('e_out')&&n.includes('e_merge'))")"
+chk "collStats still allowed" "true"    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.stats().count >= 0)")"
 
 echo "== dry runs write nothing =="
-cline watermark --config $CFG --ns shop.$NS --complete-all >/dev/null
-BEFORE_H=$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
-BEFORE_C=$(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")
+cline watermark --config $CFG --ns $DB.$NS --complete-all >/dev/null
+BEFORE_H=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
+BEFORE_C=$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
 cline warmer  --config $CFG --dry-run >/dev/null 2>&1
 cline evictor --config $CFG --once --dry-run >/dev/null 2>&1
-chk "warmer dry run changed the fast tier by"  "$BEFORE_H" "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
-chk "evictor dry run changed the archive by"   "$BEFORE_C" "$(C "print(db.getSiblingDB('shop').$NS.countDocuments({}))")"
+chk "warmer dry run changed the fast tier by"  "$BEFORE_H" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
+chk "evictor dry run changed the archive by"   "$BEFORE_C" "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
 echo "== date_field rules, the non-ObjectId selector =="
 python3 - <<'PY'
-p='/root/cline.yaml'; s=open(p).read()
-s=s.replace('    - ns: "shop.orders"\n      older_than: 40m','    - ns: "shop.dated"\n      older_than: 40m\n      date_field: "createdAt"')
-s=s.replace('    - ns: "shop.orders"\n      back: 40m','    - ns: "shop.dated"\n      back: 12h\n      date_field: "createdAt"')
-s=s.replace('    - "shop.tacct"\n','    - "shop.tacct"\n    - "shop.dated"\n',1)
-open('/root/edge_df.yaml','w').write(s)
+import os
+# The heredoc is quoted so nothing here is expanded by the shell. The database
+# and the directory come from the environment, which is what lets a worker edit
+# its own config rather than another worker's.
+db, wdir = os.environ['DB'], os.environ['WDIR']
+p = wdir + '/cline.yaml'; s = open(p).read()
+s = s.replace('    - ns: "%s.orders"\n      older_than: 40m' % db,
+              '    - ns: "%s.dated"\n      older_than: 40m\n      date_field: "createdAt"' % db)
+s = s.replace('    - ns: "%s.orders"\n      back: 40m' % db,
+              '    - ns: "%s.dated"\n      back: 12h\n      date_field: "createdAt"' % db)
+s = s.replace('    - "%s.tacct"\n' % db, '    - "%s.tacct"\n    - "%s.dated"\n' % (db, db), 1)
+open(wdir + '/edge_df.yaml', 'w').write(s)
 PY
 stopFeeder
-C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
-startFeeder /root/edge_df.yaml edge_df.log
-H 'const c=db.getSiblingDB("shop").dated; const now=Date.now(); const d=[];
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder $WDIR/edge_df.yaml edge_df.log
+H 'const c=db.getSiblingDB(process.env.TC_DB).dated; const now=Date.now(); const d=[];
    for(let i=0;i<30;i++) d.push({_id:i, createdAt:new Date(now-i*5*60*1000), n:i});
    c.insertMany(d); c.createIndex({createdAt:1,_id:1});' >/dev/null
 waitMirrored dated 30
-H 'db.getSiblingDB("shop").dated.updateMany({},{$set:{m:1}})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_DB).dated.updateMany({},{$set:{m:1}})' >/dev/null
 # The update has to be mirrored too, or the evictor below runs against an
 # archive that is one write behind the fast tier.
 waitFor "the m:1 update in the archive" "30" \
-  "C 'print(db.getSiblingDB(\"shop\").dated.countDocuments({m:1}))'"
-chk "date_field collection mirrored" "30" "$(C 'print(db.getSiblingDB("shop").dated.countDocuments({}))')"
-cline evictor --config /root/edge_df.yaml --once >/dev/null 2>&1
-chk "date_field evictor kept the young"  "8"  "$(H 'print(db.getSiblingDB("shop").dated.countDocuments({}))')"
-chk "and the archive kept everything"    "30" "$(C 'print(db.getSiblingDB("shop").dated.countDocuments({_tcDeletedAt:{$exists:false}}))')"
-cline watermark --config /root/edge_df.yaml --ns shop.dated --clear >/dev/null
-cline warmer --config /root/edge_df.yaml >/dev/null 2>&1
-chk "date_field warmer refilled"         "30" "$(H 'print(db.getSiblingDB("shop").dated.countDocuments({}))')"
+  "C 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({m:1}))'"
+chk "date_field collection mirrored" "30" "$(C 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
+cline evictor --config $WDIR/edge_df.yaml --once >/dev/null 2>&1
+chk "date_field evictor kept the young"  "8"  "$(H 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
+chk "and the archive kept everything"    "30" "$(C 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({_tcDeletedAt:{$exists:false}}))')"
+cline watermark --config $WDIR/edge_df.yaml --ns $DB.dated --clear >/dev/null
+cline warmer --config $WDIR/edge_df.yaml >/dev/null 2>&1
+chk "date_field warmer refilled"         "30" "$(H 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
 
 echo "== unannounced delete policies =="
 stopFeeder
-sed 's/unannounced_deletes: tombstone/unannounced_deletes: ignore/' $CFG > /root/edge_ignore.yaml
-sed 's/unannounced_deletes: tombstone/unannounced_deletes: halt/'   $CFG > /root/edge_halt.yaml
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop(); db.getSiblingDB('_thermocline').checkpoints.deleteOne({_id:'test'})" >/dev/null
-startFeeder /root/edge_ignore.yaml edge_ig.log
-H "db.getSiblingDB('shop').$NS.insertOne({_id:1,v:'a'})" >/dev/null
+sed 's/unannounced_deletes: tombstone/unannounced_deletes: ignore/' $CFG > $WDIR/edge_ignore.yaml
+sed 's/unannounced_deletes: tombstone/unannounced_deletes: halt/'   $CFG > $WDIR/edge_halt.yaml
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder $WDIR/edge_ignore.yaml edge_ig.log
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:1,v:'a'})" >/dev/null
 waitMirrored $NS 1
-H "db.getSiblingDB('shop').$NS.deleteOne({_id:1})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:1})" >/dev/null
 # Under ignore the delete changes nothing in the archive, so there is no state
 # to wait for. A sentinel written after it is: the change stream is ordered, so
 # the sentinel arriving proves the delete was already seen and ignored.
-H "db.getSiblingDB('shop').$NS.insertOne({_id:'sentinel'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'sentinel'})" >/dev/null
 waitFor "the sentinel in the archive" "true" \
-  "C \"print(!!db.getSiblingDB('shop').$NS.findOne({_id:'sentinel'}))\""
-chk "ignore leaves the archive readable" "no" "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?(d._tcDeletedAt?'yes':'no'):'GONE')")"
-chk "and the feeder keeps running"       "1"  "$(pgrep -fc 'cline feeder --config /root/edge_ignore' || true)"
+  "C \"print(!!db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:'sentinel'}))\""
+chk "ignore leaves the archive readable" "no" "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:1}); print(d?(d._tcDeletedAt?'yes':'no'):'GONE')")"
+chk "and the feeder keeps running"       "1"  "$(pgrep -fc "cline feeder --config $WDIR/edge_ignore" || true)"
 
 stopFeeder
-C 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"test"})' >/dev/null
-H "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-C "db.getSiblingDB('shop').$NS.drop()" >/dev/null
-rm -f /var/log/cline/edge_halt.log
-startFeeder /root/edge_halt.yaml edge_halt.log
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+rm -f $LOGDIR/edge_halt.log
+startFeeder $WDIR/edge_halt.yaml edge_halt.log
 HP=$FP
-H "db.getSiblingDB('shop').$NS.insertOne({_id:2,v:'b'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:2,v:'b'})" >/dev/null
 waitMirrored $NS 1
-H "db.getSiblingDB('shop').$NS.deleteOne({_id:2})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:2})" >/dev/null
 # Bounded, because a bare wait on a feeder that refuses to halt hangs the suite
 # forever with every check above it already passed.
 HALTRC=99
@@ -211,7 +236,7 @@ chk "halt stops the feeder"              "1"    "$HALTRC"
 # The reason has to reach the log file. main prints it to stderr, which is not
 # where the logs go once --log-file is set, so a halt used to end the log
 # mid-sentence and explain nothing.
-chk "and says why in the log file"       "true" "$(grep -qE 'level=ERROR.*feeder stopped.*unannounced' /var/log/cline/edge_halt.log && echo true || echo false)"
+chk "and says why in the log file"       "true" "$(grep -qE 'level=ERROR.*feeder stopped.*unannounced' $LOGDIR/edge_halt.log && echo true || echo false)"
 
 stopDaemons
 echo
