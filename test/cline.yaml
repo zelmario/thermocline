@@ -28,6 +28,12 @@ feeder:
   # one proves nothing.
   namespaces:
     - "shop.orders"
+    # test/store: the order log a shop appends to for ever, tiered alongside
+    # the orders themselves. The catalogue and the customers are deliberately
+    # NOT tiered: no shop archives what it is still selling, and a router that
+    # is only ever asked about tiered collections is not being tested the way
+    # an application uses it.
+    - "shop.order_events"
     - "shop.tprobe"
     - "shop.tacct"
     # testkeys.sh, one collection per section: the router caches a namespace's

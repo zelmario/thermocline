@@ -55,6 +55,16 @@ Or one at a time:
     bash test/testsharded.sh                       # a mongos fast tier, which is refused (host side)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
+    go run ./test/store -uri ... -skip-seed        # a shop, checking what a shop would notice (see store/README.md)
+
+`test/store` answers a different question from all of the above. Every suite here
+asks whether an operation returns what it should; the store asks whether an
+application keeps working while the tiering moves data underneath it, by running
+a shop and checking what a shop would notice: an order it just placed is
+readable, placing one order moves that customer's count by exactly one, and a
+report over a month that has already ended does not change its answer. Run it
+straight at MongoDB first. That control is the point: a check that fails without
+the router in the way is a broken check, and nothing it says afterwards counts.
 
 `testconform.sh` is the one to extend. It asserts almost nothing by hand: two
 collections hold identical documents, one untiered and one tiered with half its
