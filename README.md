@@ -254,6 +254,16 @@ A fallback read has to clear both bars, never either, so requiring the cluster
 time can only make the barrier stricter, and it falls back to the clock alone
 against a feeder from before this.
 
+**A caller's own deadline bounds all of this, and it is spent once.** The wait
+takes at most half of `maxTimeMS` and the archive read is given what is left,
+rather than the whole of it a second time. Measured before that: a client asking
+for 800 ms with mirroring behind waited 300 ms at the barrier, handed the
+archive 800 ms of its own, and got a successful answer after 1,117 ms. Splitting
+it is what stops either half starving the other, because waiting out the entire
+deadline honours it and then reaches the archive with nothing to spend, which
+would turn a feeder that is merely behind into failed queries. That is the one
+thing this barrier exists not to do.
+
 A read of something written milliseconds ago is therefore seen, at the cost of
 that wait. A stopped feeder is the one case the barrier cannot hold, and there
 the router answers anyway and warns rather than turning a dead background daemon

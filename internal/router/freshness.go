@@ -180,13 +180,22 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 // two archive read paths behave the same way and report it the same way.
 //
 // budget is the caller's own maxTimeMS, or zero when they set none. The wait
-// must not outlast it: a client that asked for an answer within fifty
-// milliseconds and got one after five hundred was told its deadline did not
-// apply here, which is not the proxy's decision to make.
+// takes at most half of it, and the read that follows is given what is left: a
+// client that asked for an answer within fifty milliseconds and got one after
+// five hundred was told its deadline did not apply here, which is not the
+// proxy's decision to make, and one that waited out its whole deadline here
+// would reach the archive with nothing to spend.
 func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.Time, budget time.Duration) {
 	if budget > 0 {
+		// Half, not all of it. Waiting out the whole deadline honours it and
+		// starves the read that deadline was set for: the archive would then
+		// be asked with a millisecond left and answer MaxTimeMSExpired, which
+		// turns a feeder that is merely behind into failed queries. That is
+		// the thing this barrier exists not to do. Splitting it means neither
+		// half can starve the other, and a caller who set no deadline is
+		// unaffected.
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, budget)
+		ctx, cancel = context.WithTimeout(ctx, budget/2)
 		defer cancel()
 	}
 	if c.r.waitForArchive(ctx, started) {

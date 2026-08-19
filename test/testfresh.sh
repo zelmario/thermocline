@@ -181,6 +181,29 @@ chk "and it did not hang waiting"          "true" "$([ "$ELAPSED" -lt 8 ] && ech
 chk "the router said the answer was stale" "true" \
     "$(grep -qE 'answering from the archive before mirroring caught up' $LOGDIR/fresh_r.log && echo true || echo false)"
 
+echo "== the caller's deadline is spent once, not twice =="
+# The wait above is bounded by the caller's maxTimeMS, and the command used to
+# carry that same maxTimeMS onward to the archive, so a caller could be charged
+# its deadline twice. Measured before the fix: a client asking for 800ms with
+# mirroring behind waited 300ms here, handed the archive 800ms of its own, and
+# got a successful answer after 1117ms.
+#
+# The wait takes at most half the deadline now and the read gets the rest, so
+# neither can starve the other. Timed inside mongosh rather than around it,
+# because timing the whole invocation measures node starting up: that mistake
+# already cost this suite a false failure once.
+#
+# The feeder is still stopped from the section above, but its checkpoint is put
+# back, because a missing one makes the router give up at once and there is then
+# no wait to measure at all.
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:"test"},{$set:{eventAt:new Date(Date.now()-3600000),savedAt:new Date(Date.now()-3600000)}},{upsert:true})' >/dev/null
+ELAPSED_MS=$(R "const t=Date.now();
+   try { db.getSiblingDB(process.env.TC_DB).$NS.find({}).maxTimeMS(1000).itcount(); } catch(e) {}
+   print(Date.now()-t)")
+chk "a read is not charged its deadline twice" "true" \
+    "$([ "${ELAPSED_MS:-99999}" -lt 900 ] && echo true || echo false)"
+echo "      (the read took ${ELAPSED_MS} ms of a 1000 ms deadline)"
+
 startFeeder
 stopDaemons
 echo

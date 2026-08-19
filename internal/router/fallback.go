@@ -274,7 +274,20 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// caller remembering to. A find waited and an aggregation did not, and
 	// countDocuments is an aggregation, so a document inserted a moment earlier
 	// was found by find and not counted by countDocuments.
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
+	budget := maxTimeBudget(cmd)
+	waitedFrom := time.Now()
+	c.archiveReadIsFresh(ctx, db+"."+coll, waitedFrom, budget)
+
+	// The archive gets what is left of the caller's deadline, not the whole of
+	// it a second time.
+	//
+	// The wait above is bounded by maxTimeMS, and the command carried maxTimeMS
+	// onward unchanged, so a caller could be charged its deadline twice.
+	// Measured: a client asking for 800ms with mirroring behind waited 300ms
+	// here, handed the archive 800ms of its own, and got a successful answer
+	// after 1117ms. Being told a deadline does not apply here is not this
+	// proxy's decision to make.
+	rewritten = withRemainingTime(rewritten, budget, time.Since(waitedFrom))
 
 	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
@@ -995,4 +1008,29 @@ func (r *Router) serverErrorReply(requestID, responseTo int32, err error) (*wire
 		return nil, false
 	}
 	return msg, true
+}
+
+// withRemainingTime rewrites maxTimeMS to what is left of it.
+//
+// Nothing happens when the caller set no deadline, which is the common case.
+// An exhausted one is not rounded up to something comfortable: it becomes the
+// smallest positive value, so the archive answers if it can and MongoDB returns
+// its own MaxTimeMSExpired if it cannot. Zero would be worse than wrong, as
+// MongoDB reads zero as "no limit", which is the opposite of what an expired
+// deadline means.
+func withRemainingTime(cmd bson.D, budget, spent time.Duration) bson.D {
+	if budget <= 0 {
+		return cmd
+	}
+	left := budget - spent
+	if left < time.Millisecond {
+		left = time.Millisecond
+	}
+	for i := range cmd {
+		if cmd[i].Key == "maxTimeMS" {
+			cmd[i].Value = left.Milliseconds()
+			return cmd
+		}
+	}
+	return cmd
 }

@@ -50,3 +50,46 @@ func TestCaughtUp(t *testing.T) {
 		})
 	}
 }
+
+// The archive gets what is left of the caller's deadline, not the whole of it
+// a second time. Measured before this: a client asking for 800ms waited 300ms
+// for mirroring, the archive was handed 800ms of its own, and the answer came
+// back successfully after 1117ms.
+func TestWithRemainingTime(t *testing.T) {
+	cmdWith := func(ms int64) bson.D {
+		return bson.D{{Key: "find", Value: "c"}, {Key: "maxTimeMS", Value: ms}, {Key: "filter", Value: bson.D{}}}
+	}
+	maxTimeOf := func(d bson.D) interface{} {
+		for _, e := range d {
+			if e.Key == "maxTimeMS" {
+				return e.Value
+			}
+		}
+		return nil
+	}
+
+	t.Run("the wait is deducted", func(t *testing.T) {
+		got := withRemainingTime(cmdWith(800), 800*time.Millisecond, 300*time.Millisecond)
+		if maxTimeOf(got) != int64(500) {
+			t.Fatalf("maxTimeMS = %v, want 500", maxTimeOf(got))
+		}
+	})
+
+	// Zero would be read by MongoDB as "no limit", which is the opposite of
+	// what an exhausted deadline means, so the floor is one millisecond and the
+	// server decides.
+	t.Run("an exhausted deadline never becomes no deadline", func(t *testing.T) {
+		got := withRemainingTime(cmdWith(800), 800*time.Millisecond, 900*time.Millisecond)
+		if maxTimeOf(got) != int64(1) {
+			t.Fatalf("maxTimeMS = %v, want 1", maxTimeOf(got))
+		}
+	})
+
+	t.Run("a caller who set no deadline is left alone", func(t *testing.T) {
+		in := bson.D{{Key: "find", Value: "c"}}
+		got := withRemainingTime(in, 0, 300*time.Millisecond)
+		if maxTimeOf(got) != nil {
+			t.Fatalf("a deadline appeared from nowhere: %v", maxTimeOf(got))
+		}
+	})
+}
