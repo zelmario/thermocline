@@ -15,10 +15,23 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// DB is the database holding all Thermocline bookkeeping. It lives on the cold
+// tier, which is the durable side of the pair, and the unique key registry of
+// the same name lives on the fast tier.
+//
+// It is a variable rather than a constant because one pair of tiers can carry
+// more than one Thermocline deployment, and two deployments sharing a
+// bookkeeping database would each read the other's watermarks, residency holds
+// and singleton markers as their own. Set it from configuration through SetDB
+// and never after a daemon has started; config.Load is the single place that
+// does, so every command picks it up before it opens a connection.
+var DB = DefaultDB
+
 const (
-	// DB is the database holding all Thermocline bookkeeping. It lives on the
-	// cold tier, which is the durable side of the pair.
-	DB = "_thermocline"
+	// DefaultDB is the bookkeeping database a deployment gets when the config
+	// does not name one. It is what every existing deployment already uses, so
+	// the name only has to be set when a second deployment shares these tiers.
+	DefaultDB = "_thermocline"
 
 	// Residency tracks how long a document should stay in the fast tier. One
 	// small record per resident document, so extending a document's stay
@@ -102,6 +115,18 @@ const (
 	// deleted. The document stays for auditing, but reads must not return it.
 	TombstoneField = "_tcDeletedAt"
 )
+
+// SetDB names the bookkeeping database for this process.
+//
+// Call it once, before anything opens a collection. Every entry point reaches
+// it through config.Load, so a daemon that read a config is already pointed at
+// the right database; a caller that skips config keeps DefaultDB.
+func SetDB(name string) {
+	if name == "" {
+		name = DefaultDB
+	}
+	DB = name
+}
 
 // DocID is a stable, comparable identifier for one user document across
 // namespaces. MongoDB allows any BSON type as an _id, so the bytes are encoded

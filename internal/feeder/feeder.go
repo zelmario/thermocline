@@ -24,9 +24,6 @@ import (
 	"github.com/zelmario/thermocline/internal/watermark"
 )
 
-// metaDB is aliased so classify.go does not import meta for one constant.
-const metaDB = meta.DB
-
 // ErrUnannouncedDelete is returned when policy is "halt" and a delete arrived
 // that the evictor did not announce.
 var ErrUnannouncedDelete = errors.New("unannounced delete on the fast tier")

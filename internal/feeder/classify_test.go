@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 func TestClassifyOp(t *testing.T) {
@@ -84,7 +85,7 @@ func TestClassifyDelete(t *testing.T) {
 }
 
 func TestSkipNamespace(t *testing.T) {
-	for _, db := range []string{"admin", "local", "config", metaDB} {
+	for _, db := range []string{"admin", "local", "config", meta.DB} {
 		if !skipNamespace(db) {
 			t.Errorf("skipNamespace(%q) = false, want true", db)
 		}

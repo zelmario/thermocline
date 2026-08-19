@@ -27,6 +27,23 @@ log:
   # the file you are tailing stays empty while the disk fills.
   file: ""
 
+# Where Thermocline keeps its own bookkeeping: watermarks, residency holds,
+# checkpoints, the eviction and warming announcements and the unique key
+# registry. Almost nobody sets this, and the default is right for a deployment
+# that owns its pair of tiers.
+#
+# Set it when one pair of tiers carries two Thermocline deployments. They would
+# otherwise share this database and each would read the other's watermarks,
+# residency holds and singleton markers as its own. A feeder id already
+# separates the checkpoints; this separates the rest.
+#
+# It must not name a database that also holds tiered collections. The feeder
+# skips its own bookkeeping database wholesale, so that combination would stop
+# those collections being mirrored with nothing saying so. The config refuses
+# it rather than letting you find out at the first eviction.
+meta:
+  db: "_thermocline"
+
 feeder:
   # Names this feeder's checkpoint. Changing it starts mirroring from now,
   # skipping everything written before, so only change it deliberately.

@@ -945,7 +945,8 @@ bin/cline warmer --config cline.yaml             # fill, then exit
 ## Bookkeeping
 
 Thermocline never modifies user documents to carry its own state. Everything
-lives in the `_thermocline` database on the cold tier:
+lives in the `_thermocline` database on the cold tier, whose name is
+configurable as `meta.db`:
 
 | Collection | Purpose |
 |---|---|
@@ -956,6 +957,20 @@ lives in the `_thermocline` database on the cold tier:
 | `warming` | Warming announcements, expiring on a TTL index |
 | `watermarks` | How far back the fast tier is complete, one per namespace |
 | `markers` | Daemon heartbeats, currently just the warmer's |
+
+The unique key registry is the one piece that lives on the *fast* tier instead,
+in a database of the same name, because it has to be written in the same place
+as the data it constrains.
+
+**The name is `meta.db` in the config and almost nobody should set it.** One
+pair of tiers can carry two Thermocline deployments, and the default would have
+them share this database: each would read the other's watermarks, residency
+holds and singleton markers as its own, and the markers in particular have no
+namespace to tell them apart. A feeder id already separates the checkpoints;
+this separates the rest. The config refuses a name that also holds a tiered
+collection, because the feeder skips its own bookkeeping database wholesale and
+that combination would stop those collections being mirrored with nothing
+saying so.
 
 Residency is a sidecar rather than a field on the document on purpose.
 Extending a document's stay rewrites 60 bytes instead of a 5 KB document.

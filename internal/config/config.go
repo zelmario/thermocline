@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // UnannouncedDeletes decides what the feeder does with a delete on the fast
@@ -35,10 +37,25 @@ type Config struct {
 	Hot     Tier          `yaml:"hot"`
 	Cold    Tier          `yaml:"cold"`
 	Log     LogConfig     `yaml:"log"`
+	Meta    MetaConfig    `yaml:"meta"`
 	Feeder  FeederConfig  `yaml:"feeder"`
 	Evictor EvictorConfig `yaml:"evictor"`
 	Warmer  WarmerConfig  `yaml:"warmer"`
 	Router  RouterConfig  `yaml:"router"`
+}
+
+// MetaConfig names the database Thermocline keeps its own bookkeeping in.
+type MetaConfig struct {
+	// DB is the bookkeeping database, on the cold tier for everything except
+	// the unique key registry, which has to live beside the data it constrains
+	// on the fast tier. Empty means the default, which is what every single
+	// deployment wants.
+	//
+	// It exists because one pair of tiers can carry two Thermocline
+	// deployments, and two of them sharing this database would each read the
+	// other's watermarks, residency holds and singleton markers as their own.
+	// A feeder id already separates checkpoints; this separates the rest.
+	DB string `yaml:"db"`
 }
 
 // LogConfig says where the daemons write their logs.
@@ -300,6 +317,7 @@ type FeederConfig struct {
 // with it.
 func Default() Config {
 	return Config{
+		Meta: MetaConfig{DB: meta.DefaultDB},
 		Feeder: FeederConfig{
 			ID:                 "default",
 			CheckpointEvery:    5 * time.Second,
@@ -372,6 +390,10 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	// Every command reaches this line before it opens a connection, which is
+	// what makes a package-level name safe: there is one place that sets it,
+	// and it is past validation, so a rejected name never takes effect.
+	meta.SetDB(cfg.Meta.DB)
 	return cfg, nil
 }
 
@@ -398,6 +420,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("feeder.unannounced_deletes must be tombstone, ignore or halt, got %q",
 			c.Feeder.UnannouncedDeletes)
 	}
+	if err := c.validateMetaDB(); err != nil {
+		return err
+	}
 	for _, ns := range c.Feeder.Namespaces {
 		db, coll, ok := strings.Cut(ns, ".")
 		if !ok || db == "" || coll == "" {
@@ -411,6 +436,41 @@ func (c Config) Validate() error {
 		return err
 	}
 	return c.Router.Validate()
+}
+
+// validateMetaDB rejects a bookkeeping database that MongoDB would refuse, or
+// that would quietly stop the feeder mirroring.
+//
+// The last check is the one that matters. The feeder skips its own bookkeeping
+// database wholesale, so naming it after a database that holds tiered
+// collections means those collections are never mirrored, and nothing says so:
+// the fast tier looks healthy, the archive stays empty, and the first eviction
+// has nowhere to evict to.
+func (c Config) validateMetaDB() error {
+	db := c.Meta.DB
+	if db == "" {
+		return errors.New("meta.db must not be empty")
+	}
+	if len(db) > 63 {
+		return fmt.Errorf("meta.db %q is longer than the 63 bytes MongoDB allows", db)
+	}
+	// MongoDB's own rejected set for a database name, plus the dot, which would
+	// make every collection reference ambiguous.
+	if i := strings.IndexAny(db, "/\\. \"$*<>:|?\x00"); i >= 0 {
+		return fmt.Errorf("meta.db %q contains %q, which MongoDB does not allow in a database name",
+			db, db[i:i+1])
+	}
+	switch db {
+	case "admin", "local", "config":
+		return fmt.Errorf("meta.db must not be %q, which is MongoDB's own", db)
+	}
+	for _, ns := range c.Feeder.Namespaces {
+		if nsDB, _, ok := strings.Cut(ns, "."); ok && nsDB == db {
+			return fmt.Errorf("meta.db %q also holds the tiered namespace %q, so the feeder would skip mirroring it",
+				db, ns)
+		}
+	}
+	return nil
 }
 
 // Validate reports the first problem that would stop the router from running.

@@ -2,6 +2,7 @@ package feeder
 
 import (
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // action is what the feeder does with one change event.
@@ -87,5 +88,5 @@ func skipNamespace(db string) bool {
 	case "admin", "local", "config":
 		return true
 	}
-	return db == metaDB
+	return db == meta.DB
 }

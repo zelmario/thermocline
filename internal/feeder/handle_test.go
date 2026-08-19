@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zelmario/thermocline/internal/meta"
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
@@ -107,7 +108,7 @@ func TestHandleBuffersWork(t *testing.T) {
 
 // Thermocline's own bookkeeping must never be mirrored back into itself.
 func TestHandleSkipsInternalNamespaces(t *testing.T) {
-	for _, db := range []string{"admin", "local", "config", metaDB} {
+	for _, db := range []string{"admin", "local", "config", meta.DB} {
 		f := testFeeder()
 		ev := event(t, "insert", db, "whatever", bson.D{
 			{Key: "documentKey", Value: bson.D{{Key: "_id", Value: 1}}},
