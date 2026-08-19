@@ -190,6 +190,48 @@ HOTN=$(H 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')
 chk "permissive returns the fast tier answer" "$HOTN" "$(P 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount())')"
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
 
+echo "== a collection nothing tiers is the fast tier's alone =="
+# Adoption puts every collection on the archive, because the archive is the
+# cluster the application already had, and only the tiered ones are ever filled
+# into the new fast tier. tuntier is deliberately absent from feeder.namespaces,
+# so it is what one of those left-behind collections looks like.
+#
+# The point is that all reads agree. A lookup by exact id skips the completeness
+# guard, because a point read has no completeness question, and it used to skip
+# the tiering question with it: measured, findOne returned an archived document
+# from an untiered collection and copied it up, while countDocuments on the same
+# collection answered zero. The copy-up was the worse half, writing into a
+# collection nothing manages and the feeder will never mirror, so the two tiers
+# disagreed about it from then on.
+# The collection has to exist on the archive before the router starts, because
+# the warning is a startup reading of what each tier holds. Written the other
+# way round the check failed for a reason that had nothing to do with the
+# product.
+H "db.getSiblingDB(process.env.TC_DB).tuntier.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tuntier.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tuntier.insertMany([{_id:'p1',name:'a kettle'},{_id:'p2',name:'a toaster'}])" >/dev/null
+cline router --config $CFG --log-file $LOGDIR/unt_r.log & UP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a count sees the fast tier's answer"     "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
+chk "and a lookup by _id agrees with it"      "NOTHING" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tuntier.findOne({_id:'p1'}); print(d?d.name:'NOTHING')")"
+sleep 2
+chk "nothing was copied into it"              "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
+chk "and the archive still has it"            "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
+C "db.getSiblingDB(process.env.TC_DB).tuntier.drop()" >/dev/null
+kill $UP 2>/dev/null; wait $UP 2>/dev/null
+# Correct and silent is the wrong pair: the application sees an empty collection
+# where its catalogue used to be, so the router names it at startup.
+chk "the router named it at startup"          "true" \
+    "$(grep -q 'the archive holds collections the fast tier does not' $LOGDIR/unt_r.log && echo true || echo false)"
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "================================"

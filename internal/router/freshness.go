@@ -51,19 +51,26 @@ import (
 // one from.
 
 // checkpointPoll bounds how often the position is re-read while anything is
-// waiting on it. The interval used is a quarter of the cadence the feeder
-// promised, between these two.
+// waiting on it. The interval used is the cadence the feeder promised, between
+// these two.
 //
-// A quarter, because polling faster than the thing being watched changes only
-// the load. The feeder says how often it publishes in the position record
-// itself, so this tunes to the deployment rather than to a guess: a feeder
-// publishing every 20ms is polled every 5ms, and one publishing every second is
-// polled four times in it.
+// The cadence itself, not a fraction of it, and that took a measurement to
+// settle because the obvious reasoning is wrong. Polling faster than the
+// position changes cannot make it newer, it can only add reads to the archive,
+// and the archive is the tier already answering the queries this is trying to
+// speed up.
 //
-// It matters because one goroutine polls however many reads are waiting, but
-// that goroutine runs for as long as any of them do. Two milliseconds against a
-// feeder that publishes every 20ms is five hundred reads a second of one small
-// document, for four milliseconds of latency that the cadence hides anyway.
+// A microbenchmark says the opposite, and did: one client on an idle system
+// measured 30ms at a 25ms interval against 10ms at 2ms, because granularity is
+// all there is to see when nothing is competing. The shop, eight clients
+// against a 5,000,000 order archive, said this at a 20ms cadence:
+//
+//	poll every  5ms   71/s   p50 84ms   p95 282ms   p99 464ms
+//	poll every 25ms   74/s   p50 77ms   p95 166ms   p99 245ms
+//
+// Less polling was better on every one of them, and the tails by half. The
+// feeder says how often it publishes in the position record itself, so this
+// tunes to the deployment rather than to a guess.
 const (
 	checkpointPollMin = 2 * time.Millisecond
 	checkpointPollMax = 25 * time.Millisecond
@@ -80,7 +87,7 @@ func (c *checkpointCache) pollInterval() time.Duration {
 		// possible" would poll a deployment that never asked for it.
 		return checkpointPollMax
 	}
-	d := time.Duration(every) * time.Millisecond / 4
+	d := time.Duration(every) * time.Millisecond
 	if d < checkpointPollMin {
 		return checkpointPollMin
 	}

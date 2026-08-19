@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -211,6 +212,67 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 			"meaning", "range queries will be refused, because nothing has claimed the fast tier is complete",
 			"action", "run the warmer, or declare it with: cline watermark --ns NS --complete-all")
 	}
+}
+
+// warnAboutStrandedCollections names collections the archive holds that the
+// fast tier does not and that nothing tiers, because the application will not
+// be able to see them at all.
+//
+// This is the shape of every adoption. The existing cluster becomes the archive
+// carrying every collection it ever had; the fast tier is new and empty; only
+// the namespaces in feeder.namespaces are ever filled into it. A collection
+// left out of that list lives only on the archive, and the router forwards
+// reads of it to the fast tier, correctly, because a collection Thermocline
+// does not tier is the fast tier's alone. The application sees an empty
+// collection where it used to see its catalogue.
+//
+// Silence is the failure here. The behaviour is right and the surprise is
+// total, so it is said once at startup, naming them.
+func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
+	dbs := map[string]bool{}
+	for _, ns := range r.cfg.Managed {
+		if db, _ := splitNS(ns); db != "" {
+			dbs[db] = true
+		}
+	}
+	for db := range dbs {
+		cold, cerr := collectionsIn(ctx, r.cold, db)
+		hot, herr := collectionsIn(ctx, r.hot, db)
+		if cerr != nil || herr != nil {
+			continue
+		}
+		var stranded []string
+		for name := range cold {
+			ns := db + "." + name
+			if hot[name] || r.cfg.Manages(ns) || strings.HasPrefix(name, "system.") {
+				continue
+			}
+			stranded = append(stranded, ns)
+		}
+		if len(stranded) == 0 {
+			continue
+		}
+		sort.Strings(stranded)
+		r.log.Warn("the archive holds collections the fast tier does not, and nothing tiers them",
+			"collections", stranded,
+			"meaning", "reads of these go to the fast tier, which has never held them, so the "+
+				"application sees them empty",
+			"action", "add them to feeder.namespaces to tier them, or copy them to the fast tier "+
+				"if they are small enough to live there whole")
+	}
+}
+
+// collectionsIn lists one database's collection names.
+func collectionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]bool, error) {
+	names, err := client.Database(db).ListCollectionNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out, nil
 }
 
 // singleDocReply builds a find reply carrying one document fetched from the

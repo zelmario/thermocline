@@ -241,6 +241,7 @@ func (r *Router) Listen(ctx context.Context) error {
 		return err
 	}
 	r.warnAboutMissingWatermarks(ctx)
+	r.warnAboutStrandedCollections(ctx)
 
 	// Open one pooled connection before accepting anybody, so the first client's
 	// handshake can be answered from the fast tier's own reply. Without it that

@@ -103,6 +103,16 @@ chkv "the fast tier holds the only live copy" "1" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$TOID')}))")"
 chkv "and the archive holds none"             "0" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$TOID'),_tcDeletedAt:{\$exists:false}}))")"
+# Make the health gate deterministic rather than racing it. The feeder is
+# stopped for this setup, so mirroring lag grows while the fixture is written,
+# and inside a four-worker sweep that took longer than max_feeder_lag: the sweep
+# refused on health and the check below would have been meaningless. The control
+# caught it, which is what it is for. Lag is what the first section of this
+# suite tests; this one is about what counts as the archive holding a document,
+# so the position is stamped fresh immediately before the sweep.
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
 EVOUT=$(cline evictor --config $CFG --once 2>&1)
 # The control. A sweep that refused to run for health reasons would leave the
 # document alone too, and prove nothing at all about tombstones.

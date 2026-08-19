@@ -68,6 +68,25 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 		return reply, nil
 	}
 
+	// A collection Thermocline does not tier lives only on the fast tier, so an
+	// empty answer from it is the whole truth.
+	//
+	// The guard above is skipped for a point read on purpose, because a lookup
+	// by exact id has no completeness question to answer, and the tiering
+	// question went with it. Measured on an untiered collection whose documents
+	// were still on the old cluster: countDocuments answered zero, correctly,
+	// while findOne by _id returned a document from the archive and copied it
+	// up. Two reads of one collection disagreeing is bad enough; the copy-up is
+	// worse, because it writes into a collection nothing manages and the feeder
+	// will never mirror it, so the tiers disagree about it from then on.
+	//
+	// This is the shape of every adoption, where the existing cluster becomes
+	// the archive carrying every collection and only the tiered ones are ever
+	// filled into the fast tier.
+	if _, _, tiered := c.r.tieredBase(ctx, ns); !tiered {
+		return reply, nil
+	}
+
 	// Linearizable cannot be honoured by another cluster, and downgrading the
 	// strongest guarantee in the system without saying so is the one thing this
 	// must not do.

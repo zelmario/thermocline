@@ -95,20 +95,19 @@ func TestWithRemainingTime(t *testing.T) {
 }
 
 // The poller paces itself to the cadence the feeder promised, which is in the
-// position record. A flat interval was the first version and it was wrong in
-// both directions: two milliseconds against a feeder publishing every twenty is
-// five hundred reads a second of one document for latency the cadence hides,
-// and a feeder that promises nothing must not be polled as though it promised
-// everything.
+// position record, because polling faster than the position changes cannot make
+// it newer and the reads land on the tier this is trying to speed up. Measured
+// on the shop: polling every 5ms against a 20ms cadence was worse than every
+// 25ms on throughput, p50, p95 and p99 alike.
 func TestPollIntervalPacesToTheFeeder(t *testing.T) {
 	cases := []struct {
 		name    string
 		everyMS int64
 		want    time.Duration
 	}{
-		{"a quarter of the cadence", 20, 5 * time.Millisecond},
-		{"and of a slower one", 80, 20 * time.Millisecond},
-		{"never below the floor", 4, checkpointPollMin},
+		{"the cadence itself", 20, 20 * time.Millisecond},
+		{"and a slower one is clamped", 80, checkpointPollMax},
+		{"never below the floor", 1, checkpointPollMin},
 		{"never above the ceiling", 10000, checkpointPollMax},
 		{"unknown means the old interval", 0, checkpointPollMax},
 	}

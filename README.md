@@ -266,19 +266,21 @@ there for a deployment that would rather spend the round trips.
 
 **What that is worth to an application**, measured on the shop against a
 5,000,000 order archive with the fast tier empty, so nearly every read falls
-through. Same data, same run, only the cadence differing:
+through. Three runs of each, alternating, on the same data:
 
 | | 100 ms | 20 ms |
 |---|---|---|
-| throughput | 60/s | **71/s** |
-| a customer's order history | 167 ms | **84 ms** |
-| count a customer's orders | 152 ms | **89 ms** |
-| read an order by date | 162 ms | **80 ms** |
+| throughput | 56, 57, 63 /s | **73, 82, 98 /s** |
+| count a customer's orders, p50 | 148, 154, 155 ms | **69, 84, 89 ms** |
+| the same, p99 | 308, 313, 629 ms | **257, 310, 425 ms** |
 
-The cadence is not free on the archive: it is more round trips to the tier that
-is already answering the reads this is trying to speed up, and two of the three
-99th percentiles move the wrong way, from about 300 ms to about 440 ms, while
-the worst of them halves. It is a good trade here and it is a trade. There is no
+**Report the spread, because a single pair of runs here says almost nothing.**
+One machine carries six mongods, the router, the feeder and the shop, and the
+same configuration has come back at 46/s and at 98/s. Alternating the arms and
+repeating them is what makes the two ranges mean something: they do not overlap,
+so the worst run of the faster cadence still beats the best run of the slower
+one. A single pair had said 60 against 71, which understated it, and a different
+single pair would have said the opposite. There is no
 point setting `position_every` slower than `max_await`, because the position can
 only move when a poll finds the stream empty.
 
