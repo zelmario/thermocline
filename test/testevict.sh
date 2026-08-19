@@ -64,6 +64,55 @@ kill $EP 2>/dev/null; wait $EP 2>/dev/null
 
 ok "dry run never blocks on health" 0 "dry run" -- cline evictor --config $CFG --once --dry-run
 
+echo "== a tombstone is not a copy of the document =="
+# The evictor removes a document once the archive is confirmed to hold it, and
+# a tombstoned copy is not that. It is a record that the application deleted the
+# document; reads filter it out, so counting it would confirm the archive holds
+# something no read will ever return.
+#
+# The state is ordinary: an application deletes a record and writes the same _id
+# again, which is what a natural key or a reprocessed record looks like. Until
+# the feeder mirrors the second write the fast tier holds the only live copy and
+# the archive holds a tombstone. Measured before the fix: one sweep and the
+# document was on neither tier, and the router answered GONE for a document the
+# application had just written.
+#
+# Set up directly rather than raced, because the evictor's decision depends on
+# the state it finds and not on how the state arose.
+chkv() {
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-50s %s\n' "$1" "$3"
+  else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-50s got=%s want=%s\n' "$1" "$3" "$2"; fi
+}
+H() { mongosh "${HOT:?}"  --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "${COLD:?}" --quiet --eval "$1" 2>&1 | tail -1; }
+# The feeder is stopped for this, so it cannot mirror the fast tier write and
+# clear the tombstone underneath the sweep. Briefly, though: the evictor fails
+# closed once mirroring looks stale, and a sweep that refuses to run would pass
+# this check while proving nothing. A few seconds is far inside max_feeder_lag.
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+TOID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 4242)
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
+# The live copy is put on the fast tier while the feeder is stopped further up,
+# so the archive keeps its tombstone rather than being caught up over it.
+H "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$TOID'), n:'written again'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$TOID'), n:'the older one', _tcDeletedAt:new Date()})" >/dev/null
+chkv "the fast tier holds the only live copy" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$TOID')}))")"
+chkv "and the archive holds none"             "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$TOID'),_tcDeletedAt:{\$exists:false}}))")"
+EVOUT=$(cline evictor --config $CFG --once 2>&1)
+# The control. A sweep that refused to run for health reasons would leave the
+# document alone too, and prove nothing at all about tombstones.
+chkv "the sweep actually ran"                  "true" \
+    "$(grep -q "not healthy enough to evict" <<<"$EVOUT" && echo false || echo true)"
+chkv "the sweep left the only live copy alone" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$TOID')}))")"
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "PASS $PASS   FAIL $FAIL"

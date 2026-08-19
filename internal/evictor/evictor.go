@@ -341,13 +341,26 @@ func (e *Evictor) residencyHolds(ctx context.Context, docIDs []string) (map[stri
 	return held, cur.Err()
 }
 
-// archived returns the documents the cold tier actually holds. This is the
-// check that makes eviction safe, so it queries the archive directly rather
+// archived returns the documents the cold tier actually holds, live. This is
+// the check that makes eviction safe, so it queries the archive directly rather
 // than trusting any bookkeeping.
+//
+// Live is the word that matters. A tombstoned copy is a record that the
+// application deleted this document, not a copy of it: reads filter it out, so
+// counting it here would confirm the archive holds something no read will ever
+// return.
+//
+// That state is reachable and costs the document. An application deletes a
+// record, which tombstones the archive's copy, and then writes the same _id
+// again, which is ordinary for a natural key or a reprocessed record. Until the
+// feeder mirrors the second write the fast tier holds the only live copy and
+// the archive holds a tombstone. Measured without this filter: one sweep and
+// the document was on neither tier, and the router answered GONE for a document
+// the application had just written.
 func (e *Evictor) archived(ctx context.Context, ns string, cands []candidate, ids []bson.RawValue) (map[string]bool, error) {
 	db, coll := splitNS(ns)
 	cur, err := e.cold.Database(db).Collection(coll).Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}, meta.NotArchivedDeleted()},
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
 		return nil, fmt.Errorf("confirm archive copies for %s: %w", ns, err)

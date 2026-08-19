@@ -69,9 +69,20 @@ Three things stand between an old document and removal. All three are enforced
 in code, not documented as guidance.
 
 1. **Nothing is removed unless the archive is confirmed to hold that exact
-   document.** The evictor queries the cold tier for the batch it is about to
-   delete and drops anything that comes back missing. An empty or unreachable
+   document, live.** The evictor queries the cold tier for the batch it is about
+   to delete and drops anything that comes back missing. An empty or unreachable
    archive can never look like permission to delete.
+
+   *Live* is the word that carries this. A tombstoned copy is a record that the
+   application deleted the document, not a copy of it, and reads filter it out,
+   so counting it would confirm the archive holds something no read will ever
+   return. That state is ordinary rather than exotic: an application deletes a
+   record and writes the same `_id` again, which is what a natural key or a
+   reprocessed record looks like, and until the feeder mirrors the second write
+   the fast tier holds the only live copy while the archive holds a tombstone.
+   Measured without that filter: one sweep, and the document was on neither tier
+   and the router answered nothing for a record the application had just
+   written.
 2. **Nothing is removed while mirroring is behind.** Lag is read from the
    feeder's own checkpoint. This check fails closed: if the lag cannot be read
    at all, eviction stops, because removing a document the archive has not
