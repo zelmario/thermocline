@@ -75,6 +75,11 @@ type Router struct {
 	checkpoints *checkpoint.Store
 	positions   *checkpoint.Positions
 	ckptCache   checkpointCache
+	// seenOpTime is the newest cluster time the fast tier has reported, packed
+	// so it fits an atomic. A read falling through to the archive waits for
+	// mirroring to reach it. See freshness.go for why a cluster time and not a
+	// clock.
+	seenOpTime atomic.Uint64
 
 	wmCache   watermarkCache
 	idxCache  indexCache
@@ -834,6 +839,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			}
 		}
 	}
+	// Every reply from the fast tier says what time the cluster thinks it is,
+	// so this costs a lookup on a document already in hand. A read that later
+	// falls through to the archive waits for mirroring to reach that instant.
+	// See freshness.go.
+	c.r.noteOpTime(reply)
+
 	if nameErr != nil {
 		return c.send(reply)
 	}

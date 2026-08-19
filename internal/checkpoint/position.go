@@ -43,14 +43,44 @@ import (
 // PositionRecord is how far mirroring has got.
 type PositionRecord struct {
 	ID string `bson:"_id"`
-	// At is the cluster time through which every event has been applied to the
-	// archive. It is written after the batch lands, never before.
+	// At is the wall-clock instant through which every event has been applied
+	// to the archive. It is written after the batch lands, never before.
+	//
+	// It is kept for a reader that has nothing better, and it is the weaker of
+	// the two: it is the *feeder's* clock, and whoever compares against it is
+	// reading their own. On separate hosts the barrier is then only as sound as
+	// the skew between two machines nothing keeps in step.
 	At      time.Time `bson:"at"`
 	SavedAt time.Time `bson:"savedAt"`
+	// TS is the same position as a cluster time, and is the one to compare
+	// against when it is there.
+	//
+	// A cluster time is the replica set's own logical clock, so the feeder and
+	// the router read it from the same place and no clock of their own comes
+	// into it. It is exact where the wall-clock reading is a claim: it comes
+	// either from an event the feeder applied or from the resume token of an
+	// empty poll, which is MongoDB saying "nothing exists up to here".
+	//
+	// Absent on a record written by a feeder from before this, which is the
+	// only reason At survives.
+	TS bson.Timestamp `bson:"ts,omitempty"`
 	// EveryMS is the cadence the publisher promised, so a reader can judge
 	// whether silence means "behind" or "gone" without being told how this
 	// feeder is configured.
 	EveryMS int64 `bson:"everyMS,omitempty"`
+}
+
+// PackTS makes a cluster time comparable as a single number.
+//
+// A BSON timestamp orders by seconds first and by increment second, which is
+// exactly what the two halves packed into a uint64 do. Comparing the seconds
+// alone would treat every event inside one second as simultaneous, and that
+// rounding is what once made the published position appear to move backwards.
+func PackTS(ts bson.Timestamp) uint64 { return uint64(ts.T)<<32 | uint64(ts.I) }
+
+// UnpackTS is PackTS backwards, for logging a value that was kept packed.
+func UnpackTS(v uint64) bson.Timestamp {
+	return bson.Timestamp{T: uint32(v >> 32), I: uint32(v)}
 }
 
 // Positions reads and writes mirroring positions.
@@ -70,17 +100,23 @@ func NewPositions(cold *mongo.Client) *Positions {
 // tick, and the durable checkpoint is what recovery actually uses. Paying for
 // majority acknowledgement several times a second to speed up reads would be a
 // poor trade.
-func (p *Positions) Save(ctx context.Context, id string, at time.Time, every time.Duration) error {
-	if at.IsZero() {
+func (p *Positions) Save(ctx context.Context, id string, at time.Time, ts bson.Timestamp, every time.Duration) error {
+	if at.IsZero() && ts.T == 0 {
 		return nil
+	}
+	set := bson.D{
+		{Key: "savedAt", Value: time.Now().UTC()},
+		{Key: "everyMS", Value: every.Milliseconds()},
+	}
+	if !at.IsZero() {
+		set = append(set, bson.E{Key: "at", Value: at})
+	}
+	if ts.T != 0 {
+		set = append(set, bson.E{Key: "ts", Value: ts})
 	}
 	_, err := p.coll.UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: id}},
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "at", Value: at},
-			{Key: "savedAt", Value: time.Now().UTC()},
-			{Key: "everyMS", Value: every.Milliseconds()},
-		}}},
+		bson.D{{Key: "$set", Value: set}},
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
@@ -103,7 +139,7 @@ func (p *Positions) At(ctx context.Context, id string) (PositionRecord, bool, er
 	if err != nil {
 		return PositionRecord{}, false, fmt.Errorf("read position %q: %w", id, err)
 	}
-	return rec, !rec.At.IsZero(), nil
+	return rec, !rec.At.IsZero() || rec.TS.T != 0, nil
 }
 
 // Live reports whether the publisher still looks alive.

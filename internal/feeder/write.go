@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -24,23 +25,41 @@ import (
 //
 // An empty change stream poll means everything written so far has been applied,
 // so the honest lag at that moment is zero.
-// A known hazard, not yet closed. An empty poll proves the server had nothing
-// more to send at the moment it answered, which is not the same as proving that
-// a write committed a millisecond earlier has been delivered. So this claim can
-// be very slightly ahead of the truth, and a fallback read that trusts it can
-// miss a write that had already returned to the client.
+// The cluster time comes from the poll's own resume token, which is the whole
+// point. MongoDB advances that token past an empty batch precisely to say
+// "nothing exists up to here", so it states what this function means instead of
+// approximating it.
 //
-// The shop test saw this once in 358 order placements, on the build before the
-// cadence fix: "placing one order moved c001889 from 18 to 18", a count that
-// should have gone up by one and did not. It has not been reproduced since, and
-// once is not a diagnosis, so it is written down rather than acted on.
+// The clock reading it replaces was wrong twice. It claimed a moment it had not
+// proved: an empty poll says the server had nothing more to send when it
+// answered, not that a write committed a millisecond earlier had been
+// delivered. And it was the feeder's clock, published for a router to compare
+// against its own, so on separate hosts the barrier was only as sound as the
+// skew between them. The shop test saw the consequence once in 358 order
+// placements: "placing one order moved c001889 from 18 to 18", a count that
+// should have gone up by one and did not.
 //
-// The honest fix is to publish the post-batch resume token's cluster time
-// instead of the local clock. MongoDB advances that token past an empty batch
-// precisely to say "nothing exists up to here", which is the statement this
-// function is trying to make and currently approximates.
-func (f *Feeder) markCaughtUp() {
+// The wall clock is still recorded alongside it. Lag is reported to humans in
+// seconds and it is what a reader from before this understands, but nothing
+// that has a cluster time to hand should be comparing against it.
+func (f *Feeder) markCaughtUp(tok bson.Raw) {
 	f.lastEventAt = time.Now().UTC()
+	if ts, ok := clusterTimeFromToken(tok); ok {
+		f.noteEventTS(ts)
+	}
+}
+
+// noteEventTS records how far mirroring has got as a cluster time, and never
+// lets that go backwards.
+//
+// Backwards is possible and is not a paradox: a resume token from an empty poll
+// is taken before the batch that follows it is applied, and the two are
+// published on different cadences. Mirroring reaching a moment is a claim that
+// can only ever be strengthened.
+func (f *Feeder) noteEventTS(ts bson.Timestamp) {
+	if checkpoint.PackTS(ts) > checkpoint.PackTS(f.lastEventTS) {
+		f.lastEventTS = ts
+	}
 }
 
 // noteEventTime records how far mirroring has got, and never lets that go
@@ -256,13 +275,13 @@ var _ = []config.UnannouncedDeletes{config.Tombstone, config.Ignore, config.Halt
 // wait it would have had anyway, and stopping mirroring over it would be
 // absurd.
 func (f *Feeder) publishPosition(ctx context.Context) {
-	if f.cfg.PositionEvery <= 0 || f.lastEventAt.IsZero() {
+	if f.cfg.PositionEvery <= 0 || (f.lastEventAt.IsZero() && f.lastEventTS.T == 0) {
 		return
 	}
 	if time.Since(f.lastPublished) < f.cfg.PositionEvery {
 		return
 	}
-	if err := f.pos.Save(ctx, f.cfg.ID, f.lastEventAt, f.cfg.PositionEvery); err != nil {
+	if err := f.pos.Save(ctx, f.cfg.ID, f.lastEventAt, f.lastEventTS, f.cfg.PositionEvery); err != nil {
 		f.log.Debug("could not publish the mirroring position", "err", err)
 		return
 	}

@@ -42,6 +42,11 @@ type Feeder struct {
 	pending []pendingOp
 	// lag of the most recent event applied
 	lastEventAt time.Time
+	// lastEventTS is the same position as a cluster time, kept whole.
+	// lastEventAt is that instant with its sub-second half thrown away, which
+	// is fine for reporting lag to a human and useless to a read deciding
+	// whether it has to wait. See resumetoken.go for why this is the sound one.
+	lastEventTS bson.Timestamp
 	lastToken   bson.Raw
 	lastSaved   time.Time
 	// lastPublished paces the position write, which is far more frequent than
@@ -249,13 +254,14 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		// past an empty batch precisely so a reader can record progress it made
 		// without seeing anything, which also means a long quiet spell does not
 		// leave the feeder resuming from an ancient position.
-		if tok := stream.ResumeToken(); len(tok) > 0 {
+		tok := stream.ResumeToken()
+		if len(tok) > 0 {
 			f.lastToken = tok
 		}
 		if err := f.flush(ctx); err != nil {
 			return err
 		}
-		f.markCaughtUp()
+		f.markCaughtUp(tok)
 		if err := f.flushAndCheckpoint(ctx); err != nil {
 			return err
 		}
@@ -303,6 +309,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		return nil
 	}
 	f.noteEventTime(time.Unix(int64(ev.ClusterTime.T), 0).UTC())
+	f.noteEventTS(ev.ClusterTime)
 
 	ns := ev.NS.DB + "." + ev.NS.Coll
 

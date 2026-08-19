@@ -79,13 +79,26 @@ comes back empty, so every fallback read waited for the next poll, once per
 A benchmark would have reported the same 570ms and called it the cost of
 tiering.
 
-**One lost write, seen once and not explained.** On the build before that fix,
-one placement in 358 reported "placing one order moved c001889 from 18 to 18".
-The count should have gone up by one. Not reproduced since. The suspected
-mechanism is written down where it lives, in the feeder's markCaughtUp: an empty
-change stream poll proves the server had nothing more to send when it answered,
-which is not the same as proving a write committed a millisecond earlier has
-been delivered. This is the check that would catch it again.
+**One lost write, seen once, and now closed.** On the build before that fix, one
+placement in 358 reported "placing one order moved c001889 from 18 to 18". The
+count should have gone up by one, and was never reproduced, which is exactly why
+it stayed written down rather than acted on: once is an observation, not a
+diagnosis.
+
+What made it actionable was not another sighting but reading what the suspected
+mechanism actually claimed. `markCaughtUp` stamped the feeder's own wall clock
+when a change stream poll came back empty, and that is unsound twice over. An
+empty poll proves the server had nothing more to send when it answered, not that
+a write committed a millisecond earlier had been delivered. And a wall clock is
+the *feeder's*, published for a router on another host to compare against its
+own, so the barrier was only as sound as the skew between two machines nothing
+keeps in step, and the failing direction is silent.
+
+Both halves now use the replica set's own logical clock: the feeder publishes
+the cluster time of the poll's post-batch resume token, which is MongoDB saying
+"nothing exists up to here", and the router waits for mirroring to pass the
+newest `operationTime` the fast tier has reported. This check is still the one
+that would catch it again, and it is the only thing that ever saw it.
 
 ## Two ways to write a check that lies
 

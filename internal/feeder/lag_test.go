@@ -3,6 +3,8 @@ package feeder
 import (
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // Lag is measured from the last applied event, so on a database that goes quiet
@@ -18,7 +20,7 @@ func TestIdleFeederReportsNoLag(t *testing.T) {
 		t.Fatalf("setup: wanted a large lag to start from, got %v", f.Lag())
 	}
 
-	f.markCaughtUp()
+	f.markCaughtUp(nil)
 	if got := f.Lag(); got > time.Second {
 		t.Errorf("Lag after catching up = %v, want about zero: a quiet database must not look like a feeder hours behind", got)
 	}
@@ -29,5 +31,45 @@ func TestIdleFeederReportsNoLag(t *testing.T) {
 func TestFreshFeederReportsNoLag(t *testing.T) {
 	if got := testFeeder().Lag(); got != 0 {
 		t.Errorf("Lag before any event = %v, want 0", got)
+	}
+}
+
+// Catching up must publish a cluster time taken from the poll's own resume
+// token, not one invented locally. A feeder that stamped its own clock claimed
+// a moment it had not proved, and published it for a router on another host to
+// compare against a different clock.
+func TestCatchingUpTakesItsClusterTimeFromTheToken(t *testing.T) {
+	f := testFeeder()
+
+	f.markCaughtUp(tokenRaw(t, "826A85B3FE000000042B0429296E1404"))
+	if f.lastEventTS.T != 1787147262 || f.lastEventTS.I != 4 {
+		t.Fatalf("cluster time after catching up = %v, want the token's T=1787147262 I=4", f.lastEventTS)
+	}
+
+	// A token this cannot read leaves the claim where it was rather than
+	// replacing it with a guess.
+	f.markCaughtUp(tokenRaw(t, "not hex at all"))
+	if f.lastEventTS.T != 1787147262 || f.lastEventTS.I != 4 {
+		t.Errorf("an unreadable token moved the cluster time to %v", f.lastEventTS)
+	}
+}
+
+// Mirroring reaching a moment is a claim that can only be strengthened. The
+// resume token of an empty poll is taken before the batch that follows it is
+// applied, and the two are published on different cadences, so an older value
+// arriving later must not undo a newer one.
+func TestClusterTimeNeverGoesBackwards(t *testing.T) {
+	f := testFeeder()
+	f.noteEventTS(bson.Timestamp{T: 100, I: 5})
+
+	f.noteEventTS(bson.Timestamp{T: 100, I: 4})
+	f.noteEventTS(bson.Timestamp{T: 99, I: 9})
+	if f.lastEventTS.T != 100 || f.lastEventTS.I != 5 {
+		t.Fatalf("an older cluster time moved the position back to %v", f.lastEventTS)
+	}
+
+	f.noteEventTS(bson.Timestamp{T: 100, I: 6})
+	if f.lastEventTS.I != 6 {
+		t.Errorf("a newer increment in the same second did not advance it: %v", f.lastEventTS)
 	}
 }

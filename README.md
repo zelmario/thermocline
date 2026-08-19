@@ -230,6 +230,30 @@ on an idle database the feeder cannot know that time has passed until its change
 stream poll times out, so budget a fallback read at roughly
 `max_await + position_every` and lower both if such reads are on a user's path.
 
+**What the wait compares was the other half of getting this right, and it was
+wrong for longer.** "How far mirroring has got" was the feeder's own wall clock,
+and "the instant the read began" is the router's, so on separate hosts the
+barrier was only as sound as the skew between two machines nothing keeps in
+step. The dangerous direction is silent: a feeder whose clock runs a little
+ahead publishes a position past writes it has not mirrored, and a read that
+trusts it misses a write that had already returned to the client. Worse, the
+feeder stamped that clock whenever a change stream poll came back empty, which
+proves the server had nothing more to send when it answered and not that a write
+committed a millisecond earlier had been delivered. The shop test caught the
+consequence once in 358 order placements: placing an order moved that customer's
+count from 18 to 18.
+
+Both halves now use the replica set's own logical clock, which neither daemon
+has an opinion about. The feeder publishes the cluster time it has mirrored
+through, taken from an applied event or, when the poll is empty, from that
+poll's post-batch resume token, which is MongoDB saying "nothing exists up to
+here" rather than anyone's guess. The router keeps the newest `operationTime`
+the fast tier has reported, which every reply carries and which is therefore
+free, and any write already acknowledged to a client happened at or before it.
+A fallback read has to clear both bars, never either, so requiring the cluster
+time can only make the barrier stricter, and it falls back to the clock alone
+against a feeder from before this.
+
 A read of something written milliseconds ago is therefore seen, at the cost of
 that wait. A stopped feeder is the one case the barrier cannot hold, and there
 the router answers anyway and warns rather than turning a dead background daemon
