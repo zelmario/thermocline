@@ -305,7 +305,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 	if skipNamespace(ev.NS.DB) {
 		return nil
 	}
-	f.lastEventAt = time.Unix(int64(ev.ClusterTime.T), 0).UTC()
+	f.noteEventTime(time.Unix(int64(ev.ClusterTime.T), 0).UTC())
 
 	ns := ev.NS.DB + "." + ev.NS.Coll
 

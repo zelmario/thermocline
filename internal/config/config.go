@@ -261,6 +261,10 @@ type FeederConfig struct {
 	CheckpointEvery time.Duration `yaml:"checkpoint_every"`
 	// PositionEvery is how often the feeder publishes how far it has mirrored.
 	//
+	// There is no point setting this slower than MaxAwait: the position can
+	// only advance when a poll finds the stream empty, so pacing publication
+	// below that rate just adds to what every fallback read waits for.
+	//
 	// This is what a read falling through to the archive waits on, so it sets
 	// that read's floor latency. It is deliberately separate from
 	// CheckpointEvery: the two trade against different things. A stale
@@ -271,6 +275,19 @@ type FeederConfig struct {
 	// BatchSize caps documents per bulk write to the cold tier.
 	BatchSize int `yaml:"batch_size"`
 	// MaxAwait is how long a change stream poll blocks before returning empty.
+	//
+	// It is also the floor on every fallback read, which is not obvious and is
+	// the reason this default is as low as it is. The feeder only knows it has
+	// caught up when a poll comes back with nothing, and that is the only
+	// moment it can honestly publish "everything written up to now is in the
+	// archive". A read that falls through to the archive waits for a position
+	// at least as new as itself, so it waits for the next such poll.
+	//
+	// Measured on a shop-shaped workload with this at 500ms, every archive read
+	// cost about 570ms while the archive answered the same query in 11ms and
+	// the same read with the barrier disabled took 54ms. Almost all of it was
+	// waiting for the next poll. Ten polls a second on an idle stream is one
+	// small getMore each, which is what a change stream does anyway.
 	MaxAwait time.Duration `yaml:"max_await"`
 	// UnannouncedDeletes handles deletes the evictor did not announce.
 	UnannouncedDeletes UnannouncedDeletes `yaml:"unannounced_deletes"`
@@ -286,9 +303,9 @@ func Default() Config {
 		Feeder: FeederConfig{
 			ID:                 "default",
 			CheckpointEvery:    5 * time.Second,
-			PositionEvery:      250 * time.Millisecond,
+			PositionEvery:      100 * time.Millisecond,
 			BatchSize:          500,
-			MaxAwait:           500 * time.Millisecond,
+			MaxAwait:           100 * time.Millisecond,
 			UnannouncedDeletes: Tombstone,
 		},
 		Evictor: EvictorConfig{

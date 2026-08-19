@@ -28,6 +28,26 @@ func (f *Feeder) markCaughtUp() {
 	f.lastEventAt = time.Now().UTC()
 }
 
+// noteEventTime records how far mirroring has got, and never lets that go
+// backwards.
+//
+// An event carries a cluster time, which is a BSON timestamp: one second of
+// wall-clock resolution and an increment that only orders events inside that
+// second. Converting it to an instant therefore rounds down by up to a second.
+// Assigning that straight to lastEventAt made the position lurch backwards
+// every time an event arrived, undoing a markCaughtUp that had just recorded
+// the true instant, and a fallback read waiting on the position paid for it.
+//
+// Keeping the later of the two is not a stretched claim. markCaughtUp fires
+// when the change stream is empty, so everything written up to that instant is
+// already in the archive. An event that arrives afterwards was written
+// afterwards, so mirroring it cannot make an earlier statement false.
+func (f *Feeder) noteEventTime(ct time.Time) {
+	if ct.After(f.lastEventAt) {
+		f.lastEventAt = ct
+	}
+}
+
 // flushAndCheckpoint writes buffered work and saves the resume position, but
 // only saves as often as configured. Mirroring is idempotent, so repeating a
 // few seconds of work after a restart is cheaper than a checkpoint write per
