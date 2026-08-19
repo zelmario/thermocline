@@ -410,6 +410,11 @@ const adviceRows = 50
 // adviceEvery is how often the report is refreshed.
 const adviceEvery = time.Minute
 
+// adviceShutdownWait bounds the last report. Long enough for a write to a
+// healthy archive, short enough that an unreachable one does not hold a
+// shutdown open.
+const adviceShutdownWait = 5 * time.Second
+
 // reportAdvice keeps the published report current while the router runs.
 func (r *Router) reportAdvice(ctx context.Context) {
 	t := time.NewTicker(adviceEvery)
@@ -418,8 +423,13 @@ func (r *Router) reportAdvice(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			// One last report on the way out, so a router stopped after an
-			// hour of traffic does not take what it learned with it.
-			r.publishAdvice(context.WithoutCancel(ctx))
+			// hour of traffic does not take what it learned with it. The
+			// context is detached because the cancellation that brought us
+			// here would otherwise cancel this write too, and bounded because
+			// Run is waiting on it.
+			pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), adviceShutdownWait)
+			r.publishAdvice(pctx)
+			cancel()
 			return
 		case <-t.C:
 			r.publishAdvice(ctx)

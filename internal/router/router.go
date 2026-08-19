@@ -261,7 +261,18 @@ func (r *Router) Listen(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 	go r.reapCursors(ctx)
-	go r.reportAdvice(ctx)
+	// The advisor publishes one last report as it stops, and that write has to
+	// finish before this function returns or the process exits out from under
+	// it. Started fire-and-forget, it usually won that race on an idle machine
+	// and usually lost it on a busy one, which is the worst way for it to
+	// behave: what a router learned was kept or dropped depending on how much
+	// traffic it had, and the load that makes the advice worth having is the
+	// load that lost it.
+	adviceDone := make(chan struct{})
+	go func() {
+		defer close(adviceDone)
+		r.reportAdvice(ctx)
+	}()
 	go r.watchForInvalidation(ctx)
 
 	r.log.Info("router listening",
@@ -290,6 +301,15 @@ func (r *Router) Listen(ctx context.Context) error {
 	}
 	wg.Wait()
 	r.cursors.closeAll(context.WithoutCancel(ctx))
+	// Bounded, because an archive that cannot be reached must not turn a
+	// shutdown into a hang. The report is worth a moment and no more.
+	select {
+	case <-adviceDone:
+	case <-time.After(adviceShutdownWait):
+		r.log.Warn("gave up waiting for the final cache advice report",
+			"waited", adviceShutdownWait.String(),
+			"effect", "what this router learned about query shapes is not published")
+	}
 	return nil
 }
 

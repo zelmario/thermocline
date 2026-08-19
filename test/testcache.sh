@@ -60,6 +60,20 @@ startRouter() { # config
   echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
+# waitMirrored COLLECTION COUNT blocks until the archive holds COUNT live
+# documents. A fixed sleep here is the largest single source of false failures
+# in this harness: reads that fall through to an archive still filling up return
+# a short answer, which reads exactly like the cache serving a stale one.
+waitMirrored() {
+  local n=""
+  for _ in $(seq 1 60); do
+    n=$(C "print(db.getSiblingDB(process.env.TC_DB).$1.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+    [ "$n" = "$2" ] && return 0
+    sleep 0.5
+  done
+  echo "  WARN  $DB.$1 never reached $2 mirrored documents, last saw ${n:-none}"
+}
+
 echo "== setup =="
 stopDaemons
 # The cache is off in the shared config, so this one is derived rather than
@@ -74,12 +88,27 @@ else
   sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' $CFG > $CCFG
 fi
 chk "the derived config turns the cache on" "1" "$(grep -c 'enabled: true' $CCFG)"
-H "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).$NS.insertMany(
-   Array.from({length:60},(_,i)=>({_id:i, country:['UY','AR','BR'][i%3], n:i})))" >/dev/null
+# The feeder starts before the seed, not after it, and the suite then waits for
+# the archive rather than sleeping at it.
+#
+# Written the other way round this suite only passed by accident. A change
+# stream opened after the inserts never sees them, so the archive stayed empty,
+# every read fell through to it and returned zero. What hid that was the
+# checkpoint an *earlier* suite on the same worker had left: the feeder resumed
+# from before the seed and picked it up on the way past. So this passed whenever
+# something else had run first and failed whenever it went first, which in a
+# queue that hands suites out as workers free up is a coin toss.
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).cacheadvice.deleteMany({})' >/dev/null
 cline feeder --config $CCFG --log-file $LOGDIR/cache_f.log &
-sleep 3
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(
+   Array.from({length:60},(_,i)=>({_id:i, country:['UY','AR','BR'][i%3], n:i})))" >/dev/null
+waitMirrored $NS 60
 startRouter $CCFG
 
 echo "== the answer is the answer, cached or not =="
@@ -181,7 +210,12 @@ for _ in $(seq 1 6); do
   sleep 1
 done
 stopDaemons
-sleep 2
+# No sleep. stopDaemons returns when the process is gone, and a router that has
+# exited has already published its last report, because Run waits for it. That
+# is the property under test, and it is exactly what a sleep here would hide:
+# the report used to be published by a fire-and-forget goroutine racing the
+# process exit, so it survived on an idle machine and was lost under load. This
+# suite passed for that reason and failed inside a parallel sweep.
 ADVICE=$(cline cache --config $CCFG --ns $DB.$NS --top 5 2>&1)
 echo "$ADVICE" | sed 's/^/  | /' | head -8
 chk "the report names the collection"              "true" \
@@ -215,7 +249,6 @@ for _ in $(seq 1 4); do
   sleep 1
 done
 stopDaemons
-sleep 2
 OFF=$(cline cache --config $OFFCFG --top 5 2>&1)
 chk "it publishes with the cache off"              "true" \
     "$(echo "$OFF" | grep -q 'measuring only' && echo true || echo false)"

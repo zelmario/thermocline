@@ -71,6 +71,15 @@ type checkpointCache struct {
 // It is strictly at or after every write the fast tier has already
 // acknowledged, which is what makes it the right thing for a fallback read to
 // wait on.
+//
+// **Only ever a fast tier reply.** The two tiers are separate clusters with
+// independent logical clocks, and a cold tier reading here would be compared
+// against the feeder's fast tier one, which is a comparison between two
+// unrelated counters. It holds today because every path that answers from the
+// archive or the cache sends its reply and returns before this is reached, so
+// the only thing that gets here is what was read from the upstream connection.
+// Anything that moves this call earlier, or lets an archive answer fall through
+// to it, breaks the barrier silently.
 func (r *Router) noteOpTime(reply *wire.Message) {
 	if reply == nil {
 		return
