@@ -24,6 +24,21 @@ import (
 //
 // An empty change stream poll means everything written so far has been applied,
 // so the honest lag at that moment is zero.
+// A known hazard, not yet closed. An empty poll proves the server had nothing
+// more to send at the moment it answered, which is not the same as proving that
+// a write committed a millisecond earlier has been delivered. So this claim can
+// be very slightly ahead of the truth, and a fallback read that trusts it can
+// miss a write that had already returned to the client.
+//
+// The shop test saw this once in 358 order placements, on the build before the
+// cadence fix: "placing one order moved c001889 from 18 to 18", a count that
+// should have gone up by one and did not. It has not been reproduced since, and
+// once is not a diagnosis, so it is written down rather than acted on.
+//
+// The honest fix is to publish the post-batch resume token's cluster time
+// instead of the local clock. MongoDB advances that token past an empty batch
+// precisely to say "nothing exists up to here", which is the statement this
+// function is trying to make and currently approximates.
 func (f *Feeder) markCaughtUp() {
 	f.lastEventAt = time.Now().UTC()
 }

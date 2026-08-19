@@ -68,6 +68,25 @@ Without it every read would miss and the numbers would describe nothing.
 more than the router run: if a check fails with no proxy and no tiering in the
 way, the check is wrong, and nothing it says afterwards means anything.
 
+## What it has found
+
+**The freshness barrier was costing 570ms on every archive read.** Not the
+archive, which answered the same query in 11ms, and not the query. The feeder
+only publishes "everything up to now is mirrored" when its change stream poll
+comes back empty, so every fallback read waited for the next poll, once per
+`max_await`. A shop-shaped workload pays that on 43% of its operations. Fixed in
+3051a6c: 570ms to 173ms, and the whole run from 30 to 95 operations per second.
+A benchmark would have reported the same 570ms and called it the cost of
+tiering.
+
+**One lost write, seen once and not explained.** On the build before that fix,
+one placement in 358 reported "placing one order moved c001889 from 18 to 18".
+The count should have gone up by one. Not reproduced since. The suspected
+mechanism is written down where it lives, in the feeder's markCaughtUp: an empty
+change stream poll proves the server had nothing more to send when it answered,
+which is not the same as proving a write committed a millisecond earlier has
+been delivered. This is the check that would catch it again.
+
 ## Two ways to write a check that lies
 
 Both of these were made here, and both produce failures that look exactly like a
