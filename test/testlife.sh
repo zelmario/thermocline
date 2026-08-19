@@ -102,6 +102,33 @@ cline evictor --config $CFG --once >/dev/null 2>&1
 chk "the expired resident is evicted now" "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$OID')}))")"
 chk "and the archive kept it live"        "true" "$(C "const d=db.getSiblingDB(process.env.TC_DB).orders.findOne({_id:ObjectId('$OID')}); print(!!d && !d._tcDeletedAt)")"
 
+echo "== a copy-up the fast tier refuses must not fail the read =="
+# What a collection looks like after an operator adds a validator to one that
+# was already being tiered: the fast tier enforces a rule the archive's copy
+# knows nothing about, because the feeder created that copy by upserting
+# documents and a validator is not a document.
+#
+# The archived documents predate the rule and cannot be inserted back. The read
+# still has to answer, because the document exists and is readable, and the
+# operator has to be told rather than left with a collection that quietly pays
+# archive latency on every read for ever.
+H "db.getSiblingDB(process.env.TC_DB).tval.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tval.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('tval', {validator:{\$jsonSchema:{
+     bsonType:'object', required:['email'], properties:{email:{bsonType:'string'}}}}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tval.insertOne({_id:1, n:'written before the rule'})" >/dev/null
+chk "the fast tier does not hold it"          "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).tval.countDocuments({_id:1}))")"
+chk "the read is answered anyway"             "written before the rule" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tval.findOne({_id:1}); print(d?d.n:'MISSING')")"
+sleep 2
+chk "and the copy-up did not happen"          "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).tval.countDocuments({_id:1}))")"
+chk "the archive still holds it live"         "true" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tval.findOne({_id:1}); print(!!d && !d._tcDeletedAt)")"
+# Silence here would be the real failure: reads keep working and nothing says
+# why they are slow.
+chk "and the router said why"                 "true" \
+    "$(grep -q 'copy up failed' $LOGDIR/life_r.log && echo true || echo false)"
+
 echo "== dropping a tiered collection =="
 R "db.getSiblingDB(process.env.TC_DB).tdrop.insertMany([{_id:1,v:'a'},{_id:2,v:'b'},{_id:3,v:'c'}])" >/dev/null
 sleep 4

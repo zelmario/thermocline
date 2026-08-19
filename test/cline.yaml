@@ -53,6 +53,10 @@ feeder:
     - "shop.rollup"
     - "shop.merged"
     - "shop.tres"
+    # testlife.sh: a collection the fast tier validates and the archive does
+    # not, which is what every collection looks like after an operator adds a
+    # validator to one that was already being tiered.
+    - "shop.tval"
     - "shop.tttl"
     - "shop.tdrop"
     - "shop.tbig"
