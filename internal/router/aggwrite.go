@@ -164,10 +164,23 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		// reads as what it held, because the archive is what answers once the
 		// fast tier is empty, and the caller gets an error rather than a
 		// half-replaced collection reported as success.
+		//
+		// It is also the expensive half, and worth knowing about: this reaches
+		// every live document the archive holds for the namespace, however many
+		// that is, where clearing the fast tier only reaches the working set. A
+		// $out over a collection with years of history behind it is a large
+		// write, so it says how large.
 		archived := c.r.cold.Database(outDB).Collection(outColl)
-		if _, err := archived.UpdateMany(ctx,
-			bson.D{meta.NotArchivedDeleted()}, meta.Tombstone(time.Now().UTC())); err != nil {
+		res, err := archived.UpdateMany(ctx,
+			bson.D{meta.NotArchivedDeleted()}, meta.Tombstone(time.Now().UTC()))
+		if err != nil {
 			return nil, fmt.Errorf("clear the archive's copy of %s: %w", target, err)
+		}
+		if res.ModifiedCount > 0 {
+			c.log.Info("$out marked the archive's copies deleted",
+				"ns", target, "documents", res.ModifiedCount,
+				"why", "$out says the target holds the result and nothing else, and clearing "+
+					"the fast tier reaches only what the fast tier held")
 		}
 		return &writeSink{
 			r: c.r, how: "replaced on both tiers, so the result is all that is left",

@@ -76,7 +76,7 @@ feeder:
   # second cost nothing. Lower it if fallback reads matter; raise it if they are
   # rare and you would rather have the writes back. Zero turns it off and falls
   # back to the checkpoint, which is where this information used to live.
-  position_every: 250ms
+  position_every: 20ms
 
   # Documents per bulk write to the cold tier.
   batch_size: 500
@@ -91,8 +91,15 @@ feeder:
   # at roughly max_await + position_every.
   #
   # Lowering it costs one cheap getMore per interval against the fast tier and
-  # nothing else. Take it to 100ms if fallback reads are on a user's path.
-  max_await: 500ms
+  # nothing else. Measured on a read that falls through, with the router's own
+  # side of the wait removed: 106ms at 100ms, 59ms at 50ms, 27ms at 20ms, 21ms
+  # at 10ms, 17ms at 5ms, against a 4ms floor with the barrier off. A fallback
+  # read costs about this interval plus seven milliseconds.
+  #
+  # Below 20ms it stops paying for itself: ten buys six milliseconds and makes
+  # the tail worse. Lower it further only if fallback reads are on a user's path
+  # and you would rather spend the round trips.
+  max_await: 20ms
 
   # What to do with a delete on the fast tier that the evictor did not
   # announce. The evictor announces every document it removes, so an

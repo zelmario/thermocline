@@ -321,9 +321,9 @@ func Default() Config {
 		Feeder: FeederConfig{
 			ID:                 "default",
 			CheckpointEvery:    5 * time.Second,
-			PositionEvery:      100 * time.Millisecond,
+			PositionEvery:      20 * time.Millisecond,
 			BatchSize:          500,
-			MaxAwait:           100 * time.Millisecond,
+			MaxAwait:           20 * time.Millisecond,
 			UnannouncedDeletes: Tombstone,
 		},
 		Evictor: EvictorConfig{

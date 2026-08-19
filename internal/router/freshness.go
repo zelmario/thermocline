@@ -50,20 +50,146 @@ import (
 // publishes no cluster time, or when this router has forwarded no reply to take
 // one from.
 
-// checkpointPoll is how often the checkpoint is re-read while waiting.
-const checkpointPoll = 25 * time.Millisecond
+// checkpointPoll bounds how often the position is re-read while anything is
+// waiting on it. The interval used is a quarter of the cadence the feeder
+// promised, between these two.
+//
+// A quarter, because polling faster than the thing being watched changes only
+// the load. The feeder says how often it publishes in the position record
+// itself, so this tunes to the deployment rather than to a guess: a feeder
+// publishing every 20ms is polled every 5ms, and one publishing every second is
+// polled four times in it.
+//
+// It matters because one goroutine polls however many reads are waiting, but
+// that goroutine runs for as long as any of them do. Two milliseconds against a
+// feeder that publishes every 20ms is five hundred reads a second of one small
+// document, for four milliseconds of latency that the cadence hides anyway.
+const (
+	checkpointPollMin = 2 * time.Millisecond
+	checkpointPollMax = 25 * time.Millisecond
+)
 
-// checkpointFresh is how long a checkpoint reading is reused. Many reads can
-// fall through at once, and they would otherwise all query the same small
-// document on the archive at the same time.
-const checkpointFresh = 20 * time.Millisecond
+// pollInterval is how long to wait before reading the position again.
+func (c *checkpointCache) pollInterval() time.Duration {
+	c.mu.Lock()
+	every := c.everyMS
+	c.mu.Unlock()
+	if every <= 0 {
+		// A feeder that promises no cadence gets the slowest of these, which is
+		// what this did before it paced itself. Treating unknown as "as fast as
+		// possible" would poll a deployment that never asked for it.
+		return checkpointPollMax
+	}
+	d := time.Duration(every) * time.Millisecond / 4
+	if d < checkpointPollMin {
+		return checkpointPollMin
+	}
+	if d > checkpointPollMax {
+		return checkpointPollMax
+	}
+	return d
+}
 
+// checkpointIdle is how long the poller keeps going after the last waiter
+// leaves. Reads that fall through arrive in bursts, so stopping the instant one
+// finishes would pay the first read of the next burst a full poll to start it
+// up again.
+const checkpointIdle = time.Second
+
+// checkpointCache is the newest reading of how far mirroring has got, and the
+// way waiters are told it has moved.
+//
+// It used to be a cache with a freshness window, which every waiter consulted
+// and refreshed for itself. That put two quantisations in front of a read that
+// was already waiting on the feeder's: the interval each waiter polled at, and
+// the window a stale reading was reused for. One poller and a broadcast removes
+// both, and removes the load of one query per waiting read at the same time.
 type checkpointCache struct {
 	mu      sync.Mutex
 	at      time.Time      // the feeder's position, by the clock
 	ts      bson.Timestamp // and as a cluster time, when it published one
 	known   bool
 	fetched time.Time // when this reading was taken
+	// everyMS is the cadence the feeder promised, which is what this side
+	// paces itself against. Zero until a position has been read.
+	everyMS int64
+
+	// updated is closed and replaced every time the reading changes, so a
+	// waiter can take it, check the reading, and block on it without a race:
+	// anything published between the check and the wait has already closed the
+	// channel it is about to wait on.
+	updated chan struct{}
+	// waiters is how many reads are blocked on this. The poller runs while it
+	// is above zero and for checkpointIdle afterwards.
+	waiters int
+	polling bool
+}
+
+// waitChan returns the channel that will be closed on the next reading.
+func (c *checkpointCache) waitChan() chan struct{} {
+	if c.updated == nil {
+		c.updated = make(chan struct{})
+	}
+	return c.updated
+}
+
+// publish records a reading and wakes everything waiting on it.
+func (c *checkpointCache) publish(at time.Time, ts bson.Timestamp, known bool, everyMS int64) {
+	c.mu.Lock()
+	c.at, c.ts, c.known, c.fetched = at, ts, known, time.Now()
+	if everyMS > 0 {
+		c.everyMS = everyMS
+	}
+	if c.updated != nil {
+		close(c.updated)
+		c.updated = nil
+	}
+	c.mu.Unlock()
+}
+
+// poll keeps the reading current while reads are waiting on it.
+func (r *Router) poll(ctx context.Context) {
+	defer func() {
+		r.ckptCache.mu.Lock()
+		r.ckptCache.polling = false
+		r.ckptCache.mu.Unlock()
+	}()
+	idleSince := time.Time{}
+	for {
+		at, ts, known, everyMS := r.readPosition(ctx)
+		r.ckptCache.publish(at, ts, known, everyMS)
+
+		r.ckptCache.mu.Lock()
+		n := r.ckptCache.waiters
+		r.ckptCache.mu.Unlock()
+		if n > 0 {
+			idleSince = time.Time{}
+		} else if idleSince.IsZero() {
+			idleSince = time.Now()
+		} else if time.Since(idleSince) > checkpointIdle {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.ckptCache.pollInterval()):
+		}
+	}
+}
+
+// startPolling makes sure the poller is running.
+func (r *Router) startPolling(ctx context.Context) {
+	r.ckptCache.mu.Lock()
+	if r.ckptCache.polling {
+		r.ckptCache.mu.Unlock()
+		return
+	}
+	r.ckptCache.polling = true
+	r.ckptCache.mu.Unlock()
+	// Detached: the poller outlives the read that started it, and serves the
+	// reads that follow.
+	go r.poll(context.WithoutCancel(ctx))
 }
 
 // noteOpTime remembers the newest cluster time the fast tier has reported.
@@ -104,13 +230,21 @@ func (r *Router) noteOpTime(reply *wire.Message) {
 // mirroredThrough returns how far mirroring has got, reusing a recent reading.
 func (r *Router) mirroredThrough(ctx context.Context) (time.Time, bson.Timestamp, bool) {
 	r.ckptCache.mu.Lock()
-	if !r.ckptCache.fetched.IsZero() && time.Since(r.ckptCache.fetched) < checkpointFresh {
+	if !r.ckptCache.fetched.IsZero() {
 		at, ts, known := r.ckptCache.at, r.ckptCache.ts, r.ckptCache.known
 		r.ckptCache.mu.Unlock()
 		return at, ts, known
 	}
 	r.ckptCache.mu.Unlock()
+	// Nothing has been read yet, so this first caller fetches it rather than
+	// waiting a poll to find out.
+	at, ts, known, everyMS := r.readPosition(ctx)
+	r.ckptCache.publish(at, ts, known, everyMS)
+	return at, ts, known
+}
 
+// readPosition asks the archive how far mirroring has got.
+func (r *Router) readPosition(ctx context.Context) (time.Time, bson.Timestamp, bool, int64) {
 	// The position first. It says the same thing the checkpoint's eventAt says,
 	// published on its own much faster cadence, and it is the difference
 	// between this wait costing a couple of milliseconds and costing a whole
@@ -119,20 +253,17 @@ func (r *Router) mirroredThrough(ctx context.Context) (time.Time, bson.Timestamp
 	var at time.Time
 	var ts bson.Timestamp
 	var known bool
+	var everyMS int64
 	rec, ok, err := r.positions.At(ctx, r.cfg.FeederID)
 	if err == nil && ok && rec.Live(time.Now()) {
-		at, ts, known = rec.At, rec.TS, true
+		at, ts, known, everyMS = rec.At, rec.TS, true, rec.EveryMS
 	} else {
 		at, known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
 	}
 	if err != nil {
-		return time.Time{}, bson.Timestamp{}, false
+		return time.Time{}, bson.Timestamp{}, false, 0
 	}
-
-	r.ckptCache.mu.Lock()
-	r.ckptCache.at, r.ckptCache.ts, r.ckptCache.known, r.ckptCache.fetched = at, ts, known, time.Now()
-	r.ckptCache.mu.Unlock()
-	return at, ts, known
+	return at, ts, known, everyMS
 }
 
 // waitForArchive blocks until mirroring has reached until, and reports whether
@@ -154,7 +285,24 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 	untilTS := r.seenOpTime.Load()
 
 	deadline := time.Now().Add(wait)
+
+	r.ckptCache.mu.Lock()
+	r.ckptCache.waiters++
+	r.ckptCache.mu.Unlock()
+	defer func() {
+		r.ckptCache.mu.Lock()
+		r.ckptCache.waiters--
+		r.ckptCache.mu.Unlock()
+	}()
+	r.startPolling(ctx)
+
 	for {
+		// Taken before the reading is checked, so a position published between
+		// the check and the wait wakes this rather than being missed.
+		r.ckptCache.mu.Lock()
+		next := r.ckptCache.waitChan()
+		r.ckptCache.mu.Unlock()
+
 		at, ts, known := r.mirroredThrough(ctx)
 		if known && caughtUp(at, ts, until, untilTS) {
 			return true
@@ -165,13 +313,21 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		if !known {
 			return false
 		}
-		if !time.Now().Before(deadline) {
+		left := time.Until(deadline)
+		if left <= 0 {
 			return false
 		}
+		// Woken by the poller rather than by a timer of its own, so the wait is
+		// as short as the position is new. The deadline is still the bound.
+		timer := time.NewTimer(left)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false
-		case <-time.After(checkpointPoll):
+		case <-next:
+			timer.Stop()
+		case <-timer.C:
+			return false
 		}
 	}
 }

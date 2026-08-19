@@ -234,12 +234,37 @@ the default it was also worse than slow: the wait exceeded `archive_wait`, which
 also defaults to 5s, so reads gave up and answered stale anyway.
 
 Freshness now has its own record. The feeder publishes how far it has mirrored
-every `feeder.position_every` (250 ms by default) as one small document with no
-resume token at `w:1`, and the durable checkpoint goes back to meaning only what
-it says. The same read now takes **520 ms**, and the remaining cost is honest:
-on an idle database the feeder cannot know that time has passed until its change
-stream poll times out, so budget a fallback read at roughly
-`max_await + position_every` and lower both if such reads are on a user's path.
+every `feeder.position_every` as one small document with no resume token at
+`w:1`, and the durable checkpoint goes back to meaning only what it says.
+
+**What is left is two quantisations, and both were larger than they needed to
+be.** The feeder can only say "everything written up to here is mirrored" when a
+change stream poll comes back empty, so a fallback read waits for the next poll.
+And the router used to re-read the position on its own timer, every 25 ms, with
+each waiting read consulting and refreshing a reading it reused for 20 ms, which
+put a second interval in front of one it was already waiting out.
+
+The router's side is gone. One goroutine polls while anything is waiting and
+wakes every waiter the moment the position moves, so the cost is a fixed stream
+of reads of one small document rather than one per waiting client, and the wait
+is as short as the position is new. The feeder's side is a cadence to choose,
+measured on a read that falls through to the archive:
+
+| feeder publishes every | p50 | p95 |
+|---|---|---|
+| 100 ms | 106 ms | 115 ms |
+| 50 ms | 59 ms | 77 ms |
+| **20 ms**, the default | **27 ms** | 35 ms |
+| 10 ms | 21 ms | 52 ms |
+| 5 ms | 17 ms | 41 ms |
+| barrier off, for reference | 4 ms | 12 ms |
+
+A fallback read costs about the cadence plus seven milliseconds. Below 20 ms it
+stops paying for itself: ten buys six milliseconds and makes the tail worse, so
+20 ms is the default and `feeder.max_await` with `feeder.position_every` are
+there for a deployment that would rather spend the round trips. There is no
+point setting `position_every` slower than `max_await`, because the position can
+only move when a poll finds the stream empty.
 
 **What the wait compares was the other half of getting this right, and it was
 wrong for longer.** "How far mirroring has got" was the feeder's own wall clock,
@@ -1265,7 +1290,11 @@ mongosh --port 28018 --eval '
   collection should now contain. The archived documents are tombstoned rather
   than removed, so what they were is still there to look at, and the archive is
   cleared after the fast tier, so a failure leaves the collection reading as
-  what it held rather than half replaced.
+  what it held rather than half replaced. It is the expensive half as well:
+  clearing the fast tier reaches only the working set, while this reaches every
+  live document the archive holds for that namespace, so a `$out` over a
+  collection with years behind it is a large write. The router logs how many it
+  marked.
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection
