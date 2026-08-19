@@ -685,7 +685,36 @@ would rather refuse expensive fallback reads than run them has
 `router.completeness: strict`, which refuses them all.
 
 `hint` is dropped for the same reason: it names an index the archive is not
-expected to have.
+expected to have. **Except when the hint is not only about the plan**, and there
+are two such cases, both of which used to produce a wrong answer quietly.
+
+A sparse index holds only the documents carrying its fields, and a partial index
+only the ones its filter matches, so hinting either narrows which documents are
+looked at. Measured on PSMDB 8.0, twenty documents of which six carry a field,
+with a sparse index on it: `find({})` returns twenty and
+`find({}).hint(thatIndex)` returns six. Dropping that hint on the way to the
+archive therefore answered a different question and reported it as success. What
+the hint removed is put back as a filter instead: `$exists` on the index's
+fields, or the index's own `partialFilterExpression`. Both are predicates the
+archive can evaluate whether or not it carries the index, which is what keeps
+this from requiring the tiers to agree about indexes.
+
+That translation is only written down where it is exact. "Holds every document
+carrying at least one of its fields" is the rule for a sparse index whose key is
+all directions, and it is not the rule for one carrying a `2dsphere` or `text`
+component: measured with `{loc: "2dsphere", n: 1}` sparse over three documents,
+hinting it returned the two carrying `loc` and left out the one with `n` and no
+`loc`, which an `$or` over both fields would have put back. For those the hint
+is forwarded instead, and MongoDB is the authority: the archive either carries
+the index and answers exactly, or names the index it is missing.
+
+`min` and `max` are bounds on an index key, so they mean nothing without the
+index that defines it, and MongoDB has required a hint alongside them since 4.2.
+Dropping it there did not cost a plan, it turned a working query into
+`NoQueryExecutionPlans`. The hint travels with them now, and if the archive does
+not carry that index the caller gets MongoDB's own complaint naming it, which is
+a true statement about a real divergence and one the report below already
+covers.
 
 To see the divergence rather than infer it:
 

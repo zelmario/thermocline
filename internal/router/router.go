@@ -81,8 +81,12 @@ type Router struct {
 	// clock.
 	seenOpTime atomic.Uint64
 
-	wmCache   watermarkCache
-	idxCache  indexCache
+	wmCache  watermarkCache
+	idxCache indexCache
+	// hintCache holds each namespace's sparse and partial indexes, the ones
+	// whose hint decides which documents are looked at rather than how. See
+	// hint.go.
+	hintCache hintCache
 	collCache collationCache
 	viewCache viewCache
 

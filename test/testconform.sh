@@ -105,7 +105,13 @@ mkIndexes() { # collection, connection-fn
   $2 "const c=db.getSiblingDB(process.env.TC_DB).$1;
       c.createIndex({words:'text'});
       c.createIndex({loc:'2dsphere'});
-      c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});" >/dev/null
+      c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});
+      // Two selective indexes, for the hint checks below. A sparse index holds
+      // only the documents carrying the field, and a partial one only those its
+      // filter matches, so hinting either is a statement about which documents
+      // are looked at and not merely about how.
+      c.createIndex({opt:1},{sparse:true,name:'conf_sparse'});
+      c.createIndex({f:1},{partialFilterExpression:{n:{\$gt:10}},name:'conf_partial'});" >/dev/null
 }
 
 # waitFeederPast blocks until the feeder has processed everything written to the
@@ -181,6 +187,29 @@ echo "== CRUD reads =="
 same 'find()'                 "print(JSON.stringify(COLL.find({})$S"
 same 'findOne()'              'print(JSON.stringify(COLL.findOne({_id:17})))'
 same 'find() projection'      "print(JSON.stringify(COLL.find({},{name:1,n:1})$S"
+
+echo
+echo "== hints, which are not only about the plan =="
+# A hint on an ordinary index picks how to answer and cannot change the answer.
+# A hint on a sparse or partial index also decides *which documents are looked
+# at*: measured on PSMDB 8.0, a sparse index on a field six of twenty documents
+# carry returns those six and nothing else. So a tier that drops the hint
+# answers a different question, and answers it as though nothing happened.
+#
+# These are differential like everything else here, so they say nothing about
+# what the right answer is, only that both collections have to give it.
+same 'hint an ordinary index'  "print(JSON.stringify(COLL.find({n:{\$gt:5}}).hint({n:1})$S"
+same 'hint a sparse index'     "print(JSON.stringify(COLL.find({}).hint('conf_sparse')$S"
+same 'hint a sparse index by key' "print(JSON.stringify(COLL.find({}).hint({opt:1})$S"
+same 'count through a sparse hint' "print(COLL.find({}).hint('conf_sparse').itcount())"
+same 'hint a partial index'    "print(JSON.stringify(COLL.find({}).hint('conf_partial')$S"
+same 'count through a partial hint' "print(COLL.find({}).hint('conf_partial').itcount())"
+# min and max are bounds on an index key, so they mean nothing without the index
+# that defines the key, and MongoDB has required a hint alongside them since
+# 4.2. Dropping that hint does not cost a plan, it turns a working query into
+# NoQueryExecutionPlans.
+same 'min and max with a hint'  "print(JSON.stringify(COLL.find({}).min({n:5}).max({n:12}).hint({n:1})$S"
+same 'min alone with a hint'    "print(JSON.stringify(COLL.find({}).min({n:15}).hint({n:1})$S"
 
 echo
 echo "== query and filtering =="

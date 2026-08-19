@@ -82,7 +82,11 @@ chk "the fast tier starts empty" "0" "$(H "print(db.getSiblingDB(process.env.TC_
 chk "a point lookup finds it"    "resident" "$(R "const d=db.getSiblingDB(process.env.TC_DB).orders.findOne({_id:ObjectId('$OID')}); print(d?d.n:'MISSING')")"
 sleep 4
 chk "and it was copied up"       "1" "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$OID')}))")"
-chk "residency was recorded"     "1" "$(C "print(db.getSiblingDB(process.env.TC_META).residency.countDocuments({}))")"
+# Scoped to the document this section is about. Counting every residency record
+# in the bookkeeping database made this fail whenever anything else on the same
+# worker had copied a document up, which is a true statement about the cluster
+# and says nothing about whether the copy-up above recorded its residency.
+chk "residency was recorded"     "1" "$(C "print(db.getSiblingDB(process.env.TC_META).residency.countDocuments({ns:process.env.TC_DB+'.orders', doc:ObjectId('$OID')}))")"
 
 # The document is two hours old and the rule evicts past forty minutes, so
 # without residency the next sweep would take it straight back out and the copy

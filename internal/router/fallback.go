@@ -262,7 +262,10 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 		return nil, err
 	}
 	collation, _ := c.r.defaultCollation(ctx, db+"."+coll)
-	rewritten, batchSize, err := rewriteForArchive(cmd, collation)
+	// Resolved here rather than inside the rewrite, because it needs the fast
+	// tier's index list and the rewrite is a pure function of the command.
+	hintPred, keepHint := c.r.hintPredicate(ctx, db+"."+coll, cmd)
+	rewritten, batchSize, err := rewriteForArchive(cmd, collation, hintPred, keepHint)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +542,7 @@ func cursorReply(requestID, responseTo int32, id int64, ns, field string, batch 
 // records the application deleted and returning one would resurrect it. And the
 // client's session and transaction fields are dropped, because they name a
 // conversation happening on the other cluster.
-func rewriteForArchive(cmd bson.Raw, collation bson.Raw) (bson.D, int, error) {
+func rewriteForArchive(cmd bson.Raw, collation bson.Raw, hintPred bson.D, keepHint bool) (bson.D, int, error) {
 	elems, err := cmd.Elements()
 	if err != nil {
 		return nil, 0, err
@@ -574,17 +577,26 @@ func rewriteForArchive(cmd bson.Raw, collation bson.Raw) (bson.D, int, error) {
 			// fewer of them: the rollout guide tells operators to drop the
 			// ones the cheap tier does not need. Passing it on turns a
 			// perfectly good query into "hint provided does not correspond to
-			// an existing index" the first time it falls through. A hint is a
-			// directive about how to answer, not about what the answer is, so
-			// dropping it changes the plan and not the result.
+			// an existing index" the first time it falls through.
+			//
+			// For an ordinary index that is the whole story, because such a
+			// hint chooses how the query is answered and not what the answer
+			// is. Two cases are not ordinary and both are handled in hint.go:
+			// a sparse or partial index holds only part of the collection, so
+			// hinting one narrows the documents and the narrowing is put back
+			// as a filter; and min or max are bounds on an index key, so the
+			// hint that names the key has to travel with them.
+			if keepHint || hintIsLoadBearing(cmd) {
+				break
+			}
 			continue
 		case "filter":
 			sawFilter = true
-			out = append(out, bson.E{Key: "filter", Value: liveOnly(val)})
+			out = append(out, bson.E{Key: "filter", Value: andPredicate(liveOnly(val), hintPred)})
 			continue
 		case "pipeline":
 			sawPipeline = true
-			out = append(out, bson.E{Key: "pipeline", Value: livePipeline(val)})
+			out = append(out, bson.E{Key: "pipeline", Value: matchFirst(livePipeline(val), hintPred)})
 			continue
 		case "batchSize":
 			// Zero is a request, not an absence: a driver asks for it to get a
@@ -612,12 +624,13 @@ func rewriteForArchive(cmd bson.Raw, collation bson.Raw) (bson.D, int, error) {
 
 	// A find with no filter at all still has to exclude tombstones.
 	if _, isFind := lookupString(cmd, "find"); isFind && !sawFilter {
-		out = append(out, bson.E{Key: "filter", Value: bson.D{meta.NotArchivedDeleted()}})
+		out = append(out, bson.E{Key: "filter",
+			Value: andPredicate(bson.D{meta.NotArchivedDeleted()}, hintPred)})
 	}
 	if _, isAgg := lookupString(cmd, "aggregate"); isAgg && !sawPipeline {
-		out = append(out, bson.E{Key: "pipeline", Value: bson.A{
+		out = append(out, bson.E{Key: "pipeline", Value: matchFirst(bson.A{
 			bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}},
-		}})
+		}, hintPred)})
 	}
 
 	// Let the archive spill a sort to disk.
