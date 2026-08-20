@@ -1326,7 +1326,8 @@ help: a driver never says it was looking for a replica set. Drop `replicaSet=`
 and give it the router's address.
 
 **3. Create the application's accounts on the fast tier.** It is a new replica
-set and has none of them. The router authenticates against the fast tier, so
+set and has none of them, nor any custom role they refer to; MongoDB refuses to
+create a user whose role is missing and names it, so do the roles first. The router authenticates against the fast tier, so
 until they exist every connection is refused with MongoDB's ordinary
 `Authentication failed`, which says nothing about which tier is missing them.
 The router names them at startup.
@@ -1355,7 +1356,23 @@ already in it starts with none of them claimed. It reads the constraint from the
 fast tier's unique indexes, which the router builds there at startup, so run it
 after the router has been up once.
 
-**8. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**8. Start change stream consumers fresh, do not resume them.** A resume token
+minted on the old cluster is accepted by the router and delivers nothing.
+Measured with one token and one collection: against the cluster it came from it
+delivers the write that followed it; through the router after the cutover it
+delivers nothing at all and reports success. The router serves change streams
+from the fast tier, which is a different replica set with its own oplog, and a
+token from another one is not a position in it. There is no error to catch, so
+this has to be a step rather than a surprise.
+
+**9. Expect eviction to hold off at first.** The evictor will not remove
+anything until the fast tier's oplog window exceeds `min_oplog_window`, and a
+new replica set's window is its own age, so with the shipped default of 24h
+nothing is evicted on the first day. That is the guard working, and it says so:
+`eviction paused, reason="oplog window is 3h20m, limit 24h"`. Lower the limit
+only if you understand what it protects.
+
+**10. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
@@ -1466,6 +1483,19 @@ mongosh --port 28018 --eval '
 ```
 
 ## What is not handled yet
+
+- **A change stream cannot be resumed across the cutover, and nothing says so.**
+  A resume token is a position in one replica set's oplog. The router serves
+  change streams from the fast tier, so a token minted on the cluster being
+  adopted is not a position in it. MongoDB accepts it rather than refusing it:
+  measured, the same token delivered the write that followed it against the
+  cluster it came from, and delivered nothing at all through the router, with
+  `ok: 1`. A consumer resuming across the cutover therefore loses every event
+  the old cluster saw after its last token, silently.
+
+  Refusing it would mean the router parsing resume tokens, which are an
+  undocumented encoding that changes between server releases, so this is a step
+  in the rollout rather than a guard: start consumers fresh.
 
 - **Sharded fast tiers are refused, with the reason.** Everything here assumes
   the fast tier is a replica set. The router proxies bytes to one primary
