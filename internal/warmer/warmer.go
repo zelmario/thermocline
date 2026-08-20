@@ -266,6 +266,11 @@ func (w *Warmer) anyInWindow(ctx context.Context, client *mongo.Client, rule con
 	return true, nil
 }
 
+// progressEvery is how often a running warm says where it has got to. Slow
+// enough to stay out of the way of a warm that finishes in seconds, often
+// enough that one running for hours is visibly alive.
+const progressEvery = 30 * time.Second
+
 func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, error) {
 	var stats Stats
 	now := time.Now().UTC()
@@ -362,6 +367,8 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		return stats, nil
 	}
 
+	lastReport := time.Now()
+
 	// Resume by starting just past the last completed point.
 	before := bson.RawValue{}
 	if saved.Claimed && saved.From.Before(now) {
@@ -418,6 +425,28 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		}
 
 		w.limiter.spend(ctx, len(docs))
+
+		// Progress, at a rate a person can read.
+		//
+		// The only per batch output was at debug, so a warm said "warming" and
+		// then nothing until "warm complete". A first warm of a large adopted
+		// collection runs for hours: measured, 184,521 documents took 672
+		// seconds, so tens of millions is most of a day. Silence for that long
+		// is indistinguishable from a stall, and the reasonable thing an
+		// operator does about a stall is restart it, which throws away nothing
+		// but starts the whole scan again.
+		//
+		// How far back it has reached matters more than the count, because the
+		// window is a span of time and that is what says how much is left.
+		if !w.dryRun && time.Since(lastReport) >= progressEvery {
+			lastReport = time.Now()
+			w.log.Info("warming",
+				"ns", rule.NS,
+				"warmed", stats.Warmed,
+				"already_present", stats.Present,
+				"reached_back_to", oldest.UTC().Format(time.RFC3339),
+				"target", floor.UTC().Format(time.RFC3339))
+		}
 
 		if len(docs) < w.cfg.BatchSize {
 			if !w.dryRun {
