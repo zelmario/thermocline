@@ -1365,14 +1365,29 @@ from the fast tier, which is a different replica set with its own oplog, and a
 token from another one is not a position in it. There is no error to catch, so
 this has to be a step rather than a surprise.
 
-**9. Expect eviction to hold off at first.** The evictor will not remove
+**9. Fallback reads land on the archive's primary, and you cannot move them.**
+During the adoption most reads fall through, and the archive is the production
+cluster you are relieving, so sending them to its secondaries is the obvious
+thing to want. `readPreference` on `cold.uri` does not do it: archive reads are
+issued as commands, and a driver runs a command against the primary whatever the
+client's preference says. Measured with `secondaryPreferred`, the fallback read
+was served by the primary anyway.
+
+That stays as it is on purpose. The freshness barrier waits for mirroring to
+reach the archive's primary, and a secondary is behind that by a lag nothing
+here measures, so a read served there could miss a write that has already been
+acknowledged. The router now says the setting is ignored rather than letting you
+believe it took effect. Plan the archive's primary for the read load, and warm
+the fast tier to shorten the period it lasts.
+
+**10. Expect eviction to hold off at first.** The evictor will not remove
 anything until the fast tier's oplog window exceeds `min_oplog_window`, and a
 new replica set's window is its own age, so with the shipped default of 24h
 nothing is evicted on the first day. That is the guard working, and it says so:
 `eviction paused, reason="oplog window is 3h20m, limit 24h"`. Lower the limit
 only if you understand what it protects.
 
-**10. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**11. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 

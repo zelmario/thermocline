@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/evictor"
@@ -304,6 +306,8 @@ func runRouter(args []string) error {
 	}
 	defer disconnect(cold, log)
 
+	warnIfArchiveReadPreferenceIgnored(cfg.Cold.URI, log)
+
 	r := router.New(hot, cold, cfg.Router, log)
 	go reportRouterStats(ctx, r, log)
 	if cfg.Router.Dashboard != "" {
@@ -360,6 +364,41 @@ func reportRouterStats(ctx context.Context, r *router.Router, log *slog.Logger) 
 func fatal(log *slog.Logger, what string, err error) error {
 	log.Error(what+" stopped", "err", err)
 	return err
+}
+
+// warnIfArchiveReadPreferenceIgnored says that a read preference on cold.uri
+// does not do what it looks like it does.
+//
+// It is the natural thing to reach for when adopting a large cluster: during
+// the adoption most reads fall through to the archive, which is the production
+// cluster being relieved, and sending them to its secondaries instead of its
+// primary is exactly the kind of thing an operator does. Measured with
+// readPreference=secondaryPreferred on cold.uri: the fallback read was served
+// by the archive's primary anyway.
+//
+// It is ignored because archive reads are issued as commands, and the driver
+// runs a command against the primary whatever the client's preference says.
+// Keeping it that way is deliberate rather than an oversight: the freshness
+// barrier waits for the feeder to have written to the archive, which means its
+// primary, and a secondary is behind that by a lag nothing here measures. A
+// read served there could miss a write that has already been acknowledged.
+//
+// So the setting stays ignored and stops being silent.
+func warnIfArchiveReadPreferenceIgnored(uri string, log *slog.Logger) {
+	cs, err := connstring.ParseAndValidate(uri)
+	if err != nil || cs.ReadPreference == "" {
+		return
+	}
+	if strings.EqualFold(cs.ReadPreference, "primary") {
+		return
+	}
+	log.Warn("the read preference on cold.uri is ignored",
+		"read_preference", cs.ReadPreference,
+		"meaning", "reads that fall through are served by the archive's primary whatever this says, "+
+			"because they are issued as commands",
+		"why", "the freshness barrier waits for mirroring to reach the archive's primary, and a "+
+			"secondary is behind that by a lag nothing measures, so a read served there could "+
+			"miss a write that has already been acknowledged")
 }
 
 func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {

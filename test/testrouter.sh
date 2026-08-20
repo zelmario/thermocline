@@ -239,6 +239,36 @@ kill $UP 2>/dev/null; wait $UP 2>/dev/null
 chk "the router named it at startup"          "true" \
     "$(grep -q 'the archive holds collections the fast tier does not' $LOGDIR/unt_r.log && echo true || echo false)"
 
+echo "== a read preference on cold.uri, which does not do what it looks like =="
+# The natural thing to reach for when adopting a large cluster: during the
+# adoption most reads fall through to the archive, which is the production
+# cluster being relieved, so sending them to its secondaries looks obvious.
+#
+# It is ignored, because archive reads are issued as commands and the driver
+# runs a command against the primary whatever the client's preference says.
+# Measured with secondaryPreferred on cold.uri: the fallback read was served by
+# the archive's primary anyway. Keeping it ignored is deliberate, because the
+# freshness barrier waits for mirroring to reach the archive's primary. Being
+# silent about it was not.
+sed 's|\(uri: "mongodb://[^"]*rsCold[^"]*\)"|\1\&readPreference=secondaryPreferred"|' $CFG > $WDIR/coldpref.yaml
+chk "the derived config asks for secondaries"      "1" \
+    "$(grep -c 'readPreference=secondaryPreferred' $WDIR/coldpref.yaml)"
+rm -f $LOGDIR/coldpref.log
+cline router --config $WDIR/coldpref.yaml --log-file $LOGDIR/coldpref.log & CP=$!
+for _ in $(seq 1 30); do grep -q "router listening" $LOGDIR/coldpref.log 2>/dev/null && break; sleep 1; done
+kill $CP 2>/dev/null; wait $CP 2>/dev/null
+chk "the router says it is ignored"                "true" \
+    "$(grep -q 'read preference on cold.uri is ignored' $LOGDIR/coldpref.log && echo true || echo false)"
+chk "and says a secondary could miss a write"      "true" \
+    "$(grep -q 'miss a write that has already been acknowledged' $LOGDIR/coldpref.log && echo true || echo false)"
+# And it must not say it about an ordinary config, or it becomes noise.
+rm -f $LOGDIR/coldplain.log
+cline router --config $CFG --log-file $LOGDIR/coldplain.log & CQ=$!
+for _ in $(seq 1 30); do grep -q "router listening" $LOGDIR/coldplain.log 2>/dev/null && break; sleep 1; done
+kill $CQ 2>/dev/null; wait $CQ 2>/dev/null
+chk "and stays quiet when nothing asks for it"     "0" \
+    "$(grep -c 'read preference on cold.uri' $LOGDIR/coldplain.log || true)"
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "================================"
