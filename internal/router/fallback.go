@@ -948,7 +948,38 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	if err := bson.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
-	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, doc)
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, withoutForeignTime(doc))
+}
+
+// withoutForeignTime removes the archive's own sense of time from a reply that
+// is about to be handed to a client talking to the fast tier.
+//
+// $clusterTime and operationTime describe the cluster that produced them, and
+// the two tiers are different clusters with different keys. A driver gossips
+// the $clusterTime it is given back on its next command, so an archive reply
+// passed through whole leaves the session speaking the archive's time to the
+// fast tier, which cannot validate the signature and answers "No keys found for
+// HMAC that is valid for time".
+//
+// The failure lands on the *next* command, which is what made it hard to see:
+// the count itself is correct, and then an unrelated find fails. Measured on an
+// adoption, in a fresh session each time: after estimatedDocumentCount or
+// distinct fell through, the following command failed; after a find or an
+// aggregate fell through, it did not, because those build their own replies
+// rather than forwarding the archive's.
+//
+// Dropping them rather than substituting the fast tier's is the conservative
+// choice: a driver that is given no $clusterTime keeps the last one it had,
+// which is the fast tier's and still true.
+func withoutForeignTime(doc bson.D) bson.D {
+	out := doc[:0:0]
+	for _, e := range doc {
+		if e.Key == "$clusterTime" || e.Key == "operationTime" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // serverErrorReply rebuilds an error the archive returned, so the client sees

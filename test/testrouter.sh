@@ -117,7 +117,15 @@ chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
 # distinguishing from a wrong count, and the first version of this collapsed
 # every error to the same number, which said nothing about whether the cursor
 # had been refused, had expired, or the router had gone away.
-OWN=$(R "let n=0; const db2=db.getSiblingDB(process.env.TC_DB);
+# In one explicit session, not two implicit ones. find and getMore issued as
+# separate runCommand calls each get their own implicit session from the
+# driver's pool, and the pool usually hands back the same one, which is why this
+# passed for months and failed twice under a parallel sweep. mongod enforces the
+# same rule the router does: a getMore must come from the session that created
+# the cursor. Two runCommands do not guarantee that, so the check was asking for
+# something no driver promises.
+OWN=$(R "let n=0; const s=db.getMongo().startSession();
+         const db2=s.getDatabase(process.env.TC_DB);
          let r=db2.runCommand({find:'tprobe',filter:{},batchSize:2});
          n+=r.cursor.firstBatch.length;
          let id=r.cursor.id;
@@ -127,8 +135,36 @@ OWN=$(R "let n=0; const db2=db.getSiblingDB(process.env.TC_DB);
            catch(e){ err='threw after '+n+': '+String(e.message).substring(0,60); break }
            if(g.ok!==1){ err='not ok after '+n+': '+g.code+' '+g.codeName; break }
            n+=g.cursor.nextBatch.length; id=g.cursor.id }
+         s.endSession();
          print(err || n)")
 chk "its own session pages to the end"     "$LIVE" "$OWN"
+
+echo "== the archive's sense of time must not follow the reply out =="
+# $clusterTime and operationTime describe the cluster that produced them, and
+# the two tiers are different clusters with different signing keys. A driver
+# gossips the $clusterTime it is given back on its next command, so an archive
+# reply passed through whole leaves the session speaking the archive's time to
+# the fast tier, which answers "No keys found for HMAC that is valid for time".
+#
+# The failure lands on the *next* command, which is what makes it hard to see:
+# the count is correct and then an unrelated command fails. count and distinct
+# were the two that forwarded the archive's reply verbatim; find and aggregate
+# build their own, which is why only these two ever did it.
+cline watermark --config $CFG --ns $DB.tprobe --clear >/dev/null 2>&1
+LEAK=$(R "const d=db.getSiblingDB(process.env.TC_DB);
+  function after(label, f) {
+    try { f() } catch(e) { return label+':fallback-failed' }
+    try { d.tprobe.find({_id:'no-such'}).itcount(); return '' }
+    catch(e) { return label+':'+String(e.message).slice(0,40) }
+  }
+  const bad = [
+    after('count', ()=>d.tprobe.estimatedDocumentCount()),
+    after('distinct', ()=>d.tprobe.distinct('n').length),
+    after('find', ()=>d.tprobe.find({n:{\$gte:0}}).itcount()),
+    after('aggregate', ()=>d.tprobe.countDocuments({})),
+  ].filter(x=>x);
+  print(bad.length ? bad.join(' | ') : 'none')")
+chk "no fallback leaves the session broken"        "none" "$LEAK"
 
 echo "== unique index across tiers =="
 H 'db.getSiblingDB(process.env.TC_DB).tacct.drop(); db.getSiblingDB(process.env.TC_DB).tacct.createIndex({email:1},{unique:true})' >/dev/null

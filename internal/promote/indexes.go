@@ -179,8 +179,8 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 // exists to keep. Those are refused rather than copied; see the feeder's
 // collection kind check.
 func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error {
-	opts, err := archiveCollectionOptions(ctx, ix.cold, db, coll)
-	if err != nil || opts == nil {
+	exists, opts, err := archiveCollectionOptions(ctx, ix.cold, db, coll)
+	if err != nil || !exists {
 		return err
 	}
 
@@ -211,29 +211,39 @@ func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error
 	ix.log.Info("created the collection on the fast tier the way the archive has it",
 		"ns", db+"."+coll, "options", carried,
 		"why", "a collation decides which documents match and a validator which writes are refused, "+
-			"and neither arrives with the documents")
+			"and neither arrives with the documents; and a collection that does not exist is not "+
+			"listed by listCollections and cannot be asked for its stats, however well its reads work")
 	return nil
 }
 
-// archiveCollectionOptions reads the options worth carrying upward, or nil when
-// the archive has no such collection or nothing to carry.
-func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll string) (bson.D, error) {
+// archiveCollectionOptions reports whether the archive holds the collection, and
+// which of its options are worth carrying upward.
+//
+// The two answers are separate because most collections have no options at all
+// and still have to be created. A namespace the archive holds and the fast tier
+// does not is invisible until something creates it: listCollections does not
+// name it, so an ORM checking whether its collection exists is told no, and
+// db.coll.stats() fails with "Unable to retrieve storage" while every read of
+// the same collection is answered correctly from the archive. Measured on an
+// adoption of a hundred documents: countDocuments answered 100, show
+// collections was empty, and stats() errored.
+func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll string) (bool, bson.D, error) {
 	cur, err := cold.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
 	if err != nil {
-		return nil, fmt.Errorf("list %s.%s in the archive: %w", db, coll, err)
+		return false, nil, fmt.Errorf("list %s.%s in the archive: %w", db, coll, err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	if !cur.Next(ctx) {
-		return nil, cur.Err()
+		return false, nil, cur.Err()
 	}
 	var raw bson.Raw
 	if err := cur.Decode(&raw); err != nil {
-		return nil, err
+		return false, nil, err
 	}
 	odoc, ok := raw.Lookup("options").DocumentOK()
 	if !ok {
-		return nil, nil
+		return true, nil, nil
 	}
 
 	var out bson.D
@@ -243,7 +253,7 @@ func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll 
 			out = append(out, bson.E{Key: key, Value: v})
 		}
 	}
-	return out, nil
+	return true, out, nil
 }
 
 // isNamespaceExists reports MongoDB's "collection already exists", which is the

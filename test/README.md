@@ -211,6 +211,15 @@ Things this encodes, each of which cost a wrong result first:
   sweep runs: workers derive their config when they start, so half of them get
   one file and half the other.
 
+- **Two `runCommand` calls are not one session.** A `find` and its `getMore`
+  issued as separate `runCommand`s each get their own implicit session from the
+  driver's pool, and a getMore from a different session than the one that opened
+  the cursor is refused, by mongod and by the router alike. The pool usually
+  hands back the same session, so this passes for months and then fails twice in
+  one day under a parallel sweep, with "cursor id ... was not created by the
+  authenticated user or was created in another session". Open an explicit
+  session and run both through it.
+
 Things these encode that are easy to get wrong when testing by hand:
 
 - **The evictor's precondition is a feeder that has caught up.** Killing the

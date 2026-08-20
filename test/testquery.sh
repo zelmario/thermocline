@@ -134,14 +134,22 @@ echo "== batchSize zero asks for a cursor, not for documents =="
 # archive fallback was doing exactly that.
 cline watermark --config $CFG --ns $DB.tqcoll --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
+# In one explicit session. Issued as two runCommand calls, the find and the
+# getMore each get their own implicit session from the driver's pool, and a
+# getMore from a different session than the one that opened the cursor is
+# refused by mongod and by the router alike. The pool usually returns the same
+# session, which is why this passed until a parallel sweep made it not.
 chk "an empty first batch, then the documents"        "3" "$(R "
-  const r = db.getSiblingDB(process.env.TC_DB).runCommand({find:'tqcoll', filter:{}, batchSize:0});
+  const s = db.getMongo().startSession();
+  const d = s.getDatabase(process.env.TC_DB);
+  const r = d.runCommand({find:'tqcoll', filter:{}, batchSize:0});
   if (r.cursor.firstBatch.length !== 0) { print('first batch was '+r.cursor.firstBatch.length); }
   else if (!r.cursor.id) { print('no cursor'); }
   else {
-    const g = db.getSiblingDB(process.env.TC_DB).runCommand({getMore:r.cursor.id, collection:'tqcoll'});
-    print(g.cursor.nextBatch.length);
-  }")"
+    const g = d.runCommand({getMore:r.cursor.id, collection:'tqcoll'});
+    print(g.ok === 1 ? g.cursor.nextBatch.length : 'getMore failed: '+g.codeName);
+  }
+  s.endSession();")"
 
 echo "== a view over a tiered collection =="
 # A view is a saved pipeline over another collection. The router decides whether
