@@ -1435,6 +1435,13 @@ router: `cursor id 8792354910962146833 not found`. It fails only for reads that
 fall through and return more than one batch, which is most of them during an
 adoption, and only sometimes, which is worse.
 
+The caches do not need naming: each router keeps its own, and a write it did not
+make reaches it through the change stream it watches on the fast tier. That is
+asynchronous, so it is a race by nature, and it was measured rather than
+assumed: with one router answering from its cache, nine hits deep, and the other
+taking a write before each read, twenty rounds in a row gave the new answer and
+none gave the old one.
+
 **14. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
