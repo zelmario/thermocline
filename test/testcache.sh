@@ -255,6 +255,58 @@ chk "it publishes with the cache off"              "true" \
 chk "and still has something to suggest"           "true" \
     "$(echo "$OFF" | grep -q "$DB.$NS" && echo true || echo false)"
 
+echo "== the cache across an adoption =="
+# Nothing had ever run the cache in the shape every deployment starts in: the
+# existing cluster is the archive holding every document, the fast tier is new
+# and empty, and the tier that answers changes underneath the application as the
+# fast tier fills. A cached answer that outlives one of those changes is the
+# failure this looks for, so the same question is asked at every stage and
+# compared with the archive's own answer, which is the truth because the archive
+# holds everything.
+ANS=tcadopt
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$ANS; const now=Date.now(); const d=[];
+   // Inside the 40m warm window, so the warm below really does fill the fast
+   // tier and the stage that says so is a fact.
+   for (let i=0;i<60;i++) d.push({_id:new ObjectId(), grp:'g'+(i%4), state:(i%3===0?'done':'open'), at:new Date(now-i*20000)});
+   c.insertMany(d);" >/dev/null
+chk "the archive holds them, the fast tier does not" "60/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({}))")"
+cline feeder --config $CCFG --log-file $LOGDIR/cache_f2.log &
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+startRouter $CCFG
+
+asked() { R "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({grp:'g1',state:'open'}))"; }
+# Asked twice, so the second answer is the one a cache would give if it had one.
+#
+# Compared with a count this suite knows by construction, not with the archive.
+# The archive is behind by the mirroring lag, so immediately after a write it
+# legitimately disagrees with the router and reading it as the truth fails the
+# router for being right. That is what the first version of this did.
+stage() { asked >/dev/null; chk "$1" "$2" "$(asked)"; }
+
+OPEN=$(C "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({grp:'g1',state:'open',_tcDeletedAt:{\$exists:false}}))")
+stage "day one, the archive answers" "$OPEN"
+cline warmer --config $CCFG >/dev/null 2>&1
+# Say that the tier really did flip, so the label above is a fact rather than an
+# intention: a stage that never changed which tier answers proves nothing about
+# a cached answer surviving the change.
+chk "the warm put them on the fast tier"            "60" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({}))")"
+stage "after the warm, the fast tier answers" "$OPEN"
+R "db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:new ObjectId(), grp:'g1', state:'open', at:new Date()})" >/dev/null
+stage "immediately after a write" "$((OPEN + 1))"
+R "db.getSiblingDB(process.env.TC_DB).$ANS.updateOne({grp:'g1',state:'open'},{\$set:{state:'done'}})" >/dev/null
+stage "immediately after an update" "$OPEN"
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+stopDaemons
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

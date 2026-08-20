@@ -156,6 +156,9 @@ feeder:
     - "shop.tcs"
     # testcache.sh
     - "shop.tcache"
+    # testcache.sh again, for the cache across an adoption: the archive holds
+    # the collection and the fast tier has never held any of it.
+    - "shop.tcadopt"
     # testddl.sh. tddl2 is the target of the rename, and it has to be tiered
     # too: a rename into a name the namespace list does not carry is refused,
     # because it would stop the tiering with nothing saying so.
@@ -198,6 +201,10 @@ warmer:
     # Deliberately with no date_field, against a collection keyed by integers.
     # testwarm.sh checks that this is refused rather than obeyed.
     - ns: "shop.tintid"
+      back: 40m
+    # testcache.sh: the collection an adoption starts with, warmed so the tier
+    # that answers changes underneath the application while the cache is on.
+    - ns: "shop.tcadopt"
       back: 40m
   backoff:
     max_replication_lag: 10s

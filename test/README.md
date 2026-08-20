@@ -198,6 +198,19 @@ Things this encodes, each of which cost a wrong result first:
   the primary; an election moved it mid-session and four indexes became one.
   Run generated commands with `--eval`.
 
+- **The archive is not the truth immediately after a write.** It is behind by
+  the mirroring lag, so a check that reads it as ground truth right after a
+  write fails the router for being right: the router answered 10 and the archive
+  still said 11. Compare against a count the suite knows by construction, or
+  wait for the mirror first.
+- **Never run a suite by hand on a worker directory a sweep is using.** Its
+  `stopDaemons` and cleanup trap pkill by `--config $WDIR/`, which is the same
+  pattern the sweep's own worker uses, so it kills the sweep's feeder and router
+  out from under it. The sweep then reports failures that belong to nobody. The
+  same goes for copying a suite or the shared config into the container while a
+  sweep runs: workers derive their config when they start, so half of them get
+  one file and half the other.
+
 Things these encode that are easy to get wrong when testing by hand:
 
 - **The evictor's precondition is a feeder that has caught up.** Killing the
