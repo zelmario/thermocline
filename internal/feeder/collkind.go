@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // Two kinds of collection cannot be mirrored, and mirroring them does damage
@@ -49,30 +50,54 @@ func (f *Feeder) unmirrorable(ctx context.Context) ([]string, error) {
 		wanted[db][coll] = true
 	}
 
+	// Both tiers, because which one holds the collection depends on where the
+	// deployment is in its life. Ordinarily the fast tier is where the
+	// application's collections are and the archive's copies are made by the
+	// feeder. In an adoption it is the other way round: the existing cluster
+	// becomes the archive carrying every collection it ever had, and the fast
+	// tier is new and empty, so a capped collection listed in feeder.namespaces
+	// was invisible to a check that only looked at the fast tier. Measured: the
+	// feeder started and reported it was mirroring the namespace.
+	seen := map[string]bool{}
 	var bad []string
-	for db, colls := range wanted {
-		cur, err := f.hot.Database(db).ListCollections(ctx, bson.D{})
-		if err != nil {
-			// Not being able to look is not a reason to refuse to run. The
-			// check exists to catch a configuration mistake, and a database
-			// that cannot be listed will fail louder elsewhere.
-			f.log.Warn("could not check collection types before mirroring", "db", db, "err", err)
-			continue
-		}
-		for cur.Next(ctx) {
-			var raw bson.Raw
-			if cur.Decode(&raw) != nil {
+	for _, tier := range []struct {
+		name   string
+		client *mongo.Client
+	}{{"the fast tier", f.hot}, {"the archive", f.cold}} {
+		for db, colls := range wanted {
+			cur, err := tier.client.Database(db).ListCollections(ctx, bson.D{})
+			if err != nil {
+				// Not being able to look is not a reason to refuse to run. The
+				// check exists to catch a configuration mistake, and a database
+				// that cannot be listed will fail louder elsewhere.
+				f.log.Warn("could not check collection types before mirroring",
+					"db", db, "tier", tier.name, "err", err)
 				continue
 			}
-			name, _ := raw.Lookup("name").StringValueOK()
-			if !colls[name] {
-				continue
+			for cur.Next(ctx) {
+				var raw bson.Raw
+				if cur.Decode(&raw) != nil {
+					continue
+				}
+				name, _ := raw.Lookup("name").StringValueOK()
+				if !colls[name] {
+					continue
+				}
+				kind, why := unmirrorableKind(raw)
+				if kind == "" {
+					continue
+				}
+				// One complaint per namespace, however many tiers hold it, so
+				// the ordinary case does not report the same collection twice.
+				ns := db + "." + name
+				if seen[ns] {
+					continue
+				}
+				seen[ns] = true
+				bad = append(bad, fmt.Sprintf("%s is %s, which %s", ns, kind, why))
 			}
-			if kind, why := unmirrorableKind(raw); kind != "" {
-				bad = append(bad, fmt.Sprintf("%s.%s is %s, which %s", db, name, kind, why))
-			}
+			_ = cur.Close(ctx)
 		}
-		_ = cur.Close(ctx)
 	}
 	sort.Strings(bad)
 	return bad, nil

@@ -91,6 +91,33 @@ for _ in $(seq 1 60); do
 done
 chk "the feeder starts once they are gone"              "1" "$(pgrep -fc "cline feeder --config $WDIR/" || true)"
 
+echo "== the same collection, capped on the archive instead =="
+# Which tier holds the collection depends on where the deployment is in its
+# life. Ordinarily the application's collections are on the fast tier and the
+# archive's copies are the feeder's. An adoption is the other way round: the
+# existing cluster becomes the archive carrying every collection it ever had,
+# and the fast tier is new and empty.
+#
+# So the refusal has to look at both. Measured before it did: the feeder started
+# against a capped collection that existed only on the archive and reported it
+# was mirroring the namespace, which is the thing this refusal exists to
+# prevent.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('tcap',{capped:true,size:4096})" >/dev/null
+chk "only the archive holds it, and it is capped"       "true" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'tcap'})[0]; print(!!(c.options&&c.options.capped))")"
+chk "and the fast tier does not hold it at all"         "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('tcap'))")"
+OUT3=$(timeout 20 cline feeder --config $CFG 2>&1 | tail -3)
+STARTED3=$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+chk "the feeder refuses it on the archive too"          "true" \
+    "$(echo "$OUT3" | grep -qi "capped" && echo true || echo "false ($(echo "$OUT3" | tail -1 | cut -c1-60))")"
+chk "and it did not stay running"                       "0"    "$STARTED3"
+C "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"
