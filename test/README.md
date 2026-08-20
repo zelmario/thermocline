@@ -178,6 +178,16 @@ Things this encodes, each of which cost a wrong result first:
   fired on the one worker whose port legitimately equalled the default. A guard
   that reports a problem the run does not have costs as much as one that misses
   a problem it does.
+- **`${VAR:?}` in a suite is a check that cannot run, reported as a check that
+  failed.** `testevict.sh` reached the tiers through `${HOT:?}` and `${COLD:?}`
+  with no default, and a sweep exports neither, so its two newest checks died at
+  the first `mongosh` and printed `got= want=1`. That is the same line a real
+  eviction bug prints, and the pair guards the evictor destroying a live record,
+  so the one check that would catch the worst defect found here had never run in
+  a sweep. Every other suite defaults `HOT` and `COLD` to the six-node URIs;
+  this one now does too. **A suite that needs something from the environment
+  should default it, not assert it**, because the assertion fires inside a
+  check and wears that check's name.
 
 Things these encode that are easy to get wrong when testing by hand:
 

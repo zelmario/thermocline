@@ -18,6 +18,14 @@ META=${META:-_thermocline}
 export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
+# The tier endpoints, defaulted the same way every other suite defaults them.
+# Without a default these were ${HOT:?}, which reads as strict and is not: a
+# sweep does not export them, so the two checks that use them exited before
+# querying anything and reported got= want=1. A check that cannot run looks
+# exactly like a check that failed, and this pair guards the evictor destroying
+# a live record.
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
 ok() {
   local name="$1" want="$2" pat="$3"; shift 3; [ "$1" = "--" ] && shift
@@ -83,8 +91,8 @@ chkv() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-50s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-50s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
-H() { mongosh "${HOT:?}"  --quiet --eval "$1" 2>&1 | tail -1; }
-C() { mongosh "${COLD:?}" --quiet --eval "$1" 2>&1 | tail -1; }
+H() { mongosh "$HOT"  --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 # The feeder is stopped for this, so it cannot mirror the fast tier write and
 # clear the tombstone underneath the sweep. Briefly, though: the evictor fails
 # closed once mirroring looks stale, and a sweep that refuses to run would pass
