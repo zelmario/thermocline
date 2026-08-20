@@ -1165,6 +1165,22 @@ Nothing was wrong with the fast tier in the left hand column. It held all 50,000
 orders and answered 59% of the run. The other 41% went to the archive because
 the claim could not be shown to cover them.
 
+**Read the right hand column for what it is: the fast tier holding the whole
+collection, which is the state before tiering rather than after it.** As soon as
+the archive holds anything older than the warm window, which is the entire point
+of having two tiers, the warmer declines that claim and leaves a boundary one,
+and the first eviction sweep would raise it anyway. Measured on a collection
+warmed with a window narrower than its history: the claim came back as a
+boundary, and the customer history query went to the archive before and after
+eviction alike.
+
+So the shape to expect in a steady state is this. A query bounded in time, a
+report over last month, is answered by the fast tier. A query with no lower
+bound, give me this customer's orders, falls through, and no amount of warming
+changes that while the collection is genuinely tiered. If your hottest queries
+are the unbounded kind, tiering will save you storage rather than latency, and
+it is worth knowing that before you adopt rather than after.
+
 **So the warmer makes the stronger claim when it can prove it.** When the
 archive holds no live document older than the window just warmed, the fast tier
 holds every document there is, and the watermark says all of history. When the
