@@ -1297,6 +1297,76 @@ The feeder now says so, once per collection, naming the field and what it costs.
 It reports rather than refuses, because refusing would stop mirroring that
 collection, which is a larger failure than the one being reported.
 
+## Adopting a cluster you already have
+
+This is the shape every deployment starts in, and the one most of this system's
+defects have come from. **The cluster you have becomes the archive, exactly as
+it is. The fast tier is a new, smaller replica set with nothing in it. The
+application is pointed at the router.** Nothing is loaded into the fast tier by
+hand.
+
+The order matters, because most of what goes wrong goes wrong quietly.
+
+**1. Point the router at both, and read what it says at startup.** It compares
+the two tiers and names, once, everything the fast tier is missing that the
+application will need. Nothing here is fatal and all of it is silent afterwards.
+
+**2. Change the connection string, do not just repoint it.** The router answers
+`hello` as a mongos, so a driver told `replicaSet=` in its URI is looking for a
+replica set member and will never accept one. Measured, with the same router and
+the same credentials:
+
+```
+mongodb://user:pw@router:27017/?authSource=admin                  ok
+mongodb://user:pw@router:27017/?replicaSet=rsOld&authSource=admin MongoServerSelectionError
+```
+
+The second one times out rather than saying what is wrong, and the router cannot
+help: a driver never says it was looking for a replica set. Drop `replicaSet=`
+and give it the router's address.
+
+**3. Create the application's accounts on the fast tier.** It is a new replica
+set and has none of them. The router authenticates against the fast tier, so
+until they exist every connection is refused with MongoDB's ordinary
+`Authentication failed`, which says nothing about which tier is missing them.
+The router names them at startup.
+
+**4. Deal with the collections nothing tiers.** A collection the archive holds
+that is not in `feeder.namespaces` lives only on the archive, and the router
+correctly forwards reads of it to the fast tier, which has never held it. The
+application sees it empty. Either tier it or copy it whole. Views are named
+separately because neither answer works for them: recreate them with
+`createView` and tier what they read from.
+
+**5. Check the `_id` type of everything you are tiering.** A warm or eviction
+rule with no `date_field` takes each document's age from the timestamp inside
+its `_id`, which only an ObjectId has. Against integer, string or UUID `_id`s
+the rule addresses nothing at all, so set `date_field` for those collections.
+Both components now refuse such a rule rather than obeying it, and say so.
+
+**6. Warm, then look at the claim it left.** A boundary claim cannot answer a
+query with no lower bound, which is most of what an application asks. When the
+warm covers everything the archive holds, the warmer says so and the fast tier
+answers everything; when it does not, the warmer names what that costs.
+
+**7. Run `cline keys --rebuild` before you let the evictor run.** The registry
+only protects values it knows about, and a cluster adopted with documents
+already in it starts with none of them claimed. It reads the constraint from the
+fast tier's unique indexes, which the router builds there at startup, so run it
+after the router has been up once.
+
+**8. Check the tiers agree, with `cline indexes`.** It reports both directions:
+what the archive cannot answer efficiently, and what the fast tier is scanning
+for.
+
+What the router does for you, at startup, for every namespace it manages that
+the archive already holds: it creates the collection on the fast tier the way
+the archive has it, carrying the default collation and the validator, and builds
+the archive's indexes on it. Those are the things that are not documents, and
+filling a tier with documents does not bring them. A collation cannot be added
+to a collection afterwards at all, which is why this happens before the first
+client connects.
+
 ## Running it
 
 ```

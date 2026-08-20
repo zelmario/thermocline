@@ -113,14 +113,21 @@ WRONGNS=$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'tprobe
 chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
 # The control: one client, one session, its own cursor, paged to the end. This is
 # the case the three checks above must not have broken.
+# Says what went wrong rather than -1. A paging failure here is worth
+# distinguishing from a wrong count, and the first version of this collapsed
+# every error to the same number, which said nothing about whether the cursor
+# had been refused, had expired, or the router had gone away.
 OWN=$(R "let n=0; const db2=db.getSiblingDB(process.env.TC_DB);
          let r=db2.runCommand({find:'tprobe',filter:{},batchSize:2});
          n+=r.cursor.firstBatch.length;
          let id=r.cursor.id;
+         let err='';
          while(id.toString()!=='0'){ let g;
-           try{ g=db2.runCommand({getMore:id,collection:'tprobe',batchSize:2}) }catch(e){ n=-1; break }
-           if(g.ok!==1){ n=-1; break } n+=g.cursor.nextBatch.length; id=g.cursor.id }
-         print(n)")
+           try{ g=db2.runCommand({getMore:id,collection:'tprobe',batchSize:2}) }
+           catch(e){ err='threw after '+n+': '+String(e.message).substring(0,60); break }
+           if(g.ok!==1){ err='not ok after '+n+': '+g.code+' '+g.codeName; break }
+           n+=g.cursor.nextBatch.length; id=g.cursor.id }
+         print(err || n)")
 chk "its own session pages to the end"     "$LIVE" "$OWN"
 
 echo "== unique index across tiers =="
