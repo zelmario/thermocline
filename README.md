@@ -1417,7 +1417,25 @@ it, and the count agrees again:
 db.getSiblingDB("app").orders.deleteMany({_tcDeletedAt: {$exists: true}})
 ```
 
-**13. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**13. Run more than one router by naming them all, not by hiding them.** A read
+the fast tier cannot answer is served from a cursor the router owns in its own
+memory, holding an open connection to the archive, so it cannot be shared with
+another process. Drivers already handle this: they pin a cursor to the server
+that created it, exactly as they do for a mongos. Give the connection string
+both addresses and it works.
+
+```
+mongodb://user:pw@router1:27017,router2:27017/?authSource=admin      iterated 20 of 20
+```
+
+Putting them behind a single load balanced address breaks that, because the
+driver then believes there is one server and its pool sends the getMore down
+whichever connection is free. Measured, the same cursor asked of the second
+router: `cursor id 8792354910962146833 not found`. It fails only for reads that
+fall through and return more than one batch, which is most of them during an
+adoption, and only sometimes, which is worse.
+
+**14. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
@@ -1528,6 +1546,15 @@ mongosh --port 28018 --eval '
 ```
 
 ## What is not handled yet
+
+- **Cursors are not shared between routers.** A read answered from the archive
+  is served from a cursor this router holds open against the archive, in its own
+  memory, so another router cannot continue it. This is what a mongos does too,
+  and drivers pin cursors to the server that created them, so naming every
+  router in the connection string is all it takes. What does not work is one
+  load balanced address in front of several routers: the driver sees one server,
+  its pool sends the getMore down whichever connection is free, and it lands on
+  a router that never had the cursor.
 
 - **A change stream cannot be resumed across the cutover, and nothing says so.**
   A resume token is a position in one replica set's oplog. The router serves
