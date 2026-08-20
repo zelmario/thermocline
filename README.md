@@ -1458,7 +1458,23 @@ assumed: with one router answering from its cache, nine hits deep, and the other
 taking a write before each read, twenty rounds in a row gave the new answer and
 none gave the old one.
 
-**14. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**14. The archive is a hard dependency, and not only for its documents.** The
+completeness watermarks, the feeder's checkpoint and its published position all
+live on the archive, so a router that cannot reach it does not know what the
+fast tier is allowed to answer or how far mirroring has got. It therefore
+refuses to start rather than guess: `error: ping cold tier: server selection
+error`. A router restart during an archive outage leaves the application with
+nothing, including the reads the fast tier could have served alone. Plan
+restarts accordingly, and remember that on day one almost every read needs the
+archive anyway.
+
+An archive *failover* is a different matter and was measured rather than
+assumed. With its primary stepped down under load, and both kinds of read
+running throughout, nothing failed: 19 reads the fast tier owned and 13 that
+fell through, all answered correctly while the set elected a new primary. The
+driver's own retry absorbs it.
+
+**15. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
