@@ -25,6 +25,8 @@ P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin'}
+# The collection whose mirror the archive's unique index refuses.
+DNS=tdup
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-50s %s
@@ -64,7 +66,7 @@ OID2=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 992)
 
 echo "== setup =="
 stopDaemons
-for t in orders tttl tdrop tbig tconc; do
+for t in orders tttl tdrop tbig tconc $DNS; do
   H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
 done
@@ -240,6 +242,52 @@ waitBig2() { for _ in $(seq 1 60); do
 waitBig2
 chk "a later write still reaches the archive" "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:778}))")"
+
+echo "== a document the archive's unique index refuses =="
+# The other way one document stops everything. The fast tier accepts a value the
+# archive already holds, the archive's unique index refuses the mirror, and no
+# retry of it can ever succeed because the value belongs to another live archive
+# document. Measured before the fix, on an adoption: 85 identical reopens in 85
+# seconds, and an order written through the router afterwards never reached the
+# archive at all.
+#
+# Written straight at the fast tier rather than through the router, because the
+# router enforces this constraint itself and would refuse it. That is the point:
+# this is what reaches the feeder when something else put the duplicate there,
+# such as a unique index added to the archive alone, or a writer that does not
+# go through the router.
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$DNS;
+   c.createIndex({code:1},{unique:true,name:'code_1'});
+   c.insertOne({_id:1, code:'DUP'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:2, code:'DUP'})" >/dev/null
+waitDup() { for _ in $(seq 1 60); do
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:\$1}))")" = "1" ] && return 0; sleep 0.5; done; }
+sleep 6
+chk "the archive keeps the document it had"   "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:1}))")"
+chk "and does not gain the one it refuses"    "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:2}))")"
+# Everything below is the point: one document it cannot mirror must not stop it
+# mirroring anything else.
+chk "the feeder is still mirroring"           "1" "$(pgrep -fc "cline feeder --config $WDIR/" || true)"
+H "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:3, code:'OTHER'})" >/dev/null
+waitDup 3
+chk "a later write still reaches the archive" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:3}))")"
+# And a different namespace, since the change stream is one stream over all of
+# them and a jam on this one stops every other one behind it.
+H "db.getSiblingDB(process.env.TC_DB).tconc.insertOne({_id:9001, after:1})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tconc.countDocuments({_id:9001}))")" = "1" ] && break
+  sleep 0.5
+done
+chk "and so does a write to another namespace" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tconc.countDocuments({_id:9001}))")"
+H "db.getSiblingDB(process.env.TC_DB).tconc.deleteOne({_id:9001})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
 
 echo "== authentication failures pass through =="
 chk "a wrong password is rejected" "true" "$(mongosh --port $PORT -u dba -p wrongpassword --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed|AuthenticationFailed' && echo true || echo false)"

@@ -60,6 +60,9 @@ feeder:
     - "shop.tttl"
     - "shop.tdrop"
     - "shop.tbig"
+    # testlife.sh: the collection the archive has a unique index on and the
+    # fast tier does not, which is what the feeder cannot mirror.
+    - "shop.tdup"
     - "shop.tconc"
     - "shop.tbulk"
     - "shop.bench"

@@ -297,6 +297,11 @@ func (f *Feeder) publishPosition(ctx context.Context) {
 // "Resulting document after update is larger than 16777216".
 const bsonObjectTooLarge = 10334
 
+// duplicateKey is what MongoDB answers when a write violates a unique index.
+// On the mirroring path it means the archive holds another live document with
+// this value, so no retry of this document can ever succeed.
+const duplicateKey = 11000
+
 // writeBatch mirrors one namespace's batch, repairing the one failure it can
 // repair rather than retrying it for ever.
 //
@@ -311,6 +316,16 @@ const bsonObjectTooLarge = 10334
 // So the body is dropped to make room for the mark. That loses the archive's
 // audit copy of one document, which is worth much less than never returning a
 // deleted one, and it is said out loud rather than inferred.
+//
+// The second is a document the archive's unique index refuses, which happens
+// when the fast tier accepted a value the archive already holds. Measured on an
+// adoption: 85 identical reopens in 85 seconds, and an order written through
+// the router afterwards never reached the archive at all. No retry can succeed,
+// because the value is taken by another live archive document, so the document
+// is left out of the batch and named. It stays on the fast tier and the evictor
+// will not remove it, since a document the archive does not hold is never
+// evicted, so the cost is an archive that is missing one document until the
+// duplicate is resolved. That is worth far less than all mirroring stopping.
 func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.WriteModel,
 	ops []pendingOp, now time.Time) (*mongo.BulkWriteResult, error) {
 
@@ -324,6 +339,22 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 		res, err := c.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(true))
 		if err == nil {
 			return res, nil
+		}
+		if i, dup, ok := refusedByUniqueIndex(err, ops); ok {
+			f.log.Error("the archive refuses a document the fast tier accepted, leaving it unmirrored",
+				"ns", ns,
+				"id", dup.id.String(),
+				"err", dup.msg,
+				"reason", "another live document in the archive already holds this unique value",
+				"effect", "the archive does not hold this document, and the evictor will not remove it from the fast tier",
+				"action", "resolve the duplicate, then re-run the write; see cline keys --rebuild",
+				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
+			models = append(models[:i:i], models[i+1:]...)
+			ops = append(ops[:i:i], ops[i+1:]...)
+			if len(models) == 0 {
+				return &mongo.BulkWriteResult{}, nil
+			}
+			continue
 		}
 		op, ok := oversizedTombstone(err, ops)
 		if !ok {
@@ -340,6 +371,35 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 		}
 	}
 	return nil, fmt.Errorf("mirroring %s made no progress", ns)
+}
+
+// refusedByUniqueIndex reports whether a bulk write failed because the archive's
+// unique index refuses one of its documents, and which one.
+//
+// It returns the position in the batch, because the answer is to leave that
+// document out rather than to repair it: the value belongs to another live
+// document in the archive and nothing the feeder can do here changes that.
+func refusedByUniqueIndex(err error, ops []pendingOp) (int, refusedDoc, bool) {
+	var bwe mongo.BulkWriteException
+	if !errors.As(err, &bwe) {
+		return 0, refusedDoc{}, false
+	}
+	for _, we := range bwe.WriteErrors {
+		if we.Code != duplicateKey {
+			continue
+		}
+		if we.Index < 0 || we.Index >= len(ops) {
+			continue
+		}
+		return we.Index, refusedDoc{id: ops[we.Index].id, msg: we.Message}, true
+	}
+	return 0, refusedDoc{}, false
+}
+
+// refusedDoc is one document the archive would not take, and why.
+type refusedDoc struct {
+	id  bson.RawValue
+	msg string
 }
 
 // oversizedTombstone reports whether a bulk write failed because a tombstone

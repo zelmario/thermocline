@@ -1176,6 +1176,25 @@ carrying that mark never succeeds, so the feeder reopens its change stream on
 the same event again and again and **all** mirroring stops behind it, which was
 thirteen identical failures before the run was killed.
 
+**A document the archive's unique index refuses is the other one that stops
+everything.** The fast tier accepts a value the archive already holds, the
+mirror is refused with a duplicate key, and no retry can ever succeed because
+that value belongs to another live document in the archive. Measured on an
+adoption: 85 identical reopens in 85 seconds, and an order written through the
+router afterwards never reached the archive at all.
+
+That document is left out of the batch and named at ERROR, with the namespace,
+the `_id` and the index that refused it. The archive is then missing one
+document until the duplicate is resolved, which the evictor already handles:
+a document the archive does not hold is never removed from the fast tier, so
+nothing is lost, it is only unarchived. Every other document, in that namespace
+and every other, goes on mirroring.
+
+The router will not let this happen through itself, because it enforces the
+archive's unique indexes across both tiers. What reaches the feeder is a
+duplicate something else put there: a unique index added to the archive alone,
+or a writer that does not go through the router.
+
 **`_tcDeletedAt` is therefore a reserved field name**, along with
 `_tcBodyDropped`. An application that sets either on its own documents will find
 them treated as deleted the moment they are served from the archive: still
