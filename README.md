@@ -1104,6 +1104,26 @@ That distinction is the whole point: a fast tier built empty has no claim, and
 answering range queries from it would return short results and call them
 success. Range queries are refused until something records a claim.
 
+**A rule with no `date_field` reads each document's age from the timestamp
+inside its `_id`, and that only exists in an ObjectId.** Against any other `_id`
+type the rule does not merely approximate, it addresses nothing: MongoDB
+brackets range predicates by BSON type, so `_id < ObjectId(cutoff)` matches no
+integer, string or UUID `_id` at all. Sorting uses the canonical type order;
+queries do not.
+
+Obeying such a rule is silent in both directions. The evictor sweeps, reports
+success and tiers nothing, for ever. The warmer copies nothing, concludes the
+window is done and records a completeness claim over a fast tier it never
+filled. Measured on an adopted collection of ten integer-keyed documents: the
+warmer reported `warm complete, scanned 0` and claimed it complete for all of
+history, and the router then answered `countDocuments({})` with **0** where the
+original cluster answers 10. The collection had disappeared and every component
+reported success.
+
+Both now refuse such a rule at ERROR, naming the namespace and telling you to
+set `date_field`. Refusing leaves no claim, so reads fall through to the archive
+and the application keeps seeing its data while the configuration is corrected.
+
 **A claim on a boundary cannot answer a query with no lower bound**, and that is
 most of what an application asks. "Complete for everything newer than T" covers
 a query that says `at >= T`; it cannot cover `find({customer: X})`, because that

@@ -327,6 +327,29 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		w.indexer.Ensure(ctx, rule.NS)
 	}
 
+	// A rule with no date_field reads a document's age from the timestamp
+	// inside its _id, and against any other _id type it addresses nothing at
+	// all. Warming such a rule copies nothing, concludes the window is done and
+	// records a claim over a fast tier it never filled, which is the one
+	// mistake this component must not make. See meta.IDsAreNotObjectIDs.
+	if rule.UsesObjectIDTime() {
+		db, coll := splitNS(rule.NS)
+		wrong, err := meta.IDsAreNotObjectIDs(ctx, w.cold, db, coll)
+		if err != nil {
+			return stats, err
+		}
+		if wrong {
+			w.log.Error("not warming a namespace this rule cannot address",
+				"ns", rule.NS,
+				"reason", "the rule takes each document's age from the timestamp inside its _id, and this "+
+					"collection's _id values are not ObjectIds",
+				"effect", "the range this rule asks for matches no document, so warming it would copy "+
+					"nothing and then claim the fast tier holds everything",
+				"action", "set date_field on this rule to the field that carries the document's date")
+			return stats, nil
+		}
+	}
+
 	w.log.Info("warming",
 		"ns", rule.NS,
 		"back", rule.Back.String(),

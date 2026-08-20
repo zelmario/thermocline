@@ -140,6 +140,36 @@ chk "an unbounded query still finds them all"  "20" \
 AFTER=$(arch)
 chk "and no part of it went to the archive"    "0" "$(( ${AFTER:-0} - ${BEFORE:-1} ))"
 
+echo "== a rule that cannot address the collection it names =="
+# With no date_field a rule reads each document's age from the timestamp inside
+# its _id, which only an ObjectId has. MongoDB brackets range predicates by BSON
+# type, so against integer, string or UUID _ids the range matches nothing at
+# all. Sorting uses the canonical type order; queries do not.
+#
+# Obeying such a rule is silent in both directions. Measured before this was
+# refused, on ten integer-keyed documents held only by the archive: the warmer
+# reported "warm complete, scanned 0" and then claimed the collection complete
+# for all of history, and the router answered countDocuments({}) with 0 where
+# the original cluster answers 10. The collection had disappeared and every part
+# of the system reported success.
+H "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tintid.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i})))" >/dev/null
+chk "the archive holds them, the fast tier does not" "10/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tintid.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).tintid.countDocuments({}))")"
+rm -f $LOGDIR/warm_intid.log
+cline warmer --config $CFG --log-file $LOGDIR/warm_intid.log >/dev/null 2>&1
+chk "the warmer refuses the rule and says why"      "true" \
+    "$(grep -q 'cannot address' $LOGDIR/warm_intid.log && echo true || echo false)"
+chk "and it claims nothing for that namespace"      "true" \
+    "$(cline watermark --config $CFG --ns $DB.tintid 2>&1 | grep -q 'claims nothing' && echo true || echo false)"
+# The consequence, which is the whole point: with no claim the read falls
+# through to the archive and the application still sees its collection.
+chk "the application still sees every document"     "10" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tintid.countDocuments({}))")"
+H "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null
+
 echo "== a hole inside the claimed range must withdraw the claim =="
 # Eight documents vanish from the fast tier. The archive still has them live, so
 # this is loss, not deletion, and the claim is now a lie.

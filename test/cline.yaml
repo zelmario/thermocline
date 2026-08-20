@@ -126,6 +126,10 @@ feeder:
     # documents do not: a default collation and a validator, both of which live
     # only on the archive until something puts them on the fast tier.
     - "shop.tidxopt"
+    # testwarm.sh: a collection whose _id values are not ObjectIds, which is
+    # what a rule reading a document's age from the _id timestamp cannot
+    # address at all.
+    - "shop.tintid"
     # testexplain.sh
     - "shop.texpl"
     # testunack.sh, the writes that ask for no acknowledgement
@@ -190,6 +194,10 @@ warmer:
   residency: 5m
   rules:
     - ns: "shop.orders"
+      back: 40m
+    # Deliberately with no date_field, against a collection keyed by integers.
+    # testwarm.sh checks that this is refused rather than obeyed.
+    - ns: "shop.tintid"
       back: 40m
   backoff:
     max_replication_lag: 10s

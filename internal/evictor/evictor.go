@@ -184,6 +184,28 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule) (Stats,
 	db, coll := splitNS(rule.NS)
 	hotColl := e.hot.Database(db).Collection(coll)
 
+	// The same rule the warmer refuses, for the same reason. With no date_field
+	// the age comes from the timestamp inside an ObjectId _id, and MongoDB
+	// brackets range predicates by type, so against any other _id type the
+	// candidate query matches nothing. The evictor then sweeps for ever,
+	// reports success every time and tiers nothing at all.
+	if rule.UsesObjectIDTime() {
+		wrong, err := meta.IDsAreNotObjectIDs(ctx, e.cold, db, coll)
+		if err != nil {
+			return stats, err
+		}
+		if wrong {
+			e.log.Error("not evicting a namespace this rule cannot address",
+				"ns", rule.NS,
+				"reason", "the rule takes each document's age from the timestamp inside its _id, and this "+
+					"collection's _id values are not ObjectIds",
+				"effect", "the range this rule asks for matches no document, so this namespace is never tiered "+
+					"and the fast tier grows without bound",
+				"action", "set date_field on this rule to the field that carries the document's date")
+			return stats, nil
+		}
+	}
+
 	boundary := cutoff(time.Now(), rule.OlderThan.D())
 	e.log.Info("evicting",
 		"ns", rule.NS,

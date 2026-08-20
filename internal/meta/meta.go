@@ -389,3 +389,38 @@ func ReadCacheAdvice(ctx context.Context, cold *mongo.Client) ([]CacheAdviceRepo
 	}
 	return out, nil
 }
+
+// IDsAreNotObjectIDs reports whether the archive holds a live document in this
+// namespace whose _id is not an ObjectId.
+//
+// A warm or eviction rule with no date_field reads a document's age from the
+// timestamp inside its _id, which only exists in an ObjectId. Against any other
+// _id type the rule is not merely approximate, it addresses nothing:
+// MongoDB brackets range predicates by BSON type, so `_id < ObjectId(cutoff)`
+// and `_id >= ObjectId(floor)` match no integer, string or UUID _id at all.
+// Sorting uses the canonical type order; queries do not.
+//
+// The consequences are silent in both directions and neither looks like a
+// misconfiguration. The evictor scans nothing and tiers nothing, for ever. The
+// warmer copies nothing, concludes the window is done and records a
+// completeness claim over a fast tier it never filled. Measured on an adopted
+// collection of ten integer-keyed documents: the warmer reported "warm
+// complete, scanned 0" and claimed the collection complete for all of history,
+// and the router then answered countDocuments({}) with 0 where the original
+// cluster answers 10. The collection had disappeared, and every part of the
+// system reported success.
+//
+// One document is enough to answer, and the query is by _id type against an
+// index that always exists.
+func IDsAreNotObjectIDs(ctx context.Context, cold *mongo.Client, db, coll string) (bool, error) {
+	n, err := cold.Database(db).Collection(coll).CountDocuments(ctx,
+		bson.D{
+			NotArchivedDeleted(),
+			{Key: "_id", Value: bson.D{{Key: "$not", Value: bson.D{{Key: "$type", Value: "objectId"}}}}},
+		},
+		options.Count().SetLimit(1))
+	if err != nil {
+		return false, fmt.Errorf("check the _id type of %s.%s: %w", db, coll, err)
+	}
+	return n > 0, nil
+}
