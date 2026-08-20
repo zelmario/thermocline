@@ -199,6 +199,15 @@ type WarmerConfig struct {
 	// Backoff holds the fast tier health limits. The warmer writes to the fast
 	// tier, so it backs off on the same signals the evictor does.
 	Backoff BackoffConfig `yaml:"backoff"`
+	// MinFreeDisk is the fraction of the fast tier's filesystem that must stay
+	// free, as a number between 0 and 1. Zero turns the check off.
+	//
+	// It lives here rather than in Backoff because only the warmer may act on
+	// it. The warmer fills the fast tier and a warm window is bounded by time
+	// rather than by size, so a window chosen from the age of the data instead
+	// of the size of the tier fills the disk. Holding the evictor back on the
+	// same signal would stop the one thing that makes room.
+	MinFreeDisk float64 `yaml:"min_free_disk"`
 }
 
 // WarmRule says how far back one namespace should be filled.

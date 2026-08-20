@@ -33,11 +33,19 @@ type Reading struct {
 	OplogWindow       time.Duration
 
 	// Missing names the checks that could not be taken, usually a permissions
+	// FreeDisk is the fraction of the fast tier's filesystem still free, from
+	// dbStats. The warmer acts on it; the evictor deliberately does not.
+	FreeDisk float64
+
 	// problem or a MongoDB version that reports the metric elsewhere.
 	Missing []string
 }
 
 func (r *Reading) missing(name string) { r.Missing = append(r.Missing, name) }
+
+// IsMissingSignal reports whether a named reading could not be taken, for
+// callers outside this package that act on one of them.
+func (r Reading) IsMissingSignal(name string) bool { return r.isMissing(name) }
 
 func (r Reading) isMissing(name string) bool {
 	for _, m := range r.Missing {
@@ -112,6 +120,7 @@ func (c *Checker) Sample(ctx context.Context) Reading {
 	c.sampleServerStatus(ctx, &r)
 	c.sampleReplicationLag(ctx, &r)
 	c.sampleOplogWindow(ctx, &r)
+	c.sampleFreeDisk(ctx, &r)
 	return r
 }
 
@@ -253,6 +262,31 @@ func (c *Checker) sampleReplicationLag(ctx context.Context, r *Reading) {
 		return
 	}
 	r.ReplicationLag = max(primary.Sub(oldest), 0)
+}
+
+// sampleFreeDisk reads what fraction of the fast tier's filesystem is still
+// free, from dbStats, which reports the filesystem the data sits on.
+//
+// This is the one signal that ends a deployment rather than slowing it. The
+// warmer fills the fast tier, the fast tier is by definition smaller than the
+// archive, and a warm window is bounded by time rather than by size, so a
+// window chosen from the age of the data instead of the size of the tier fills
+// the disk. On the first day of an adoption the evictor cannot make room
+// either, because a new replica set's oplog window is its own age.
+//
+// Only the warmer acts on it. Pausing the evictor when a disk is nearly full
+// would hold back the one thing that frees space.
+func (c *Checker) sampleFreeDisk(ctx context.Context, r *Reading) {
+	var stats struct {
+		FsUsedSize  int64 `bson:"fsUsedSize"`
+		FsTotalSize int64 `bson:"fsTotalSize"`
+	}
+	err := c.hot.Database("admin").RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&stats)
+	if err != nil || stats.FsTotalSize <= 0 {
+		r.missing("free disk")
+		return
+	}
+	r.FreeDisk = float64(stats.FsTotalSize-stats.FsUsedSize) / float64(stats.FsTotalSize)
 }
 
 func (c *Checker) sampleOplogWindow(ctx context.Context, r *Reading) {

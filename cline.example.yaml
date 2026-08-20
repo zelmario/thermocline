@@ -163,6 +163,17 @@ warmer:
   # warm followed by an eviction sweep undoes itself.
   residency: 30d
 
+  # The fraction of the fast tier's filesystem that must stay free, or 0 to turn
+  # the check off. The warmer pauses below it and says so.
+  #
+  # This is the warmer's alone, deliberately. A warm window is bounded by time
+  # and not by size, so a window chosen from the age of the data rather than the
+  # size of the tier fills the disk; and on the first day of an adoption the
+  # evictor cannot make room, because a new replica set's oplog window is its
+  # own age. Holding the evictor back on the same signal would stop the one
+  # thing that frees space.
+  min_free_disk: 0.15
+
   rules:
     - ns: "app.orders"
       # Fill the fast tier back this far. This is what moves the completeness

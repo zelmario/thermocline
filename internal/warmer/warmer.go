@@ -619,6 +619,19 @@ func (w *Warmer) waitForHealth(ctx context.Context) (bool, error) {
 		reading := w.check.Sample(ctx)
 		reading.Missing = dropMissing(reading.Missing, "feeder lag")
 		verdict := health.Evaluate(reading, w.cfg.Backoff, 0)
+		// Free disk is the warmer's alone. It fills the fast tier, which is
+		// smaller than the archive by design, and a warm window is bounded by
+		// time rather than by size: a window chosen from the age of the data
+		// instead of the size of the tier fills the disk. On the first day of
+		// an adoption the evictor cannot make room either, because a new
+		// replica set's oplog window is its own age. The evictor is not held
+		// back on this signal, because it is what frees the space.
+		if verdict.OK && w.cfg.MinFreeDisk > 0 && !reading.IsMissingSignal("free disk") &&
+			reading.FreeDisk < w.cfg.MinFreeDisk {
+			verdict = health.Verdict{Reason: fmt.Sprintf(
+				"the fast tier's filesystem is %.1f%% free, limit %.1f%%",
+				reading.FreeDisk*100, w.cfg.MinFreeDisk*100)}
+		}
 		if verdict.OK {
 			if waited {
 				w.log.Info("resuming warm")

@@ -140,6 +140,35 @@ chk "an unbounded query still finds them all"  "20" \
 AFTER=$(arch)
 chk "and no part of it went to the archive"    "0" "$(( ${AFTER:-0} - ${BEFORE:-1} ))"
 
+echo "== the warm stops before it fills the disk =="
+# The one failure that ends a deployment rather than slowing it. The warmer
+# fills the fast tier, which is smaller than the archive by design, and a warm
+# window is bounded by time and not by size: a window chosen from the age of the
+# data rather than the size of the tier fills the disk. On the first day of an
+# adoption the evictor cannot make room either, because a new replica set's
+# oplog window is its own age.
+#
+# The limit is set above what is actually free, which is what a tier about to
+# fill looks like from here.
+# Scoped to the warmer block: `residency:` appears under router: too, and an
+# unscoped substitution put the limit in both, where the router does not read it.
+sed '/^warmer:/,/^router:/{s/^  residency: .*/&\n  min_free_disk: 0.99/}' $CFG > $WDIR/nodisk.yaml
+chk "the derived config sets a free disk floor"    "1" \
+    "$(grep -c 'min_free_disk: 0.99' $WDIR/nodisk.yaml)"
+# There has to be something to fill, or the warmer reports "already complete"
+# and never reaches the loop the limit is checked in. An earlier section leaves
+# a claim on this namespace, so withdraw it first.
+cline watermark --config $CFG --ns $DB.$NS --clear >/dev/null 2>&1
+rm -f $LOGDIR/warm_disk.log
+timeout 40 cline warmer --config $WDIR/nodisk.yaml --log-file $LOGDIR/warm_disk.log >/dev/null 2>&1
+chk "the warmer pauses and says how full it is"    "true" \
+    "$(grep -qE "filesystem is .* free, limit" $LOGDIR/warm_disk.log && echo true || echo false)"
+# And the evictor must not be held back by the same thing: it is what makes room.
+rm -f $LOGDIR/evict_disk.log
+cline evictor --config $WDIR/nodisk.yaml --once --log-file $LOGDIR/evict_disk.log >/dev/null 2>&1
+chk "the evictor is not paused by a full disk"     "0" \
+    "$(grep -c "filesystem is" $LOGDIR/evict_disk.log || true)"
+
 echo "== a rule that cannot address the collection it names =="
 # With no date_field a rule reads each document's age from the timestamp inside
 # its _id, which only an ObjectId has. MongoDB brackets range predicates by BSON
