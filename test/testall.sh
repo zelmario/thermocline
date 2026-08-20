@@ -99,7 +99,11 @@ echo "== warmer =="
 ok "--dry-run"                          0 "warm complete"     -- cline warmer --config $CFG --dry-run
 ok "normal run"                         0 "warm complete"     -- cline warmer --config $CFG
 ok "-v verbose"                         0 "warm complete"     -- cline warmer --config $CFG -v
-sed '/^warmer:/,/^router:/{/  rules:/,/    back:/d}' $CFG > $WDIR/nowarm.yaml
+# Delete the whole rules block, not one rule. The old range ended at the first
+# `back:`, so a second warm rule in the shared config left a dangling list item
+# and the config would not parse at all, which reads as the warmer rejecting a
+# valid file. The evictor fixture above was fixed for the same reason.
+sed '/^warmer:/,/^router:/{/^  rules:/,/^  backoff:/{/^  backoff:/!d}}' $CFG > $WDIR/nowarm.yaml
 ok "no warmer rules"                    1 "rules is empty"    -- cline warmer --config $WDIR/nowarm.yaml
 
 echo "== evictor =="
