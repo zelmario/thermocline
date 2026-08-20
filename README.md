@@ -1387,7 +1387,37 @@ nothing is evicted on the first day. That is the guard working, and it says so:
 `eviction paused, reason="oplog window is 3h20m, limit 24h"`. Lower the limit
 only if you understand what it protects.
 
-**11. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**11. Size the fast tier for the key registry as well as the documents.** Every
+unique value gets a claim in `_thermocline.keys`, on the fast tier, and claims
+are permanent by design: one has to outlive the document it protects. After
+`cline keys --rebuild` on a cluster adopted with data already in it, that is one
+claim for every document the collection has, multiplied by the number of unique
+indexes on it.
+
+Measured on 20,000 documents with one unique index: 147 bytes per claim
+uncompressed, 56 on disk, and a registry of 1.1 MB beside a collection of
+0.3 MB. The ratio is a function of how big your documents are and means little;
+the per claim figure is the one to plan with. Fifty million documents with one
+unique index is on the order of three gigabytes of registry, on the tier you
+sized for a hot window.
+
+**12. Know how to go back before you need to.** The feeder mirrors every write
+into the archive, so the archive stays current and rolling back is repointing
+the application at it. One thing has to happen first: a delete is mirrored as a
+mark and not as a removal, so every document deleted since the cutover is still
+physically there carrying `_tcDeletedAt`. The router filters those out of every
+answer and a client reading the cluster directly does not.
+
+Measured: three documents in the collection, one of them deleted through the
+router, and the original cluster answering `countDocuments({})` with 3 where the
+router answers 2. Clear them per tiered namespace before you point anything at
+it, and the count agrees again:
+
+```
+db.getSiblingDB("app").orders.deleteMany({_tcDeletedAt: {$exists: true}})
+```
+
+**13. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
