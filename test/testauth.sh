@@ -126,6 +126,36 @@ chk "a restricted distinct still refused"               "DENIED" "$(L "
 chk "a restricted aggregation still refused"            "DENIED" "$(L "
   try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}}]).toArray().length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 
+echo "== an account the archive has and the fast tier does not =="
+# Certain in an adoption rather than merely possible. The existing cluster
+# carries the application's users; the fast tier is a new replica set and
+# carries none of them. The router authenticates against the fast tier, so every
+# connection is refused with MongoDB's ordinary authentication failure and
+# nothing connects that failure to the tier missing the account.
+#
+# The refusal is correct. The silence is the failure, so this checks the router
+# says which accounts and what to do, once, at startup.
+C "try{db.getSiblingDB('admin').dropUser('oldapp')}catch(e){}
+   db.getSiblingDB('admin').createUser({user:'oldapp',pwd:'oldpass',roles:[{role:'read',db:process.env.TC_DB}]})" >/dev/null 2>&1
+chk "the archive has it and the fast tier does not"  "1/0" \
+    "$(C "print(db.getSiblingDB('admin').system.users.countDocuments({user:'oldapp'}))")/$(H "print(db.getSiblingDB('admin').system.users.countDocuments({user:'oldapp'}))")"
+stopDaemons
+rm -f $LOGDIR/auth_users.log
+startFeeder
+cline router --config $CFG --log-file $LOGDIR/auth_users.log & RP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the router names it at startup"                 "true" \
+    "$(grep -q 'oldapp@admin' $LOGDIR/auth_users.log && echo true || echo false)"
+chk "and says to create it on the fast tier"         "true" \
+    "$(grep -qE 'create them on the fast tier' $LOGDIR/auth_users.log && echo true || echo false)"
+# The behaviour itself is unchanged and correct: the account cannot log in.
+chk "and the account still cannot log in"            "true" \
+    "$(mongosh --port $PORT -u oldapp -p oldpass --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed' && echo true || echo false)"
+C "try{db.getSiblingDB('admin').dropUser('oldapp')}catch(e){}" >/dev/null 2>&1
+
 H "db.getSiblingDB('admin').dropUser('limited')" >/dev/null 2>&1
 stopDaemons
 echo

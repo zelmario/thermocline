@@ -262,6 +262,75 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 	}
 }
 
+// warnAboutMissingUsers names accounts the archive has that the fast tier does
+// not, because the application will not be able to log in with them.
+//
+// This is certain in an adoption rather than merely possible. The existing
+// cluster carries the application's users; the fast tier is a new replica set
+// and carries none of them. The router authenticates against the fast tier,
+// either by reading admin.system.users itself when it terminates
+// authentication or by forwarding the handshake, so on day one every
+// connection is refused with MongoDB's ordinary authentication failure and
+// nothing connects the failure to the tier that is missing the account.
+//
+// Said once at startup, naming them, because the fix is a minute's work and
+// finding out what to fix is the part that costs an afternoon.
+//
+// Reading admin.system.users needs a privilege the router's own account may not
+// have when it is not terminating authentication, so a refusal here is logged
+// at debug and nothing more: this is a courtesy, not a precondition.
+func (r *Router) warnAboutMissingUsers(ctx context.Context) {
+	cold, cerr := usersIn(ctx, r.cold)
+	if cerr != nil {
+		r.log.Debug("could not read the archive's users to compare them", "err", cerr)
+		return
+	}
+	hot, herr := usersIn(ctx, r.hot)
+	if herr != nil {
+		r.log.Debug("could not read the fast tier's users to compare them", "err", herr)
+		return
+	}
+
+	var missing []string
+	for u := range cold {
+		if !hot[u] {
+			missing = append(missing, u)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	r.log.Warn("the archive has accounts the fast tier does not",
+		"users", missing,
+		"meaning", "the router authenticates against the fast tier, so these cannot log in and the "+
+			"application sees an ordinary authentication failure",
+		"action", "create them on the fast tier with the same names, passwords and roles")
+}
+
+// usersIn lists user@db for every account a tier holds.
+func usersIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+	cur, err := client.Database("admin").Collection("system.users").
+		Find(ctx, bson.D{}, options.Find().SetProjection(bson.D{{Key: "user", Value: 1}, {Key: "db", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	out := map[string]bool{}
+	for cur.Next(ctx) {
+		var u struct {
+			User string `bson:"user"`
+			DB   string `bson:"db"`
+		}
+		if cur.Decode(&u) != nil || u.User == "" {
+			continue
+		}
+		out[u.User+"@"+u.DB] = true
+	}
+	return out, cur.Err()
+}
+
 // ensureFastTierIndexes gives the fast tier the archive's indexes for every
 // namespace this router manages, before it accepts a client.
 //

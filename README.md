@@ -768,6 +768,15 @@ before it fills a namespace, the router the first time it copies a document up,
 and the router at startup for every namespace it manages that the archive
 already holds. Once built, never again.
 
+**The accounts are the other thing the new tier does not have.** The existing
+cluster carries the application's users; the fast tier is a new replica set and
+carries none of them. The router authenticates against the fast tier, so on day
+one every connection is refused with MongoDB's ordinary `Authentication failed`
+and nothing connects that message to the tier missing the account. The refusal
+is correct; the silence is the failure. The router now names them once at
+startup, and creating them on the fast tier with the same names, passwords and
+roles is the whole fix.
+
 **The collection comes before its indexes, for the same reason and with worse
 consequences.** A collection is more than its documents, and everything about it
 other than documents arrives on the fast tier only if something puts it there.

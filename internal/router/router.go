@@ -242,6 +242,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	}
 	r.warnAboutMissingWatermarks(ctx)
 	r.warnAboutStrandedCollections(ctx)
+	r.warnAboutMissingUsers(ctx)
 	// Before the listener opens: a unique index the fast tier is missing is one
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
