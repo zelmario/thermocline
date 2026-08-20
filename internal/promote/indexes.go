@@ -2,6 +2,7 @@ package promote
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -96,6 +97,12 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 func (ix *Indexer) build(ctx context.Context, ns string) error {
 	db, coll := splitNS(ns)
 
+	// The collection before the indexes, because two of its options decide
+	// answers and cannot be added afterwards.
+	if err := ix.createWithOptions(ctx, db, coll); err != nil {
+		return err
+	}
+
 	want, err := archiveIndexes(ctx, ix.cold, db, coll)
 	if err != nil {
 		return err
@@ -139,6 +146,111 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 		"ns", ns, "indexes", names,
 		"why", "the fast tier is filled with documents and an index is not a document")
 	return nil
+}
+
+// createWithOptions makes the fast tier's copy of a collection the way the
+// archive has it, before anything inserts into it.
+//
+// A collection is more than its documents, and the fast tier is filled with
+// documents. Everything else about it arrives only if something puts it there,
+// and in an adoption nothing does: the existing cluster becomes the archive
+// carrying the application's collections as they are, and the fast tier's copy
+// is brought into existence by the first insert, which carries no options at
+// all. Two of them decide answers rather than performance:
+//
+// A default collation decides which documents match. Measured on an adopted
+// collection created with {locale: "en", strength: 2}: the application's own
+// cluster answers countDocuments({name: "alice"}) with 2, and the same query
+// through the router answered 1 as soon as the fast tier held the documents.
+// No error, no warning, a different answer to the query it has always run.
+//
+// A validator decides which writes are refused. Measured on the same adoption:
+// a write the archive rejects was accepted through the router, so a rule the
+// application had relied on stopped applying on the day it was adopted.
+//
+// Neither can be added to a collection that already holds documents in a way
+// that fixes the past, and a collation cannot be added at all. So this runs
+// before the first insert: at router startup for every managed namespace, and
+// from the warmer before it fills one.
+//
+// capped and timeseries are deliberately not carried. A capped fast tier would
+// remove its own oldest documents, the feeder would read those removals as the
+// application deleting them, and the archive would tombstone the history it
+// exists to keep. Those are refused rather than copied; see the feeder's
+// collection kind check.
+func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error {
+	opts, err := archiveCollectionOptions(ctx, ix.cold, db, coll)
+	if err != nil || opts == nil {
+		return err
+	}
+
+	names, err := ix.hot.Database(db).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return fmt.Errorf("list %s.%s on the fast tier: %w", db, coll, err)
+	}
+	if len(names) > 0 {
+		// Already there. Adding a collation now would not apply to what it
+		// already holds, and MongoDB does not allow it either.
+		return nil
+	}
+
+	cmd := bson.D{{Key: "create", Value: coll}}
+	cmd = append(cmd, opts...)
+	if err := ix.hot.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
+		// A racing insert is the expected way to lose here, and it is not
+		// worth failing the index build over.
+		if isNamespaceExists(err) {
+			return nil
+		}
+		return fmt.Errorf("create %s.%s on the fast tier: %w", db, coll, err)
+	}
+	carried := make([]string, 0, len(opts))
+	for _, e := range opts {
+		carried = append(carried, e.Key)
+	}
+	ix.log.Info("created the collection on the fast tier the way the archive has it",
+		"ns", db+"."+coll, "options", carried,
+		"why", "a collation decides which documents match and a validator which writes are refused, "+
+			"and neither arrives with the documents")
+	return nil
+}
+
+// archiveCollectionOptions reads the options worth carrying upward, or nil when
+// the archive has no such collection or nothing to carry.
+func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll string) (bson.D, error) {
+	cur, err := cold.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return nil, fmt.Errorf("list %s.%s in the archive: %w", db, coll, err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	if !cur.Next(ctx) {
+		return nil, cur.Err()
+	}
+	var raw bson.Raw
+	if err := cur.Decode(&raw); err != nil {
+		return nil, err
+	}
+	odoc, ok := raw.Lookup("options").DocumentOK()
+	if !ok {
+		return nil, nil
+	}
+
+	var out bson.D
+	// Order matters only for reading the log line back; MongoDB does not care.
+	for _, key := range []string{"collation", "validator", "validationLevel", "validationAction"} {
+		if v, lerr := odoc.LookupErr(key); lerr == nil {
+			out = append(out, bson.E{Key: key, Value: v})
+		}
+	}
+	return out, nil
+}
+
+// isNamespaceExists reports MongoDB's "collection already exists", which is the
+// benign outcome of racing an insert.
+func isNamespaceExists(err error) bool {
+	var ce mongo.CommandError
+	return errors.As(err, &ce) && ce.Code == 48
 }
 
 // splitNS is db.collection, split at the first dot, which is where MongoDB

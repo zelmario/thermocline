@@ -32,6 +32,7 @@ HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tidx
 ANS=tidxadopt
+ONS=tidxopt
 N=${N:-40000}
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
@@ -281,6 +282,62 @@ chk "and mirroring is still running behind it"     "true" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({code:'B-001'})===1)")"
 H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+
+echo "== the options an adopted collection carries, which documents do not =="
+# A collection is more than its documents, and the fast tier is filled with
+# documents. In an adoption the existing cluster becomes the archive carrying
+# its collections as they are, and the fast tier's copy is brought into
+# existence by the first insert, which carries no options at all.
+#
+# Two of them decide answers rather than speed. Measured before this was fixed,
+# on a collection created with {locale:'en',strength:2}: the application's own
+# cluster answered countDocuments({name:'alice'}) with 2 and the router answered
+# 1 as soon as the fast tier held the documents. And a write the archive's
+# validator rejects was accepted. Neither said anything.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+C "const d=db.getSiblingDB(process.env.TC_DB);
+   d.createCollection('$ONS', {collation:{locale:'en',strength:2},
+     validator:{\$jsonSchema:{bsonType:'object',required:['email'],
+                properties:{email:{bsonType:'string'}}}}});
+   d.$ONS.insertMany([{_id:1,name:'Alice',email:'a@x'},{_id:2,name:'alice',email:'b@x'},
+                      {_id:3,name:'BOB',email:'c@x'}]);" >/dev/null
+chk "the archive answers case-insensitively"      "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+chk "and the fast tier has never held it"         "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('$ONS'))")"
+startFeeder
+startRouter
+
+chk "the fast tier's copy carries the collation"  "en" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+chk "and the validator"                           "true" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(!!(c&&c.options&&c.options.validator))")"
+# The behaviour, not the metadata. The documents have to be on the fast tier
+# before it can be said to hold them: a point read by _id is what copies one up,
+# which is what ordinary traffic does. Claiming completeness over an empty fast
+# tier is a false claim, and the zero it then answers is correct rather than the
+# bug this is looking for.
+R "[1,2,3].forEach(i=>db.getSiblingDB(process.env.TC_DB).$ONS.findOne({_id:i}))" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({}))")" = "3" ] && break
+  sleep 0.5
+done
+chk "the fast tier holds them after the copy-up"  "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({}))")"
+# With the fast tier answering, the same query the application has always run
+# must give the same answer it has always given.
+cline watermark --config $CFG --ns $DB.$ONS --complete-all >/dev/null 2>&1
+sleep 7
+chk "the router still answers case-insensitively" "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+chk "and still refuses what the validator refuses" "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$ONS.insertOne({_id:9,email:12345});print('ACCEPTED')}catch(e){print('refused')}")"
+H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
 stopDaemons
 echo

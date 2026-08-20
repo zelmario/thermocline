@@ -768,6 +768,31 @@ before it fills a namespace, the router the first time it copies a document up,
 and the router at startup for every namespace it manages that the archive
 already holds. Once built, never again.
 
+**The collection comes before its indexes, for the same reason and with worse
+consequences.** A collection is more than its documents, and everything about it
+other than documents arrives on the fast tier only if something puts it there.
+In an adoption nothing does: the fast tier's copy is brought into existence by
+the first insert, which carries no options at all. Two of those options decide
+answers rather than performance.
+
+Measured on an adopted collection created with `{locale: "en", strength: 2}`,
+with the same three documents present on both tiers:
+
+| | the application's own cluster | through the router |
+|---|---|---|
+| `countDocuments({name: "alice"})` | 2 | **1** |
+| a write the validator rejects | refused | **accepted** |
+
+No error and no warning in either case. A query that has always matched
+case-insensitively quietly stops, and a rule the application has relied on for
+years quietly stops applying, on the day it is adopted.
+
+So the router creates the fast tier's copy the way the archive has it, before
+anything inserts into it: the default collation, the validator and its level and
+action. `capped` and `timeseries` are deliberately not carried, because a capped
+fast tier would remove its own oldest documents and the feeder would read those
+removals as the application deleting them.
+
 The third exists because the first two are both paths that fill the fast tier
 *from the archive*, and a tiered collection the application only ever writes to
 is filled by neither. Nothing warms it, no read of it falls through, so the

@@ -122,6 +122,10 @@ feeder:
     # never held it, and nothing warms it or reads it, so the application's own
     # first write is what creates it on the fast tier.
     - "shop.tidxadopt"
+    # testindexes.sh again, for the collection options an adoption carries that
+    # documents do not: a default collation and a validator, both of which live
+    # only on the archive until something puts them on the fast tier.
+    - "shop.tidxopt"
     # testexplain.sh
     - "shop.texpl"
     # testunack.sh, the writes that ask for no acknowledgement
