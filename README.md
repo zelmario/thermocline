@@ -763,16 +763,34 @@ the archive it was relieving was seeking an index. Building them costs nothing,
 because an index built on an empty collection is free and one built on a full
 one is a scan.
 
-Both fillers do it, through one implementation in `internal/promote`: the warmer
-before it fills a namespace, and the router the first time it copies a document
-up, which is the only path for a collection no warm rule covers. Once built,
-never again.
+Three paths do it, through one implementation in `internal/promote`: the warmer
+before it fills a namespace, the router the first time it copies a document up,
+and the router at startup for every namespace it manages that the archive
+already holds. Once built, never again.
+
+The third exists because the first two are both paths that fill the fast tier
+*from the archive*, and a tiered collection the application only ever writes to
+is filled by neither. Nothing warms it, no read of it falls through, so the
+first thing to create it on the fast tier is the application's own insert, and
+an insert is not a copy-up. Startup is both the correct moment and the cheapest:
+correct, because a unique index built after a duplicate has been accepted is too
+late and will not build; cheapest, because this is the collection the fast tier
+has never held.
 
 It is not only speed. The router reads the **fast tier's** unique indexes to
 know which values it must protect across the tiers, so a bare fast tier means
 neither mongod nor the registry is enforcing one, and a constraint the
 application has relied on for years quietly stops holding on the day it is
-adopted.
+adopted. Measured on an adoption whose archive carried a unique index: a value
+the archive already held, and the same new value twice, were all three accepted.
+`cline keys --rebuild`, the documented step for exactly this, does not save you
+either, because it reads the constraint from the same place and claimed nothing.
+
+What follows is worse than the duplicates. The fast tier then holds documents
+the archive's index refuses, so the feeder cannot mirror them: it reopens its
+change stream from the same checkpoint once a second, for ever, and mirroring
+stops for **every** namespace behind it. An order written after that never
+reaches the archive at all.
 
 A TTL index is the one that does not travel. Expiring documents on the fast tier
 would have the feeder read those expiries as application deletes and tombstone

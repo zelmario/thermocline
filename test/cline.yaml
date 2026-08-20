@@ -114,6 +114,11 @@ feeder:
     # testindexes.sh again, for what `cline indexes` reports and what it
     # refuses to suggest creating on the archive.
     - "shop.tidxrep"
+    # testindexes.sh again, for the collection an adoption starts with: it
+    # exists on the archive with the application's indexes, the fast tier has
+    # never held it, and nothing warms it or reads it, so the application's own
+    # first write is what creates it on the fast tier.
+    - "shop.tidxadopt"
     # testexplain.sh
     - "shop.texpl"
     # testunack.sh, the writes that ask for no acknowledgement

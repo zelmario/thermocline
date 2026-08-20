@@ -262,6 +262,60 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 	}
 }
 
+// ensureFastTierIndexes gives the fast tier the archive's indexes for every
+// namespace this router manages, before it accepts a client.
+//
+// The indexer already runs from the two paths that fill the fast tier from the
+// archive: the warmer before it fills a namespace, and the router the first
+// time it copies a document up. Neither covers a tiered collection the
+// application only ever writes to. Nothing warms it, no read of it falls
+// through, so the first thing to create it on the fast tier is the
+// application's own insert, and an insert is not a copy-up.
+//
+// That gap is not merely slow. The router reads the fast tier's unique indexes
+// to know which values it has to protect across both tiers, so a fast tier
+// that was never given them means neither mongod nor the key registry is
+// enforcing one. Measured on an adoption: an archive carrying a unique index it
+// had held for years, and through the router a value the archive already held
+// and the same new value twice were all three accepted. The fast tier then held
+// documents the archive's index refuses, so the feeder could not mirror them,
+// and it reopened its change stream from the same checkpoint once a second for
+// ever. Mirroring stopped for every namespace behind it, and an order written
+// after that never reached the archive at all.
+//
+// Startup is both the correct moment and the cheapest one. Correct, because a
+// unique index built after the duplicate has been accepted is too late and will
+// not build; cheapest, because the collection this is protecting is the one the
+// fast tier has never held. Before the listener opens, so no client can write
+// into the window.
+//
+// Only namespaces the archive actually holds, which keeps a config naming a
+// hundred collections to the one listCollections per database it already does.
+func (r *Router) ensureFastTierIndexes(ctx context.Context) {
+	byDB := map[string][]string{}
+	for _, ns := range r.cfg.Managed {
+		if db, _ := splitNS(ns); db != "" {
+			byDB[db] = append(byDB[db], ns)
+		}
+	}
+	for db, nss := range byDB {
+		cold, err := collectionsIn(ctx, r.cold, db)
+		if err != nil {
+			// Nothing to do here that the read paths do not already do: the
+			// indexer is still called on the first copy-up, and the warmer
+			// still calls it before it fills.
+			r.log.Warn("could not list the archive's collections to build its indexes on the fast tier",
+				"db", db, "err", err)
+			continue
+		}
+		for _, ns := range nss {
+			if _, coll := splitNS(ns); cold[coll] {
+				r.indexer.Ensure(ctx, ns)
+			}
+		}
+	}
+}
+
 // collectionsIn lists one database's collection names.
 func collectionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]bool, error) {
 	names, err := client.Database(db).ListCollectionNames(ctx, bson.D{})

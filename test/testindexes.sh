@@ -31,6 +31,7 @@ CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tidx
+ANS=tidxadopt
 N=${N:-40000}
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
@@ -212,6 +213,67 @@ chk "the report then shows only the TTL one left" "true" \
     "$(grep -qE 'ttl_idx' <<<"$AFTER" && ! grep -q 'customer_1_createdAt_-1' <<<"$AFTER" && echo true || echo false)"
 H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+
+echo "== the collection an adoption starts with, written to before it is read =="
+# The shape every adoption has: the existing cluster becomes the archive
+# carrying the application's indexes, the fast tier is new and empty, and the
+# application is pointed at the router. This collection is tiered, nothing warms
+# it, and no read of it ever falls through, so the only thing that ever creates
+# it on the fast tier is the application's own first insert.
+#
+# The unique index is the point. The router reads the FAST TIER's unique indexes
+# to know which values it has to protect across both tiers, so a fast tier that
+# has never been given them means neither mongod nor the key registry is
+# enforcing one. A constraint the application has relied on for years must not
+# stop holding on the day it is adopted.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+# The registry lives on the fast tier and outlives the collection, so a re-run
+# would inherit its own last run's claims and refuse a value nothing holds any
+# more. Adoption means nothing has been claimed yet, so say so.
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$ANS'})" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$ANS;
+   c.createIndex({code:1},{unique:true, name:'code_1'});
+   c.createIndex({owner:1},{name:'owner_1'});
+   c.insertMany([{_id:1,code:'A-001',owner:'ann'},{_id:2,code:'A-002',owner:'bo'}])" >/dev/null
+chk "the archive carries it, the fast tier does not" "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('$ANS'))")"
+startFeeder
+startRouter
+
+chk "the fast tier is given the unique index"      "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ANS.getIndexes().some(i=>i.name=='code_1' && i.unique===true))")"
+# The documented adoption step, and it only works because of the line above.
+# The registry protects what it knows about, and a database adopted with
+# documents already in it starts with none of them claimed. RebuildKeys reads
+# the constraint from the FAST TIER's unique indexes, so against a fast tier
+# that had never been given them it walked both tiers and claimed nothing,
+# reporting success. That is the check below: not that the command ran, but
+# that it found a constraint to enforce.
+REB=$(cline keys --config $CFG --rebuild 2>&1)
+chk "keys --rebuild finds a constraint to enforce" "true" \
+    "$(grep -qE "$ANS" <<<"$REB" && echo true || echo false)"
+# Both halves of the constraint, because they fail for different reasons: a
+# value the archive holds is the registry's job, and a value only this fast tier
+# holds is mongod's.
+chk "a code the archive already holds is refused"  "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:10,code:'A-001',owner:'cy'});print('ACCEPTED')}catch(e){print('refused')}")"
+chk "and the same new code twice is refused"       "refused" \
+    "$(R "const c=db.getSiblingDB(process.env.TC_DB).$ANS;
+          try{c.insertOne({_id:11,code:'B-001',owner:'cy'})}catch(e){print('first insert refused: '+e.message.substring(0,40))}
+          try{c.insertOne({_id:12,code:'B-001',owner:'di'});print('ACCEPTED')}catch(e){print('refused')}")"
+chk "so the fast tier holds one B-001, not two"    "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({code:'B-001'}))")"
+# The consequence of getting the above wrong, and the reason it is not merely
+# slow: a document the fast tier accepted and the archive's unique index refuses
+# cannot be mirrored, and the feeder that cannot mirror it stops mirroring
+# everything behind it. This check is what says the archive is still moving.
+sleep 6
+chk "and mirroring is still running behind it"     "true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({code:'B-001'})===1)")"
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 
 stopDaemons
 echo
