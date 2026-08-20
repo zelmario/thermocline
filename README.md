@@ -1496,7 +1496,26 @@ running throughout, nothing failed: 19 reads the fast tier owned and 13 that
 fell through, all answered correctly while the set elected a new primary. The
 driver's own retry absorbs it.
 
-**15. Check the tiers agree, with `cline indexes`.** It reports both directions:
+**15. Expect the warm to cost something and the evictor not to.** With a shop
+running against the router while all four daemons worked underneath it, 38,248
+operations completed with no errors and no violated invariants, so the pieces do
+not fight. What they cost is not equal, and the difference is worth knowing when
+choosing a window to start in.
+
+The evictor is free within the noise of this machine, measured by alternating
+arms rather than trusted from one run:
+
+| | throughput | order history p50 |
+|---|---|---|
+| evictor sweeping | 177/s | 83.21 ms |
+| evictor paused | 181/s | 81.70 ms |
+| evictor sweeping | 159/s | 86.94 ms |
+
+The initial warm is the part that competes: the same shop ran at 84/s while it
+was filling and around 170/s afterwards. It is bounded by `warmer.rate`, which
+is the knob to turn if the application feels it, and it happens once.
+
+**16. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
