@@ -1355,11 +1355,33 @@ application sees it empty. Either tier it or copy it whole. Views are named
 separately because neither answer works for them: recreate them with
 `createView` and tier what they read from.
 
-**5. Check the `_id` type of everything you are tiering.** A warm or eviction
-rule with no `date_field` takes each document's age from the timestamp inside
-its `_id`, which only an ObjectId has. Against integer, string or UUID `_id`s
-the rule addresses nothing at all, so set `date_field` for those collections.
-Both components now refuse such a rule rather than obeying it, and say so.
+**5. Check the `_id` type of everything you are tiering, and what its timestamps
+mean.** A warm or eviction rule with no `date_field` takes each document's age
+from the timestamp inside its `_id`, which only an ObjectId has. Against
+integer, string or UUID `_id`s the rule addresses nothing at all, so set
+`date_field` for those collections. Both components now refuse such a rule
+rather than obeying it, and say so.
+
+The quieter half is a collection whose `_id`s *are* ObjectIds carrying the wrong
+date. An ObjectId's timestamp is when the document was created, which is the
+same as its business date only when the collection accumulated over time. A
+cluster populated by an application level migration has every document
+re-inserted, so every `_id` carries the migration's date. Measured on documents
+dated a year ago and loaded a moment before: the evictor with `older_than: 40m`
+scanned zero and evicted nothing, and would go on doing that until the
+migration itself was older than the window. Nothing is wrong from where it
+stands: the rule addresses documents and tiers by the wrong clock.
+
+`mongorestore` keeps the original `_id`s and is fine. Anything that re-inserted
+the documents is not. Compare the two before you trust a rule that has no
+`date_field`:
+
+```
+const c = db.getSiblingDB("app").orders;
+const o = c.find().sort({_id: 1}).limit(1).next();
+print(o._id.getTimestamp() + "   <- what the rule reads");
+print(o.at + "   <- what the application means");
+```
 
 **6. Warm, then look at the claim it left.** A boundary claim cannot answer a
 query with no lower bound, which is most of what an application asks. When the
