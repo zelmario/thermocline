@@ -953,6 +953,23 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			"command", name, "err", err)
 		return c.send(reply)
 	}
+	// Again, on what the interception produced, because it may have done the
+	// write the client asked for.
+	//
+	// A deleteOne naming a document the fast tier does not hold matches nothing
+	// there, and that first reply is the one noted above. The interception then
+	// copies the document up and runs the delete again, and *that* is when the
+	// document goes. Noting only the first reply leaves the barrier waiting for
+	// an instant before the delete, so a read that falls through a moment later
+	// is told mirroring has caught up when the tombstone is still in flight,
+	// and the archive answers with the document the client has just deleted.
+	//
+	// Measured with the feeder given a backlog to fall behind on: one round in
+	// thirty deleted a document, was told deletedCount 1, and counted it again
+	// immediately afterwards. stale_reads stayed at zero throughout, because
+	// the barrier believed it had caught up. Taking the maximum, so a second
+	// call can only move it forward.
+	c.r.noteOpTime(rewritten)
 
 	// Inside a transaction the unique key guard runs here, on what the write
 	// actually produced, rather than on a guess made before it ran. Nothing is

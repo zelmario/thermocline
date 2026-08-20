@@ -119,6 +119,45 @@ chk "ten write-then-read pairs all agree" "ok" "$(R "
   }
   print('ok');")"
 
+echo "== deleting a document the fast tier does not hold =="
+# The delete that the barrier could not see. A deleteOne naming a document the
+# fast tier does not hold matches nothing there, and that first reply is the one
+# the router noted the cluster time from. The interception then copies the
+# document up and runs the delete again, and that is when the document actually
+# goes. Noting only the first reply left the barrier waiting for an instant
+# before the delete, so the read that followed was told mirroring had caught up
+# while the tombstone was still in flight.
+#
+# Measured with the feeder given a backlog: four rounds in ninety deleted a
+# document, were told deletedCount 1, and counted it again immediately after.
+# stale_reads stayed at zero throughout, because the barrier believed it had
+# caught up, which is what made it invisible.
+#
+# Made deterministic here by stopping the feeder outright, so mirroring cannot
+# catch up at all. The barrier must then either wait or say it gave up; what it
+# must not do is answer at once and say nothing.
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:300}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:300}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:301, n:301, grp:'c'})" >/dev/null
+chk "the archive holds it and the fast tier does not" "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+rm -f $LOGDIR/fresh_del.log
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:301})" >/dev/null
+SAW=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")
+# Either answer is defensible with mirroring stopped. Answering 1 in silence is
+# not: that is a deleted document handed back with nothing said.
+chk "it does not come back, or the router says why" "true" \
+    "$([ "$SAW" = "0" ] && echo true || { grep -q 'before mirroring caught up' $LOGDIR/fresh_r.log && echo true || echo false; })"
+startFeeder
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301,_tcDeletedAt:{\$exists:false}}))")" = "0" ] && break
+  sleep 0.5
+done
+chk "and once mirroring catches up it is gone"     "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")"
+
 echo "== a fallback read waits for mirroring, not for a checkpoint =="
 # The barrier can only be as precise as the position it waits on. While that
 # position was the durable checkpoint, a fallback read paid a whole

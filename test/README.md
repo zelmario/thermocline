@@ -220,6 +220,13 @@ Things this encodes, each of which cost a wrong result first:
   authenticated user or was created in another session". Open an explicit
   session and run both through it.
 
+- **Some races need a probe rather than a suite.** `staledelete.sh` reproduces a
+  delete the freshness barrier could not see, and it needs the feeder running
+  *and behind*: on a quiet machine mirroring finishes in milliseconds and the
+  window never opens. It failed four rounds in ninety before the fix and none in
+  ninety after. A suite cannot own a four percent per round failure, so it lives
+  beside the suites as something to run by hand, with the numbers written down.
+
 Things these encode that are easy to get wrong when testing by hand:
 
 - **The evictor's precondition is a feeder that has caught up.** Killing the
