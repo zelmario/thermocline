@@ -1515,6 +1515,15 @@ The initial warm is the part that competes: the same shop ran at 84/s while it
 was filling and around 170/s afterwards. It is bounded by `warmer.rate`, which
 is the knob to turn if the application feels it, and it happens once.
 
+Sizing the window too small costs latency and not correctness, which was worth
+knowing rather than assuming. The same shop was run against a two minute hot
+window with twenty second residency and a sweep every ten seconds, so eviction
+and copy-up fought over the same documents throughout: 26,881 documents evicted
+across twelve sweeps, 306 copied back up, the fast tier stripped to 975 orders
+of the 53,000 there are. No errors, and none of the five invariants broken. What
+you get for a window that small is a fast tier holding nothing much and an
+application paying archive latency for most of its reads.
+
 **16. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
