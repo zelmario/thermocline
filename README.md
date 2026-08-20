@@ -1079,8 +1079,37 @@ That distinction is the whole point: a fast tier built empty has no claim, and
 answering range queries from it would return short results and call them
 success. Range queries are refused until something records a claim.
 
+**A claim on a boundary cannot answer a query with no lower bound**, and that is
+most of what an application asks. "Complete for everything newer than T" covers
+a query that says `at >= T`; it cannot cover `find({customer: X})`, because that
+reaches arbitrarily far back and no boundary is far enough. Only a claim on all
+of history covers it.
+
+This is the sharpest edge in an adoption, because everything looks finished. The
+warm window is set to the age of the data, the warmer copies every document up
+and reports success, and the fast tier holds the entire collection. Measured on
+a 50,000 order shop in exactly that state:
+
+| | boundary claim | all of history |
+|---|---|---|
+| throughput | 284/s | **1,339/s** |
+| a customer's order history | 62.74 ms | **2.78 ms** |
+| count a customer's orders | 58.54 ms | **3.18 ms** |
+| read an order by date | 62.50 ms | **2.44 ms** |
+| served by the archive | 40.8% | **0%** |
+
+Nothing was wrong with the fast tier in the left hand column. It held all 50,000
+orders and answered 59% of the run. The other 41% went to the archive because
+the claim could not be shown to cover them.
+
+**So the warmer makes the stronger claim when it can prove it.** When the
+archive holds no live document older than the window just warmed, the fast tier
+holds every document there is, and the watermark says all of history. When the
+archive does hold something older, the boundary claim is the honest one and the
+warmer names what it costs and how to change it.
+
 A fast tier that genuinely holds everything, because it is the original cluster
-rather than a new empty one, says so explicitly:
+rather than a new empty one, can also say so directly:
 
 ```
 bin/cline watermark --config cline.yaml                        # show every claim

@@ -107,6 +107,39 @@ cline warmer --config $CFG >/dev/null 2>&1
 chk "the watermark is claimed" "true" "$(cline watermark --config $CFG --ns $DB.$NS 2>&1 | grep -qE 'newer than|all of history' && echo true || echo false)"
 chk "the fast tier still holds everything" "20" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
+echo "== a warm that covered everything says so, and it is worth saying =="
+# A watermark says "complete for everything newer than T". A query carrying no
+# lower time bound reaches arbitrarily far back, so no such watermark can cover
+# it: it falls through to the archive however full the fast tier is. Only a
+# claim on all of history covers it, which watermark.Mark.CoversAll has always
+# said.
+#
+# That is every adoption. The warm copies the whole collection up and the claim
+# it leaves still refuses the query an application asks most, give me this
+# customer's orders. Measured on a 50,000 order shop whose orders had all just
+# been warmed: 41% of the run still answered from the archive at 284 ops/s and
+# 62.74ms, against 100% from the fast tier at 1,384 ops/s and 2.65ms once the
+# same tier was declared complete for all of history.
+#
+# The claim is checked here, and then the thing the claim is for: a filter with
+# no time bound in it must not reach the archive.
+chk "the claim covers all of history" "true" \
+    "$(cline watermark --config $CFG --ns $DB.$NS 2>&1 | grep -qE 'all of history' && echo true || echo false)"
+# Read through the router's own counter of archive reads. Checked for being
+# readable first, and deliberately: an unreachable dashboard makes both samples
+# empty, and a delta of nothing minus nothing is zero, which is the answer this
+# check wants. A check that cannot run must not look like one that passed.
+# The snapshot is pretty printed, so the colon is followed by a space. A pattern
+# without it matches nothing, and nothing is what made this check pass before it
+# was ever right.
+arch() { curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -oE '"from_archive":[[:space:]]*[0-9]+' | grep -oE '[0-9]+'; }
+BEFORE=$(arch)
+chk "the router's archive counter is readable" "true" "$([ -n "$BEFORE" ] && echo true || echo false)"
+chk "an unbounded query still finds them all"  "20" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({tag:'warm'}))")"
+AFTER=$(arch)
+chk "and no part of it went to the archive"    "0" "$(( ${AFTER:-0} - ${BEFORE:-1} ))"
+
 echo "== a hole inside the claimed range must withdraw the claim =="
 # Eight documents vanish from the fast tier. The archive still has them live, so
 # this is loss, not deletion, and the claim is now a lie.

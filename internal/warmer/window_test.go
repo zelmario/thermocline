@@ -139,3 +139,43 @@ func TestSourceFilterRejectsIDAsDateField(t *testing.T) {
 		t.Error("sourceFilter accepted date_field: _id, want an error pointing at the empty-field form")
 	}
 }
+
+// A claim on all of history records the zero time, and that must never be
+// turned into a bound.
+//
+// bson.NewObjectIDFromTimestamp(time.Time{}) is 886e0900..., which sorts
+// *after* an ObjectID minted in 2025, so a filter of `_id >= it` matches
+// nothing at all. Both tiers then count zero, the counts agree, and
+// verifyClaim concludes the claim is sound. Hole detection would stop working
+// at the exact moment the fast tier claims the most, and nothing would say so.
+func TestWindowFilterTreatsTheZeroTimeAsUnbounded(t *testing.T) {
+	rules := []config.WarmRule{
+		{NS: "app.orders", Back: config.Duration(90 * 24 * time.Hour)},
+		{NS: "app.orders", Back: config.Duration(90 * 24 * time.Hour), DateField: "createdAt"},
+	}
+
+	for _, rule := range rules {
+		name := "objectid"
+		if !rule.UsesObjectIDTime() {
+			name = "datefield"
+		}
+		t.Run(name, func(t *testing.T) {
+			filter, err := windowFilter(rule, time.Time{})
+			if err != nil {
+				t.Fatalf("windowFilter: %v", err)
+			}
+			if len(filter) != 0 {
+				t.Fatalf("a claim on all of history must bound nothing, got %v", filter)
+			}
+		})
+	}
+
+	// And the bound it would otherwise have built really does exclude real
+	// documents, which is why the case above cannot be left to chance.
+	zeroDerived := bson.NewObjectIDFromTimestamp(time.Time{})
+	realID := bson.NewObjectIDFromTimestamp(time.Date(2025, 8, 20, 0, 0, 0, 0, time.UTC))
+	if realID.Hex() >= zeroDerived.Hex() {
+		t.Fatalf("this test guards a wrap that no longer happens: %s >= %s",
+			realID.Hex(), zeroDerived.Hex())
+	}
+}
