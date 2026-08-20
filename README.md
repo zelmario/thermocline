@@ -768,6 +768,15 @@ before it fills a namespace, the router the first time it copies a document up,
 and the router at startup for every namespace it manages that the archive
 already holds. Once built, never again.
 
+**A view is stranded like a collection and cannot be fixed like one.** The
+application's views live on the existing cluster; the fast tier has none of
+them, so reads of them return nothing at all. Measured on an adopted view over a
+tiered collection: five documents on the original cluster, zero through the
+router, no error. The router names views separately at startup because the
+advice differs, and the advice for a collection cannot be followed for a view:
+tiering one is meaningless, so the feeder refuses it. Recreate them on the fast
+tier with `createView` and tier the collections they read from.
+
 **The accounts are the other thing the new tier does not have.** The existing
 cluster carries the application's users; the fast tier is a new replica set and
 carries none of them. The router authenticates against the fast tier, so on day

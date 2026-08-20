@@ -106,6 +106,11 @@ func (f *Feeder) unmirrorable(ctx context.Context) ([]string, error) {
 // unmirrorableKind names the problem with one collection, or empty when it has
 // none.
 func unmirrorableKind(info bson.Raw) (kind, why string) {
+	if t, ok := info.Lookup("type").StringValueOK(); ok && t == "view" {
+		return "a view",
+			"holds no documents of its own, only a pipeline over another collection, so there is " +
+				"nothing to mirror and the collection it reads from is what wants tiering"
+	}
 	if t, ok := info.Lookup("type").StringValueOK(); ok && t == "timeseries" {
 		return "a time series collection",
 			"stores its documents in a system bucket collection, so what the change stream " +

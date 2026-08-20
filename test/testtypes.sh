@@ -91,6 +91,26 @@ for _ in $(seq 1 60); do
 done
 chk "the feeder starts once they are gone"              "1" "$(pgrep -fc "cline feeder --config $WDIR/" || true)"
 
+echo "== a view in feeder.namespaces =="
+# A view holds no documents of its own, only a pipeline over another
+# collection, so there is nothing to mirror. Before this was refused the feeder
+# accepted one and logged that it was mirroring it, which is what an operator
+# gets for following the router's own advice about a stranded namespace: the
+# configuration is accepted, reported as working, and cannot work.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tview.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).createView('tview','tcap',[{\$match:{n:{\$gte:0}}}])" >/dev/null 2>&1
+chk "the fast tier has a view"                          "view" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'tview'})[0]; print(c?c.type:'none')")"
+sed 's|    - "'$DB'.tcap"|    - "'$DB'.tcap"\n    - "'$DB'.tview"|' $CFG > $WDIR/withview.yaml
+OUTV=$(timeout 20 cline feeder --config $WDIR/withview.yaml 2>&1 | tail -3)
+STARTEDV=$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+chk "the feeder refuses to mirror a view"               "true" \
+    "$(echo "$OUTV" | grep -qi "is a view" && echo true || echo "false ($(echo "$OUTV" | tail -1 | cut -c1-60))")"
+chk "and it did not stay running"                       "0"    "$STARTEDV"
+H "db.getSiblingDB(process.env.TC_DB).tview.drop()" >/dev/null 2>&1
+
 echo "== the same collection, capped on the archive instead =="
 # Which tier holds the collection depends on where the deployment is in its
 # life. Ordinarily the application's collections are on the fast tier and the

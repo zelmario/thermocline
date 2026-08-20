@@ -241,24 +241,40 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 		if cerr != nil || herr != nil {
 			continue
 		}
-		var stranded []string
-		for name := range cold {
+		var stranded, views []string
+		for name, kind := range cold {
 			ns := db + "." + name
-			if hot[name] || r.cfg.Manages(ns) || strings.HasPrefix(name, "system.") {
+			if hot[name] != "" || r.cfg.Manages(ns) || strings.HasPrefix(name, "system.") {
+				continue
+			}
+			// A view separately, because the advice for one is different and
+			// the advice for a collection cannot be followed for a view: it
+			// holds no documents, so tiering it is meaningless, and the feeder
+			// refuses it for that reason.
+			if kind == "view" {
+				views = append(views, ns)
 				continue
 			}
 			stranded = append(stranded, ns)
 		}
-		if len(stranded) == 0 {
-			continue
+		if len(stranded) > 0 {
+			sort.Strings(stranded)
+			r.log.Warn("the archive holds collections the fast tier does not, and nothing tiers them",
+				"collections", stranded,
+				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
+					"application sees them empty",
+				"action", "add them to feeder.namespaces to tier them, or copy them to the fast tier "+
+					"if they are small enough to live there whole")
 		}
-		sort.Strings(stranded)
-		r.log.Warn("the archive holds collections the fast tier does not, and nothing tiers them",
-			"collections", stranded,
-			"meaning", "reads of these go to the fast tier, which has never held them, so the "+
-				"application sees them empty",
-			"action", "add them to feeder.namespaces to tier them, or copy them to the fast tier "+
-				"if they are small enough to live there whole")
+		if len(views) > 0 {
+			sort.Strings(views)
+			r.log.Warn("the archive holds views the fast tier does not",
+				"views", views,
+				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
+					"application sees them empty",
+				"action", "recreate them on the fast tier with createView, and tier the collections "+
+					"they read from; a view cannot be tiered itself and the feeder refuses one")
+		}
 	}
 }
 
@@ -378,24 +394,43 @@ func (r *Router) ensureFastTierIndexes(ctx context.Context) {
 			continue
 		}
 		for _, ns := range nss {
-			if _, coll := splitNS(ns); cold[coll] {
+			// Only real collections: a view holds no documents, so there is
+			// nothing to copy up and no index of its own to build.
+			if _, coll := splitNS(ns); cold[coll] == "collection" {
 				r.indexer.Ensure(ctx, ns)
 			}
 		}
 	}
 }
 
-// collectionsIn lists one database's collection names.
-func collectionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]bool, error) {
-	names, err := client.Database(db).ListCollectionNames(ctx, bson.D{})
+// collectionsIn maps one database's collection names to their kind, which is
+// "view" for a view and "collection" for everything else.
+//
+// The kind matters because the advice differs: a collection can be tiered or
+// copied whole, and a view can be neither.
+func collectionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]string, error) {
+	cur, err := client.Database(db).ListCollections(ctx, bson.D{})
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]bool, len(names))
-	for _, n := range names {
-		out[n] = true
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	out := map[string]string{}
+	for cur.Next(ctx) {
+		var info struct {
+			Name string `bson:"name"`
+			Type string `bson:"type"`
+		}
+		if cur.Decode(&info) != nil || info.Name == "" {
+			continue
+		}
+		kind := info.Type
+		if kind == "" {
+			kind = "collection"
+		}
+		out[info.Name] = kind
 	}
-	return out, nil
+	return out, cur.Err()
 }
 
 // singleDocReply builds a find reply carrying one document fetched from the
