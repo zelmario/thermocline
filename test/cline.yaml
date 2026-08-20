@@ -63,6 +63,9 @@ feeder:
     # testlife.sh: the collection the archive has a unique index on and the
     # fast tier does not, which is what the feeder cannot mirror.
     - "shop.tdup"
+    # testlife.sh: documents already on the fast tier when the feeder first
+    # starts, which mirroring will never carry into the archive.
+    - "shop.tstrand"
     - "shop.tconc"
     - "shop.tbulk"
     - "shop.bench"

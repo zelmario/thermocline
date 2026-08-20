@@ -243,6 +243,47 @@ waitBig2
 chk "a later write still reaches the archive" "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:778}))")"
 
+echo "== documents the archive will never receive =="
+# A change stream reports changes from now, so whatever the fast tier already
+# holds when the feeder first starts is not mirrored by starting it. In an
+# adoption that is fine: the archive is the cluster being adopted and already
+# holds everything. In the other shape, a new archive beside a fast tier that
+# already has data, the archive is missing those documents and nothing here
+# will fetch them.
+#
+# The feeder used to advise running the warmer, which copies the archive *to*
+# the fast tier. Measured before this was corrected: ten documents on the fast
+# tier, an empty archive, the warmer run exactly as the note said, and the
+# archive still held none of them.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tstrand.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tstrand.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tstrand.insertMany(Array.from({length:5},(_,i)=>({_id:i,n:i})))" >/dev/null
+chk "the fast tier has them and the archive does not" "5/0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tstrand.countDocuments({}))")/$(C "print(db.getSiblingDB(process.env.TC_DB).tstrand.countDocuments({}))")"
+rm -f $LOGDIR/strand_f.log
+timeout 15 cline feeder --config $CFG --log-file $LOGDIR/strand_f.log >/dev/null 2>&1
+chk "the feeder names them on its first start"       "true" \
+    "$(grep 'archive has none of' $LOGDIR/strand_f.log | grep -q 'tstrand' && echo true || echo false)"
+chk "and does not send anyone to the warmer"         "0" \
+    "$(grep -c 'run the warmer to backfill' $LOGDIR/strand_f.log || true)"
+# And it must stay quiet when the archive does hold them, which is every
+# adoption and so the ordinary case.
+C "db.getSiblingDB(process.env.TC_DB).tstrand.insertMany(Array.from({length:5},(_,i)=>({_id:i,n:i})))" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+rm -f $LOGDIR/strand_f2.log
+timeout 15 cline feeder --config $CFG --log-file $LOGDIR/strand_f2.log >/dev/null 2>&1
+# Scoped to this namespace. The shared config manages a hundred of them and an
+# earlier section can legitimately leave another one in exactly this state, so
+# grepping the whole line for the message counts somebody else's warning.
+chk "and says nothing when the archive holds them"   "0" \
+    "$(grep 'archive has none of' $LOGDIR/strand_f2.log | grep -c 'tstrand' || true)"
+H "db.getSiblingDB(process.env.TC_DB).tstrand.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tstrand.drop()" >/dev/null
+startFeeder
+startRouter
+
 echo "== a document the archive's unique index refuses =="
 # The other way one document stops everything. The fast tier accepts a value the
 # archive already holds, the archive's unique index refuses the mirror, and no

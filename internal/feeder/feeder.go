@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -192,6 +193,58 @@ func (f *Feeder) Run(ctx context.Context) error {
 	}
 }
 
+// warnAboutUnmirrorableHead names namespaces whose documents the archive is
+// never going to receive.
+//
+// A change stream reports changes from now, so anything already on the fast
+// tier when the feeder first starts is not mirrored by starting it. Whether
+// that matters depends entirely on which way round the deployment is, and the
+// feeder can tell by looking:
+//
+// In an adoption the archive is the cluster being adopted and already holds
+// everything, so there is nothing to say. In the other shape, a new archive
+// beside a fast tier that already has data, the archive is missing those
+// documents and no part of this system will fetch them: the warmer copies the
+// archive *to* the fast tier, which is the opposite direction, and mirroring
+// only carries what changes from here.
+//
+// This used to advise running the warmer, which cannot do it. Measured: ten
+// documents on the fast tier, an empty archive, the feeder started and the
+// warmer run exactly as the note said, and the archive still held none of them.
+//
+// Nothing is lost by it, because the evictor never removes a document the
+// archive does not hold. What is lost is the premise: the archive is supposed
+// to hold everything, and here it does not.
+func (f *Feeder) warnAboutUnmirrorableHead(ctx context.Context) {
+	var stranded []string
+	for _, ns := range f.cfg.Namespaces {
+		db, coll := splitNS(ns)
+		if db == "" || coll == "" {
+			continue
+		}
+		hot, herr := f.hot.Database(db).Collection(coll).CountDocuments(ctx, bson.D{}, options.Count().SetLimit(1))
+		if herr != nil || hot == 0 {
+			continue
+		}
+		cold, cerr := f.cold.Database(db).Collection(coll).CountDocuments(ctx, bson.D{}, options.Count().SetLimit(1))
+		if cerr != nil || cold > 0 {
+			continue
+		}
+		stranded = append(stranded, ns)
+	}
+	if len(stranded) == 0 {
+		return
+	}
+	sort.Strings(stranded)
+	f.log.Warn("the fast tier holds documents the archive has none of, and mirroring will not fetch them",
+		"namespaces", stranded,
+		"meaning", "a change stream reports changes from now, and the warmer copies the archive to the "+
+			"fast tier, which is the other direction; nothing here reads the fast tier's history",
+		"effect", "the archive is not the complete copy the rest of this system assumes, though nothing "+
+			"is lost: the evictor never removes a document the archive does not hold",
+		"action", "copy these collections into the archive before relying on it, then restart the feeder")
+}
+
 // runOnce opens a stream and pumps it until it fails or ctx ends.
 func (f *Feeder) runOnce(ctx context.Context) error {
 	token, err := f.cp.Load(ctx, f.cfg.ID)
@@ -209,7 +262,9 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 	} else {
 		f.log.Warn("no checkpoint, mirroring from now on",
 			"id", f.cfg.ID,
-			"note", "documents written before this moment are not mirrored; run the warmer to backfill")
+			"note", "a change stream reports changes from now, so whatever the fast tier already "+
+				"holds is not mirrored by starting this")
+		f.warnAboutUnmirrorableHead(ctx)
 	}
 
 	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
