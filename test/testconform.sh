@@ -40,22 +40,48 @@ P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
+# reseed opens the archive from inside mongosh rather than as a second process,
+# so the URI has to reach the JS. After COLD is set, not before: exported empty
+# it would be Mongo(""), and the reseed would fail for a reason that reads like
+# an unreachable archive.
+export TC_COLD=$COLD
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-40s %.34s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-40s\n          ref=%.150s\n          got=%.150s\n' "$1" "$2" "$3"; fi
 }
-R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R()    { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+# The same connection without tail, for a script whose output has sections and
+# is parsed by the caller. tail -1 is right for one answer and destroys two.
+RALL() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
 # The heart of the suite. The expression names its collection as COLL; it runs
 # once against the reference and once against the tiered collection, both through
 # the router, and the answers must agree.
+# Both halves run in one mongosh, not two. mongosh is node, and each invocation
+# costs about a second of process startup, SCRAM auth and topology discovery
+# before it does any work at all; the database work here is twenty documents.
+# The reference and the tiered collection are still two separate runs of the
+# expression through the router, in the same order as before, and each answer is
+# still the last line that half printed, which is what tail -1 gave.
+#
+# One thing does change: the halves now share a connection, so they share an
+# implicit session, where before each had its own process and its own. That
+# makes the tiered half causally after the reference half rather than
+# independent of it, which is stricter than it was and cannot hide a stale
+# answer. The transaction checks are unaffected: they call R directly and open
+# their own explicit sessions.
 same() {
-  local label="$1" expr="$2" ref got
-  ref=$(R "const c=db.getSiblingDB(process.env.TC_DB).tcref; try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
-  got=$(R "const c=db.getSiblingDB(process.env.TC_DB).tcon;  try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) }")
+  local label="$1" expr="$2" out ref got
+  out=$(RALL "const d=db.getSiblingDB(process.env.TC_DB);
+           function run(c) { try { ${expr//COLL/c} } catch(e) { print('ERR '+e.message.substring(0,70)) } }
+           run(d.tcref);
+           print('__TCON__');
+           run(d.tcon);" )
+  ref=$(sed -n '1,/^__TCON__$/p' <<<"$out" | grep -v '^__TCON__$' | tail -1)
+  got=$(sed -n '/^__TCON__$/,$p'  <<<"$out" | grep -v '^__TCON__$' | tail -1)
   chk "$label" "$ref" "$got"
 }
 # For writes, which need both collections put back first.
@@ -101,8 +127,12 @@ DOCS='Array.from({length:20},(_,i)=>({
 }))'
 OPT='[3,6,9,12,15,18]'
 
-mkIndexes() { # collection, connection-fn
-  $2 "const c=db.getSiblingDB(process.env.TC_DB).$1;
+reseed() {
+  RESEED=$(mongosh "$HOT" --quiet --eval "
+    const hot  = db.getSiblingDB(process.env.TC_DB);
+    const cold = Mongo(process.env.TC_COLD).getDB(process.env.TC_DB);
+
+    function mkIndexes(c) {
       c.createIndex({words:'text'});
       c.createIndex({loc:'2dsphere'});
       c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});
@@ -111,62 +141,66 @@ mkIndexes() { # collection, connection-fn
       // filter matches, so hinting either is a statement about which documents
       // are looked at and not merely about how.
       c.createIndex({opt:1},{sparse:true,name:'conf_sparse'});
-      c.createIndex({f:1},{partialFilterExpression:{n:{\$gt:10}},name:'conf_partial'});" >/dev/null
-}
+      c.createIndex({f:1},{partialFilterExpression:{n:{\$gt:10}},name:'conf_partial'});
+    }
 
-# waitFeederPast blocks until the feeder has processed everything written to the
-# fast tier so far, proved by a sentinel document reaching the archive.
-#
-# The feeder is running throughout this suite and it is always some way behind.
-# Two things in reseed depend on it having caught up, and both used to be a
-# sleep 1 that was usually but not always long enough:
-#
-# The archive seed raced the feeder's mirror of the previous reseed's fast tier
-# inserts. When that mirror landed after this reseed had dropped the archive
-# collection, the archive already held _id 1, and an ordered insertMany aborts on
-# the first duplicate without inserting any of the twenty. The archive was left
-# holding ten documents rather than twenty, so half the collection was missing
-# from every answer and checks failed with nothing wrong with the product. It hit
-# a different handful of checks on each run.
-#
-# The completeness claim raced the drop. The feeder withdraws the claim when it
-# sees a collection dropped on the fast tier, which is correct, but reseed writes
-# the claim moments later and the withdrawal can land after it.
-waitFeederPast() {
-  H "db.getSiblingDB(process.env.TC_DB).tcon.insertOne({_id:'__sentinel'})" >/dev/null
-  for _ in $(seq 1 120); do
-    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({_id:'__sentinel'}))")" = "1" ] && break
-    sleep 0.5
-  done
-  H "db.getSiblingDB(process.env.TC_DB).tcon.deleteOne({_id:'__sentinel'})" >/dev/null
-  C "db.getSiblingDB(process.env.TC_DB).tcon.deleteOne({_id:'__sentinel'})" >/dev/null
-}
+    const all = $DOCS;
+    hot.tcref.drop();
+    hot.tcref.insertMany(all);
+    hot.tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
 
-reseed() {
-  H "db.getSiblingDB(process.env.TC_DB).tcref.drop();
-     db.getSiblingDB(process.env.TC_DB).tcref.insertMany($DOCS);
-     db.getSiblingDB(process.env.TC_DB).tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
-  H "db.getSiblingDB(process.env.TC_DB).tcon.drop()" >/dev/null
-  C "db.getSiblingDB(process.env.TC_DB).tcon.drop()" >/dev/null
-  # 1 to 10 on both tiers, 11 to 20 only in the archive, which is what an evicted
-  # document looks like.
-  H "const all=$DOCS; db.getSiblingDB(process.env.TC_DB).tcon.insertMany(all.slice(0,10))" >/dev/null
-  # Upserts, not insertMany. A late mirror of the fast tier inserts above can put
-  # documents here first, and an ordered insert then abandons the whole seed on
-  # the first duplicate. This states the archive's contents rather than assuming
-  # it is empty, and replacing the whole document also clears any tombstone.
-  C "const all=$DOCS;
-     db.getSiblingDB(process.env.TC_DB).tcon.bulkWrite(
-       all.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
-       {ordered:false})" >/dev/null
-  H "db.getSiblingDB(process.env.TC_DB).tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
-  C "db.getSiblingDB(process.env.TC_DB).tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}})" >/dev/null
-  mkIndexes tcref H
-  mkIndexes tcon H
-  mkIndexes tcon C
+    hot.tcon.drop();
+    cold.tcon.drop();
+    // 1 to 10 on both tiers, 11 to 20 only in the archive, which is what an
+    // evicted document looks like.
+    hot.tcon.insertMany(all.slice(0,10));
+    // Upserts, not insertMany. A late mirror of the fast tier inserts above can
+    // put documents here first, and an ordered insert then abandons the whole
+    // seed on the first duplicate. This states the archive's contents rather
+    // than assuming it is empty, and replacing the whole document also clears
+    // any tombstone.
+    cold.tcon.bulkWrite(
+      all.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
+      {ordered:false});
+    hot.tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
+    cold.tcon.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
+
+    mkIndexes(hot.tcref);
+    mkIndexes(hot.tcon);
+    mkIndexes(cold.tcon);
+
+    // waitFeederPast, inlined. It blocks until the feeder has processed
+    // everything written to the fast tier so far, proved by a sentinel document
+    // reaching the archive. The feeder runs throughout this suite and is always
+    // some way behind, and two things above depend on it having caught up. Both
+    // used to be a sleep 1 that was usually but not always long enough.
+    //
+    // The archive seed raced the feeder's mirror of the previous reseed's fast
+    // tier inserts. When that mirror landed after this reseed had dropped the
+    // archive collection, the archive already held _id 1, and an ordered
+    // insertMany aborts on the first duplicate without inserting any of the
+    // twenty. The archive was left holding ten documents rather than twenty, so
+    // half the collection was missing from every answer and checks failed with
+    // nothing wrong with the product. It hit a different handful each run.
+    //
+    // The completeness claim raced the drop. The feeder withdraws the claim when
+    // it sees a collection dropped on the fast tier, which is correct, but
+    // reseed writes the claim moments later and the withdrawal can land after it.
+    hot.tcon.insertOne({_id:'__sentinel'});
+    let caught = false;
+    for (let i = 0; i < 120; i++) {
+      if (cold.tcon.countDocuments({_id:'__sentinel'}) === 1) { caught = true; break; }
+      sleep(500);
+    }
+    hot.tcon.deleteOne({_id:'__sentinel'});
+    cold.tcon.deleteOne({_id:'__sentinel'});
+    print(caught ? 'RESEEDED' : 'FEEDER-NEVER-CAUGHT-UP');
+  " 2>&1 | tail -1)
+  # Said out loud rather than inferred. A reseed that silently half happened is
+  # the shape of failure this suite is least able to tell from a product bug.
+  [ "$RESEED" = "RESEEDED" ] && : || echo "  WARN  reseed: $RESEED"
   # The claim goes last, after the feeder has seen the drop and withdrawn the
   # previous one. Writing it before that is what made the claim vanish.
-  waitFeederPast
   cline watermark --config $CFG --ns $DB.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
 }
 

@@ -262,8 +262,11 @@ C "const c=db.getSiblingDB(process.env.TC_DB).$DNS;
    c.createIndex({code:1},{unique:true,name:'code_1'});
    c.insertOne({_id:1, code:'DUP'})" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:2, code:'DUP'})" >/dev/null
+# $1 unescaped on purpose: escaping it makes mongosh evaluate the literal
+# {_id:$1}, which is a syntax error, so the wait never matches and quietly
+# becomes a fixed 30 second sleep. See "wait for things, do not sleep for them".
 waitDup() { for _ in $(seq 1 60); do
-    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:\$1}))")" = "1" ] && return 0; sleep 0.5; done; }
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:$1}))")" = "1" ] && return 0; sleep 0.5; done; }
 sleep 6
 chk "the archive keeps the document it had"   "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:1}))")"
