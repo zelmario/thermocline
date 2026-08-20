@@ -203,7 +203,14 @@ chk "a nested path is quoted"                     "true" \
     "$(grep -q '"nested.path"' <<<"$CMDS" && echo true || echo false)"
 
 # The strongest check: the output is not merely plausible, it runs.
-echo "$CMDS" | mongosh "$COLD" --quiet >/dev/null 2>&1
+#
+# Through --eval rather than piped on stdin. Same URI, different topology:
+# mongosh given a script on stdin connects direct to whichever member it lands
+# on, so every createIndex is refused with NotWritablePrimary, while --eval on
+# the identical URI discovers the replica set and reaches the primary. This
+# passed for as long as it landed on the primary and started failing the moment
+# an election moved it, which is the shape of check that hides for weeks.
+mongosh "$COLD" --quiet --eval "$CMDS" >/dev/null 2>&1
 chk "the commands run against the archive"        "4" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$IXNS.getIndexes().length)")"
 chk "and none of them arrived unique or expiring" "true" \

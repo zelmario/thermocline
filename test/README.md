@@ -189,6 +189,15 @@ Things this encodes, each of which cost a wrong result first:
   should default it, not assert it**, because the assertion fires inside a
   check and wears that check's name.
 
+- **`mongosh URI --eval` and `mongosh URI < script` do not connect the same
+  way.** With the same seed list and the same `replicaSet=`, `--eval` discovers
+  the set and reaches the primary, while a script piped on stdin connects
+  direct to a member and reports `[direct: secondary]`. Every write in it then
+  fails with `NotWritablePrimary`. `testindexes.sh` ran `cline indexes
+  --commands` output that way and passed for as long as it happened to land on
+  the primary; an election moved it mid-session and four indexes became one.
+  Run generated commands with `--eval`.
+
 Things these encode that are easy to get wrong when testing by hand:
 
 - **The evictor's precondition is a feeder that has caught up.** Killing the
