@@ -101,11 +101,23 @@ chk "a later write goes to the new primary"            "3" \
 chk "and a read still answers"                         "3" \
     "$(RW "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?d.v:'MISSING')")"
 
-echo "== and with authentication proxied it still fails, as it always did =="
-# The control, and the point of the whole change. Without terminated
-# authentication there is no connection to replay onto, so the client sees the
-# failover. testchaos.sh pins the same behaviour under load; this is the same
-# thing beside its replacement, so the difference is not taken on faith.
+echo "== and with authentication proxied the client's own retry finishes it =="
+# This used to be the control that showed what terminated authentication bought:
+# with authentication proxied there is no connection to replay onto, so the
+# client saw the failover. Half of that is still true, and the half that mattered
+# turned out to be a defect rather than a limitation.
+#
+# The router re-resolved which member is primary only when a dial failed, and a
+# member that steps down stays up and answers, so nothing ever failed to dial.
+# The pinned address stayed on the demoted member for ever: measured with the
+# shop running, 4,226 refusals three minutes after an election decided in one
+# second, and every client that connected afterwards refused too. It now
+# re-resolves on the first refusal and ends the connection once the refusal has
+# gone out, which is what mongod does to the clients of a member that stops
+# being primary. The driver opens a new one, authenticates against the member
+# that is primary now, and its retry lands.
+#
+# The line that must not move is the one below it: still exactly once.
 stopRouter
 H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:100}})" >/dev/null
 startRouter $BASE
@@ -116,11 +128,17 @@ case "$PROXOUT" in
   matched=1) PROXRES=succeeded ;;
   *)         PROXRES=failed ;;
 esac
-chk "a proxied write across a failover fails"          "failed" "$PROXRES"
-# And still without applying anything twice, which is what makes that failure an
-# honest one rather than a silent loss.
+chk "a proxied write across a failover finishes"       "succeeded" "$PROXRES"
+# And still without applying anything twice, which is what makes the retry an
+# honest one rather than a silent double.
 chk "and nothing was applied twice"                    "true" \
     "$(H "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d && d.v <= 101)")"
+# The regression this exists for. A client that connects after the election is
+# the plainest way to ask whether the router is still pointing at the member
+# that stepped down, and before the fix this was refused for as long as the
+# router stayed up.
+chk "a client connecting after it reaches the new primary" "true" \
+    "$(RW "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d !== null)")"
 
 # A cursor open across a change of primary.
 #

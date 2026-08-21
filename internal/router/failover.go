@@ -102,6 +102,33 @@ func (c *conn) replayAfterFailover(ctx context.Context, msg *wire.Message, name 
 	return nil, false
 }
 
+// endAfterFailover ends a connection the router cannot point anywhere useful.
+//
+// While authentication is proxied, a client's upstream connection was made by
+// that client's own SCRAM exchange against whichever member was primary at the
+// time. The router has no credentials of its own, so it cannot replace that
+// connection: every command the client sends afterwards goes to the same
+// member, which is now a secondary and refuses all of them. Re-resolving the
+// pinned address fixes the next client, not this one.
+//
+// Measured before this existed, with the shop running through the router while
+// the fast tier's primary stepped down: 4,226 refusals and still counting three
+// minutes after the election, on a set that had elected a new primary in one
+// second. The shop never recovered, because nothing ever ended the connections.
+//
+// So the connection ends once the refusal has been delivered, which is what
+// MongoDB itself does to the clients of a member that stops being primary. The
+// driver reconnects, that handshake authenticates against the member that is
+// primary now, and the retry lands. With `terminate_auth` on none of this
+// applies: the connections are the router's, a new primary is one checkout
+// away, and the command is replayed above rather than refused.
+func (c *conn) endAfterFailover() {
+	if c.pooledPrimary() {
+		return
+	}
+	c.closeAfterReply = true
+}
+
 // replayable reports whether a command can be sent again without the risk of
 // applying it twice.
 func (c *conn) replayable(msg *wire.Message, name string) bool {

@@ -49,6 +49,11 @@ type Router struct {
 	// members is every node of the fast tier, so a read asking for a secondary
 	// can be sent to one.
 	members []string
+	// primaryProbeAt throttles re-resolving after a refusal. Every command in
+	// flight when a primary steps down comes back refused the same way, and one
+	// lookup answers all of them.
+	primaryProbeMu sync.Mutex
+	primaryProbeAt time.Time
 
 	// pools hold authenticated connections per member, which only became
 	// possible once authentication stopped being the client's.
@@ -451,6 +456,10 @@ type conn struct {
 	// is closed rather than returned to the pool.
 	dirty bool
 
+	// closeAfterReply ends this connection once the reply in hand has gone out.
+	// See endAfterFailover for what sets it.
+	closeAfterReply bool
+
 	// pinned maps a cursor to the pooled connection that owns it. A cursor
 	// exists on one node, so its getMore has to go back there.
 	pinned map[int64]*pooled
@@ -518,6 +527,11 @@ func (c *conn) pump(ctx context.Context) error {
 		c.r.Metrics.Record(c.cls, time.Since(started))
 		if err != nil {
 			return err
+		}
+		// The reply has gone out. Ending the connection here is what lets the
+		// client start again somewhere useful. See endAfterFailover.
+		if c.closeAfterReply {
+			return nil
 		}
 	}
 }
@@ -870,8 +884,13 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			reply = out
 		} else if !fromPool {
 			if rdoc, derr := reply.ReplyDoc(); derr == nil && isFailoverReply(rdoc) {
+				// Whether or not this command can be sent again, the address
+				// this router is pinned to is wrong from here on.
+				c.r.primaryMoved()
 				if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
 					reply = out
+				} else {
+					c.endAfterFailover()
 				}
 			}
 		}
@@ -1066,6 +1085,56 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 		r.log.Info("fast tier primary resolved", "addr", addr)
 	}
 	return nil
+}
+
+// primaryProbeEvery is the shortest interval between two re-resolutions
+// prompted by a refusal.
+const primaryProbeEvery = time.Second
+
+// primaryProbeWait bounds one such lookup. It is generous enough to cross an
+// ordinary election and short enough that a fast tier with no primary at all
+// does not accumulate probes.
+const primaryProbeWait = 5 * time.Second
+
+// primaryMoved re-resolves the pinned fast tier address after a member has said
+// it is no longer the primary.
+//
+// dialPrimary already re-resolves when a dial fails, which covers a member that
+// died. A stepDown is the other half and it looks nothing like that: the member
+// stays up, keeps accepting connections and answers every command with
+// NotPrimaryNoSecondaryOk, so nothing ever fails to dial and nothing ever asks
+// again. Measured before this existed, with `terminate_auth` off so no command
+// could be replayed: one stepDown on the fast tier, and seven minutes later
+// every command through the router still failed, including from clients that
+// connected after the election was over. The pinned address never moved, and
+// the router said nothing about it.
+//
+// The command that prompted this still fails, which is honest: whether it was
+// applied is exactly what a lost acknowledgement does not say, and replaying it
+// is decided in failover.go on much narrower grounds. What this buys is that
+// the next command reaches the new primary rather than the same secondary.
+//
+// It runs in the background because the caller is holding a client's reply. The
+// driver tracks the topology continuously but its own view may still be mid
+// election, and waiting for that here would stall a connection that has an
+// answer to deliver.
+func (r *Router) primaryMoved() {
+	r.primaryProbeMu.Lock()
+	if time.Since(r.primaryProbeAt) < primaryProbeEvery {
+		r.primaryProbeMu.Unlock()
+		return
+	}
+	r.primaryProbeAt = time.Now()
+	r.primaryProbeMu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), primaryProbeWait)
+		defer cancel()
+		if err := r.refreshPrimary(ctx); err != nil {
+			r.log.Warn("the fast tier refused a command as not primary, and which member took over could not be resolved",
+				"pinned", r.currentPrimary(), "err", err)
+		}
+	}()
 }
 
 // primaryWait is how long a new connection waits for the fast tier to have a

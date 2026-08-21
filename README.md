@@ -163,6 +163,20 @@ Range queries are governed by the watermark below.
   acknowledged write was present, none was applied twice, and a retry finished
   the job. A client reconnecting mid-election now waits up to 20 seconds for a
   new primary rather than failing outright.
+
+  A client that is *already* connected was the worse half of this, and it was
+  not a pause but a permanent outage. The router re-resolved which member is
+  primary only when a dial failed, which covers a member that died; a member
+  that steps down stays up, keeps accepting connections and answers every
+  command with `NotPrimaryNoSecondaryOk`, so nothing ever failed to dial and
+  nothing ever asked again. Measured with the shop running through the router
+  while the fast tier's primary stepped down: 4,226 refusals and still counting
+  three minutes later, against a set that had elected a new primary in one
+  second, and every client that connected afterwards was refused too. The router
+  now re-resolves on the first refusal, and ends that connection once the
+  refusal has been delivered, which is what mongod does to the clients of a
+  member that stops being primary. The driver reconnects, that handshake
+  authenticates against the member that is primary now, and the retry lands.
 - **Read preference is not honoured. Every read is served by the primary.** This
   follows from proxied authentication and is the one limitation to weigh before a
   pilot. The router answers `hello` as a mongos, and a mongos routes by read
@@ -1495,6 +1509,20 @@ assumed. With its primary stepped down under load, and both kinds of read
 running throughout, nothing failed: 19 reads the fast tier owned and 13 that
 fell through, all answered correctly while the set elected a new primary. The
 driver's own retry absorbs it.
+
+**The fast tier's failover costs a handful of operations, and it used to cost
+everything.** This is the one an adoption is most likely to meet, because the
+fast tier is the new replica set and the one being rolled and resized. Measured
+three times with the shop running through the router, all four daemons working
+underneath it and the warm still filling, and the fast tier's primary stepped
+down about forty seconds in: 25,600 operations a run, an election decided in
+about a second, the router pointing at the new primary 1.1 to 1.5 seconds later,
+2 to 8 failed operations, and none of the five invariants broken. What the
+client sees is a few refusals and a dropped connection, which its driver retries.
+The control says what to compare that against: the same shop and the same
+stepdown against plain MongoDB, with no router in the way, cost no errors at
+all. Before this was fixed the same test never recovered; see the proxied
+authentication bullet under "What it does not do yet".
 
 **15. Expect the warm to cost something and the evictor not to.** With a shop
 running against the router while all four daemons worked underneath it, 38,248
