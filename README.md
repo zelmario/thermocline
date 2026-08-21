@@ -1574,14 +1574,31 @@ The initial warm is the part that competes: the same shop ran at 84/s while it
 was filling and around 170/s afterwards. It is bounded by `warmer.rate`, which
 is the knob to turn if the application feels it, and it happens once.
 
-Sizing the window too small costs latency and not correctness, which was worth
-knowing rather than assuming. The same shop was run against a two minute hot
-window with twenty second residency and a sweep every ten seconds, so eviction
-and copy-up fought over the same documents throughout: 26,881 documents evicted
-across twelve sweeps, 306 copied back up, the fast tier stripped to 975 orders
-of the 53,000 there are. No errors, and none of the five invariants broken. What
-you get for a window that small is a fast tier holding nothing much and an
-application paying archive latency for most of its reads.
+Sizing the window too small costs latency. The same shop was run against a two
+minute hot window with twenty second residency and a sweep every ten seconds, so
+eviction and copy-up fought over the same documents throughout: 26,881 documents
+evicted across twelve sweeps, 306 copied back up, the fast tier stripped to 975
+orders of the 53,000 there are. No errors, and none of the five invariants
+broken. What you get for a window that small is a fast tier holding nothing much
+and an application paying archive latency for most of its reads.
+
+**That run was also reported here as costing latency and not correctness, and
+that was wrong.** The same fight, watched a different way, was losing data. A
+copy-up deleted the eviction announcement the feeder had not used yet, so the
+feeder read a real eviction as an application delete and tombstoned a record
+nothing had deleted; the copy-up's own insert did not repair it, because the
+feeder suppresses that as an echo. Measured on the sample datasets with a warm
+and an evictor over the same collections: 66 batches of "deletes not announced
+by the evictor" in ninety seconds, and an archive left holding 200 tombstoned
+trips and 45 tombstoned sales that nothing had ever deleted. The router then
+hid them from every answer, and the fast tier had already dropped them.
+
+It is fixed, and the announcement is now a count that only the feeder spends.
+The reason it was missed for so long is worth more than the bug: the earlier run
+watched throughput and the shop's five invariants, and both stayed clean,
+because a document quietly removed from a collection breaks no invariant about
+the documents that remain. What caught it was comparing every answer against the
+archive, which is what `test/pilot` does.
 
 **16. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
