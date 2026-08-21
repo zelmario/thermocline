@@ -369,10 +369,17 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 
 	lastReport := time.Now()
 
-	// Resume by starting just past the last completed point.
-	before := bson.RawValue{}
+	// Resume by starting just past the last completed point, expressed in the
+	// same quantity the rule tiers by. Turning a date watermark into an _id
+	// bound is what made a widened window scan nothing and then claim it. See
+	// scanCursor.
+	before := scanCursor{}
 	if saved.Claimed && saved.From.Before(now) {
-		before = objectIDBound(saved.From)
+		if rule.UsesObjectIDTime() {
+			before.id = objectIDBound(saved.From)
+		} else {
+			before.at, before.atSet = saved.From, true
+		}
 	}
 
 	for {
@@ -390,7 +397,7 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, err
 		}
 
-		docs, err := w.read(ctx, rule.NS, filter)
+		docs, err := w.read(ctx, rule.NS, filter, scanSort(rule))
 		if err != nil {
 			return stats, err
 		}
@@ -402,7 +409,15 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, nil
 		}
 		stats.Scanned += len(docs)
-		before = docs[len(docs)-1].id
+		last := docs[len(docs)-1]
+		before.id = last.id
+		if !rule.UsesObjectIDTime() {
+			at, aerr := w.oldestOf(docs, rule)
+			if aerr != nil {
+				return stats, aerr
+			}
+			before.at, before.atSet = at, true
+		}
 
 		written, err := w.write(ctx, rule.NS, docs)
 		if err != nil {
@@ -468,11 +483,11 @@ type sourceDoc struct {
 }
 
 // read pulls one batch out of the archive, newest first.
-func (w *Warmer) read(ctx context.Context, ns string, filter bson.D) ([]sourceDoc, error) {
+func (w *Warmer) read(ctx context.Context, ns string, filter bson.D, sort bson.D) ([]sourceDoc, error) {
 	db, coll := splitNS(ns)
 	cur, err := w.cold.Database(db).Collection(coll).Find(ctx, filter,
 		options.Find().
-			SetSort(bson.D{{Key: "_id", Value: -1}}).
+			SetSort(sort).
 			SetLimit(int64(w.cfg.BatchSize)))
 	if err != nil {
 		return nil, fmt.Errorf("read archive %s: %w", ns, err)

@@ -72,8 +72,33 @@ Everything that mechanism needed had already been worked out for the router's
 own copy-ups, in the code immediately below it. Fixed, and pinned by
 testecho.sh.
 
-After all three, the 212 questions produce no disagreements and the write
-harness passes.
+**A widened warm claiming a window it never copied.** The worst of the four,
+because nothing would have looked again: the warmer is one-shot, so an operator
+who widens the hot window runs it once and walks away.
+
+The scan has to run in the order the watermark is expressed in. A `date_field`
+rule tiers by that field and the watermark records a date, but the walk ran
+newest `_id` first and resumed by turning the date watermark into an `_id`
+bound. Those two orders agree only while a collection's `_id` order tracks its
+date field, which is the usual case and not the interesting one. These comments
+have ObjectIds minted when the dataset was published in 2018 and dates running
+to 2017, so resuming at the ten year boundary asked for
+`_id < ObjectId(2016-08-23)` and no document in the collection matched.
+
+Measured: a ten year warm filled 889 comments and claimed completeness from
+2016-08-23. Widening the rule to fifteen years scanned **zero** documents,
+copied none, and moved the claim to 2011-08-25. The archive holds 5,233 comments
+newer than that boundary and the fast tier held 889 of them, so every range
+query inside those five years would have been answered from the fast tier alone
+and returned a sixth of its rows, reported as success. Fixed, and pinned by
+testwarm.sh.
+
+The same question was asked of the evictor, which walks by `_id` too. It is
+sound: its cursor never converts a date into an `_id`, and its watermark comes
+from the eviction boundary rather than from where the scan happens to be.
+
+After all four, the 212 questions produce no disagreements and the write and
+stream harnesses pass.
 
 ## What the harnesses are
 
@@ -118,6 +143,19 @@ database works. The same test pointed straight at a mongod takes the same
 10.048 seconds and also reports `valid: true`, so it is Metabase's own timeout
 and not something the router does. Measuring the control is what settled it in
 a minute rather than an afternoon.
+
+## Change streams
+
+`streams.js` asks what a reactive application sees. A change stream is served
+from the fast tier, and the fast tier gains documents the application never
+asked for: a read of an archived document copies it up, and a warm copies up
+thousands. Each of those is an insert in that tier's oplog.
+
+None of them reaches the client. Measured: reading an archived comment produced
+no event at all, updating one produced exactly one `update` and no `insert`
+even though the fast tier gained the document a moment earlier, and an ordinary
+insert and delete both arrived. A warm of 10,000 documents underneath an open
+stream delivered nothing to the watcher.
 
 ## Two traps this dataset has naturally
 

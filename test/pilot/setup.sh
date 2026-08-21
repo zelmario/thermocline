@@ -109,10 +109,19 @@ writes() {
     mongosh "$ROUTER" --quiet --file /root/writes.js
 }
 
+streams() {
+  # What a reactive application sees while the tiers move underneath it.
+  echo "== watching a collection while documents move between tiers =="
+  docker cp test/pilot/streams.js $NODE:/root/streams.js >/dev/null
+  docker exec -e TC_COLD="$COLD" -e TC_HOT="$HOT" $NODE \
+    mongosh "$ROUTER" --quiet --file /root/streams.js
+}
+
 case "${1:-all}" in
   compare) compare ;;
   writes)  writes ;;
+  streams) streams ;;
   rewarm)  rewarm ;;
-  all)     restore; copyUntiered; start; compare; writes ;;
-  *)       echo "usage: $0 [all|compare|writes|rewarm]"; exit 2 ;;
+  all)     restore; copyUntiered; start; compare; writes; streams ;;
+  *)       echo "usage: $0 [all|compare|writes|streams|rewarm]"; exit 2 ;;
 esac

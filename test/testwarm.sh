@@ -231,6 +231,56 @@ chk "the claim survives a deletion"     "false" \
 chk "and nothing was resurrected"       "15" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 chk "the deleted documents stay gone"   "0"  "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({n:{\$gte:15}}))")"
 
+echo "== widening the window must copy what it then claims =="
+# The scan has to run in the order the watermark is expressed in. A date_field
+# rule tiers by that field and the watermark records a date, but the walk ran
+# newest _id first and resumed by turning the date watermark into an _id bound.
+# Those two orders agree only while a collection's _id order tracks its date
+# field, which is the usual case and not the interesting one.
+#
+# Found on MongoDB's sample datasets. sample_mflix.comments has ObjectIds minted
+# when the dataset was published in 2018 and comments dated 1970 to 2017, so
+# resuming at the ten year boundary asked for `_id < ObjectId(2016-08-23)`,
+# which no document in the collection matches. The scan returned nothing, the
+# loop read that as "the window is done", and the claim moved five years. The
+# archive held 5,233 documents newer than the new boundary and the fast tier
+# held 889 of them, so a range query inside those five years would have been
+# answered from the fast tier alone and returned a sixth of the rows, as a
+# success. The warmer is one-shot, so nothing would have looked again.
+#
+# tdated reproduces that shape deliberately: every _id is minted now and the
+# dates run backwards, so _id order says nothing about date order.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
+C 'const d=[]; for (let i=0;i<60;i++) d.push({_id:new ObjectId(), n:i, at:new Date(Date.now()-i*60*1000)});
+   db.getSiblingDB(process.env.TC_DB).tdated.insertMany(d)' >/dev/null
+cline watermark --config $CFG --ns $DB.tdated --clear >/dev/null 2>&1
+# Two configs, a narrow window and a wide one, so the second run is the
+# incremental step that used to scan nothing.
+for span in 20 50; do
+  sed '/^warmer:/,/^router:/ s|^  rules:|  rules:\n    - ns: "'"$DB.tdated"'"\n      date_field: "at"\n      back: '"$span"'m|' \
+      $CFG > $WDIR/warm_dated_$span.yaml
+done
+chk "the derived configs name the collection" "2" \
+    "$(grep -lc "ns: \"$DB.tdated\"" $WDIR/warm_dated_20.yaml $WDIR/warm_dated_50.yaml | wc -l)"
+cline warmer --config $WDIR/warm_dated_20.yaml >/dev/null 2>&1
+NARROW=$(H "print(db.getSiblingDB(process.env.TC_DB).tdated.countDocuments({}))")
+chk "the narrow warm filled its window"       "true" \
+    "$(awk -v n="$NARROW" 'BEGIN{print (n+0 > 0 && n+0 < 60) ? "true" : "false"}')"
+rm -f $LOGDIR/warm_wide.log
+cline warmer --config $WDIR/warm_dated_50.yaml --log-file $LOGDIR/warm_wide.log >/dev/null 2>&1
+chk "widening it scanned the newly exposed slice" "true" \
+    "$(grep -qE 'warm complete scanned=0 ' $LOGDIR/warm_wide.log && echo false || echo true)"
+# The invariant, and the only one that matters: everything the claim covers is
+# actually there. Asked of both tiers with the claim's own boundary.
+WM=$(cline watermark --config $CFG --ns $DB.tdated 2>&1 | sed 's/.*newer than //')
+chk "the fast tier holds all the claim covers" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tdated.countDocuments({at:{\$gte:new Date('$WM')},_tcDeletedAt:{\$exists:false}}))")" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tdated.countDocuments({at:{\$gte:new Date('$WM')}}))")"
+H "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"
