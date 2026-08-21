@@ -100,3 +100,54 @@ func TestExampleConfigLoads(t *testing.T) {
 		}
 	}
 }
+
+// A warm window reaching further back than the eviction cutoff tells the two
+// components to do opposite things to the same documents. They both obey, and
+// the completeness watermark is one value they write with opposite intent, so
+// whichever wrote last decides what the router believes the fast tier holds.
+//
+// Measured on MongoDB's sample datasets with a fifteen year warm against an
+// evictor removing anything over a day old: eighteen of 199 answers disagreed
+// with the archive while the two fought.
+func TestContradictoryWindowsAreRefused(t *testing.T) {
+	withWindows := func(back, older string) Config {
+		c := valid()
+		c.Warmer.Rules = []WarmRule{{NS: "app.orders", DateField: "at", Back: mustDur(t, back)}}
+		c.Evictor.Rules = []EvictionRule{{NS: "app.orders", DateField: "at", OlderThan: mustDur(t, older)}}
+		return c
+	}
+
+	if err := withWindows("120d", "90d").Validate(); err == nil {
+		t.Error("a warm reaching 120d against an eviction cutoff of 90d was accepted, so the two " +
+			"would take turns deciding what the fast tier claims to hold")
+	} else if !strings.Contains(err.Error(), "app.orders") {
+		t.Errorf("the refusal does not name the namespace: %v", err)
+	}
+
+	// The ordinary configuration: they meet at the same boundary and never
+	// address the same document.
+	if err := withWindows("90d", "90d").Validate(); err != nil {
+		t.Errorf("a warm and an eviction cutoff at the same boundary must be allowed: %v", err)
+	}
+	// And the safe direction, a warm narrower than the cutoff.
+	if err := withWindows("30d", "90d").Validate(); err != nil {
+		t.Errorf("a warm narrower than the eviction cutoff must be allowed: %v", err)
+	}
+	// A namespace the evictor never touches is not a contradiction whatever the
+	// warm window says.
+	c := valid()
+	c.Warmer.Rules = []WarmRule{{NS: "app.audit", DateField: "at", Back: mustDur(t, "3650d")}}
+	c.Evictor.Rules = []EvictionRule{{NS: "app.orders", DateField: "at", OlderThan: mustDur(t, "90d")}}
+	if err := c.Validate(); err != nil {
+		t.Errorf("a warm rule with no eviction rule beside it was refused: %v", err)
+	}
+}
+
+func mustDur(t *testing.T, s string) Duration {
+	t.Helper()
+	d, err := ParseDuration(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return d
+}

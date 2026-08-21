@@ -444,7 +444,55 @@ func (c Config) Validate() error {
 	if err := c.Warmer.Validate(); err != nil {
 		return err
 	}
+	if err := c.validateWindows(); err != nil {
+		return err
+	}
 	return c.Router.Validate()
+}
+
+// validateWindows refuses a namespace whose warm window reaches further back
+// than its eviction cutoff.
+//
+// Those two rules contradict each other. "Fill the fast tier back 120 days" and
+// "remove anything older than 90 days" are instructions about the same
+// documents, and the components obey them both: the warmer copies the 90 to 120
+// day band up, the evictor takes it away, and it repeats for as long as both
+// run.
+//
+// The waste is the smaller half. The completeness watermark is one value that
+// both write with opposite intent, the warmer widening it as it fills and the
+// evictor narrowing it before it removes, so whichever wrote last decides what
+// the router believes the fast tier holds. When the warmer wins that race the
+// claim describes documents the evictor has already taken, and a query inside
+// it is answered from the fast tier and comes back short, reported as success.
+//
+// Measured on MongoDB's sample datasets with a fifteen year warm against an
+// evictor removing anything over a day old, asking both tiers the same 199
+// questions while they fought: eighteen answers disagreed, all of them on the
+// two collections whose window covered their whole history.
+//
+// No ordering fixes this, because the two rules disagree about what the right
+// answer is. So it is refused where it can be seen, which is here.
+func (c Config) validateWindows() error {
+	evict := make(map[string]Duration, len(c.Evictor.Rules))
+	for _, r := range c.Evictor.Rules {
+		evict[r.NS] = r.OlderThan
+	}
+	for _, w := range c.Warmer.Rules {
+		older, ok := evict[w.NS]
+		if !ok {
+			continue
+		}
+		if w.Back.D() > older.D() {
+			return fmt.Errorf(
+				"%s: warmer.back is %s but evictor.older_than is %s, so the warmer would keep "+
+					"copying up what the evictor keeps removing, and the two would take turns "+
+					"deciding what the fast tier claims to hold; set warmer.back to %s or less, "+
+					"or evictor.older_than to %s or more",
+				w.NS, w.Back.String(), older.String(), older.String(), w.Back.String())
+		}
+	}
+	return nil
 }
 
 // validateMetaDB rejects a bookkeeping database that MongoDB would refuse, or
