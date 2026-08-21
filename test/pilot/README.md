@@ -88,6 +88,37 @@ passed. `setup.sh rewarm` puts the fast tier back to what a warm leaves, which
 is what the boundary checks need and what eviction will not do for half an hour,
 because a copy-up carries a residency hold.
 
+## A real application on top
+
+    bash test/pilot/metabase.sh
+
+Metabase is the first client here that nobody wrote for this project. It syncs
+its own schema by sampling documents, decides its own field types, and generates
+its own aggregation pipelines with date extraction operators nothing in `test/`
+ever sends. It reaches the router from inside the docker network, on a
+connection string with no `replicaSet=` in it, which is runbook step 2.
+
+It works, and every number it produces matches the archive. 22 comparisons over
+15 collections in 4 databases: counts, and the by-year distributions an X-ray
+builds, including the null group for documents with no date. Two of those
+collections hold nothing at all on the fast tier, and it still inferred a
+schema for them by sampling, 17 fields for `sample_training.trips` and 99 for
+`sample_weatherdata.data`.
+
+The seven queries an X-ray of the tiered `comments` collection generates all ran
+and none was refused: distributions by day of week, hour of day, month, quarter
+and year, over a collection whose documents are mostly in the archive. Each one
+was checked against the archive by hand as well and matched exactly. Seven of
+them fell through, which the router's counters say and which is what should
+happen.
+
+**One thing it does that looks like a defect and is not.** Adding each database
+logs `Failed to connect to Database: Timed out after 10.0 s`, and then the
+database works. The same test pointed straight at a mongod takes the same
+10.048 seconds and also reports `valid: true`, so it is Metabase's own timeout
+and not something the router does. Measuring the control is what settled it in
+a minute rather than an afternoon.
+
 ## Two traps this dataset has naturally
 
 Both are written up in the runbook as things to watch for, and both occur here
