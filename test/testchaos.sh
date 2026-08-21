@@ -153,9 +153,14 @@ for (let i=0;i<60;i++){
 print(err);")
 docker exec $NODE pkill -f 'cline evictor' 2>/dev/null
 chk "client errors while everything runs" "0" "$ERRS"
-# The feeder logs a reopen at ERROR when the primary it was tailing goes away.
-# That is the recovery working, not a fault, so it is excluded by name.
-chk "no unexpected daemon error" "0" "$(docker exec $NODE sh -c 'cat /var/log/cline/chaos_*.log 2>/dev/null | grep -iE "level=ERROR|panic" | grep -vc "change stream ended, reopening" || true' 2>/dev/null | tail -1)"
+# Two ERROR lines here are the product working and are excluded by name.
+#
+# The feeder logs a reopen when the primary it was tailing goes away, which is
+# the recovery. And the router logs the insert it refused while the archive was
+# down, three checks above: that refusal is the whole point of that section, so
+# counting it here reports a fault for behaviour this suite has just demanded.
+# It did, on every run, until it was named.
+chk "no unexpected daemon error" "0" "$(docker exec $NODE sh -c 'cat /var/log/cline/chaos_*.log 2>/dev/null | grep -iE "level=ERROR|panic" | grep -vEc "change stream ended, reopening|refused an insert because the archive could not be checked" || true' 2>/dev/null | tail -1)"
 
 docker exec $NODE pkill -f 'cline feeder|cline router' 2>/dev/null
 echo
