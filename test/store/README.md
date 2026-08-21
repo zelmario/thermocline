@@ -100,9 +100,9 @@ the cluster time of the poll's post-batch resume token, which is MongoDB saying
 newest `operationTime` the fast tier has reported. This check is still the one
 that would catch it again, and it is the only thing that ever saw it.
 
-## Two ways to write a check that lies
+## Three ways to write a check that lies
 
-Both of these were made here, and both produce failures that look exactly like a
+All of these were made here, and all produce failures that look exactly like a
 product bug.
 
 **A window that moves is not a fixed question.** Check 5 first computed its month
@@ -118,6 +118,23 @@ The windows are now whole calendar months fixed at startup.
 control run, because the control finished in nine seconds and the window barely
 moved. A control is necessary and not sufficient: it catches a check that is
 wrong always, not one that is wrong slowly.
+
+**A check that runs after an operation failed is asking about nothing.** Every
+check here compares one operation's result against another's, and each one used
+to run whether or not the operation under it had succeeded. Under a fast tier
+failover that turned six honest errors into twenty-nine invented violations: an
+insert refused with `NotWritablePrimary` was still followed by "read the order
+back", which found nothing and called it a lost write; and a count that failed
+left its `before` at zero, so the count after it read as a shop that had gained
+seventeen orders in one placement. Both were reported as the shop noticing
+something wrong, which is the strongest signal this tool has, spent on the
+system saying no correctly.
+
+The distinction that matters is the one the tool exists to draw. An error is the
+system saying no, and what follows a no proves nothing: the write may have been
+refused, or it may have landed with its acknowledgement lost, and the check
+cannot tell those apart. So each check now runs only when the operation it rests
+on actually happened, and the failure is counted once, as an error.
 
 Writes are partitioned by shopper, so shopper 3 only ever places orders for
 customers 3, 11, 19 and so on. Check 2 compares a count taken before an insert

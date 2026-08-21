@@ -230,11 +230,20 @@ func (s *shop) browse(ctx context.Context, rng *rand.Rand) {
 // if this system were broken: that the order is there, and that it is there
 // once.
 func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
+	// Every check below compares one operation's result against another's, so
+	// each one is only asked when the operation it rests on actually happened.
+	// An error is the system saying no, and what follows a no proves nothing:
+	// a count that failed leaves zero behind, and zero against eighteen reads
+	// as a shop that lost seventeen orders. See the README.
 	var beforeCount int64
+	countedBefore := false
 	s.timed("count a customer's orders", func() error {
 		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
-		beforeCount = n
-		return err
+		if err != nil {
+			return err
+		}
+		beforeCount, countedBefore = n, true
+		return nil
 	})
 
 	lines := bson.A{}
@@ -253,12 +262,14 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 	at := time.Now()
 	id := idAt(at, rng.Intn(1<<20))
 
+	placed := false
 	s.timed("place an order", func() error {
 		_, err := s.orders.InsertOne(ctx, bson.D{
 			{Key: "_id", Value: id}, {Key: "customer", Value: cust}, {Key: "at", Value: at},
 			{Key: "lines", Value: lines}, {Key: "total", Value: total},
 			{Key: "status", Value: "placed"},
 		})
+		placed = err == nil
 		return err
 	})
 	s.timed("log an order event", func() error {
@@ -269,6 +280,12 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 	})
 
 	// Read your own write, which is the promise, and check the total survived.
+	// Only when there was a write: an insert that was refused leaves nothing to
+	// read back, and an insert whose acknowledgement was lost may have landed
+	// anyway. Neither is this check's answer to give.
+	if !placed {
+		return
+	}
 	s.timed("read back the new order", func() error {
 		var got struct {
 			Total float64 `bson:"total"`
@@ -298,7 +315,11 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 		return nil
 	})
 
-	// Exactly one more, whichever tier answers the count.
+	// Exactly one more, whichever tier answers the count, and only when there is
+	// a number to compare against.
+	if !countedBefore {
+		return
+	}
 	s.timed("count a customer's orders", func() error {
 		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
 		if err != nil {
