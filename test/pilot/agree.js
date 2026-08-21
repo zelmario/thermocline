@@ -45,10 +45,16 @@ for (const dbName of dbs) {
     ask(ns, "stats.count",        () => c.stats().count - buried(c));
     ask(ns, "first 5 _id",        () => c.find(LIVE, {_id: 1}).sort({_id: 1}).limit(5).toArray().map(x => String(x._id)).join(","));
     ask(ns, "last 5 _id",         () => c.find(LIVE, {_id: 1}).sort({_id: -1}).limit(5).toArray().map(x => String(x._id)).join(","));
-    ask(ns, "distinct field set", () => Object.keys(c.findOne(LIVE) || {}).sort().join(","));
+    // Sorted, because findOne with no sort returns whatever the storage engine
+    // reaches first, and the two tiers are different clusters that need not
+    // agree on that. Documents here have optional fields, so an arbitrary
+    // document has an arbitrary field set and the check reported a difference
+    // that was two different documents rather than two different answers.
+    const first = () => c.find(LIVE).sort({_id: 1}).limit(1).toArray()[0] || {};
+    ask(ns, "field set of the first document", () => Object.keys(first()).sort().join(","));
     // A group-by over the whole collection, which is the shape a report has and
     // the shape that goes wrong quietly if half the documents are elsewhere.
-    const one = c.findOne(LIVE) || {};
+    const one = first();
     const key = Object.keys(one).filter(k => k !== "_id" && typeof one[k] === "string")[0];
     if (key) {
       ask(ns, "group by " + key, () =>
