@@ -80,3 +80,29 @@ func TestTombstoneSetsTheField(t *testing.T) {
 		t.Errorf("tombstone $set does not contain %s: %v", TombstoneField, err)
 	}
 }
+
+// One pair of tiers can carry two Thermocline deployments, and the second one's
+// bookkeeping database is not named in the first one's config. Reporting it to
+// an operator as application data tells them to tier somebody's checkpoints.
+func TestIsBookkeeping(t *testing.T) {
+	cases := []struct {
+		name  string
+		colls []string
+		want  bool
+	}{
+		{"another deployment's bookkeeping", []string{"checkpoints", "watermarks", "positions", "residency"}, true},
+		{"the key registry on the fast tier", []string{"keys"}, true},
+		{"one bookkeeping collection alone", []string{"markers"}, true},
+		{"an application database", []string{"orders", "customers"}, false},
+		// The one that matters: a database carrying both is somebody's data
+		// with an unlucky name in it, and staying quiet about it would hide the
+		// collections an application cannot see.
+		{"application data beside a lookalike", []string{"checkpoints", "orders"}, false},
+		{"an empty database says nothing either way", nil, false},
+	}
+	for _, c := range cases {
+		if got := IsBookkeeping(c.colls); got != c.want {
+			t.Errorf("%s: IsBookkeeping(%v) = %v, want %v", c.name, c.colls, got, c.want)
+		}
+	}
+}

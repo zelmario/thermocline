@@ -16,6 +16,8 @@ META=${META:-_thermocline}
 # shell expansion. Half the eval strings are single-quoted at the shell, where a
 # $VAR would not expand and would silently query the wrong database.
 export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+# A database with nothing tiered in it, for the section that checks it is named.
+LOSTDB=${DB}_lost; export TC_LOSTDB=$LOSTDB
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
@@ -274,6 +276,39 @@ kill $UP 2>/dev/null; wait $UP 2>/dev/null
 # where its catalogue used to be, so the router names it at startup.
 chk "the router named it at startup"          "true" \
     "$(grep -q 'the archive holds collections the fast tier does not' $LOGDIR/unt_r.log && echo true || echo false)"
+
+echo "== a database nothing tiers is not empty, it is absent =="
+# The stranded check above works within a database that already has something
+# tiered in it. It used to derive the whole list of databases to compare from
+# feeder.namespaces, so a database with nothing tiered was never looked at, and
+# that is the worse case rather than a rarer one: every collection in it is
+# invisible, and listDatabases and listCollections are answered by the fast tier
+# too, so it does not show up as empty, it does not show up.
+#
+# Found on MongoDB's own sample datasets adopted as an archive. Four collections
+# tiered across four databases: startup named eleven stranded collections and
+# said nothing at all about five whole databases holding 44,000 documents.
+C "db.getSiblingDB(process.env.TC_LOSTDB).catalogue.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_LOSTDB).catalogue.insertMany([{_id:'k1',name:'a kettle'},{_id:'k2',name:'a toaster'}])" >/dev/null
+rm -f $LOGDIR/lost_r.log
+cline router --config $CFG --log-file $LOGDIR/lost_r.log & LP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the application sees the collection empty" "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_LOSTDB).catalogue.countDocuments({}))")"
+chk "and the database is not even listed"       "false" \
+    "$(R "print(db.adminCommand({listDatabases:1}).databases.some(function(d){return d.name===process.env.TC_LOSTDB}))")"
+chk "while the archive still holds it"          "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_LOSTDB).catalogue.countDocuments({}))")"
+kill $LP 2>/dev/null; wait $LP 2>/dev/null
+chk "the router named the stranded collection"  "true" \
+    "$(grep -q "$LOSTDB.catalogue" $LOGDIR/lost_r.log && echo true || echo false)"
+chk "and named the database as having no trace" "true" \
+    "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
+C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
 echo "== a read preference on cold.uri, which does not do what it looks like =="
 # The natural thing to reach for when adopting a large cluster: during the

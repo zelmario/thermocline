@@ -229,16 +229,25 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 // Silence is the failure here. The behaviour is right and the surprise is
 // total, so it is said once at startup, naming them.
 func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
-	dbs := map[string]bool{}
+	managed := map[string]bool{}
 	for _, ns := range r.cfg.Managed {
 		if db, _ := splitNS(ns); db != "" {
-			dbs[db] = true
+			managed[db] = true
 		}
 	}
-	for db := range dbs {
+
+	var wholly []string
+	for _, db := range r.archiveDatabases(ctx) {
 		cold, cerr := collectionsIn(ctx, r.cold, db)
 		hot, herr := collectionsIn(ctx, r.hot, db)
 		if cerr != nil || herr != nil {
+			continue
+		}
+		// Another deployment's bookkeeping is not this application's data, and
+		// telling an operator to tier somebody's checkpoints is advice that
+		// would do harm if followed. This deployment's own is already excluded
+		// by name, and anything it tiers is examined whatever it is called.
+		if !managed[db] && meta.IsBookkeeping(collectionNames(cold)) {
 			continue
 		}
 		var stranded, views []string
@@ -256,6 +265,13 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 				continue
 			}
 			stranded = append(stranded, ns)
+		}
+		// A database the fast tier has no trace of is worse than a stranded
+		// collection and reads differently to an operator checking up on it:
+		// listDatabases and listCollections are answered by the fast tier, so
+		// the database is not empty, it is absent. Nothing names it anywhere.
+		if len(hot) == 0 && len(stranded)+len(views) > 0 {
+			wholly = append(wholly, db)
 		}
 		if len(stranded) > 0 {
 			sort.Strings(stranded)
@@ -276,6 +292,69 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 					"they read from; a view cannot be tiered itself and the feeder refuses one")
 		}
 	}
+	if len(wholly) > 0 {
+		sort.Strings(wholly)
+		r.log.Warn("the fast tier has no trace of these databases at all",
+			"databases", wholly,
+			"meaning", "listDatabases and listCollections are answered by the fast tier, so these do "+
+				"not show up as empty, they do not show up",
+			"action", "tier or copy what is in them, and check this list against what the "+
+				"application expects to find")
+	}
+}
+
+// collectionNames is the names out of what collectionsIn returned.
+func collectionNames(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for name := range m {
+		out = append(out, name)
+	}
+	return out
+}
+
+// archiveDatabases names every database on the archive worth comparing against
+// the fast tier.
+//
+// This used to be derived from feeder.namespaces, which meant it could only see
+// databases that already had something tiered in them. A database with nothing
+// tiered was never looked at, and that is the worst case rather than an edge
+// one: every collection in it is invisible to the application and no warning
+// mentioned it.
+//
+// Measured on MongoDB's own sample datasets adopted as an archive, with four
+// collections tiered across four databases: startup named eleven stranded
+// collections and said nothing about five whole databases holding 44,000
+// documents, including the one the sample data's own tutorials start with.
+//
+// The configured namespaces are kept in the set as well, so a database named in
+// the config but missing from the archive is still examined rather than
+// disappearing from the report along with the typo that caused it.
+func (r *Router) archiveDatabases(ctx context.Context) []string {
+	dbs := map[string]bool{}
+	for _, ns := range r.cfg.Managed {
+		if db, _ := splitNS(ns); db != "" {
+			dbs[db] = true
+		}
+	}
+	names, err := r.cold.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		r.log.Warn("could not list the archive's databases, so this report covers only what is tiered",
+			"err", err)
+	}
+	for _, n := range names {
+		switch n {
+		case "admin", "local", "config", meta.DB:
+			continue
+		}
+		dbs[n] = true
+	}
+
+	out := make([]string, 0, len(dbs))
+	for db := range dbs {
+		out = append(out, db)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // warnAboutMissingUsers names accounts the archive has that the fast tier does

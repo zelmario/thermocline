@@ -15,6 +15,39 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// bookkeepingCollections is every collection Thermocline creates in a
+// bookkeeping database, including the unique key registry, which lives in the
+// database of the same name on the fast tier.
+var bookkeepingCollections = map[string]bool{
+	Residency: true, Evicting: true, Checkpoints: true, PositionsColl: true,
+	Warming: true, Markers: true, DaemonStats: true, CacheAdvice: true,
+	Watermarks: true, "keys": true,
+}
+
+// IsBookkeeping reports whether a database holding exactly these collections is
+// some Thermocline deployment's bookkeeping rather than application data.
+//
+// The database this deployment uses is known from its own config. Another one's
+// is not, and one pair of tiers carrying two deployments is the situation DB is
+// a variable for, so it has to be recognised rather than named. Reporting it as
+// application data tells an operator to tier another deployment's checkpoints,
+// which is advice that would do harm if followed.
+//
+// It is recognised by content and not by name, because the name is whatever
+// somebody's meta.db said. An empty database is not bookkeeping: there is
+// nothing to go on, and nothing to warn about either.
+func IsBookkeeping(collections []string) bool {
+	if len(collections) == 0 {
+		return false
+	}
+	for _, c := range collections {
+		if !bookkeepingCollections[c] {
+			return false
+		}
+	}
+	return true
+}
+
 // DB is the database holding all Thermocline bookkeeping. It lives on the cold
 // tier, which is the durable side of the pair, and the unique key registry of
 // the same name lives on the fast tier.
