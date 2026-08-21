@@ -51,6 +51,11 @@ type Feeder struct {
 	// window both spending the same announcement, which is what the archive's
 	// own count cannot see. See flushAndCheckpoint.
 	spentNotices map[string]int
+	// claimedInBatch are the announcements the batch being assembled has taken.
+	// They join spentNotices only once that batch is in the archive, so an
+	// attempt that failed leaves nothing behind for a retry to under-count
+	// against.
+	claimedInBatch map[string]int
 	// lag of the most recent event applied
 	lastEventAt time.Time
 	// lastEventTS is the same position as a cluster time, kept whole.

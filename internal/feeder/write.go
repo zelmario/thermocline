@@ -204,9 +204,19 @@ func (f *Feeder) flush(ctx context.Context) error {
 			"matched", res.MatchedCount)
 	}
 
-	// The announcements this batch used are not written down here. They are
-	// held until the checkpoint that covers these events is saved. See
-	// flushAndCheckpoint.
+	// The batch is in the archive, so the announcements it claimed are now this
+	// run's to spend. They are not written down yet: that waits for the
+	// checkpoint covering these events. See flushAndCheckpoint.
+	if len(f.claimedInBatch) > 0 {
+		if f.spentNotices == nil {
+			f.spentNotices = map[string]int{}
+		}
+		for id, n := range f.claimedInBatch {
+			f.spentNotices[id] += n
+		}
+		f.claimedInBatch = nil
+	}
+
 	f.pending = f.pending[:0]
 	return nil
 }
@@ -249,9 +259,11 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// tombstones a real eviction. Without the second, two deletes of one
 	// document inside a checkpoint window both spend the same announcement, and
 	// the second of them is the application's.
-	if f.spentNotices == nil {
-		f.spentNotices = map[string]int{}
-	}
+	// Claims for this batch are staged separately and only merged once it is
+	// applied, so an attempt that fails part way leaves nothing behind. The
+	// halt policy returns from the middle of the loop below, and a write can
+	// fail after it.
+	f.claimedInBatch = map[string]int{}
 	avail := make(map[string]int, len(announced))
 	for id, n := range announced {
 		avail[id] = n - f.spentNotices[id]
@@ -262,7 +274,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		ok := avail[ids[n]] > 0
 		if ok {
 			avail[ids[n]]--
-			f.spentNotices[ids[n]]++
+			f.claimedInBatch[ids[n]]++
 		}
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)
 		if !ok {
