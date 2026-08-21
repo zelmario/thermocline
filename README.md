@@ -1439,6 +1439,21 @@ nothing is evicted on the first day. That is the guard working, and it says so:
 `eviction paused, reason="oplog window is 3h20m, limit 24h"`. Lower the limit
 only if you understand what it protects.
 
+An eviction sweep that does run before the warm is no longer a problem either,
+and it was one. The evictor narrows what the fast tier claims to hold before it
+removes anything, which is right; on an adoption there was nothing to narrow,
+and it made a claim instead, saying the fast tier held everything since the
+eviction boundary about a tier holding nothing. A sweep that scanned zero
+documents and evicted zero was enough. Measured on 4,000 archived orders with
+the fast tier empty: the router answered a thirty day range with 240 before the
+sweep, the archive's own answer, and a router started after it answered 0 and
+reported success. The already-running router kept the claim it had cached, so
+it took a restart to appear.
+
+A sweep now narrows a claim and never makes one. The claim comes from whatever
+put the documents there: the warmer, which knows how far back it filled, or you,
+with `cline watermark --complete-all`.
+
 **11. Size the fast tier for the key registry as well as the documents.** Every
 unique value gets a claim in `_thermocline.keys`, on the fast tier, and claims
 are permanent by design: one has to outlive the document it protects. After

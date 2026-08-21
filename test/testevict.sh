@@ -131,6 +131,42 @@ chkv "the sweep left the only live copy alone" "1" \
 H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$TOID')})" >/dev/null
 
+echo "== a sweep narrows a claim and does not invent one =="
+# The state every adoption starts in: the archive holds the collection, the fast
+# tier has never held any of it, no warm has run, so nothing has claimed
+# anything. One sweep used to leave a claim behind saying the fast tier holds
+# everything since the eviction boundary, about a tier holding nothing, and a
+# sweep that scanned zero documents and evicted zero was enough to do it.
+#
+# Measured through the router on 4,000 archived orders and an empty fast tier:
+# 240 in the last thirty days before the sweep, 0 after it, reported as success.
+# The router already running kept the claim it had cached, so this only showed
+# itself on the next restart, which is what made it worth a check here.
+#
+# The claim belongs to whatever put the documents there: the warmer, which knows
+# how far back it filled, or an operator who has checked.
+WMWAS=$(cline watermark --config $CFG --ns $DB.orders 2>&1 | tail -1)
+cline watermark --config $CFG --ns $DB.orders --clear >/dev/null 2>&1
+chkv "the claim starts withdrawn"              "true" \
+    "$(cline watermark --config $CFG --ns $DB.orders 2>&1 | grep -qc 'claims nothing' && echo true || echo false)"
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+WMOUT=$(cline evictor --config $CFG --once 2>&1)
+# The control again. A sweep that refused on health would leave the claim
+# withdrawn too, and prove nothing.
+chkv "the sweep actually ran"                  "true" \
+    "$(grep -q "not healthy enough to evict" <<<"$WMOUT" && echo false || echo true)"
+chkv "and it claimed nothing on its own"       "true" \
+    "$(cline watermark --config $CFG --ns $DB.orders 2>&1 | grep -qc 'claims nothing' && echo true || echo false)"
+# Put back exactly what was there, so nothing after this suite inherits a
+# withdrawn claim.
+case "$WMWAS" in
+  *"newer than "*) cline watermark --config $CFG --ns $DB.orders \
+      --complete-from "${WMWAS##*newer than }" >/dev/null 2>&1 ;;
+  *"all of history"*) cline watermark --config $CFG --ns $DB.orders --complete-all >/dev/null 2>&1 ;;
+esac
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "PASS $PASS   FAIL $FAIL"

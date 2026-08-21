@@ -101,8 +101,16 @@ func TestRaiseToIsOneWay(t *testing.T) {
 	}
 }
 
-// An evictor may well run before any warmer has recorded anything.
-func TestRaiseToCreatesWhenMissing(t *testing.T) {
+// An evictor may well run before any warmer has recorded anything, and what it
+// must do then is nothing.
+//
+// This pinned the opposite, and the opposite is how an adoption answers a range
+// query with silence. The fast tier starts empty, one sweep scans zero
+// documents and evicts zero, and the claim it left said the fast tier holds
+// everything since the eviction boundary. Measured through the router on 4,000
+// archived orders: 240 in the last thirty days before the sweep, 0 afterwards,
+// reported as success.
+func TestRaiseToDoesNotCreateAClaim(t *testing.T) {
 	s, cleanup := testStore(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -112,12 +120,15 @@ func TestRaiseToCreatesWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RaiseTo: %v", err)
 	}
-	if !raised {
-		t.Error("RaiseTo reported no change while creating the first watermark")
+	if raised {
+		t.Error("RaiseTo reported a change while there was no claim to narrow")
 	}
-	got, _ := s.Load(ctx, testNS)
-	if !got.From.Equal(boundary) {
-		t.Errorf("watermark = %v, want %v", got, boundary)
+	got, err := s.Load(ctx, testNS)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Claimed {
+		t.Errorf("a namespace nobody warmed claims completeness from %v after one sweep", got.From)
 	}
 }
 

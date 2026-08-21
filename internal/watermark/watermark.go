@@ -134,6 +134,23 @@ func (s *Store) Set(ctx context.Context, ns string, from time.Time) error {
 // The evictor calls this before removing documents older than `from`. Raising
 // the watermark shrinks what the fast tier claims to hold completely, which is
 // the safe direction: the worst case is a redundant lookup in the archive.
+//
+// It narrows a claim and never makes one. A namespace with no watermark claims
+// nothing, and that is the state every adoption starts in: the archive holds
+// the collection, the fast tier has never held any of it, and no warm has run.
+// Creating a claim there says the fast tier holds everything since the eviction
+// boundary about a tier that holds nothing, and a sweep that scans zero
+// documents and evicts zero was enough to do it.
+//
+// Measured on 4,000 orders in the archive and an empty fast tier: before the
+// sweep the router answered a thirty day range with 240, the archive's own
+// answer; after one sweep, a router started afterwards answered 0 and reported
+// success. The router already running kept the older claim it had cached, which
+// is why this waited for a restart to show itself.
+//
+// The claim belongs to whatever put documents there: the warmer, which knows
+// how far back it filled, or an operator who has checked, with
+// `cline watermark --complete-all`.
 func (s *Store) RaiseTo(ctx context.Context, ns string, from time.Time) (bool, error) {
 	res, err := s.coll.UpdateOne(ctx,
 		bson.D{
@@ -151,14 +168,9 @@ func (s *Store) RaiseTo(ctx context.Context, ns string, from time.Time) (bool, e
 		return true, nil
 	}
 
-	// No existing record matched. Either the watermark is already later, which
-	// needs nothing, or there is no watermark at all, which needs one.
-	err = s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: ns}}).Err()
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return true, s.Set(ctx, ns, from)
-	}
-	if err != nil {
-		return false, fmt.Errorf("raise watermark for %s: %w", ns, err)
-	}
+	// No existing record matched. Either the watermark is already later, or
+	// there is no watermark at all. Neither needs anything: there is no claim
+	// to narrow, and one made here would be about documents nothing has put on
+	// the fast tier.
 	return false, nil
 }
