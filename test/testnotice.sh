@@ -124,6 +124,57 @@ kill $FP 2>/dev/null; wait $FP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$EVID')})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$EVID')})" >/dev/null
 
+echo "== a restart before the checkpoint must not turn it into a deletion =="
+# Mirroring is idempotent, which is what lets the feeder checkpoint every few
+# seconds instead of every event: after a restart it repeats the work since the
+# last saved position and nothing is harmed. An announcement written off as the
+# batch is applied breaks exactly that. The events come round again, there is
+# nothing left to say those deletes were evictions, and the replay tombstones
+# every one of them. The window is one checkpoint interval, and an eviction
+# sweep runs continuously.
+#
+# Forced here with a sixty second checkpoint interval, so the feeder applies the
+# eviction and is stopped long before it saves its position.
+sed 's|^  checkpoint_every: .*|  checkpoint_every: 60s|' $CFG > $WDIR/notice_slowcp.yaml
+chkv "the derived config checkpoints slowly"     "true" \
+    "$(grep -q 'checkpoint_every: 60s' $WDIR/notice_slowcp.yaml && echo true || echo false)"
+RID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 5151)
+RNOTICE="$DB.orders|07$RID"
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$RID'), n:'live'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$RID'), n:'live'})" >/dev/null
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# The feeder starts first and is given time to save its position once. Its very
+# first flush always checkpoints, whatever the interval says, so an eviction
+# arranged before it starts is inside the saved position and the window this
+# section needs never opens.
+cline feeder --config $WDIR/notice_slowcp.yaml >/dev/null 2>&1 & FP3=$!
+sleep 10
+cline evictor --config $CFG --once >/dev/null 2>&1
+chkv "the eviction is announced"                 "1" "$(notices "$RNOTICE")"
+# Long enough for the feeder to apply the delete, far short of the sixty seconds
+# it would take to save the position covering it.
+sleep 8
+kill -9 $FP3 2>/dev/null; wait $FP3 2>/dev/null
+chkv "the archive did not tombstone it"          "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$RID'),_tcDeletedAt:{\$exists:true}}))")"
+chkv "the announcement survived an unsaved run"  "1" "$(notices "$RNOTICE")"
+# Now the replay, which is what a restart does.
+cline feeder --config $CFG >/dev/null 2>&1 & FP4=$!
+sleep 8
+chkv "and the replay did not tombstone it either" "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$RID'),_tcDeletedAt:{\$exists:true}}))")"
+chkv "the archive still holds it live"           "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$RID'),_tcDeletedAt:{\$exists:false}}))")"
+kill $FP4 2>/dev/null; wait $FP4 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

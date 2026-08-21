@@ -108,6 +108,31 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 		return err
 	}
 	f.lastSaved = time.Now()
+
+	// Only now are the eviction announcements this run has used written off.
+	//
+	// The comment above says mirroring is idempotent, so repeating a few
+	// seconds of work after a restart is cheap. That is what the whole
+	// checkpoint cadence rests on, and an announcement spent on apply breaks
+	// it: the events come round again, there is nothing left to say those
+	// deletes were evictions, and the replay tombstones every one of them. The
+	// window is one checkpoint interval, and an eviction sweep runs
+	// continuously, so it is not a small one.
+	//
+	// Tied to the checkpoint instead, a crash before the save leaves the
+	// announcements standing and the replay classifies them correctly. A crash
+	// after it means those events are not replayed at all.
+	if len(f.spentNotices) > 0 {
+		if err := meta.SpendEvictionNotices(ctx, f.cold, f.spentNotices); err != nil {
+			// An announcement left standing costs a later application delete
+			// being read as an eviction, so the archive keeps a record it
+			// should have marked deleted. That is the safe direction: it keeps
+			// something it should not, rather than losing something it should.
+			f.log.Warn("could not spend eviction notices", "err", err)
+			return nil
+		}
+		f.spentNotices = nil
+	}
 	return nil
 }
 
@@ -179,25 +204,9 @@ func (f *Feeder) flush(ctx context.Context) error {
 			"matched", res.MatchedCount)
 	}
 
-	// The announcements this batch used are spent only now, with every write
-	// already applied to the archive.
-	//
-	// Doing it while the deletes were being classified was wrong in a way that
-	// only shows on a failure: a batch that cannot be written leaves the
-	// checkpoint where it was and the same events arrive again, and the second
-	// time round there is nothing left to say those deletes were evictions. The
-	// retry would tombstone every one of them, which is the loss this whole
-	// mechanism exists to prevent, reintroduced by the recovery path.
-	//
-	// Failing here instead leaves the announcements standing, which costs a
-	// later application delete being read as an eviction: the archive keeps a
-	// record it should have marked deleted, rather than losing one it should
-	// have kept.
-	if err := meta.SpendEvictionNotices(ctx, f.cold, f.spentNotices); err != nil {
-		f.log.Warn("could not spend eviction notices", "err", err)
-	}
-	f.spentNotices = nil
-
+	// The announcements this batch used are not written down here. They are
+	// held until the checkpoint that covers these events is saved. See
+	// flushAndCheckpoint.
 	f.pending = f.pending[:0]
 	return nil
 }
@@ -234,14 +243,25 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		return err
 	}
 
-	// Recomputed from scratch, because a batch that failed to apply is
-	// retried and its earlier tally must not be counted twice.
-	f.spentNotices = map[string]int{}
+	// What is left to claim: what the archive still records, minus what this
+	// process has already claimed and not yet written down. Both halves are
+	// needed. Without the first, a replay after a restart finds nothing and
+	// tombstones a real eviction. Without the second, two deletes of one
+	// document inside a checkpoint window both spend the same announcement, and
+	// the second of them is the application's.
+	if f.spentNotices == nil {
+		f.spentNotices = map[string]int{}
+	}
+	avail := make(map[string]int, len(announced))
+	for id, n := range announced {
+		avail[id] = n - f.spentNotices[id]
+	}
+
 	var unannounced int
 	for n, slot := range slots {
-		ok := announced[ids[n]] > 0
+		ok := avail[ids[n]] > 0
 		if ok {
-			announced[ids[n]]--
+			avail[ids[n]]--
 			f.spentNotices[ids[n]]++
 		}
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)

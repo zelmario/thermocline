@@ -41,10 +41,15 @@ type Feeder struct {
 
 	// buffered work, flushed together
 	pending []pendingOp
-	// spentNotices are the eviction announcements this batch used up, held
-	// until the batch is durable in the archive. Spending them earlier would
-	// hand a retry a set of deletes with nothing left to explain them, and the
-	// retry would tombstone every one. See flush.
+	// spentNotices are the eviction announcements this run has used and not yet
+	// written off, held until the checkpoint covering those events is saved.
+	//
+	// Writing them off sooner breaks the idempotence the checkpoint cadence
+	// rests on: the events come round again after a restart, nothing is left to
+	// say those deletes were evictions, and the replay tombstones every one.
+	// Held here, they also stop two deletes of one document inside a single
+	// window both spending the same announcement, which is what the archive's
+	// own count cannot see. See flushAndCheckpoint.
 	spentNotices map[string]int
 	// lag of the most recent event applied
 	lastEventAt time.Time
