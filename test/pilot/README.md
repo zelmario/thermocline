@@ -97,8 +97,31 @@ The same question was asked of the evictor, which walks by `_id` too. It is
 sound: its cursor never converts a date into an `_id`, and its watermark comes
 from the eviction boundary rather than from where the scan happens to be.
 
-After all four, the 212 questions produce no disagreements and the write and
-stream harnesses pass.
+**A warm and an evictor fighting turned live records into tombstones.** The
+worst of the five, and the one that needed the tiers moving to find.
+
+The evictor announces a document before removing it, and the feeder reads that
+announcement to tell an eviction from an application delete. A copy-up deleted
+the announcement, which is right about the next eviction and wrong about the one
+already in flight: with the feeder yet to apply that delete, the notice it needs
+is gone by the time it looks, so it reads a real eviction as an application
+delete. The warm's own insert does not repair it, because the feeder suppresses
+that as an echo of the copy-up.
+
+Measured by running `setup.sh churn` with the eviction cutoff set inside the
+warm window, so the two fight: 66 batches of "deletes not announced by the
+evictor" in ninety seconds, and an archive left holding 200 tombstoned trips and
+45 tombstoned sales that nothing had ever deleted. The comparison caught it as
+answers, not as logs: the router reported 8,400 trips grouped by user type where
+the archive held 9,800.
+
+The same configuration had been measured before and reported as costing latency
+and not correctness. It cost both. The difference is that the earlier run
+watched throughput and invariants, and this one compared every answer against
+the archive. Fixed, and pinned by testevict.sh.
+
+After all five, the 212 questions produce no disagreements, and the write,
+stream, transaction and cache harnesses pass.
 
 ## What the harnesses are
 
@@ -156,6 +179,31 @@ no event at all, updating one produced exactly one `update` and no `insert`
 even though the fast tier gained the document a moment earlier, and an ordinary
 insert and delete both arrived. A warm of 10,000 documents underneath an open
 stream delivered nothing to the watcher.
+
+## Transactions, the cache, and the tiers moving
+
+`setup.sh txn` runs transactions over documents the fast tier does not hold. A
+transaction runs on the fast tier and cannot reach into the archive from inside
+itself, so the router copies what it touches up and aborts with
+TransientTransactionError for the driver's helper to retry. An `updateMany`
+inside a transaction reached all 868 documents of a year the fast tier held 320
+of. The label is checked directly as well, because without it a driver would not
+retry and every such transaction would fail rather than take slightly longer.
+
+`setup.sh cache` runs the query cache. A held answer is keyed by connection
+while authentication is proxied, since the router does not know who the client
+is, so a test that reconnects measures a cache that never hits: 0 hits over two
+full passes. Asked three times on one connection, the last pass is the one the
+cache answered and all 199 questions still match the archive, at 281 hits. With
+the fast tier's primary stepped down mid-flight and another client deleting a
+document during the election, the held answer did not survive it and the first
+read afterwards was correct.
+
+`setup.sh churn` asks the questions while a warm copies documents up and an
+evictor takes them away. Which tier answers is allowed to change; what the
+answer is, is not. The counts before and after are printed because without them
+a quiet run proves only that the churn never started, which happened: a
+residency hold meant the first attempt moved nothing at all.
 
 ## Two traps this dataset has naturally
 

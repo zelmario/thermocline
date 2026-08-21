@@ -157,13 +157,53 @@ print('  cache: %s shapes, %s hits, %s misses, watching=%s'
       % (c.get('shapes'), c.get('hits'), c.get('misses'), c.get('watching')))"
 }
 
+churn() {
+  # Ask the questions while the tiers move underneath them.
+  #
+  # A warm copying documents up and an evictor taking them away, both against
+  # the collections the comparison is reading. Which tier answers is allowed to
+  # change; what the answer is, is not.
+  #
+  # Measured: comments went from 1,443 documents on the fast tier to 5,238 and
+  # trips from 0 to 10,000 while three rounds of 212 questions ran, with the
+  # query cache on and serving. No disagreement in any round. The counts before
+  # and after are the control: without them a quiet run proves only that the
+  # churn never started.
+  echo "== moving documents between the tiers while a client asks =="
+  # A wide window and a residency of seconds. Without the short residency this
+  # is a no-op: a copy-up holds a document against eviction for as long as
+  # warmer.residency says, so a warm immediately followed by a sweep evicts
+  # nothing and the counts before and after are identical. That happened, and
+  # the counts are what showed it, which is why they are printed.
+  N "sed -e 's|      back: 3650d|      back: 5475d|' -e 's|  residency: 30m|  residency: 5s|' /root/pilot.yaml > /root/pilot_wide.yaml"
+  docker cp test/pilot/churn.sh $NODE:/root/churn.sh >/dev/null
+  echo "  fast tier before:"; tierCounts
+  docker exec -d $NODE bash /root/churn.sh
+  sleep 3
+  local rc=0
+  for i in 1 2 3; do
+    echo "  -- round $i --"
+    TC_REPEAT=2 compare || rc=1
+  done
+  echo "  fast tier after:"; tierCounts
+  return $rc
+}
+
+tierCounts() {
+  N "mongosh '$HOT' --quiet --eval '
+    [\"sample_mflix.comments\",\"sample_supplies.sales\",\"sample_training.trips\"].forEach(function(ns){
+      const p = ns.split(\".\");
+      print(\"    \" + ns + \"  \" + db.getSiblingDB(p[0])[p[1]].countDocuments({}));});'"
+}
+
 case "${1:-all}" in
   compare) compare ;;
   writes)  writes ;;
   streams) streams ;;
   txn)     txn ;;
   cache)   cache ;;
+  churn)   churn ;;
   rewarm)  rewarm ;;
   all)     restore; copyUntiered; start; compare; writes; streams; txn ;;
-  *)       echo "usage: $0 [all|compare|writes|streams|txn|cache|rewarm]"; exit 2 ;;
+  *)       echo "usage: $0 [all|compare|writes|streams|txn|cache|churn|rewarm]"; exit 2 ;;
 esac
