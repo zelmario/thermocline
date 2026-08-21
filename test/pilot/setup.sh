@@ -60,35 +60,61 @@ start() {
 }
 
 compare() {
-  # The whole point. Nothing here asserts an expected value: the archive is the
-  # control, and the only claim being checked is that a client cannot tell the
-  # difference. See README.md in this directory.
+  # The whole point. Nothing in either harness asserts an expected value: the
+  # archive is the control, and the only claim being checked is that a client
+  # cannot tell the difference. See README.md in this directory.
+  #
+  # agree.js asks per collection. aggs.js asks the questions that reach across
+  # them, including a join in each direction between a tiered collection and an
+  # untiered one, which is the case no watermark can cover.
   echo "== asking both the same questions =="
-  docker cp test/pilot/agree.js $NODE:/root/agree.js
-  N "mongosh '$ROUTER' --quiet --file /root/agree.js > /root/agree_router.json 2>&1"
-  N "mongosh '$COLD'   --quiet --file /root/agree.js > /root/agree_archive.json 2>&1"
-  docker cp $NODE:/root/agree_router.json /tmp/agree_router.json
-  docker cp $NODE:/root/agree_archive.json /tmp/agree_archive.json
-  python3 - <<'PY'
-import json, sys
-try:
-    r = json.load(open("/tmp/agree_router.json"))
-    a = json.load(open("/tmp/agree_archive.json"))
-except Exception as e:
-    print("  could not read an answer set, so nothing was compared:", e); sys.exit(2)
-ra = {(x["ns"], x["q"]): x["v"] for x in r}
-aa = {(x["ns"], x["q"]): x["v"] for x in a}
-keys = sorted(set(ra) | set(aa))
-diff = [k for k in keys if ra.get(k) != aa.get(k)]
-print(f"  {len(keys)} questions asked, {len(diff)} disagreements")
-for k in diff:
-    print(f"  {k[0]:38} {k[1]:22}\n      router  {str(ra.get(k))[:110]}\n      archive {str(aa.get(k))[:110]}")
-sys.exit(1 if diff else 0)
-PY
+  local rc=0
+  for h in agree aggs; do
+    docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
+    N "mongosh '$ROUTER' --quiet --file /root/$h.js > /root/${h}_router.json 2>&1"
+    N "mongosh '$COLD'   --quiet --file /root/$h.js > /root/${h}_archive.json 2>&1"
+    docker cp $NODE:/root/${h}_router.json /tmp/${h}_router.json >/dev/null
+    docker cp $NODE:/root/${h}_archive.json /tmp/${h}_archive.json >/dev/null
+    python3 test/pilot/diff.py "$h" || rc=1
+  done
+  return $rc
+}
+
+rewarm() {
+  # Put the fast tier back to what a warm leaves, which is what the boundary
+  # checks in writes.js need. They cannot be re-run against a tier that their
+  # own previous run pulled documents into, and eviction will not undo that for
+  # half an hour because a copy-up carries a residency hold, which is the point
+  # of one. Dropping and warming again is the documented way back: the warmer
+  # withdraws a completeness claim it finds the fast tier cannot support.
+  echo "== putting the fast tier back to a warm =="
+  N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
+  sleep 2
+  N "mongosh '$HOT' --quiet --eval 'db.getSiblingDB(\"sample_mflix\").comments.drop()'" >/dev/null
+  docker exec -d $NODE cline router --config /root/pilot.yaml --log-file /root/pilotlog/router.log
+  for _ in $(seq 1 30); do
+    N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  N "cline warmer --config /root/pilot.yaml 2>&1 | grep 'warm complete'"
+}
+
+writes() {
+  # The reads above never change anything. This writes to documents the fast
+  # tier has never held, which is where a tiered write is hardest: a comment
+  # from 1994 exists only in the archive, and an updateMany over 2016 straddles
+  # the boundary. It checks everything against the archive rather than against
+  # values chosen by hand, and clears up after itself.
+  echo "== writing to what is not on the fast tier =="
+  docker cp test/pilot/writes.js $NODE:/root/writes.js >/dev/null
+  docker exec -e TC_COLD="$COLD" -e TC_HOT="$HOT" $NODE \
+    mongosh "$ROUTER" --quiet --file /root/writes.js
 }
 
 case "${1:-all}" in
   compare) compare ;;
-  all)     restore; copyUntiered; start; compare ;;
-  *)       echo "usage: $0 [all|compare]"; exit 2 ;;
+  writes)  writes ;;
+  rewarm)  rewarm ;;
+  all)     restore; copyUntiered; start; compare; writes ;;
+  *)       echo "usage: $0 [all|compare|writes|rewarm]"; exit 2 ;;
 esac

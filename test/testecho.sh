@@ -187,6 +187,60 @@ chk "and both updates reached the archive"           "2" \
 chk "any notice left behind is one the router wrote"  "true" \
     "$(C "const n=db.getSiblingDB(process.env.TC_META).residency.countDocuments({echoPending:true, promotedAt:{\$exists:false}}); print(n===0)")"
 
+echo "== a warm must not swallow the application's own write =="
+# The warmer announces every document it is about to copy up, so the feeder does
+# not mirror that copy straight back into the archive it came from. The notice
+# matched any mirror for the document rather than only the copy-up's insert, and
+# it was never spent, so while a warm was running the feeder dropped the
+# application's own writes to warmed documents.
+#
+# Everything the promotion path above had to learn, and this had learned none of
+# it. Found by adopting MongoDB's sample datasets rather than by a fixture: warm
+# a collection, then update a year of it through the router. 868 documents
+# modified, 868 marked on the fast tier, 548 in the archive, and it stayed at
+# 548. The router answered 548 as well, because a range straddling the watermark
+# is read from the archive, so the write was acknowledged, held on one tier,
+# invisible through the proxy and missing from the durable one. An eviction
+# would have finished the job.
+#
+# The rule lives in a derived config rather than the shared one, which is what
+# the suites needing a different config already do, so nothing else inherits a
+# warm rule for this namespace.
+# date_field, because these _ids are integers and a rule without one takes a
+# document's age from the timestamp inside an ObjectId. Both components refuse
+# such a rule rather than obeying it, so the warm would copy nothing and every
+# check below would pass while measuring an idle warmer.
+sed '/^warmer:/,/^router:/ s|^  rules:|  rules:\n    - ns: "'"$DB.$NS"'"\n      date_field: "at"\n      back: 40m|' $CFG > $WDIR/echo_warm.yaml
+chk "the derived config warms this namespace"        "1" \
+    "$(grep -c "ns: \"$DB.$NS\"" $WDIR/echo_warm.yaml)"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).warming.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:30,v:'old',at:new Date()},{_id:31,v:'old',at:new Date()}])" >/dev/null
+startFeeder
+startRouter
+cline warmer --config $WDIR/echo_warm.yaml >/dev/null 2>&1
+chk "the warm copied both up"                        "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:{\$in:[30,31]}}))")"
+# Immediately, while the warmer's marker is still fresh. That window is the only
+# time the suppression is active, so a check run after it has gone stale would
+# pass whatever the feeder does.
+chk "the update is applied"                          "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:30},{\$set:{v:'new'}}).modifiedCount)")"
+for _ in $(seq 1 40); do
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:30}); print(d?d.v:'MISSING')")" = "new" ] && break
+  sleep 0.5
+done
+chk "and it reached the archive"                     "new" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:30}); print(d?d.v:'MISSING')")"
+chk "the one nobody wrote to is untouched"           "old" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:31}); print(d?d.v:'MISSING')")"
+# And the notice is spent rather than left waiting for a later write to the same
+# document, which is what made the loss above possible.
+chk "the warm's notices were spent"                  "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).warming.countDocuments({_id:{\$regex:'^'+process.env.TC_DB+'\\.$NS'}}))")"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

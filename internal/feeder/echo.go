@@ -56,6 +56,28 @@ func (f *Feeder) warmingActive(ctx context.Context) bool {
 
 // suppressWarmEchoes drops buffered upserts that came from the warmer copying
 // archived documents back into the fast tier. It reports how many it removed.
+//
+// Everything the promotion path below had to learn applies here, and this had
+// learned none of it. A notice matched any upsert rather than only an insert,
+// and it was never spent, so while a warm was running it swallowed every mirror
+// for a document the warmer had announced, not just the one copy-up it was
+// written for.
+//
+// Measured on MongoDB's sample datasets adopted as an archive, on the shape
+// that produces it exactly: warm sample_mflix.comments, then have a client
+// update a year of them through the router, 868 documents of which the fast
+// tier held the 320 the warm had just copied. All 868 were modified and the
+// fast tier held all 868 marked. The archive held 548, and it stayed at 548:
+// the 320 updates to warmed documents were dropped on the way and nothing said
+// so. The router then answered the client 548, because a range straddling the
+// watermark is read from the archive, so the write was acknowledged, present on
+// one tier, invisible through the proxy and absent from the durable one. An
+// eviction would have finished the job.
+//
+// A warm copies a document up as an insert, always, so an update or a replace
+// can never be one. That is the same reasoning already written down below, and
+// the same one-shot discipline follows: spend the notice, and drop nothing if
+// spending it fails.
 func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 	if !f.warmingActive(ctx) {
 		return 0, nil
@@ -63,7 +85,7 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 
 	var ids []string
 	for _, op := range f.pending {
-		if op.kind == actionUpsert {
+		if op.kind == actionUpsert && op.wasInsert {
 			ids = append(ids, meta.DocID(op.ns, op.id))
 		}
 	}
@@ -71,8 +93,16 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	cur, err := f.cold.Database(meta.DB).Collection(meta.Warming).Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+	// Bounded in time for the reason the promotion notices are: a notice whose
+	// copy-up never arrived would otherwise sit waiting for any later insert of
+	// the same document and suppress that instead. A warm's own echo arrives
+	// well inside this.
+	coll := f.cold.Database(meta.DB).Collection(meta.Warming)
+	cur, err := coll.Find(ctx,
+		bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
+			{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().UTC().Add(-echoWindow)}}},
+		},
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
 		// Not fatal. Failing to suppress costs redundant writes, and stopping
@@ -82,22 +112,45 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	announced := make(map[string]struct{}, len(ids))
+	var announced []string
 	for cur.Next(ctx) {
 		var rec struct {
 			ID string `bson:"_id"`
 		}
 		if err := cur.Decode(&rec); err == nil {
-			announced[rec.ID] = struct{}{}
+			announced = append(announced, rec.ID)
 		}
 	}
+	if len(announced) == 0 {
+		return 0, nil
+	}
 
+	// Spend the notices before dropping anything, and drop nothing if that
+	// fails. Suppressing a mirror while the notice survives would spend it on a
+	// later genuine write to the same document, which is the outcome this whole
+	// mechanism exists to avoid.
+	if _, derr := coll.DeleteMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: announced}}}}); derr != nil {
+		f.log.Warn("could not clear warming notices, mirroring them anyway", "err", derr)
+		return 0, nil
+	}
+
+	claimed := make(map[string]struct{}, len(announced))
+	for _, id := range announced {
+		claimed[id] = struct{}{}
+	}
+
+	// One notice, one mirror. Change events arrive in order, so the first
+	// insert of that document is the copy-up the notice was written for and
+	// everything after it is the application's own work.
 	var dropped int
 	for i, op := range f.pending {
-		if op.kind != actionUpsert {
+		if op.kind != actionUpsert || !op.wasInsert {
 			continue
 		}
-		if _, ok := announced[meta.DocID(op.ns, op.id)]; ok {
+		id := meta.DocID(op.ns, op.id)
+		if _, ok := claimed[id]; ok {
+			delete(claimed, id)
 			f.pending[i].kind = actionSkip
 			dropped++
 		}

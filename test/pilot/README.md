@@ -52,7 +52,41 @@ and the hot window is ten years, so none of it is on the fast tier. Meanwhile
 `countDocuments` on it answered 10,000. Two ways of asking the same question,
 disagreeing by the whole collection. Fixed, and pinned by testops.sh.
 
-After both, the 199 questions produce no disagreements.
+**A warm swallowing the application's own writes.** This one is silent data
+loss, and only the write harness could find it. The warmer announces every
+document it is about to copy up so the feeder does not mirror that copy straight
+back into the archive it came from. The notice matched any mirror for the
+document rather than only the copy-up's insert, and it was never spent, so while
+a warm was running the feeder dropped the application's own writes to warmed
+documents.
+
+Measured: warm `sample_mflix.comments`, then update a year of them through the
+router. 868 documents matched and modified, 868 marked on the fast tier, 548 in
+the archive, and it stayed at 548 rather than catching up. The router answered
+548 too, because a range straddling the watermark is read from the archive. So
+the write was acknowledged, held on one tier, invisible through the proxy and
+missing from the durable one, and an eviction would have finished the job. The
+548 are exactly the documents the warm had not touched.
+
+Everything that mechanism needed had already been worked out for the router's
+own copy-ups, in the code immediately below it. Fixed, and pinned by
+testecho.sh.
+
+After all three, the 212 questions produce no disagreements and the write
+harness passes.
+
+## What the harnesses are
+
+`agree.js` and `aggs.js` only read. `writes.js` writes, and it is the one that
+found the third defect, because a warm and an application writing to what it
+warmed cannot happen in a read-only test.
+
+It picks its subjects from the state it finds rather than assuming one, because
+its own writes change that state: a write to an archived document copies it up,
+which is the design. A check it cannot run is reported as skipped, never as
+passed. `setup.sh rewarm` puts the fast tier back to what a warm leaves, which
+is what the boundary checks need and what eviction will not do for half an hour,
+because a copy-up carries a residency hold.
 
 ## Two traps this dataset has naturally
 
