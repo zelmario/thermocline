@@ -41,6 +41,11 @@ type Feeder struct {
 
 	// buffered work, flushed together
 	pending []pendingOp
+	// spentNotices are the eviction announcements this batch used up, held
+	// until the batch is durable in the archive. Spending them earlier would
+	// hand a retry a set of deletes with nothing left to explain them, and the
+	// retry would tombstone every one. See flush.
+	spentNotices map[string]int
 	// lag of the most recent event applied
 	lastEventAt time.Time
 	// lastEventTS is the same position as a cluster time, kept whole.

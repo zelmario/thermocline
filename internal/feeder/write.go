@@ -179,6 +179,25 @@ func (f *Feeder) flush(ctx context.Context) error {
 			"matched", res.MatchedCount)
 	}
 
+	// The announcements this batch used are spent only now, with every write
+	// already applied to the archive.
+	//
+	// Doing it while the deletes were being classified was wrong in a way that
+	// only shows on a failure: a batch that cannot be written leaves the
+	// checkpoint where it was and the same events arrive again, and the second
+	// time round there is nothing left to say those deletes were evictions. The
+	// retry would tombstone every one of them, which is the loss this whole
+	// mechanism exists to prevent, reintroduced by the recovery path.
+	//
+	// Failing here instead leaves the announcements standing, which costs a
+	// later application delete being read as an eviction: the archive keeps a
+	// record it should have marked deleted, rather than losing one it should
+	// have kept.
+	if err := meta.SpendEvictionNotices(ctx, f.cold, f.spentNotices); err != nil {
+		f.log.Warn("could not spend eviction notices", "err", err)
+	}
+	f.spentNotices = nil
+
 	f.pending = f.pending[:0]
 	return nil
 }
@@ -215,13 +234,15 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		return err
 	}
 
-	spent := map[string]int{}
+	// Recomputed from scratch, because a batch that failed to apply is
+	// retried and its earlier tally must not be counted twice.
+	f.spentNotices = map[string]int{}
 	var unannounced int
 	for n, slot := range slots {
 		ok := announced[ids[n]] > 0
 		if ok {
 			announced[ids[n]]--
-			spent[ids[n]]++
+			f.spentNotices[ids[n]]++
 		}
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)
 		if !ok {
@@ -233,15 +254,6 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 				ErrUnannouncedDelete, op.ns, meta.DocID(op.ns, op.id))
 		}
 		f.pending[slot].kind = act
-	}
-
-	// Spent last, so a batch that could not be classified leaves the
-	// announcements standing for the next attempt.
-	if err := meta.SpendEvictionNotices(ctx, f.cold, spent); err != nil {
-		// Not fatal, and it fails in the safe direction: an announcement left
-		// standing costs one application delete being read as an eviction,
-		// which the archive keeps rather than loses.
-		f.log.Warn("could not spend eviction notices", "err", err)
 	}
 
 	if unannounced > 0 {
