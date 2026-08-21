@@ -122,10 +122,14 @@ func (c *conn) replayAfterFailover(ctx context.Context, msg *wire.Message, name 
 // primary now, and the retry lands. With `terminate_auth` on none of this
 // applies: the connections are the router's, a new primary is one checkout
 // away, and the command is replayed above rather than refused.
-func (c *conn) endAfterFailover() {
+func (c *conn) endAfterFailover(ctx context.Context) {
 	if c.pooledPrimary() {
 		return
 	}
+	// Wait for the re-resolution this refusal triggered rather than racing the
+	// client's reconnect to it. See awaitPrimaryProbe for what losing that race
+	// looks like.
+	c.r.awaitPrimaryProbe(ctx)
 	c.closeAfterReply = true
 }
 

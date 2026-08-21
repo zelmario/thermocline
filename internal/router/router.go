@@ -51,9 +51,12 @@ type Router struct {
 	members []string
 	// primaryProbeAt throttles re-resolving after a refusal. Every command in
 	// flight when a primary steps down comes back refused the same way, and one
-	// lookup answers all of them.
+	// lookup answers all of them. primaryProbing is non-nil while one is
+	// running and is closed when it finishes, so a refusal can wait for the
+	// answer instead of racing the client's reconnect to it.
 	primaryProbeMu sync.Mutex
 	primaryProbeAt time.Time
+	primaryProbing chan struct{}
 
 	// pools hold authenticated connections per member, which only became
 	// possible once authentication stopped being the client's.
@@ -890,7 +893,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
 					reply = out
 				} else {
-					c.endAfterFailover()
+					c.endAfterFailover(ctx)
 				}
 			}
 		}
@@ -1120,21 +1123,60 @@ const primaryProbeWait = 5 * time.Second
 // answer to deliver.
 func (r *Router) primaryMoved() {
 	r.primaryProbeMu.Lock()
-	if time.Since(r.primaryProbeAt) < primaryProbeEvery {
+	if r.primaryProbing != nil || time.Since(r.primaryProbeAt) < primaryProbeEvery {
 		r.primaryProbeMu.Unlock()
 		return
 	}
+	done := make(chan struct{})
+	r.primaryProbing = done
 	r.primaryProbeAt = time.Now()
 	r.primaryProbeMu.Unlock()
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), primaryProbeWait)
 		defer cancel()
-		if err := r.refreshPrimary(ctx); err != nil {
+		err := r.refreshPrimary(ctx)
+
+		r.primaryProbeMu.Lock()
+		r.primaryProbing = nil
+		r.primaryProbeMu.Unlock()
+		close(done)
+
+		if err != nil {
 			r.log.Warn("the fast tier refused a command as not primary, and which member took over could not be resolved",
 				"pinned", r.currentPrimary(), "err", err)
 		}
 	}()
+}
+
+// awaitPrimaryProbe waits for a re-resolution already under way, if there is
+// one.
+//
+// Without this the fix above is a race the client can win. A driver retries as
+// soon as it sees the refusal, and the connection it opens dials whatever
+// address this router is pinned to, so a retry that arrives before the lookup
+// finishes lands on the same member that just refused it. Measured: the retry
+// succeeded three times out of four and failed the fourth, which is the worst
+// kind of working.
+//
+// The wait costs the refused command about a second, on a command that has
+// already failed, and it is bounded twice over: by the probe's own timeout and
+// by the caller's context. A driver talking straight to the replica set would
+// be blocking in server selection for longer.
+func (r *Router) awaitPrimaryProbe(ctx context.Context) {
+	r.primaryProbeMu.Lock()
+	done := r.primaryProbing
+	r.primaryProbeMu.Unlock()
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(primaryProbeWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // primaryWait is how long a new connection waits for the fast tier to have a
