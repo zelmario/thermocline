@@ -1,0 +1,94 @@
+# The pilot: MongoDB's own sample datasets, adopted.
+#
+# The archive is the cluster that already has the data, which is what an
+# adoption means. The fast tier starts with nothing. Four collections are
+# tiered, chosen because they carry a date that means something; the other
+# nineteen are not, and have to be copied whole, which is step 4 of the runbook.
+#
+# Every tiered rule sets date_field on purpose. These _id values are ObjectIds
+# minted when the dataset was published, and the comments they carry are dated
+# 1970 to 2017, so a rule reading the age from the _id would address the
+# publication date and tier nothing. That is the trap in step 5 of the runbook,
+# occurring naturally in somebody else's data rather than in a fixture.
+
+hot:
+  uri: "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin"
+
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+meta:
+  db: "_thermocline_pilot"
+
+feeder:
+  id: "pilot"
+  namespaces:
+    - "sample_mflix.comments"
+    - "sample_supplies.sales"
+    - "sample_weatherdata.data"
+    - "sample_training.trips"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 20ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "pilot"
+  rate: 2000
+  batch_size: 200
+  max_feeder_lag: 30s
+  rules:
+    # Ten years, which leaves 2016 and 2017 on the fast tier and the rest in the
+    # archive.
+    - ns: "sample_mflix.comments"
+      date_field: "date"
+      older_than: 3650d
+    - ns: "sample_supplies.sales"
+      date_field: "saleDate"
+      older_than: 3650d
+    # Dated 1984, so all of it belongs in the archive. An application reading a
+    # collection that lives entirely there is a shape worth having.
+    - ns: "sample_weatherdata.data"
+      date_field: "ts"
+      older_than: 3650d
+    # A date field whose name has a space in it.
+    - ns: "sample_training.trips"
+      date_field: "start time"
+      older_than: 3650d
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05
+    min_write_tickets_free: 0.25
+    min_oplog_window: 1m
+
+warmer:
+  rate: 2000
+  batch_size: 200
+  residency: 30m
+  rules:
+    - ns: "sample_mflix.comments"
+      date_field: "date"
+      back: 3650d
+    - ns: "sample_supplies.sales"
+      date_field: "saleDate"
+      back: 3650d
+    - ns: "sample_weatherdata.data"
+      date_field: "ts"
+      back: 3650d
+    - ns: "sample_training.trips"
+      date_field: "start time"
+      back: 3650d
+  backoff:
+    max_replication_lag: 10s
+    max_cache_dirty: 0.05
+    min_write_tickets_free: 0.25
+    min_oplog_window: 1m
+
+router:
+  listen: "0.0.0.0:27500"
+  dashboard: "0.0.0.0:27510"
+  completeness: archive
+  residency: 30m
