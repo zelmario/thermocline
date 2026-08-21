@@ -191,25 +191,6 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 	}
 }
 
-// An announcement nothing will consume has to come back, or a later application
-// delete spends it and the archive keeps a record it was told to remove.
-func TestWithdrawnEvictionLeavesNothing(t *testing.T) {
-	c, cleanup := testCold(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
-		t.Fatalf("announce: %v", err)
-	}
-	if err := WithdrawEviction(ctx, c, []string{noticeID}); err != nil {
-		t.Fatalf("withdraw: %v", err)
-	}
-	have, _ := ConsumeEvictionNotices(ctx, c, []string{noticeID})
-	if have[noticeID] != 0 {
-		t.Errorf("a withdrawn announcement is still standing: %d", have[noticeID])
-	}
-}
-
 // A deployment upgraded mid-flight has notices already written without the
 // count. Reading one as zero would treat a real eviction as an application
 // delete, which is the loss this whole mechanism exists to prevent.

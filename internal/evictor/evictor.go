@@ -412,41 +412,53 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		return nil
 	}
 
-	if err := e.announce(ctx, docs); err != nil {
+	// Announce only what is actually there, so the announcements and the
+	// deletes cover the same documents.
+	//
+	// Without this the two sets drift: something can remove a candidate between
+	// the scan and here, and the delete then reports fewer removals than were
+	// announced. The first attempt at handling that took the surplus back from
+	// an arbitrary prefix of the batch, because a bulk delete does not say which
+	// id it missed. That withdrew announcements belonging to documents it had
+	// just evicted, and the feeder tombstoned them: 141 documents lost across
+	// two collections on the pilot, by the fix meant to stop exactly that.
+	present, err := e.presentOnFastTier(ctx, hotColl, docs)
+	if err != nil {
+		return err
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	if err := e.announce(ctx, present); err != nil {
 		return err
 	}
 
-	ids := make([]bson.RawValue, len(docs))
-	docIDs := make([]string, len(docs))
-	for i, d := range docs {
+	ids := make([]bson.RawValue, len(present))
+	docIDs := make([]string, len(present))
+	for i, d := range present {
 		ids[i] = d.id
 		docIDs[i] = d.docID
 	}
 	res, err := hotColl.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
 	if err != nil {
-		// Announced and not removed. The notice has to come back, or it waits
-		// for a delete that is never coming and answers for the next one, which
-		// could be the application's.
-		if werr := meta.WithdrawEviction(ctx, e.cold, docIDs); werr != nil {
-			e.log.Warn("could not withdraw eviction notices after a failed delete", "ns", ns, "err", werr)
-		}
 		return fmt.Errorf("delete from fast tier %s: %w", ns, err)
 	}
 	e.log.Debug("evicted", "ns", ns, "deleted", res.DeletedCount)
-	if int(res.DeletedCount) < len(docs) {
-		// Something removed a candidate between the scan and here, so its
-		// announcement has nothing to answer for. Which one is not knowable
-		// from a bulk delete, so the surplus is taken off the batch as a whole:
-		// every id gives one back and the ones that were evicted get theirs
-		// again. Doing nothing would leave a notice standing for an application
-		// delete to spend.
-		short := len(docs) - int(res.DeletedCount)
-		e.log.Info("fewer documents to evict than were announced",
-			"ns", ns, "announced", len(docs), "deleted", res.DeletedCount,
-			"note", "something else removed them first; taking the surplus announcements back")
-		if werr := meta.WithdrawEviction(ctx, e.cold, docIDs[:short]); werr != nil {
-			e.log.Warn("could not withdraw the surplus eviction notices", "ns", ns, "err", werr)
-		}
+	if int(res.DeletedCount) < len(present) {
+		// Still possible, in the moment between the check above and this
+		// delete, and nothing here can say which id it was. The announcements
+		// stay where they are.
+		//
+		// Leaving one standing costs a later application delete of that same
+		// document being read as an eviction, so the archive keeps a record it
+		// should have marked deleted, and the notice expires within the hour.
+		// Taking one back wrongly costs a document evicted from the fast tier
+		// and tombstoned in the archive, which is gone from both. Of the two,
+		// keep the data.
+		e.log.Info("fewer documents to evict than were there a moment ago",
+			"ns", ns, "announced", len(present), "deleted", res.DeletedCount,
+			"note", "something else removed them first; the announcements are left standing, "+
+				"because taking back the wrong one loses a document")
 	}
 
 	// Residency is meaningless once the document has left the fast tier.
@@ -456,6 +468,55 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		e.log.Warn("could not clear residency records", "ns", ns, "err", err)
 	}
 	return nil
+}
+
+// presentOnFastTier narrows a batch to the documents the fast tier still holds.
+//
+// One indexed lookup by _id, so that what is announced and what is deleted are
+// the same set. See evict for what happens when they are not.
+func (e *Evictor) presentOnFastTier(ctx context.Context, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
+	ids := make([]bson.RawValue, len(docs))
+	for i, d := range docs {
+		ids[i] = d.id
+	}
+	cur, err := hotColl.Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("check the fast tier before evicting: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	here := make(map[string]struct{}, len(docs))
+	for cur.Next(ctx) {
+		id, derr := cur.Current.LookupErr("_id")
+		if derr != nil {
+			continue
+		}
+		raw := bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)}
+		here[meta.DocID(e.nsOf(docs), raw)] = struct{}{}
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("check the fast tier before evicting: %w", err)
+	}
+
+	out := docs[:0:0]
+	for _, d := range docs {
+		if _, ok := here[d.docID]; ok {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+// nsOf reads the namespace back off a batch, which every candidate carries
+// inside its docID.
+func (e *Evictor) nsOf(docs []candidate) string {
+	if len(docs) == 0 {
+		return ""
+	}
+	ns, _, _ := strings.Cut(docs[0].docID, "|")
+	return ns
 }
 
 func (e *Evictor) announce(ctx context.Context, docs []candidate) error {

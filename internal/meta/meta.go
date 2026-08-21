@@ -241,32 +241,6 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 	return nil
 }
 
-// WithdrawEviction takes back announcements for documents that turned out not
-// to be leaving after all.
-//
-// An announcement nothing consumes is the opposite hazard and just as bad: the
-// application deletes that document later, the feeder finds the standing notice,
-// reads the delete as an eviction and never tombstones it, so the archive keeps
-// a record the application removed and a later read brings it back.
-func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
-	if len(docIDs) == 0 {
-		return nil
-	}
-	coll := cold.Database(DB).Collection(Evicting)
-	if _, err := coll.UpdateMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: -1}}}}); err != nil {
-		return fmt.Errorf("withdraw eviction: %w", err)
-	}
-	if _, err := coll.DeleteMany(ctx, bson.D{
-		{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
-		{Key: "pending", Value: bson.D{{Key: "$lte", Value: 0}}},
-	}); err != nil {
-		return fmt.Errorf("withdraw eviction: %w", err)
-	}
-	return nil
-}
-
 // ConsumeEvictionNotices takes one announcement down for each document whose
 // eviction the feeder has just applied, and removes the notice when none is
 // left. It reports which of docIDs had an announcement to take.
@@ -330,7 +304,6 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 	}
 	return nil
 }
-
 
 // Tombstone is the update applied to a cold document when the application
 // deletes its original.

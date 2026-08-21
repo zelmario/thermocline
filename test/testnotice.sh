@@ -48,9 +48,24 @@ chkv "no feeder is running" "0" "$(pgrep -cf "cline feeder --config $WDIR/" || t
 # A warm window wider than the eviction cutoff, so both address the same
 # document. That is what "the hot window is too small" means, and it is the
 # configuration the pilot was running when this was found.
-sed '/^warmer:/,/^router:/ s|^      back: 40m|      back: 24h|' $CFG > $WDIR/notice_wide.yaml
-chkv "the derived config warms past the eviction cutoff" "true" \
+# The warmer's own file, warming 24h back. Its evictor cutoff moves out to match
+# so the file itself is legal: a single config that warms past its own eviction
+# cutoff is refused outright, because the two rules are instructions about the
+# same documents and the components obey them both.
+#
+# That refusal only reaches as far as one file. The evictor and the warmer are
+# separate daemons and can be given separate configs, each legal on its own and
+# contradictory together, which is what this section arranges: the evictor runs
+# from $CFG and removes anything over 40m, the warmer runs from this one and
+# copies the last 24h back. Nothing can stop an operator doing that, so the rule
+# about announcements has to hold when they do.
+sed -e '/^warmer:/,/^router:/ s|^      back: 40m|      back: 24h|' \
+    -e '/^evictor:/,/^warmer:/ s|^      older_than: 40m|      older_than: 24h|' \
+    $CFG > $WDIR/notice_wide.yaml
+chkv "the derived config warms 24h back"         "true" \
     "$(grep -q 'back: 24h' $WDIR/notice_wide.yaml && echo true || echo false)"
+chkv "and is a legal config on its own"          "true" \
+    "$(cline warmer --config $WDIR/notice_wide.yaml --dry-run >/dev/null 2>&1 && echo true || echo false)"
 
 EVID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 5150)
 NOTICE="$DB.orders|07$EVID"
@@ -174,6 +189,78 @@ chkv "the archive still holds it live"           "1" \
 kill $FP4 2>/dev/null; wait $FP4 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$RID')})" >/dev/null
+
+echo
+echo "== documents that leave before the scan are not announced =="
+# Half the batch removed from the fast tier before the evictor looks. It should
+# evict the rest, announce only those, and leave nothing standing for the ones
+# it never saw. An announcement waiting for a delete that is not coming answers
+# for the next one instead, which could be the application's.
+#
+# This is the end of the story, not the interesting part of it. The dangerous
+# case is a document removed after the scan has read it and before the delete
+# runs, where the delete reports fewer removals than were announced and cannot
+# say which id it missed. That gap is a few milliseconds inside one function and
+# cannot be arranged from here, so it is tested directly, in
+# internal/evictor/evict_test.go. Getting it wrong cost 141 documents on the
+# pilot.
+C "db.getSiblingDB(process.env.TC_META).evicting.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
+# By the marker, not by id. The ids are derived from the clock, so a run that
+# ended early leaves documents behind that the next run's cleanup cannot name,
+# and they turn up in these counts as somebody else's tombstones.
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({n:'short'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({n:'short'})" >/dev/null
+SHORTIDS=(); KEPT=(); GONE=()
+BASE=$(( $(date +%s) - 7200 ))
+for i in $(seq 0 9); do
+  oid=$(printf '%08x%016x' $BASE $((0x5200 + i)))
+  SHORTIDS+=("$oid")
+  if [ $i -lt 5 ]; then KEPT+=("$oid"); else GONE+=("$oid"); fi
+  H "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$oid'), n:'short'})" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$oid'), n:'short'})" >/dev/null
+done
+chkv "ten candidates are on the fast tier" "10" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short'}))")"
+
+# The feeder runs, so the deletes it sees are the ones under test. Its position
+# is current first, so it does not replay anything older.
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+cline feeder --config $CFG >/dev/null 2>&1 & FP5=$!
+sleep 6
+
+# The race, made deterministic: the five highest ids leave the fast tier before
+# the evictor's delete, and the feeder is told about them the honest way so its
+# own view stays consistent.
+for oid in "${GONE[@]}"; do
+  C "db.getSiblingDB(process.env.TC_META).evicting.updateOne({_id:'$DB.orders|07$oid'},{\$inc:{pending:1},\$set:{at:new Date()}},{upsert:true})" >/dev/null
+  H "db.getSiblingDB(process.env.TC_DB).orders.deleteOne({_id:ObjectId('$oid')})" >/dev/null
+done
+sleep 3
+chkv "five candidates are left for the evictor" "5" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short'}))")"
+
+cline evictor --config $CFG --once >/dev/null 2>&1
+sleep 6
+kill $FP5 2>/dev/null; wait $FP5 2>/dev/null
+
+chkv "the fast tier is empty of them"            "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short'}))")"
+# The control. If these are not in the archive the check below passes on an
+# empty set and says nothing.
+chkv "the archive still has all ten"             "10" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short'}))")"
+chkv "none of the evicted five was tombstoned"   "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short',_tcDeletedAt:{\$exists:true}}))")"
+chkv "no announcement is left for the five it never saw" "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:{\$in:[$(printf "'$DB.orders|07%s'," "${GONE[@]}" | sed 's/,$//')]}}))")"
+chkv "the five it evicted are live in the archive" "5" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:{\$in:[$(printf "ObjectId('%s')," "${KEPT[@]}" | sed 's/,$//')]}, _tcDeletedAt:{\$exists:false}}))")"
+
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({n:'short'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({n:'short'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
 
 echo
 echo "================================"
