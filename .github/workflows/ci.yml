@@ -1,0 +1,47 @@
+# What can be checked without a database.
+#
+# This builds, vets and runs the unit tests. It cannot run what actually tests
+# this project: the suites in test/ drive two real replica sets and the pilot in
+# test/pilot adopts MongoDB's sample datasets, and both need a cluster that a
+# runner does not have. Several unit tests skip themselves for the same reason,
+# saying which environment variable would let them run.
+#
+# So a green tick here means it compiles and the pure logic holds. It does not
+# mean the tiering works. That is `bash test/psweep.sh` inside the test cluster,
+# 34 suites and about a thousand checks, and `bash test/pilot/setup.sh` on top
+# of it.
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: unit tests
+        # -count=1 so a cached pass from an earlier run cannot stand in for this
+        # one. Tests needing a live cluster skip and say so.
+        run: go test -count=1 ./...
+
+      - name: the suites are shell, so check they at least parse
+        run: |
+          fail=0
+          for f in test/*.sh test/pilot/*.sh; do
+            bash -n "$f" || { echo "  $f does not parse"; fail=1; }
+          done
+          exit $fail

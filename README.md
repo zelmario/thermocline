@@ -6,6 +6,12 @@ string.
 
 **Status: early, but all four components work. Not production tested.**
 
+It is tested against real clusters rather than mocks: 34 suites and about a
+thousand checks against two three-member replica sets, and a pilot that adopts
+MongoDB's published sample datasets and compares every answer the router gives
+against the archive it came from. See `test/README.md` and `test/pilot`. The CI
+badge only means it compiles; a runner has no cluster to test tiering with.
+
 ## The problem
 
 Databases grow, but access does not grow with them. Most systems read a small
