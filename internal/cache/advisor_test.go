@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // The example this was built from. A count of users in one country returns
@@ -182,5 +184,39 @@ func TestTheReportIsNotRecomputedForEveryLook(t *testing.T) {
 	_ = a.Report(10)
 	if !a.cachedAt.After(before) {
 		t.Error("the report was never refreshed after it went stale")
+	}
+}
+
+// A driver asks config.collections constantly and the answers are perfectly
+// stable, so they win a ranking meant to tell an operator which of *their*
+// queries to cache. Measured on the pilot: the top twenty rows were that one
+// shape, twenty times, and no application query appeared at all.
+func TestAdvisorIgnoresHousekeeping(t *testing.T) {
+	for _, ns := range []string{
+		"config.collections", "admin.system.users", "local.oplog.rs", meta.DB + ".watermarks",
+	} {
+		if !Housekeeping(ns) {
+			t.Errorf("%s should not be advised on", ns)
+		}
+	}
+	for _, ns := range []string{"app.orders", "sample_mflix.comments", "configuration.things"} {
+		if Housekeeping(ns) {
+			t.Errorf("%s is the application's and must be advised on", ns)
+		}
+	}
+
+	a := NewAdvisor(100, 100, time.Minute)
+	for i := 0; i < 10; i++ {
+		a.Observe("find config.collections filter={_id:?}", "config.collections", 1, 7)
+		a.Observe("find app.orders filter={customer:?}", "app.orders", 1, 7)
+	}
+	rows := a.Report(10)
+	for _, r := range rows {
+		if r.NS == "config.collections" {
+			t.Fatalf("the report advises on %s, which crowds out the queries an operator can act on", r.NS)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("the application's query was dropped along with the housekeeping")
 	}
 }

@@ -2,8 +2,11 @@ package cache
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // The advisor watches queries go past and works out which of them would be
@@ -104,9 +107,41 @@ func NewAdvisor(maxShapes, maxParams int, maxTTL time.Duration) *Advisor {
 	}
 }
 
+// Housekeeping reports whether a namespace belongs to MongoDB or to Thermocline
+// rather than to the application.
+//
+// A driver asks config.collections constantly, to find out whether a collection
+// is sharded, and those answers are as stable and as repetitive as anything an
+// application sends. So they win the ranking. Measured on the pilot after a few
+// thousand queries over real data: every one of the top twenty rows was that
+// one shape, rendered identically twenty times because the report prints ? in
+// place of the values, and not a single application query appeared.
+//
+// Crowding the report is the visible half. The shape table is bounded, and a
+// query the operator cannot act on taking a slot in it is a query of theirs
+// that is not measured at all.
+//
+// This is a decision about what to advise on, not about what to cache. Whether
+// an answer to config.collections may be held is the cache's own business and
+// is unchanged.
+func Housekeeping(ns string) bool {
+	db, _, found := strings.Cut(ns, ".")
+	if !found {
+		db = ns
+	}
+	switch db {
+	case "admin", "local", "config":
+		return true
+	}
+	return db == meta.DB
+}
+
 // Observe records one execution: which query, with which parameters, and what
 // it answered.
 func (a *Advisor) Observe(shape, ns string, params, result uint64) {
+	if Housekeeping(ns) {
+		return
+	}
 	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -166,6 +201,9 @@ func (a *Advisor) Observe(shape, ns string, params, result uint64) {
 // memory, and measuring stability against it would be measuring a belief
 // against itself.
 func (a *Advisor) ObserveHit(shape, ns string, params uint64) {
+	if Housekeeping(ns) {
+		return
+	}
 	now := a.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
