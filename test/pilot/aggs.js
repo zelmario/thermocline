@@ -7,6 +7,11 @@
 // collection that is mostly somewhere else. A join is the case the router
 // cannot answer partially, because a joined collection is read by key rather
 // than by time, so no watermark covers it.
+// The archive keeps what the application deleted, carrying a tombstone, and the
+// router filters those out. Read raw it is not a control: it answers with rows
+// the router is right to withhold. A leading $match costs nothing against the
+// router, where LIVE is empty.
+const LIVE = process.env.TC_TARGET === "archive" ? {_tcDeletedAt: {$exists: false}} : {};
 const out = [];
 function ask(label, dbName, f) {
   let v;
@@ -14,7 +19,7 @@ function ask(label, dbName, f) {
   catch (e) { v = "ERR " + (e.codeName || "") + " " + String(e.message).slice(0, 150); }
   out.push({ q: label, v: v });
 }
-const A = (c, p) => c.aggregate(p, {allowDiskUse: true}).toArray();
+const A = (c, p) => c.aggregate([{$match: LIVE}].concat(p), {allowDiskUse: true}).toArray();
 
 // Tiered collection, grouped over all of it. Most of these comments are in the
 // archive: the hot window is ten years and they run back to 1970.
@@ -62,10 +67,10 @@ ask("weather by day", "sample_weatherdata", d =>
 
 // Index-dependent reads on untiered collections, which have to keep working.
 ask("text search on movies", "sample_mflix", d =>
-  d.movies.find({$text: {$search: "space station"}}, {score: {$meta: "textScore"}, title: 1, _id: 0})
+  d.movies.find(Object.assign({$text: {$search: "space station"}}, LIVE), {score: {$meta: "textScore"}, title: 1, _id: 0})
     .sort({score: {$meta: "textScore"}, title: 1}).limit(5).toArray());
 ask("geo near a point", "sample_restaurants", d =>
-  d.neighborhoods.find({geometry: {$geoIntersects: {$geometry: {type: "Point", coordinates: [-73.93414657, 40.82302903]}}}},
+  d.neighborhoods.find(Object.assign({geometry: {$geoIntersects: {$geometry: {type: "Point", coordinates: [-73.93414657, 40.82302903]}}}}, LIVE),
                        {name: 1, _id: 0}).toArray());
 
 // A bounded read of a tiered collection, inside the hot window, which is the

@@ -71,10 +71,8 @@ compare() {
   local rc=0
   for h in agree aggs; do
     docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
-    N "mongosh '$ROUTER' --quiet --file /root/$h.js > /root/${h}_router.json 2>&1"
-    N "mongosh '$COLD'   --quiet --file /root/$h.js > /root/${h}_archive.json 2>&1"
-    docker cp $NODE:/root/${h}_router.json /tmp/${h}_router.json >/dev/null
-    docker cp $NODE:/root/${h}_archive.json /tmp/${h}_archive.json >/dev/null
+    docker exec -e TC_TARGET=router  $NODE mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
+    docker exec -e TC_TARGET=archive $NODE mongosh "$COLD"   --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
     python3 test/pilot/diff.py "$h" || rc=1
   done
   return $rc
