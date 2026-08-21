@@ -71,7 +71,8 @@ compare() {
   local rc=0
   for h in agree aggs; do
     docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
-    docker exec -e TC_TARGET=router  $NODE mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
+    docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" $NODE \
+      mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
     docker exec -e TC_TARGET=archive $NODE mongosh "$COLD"   --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
     python3 test/pilot/diff.py "$h" || rc=1
   done
@@ -117,11 +118,52 @@ streams() {
     mongosh "$ROUTER" --quiet --file /root/streams.js
 }
 
+txn() {
+  # Transactions run on the fast tier and cannot reach into the archive from
+  # inside themselves, so the router copies what they touch up and aborts with
+  # TransientTransactionError for the driver to retry. This uses withTransaction,
+  # which is what an application uses, and checks the label directly as well.
+  echo "== transactions over documents that are not on the fast tier =="
+  docker cp test/pilot/txn.js $NODE:/root/txn.js >/dev/null
+  docker exec -e TC_COLD="$COLD" -e TC_HOT="$HOT" $NODE \
+    mongosh "$ROUTER" --quiet --file /root/txn.js
+}
+
+cache() {
+  # The query cache, over data that lives mostly in the archive. It needs its
+  # own router, because the cache is off by default and should stay off until it
+  # has run somewhere real.
+  echo "== the query cache, on =="
+  N "sed 's|^  completeness: archive|  cache:\n    enabled: true\n    max_queries: 1000\n    max_bytes: 67108864\n    max_ttl: 1m\n    measure: true\n  completeness: archive|' /root/pilot.yaml > /root/pilot_cache.yaml"
+  N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
+  sleep 2
+  docker exec -d $NODE cline router --config /root/pilot_cache.yaml --log-file /root/pilotlog/router_cache.log
+  for _ in $(seq 1 30); do
+    N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  docker cp test/pilot/cache.js $NODE:/root/cache.js >/dev/null
+  docker exec -e TC_COLD="$COLD" -e TC_HOT="$HOT" $NODE \
+    mongosh "$ROUTER" --quiet --file /root/cache.js
+  # And the whole read battery again, asked three times on one connection so the
+  # last pass is the one the cache answered. A held answer compared against the
+  # archive is the only way to know it is still the right answer.
+  echo "  -- the read battery, answered from the cache --"
+  TC_REPEAT=3 compare
+  N "curl -s http://127.0.0.1:27510/api/snapshot" | python3 -c "
+import sys, json
+c = json.load(sys.stdin).get('cache', {})
+print('  cache: %s shapes, %s hits, %s misses, watching=%s'
+      % (c.get('shapes'), c.get('hits'), c.get('misses'), c.get('watching')))"
+}
+
 case "${1:-all}" in
   compare) compare ;;
   writes)  writes ;;
   streams) streams ;;
+  txn)     txn ;;
+  cache)   cache ;;
   rewarm)  rewarm ;;
-  all)     restore; copyUntiered; start; compare; writes; streams ;;
-  *)       echo "usage: $0 [all|compare|writes|streams|rewarm]"; exit 2 ;;
+  all)     restore; copyUntiered; start; compare; writes; streams; txn ;;
+  *)       echo "usage: $0 [all|compare|writes|streams|txn|cache|rewarm]"; exit 2 ;;
 esac

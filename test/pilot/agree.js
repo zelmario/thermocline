@@ -11,7 +11,14 @@
 // router is right to withhold. writes.js deletes one comment per run, so this
 // matters after the very first one.
 const LIVE = process.env.TC_TARGET === "archive" ? {_tcDeletedAt: {$exists: false}} : {};
-const out = [];
+// TC_REPEAT asks everything more than once on this one connection and reports
+// the last pass. With the query cache on, that last pass is the one the cache
+// answered, and comparing it against the archive is how a held answer is
+// checked rather than assumed. A held answer is keyed by connection while
+// authentication is proxied, so repeating inside one process is the only way to
+// reach it.
+const REPEAT = parseInt(process.env.TC_REPEAT || "1", 10);
+let out = [];
 
 // How many records the archive is keeping for documents the application
 // deleted. Zero against the router, which never returns them.
@@ -28,7 +35,9 @@ function ask(ns, label, f) {
 const dbs = db.adminCommand({ listDatabases: 1 }).databases
   .map(d => d.name).filter(n => /^sample_/.test(n)).sort();
 
-for (const dbName of dbs) {
+for (let round = 0; round < REPEAT; round++) {
+  out = [];
+  for (const dbName of dbs) {
   const d = db.getSiblingDB(dbName);
   for (const cName of d.getCollectionNames().sort()) {
     const ns = dbName + "." + cName;
@@ -64,5 +73,6 @@ for (const dbName of dbs) {
     }
     ask(ns, "count with sort+skip", () => c.find(LIVE).sort({_id: 1}).skip(7).limit(3).toArray().length);
   }
+}
 }
 print(JSON.stringify(out));
