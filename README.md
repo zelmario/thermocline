@@ -202,6 +202,22 @@ Range queries are governed by the watermark below.
   `router.terminate_auth` on, read preference is honoured: measured with the
   profiler recording on all three fast tier members, `secondary`,
   `secondaryPreferred` and `nearest` each landed on a secondary.
+- **A stats call counts the whole collection and measures one tier.** Those are
+  different questions and a single reply carries both. `db.coll.stats().count`,
+  the `collStats` command and `$collStats` all report the collection's document
+  count, which is the same number `countDocuments` gives and comes from the same
+  place. Everything else in that reply is bytes on a disk: `storageSize`,
+  `totalIndexSize`, `avgObjSize` and the WiredTiger figures describe the fast
+  tier, because they are per-cluster facts and adding two clusters' compressed
+  sizes together would produce a number describing nothing. That is also what
+  you want when sizing a fast tier. `dbStats` is the fast tier's throughout,
+  including its `objects`.
+
+  The count used to be the fast tier's too, which was wrong rather than
+  partial. Measured on MongoDB's sample datasets adopted as an archive:
+  `sample_training.trips` reported 0 documents where the archive holds 10,000,
+  because none of that collection was inside the hot window, while
+  `countDocuments` on it answered 10,000 throughout. See `test/pilot`.
 - **TLS is handled, in both directions.** `router.tls.cert` and `key` make the
   listener speak it, `ca` checks client certificates, and
   `require_client_cert` insists on one. Whether the fast tier needs TLS is read

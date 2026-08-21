@@ -111,6 +111,23 @@ chk "estimatedDocumentCount"    "$TRUTH" "$(R "print(db.getSiblingDB(process.env
 chk "count command"             "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({count:'$NS'}).n)")"
 chk "distinct n"                "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.distinct('n').length)")"
 chk "count with a query"        "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'a',_tcDeletedAt:{\$exists:false}}))")" "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({count:'$NS',query:{grp:'a'}}).n)")"
+# A stats call counts documents too, and it was the one read that did not say so.
+# $collStats and collStats were let through as metadata, on the grounds that they
+# describe the collection rather than read it, so there is nothing for the answer
+# to be short of. True of every field but the count. Measured on MongoDB's own
+# sample datasets adopted as an archive: sample_training.trips reported 0 where
+# the archive holds 10,000, because none of that collection was inside the hot
+# window, while countDocuments on it answered 10,000 throughout.
+chk "collStats count"           "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).count)")"
+chk "\$collStats count"         "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$collStats:{count:{}}}]).toArray()[0].count)")"
+chk "\$collStats storageStats"  "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$collStats:{storageStats:{}}}]).toArray()[0].storageStats.count)")"
+chk "stats().count"             "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.stats().count)")"
+# And the other half: bytes on disk are a per-tier fact, so they must still be
+# the fast tier's. Adding two clusters' compressed sizes together would produce
+# a number describing nothing, and an operator sizing a fast tier reads this one.
+chk "storage still describes the fast tier" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")"
 
 echo "== write paths, with the fast tier still short =="
 # Deliberately left incomplete. Declaring it complete here would be a lie the
@@ -136,7 +153,9 @@ chk "listCollections"  "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).get
 chk "listIndexes"      "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().length >= 1)")"
 chk "createIndex"      "true" "$(R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({grp:1}); print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().some(i=>i.name=='grp_1'))")"
 chk "dropIndex"        "false" "$(R "db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('grp_1'); print(db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().some(i=>i.name=='grp_1'))")"
-chk "collStats"        "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.stats().count >= 0)")"
+# The count itself is checked against the archive above, where what the fast
+# tier is short by is known. Here it is only that the command answers at all.
+chk "collStats"        "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.stats().ok == 1)")"
 chk "dbStats"          "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).stats().db == '$DB')")"
 chk "ping"             "1"    "$(R "print(db.adminCommand({ping:1}).ok)")"
 chk "buildInfo"        "true" "$(R "print(!!db.adminCommand({buildInfo:1}).version)")"
