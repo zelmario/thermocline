@@ -230,6 +230,56 @@ func (w *Warmer) countBothInWindow(ctx context.Context, rule config.WarmRule, fr
 	return hotN, coldN, nil
 }
 
+// stillHolds reports whether the fast tier holds the window that is about to be
+// claimed, asked at the moment of claiming rather than at the start of the run.
+//
+// A claim describes the fast tier as it is now, not as it was when this warm
+// began copying. An evictor working on the same namespace takes documents away
+// while the warm is filling, and their windows overlap whenever the hot window
+// reaches further back than the eviction cutoff.
+//
+// Measured with a warm reaching back fifteen years against an evictor removing
+// anything over a day old, both on sample_training.trips: the warm finished its
+// scan and claimed all of history, and by then the evictor had the fast tier
+// down to 4,400 documents of the 10,000 the archive holds. A client counting the
+// collection through the router was answered 4,400, as a success, because the
+// claim said the fast tier held everything.
+//
+// Refusing to strengthen the claim leaves whatever the evictor last narrowed it
+// to, which is the honest description of a tier being emptied. The next warm
+// makes the claim again if it is true by then.
+func (w *Warmer) stillHolds(ctx context.Context, rule config.WarmRule, from time.Time) bool {
+	if w.dryRun {
+		return true
+	}
+	// Under this policy the archive keeps deleted documents readable, so it
+	// legitimately holds more than the fast tier and the comparison says
+	// nothing. Same reasoning as verifyClaim.
+	if w.unannounced == config.Ignore {
+		return true
+	}
+
+	hotN, coldN, err := w.countBothInWindow(ctx, rule, from)
+	if err != nil {
+		// Not being able to check is not a reason to claim more than was
+		// proved, and not a reason to fail the warm either.
+		w.log.Warn("could not check the fast tier before recording a claim",
+			"ns", rule.NS, "err", err, "effect", "leaving the claim as it was")
+		return false
+	}
+	if hotN >= coldN {
+		return true
+	}
+	w.log.Warn("not claiming a window the fast tier no longer holds",
+		"ns", rule.NS,
+		"fast_tier", hotN, "archive", coldN, "missing", coldN-hotN,
+		"why", "documents left the fast tier while this warm was filling it, which is what an "+
+			"evictor whose cutoff falls inside the warm window does",
+		"effect", "the claim is left where it was, so these reads fall through to the archive "+
+			"and stay correct")
+	return false
+}
+
 // staleClaim reports whether a recorded watermark describes a fast tier that no
 // longer exists.
 //
@@ -740,6 +790,9 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 	}
 
 	if left == 0 {
+		if !w.stillHolds(ctx, rule, time.Time{}) {
+			return nil
+		}
 		if err := w.marks.Set(ctx, rule.NS, time.Time{}); err != nil {
 			return err
 		}
@@ -749,6 +802,9 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 		return nil
 	}
 
+	if !w.stillHolds(ctx, rule, floor) {
+		return nil
+	}
 	if err := w.marks.Set(ctx, rule.NS, floor); err != nil {
 		return err
 	}

@@ -281,6 +281,62 @@ chk "the fast tier holds all the claim covers" \
 H "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tdated.drop()" >/dev/null
 
+echo "== never claim a window the fast tier no longer holds =="
+# A claim describes the fast tier as it is now, not as it was when the warm
+# started copying. An evictor working on the same namespace takes documents away
+# while the warm fills, and their windows overlap whenever the hot window
+# reaches further back than the eviction cutoff.
+#
+# Measured on the pilot with a warm reaching back fifteen years against an
+# evictor removing anything over a day old: the warm finished its scan, claimed
+# all of history, and by then the fast tier held 4,400 of the 10,000 documents
+# the archive holds. A client counting the collection was answered 4,400, as a
+# success.
+#
+# Here the removal is done by hand, during the warm, which is what the evictor
+# does and is the only part of it that matters. The warm is slowed to a crawl so
+# the removal lands inside it rather than racing it.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
+cline watermark --config $CFG --ns $DB.tshrink --clear >/dev/null 2>&1
+C 'const d=[]; for (let i=0;i<120;i++) d.push({_id:new ObjectId(), n:i, at:new Date(Date.now()-i*60*1000)});
+   db.getSiblingDB(process.env.TC_DB).tshrink.insertMany(d)' >/dev/null
+sed -e '/^warmer:/,/^router:/ s|^  rules:|  rules:\n    - ns: "'"$DB.tshrink"'"\n      date_field: "at"\n      back: 24h|' \
+    -e '/^warmer:/,/^router:/ s|^  rate: .*|  rate: 12|' \
+    -e '/^warmer:/,/^router:/ s|^  batch_size: .*|  batch_size: 6|' $CFG > $WDIR/warm_shrink.yaml
+chk "the derived config warms this collection slowly" "true" \
+    "$(grep -q "ns: \"$DB.tshrink\"" $WDIR/warm_shrink.yaml && grep -q "rate: 12" $WDIR/warm_shrink.yaml && echo true || echo false)"
+
+# Truncated first. --log-file appends, so a line left by an earlier run makes
+# the "it said why" check pass against a binary that never said it.
+rm -f $LOGDIR/warm_shrink.log
+cline warmer --config $WDIR/warm_shrink.yaml --log-file $LOGDIR/warm_shrink.log >/dev/null 2>&1 &
+WP=$!
+# Wait until it has copied something, then take documents away underneath it,
+# which is exactly what a sweep does.
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).tshrink.countDocuments({}))")" -gt 20 ] 2>/dev/null && break
+  sleep 0.5
+done
+H "db.getSiblingDB(process.env.TC_DB).tshrink.deleteMany({n:{\$lt:15}})" >/dev/null
+wait $WP 2>/dev/null
+
+HOTN=$(H "print(db.getSiblingDB(process.env.TC_DB).tshrink.countDocuments({}))")
+COLDN=$(C "print(db.getSiblingDB(process.env.TC_DB).tshrink.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+echo "  the fast tier holds $HOTN of the archive's $COLDN"
+chk "the removal actually happened during the warm" "true" \
+    "$(awk -v h="$HOTN" -v c="$COLDN" 'BEGIN{print (h+0 < c+0) ? "true" : "false"}')"
+# The invariant. A claim covering the whole collection is only honest when the
+# fast tier holds the whole collection.
+CLAIM=$(cline watermark --config $CFG --ns $DB.tshrink 2>&1)
+chk "no claim on all of history while it is short" "false" \
+    "$(grep -q "all of history" <<<"$CLAIM" && echo true || echo false)"
+chk "and it said why"                              "true" \
+    "$(grep -q "not claiming a window the fast tier no longer holds" $LOGDIR/warm_shrink.log && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"
