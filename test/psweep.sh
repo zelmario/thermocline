@@ -31,7 +31,7 @@ SUITES=${SUITES:-"testconform testauthterm testkeys testtxn testconcerns
         testddl testcache testfresh testaggwrite testexplain testindexes
         testmerge testecho testunack testupsert testsingle testauth testbulk
         testreadpref testreadprefterm testtypes testwarm testevict
-        testdaemonmetrics testretry testpool"}
+        testdaemonmetrics testretry testpool testnotice"}
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 printf '%s\n' $SUITES > "$OUT/queue"
