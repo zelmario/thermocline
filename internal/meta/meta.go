@@ -192,31 +192,145 @@ type ResidencyRecord struct {
 type EvictionNotice struct {
 	ID string    `bson:"_id"`
 	At time.Time `bson:"at"`
+	// Pending is how many announced evictions of this document the feeder has
+	// not seen the delete for yet. A count and not a flag, because a document
+	// can be evicted, warmed back up and evicted again while the feeder is
+	// still behind, and one flag cannot answer for two deletes.
+	Pending int `bson:"pending"`
 }
 
-// ClearEvictionNotices removes eviction announcements for documents that have
-// come back into the fast tier.
+// AnnounceEviction records that these documents are about to leave the fast
+// tier, so the feeder can tell those deletes apart from an application's.
 //
-// A notice means "this document is leaving the fast tier", and the feeder reads
-// it to tell an eviction apart from an application delete. Copying a document
-// back up makes the notice false, and a notice that outlives its eviction is
-// dangerous: the application deletes the document, the feeder finds the stale
-// notice, reads the delete as another eviction, and never tombstones it. The
-// record stays live in the archive and a later read brings it back.
+// The count goes up rather than the notice being replaced, and the feeder takes
+// one down per delete it applies. Nothing else may remove one.
 //
-// Notices expire on a TTL, so this only matters inside that window, which is
-// exactly when a copy-up is most likely.
-func ClearEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+// A copy-up used to delete the notice outright, on the reasoning that a
+// document back in the fast tier is not leaving it. That is true of the next
+// eviction and false of the one already in flight. If the feeder has not
+// applied the delete event yet, the notice it needs is gone by the time it
+// looks, so it reads a real eviction as an application delete and tombstones a
+// record nothing deleted. The warm's own insert does not put that right,
+// because the feeder suppresses it as an echo of the copy-up, so the archive is
+// left holding a tombstone over a live document the fast tier has already
+// dropped.
+//
+// Measured on the pilot with a warm and an evictor fighting over the same
+// collections while a client read them: 66 batches of "deletes not announced by
+// the evictor", and an archive left holding 200 tombstoned trips and 45
+// tombstoned sales that nothing had ever deleted.
+func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
 	if len(docIDs) == 0 {
 		return nil
 	}
-	_, err := cold.Database(DB).Collection(Evicting).DeleteMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}})
-	if err != nil {
-		return fmt.Errorf("clear eviction notices: %w", err)
+	now := time.Now().UTC()
+	models := make([]mongo.WriteModel, len(docIDs))
+	for i, id := range docIDs {
+		models[i] = mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: id}}).
+			SetUpdate(bson.D{
+				{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}},
+				{Key: "$set", Value: bson.D{{Key: "at", Value: now}}},
+			}).
+			SetUpsert(true)
+	}
+	if _, err := cold.Database(DB).Collection(Evicting).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+		return fmt.Errorf("announce eviction: %w", err)
 	}
 	return nil
 }
+
+// WithdrawEviction takes back announcements for documents that turned out not
+// to be leaving after all.
+//
+// An announcement nothing consumes is the opposite hazard and just as bad: the
+// application deletes that document later, the feeder finds the standing notice,
+// reads the delete as an eviction and never tombstones it, so the archive keeps
+// a record the application removed and a later read brings it back.
+func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	coll := cold.Database(DB).Collection(Evicting)
+	if _, err := coll.UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: -1}}}}); err != nil {
+		return fmt.Errorf("withdraw eviction: %w", err)
+	}
+	if _, err := coll.DeleteMany(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
+		{Key: "pending", Value: bson.D{{Key: "$lte", Value: 0}}},
+	}); err != nil {
+		return fmt.Errorf("withdraw eviction: %w", err)
+	}
+	return nil
+}
+
+// ConsumeEvictionNotices takes one announcement down for each document whose
+// eviction the feeder has just applied, and removes the notice when none is
+// left. It reports which of docIDs had an announcement to take.
+func ConsumeEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string) (map[string]int, error) {
+	if len(docIDs) == 0 {
+		return nil, nil
+	}
+	coll := cold.Database(DB).Collection(Evicting)
+	cur, err := coll.Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("read eviction notices: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	have := map[string]int{}
+	for cur.Next(ctx) {
+		var rec EvictionNotice
+		if derr := cur.Decode(&rec); derr != nil {
+			return nil, fmt.Errorf("decode eviction notice: %w", derr)
+		}
+		// A notice written before this field existed counts as one.
+		if rec.Pending <= 0 {
+			rec.Pending = 1
+		}
+		have[rec.ID] = rec.Pending
+	}
+	if cerr := cur.Err(); cerr != nil {
+		return nil, fmt.Errorf("read eviction notices: %w", cerr)
+	}
+	return have, nil
+}
+
+// SpendEvictionNotices writes down the announcements a batch actually used.
+//
+// Separate from reading them so the caller can decide, in event order, which
+// deletes each notice answers for, and so nothing is spent if the batch cannot
+// be applied.
+func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[string]int) error {
+	if len(spent) == 0 {
+		return nil
+	}
+	coll := cold.Database(DB).Collection(Evicting)
+	models := make([]mongo.WriteModel, 0, len(spent))
+	ids := make([]string, 0, len(spent))
+	for id, n := range spent {
+		ids = append(ids, id)
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: id}}).
+			SetUpdate(bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: -n}}}}))
+	}
+	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+		return fmt.Errorf("spend eviction notices: %w", err)
+	}
+	if _, err := coll.DeleteMany(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
+		{Key: "pending", Value: bson.D{{Key: "$lte", Value: 0}}},
+	}); err != nil {
+		return fmt.Errorf("spend eviction notices: %w", err)
+	}
+	return nil
+}
+
 
 // Tombstone is the update applied to a cold document when the application
 // deletes its original.

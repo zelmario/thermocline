@@ -555,15 +555,17 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
 	}
 
-	// These documents are back in the fast tier, so their eviction notices are
-	// now false. See meta.ClearEvictionNotices for what leaving them does.
-	ids := make([]string, len(docs))
-	for i, d := range docs {
-		ids[i] = meta.DocID(ns, d.id)
-	}
-	if err := meta.ClearEvictionNotices(ctx, w.cold, ids); err != nil {
-		w.log.Warn("warmed but could not clear eviction notices", "ns", ns, "err", err)
-	}
+	// The eviction notices for these documents are deliberately left alone.
+	//
+	// Clearing them looks right, because a document back in the fast tier is not
+	// leaving it. It is right about the next eviction and wrong about the one
+	// already in flight: if the feeder has not applied that delete yet, the
+	// notice it needs is gone by the time it looks, and it tombstones a document
+	// nothing deleted. The warm's own insert does not repair it either, because
+	// the feeder suppresses that as an echo of this copy-up.
+	//
+	// The feeder consumes a notice as it applies the delete it describes, so one
+	// cannot outlive its eviction. See meta.AnnounceEviction.
 
 	w.log.Debug("warmed", "ns", ns, "inserted", inserted, "already_present", len(raw)-inserted)
 	return inserted, nil

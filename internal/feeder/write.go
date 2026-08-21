@@ -199,31 +199,30 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		return nil
 	}
 
-	cur, err := f.cold.Database(meta.DB).Collection(meta.Evicting).Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	// Read the announcements with their counts, then spend them in event order.
+	//
+	// Nothing but this consumes one. A copy-up used to delete the notice on the
+	// grounds that a document back in the fast tier is not leaving it, which is
+	// true of the next eviction and false of the one already in flight: the
+	// feeder then found no notice for a delete it had not applied yet and
+	// tombstoned a document nothing deleted. See meta.AnnounceEviction.
+	//
+	// A count rather than a flag, because a document can be evicted, warmed back
+	// up and evicted again inside one batch, and the second delete is as
+	// announced as the first.
+	announced, err := meta.ConsumeEvictionNotices(ctx, f.cold, ids)
 	if err != nil {
-		return fmt.Errorf("look up eviction notices: %w", err)
-	}
-	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-
-	announced := make(map[string]struct{}, len(ids))
-	for cur.Next(ctx) {
-		var rec struct {
-			ID string `bson:"_id"`
-		}
-		if err := cur.Decode(&rec); err != nil {
-			return fmt.Errorf("decode eviction notice: %w", err)
-		}
-		announced[rec.ID] = struct{}{}
-	}
-	if err := cur.Err(); err != nil {
-		return fmt.Errorf("read eviction notices: %w", err)
+		return err
 	}
 
+	spent := map[string]int{}
 	var unannounced int
 	for n, slot := range slots {
-		_, ok := announced[ids[n]]
+		ok := announced[ids[n]] > 0
+		if ok {
+			announced[ids[n]]--
+			spent[ids[n]]++
+		}
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)
 		if !ok {
 			unannounced++
@@ -234,6 +233,15 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 				ErrUnannouncedDelete, op.ns, meta.DocID(op.ns, op.id))
 		}
 		f.pending[slot].kind = act
+	}
+
+	// Spent last, so a batch that could not be classified leaves the
+	// announcements standing for the next attempt.
+	if err := meta.SpendEvictionNotices(ctx, f.cold, spent); err != nil {
+		// Not fatal, and it fails in the safe direction: an announcement left
+		// standing costs one application delete being read as an eviction,
+		// which the archive keeps rather than loses.
+		f.log.Warn("could not spend eviction notices", "err", err)
 	}
 
 	if unannounced > 0 {

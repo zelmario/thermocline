@@ -417,21 +417,40 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	}
 
 	ids := make([]bson.RawValue, len(docs))
+	docIDs := make([]string, len(docs))
 	for i, d := range docs {
 		ids[i] = d.id
+		docIDs[i] = d.docID
 	}
 	res, err := hotColl.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
 	if err != nil {
+		// Announced and not removed. The notice has to come back, or it waits
+		// for a delete that is never coming and answers for the next one, which
+		// could be the application's.
+		if werr := meta.WithdrawEviction(ctx, e.cold, docIDs); werr != nil {
+			e.log.Warn("could not withdraw eviction notices after a failed delete", "ns", ns, "err", werr)
+		}
 		return fmt.Errorf("delete from fast tier %s: %w", ns, err)
 	}
 	e.log.Debug("evicted", "ns", ns, "deleted", res.DeletedCount)
+	if int(res.DeletedCount) < len(docs) {
+		// Something removed a candidate between the scan and here, so its
+		// announcement has nothing to answer for. Which one is not knowable
+		// from a bulk delete, so the surplus is taken off the batch as a whole:
+		// every id gives one back and the ones that were evicted get theirs
+		// again. Doing nothing would leave a notice standing for an application
+		// delete to spend.
+		short := len(docs) - int(res.DeletedCount)
+		e.log.Info("fewer documents to evict than were announced",
+			"ns", ns, "announced", len(docs), "deleted", res.DeletedCount,
+			"note", "something else removed them first; taking the surplus announcements back")
+		if werr := meta.WithdrawEviction(ctx, e.cold, docIDs[:short]); werr != nil {
+			e.log.Warn("could not withdraw the surplus eviction notices", "ns", ns, "err", werr)
+		}
+	}
 
 	// Residency is meaningless once the document has left the fast tier.
 	// Failing here is untidy rather than dangerous, so it only warns.
-	docIDs := make([]string, len(docs))
-	for i, d := range docs {
-		docIDs[i] = d.docID
-	}
 	if _, err := e.cold.Database(meta.DB).Collection(meta.Residency).
 		DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}}); err != nil {
 		e.log.Warn("could not clear residency records", "ns", ns, "err", err)
@@ -440,22 +459,11 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 }
 
 func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
-	now := time.Now().UTC()
-	models := make([]mongo.WriteModel, len(docs))
+	docIDs := make([]string, len(docs))
 	for i, d := range docs {
-		models[i] = mongo.NewReplaceOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: d.docID}}).
-			SetReplacement(meta.EvictionNotice{ID: d.docID, At: now}).
-			SetUpsert(true)
+		docIDs[i] = d.docID
 	}
-
-	// Unordered and idempotent, so a retry after a partial failure is safe.
-	_, err := e.cold.Database(meta.DB).Collection(meta.Evicting).
-		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
-	if err != nil {
-		return fmt.Errorf("announce eviction: %w", err)
-	}
-	return nil
+	return meta.AnnounceEviction(ctx, e.cold, docIDs)
 }
 
 // ErrUnhealthy is returned when the cluster did not become fit for eviction

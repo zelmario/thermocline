@@ -95,12 +95,11 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 		r.withdrawEcho(ctx, []string{meta.DocID(ns, id)})
 	}
 
-	// The document is back in the fast tier, so any eviction notice for it is
-	// now false. Leaving it would make the next application delete look like
-	// another eviction, and the archive would never tombstone it.
-	if err := meta.ClearEvictionNotices(ctx, r.cold, []string{meta.DocID(ns, id)}); err != nil {
-		r.log.Warn("copied up but could not clear the eviction notice", "ns", ns, "err", err)
-	}
+	// The eviction notice for this document is left alone on purpose. The
+	// feeder consumes one as it applies the delete it describes, and taking it
+	// away here would take it from a delete the feeder has not looked at yet,
+	// which is how a real eviction came to be tombstoned as an application
+	// delete. See meta.AnnounceEviction.
 	r.Stats.CopiedUp.Add(1)
 	return true, nil
 }

@@ -290,9 +290,11 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 			}
 			r.withdrawEcho(ctx, stale)
 		}
-		if err := meta.ClearEvictionNotices(ctx, r.cold, ids); err != nil {
-			r.log.Warn("copied up but could not clear eviction notices", "ns", ns, "err", err)
-		}
+		// Eviction notices are left alone here, unlike the echo notices above.
+		// The feeder consumes one as it applies the delete it describes, so
+		// taking one away would take it from a delete the feeder has not looked
+		// at yet and turn a real eviction into a tombstone over a live record.
+		// See meta.AnnounceEviction.
 		r.Stats.CopiedUp.Add(int64(n))
 		docs = docs[:0]
 		ids = ids[:0]
