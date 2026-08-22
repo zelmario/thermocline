@@ -157,6 +157,52 @@ kill -HUP $HP; sleep 2
 grep -q "reopened" $LOGDIR/t_hup.log && { PASS=$((PASS+1)); echo "  PASS  SIGHUP reopens the log"; } || { FAIL=$((FAIL+1)); FAILED+=("SIGHUP"); echo "  FAIL  SIGHUP reopens the log"; }
 kill $HP 2>/dev/null; wait $HP 2>/dev/null
 
+echo "== rollback =="
+# Going back is repointing the application at the archive, and a delete was
+# mirrored as a mark rather than a removal, so every document deleted since the
+# cutover is still physically there. A client reading the cluster directly sees
+# them; the router does not.
+RBNS=trollback
+C() { mongosh "$COLDU" --quiet --eval "$1" 2>&1 | tail -1; }
+C "db.getSiblingDB(process.env.TC_DB).$RBNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$RBNS.insertMany([
+     {_id:1, n:'live'},
+     {_id:2, n:'deleted through the router', _tcDeletedAt:new Date()},
+     {_id:3, n:'also deleted', _tcDeletedAt:new Date()}])" >/dev/null
+# Stop anything publishing a position, because the guard below is about that and
+# a leftover feeder would make this section report it instead.
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+C "db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
+ok "counting names the namespace and the number" 0 "$RBNS +2 marked deleted" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS
+ok "and says what a direct reader would see"     0 "reading this cluster directly sees" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS
+# Counting must not have removed anything: an operator runs it to find out.
+chkrb() { # chkrb NAME WANT GOT
+  if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %s
+' "$1"
+  else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %s got=%s want=%s
+' "$1" "$3" "$2"; fi
+}
+chkrb "counting changed nothing" "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$RBNS.countDocuments({}))")"
+# The ordering guard, which is the part nobody was being told about.
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},
+     {\$set:{at:new Date(), savedAt:new Date(), everyMS:1000}},{upsert:true})" >/dev/null
+ok "clearing refuses while a feeder publishes"   1 "still mirroring" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS --clear
+chkrb "and it cleared nothing"                   "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$RBNS.countDocuments({}))")"
+ok "--force clears anyway"                       0 "cleared 2" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS --clear --force
+chkrb "and the archive answers as the router did" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$RBNS.countDocuments({}))")"
+C "db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
+ok "with nothing left it says so"                0 "already answers the way the router does" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS
+C "db.getSiblingDB(process.env.TC_DB).$RBNS.drop()" >/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
