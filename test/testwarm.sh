@@ -152,9 +152,19 @@ echo "== the warm stops before it fills the disk =="
 # fill looks like from here.
 # Scoped to the warmer block: `residency:` appears under router: too, and an
 # unscoped substitution put the limit in both, where the router does not read it.
-sed '/^warmer:/,/^router:/{s/^  residency: .*/&\n  min_free_disk: 0.99/}' $CFG > $WDIR/nodisk.yaml
+# The disk floor has to be the only limit that can fire. Under four workers the
+# fast tier's replication runs seconds behind, and the warmer pauses on that
+# instead: measured, "replication is 14s behind, limit 10s", with the disk never
+# reached inside the timeout. That is the warmer working, and it is not what
+# this section is asking about, so the replication limit is put out of range in
+# the same derived config.
+sed -e '/^warmer:/,/^router:/{s/^  residency: .*/&\n  min_free_disk: 0.99/}' \
+    -e '/^warmer:/,/^router:/{s/^    max_replication_lag: .*/    max_replication_lag: 600s/}' \
+    $CFG > $WDIR/nodisk.yaml
 chk "the derived config sets a free disk floor"    "1" \
     "$(grep -c 'min_free_disk: 0.99' $WDIR/nodisk.yaml)"
+chk "and puts the replication limit out of reach"  "1" \
+    "$(grep -c 'max_replication_lag: 600s' $WDIR/nodisk.yaml)"
 # There has to be something to fill, or the warmer reports "already complete"
 # and never reaches the loop the limit is checked in. An earlier section leaves
 # a claim on this namespace, so withdraw it first.

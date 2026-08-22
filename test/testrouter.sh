@@ -421,6 +421,8 @@ chk "and it is not listed twice"                   "1" \
 # nothing, so listing it would be the same lie. With no namespaces configured
 # everything is tiered, and a view would otherwise be listed and then handed to
 # the indexer to be built as a collection.
+H "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).createView('${CATNS}_view', '$CATNS', [])" >/dev/null 2>&1
 chk "a view the fast tier does not have is not listed" "false" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${CATNS}_view') >= 0)")"
@@ -445,6 +447,10 @@ kill $CATR2 2>/dev/null; wait $CATR2 2>/dev/null
 cline router --config $CFG >/dev/null 2>&1 & CATR=$!
 for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
 C "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
+# On the fast tier too. A binary without the guard builds the view there as a
+# real collection, and left behind it fails this section on the next run for a
+# reason that has nothing to do with that run.
+H "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
 
 # An untiered collection the archive holds is a different case and must stay
 # out. Reads of it go to the fast tier and come back empty, so listing it would

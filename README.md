@@ -224,6 +224,36 @@ Range queries are governed by the watermark below.
   `sample_training.trips` reported 0 documents where the archive holds 10,000,
   because none of that collection was inside the hot window, while
   `countDocuments` on it answered 10,000 throughout. See `test/pilot`.
+- **The catalog names the tiered collections the fast tier does not hold.**
+  `listCollections` and `listDatabases` are answered by the fast tier, because
+  that is where your collections live and where your writes go. For a tiered
+  collection that is half the picture, and a tiered collection with no copy on
+  the fast tier used to be reported as not existing while every read of it
+  worked. Measured on the pilot with `sample_supplies.sales` held only in the
+  archive: `countDocuments` answered 5,000, `findOne` returned a document, and
+  `show collections` came back empty. Drop the database instead and `show dbs`
+  omitted it while `use` and the collections and the documents were all still
+  there.
+
+  That is the ordinary state of an adoption, not an exotic drop: the fast tier
+  starts empty and every tiered collection is in that position until something
+  fills it. Nothing failed, which is the problem. Anything that finds its work
+  by asking what exists finds nothing, so `mongodump` backs up an empty
+  database, an ORM sees no table, and a BI tool drops the collection from its
+  model.
+
+  Both listings now include what the archive holds and the configuration tiers.
+  Untiered collections and views stay out, because a read of one goes to the
+  fast tier and comes back empty and listing it would be a lie; the router names
+  those at startup instead. The added database entries carry `sizeOnDisk: 0`,
+  for the same reason the stats above report one tier. What a client is allowed
+  to see is decided by the fast tier, on that client's own connection, so a
+  listing never names something the fast tier withheld. Asking is also what
+  repairs it: the router creates the collection on the fast tier with the
+  archive's options and indexes, which is what lets it be asked for its stats.
+
+  `dbStats` is still the fast tier's throughout, so its `collections` counts
+  what the fast tier has rather than what the catalog now lists.
 - **TLS is handled, in both directions.** `router.tls.cert` and `key` make the
   listener speak it, `ca` checks client certificates, and
   `require_client_cert` insists on one. Whether the fast tier needs TLS is read

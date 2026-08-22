@@ -108,12 +108,12 @@ compare() {
     head -3 /tmp/pilot_plan.json
     return 2
   fi
-  docker cp /tmp/pilot_plan.json $NODE:/root/pilot_plan.json >/dev/null
+  local plan; plan=$(cat /tmp/pilot_plan.json)
   for h in agree aggs; do
     docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
-    docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" -e TC_PLAN=/root/pilot_plan.json $NODE \
+    docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" -e TC_PLAN="$plan" $NODE \
       mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
-    docker exec -e TC_TARGET=archive -e TC_PLAN=/root/pilot_plan.json $NODE \
+    docker exec -e TC_TARGET=archive -e TC_PLAN="$plan" $NODE \
       mongosh "$COLD" --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
     python3 test/pilot/diff.py "$h" || rc=1
   done

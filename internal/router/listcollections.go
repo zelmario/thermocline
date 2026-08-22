@@ -66,6 +66,12 @@ func (c *conn) interceptListCollections(ctx context.Context, msg *wire.Message, 
 	if !ok {
 		return reply, nil
 	}
+	// Before the archive is asked anything. Some drivers request the catalog on
+	// every connection, and the archive is the cluster being relieved, so a
+	// database with nothing tiered in it must not cost it a round trip.
+	if !c.r.managesAnythingIn(db) {
+		return reply, nil
+	}
 
 	// Names the fast tier already reported. A collection on both tiers is the
 	// normal case and the fast tier's entry is the one to keep: it is what the
@@ -268,7 +274,7 @@ func (c *conn) interceptListDatabases(ctx context.Context, msg *wire.Message, re
 		if _, have := seen[d.Name]; have {
 			continue
 		}
-		if !c.r.managesDatabase(lctx, d.Name) {
+		if !c.r.managesAnythingIn(d.Name) {
 			continue
 		}
 		// Asked on the client's behalf, for the same reason as the collections.
@@ -309,12 +315,9 @@ func (c *conn) interceptListDatabases(ctx context.Context, msg *wire.Message, re
 	return reply, nil
 }
 
-// managesDatabase reports whether any tiered namespace lives in db.
-//
-// With no namespaces configured every namespace is tiered, which is what the
-// feeder does, and then the question is only whether this is a database of the
-// application's rather than the server's own.
-func (r *Router) managesDatabase(ctx context.Context, db string) bool {
+// managesAnythingIn reports whether any tiered namespace lives in db, without
+// asking either tier. With nothing configured every namespace is tiered.
+func (r *Router) managesAnythingIn(db string) bool {
 	if isSystemDatabase(db) {
 		return false
 	}

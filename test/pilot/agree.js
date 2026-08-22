@@ -47,10 +47,12 @@ function ask(ns, label, f) {
 // So the archive names the work, because it holds everything, and both sides
 // answer the same list. A collection the router cannot see is then a real
 // failure on a real question rather than a gap in the report.
+// Carried as the value rather than a path: mongosh has no way to read a file
+// from a script, and the list is a few kilobytes.
 const PLAN = process.env.TC_PLAN;
 let dbs, colls = null;
 if (PLAN) {
-  const plan = JSON.parse(cat(PLAN));
+  const plan = JSON.parse(PLAN);
   dbs = Object.keys(plan).sort();
   colls = plan;
 } else {

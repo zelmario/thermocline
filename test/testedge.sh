@@ -172,9 +172,19 @@ p = wdir + '/cline.yaml'; s = open(p).read()
 s = s.replace('    - ns: "%s.orders"\n      older_than: 40m' % db,
               '    - ns: "%s.dated"\n      older_than: 40m\n      date_field: "createdAt"' % db)
 s = s.replace('    - ns: "%s.orders"\n      back: 40m' % db,
-              '    - ns: "%s.dated"\n      back: 12h\n      date_field: "createdAt"' % db)
+              '    - ns: "%s.dated"\n      back: 40m\n      date_field: "createdAt"' % db)
 s = s.replace('    - "%s.tacct"\n' % db, '    - "%s.tacct"\n    - "%s.dated"\n' % (db, db), 1)
 open(wdir + '/edge_df.yaml', 'w').write(s)
+# The warmer gets its own file, reaching back twelve hours to refill what the
+# evictor took. One config that warms past its own eviction cutoff is refused,
+# because the two rules are instructions about the same documents and the
+# components obey them both. Written as two files it is legal and it is also
+# how this runs in practice: the evictor and the warmer are separate daemons.
+w = s.replace('    - ns: "%s.dated"\n      back: 40m' % db,
+              '    - ns: "%s.dated"\n      back: 12h' % db)
+w = w.replace('    - ns: "%s.dated"\n      older_than: 40m' % db,
+              '    - ns: "%s.dated"\n      older_than: 12h' % db)
+open(wdir + '/edge_dfwarm.yaml', 'w').write(w)
 PY
 stopFeeder
 C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
@@ -193,7 +203,7 @@ cline evictor --config $WDIR/edge_df.yaml --once >/dev/null 2>&1
 chk "date_field evictor kept the young"  "8"  "$(H 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
 chk "and the archive kept everything"    "30" "$(C 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({_tcDeletedAt:{$exists:false}}))')"
 cline watermark --config $WDIR/edge_df.yaml --ns $DB.dated --clear >/dev/null
-cline warmer --config $WDIR/edge_df.yaml >/dev/null 2>&1
+cline warmer --config $WDIR/edge_dfwarm.yaml >/dev/null 2>&1
 chk "date_field warmer refilled"         "30" "$(H 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
 
 echo "== unannounced delete policies =="
