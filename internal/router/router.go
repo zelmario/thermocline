@@ -439,6 +439,10 @@ type conn struct {
 	// own authorization decides whether it happens at all. See ddl.go.
 	rename *pendingRename
 
+	// indexDrop is a unique index the fast tier is being asked to drop, held
+	// until the reply says whether it did. See finishIndexDrop.
+	indexDrop *pendingIndexDrop
+
 	// id identifies this connection, which is the identity a cached answer is
 	// keyed by while authentication is proxied and the user is unknown here.
 	id uint64
@@ -588,6 +592,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
 	c.rename = nil
+	c.indexDrop = nil
 
 	// A handshake is answered here rather than forwarded, because a pooled
 	// connection can only carry one. See answerHello.
@@ -705,6 +710,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			name == "convertToCapped" || name == "cloneCollectionAsCapped" || name == "create") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
 			return c.send(out)
+		}
+	}
+
+	// Which unique indexes a dropIndexes would remove has to be read before the
+	// fast tier removes them, because afterwards there is nothing left to ask.
+	if nameErr == nil && !msg.MoreToCome() && name == "dropIndexes" {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			if coll, ok := stringField(cmd, "dropIndexes"); ok {
+				c.noteIndexDrop(ctx, cmd, db, coll)
+			}
 		}
 	}
 
@@ -969,6 +984,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if c.rename != nil && name == "renameCollection" {
 		rdoc, derr := reply.ReplyDoc()
 		c.finishRename(ctx, derr == nil && replyOK(rdoc))
+	}
+	// And a unique index the fast tier dropped has one to drop behind it, or
+	// the archive goes on refusing values the router now accepts.
+	if c.indexDrop != nil && name == "dropIndexes" {
+		rdoc, derr := reply.ReplyDoc()
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			c.finishIndexDrop(ctx, derr == nil && replyOK(rdoc), cmd)
+		}
 	}
 
 	if name == "explain" || (name == "aggregate" && inlineExplainOf(msg)) {

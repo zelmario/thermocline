@@ -389,6 +389,90 @@ chk "and still refuses what the validator refuses" "refused" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+echo "== a unique index the archive has and the fast tier does not =="
+# The router reads the FAST TIER's unique indexes to know what to protect across
+# both tiers, so while this is true it accepts a value the archive refuses. The
+# feeder cannot mirror that document, says so once in an error nobody is reading
+# at the time, and leaves it on the fast tier alone; the evictor will not remove
+# it either, because a document the archive does not hold is never evicted.
+LNS=tacct
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$LNS'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$LNS');
+   db.getSiblingDB(process.env.TC_DB).$LNS.createIndex({code:1},{unique:true,name:'code_u'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$LNS')" >/dev/null
+chk "the archive has the constraint, the fast tier does not" "true/false" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
+# Asked before the router starts, because the router's own indexer builds the
+# fast tier's indexes from the archive's and would repair this on the way up.
+chk "cline indexes calls it worse than slow"       "true" \
+    "$(cline indexes --config $CFG --ns $DB.$LNS 2>&1 | grep -q 'worse than slow' && echo true || echo false)"
+rm -f $LOGDIR/lost.log
+cline router --config $CFG --log-file $LOGDIR/lost.log >/dev/null 2>&1 & LRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chk "the router names it and the namespace"        "true" \
+    "$(grep -qE "unique index the fast tier does not.*ns=$DB.$LNS" $LOGDIR/lost.log && echo true || echo false)"
+chk "and says the document stays on the fast tier" "true" \
+    "$(grep -q 'stays on the fast tier alone' $LOGDIR/lost.log && echo true || echo false)"
+# And the router repairs it on the way up, which is why the tool was asked
+# first: the indexer builds the fast tier's indexes from the archive's.
+for _ in $(seq 1 20); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")" = "true" ] && break
+  sleep 1
+done
+chk "and the indexer then builds it"               "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
+kill $LRP 2>/dev/null; wait $LRP 2>/dev/null
+
+echo "== dropping a unique index has to reach both tiers =="
+# DDL is not mirrored, so the drop used to reach the fast tier alone. From then
+# on the router accepted a value the archive refused and the document stayed on
+# the fast tier alone: measured, the fast tier held two and the archive one.
+# The indexer put the index back on the next router start, so the constraint was
+# off now and on again later, which is worse than either.
+#
+# A plain index is a different thing and must not follow. It is a decision about
+# speed, the two tiers are allowed to differ, and an operator may keep one on
+# the archive for the reads that fall through; cline indexes exists to report
+# exactly that.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$LNS'})" >/dev/null
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "const c=db.getSiblingDB('$DB').$LNS;
+    db.getSiblingDB('$DB').createCollection('$LNS');
+    c.createIndex({code:1},{unique:true,name:'code_u'});
+    c.createIndex({owner:1},{name:'owner_1'})" >/dev/null 2>&1
+done
+startFeeder
+startRouter
+R "db.getSiblingDB(process.env.TC_DB).$LNS.insertOne({_id:1, code:'A', owner:'ann'})" >/dev/null
+sleep 4
+chk "the duplicate is refused while the index is there" "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$LNS.insertOne({_id:2, code:'A'});print('ACCEPTED')}catch(e){print('refused')}")"
+R "db.getSiblingDB(process.env.TC_DB).$LNS.dropIndex('code_u')" >/dev/null 2>&1
+chk "the archive dropped it too"                   "false" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
+# The plain index beside it is untouched, on both tiers.
+R "db.getSiblingDB(process.env.TC_DB).$LNS.dropIndex('owner_1')" >/dev/null 2>&1
+chk "a plain index is dropped only from the fast tier" "false/true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'owner_1' }))")/$(C "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'owner_1' }))")"
+# And the point of all of it: the write the application is now entitled to make
+# reaches the archive.
+R "db.getSiblingDB(process.env.TC_DB).$LNS.insertOne({_id:3, code:'A', owner:'bo'})" >/dev/null 2>&1
+sleep 6
+chk "the duplicate is accepted now"                "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.countDocuments({code:'A'}))")"
+chk "and it reached the archive"                   "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$LNS.countDocuments({code:'A',_tcDeletedAt:{\$exists:false}}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$LNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$LNS'})" >/dev/null
+
 echo "== a tiered collection that is not the same collection on both tiers =="
 # The fast tier's copy is created with the archive's options before anything
 # inserts into it, which is what keeps a collation working after an adoption.

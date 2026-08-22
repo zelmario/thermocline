@@ -137,15 +137,39 @@ func runIndexes(args []string) error {
 		if len(bare) > 0 {
 			sort.Slice(bare, func(i, j int) bool { return bare[i].name < bare[j].name })
 			fmt.Printf("  missing from the FAST TIER:\n")
+			uniqueBare := 0
 			for _, m := range bare {
 				note := ""
 				if m.ttl {
 					note = "   (TTL: expiring on the fast tier would delete the archive's" +
 						" copies too, through the feeder)"
 				}
+				if m.unique {
+					note = "   (unique: the archive refuses writes this one rejects, and the" +
+						" fast tier no longer does)"
+					uniqueBare++
+				}
 				fmt.Printf("    %-34s %s%s\n", m.name, m.spec, note)
 			}
 			fmt.Printf("  the fast tier scans for these, which is the tier that exists not to\n")
+			// A unique index in that list is not about speed at all, and saying
+			// only "the fast tier scans for these" about one is misleading in
+			// the direction that costs data.
+			//
+			// The router enforces uniqueness from the FAST TIER's indexes, so
+			// while the archive has one the fast tier does not, the router
+			// accepts a value the archive will refuse, the feeder cannot mirror
+			// that document, and it is left on the fast tier alone. Measured: a
+			// unique index dropped through the router, then a duplicate
+			// written, and afterwards the fast tier held two documents and the
+			// archive one.
+			if uniqueBare > 0 {
+				fmt.Printf("  one of those is unique, which is worse than slow: the router reads the\n" +
+					"  FAST TIER's unique indexes to know what to protect, so it accepts a value\n" +
+					"  the archive then refuses, and that document stays on the fast tier alone.\n" +
+					"  Either build it on the fast tier, or drop it from the archive if the\n" +
+					"  constraint is genuinely gone.\n")
+			}
 		}
 
 		if len(missing) == 0 {

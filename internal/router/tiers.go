@@ -471,6 +471,7 @@ func (r *Router) warnAboutOptionDrift(ctx context.Context) {
 		if cerr != nil || herr != nil {
 			continue
 		}
+		r.warnAboutLostConstraint(ctx, ns, db, coll)
 		for _, o := range []struct{ key, cold, hot string }{
 			{"collation", cold.collation, hot.collation},
 			{"validator", cold.validator, hot.validator},
@@ -487,6 +488,68 @@ func (r *Router) warnAboutOptionDrift(ctx context.Context) {
 					"the tier that is behind")
 		}
 	}
+}
+
+// warnAboutLostConstraint says so when the archive has a unique index the fast
+// tier does not.
+//
+// The router reads the fast tier's unique indexes to know what to protect
+// across both tiers, so while this is true it accepts a value the archive then
+// refuses. The feeder cannot mirror that document and says so, once, in an
+// error nobody is reading at the time; the document stays on the fast tier
+// alone, and the evictor will not remove it because a document the archive does
+// not hold is never evicted.
+//
+// Measured: a unique index dropped through the router, which reaches the fast
+// tier alone because DDL is not mirrored, then the duplicate the application
+// was now entitled to write. Afterwards the fast tier held two documents and
+// the archive held one.
+//
+// The indexer would put the index back on the next router start, since the
+// archive still defines it, which makes this a constraint that is off now and
+// on again later. Saying so is worth more than either half of that.
+func (r *Router) warnAboutLostConstraint(ctx context.Context, ns, db, coll string) {
+	cold, cerr := uniqueIndexNames(ctx, r.cold, db, coll)
+	hot, herr := uniqueIndexNames(ctx, r.hot, db, coll)
+	if cerr != nil || herr != nil {
+		return
+	}
+	var missing []string
+	for name := range cold {
+		if !hot[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	r.log.Warn("the archive has a unique index the fast tier does not",
+		"ns", ns, "indexes", missing,
+		"meaning", "uniqueness is enforced from the fast tier's indexes, so a value this one "+
+			"refuses is accepted here and then refused by the archive, and that document stays "+
+			"on the fast tier alone",
+		"action", "build it on the fast tier, or drop it from the archive if the constraint is "+
+			"genuinely gone")
+}
+
+// uniqueIndexNames is the names of one collection's unique indexes.
+func uniqueIndexNames(ctx context.Context, client *mongo.Client, db, coll string) (map[string]bool, error) {
+	cur, err := client.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	out := map[string]bool{}
+	for cur.Next(ctx) {
+		if unique, ok := cur.Current.Lookup("unique").BooleanOK(); !ok || !unique {
+			continue
+		}
+		if name, ok := cur.Current.Lookup("name").StringValueOK(); ok {
+			out[name] = true
+		}
+	}
+	return out, cur.Err()
 }
 
 type answerAffecting struct{ collation, validator string }

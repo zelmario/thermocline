@@ -242,6 +242,21 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **Dropping a unique index reaches both tiers.** Uniqueness across the tiers is
+  enforced from the fast tier's indexes, so once one is dropped there the router
+  accepts a value the archive still refuses. The feeder cannot mirror that
+  document: it says so once and leaves it on the fast tier alone, where the
+  evictor will not touch it either, because a document the archive does not hold
+  is never evicted. Measured before this: the index dropped through the router,
+  then the duplicate the application was now entitled to write, and afterwards
+  the fast tier held two documents and the archive one. The indexer also put the
+  index back on the next router start, so the constraint was off now and on
+  again later.
+
+  A plain index is a different thing and stays where it is. It is a decision
+  about speed, the two tiers are allowed to differ, and you may want one on the
+  archive for the reads that fall through; `cline indexes` reports that, and
+  flags a unique index missing from the fast tier as the hazard it is.
 - **A tiered collection cannot be turned into one the feeder cannot mirror.**
   `convertToCapped`, `cloneCollectionAsCapped`, and `create` asking for `capped`
   or `timeseries` are refused on a tiered namespace. The feeder already refuses

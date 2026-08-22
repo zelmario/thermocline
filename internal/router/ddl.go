@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -461,4 +462,130 @@ func unmirrorableTarget(cmd bson.Raw, name string) (coll, kind string, ok bool) 
 		}
 	}
 	return "", "", false
+}
+
+// pendingIndexDrop is a unique index the fast tier is being asked to drop,
+// waiting to see whether it did.
+type pendingIndexDrop struct {
+	ns    string
+	names []string
+}
+
+// noteIndexDrop records the unique indexes a dropIndexes would remove, before
+// the fast tier removes them and the answer is no longer readable.
+//
+// Only unique ones. A plain index is a decision about speed and the two tiers
+// are allowed to differ: cline indexes exists to report that, and an operator
+// may keep one on the archive for the reads that fall through. A unique index
+// is a constraint, and a constraint that holds on one tier and not the other is
+// not a slower system, it is a different one.
+func (c *conn) noteIndexDrop(ctx context.Context, cmd bson.Raw, db, coll string) {
+	c.indexDrop = nil
+	ns := db + "." + coll
+	if _, _, tiered := c.r.tieredBase(ctx, ns); !tiered {
+		return
+	}
+	unique, err := uniqueIndexNames(ctx, c.r.hot, db, coll)
+	if err != nil || len(unique) == 0 {
+		return
+	}
+
+	var names []string
+	switch v := cmd.Lookup("index"); v.Type {
+	case bson.TypeString:
+		name, _ := v.StringValueOK()
+		if name == "*" {
+			for n := range unique {
+				names = append(names, n)
+			}
+		} else if unique[name] {
+			names = append(names, name)
+		}
+	case bson.TypeArray:
+		vals, aerr := v.Array().Values()
+		if aerr != nil {
+			return
+		}
+		for _, e := range vals {
+			if name, ok := e.StringValueOK(); ok && unique[name] {
+				names = append(names, name)
+			}
+		}
+	case bson.TypeEmbeddedDocument:
+		// By key pattern rather than by name. Resolving that would mean
+		// comparing key documents, so the archive is told to drop the same
+		// pattern and MongoDB does the resolving.
+		names = append(names, "")
+	}
+	if len(names) == 0 {
+		return
+	}
+	sort.Strings(names)
+	c.indexDrop = &pendingIndexDrop{ns: ns, names: names}
+}
+
+// finishIndexDrop drops from the archive the unique indexes the fast tier just
+// dropped.
+//
+// The router enforces uniqueness from the fast tier's indexes, so once one is
+// gone from there it accepts values the archive still refuses. The feeder then
+// cannot mirror those documents: it says so, once, and leaves them on the fast
+// tier alone, where the evictor will not touch them either because a document
+// the archive does not hold is never evicted. Measured before this: a unique
+// index dropped through the router, then the duplicate the application was now
+// entitled to write, and afterwards the fast tier held two documents and the
+// archive held one.
+//
+// Leaving it also made the constraint come back. The indexer builds the fast
+// tier's indexes from the archive's, so the next router start put it back, and
+// a constraint that is off now and on again after a restart is worse than
+// either.
+//
+// A failure here is said out loud with the command to run, the same as a
+// rename: an operator with one command beats a proxy guessing.
+func (c *conn) finishIndexDrop(ctx context.Context, accepted bool, cmd bson.Raw) {
+	op := c.indexDrop
+	c.indexDrop = nil
+	if op == nil || !accepted {
+		return
+	}
+	db, coll := splitNS(op.ns)
+
+	spec := bson.RawValue{}
+	if len(op.names) == 1 && op.names[0] == "" {
+		spec = cmd.Lookup("index")
+	}
+	drop := bson.D{{Key: "dropIndexes", Value: coll}}
+	if spec.Type != 0 {
+		drop = append(drop, bson.E{Key: "index", Value: spec})
+	} else {
+		drop = append(drop, bson.E{Key: "index", Value: op.names})
+	}
+
+	err := c.r.cold.Database(db).RunCommand(ctx, drop).Err()
+	switch {
+	case err == nil:
+		c.log.Info("dropped the same unique index from the archive",
+			"ns", op.ns, "indexes", op.names,
+			"why", "uniqueness is enforced from the fast tier's indexes, so an archive that "+
+				"still refuses these values would stop the documents being mirrored at all")
+	case isIndexNotFound(err) || isNamespaceNotFound(err):
+		c.log.Debug("the archive did not have that index", "ns", op.ns, "indexes", op.names)
+	default:
+		c.log.Error("the fast tier dropped a unique index and the archive kept it",
+			"ns", op.ns, "indexes", op.names, "err", err,
+			"effect", "a value the router now accepts will be refused by the archive, and that "+
+				"document will stay on the fast tier alone",
+			"remedy", "run db."+coll+".dropIndex(...) on the archive for these")
+	}
+}
+
+// isIndexNotFound reports whether an error is MongoDB saying there is no such
+// index, which is the ordinary answer when the archive never had it.
+func isIndexNotFound(err error) bool {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return ce.Name == "IndexNotFound" || ce.Code == 27
+	}
+	return false
 }
