@@ -442,6 +442,110 @@ func (r *Router) warnAboutMissingRoles(ctx context.Context) {
 		"action", "create these first, with the same privileges, then the accounts that hold them")
 }
 
+// warnAboutOptionDrift says so when a tiered collection is not the same
+// collection on both tiers.
+//
+// The fast tier's copy is created with the archive's options before anything
+// inserts into it, which is what keeps a collation and a validator working
+// after an adoption. Two things get past that. An application insert can create
+// the collection first, and the comment on createWithOptions calls that the
+// expected way to lose the race; and a collMod through the router afterwards
+// reaches the fast tier alone, because DDL is not mirrored.
+//
+// Either way the two tiers stop being the same collection, and a collation
+// cannot be added to one that already holds documents. Measured on a collection
+// the archive created with {locale: "en", strength: 2} and the fast tier created
+// by an insert: the archive answers countDocuments({name: "alice"}) with 2 and
+// the fast tier with 1, so the answer depends on which tier served it.
+//
+// Only the options that decide answers are compared. Everything else the copy
+// carries is worth carrying and not worth a warning about.
+func (r *Router) warnAboutOptionDrift(ctx context.Context) {
+	for _, ns := range r.cfg.Managed {
+		db, coll := splitNS(ns)
+		if db == "" || coll == "" {
+			continue
+		}
+		cold, cerr := answerOptions(ctx, r.cold, db, coll)
+		hot, herr := answerOptions(ctx, r.hot, db, coll)
+		if cerr != nil || herr != nil {
+			continue
+		}
+		for _, o := range []struct{ key, cold, hot string }{
+			{"collation", cold.collation, hot.collation},
+			{"validator", cold.validator, hot.validator},
+		} {
+			if o.cold == o.hot {
+				continue
+			}
+			r.log.Warn("a tiered collection is not the same collection on both tiers",
+				"ns", ns, "option", o.key, "archive", shortOption(o.cold), "fast_tier", shortOption(o.hot),
+				"meaning", "which tier answers decides the answer, and a collation decides which "+
+					"documents match while a validator decides which writes are refused",
+				"action", "for a collation, recreate the fast tier's copy with it, because it cannot "+
+					"be added to a collection that already holds documents; for a validator, collMod "+
+					"the tier that is behind")
+		}
+	}
+}
+
+type answerAffecting struct{ collation, validator string }
+
+// answerOptions reads the two collection options whose value changes what a
+// query answers. Missing is a value like any other, and the common drift.
+func answerOptions(ctx context.Context, client *mongo.Client, db, coll string) (answerAffecting, error) {
+	cur, err := client.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return answerAffecting{}, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	if !cur.Next(ctx) {
+		return answerAffecting{}, cur.Err()
+	}
+	out := answerAffecting{}
+	odoc, ok := cur.Current.Lookup("options").DocumentOK()
+	if !ok {
+		return out, nil
+	}
+	if v, lerr := odoc.LookupErr("collation"); lerr == nil {
+		// The server fills a collation out with every default it implies, and
+		// two tiers agreeing on locale and strength agree for every purpose
+		// this warning is about.
+		if doc, dok := v.DocumentOK(); dok {
+			out.collation = lookupText(doc, "locale") + "/" + lookupText(doc, "strength")
+		}
+	}
+	if v, lerr := odoc.LookupErr("validator"); lerr == nil {
+		out.validator = v.String()
+	}
+	return out, nil
+}
+
+func lookupText(doc bson.Raw, key string) string {
+	v, err := doc.LookupErr(key)
+	if err != nil {
+		return ""
+	}
+	if s, ok := v.StringValueOK(); ok {
+		return s
+	}
+	if n, ok := intOf(v); ok {
+		return strconv.Itoa(n)
+	}
+	return v.String()
+}
+
+// shortOption keeps a log line readable when a validator is a page of schema.
+func shortOption(s string) string {
+	if s == "" {
+		return "none"
+	}
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
+}
+
 // warnAboutDefaultConcerns says so when the archive carries a cluster-wide read
 // or write concern default that the fast tier does not.
 //

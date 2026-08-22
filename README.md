@@ -242,6 +242,19 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **The router says when a tiered collection is not the same collection on both
+  tiers.** The fast tier's copy is created with the archive's options before
+  anything inserts into it, which is what keeps a collation and a validator
+  working after an adoption. Two things get past that: your own insert can
+  create the collection first, and a `collMod` through the router reaches the
+  fast tier alone, because DDL is not mirrored.
+
+  Then which tier answers decides the answer. Measured on a collection the
+  archive created with `{locale: "en", strength: 2}` and a fast tier created by
+  an insert: `countDocuments({name: "alice"})` is 2 on one and 1 on the other,
+  and nothing failed. A collation cannot be added to a collection that already
+  holds documents, so the fix is to recreate the fast tier's copy; a validator
+  can be fixed with `collMod` on whichever tier is behind.
 - **A validator applies to what your application writes, not to what moves
   between the tiers.** The fast tier enforces it at the moment of the write, the
   way your cluster always did. What reaches the archive afterwards is a copy of

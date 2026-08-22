@@ -389,6 +389,50 @@ chk "and still refuses what the validator refuses" "refused" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+echo "== a tiered collection that is not the same collection on both tiers =="
+# The fast tier's copy is created with the archive's options before anything
+# inserts into it, which is what keeps a collation working after an adoption.
+# Two things get past that: an application insert can create the collection
+# first, and a collMod through the router afterwards reaches the fast tier alone
+# because DDL is not mirrored. Either way the two stop being the same
+# collection, and a collation cannot be added to one that already holds
+# documents.
+#
+# Measured: the archive created with {locale:'en',strength:2} answers
+# countDocuments({name:'alice'}) with 2 and a fast tier created by an insert
+# answers 1, so the answer depends on which tier served it. Nothing failed.
+DNS=tdrift
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "const d=db.getSiblingDB(process.env.TC_DB);
+   d.createCollection('$DNS', {collation:{locale:'en',strength:2}});
+   d.$DNS.insertMany([{_id:1,name:'Alice'},{_id:2,name:'alice'}])" >/dev/null
+# The race, made deterministic: the application's insert creates it first.
+H "db.getSiblingDB(process.env.TC_DB).$DNS.insertMany([{_id:1,name:'Alice'},{_id:2,name:'alice'}])" >/dev/null
+chk "the two tiers answer the same query differently" "2/1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({name:'alice'}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({name:'alice'}))")"
+rm -f $LOGDIR/drift.log
+cline router --config $CFG --log-file $LOGDIR/drift.log >/dev/null 2>&1 & DRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chk "the router names the collection and the option" "true" \
+    "$(grep -qE "ns=$DB.$DNS option=collation" $LOGDIR/drift.log && echo true || echo false)"
+chk "and says which tier has what"                 "true" \
+    "$(grep -qE 'archive=en/2 fast_tier=none' $LOGDIR/drift.log && echo true || echo false)"
+kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
+# And a collection that matches must be quiet, or the warning is noise on every
+# startup and nobody reads it.
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$DNS', {collation:{locale:'en',strength:2}})" >/dev/null
+rm -f $LOGDIR/drift2.log
+cline router --config $CFG --log-file $LOGDIR/drift2.log >/dev/null 2>&1 & DRQ=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chk "and says nothing once they match"             "0" \
+    "$(grep -c "ns=$DB.$DNS" $LOGDIR/drift2.log || true)"
+kill $DRQ 2>/dev/null; wait $DRQ 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+
 echo "== a validator must not be applied to what moves between the tiers =="
 # A validator is a rule about what the application may write, and the fast tier
 # applies it when the application writes. What reaches the archive afterwards is

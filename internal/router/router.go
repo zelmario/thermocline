@@ -253,6 +253,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
+	r.warnAboutOptionDrift(ctx)
 	// Before the listener opens: a unique index the fast tier is missing is one
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
