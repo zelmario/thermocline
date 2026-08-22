@@ -32,14 +32,47 @@ function ask(ns, label, f) {
   out.push({ ns: ns, q: label, v: v });
 }
 
-const dbs = db.adminCommand({ listDatabases: 1 }).databases
-  .map(d => d.name).filter(n => /^sample_/.test(n)).sort();
+// The question list comes from one side, not from each. Asking each target what
+// it holds and then questioning it about that lets the two answer different
+// question sets, and the comparison reports a question one of them was never
+// asked as a blank answer: not obviously a missing question, and easy to read
+// as a wrong one.
+//
+// That is exactly what a real defect looked like here. The router did not name
+// a tiered collection the fast tier had no copy of, so nine questions about
+// sample_supplies.sales were asked of the archive alone, and the report showed
+// nine disagreements with the router's side empty while the router in fact
+// answered every one of them correctly when asked directly.
+//
+// So the archive names the work, because it holds everything, and both sides
+// answer the same list. A collection the router cannot see is then a real
+// failure on a real question rather than a gap in the report.
+const PLAN = process.env.TC_PLAN;
+let dbs, colls = null;
+if (PLAN) {
+  const plan = JSON.parse(cat(PLAN));
+  dbs = Object.keys(plan).sort();
+  colls = plan;
+} else {
+  dbs = db.adminCommand({ listDatabases: 1 }).databases
+    .map(d => d.name).filter(n => /^sample_/.test(n)).sort();
+}
+
+// Emitted by the archive pass so the router pass can be given the same list.
+if (process.env.TC_PLAN_OUT) {
+  const plan = {};
+  for (const dbName of dbs) {
+    plan[dbName] = db.getSiblingDB(dbName).getCollectionNames().sort();
+  }
+  print(JSON.stringify(plan));
+  quit(0);
+}
 
 for (let round = 0; round < REPEAT; round++) {
   out = [];
   for (const dbName of dbs) {
   const d = db.getSiblingDB(dbName);
-  for (const cName of d.getCollectionNames().sort()) {
+  for (const cName of (colls ? colls[dbName] : d.getCollectionNames().sort())) {
     const ns = dbName + "." + cName;
     const c = d[cName];
 

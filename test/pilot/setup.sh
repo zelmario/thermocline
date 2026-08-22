@@ -91,11 +91,30 @@ compare() {
   # untiered one, which is the case no watermark can cover.
   echo "== asking both the same questions =="
   local rc=0
+  # One question list, taken from the archive, and both sides answer it.
+  #
+  # Asking each target what it holds and then questioning it about that lets the
+  # two answer different question sets, and a question one of them was never
+  # asked is reported as a blank answer rather than as a missing question. A
+  # real defect hid in that: the router did not name a tiered collection the
+  # fast tier had no copy of, so nine questions were put to the archive alone
+  # and read as nine wrong answers, while the router answered every one of them
+  # correctly when asked directly.
+  docker cp test/pilot/agree.js $NODE:/root/agree.js >/dev/null
+  docker exec -e TC_PLAN_OUT=1 $NODE mongosh "$COLD" --quiet --file /root/agree.js \
+    | tail -1 > /tmp/pilot_plan.json
+  if ! python3 -c 'import json,sys; json.load(open("/tmp/pilot_plan.json"))' 2>/dev/null; then
+    echo "  could not build the question list from the archive, so nothing was compared"
+    head -3 /tmp/pilot_plan.json
+    return 2
+  fi
+  docker cp /tmp/pilot_plan.json $NODE:/root/pilot_plan.json >/dev/null
   for h in agree aggs; do
     docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
-    docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" $NODE \
+    docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" -e TC_PLAN=/root/pilot_plan.json $NODE \
       mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
-    docker exec -e TC_TARGET=archive $NODE mongosh "$COLD"   --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
+    docker exec -e TC_TARGET=archive -e TC_PLAN=/root/pilot_plan.json $NODE \
+      mongosh "$COLD" --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
     python3 test/pilot/diff.py "$h" || rc=1
   done
   return $rc

@@ -32,27 +32,8 @@ import (
 // own error rather than one invented here: the client should see exactly what
 // it would have seen without a proxy in the way.
 func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool) {
-	probe, err := wire.NewMsg(0, 0, bson.D{
-		{Key: "find", Value: coll},
-		{Key: "filter", Value: bson.D{}},
-		{Key: "limit", Value: 1},
-		{Key: "singleBatch", Value: true},
-		{Key: "$db", Value: db},
-	})
-	if err != nil {
-		return nil, true
-	}
-	if werr := wire.Write(c.upstream, probe); werr != nil {
-		c.upstreamBroke()
-		return nil, true
-	}
-	reply, rerr := wire.Read(c.upstream)
-	if rerr != nil {
-		c.upstreamBroke()
-		return nil, true
-	}
-	rdoc, derr := reply.ReplyDoc()
-	if derr != nil {
+	rdoc, got := c.probeRead(db, coll)
+	if !got {
 		return nil, true
 	}
 	if replyOK(rdoc) {
@@ -74,6 +55,59 @@ func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool)
 		return nil, true
 	}
 	return out, false
+}
+
+// probeRead runs a bounded find on the client's own connection and returns the
+// reply, or false if there was no usable one.
+func (c *conn) probeRead(db, coll string) (bson.Raw, bool) {
+	probe, err := wire.NewMsg(0, 0, bson.D{
+		{Key: "find", Value: coll},
+		{Key: "filter", Value: bson.D{}},
+		{Key: "limit", Value: 1},
+		{Key: "singleBatch", Value: true},
+		{Key: "$db", Value: db},
+	})
+	if err != nil {
+		return nil, false
+	}
+	if werr := wire.Write(c.upstream, probe); werr != nil {
+		c.upstreamBroke()
+		return nil, false
+	}
+	reply, rerr := wire.Read(c.upstream)
+	if rerr != nil {
+		c.upstreamBroke()
+		return nil, false
+	}
+	rdoc, derr := reply.ReplyDoc()
+	if derr != nil {
+		return nil, false
+	}
+	return rdoc, true
+}
+
+// canRead reports whether this client may read a namespace, for the catalog
+// merges, which name collections and databases the fast tier did not.
+//
+// The fast tier filters both listings by what the client is allowed to see. The
+// archive's half of the answer is read over a connection the router opened with
+// its own credentials, and a client has no session there at all, so adding a
+// name to that answer without asking would tell a limited user what exists in
+// places the fast tier had deliberately not mentioned. Same reasoning as
+// mayRead above, and the same probe.
+//
+// Anything other than a refusal counts as allowed. A probe that could not be
+// sent, or a collection that does not exist on the fast tier, is not an
+// authorisation answer and is not read as one.
+func (c *conn) canRead(db, coll string) bool {
+	rdoc, got := c.probeRead(db, coll)
+	if !got {
+		return true
+	}
+	if replyOK(rdoc) {
+		return true
+	}
+	return !isAuthError(rdoc)
 }
 
 // isAuthError reports whether a reply is an authorisation refusal.

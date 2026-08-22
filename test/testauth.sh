@@ -34,6 +34,8 @@ CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 NS=tauth
+# Tiered, and deliberately left off the fast tier for the catalog section.
+CATNS=tcatalog
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-54s %s\n' "$1" "$3"
@@ -125,6 +127,50 @@ chk "a restricted distinct still refused"               "DENIED" "$(L "
   try { print(db.getSiblingDB(process.env.TC_DB).$NS.distinct('grp').length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
 chk "a restricted aggregation still refused"            "DENIED" "$(L "
   try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}}]).toArray().length); } catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,40)); }")"
+
+echo "== and the catalog must not name what the fast tier withheld =="
+# The router adds the archive's tiered collections and databases to
+# listCollections and listDatabases, because a tiered collection with no copy on
+# the fast tier is otherwise reported as not existing while reads of it work.
+# That half of the answer is read with the router's own credentials over a
+# connection this client has no session on, and the fast tier's half was
+# filtered by what the client may see. So the names have to be checked the same
+# way the documents are, or a listing tells a limited user what exists in places
+# the fast tier deliberately did not mention.
+H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.insertMany([{_id:1},{_id:2}])" >/dev/null
+chk "the fast tier does not have it"                    "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+# The control. An allowed client must see it, or the check below passes on a
+# merge that is simply not happening.
+chk "an allowed client is told it exists"               "true" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+chk "the restricted client is not"                      "false" \
+    "$(L "try { print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0) } catch(e) { print('false') }")"
+# That client is refused listCollections outright, so the merge never runs for
+# it. The case that reaches the merge is a client whose listing succeeds and
+# comes back filtered, which is a role scoped to one collection rather than to
+# the database: MongoDB then answers listCollections with the collections the
+# client may see and leaves out the rest.
+H "db.getSiblingDB('admin').dropUser('onecoll')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').dropRole('onecollrole')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').createRole({role:'onecollrole', privileges:[{resource:{db:process.env.TC_DB, collection:'$NS'}, actions:['find']}], roles:[]})" >/dev/null
+H "db.getSiblingDB('admin').createUser({user:'onecoll', pwd:'onecoll', roles:[{role:'onecollrole', db:'admin'}]})" >/dev/null
+O() { mongosh "mongodb://onecoll:onecoll@127.0.0.1:$PORT/?authSource=admin&directConnection=true" --quiet --eval "$1" 2>&1 | tail -1; }
+# authorizedCollections is how a client without the database-wide privilege asks
+# for the part of the listing it is entitled to. Without it MongoDB refuses the
+# command outright and the merge is never reached.
+OLIST="db.getSiblingDB(process.env.TC_DB).runCommand({listCollections:1,nameOnly:true,authorizedCollections:true}).cursor.firstBatch.map(function (c) { return c.name })"
+chk "the collection-scoped client can list at all"      "true" \
+    "$(O "try { print($OLIST.indexOf('$NS') >= 0) } catch(e) { print('ERR ' + e.message.substring(0,50)) }")"
+chk "and is not told about the one it may not read"     "false" \
+    "$(O "try { print($OLIST.indexOf('$CATNS') >= 0) } catch(e) { print('ERR ' + e.message.substring(0,50)) }")"
+chk "nor is the database named to it"                   "false" \
+    "$(L "try { print(db.adminCommand({listDatabases:1,nameOnly:true}).databases.some(function (d) { return d.name === process.env.TC_DB })) } catch(e) { print('false') }")"
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+H "db.getSiblingDB('admin').dropUser('onecoll')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').dropRole('onecollrole')" >/dev/null 2>&1
 
 echo "== an account the archive has and the fast tier does not =="
 # Certain in an adoption rather than merely possible. The existing cluster

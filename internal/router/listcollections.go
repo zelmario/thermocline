@@ -155,6 +155,23 @@ func (c *conn) archiveOnlyCollections(ctx context.Context, cmd bson.Raw, db stri
 		if !c.r.cfg.Manages(db + "." + name) {
 			continue
 		}
+		// A view is not tiered and cannot be. It holds no documents, the feeder
+		// refuses it for that reason, and a read of one goes to the fast tier
+		// and finds nothing, so listing it would be the same lie as listing an
+		// untiered collection. It matters most with no namespaces configured,
+		// which means everything is tiered and would otherwise sweep views in
+		// with the rest, and hand one to the indexer to be built as a
+		// collection. Views the fast tier lacks are warned about at startup.
+		if kind, kok := stringField(cur.Current, "type"); kok && kind != "collection" {
+			continue
+		}
+		// And only what this client would have been allowed to see. The fast
+		// tier filtered its half of the answer by the client's privileges; the
+		// archive's half is read with the router's own credentials, so it is
+		// asked on the client's behalf before anything is added. See canRead.
+		if !c.canRead(db, name) {
+			continue
+		}
 		out = append(out, spec)
 
 		// And close the gap, so the next answer does not need this. The router
@@ -254,6 +271,11 @@ func (c *conn) interceptListDatabases(ctx context.Context, msg *wire.Message, re
 		if !c.r.managesDatabase(lctx, d.Name) {
 			continue
 		}
+		// Asked on the client's behalf, for the same reason as the collections.
+		// A user with no privileges on a database is not told it exists.
+		if !c.canReadAnyOf(lctx, d.Name) {
+			continue
+		}
 		if nameOnly {
 			extra = append(extra, bson.D{{Key: "name", Value: d.Name}})
 			continue
@@ -305,4 +327,27 @@ func (r *Router) managesDatabase(ctx context.Context, db string) bool {
 		}
 	}
 	return false
+}
+
+// canReadAnyOf reports whether this client may read anything tiered in a
+// database, which is what naming the database in a listing amounts to.
+//
+// The probe needs a collection, and the database is not on the fast tier, so
+// one is taken from what is tiered there. A find on a collection the fast tier
+// does not have succeeds for a client that is allowed the namespace and is
+// refused for one that is not, which is exactly the question.
+func (c *conn) canReadAnyOf(ctx context.Context, db string) bool {
+	for _, ns := range c.r.cfg.Managed {
+		d, coll := splitNS(ns)
+		if d == db {
+			return c.canRead(db, coll)
+		}
+	}
+	// Nothing configured means everything is tiered, and then the archive's own
+	// collection names are the only list there is.
+	names, err := c.r.cold.Database(db).ListCollectionNames(ctx, bson.D{})
+	if err != nil || len(names) == 0 {
+		return false
+	}
+	return c.canRead(db, names[0])
 }

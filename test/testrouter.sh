@@ -416,6 +416,36 @@ chk "the bookkeeping database is listed once"      "1" \
 chk "and it is not listed twice"                   "1" \
     "$(R "print(db.adminCommand({listDatabases:1}).databases.filter(function (d) { return d.name === process.env.TC_DB }).length)")"
 
+# A view is a different case again and must stay out. It holds no documents, the
+# feeder refuses to tier one, and a read of it goes to the fast tier and finds
+# nothing, so listing it would be the same lie. With no namespaces configured
+# everything is tiered, and a view would otherwise be listed and then handed to
+# the indexer to be built as a collection.
+C "db.getSiblingDB(process.env.TC_DB).createView('${CATNS}_view', '$CATNS', [])" >/dev/null 2>&1
+chk "a view the fast tier does not have is not listed" "false" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${CATNS}_view') >= 0)")"
+# With namespaces configured that follows from the view not being one of them,
+# so it is asked again with none configured, which means every namespace is
+# tiered and the view is no longer excluded by name. That is the config where a
+# view would otherwise be listed and then handed to the indexer to be built as
+# a collection.
+awk '/^  namespaces:/{skip=1; next} skip && /^    (-|#)/{next} {skip=0; print}' $CFG > $WDIR/router_all.yaml
+chk "the derived config tiers everything"          "0" \
+    "$(grep -c '^  namespaces:' $WDIR/router_all.yaml)"
+kill $CATR 2>/dev/null; wait $CATR 2>/dev/null
+cline router --config $WDIR/router_all.yaml >/dev/null 2>&1 & CATR2=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chk "the collection is still named"                "true" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+chk "and the view is still not"                    "false" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${CATNS}_view') >= 0)")"
+chk "and nothing built the view as a collection"   "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${CATNS}_view') >= 0)")"
+kill $CATR2 2>/dev/null; wait $CATR2 2>/dev/null
+cline router --config $CFG >/dev/null 2>&1 & CATR=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+C "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
+
 # An untiered collection the archive holds is a different case and must stay
 # out. Reads of it go to the fast tier and come back empty, so listing it would
 # be the lie this section removes.
