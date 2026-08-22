@@ -364,12 +364,18 @@ stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
+# Three shapes a window cannot select, because MongoDB brackets a range
+# predicate by type: the field absent, the field holding a string date, and the
+# field explicitly null. All three are equally never warmed, and counting only
+# the absent one would report a third of the problem.
 C "db.getSiblingDB(process.env.TC_DB).$UNS.insertMany([
      {_id:1, at:new Date(), n:'has the field'},
      {_id:2, at:new Date(), n:'has it too'},
-     {_id:3,                n:'written before the field existed'}])" >/dev/null
-chk "the archive holds one without the field"    "1" \
-    "$(C "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({at:{\$exists:false}}))")"
+     {_id:3,                n:'written before the field existed'},
+     {_id:4, at:'2026-01-01', n:'a string, not a date'},
+     {_id:5, at:null,       n:'explicitly nothing'}])" >/dev/null
+chk "three of them cannot be aged by the rule"   "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({at:{\$not:{\$type:'date'}}}))")"
 # Its own config: one rule, on this namespace, aged by a date field. Warming the
 # shared config's namespaces here would take minutes and report somebody else's
 # state in the same log.
@@ -402,8 +408,8 @@ chk "it refuses the claim"                       "true" \
     "$(grep -q 'not claiming' $LOGDIR/warm_unaged.log && echo true || echo false)"
 chk "and says the rule cannot address them"      "true" \
     "$(grep -q 'this rule cannot address' $LOGDIR/warm_unaged.log && echo true || echo false)"
-chk "counting them by the field they lack"       "true" \
-    "$(grep -q 'without_at=1' $LOGDIR/warm_unaged.log && echo true || echo false)"
+chk "counting all three, not just the absent one" "true" \
+    "$(grep -q 'not_dated_by_at=3' $LOGDIR/warm_unaged.log && echo true || echo false)"
 # The part that distinguishes it from an evictor fighting the warm: this one is
 # permanent, and the message has to say so rather than describing a race.
 chk "and that it is never going to be made"      "true" \
@@ -428,7 +434,7 @@ chk "nor one dated before this collection existed" "0" \
           print(w && w.completeFrom && w.completeFrom.getFullYear() < 2020 ? 1 : 0)")"
 # And the answers, which is the whole point: the router must still see all three.
 startRouter
-chk "the router still sees every document"       "3" \
+chk "the router still sees every document"       "5" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({}))")"
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null

@@ -283,9 +283,10 @@ func (w *Warmer) stillHolds(ctx context.Context, rule config.WarmRule, from time
 		w.log.Warn("not claiming a window, because the archive holds documents this rule cannot address",
 			"ns", rule.NS,
 			"fast_tier", hotN, "archive", coldN, "missing", coldN-hotN,
-			"without_"+rule.DateField, n,
-			"why", "a rule ages a collection by a date field, and a document that has no such "+
-				"field is selected by no window, so no warm will ever copy it up",
+			"not_dated_by_"+rule.DateField, n,
+			"why", "a rule ages a collection by a date field, and a document whose "+rule.DateField+
+				" is missing, null or not a date is selected by no window, because MongoDB brackets "+
+				"a range predicate by type; no warm will ever copy those up",
 			"effect", "this claim is never going to be made, so queries with no lower time bound "+
 				"go on being answered by the archive",
 			"action", "give those documents the field, or tier this namespace by the _id timestamp "+
@@ -894,8 +895,15 @@ func selectorName(rule config.WarmRule) string {
 	return rule.DateField
 }
 
-// unagedInArchive counts the live documents the archive holds that this rule's
-// date field is missing from.
+// unagedInArchive counts the live documents the archive holds that this rule
+// cannot read an age from.
+//
+// Not just a missing field. MongoDB brackets a range predicate by type, so a
+// window on a date selects only documents whose field holds a date: a string
+// date, a null, and an absent field are all equally invisible to it, and
+// equally never warmed. Measured on four documents, one of each shape:
+// {$exists: false} found one of the three that no window selects, and
+// {$not: {$type: "date"}} found all three.
 //
 // Only ever used to explain a refusal, so a rule that reads age from the _id has
 // nothing to report: every document has one. An error is reported as none,
@@ -907,7 +915,9 @@ func (w *Warmer) unagedInArchive(ctx context.Context, rule config.WarmRule) int6
 	db, coll := splitNS(rule.NS)
 	n, err := w.cold.Database(db).Collection(coll).CountDocuments(ctx, bson.D{
 		meta.NotArchivedDeleted(),
-		{Key: rule.DateField, Value: bson.D{{Key: "$exists", Value: false}}},
+		{Key: rule.DateField, Value: bson.D{
+			{Key: "$not", Value: bson.D{{Key: "$type", Value: "date"}}},
+		}},
 	})
 	if err != nil {
 		return 0
