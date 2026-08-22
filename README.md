@@ -242,6 +242,23 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A sorted `findAndModify` acts on the document the sort really names.** The
+  sort is how you say which of several matches you mean, and the fast tier can
+  only choose from the part it holds. The repair paths for a write that matched
+  nothing do not apply here, because something did match: the fast tier answered
+  with the first of its own share, and reported one document matched and one
+  modified, which is true and is the wrong document.
+
+  Measured on an archive holding seq 1, 2 and 3 with only 2 and 3 on the fast
+  tier: `findOneAndUpdate({}, ..., {sort: {seq: 1}})` modified seq 2, and
+  `findOneAndDelete` with the same sort deleted seq 2. Now the archive is asked
+  which document that sort names, and it is brought up before the write runs.
+  Before, not after: by the time a reply could be inspected the update has been
+  applied to the wrong document and there is no taking it back.
+
+  A `findAndModify` with no sort is untouched, because MongoDB itself promises
+  only that some matching document is acted on, so the fast tier's choice is as
+  good as the archive's. `update` and `delete` statements carry no sort.
 - **Dropping a unique index reaches both tiers.** Uniqueness across the tiers is
   enforced from the fast tier's indexes, so once one is dropped there the router
   accepts a value the archive still refuses. The feeder cannot mirror that

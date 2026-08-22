@@ -50,6 +50,8 @@ feeder:
     # testddl.sh: the collection that may not be made capped or time series.
     - "shop.tddlcap"
     - "shop.tddlcap2"
+    # testsingle.sh: the collection a sorted findAndModify picks from.
+    - "shop.tssort"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.

@@ -740,6 +740,17 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// A sorted findAndModify picks one of several matches, and the fast tier
+	// can only pick from the part it holds. Also before the write: by the time
+	// a reply could be inspected the update has been applied to the wrong
+	// document.
+	if nameErr == nil && !msg.MoreToCome() &&
+		(name == "findAndModify" || name == "findandmodify") {
+		if out, done := c.guardSortedFindAndModify(ctx, msg, db); done {
+			return c.answer(msg, out)
+		}
+	}
+
 	// An upsert that matches nothing does not wait to be put right on the way
 	// back: it creates a document in place of the archived one and the feeder
 	// then mirrors that over the archive. So it too is judged before it runs.

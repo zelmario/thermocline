@@ -133,6 +133,51 @@ echo "== and an insert of an id nobody holds still works =="
 chk "a fresh id is accepted"                            "1" \
     "$(R "db.getSiblingDB(process.env.TC_DB).tsins.insertOne({_id:10, name:'erin'}); print(db.getSiblingDB(process.env.TC_DB).tsins.countDocuments({_id:10}))")"
 
+echo "== a sort says which of several matches the caller means =="
+# The two paths above repair a write that matched nothing: the fast tier applied
+# nothing, so the statement can be run again once the document is here. A sorted
+# findAndModify that matched *something* reaches neither. The fast tier answers
+# with the first of the part it happens to hold, and that is a different
+# document from the one the caller asked for.
+#
+# Measured: an archive holding seq 1, 2 and 3 with only 2 and 3 on the fast
+# tier. findOneAndUpdate({}, ..., {sort:{seq:1}}) modified seq 2 and reported
+# it, and findOneAndDelete with the same sort deleted seq 2. One document
+# matched, one was modified, and the count was right.
+SNS=tssort
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany([{_id:1,seq:1,who:'oldest'},{_id:2,seq:2,who:'middle'},{_id:3,seq:3,who:'newest'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany([{_id:2,seq:2,who:'middle'},{_id:3,seq:3,who:'newest'}])" >/dev/null
+chk "the fast tier holds the recent two only"          "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({}))")"
+# The control, and the whole standard: whatever the archive would pick on its
+# own is the right answer, because the archive holds the collection.
+chk "the archive would pick the oldest"                "oldest" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$SNS.find({}).sort({seq:1}).limit(1).toArray()[0].who)")"
+chk "and so does a sorted findOneAndUpdate"            "oldest" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOneAndUpdate({},{\$set:{marked:true}},{sort:{seq:1}}); print(d?d.who:'null')")"
+chk "the document it marked is that one"               "oldest" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOne({marked:true}); print(d?d.who:'none')")"
+chk "and only one was marked"                          "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({marked:true}))")"
+chk "a sorted findOneAndDelete takes the oldest too"   "oldest" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOneAndDelete({},{sort:{seq:1}}); print(d?d.who:'null')")"
+sleep 5
+chk "and the archive recorded that deletion"           "true" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOne({who:'oldest'}); print(!!(d && d._tcDeletedAt))")"
+# The other direction of the same sort, which the fast tier would have got right
+# on its own. It must still be right, or the fix is just a different wrong one.
+chk "sorting the other way takes the newest"           "newest" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOneAndUpdate({},{\$set:{last:true}},{sort:{seq:-1}}); print(d?d.who:'null')")"
+# And a findAndModify with no sort is untouched: MongoDB promises any match, so
+# the fast tier's answer is as good as the archive's and no archive lookup is
+# owed for it.
+chk "an unsorted one still answers from the fast tier" "true" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOneAndUpdate({seq:{\$gte:0}},{\$set:{any:true}}); print(d!==null)")"
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"
