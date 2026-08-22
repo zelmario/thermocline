@@ -89,11 +89,14 @@ evictor:
     - ns: "probe.tiered"
       older_than: 1m
 # The warmer validates its own config before it connects, so without a rule it
-# stops on that and never reaches the question this suite is asking.
+# stops on that and never reaches the question this suite is asking. The window
+# matches the eviction cutoff for the same reason: a warm reaching past it is
+# refused, and this suite would then report that refusal instead of the one it
+# is asking about.
 warmer:
   rules:
     - ns: "probe.tiered"
-      back: 1h
+      back: 1m
 router:
   listen: "127.0.0.1:27750"
   dashboard: "127.0.0.1:27751"
