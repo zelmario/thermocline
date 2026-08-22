@@ -114,6 +114,23 @@ waitMirrored 2
 # a change stream has to already be open when the eviction happens. Its pid is
 # waited on by name: a bare wait here would also wait for the feeder and the
 # router, which are background jobs of this shell and never exit.
+# Wait for a watcher to say what it saw, not for a fixed number of seconds.
+#
+# Each watcher prints exactly once, at the end. Killing it on a deadline instead
+# means that under load it is killed mid-flight and the file is empty, and an
+# empty answer is not a wrong answer, it is no answer: the third watcher failed
+# a parallel sweep that way while passing every run on its own.
+awaitWatcher() { # awaitWatcher FILE PID
+  for _ in $(seq 1 240); do
+    [ -s "$1" ] && break
+    kill -0 "$2" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill "$2" 2>/dev/null
+  [ -s "$1" ] || echo "  the watcher never reported, so the check below is about the fixture" >&2
+  tail -1 "$1" 2>/dev/null
+}
+
 rm -f /tmp/cs_events.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
   const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
@@ -124,9 +141,7 @@ mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --e
 WATCHER=$!
 sleep 3
 cline evictor --config $CFG --once >/dev/null 2>&1
-for _ in $(seq 1 40); do kill -0 $WATCHER 2>/dev/null || break; sleep 0.5; done
-kill $WATCHER 2>/dev/null
-EVENTS=$(tail -1 /tmp/cs_events.txt 2>/dev/null)
+EVENTS=$(awaitWatcher /tmp/cs_events.txt $WATCHER)
 LEFT=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
 echo "  the fast tier now holds $LEFT of 2, the watcher saw: ${EVENTS:-nothing}"
 # An error is not an answer. Without this, a build that refuses change streams
@@ -151,9 +166,7 @@ WATCHER2=$!
 sleep 3
 # A point lookup of the evicted document copies it back up.
 R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')})" >/dev/null
-for _ in $(seq 1 40); do kill -0 $WATCHER2 2>/dev/null || break; sleep 0.5; done
-kill $WATCHER2 2>/dev/null
-EVENTS2=$(tail -1 /tmp/cs_events2.txt 2>/dev/null)
+EVENTS2=$(awaitWatcher /tmp/cs_events2.txt $WATCHER2)
 echo "  after the copy-up the watcher saw: ${EVENTS2:-nothing}"
 chk "the second watcher was actually watching"         "true" \
     "$(echo "${EVENTS2:-none}" | grep -qi "error\|refus" && echo false || echo true)"
@@ -196,9 +209,7 @@ done
 stopFeeder
 H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID')})" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
-for _ in $(seq 1 60); do kill -0 $WATCHER3 2>/dev/null || break; sleep 0.5; done
-kill $WATCHER3 2>/dev/null
-LOOKUP=$(tail -1 /tmp/cs_events3.txt 2>/dev/null)
+LOOKUP=$(awaitWatcher /tmp/cs_events3.txt $WATCHER3)
 echo "  the watcher saw: ${LOOKUP:-nothing}"
 chk "a lookup is answered from the archive"            "HAS looked up" "$LOOKUP"
 startFeeder
