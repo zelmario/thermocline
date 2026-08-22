@@ -11,7 +11,6 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // The fast tier is filled by copying documents, and an index is not a document,
@@ -148,25 +147,67 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 		}
 	}
 
-	var build []mongo.IndexModel
+	var build []bson.D
 	var names []string
 	for _, idx := range want {
 		if have[idx.name] {
 			continue
 		}
-		build = append(build, idx.model())
+		build = append(build, idx.spec)
 		names = append(names, idx.name)
 	}
 	if len(build) == 0 {
 		return nil
 	}
-	if _, err := hotColl.Indexes().CreateMany(ctx, build); err != nil {
-		return err
+	if err := ix.createIndexes(ctx, db, coll, build); err == nil {
+		ix.log.Info("built the archive's indexes on the fast tier",
+			"ns", ns, "indexes", names,
+			"why", "the fast tier is filled with documents and an index is not a document")
+		return nil
+	} else {
+		// One at a time, because createIndexes is one command for the whole
+		// batch and MongoDB refuses the batch for one bad member. That is how a
+		// single text index left an adopted collection holding _id_ and nothing
+		// else: the indexes beside it were never the problem and were refused
+		// with it.
+		ix.log.Warn("could not build the archive's indexes in one batch, trying them separately",
+			"ns", ns, "err", err)
 	}
-	ix.log.Info("built the archive's indexes on the fast tier",
-		"ns", ns, "indexes", names,
-		"why", "the fast tier is filled with documents and an index is not a document")
-	return nil
+
+	var built []string
+	var failed error
+	for i, spec := range build {
+		if err := ix.createIndexes(ctx, db, coll, []bson.D{spec}); err != nil {
+			ix.log.Warn("could not build one of the archive's indexes on the fast tier",
+				"ns", ns, "index", names[i], "err", err,
+				"effect", "the fast tier scans for reads this index would have served")
+			failed = err
+			continue
+		}
+		built = append(built, names[i])
+	}
+	if len(built) > 0 {
+		ix.log.Info("built the archive's indexes on the fast tier",
+			"ns", ns, "indexes", built,
+			"why", "the fast tier is filled with documents and an index is not a document")
+	}
+	return failed
+}
+
+// createIndexes sends the archive's own index specifications to the fast tier.
+//
+// A command rather than the driver's IndexModel, so the specification arrives
+// as the archive wrote it. Building a model means naming every option worth
+// carrying, and the ones nobody named are the ones that broke this.
+func (ix *Indexer) createIndexes(ctx context.Context, db, coll string, specs []bson.D) error {
+	list := make(bson.A, len(specs))
+	for i, s := range specs {
+		list[i] = s
+	}
+	return ix.hot.Database(db).RunCommand(ctx, bson.D{
+		{Key: "createIndexes", Value: coll},
+		{Key: "indexes", Value: list},
+	}).Err()
 }
 
 // createWithOptions makes the fast tier's copy of a collection the way the
@@ -291,39 +332,34 @@ func splitNS(ns string) (string, string) {
 	return db, coll
 }
 
-// archiveIndex is one index as the archive defines it.
+// archiveIndex is one index as the archive defines it, carried whole.
+//
+// The spec is the archive's own listIndexes document with the two fields the
+// server owns taken out, rather than a set of options read back off it. Reading
+// a set means every option outside that set is dropped, and the index that
+// arrives on the fast tier is a different index with the same name.
+//
+// Measured, and this is what it costs. An adopted collection with a text index
+// on {title, body} and weights {title: 10, body: 1}: the copy went out carrying
+// the key the archive reports for a text index and no weights, and MongoDB
+// refused it with "text index option 'weights' must specify fields or the
+// wildcard". createIndexes is one command for the whole batch, so the wildcard
+// index and an ordinary index on {a: 1} in the same collection were refused
+// with it, and the fast tier ended up holding _id_ and nothing else. Ensure
+// retried every minute and failed the same way every time. One text index in an
+// adopted collection meant the tier that exists to be fast scanned everything,
+// for ever, and the only sign was a warning in a log.
+//
+// A wildcard index lost its projection the same way, which is quieter and not
+// better: {"$**": 1} with wildcardProjection {a: 1, b: 1} indexes two fields,
+// and the same key with no projection indexes every field of every document.
+// That one builds, so nothing says anything.
 type archiveIndex struct {
-	name    string
-	keys    bson.Raw
-	unique  bool
-	sparse  bool
-	partial bson.Raw
-	// collation decides which documents an index can answer for, so an index
-	// built without the one it was defined with answers different questions.
-	collation bson.Raw
-}
-
-func (a archiveIndex) model() mongo.IndexModel {
-	opts := options.Index().SetName(a.name)
-	if a.unique {
-		// Safe on the fast tier, which holds a subset of the archive: a subset
-		// of values that are unique is unique. And it is the point, because
-		// the router looks here to learn what to enforce across both tiers.
-		opts.SetUnique(true)
-	}
-	if a.sparse {
-		opts.SetSparse(true)
-	}
-	if len(a.partial) > 0 {
-		opts.SetPartialFilterExpression(a.partial)
-	}
-	if len(a.collation) > 0 {
-		var c options.Collation
-		if err := bson.Unmarshal(a.collation, &c); err == nil {
-			opts.SetCollation(&c)
-		}
-	}
-	return mongo.IndexModel{Keys: a.keys, Options: opts}
+	name string
+	spec bson.D
+	// unique is read out for the caller's benefit, because the router looks to
+	// the fast tier's unique indexes to know what to enforce across both tiers.
+	unique bool
 }
 
 // archiveIndexes lists what the archive has, minus the two kinds that must not
@@ -348,29 +384,38 @@ func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([
 
 	var out []archiveIndex
 	for cur.Next(ctx) {
-		var spec struct {
-			Name                    string   `bson:"name"`
-			Key                     bson.Raw `bson:"key"`
-			Unique                  bool     `bson:"unique"`
-			Sparse                  bool     `bson:"sparse"`
-			PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
-			Collation               bson.Raw `bson:"collation"`
-			ExpireAfterSeconds      *int32   `bson:"expireAfterSeconds"`
-		}
-		if cur.Decode(&spec) != nil || spec.Name == "_id_" || len(spec.Key) == 0 {
+		var spec bson.D
+		if err := bson.Unmarshal(cur.Current, &spec); err != nil {
 			continue
 		}
-		if spec.ExpireAfterSeconds != nil {
+		var (
+			name   string
+			unique bool
+			keyed  bool
+			ttl    bool
+			kept   = make(bson.D, 0, len(spec))
+		)
+		for _, e := range spec {
+			switch e.Key {
+			case "v", "ns":
+				// The server owns both. v is the index version it decides for
+				// itself, and ns is a legacy field it no longer accepts.
+				continue
+			case "expireAfterSeconds":
+				ttl = true
+			case "name":
+				name, _ = e.Value.(string)
+			case "key":
+				keyed = true
+			case "unique":
+				unique, _ = e.Value.(bool)
+			}
+			kept = append(kept, e)
+		}
+		if name == "_id_" || !keyed || ttl {
 			continue
 		}
-		out = append(out, archiveIndex{
-			name:      spec.Name,
-			keys:      spec.Key,
-			unique:    spec.Unique,
-			sparse:    spec.Sparse,
-			partial:   spec.PartialFilterExpression,
-			collation: spec.Collation,
-		})
+		out = append(out, archiveIndex{name: name, spec: kept, unique: unique})
 	}
 	return out, cur.Err()
 }
