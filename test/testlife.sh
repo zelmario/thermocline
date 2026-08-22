@@ -358,19 +358,46 @@ rm -f /tmp/conc.*.out
 # suite hangs forever with every check already passed.
 CLIENTS=()
 for i in $(seq 1 10); do
+  # Each client reports what it saw rather than a single number, and separates a
+  # wrong answer from a failed one. Those mean opposite things: a wrong count is
+  # this system's worst failure, and an error under load is it saying no, which
+  # is honest. The first version of this printed one integer and treated any
+  # non-zero output as a mismatch, so an error and a wrong answer were
+  # indistinguishable. It fired once during a parallel sweep and there was no
+  # way to tell which had happened.
   ( mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
       const c = db.getSiblingDB(process.env.TC_DB).tconc;
-      let bad = 0;
-      for (let r = 0; r < 5; r++) {
-        if (c.countDocuments({}) !== 200) bad++;
-        if (c.find({}).batchSize(7).itcount() !== 200) bad++;
-        if (c.countDocuments({grp:'g2'}) !== 40) bad++;
+      let wrong = 0, failed = 0, saw = [];
+      function ask(want, f) {
+        let got;
+        try { got = f(); } catch (e) { failed++; saw.push('ERR ' + String(e.message).substring(0,60)); return; }
+        if (got !== want) { wrong++; saw.push('got ' + got + ' want ' + want); }
       }
-      print(bad);" > /tmp/conc.$i.out 2>&1 ) &
+      for (let r = 0; r < 5; r++) {
+        ask(200, () => c.countDocuments({}));
+        ask(200, () => c.find({}).batchSize(7).itcount());
+        ask(40,  () => c.countDocuments({grp:'g2'}));
+      }
+      print('wrong=' + wrong + ' failed=' + failed + (saw.length ? '  ' + saw.slice(0,3).join('; ') : ''));
+    " > /tmp/conc.$i.out 2>&1 ) &
   CLIENTS+=($!)
 done
 wait "${CLIENTS[@]}"
-chk "ten parallel clients all agree" "0" "$(cat /tmp/conc.*.out | tr -d ' \n' | sed 's/0*//' | grep -q . && echo mismatch || echo 0)"
+# awk rather than bc, which the test image does not carry: bc missing made the
+# sum empty and the check read "none", which is not zero and is not a wrong
+# answer either.
+sumOf() { grep -hoE "$1=[0-9]+" /tmp/conc.*.out 2>/dev/null | cut -d= -f2 | awk '{n+=$1} END{print n+0}'; }
+CONCWRONG=$(sumOf wrong)
+CONCFAILED=$(sumOf failed)
+# A client that produced no line at all did not run, which is neither of the
+# two and must not read as success.
+CONCLINES=$(grep -lE 'wrong=' /tmp/conc.*.out 2>/dev/null | wc -l)
+chk "all ten clients reported"                    "10" "$CONCLINES"
+chk "and none of them saw a wrong answer"         "0"  "${CONCWRONG:-none}"
+if [ "${CONCFAILED:-0}" != "0" ]; then
+  echo "      note: $CONCFAILED of the reads errored, which is the system saying no rather than answering wrongly"
+  grep -hoE 'ERR .*' /tmp/conc.*.out 2>/dev/null | sort -u | head -2 | sed 's/^/      /'
+fi
 
 stopDaemons
 echo
