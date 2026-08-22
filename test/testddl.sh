@@ -217,6 +217,44 @@ H "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).customers.drop()" >/dev/null 2>&1
 
+echo "== turning a tiered collection into one the feeder cannot mirror =="
+# The feeder refuses a capped or time series namespace at startup and says why:
+# a capped collection removes its own oldest documents when it fills, nothing
+# announces those, and the archive would record them as the application
+# deleting. That check runs when the feeder starts, and nothing stopped a client
+# turning a collection into one afterwards.
+#
+# Measured on a tiered collection of 200 documents of about a kilobyte, with
+# convertToCapped to 4KB through the router. Three things happened and the
+# command reported success: the fast tier went to 4 documents immediately, the
+# feeder then refused to start at all so mirroring stopped for every namespace,
+# and once anything claimed the fast tier was complete the router answered
+# countDocuments with 4 where the archive holds 200.
+UNS=tddlcap
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$UNS.insertMany([{_id:1},{_id:2},{_id:3}])" >/dev/null
+chk "convertToCapped on a tiered collection is refused"  "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({convertToCapped:'$UNS', size:4096});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+chk "and it still holds what it held"                    "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({}))")"
+chk "and is not capped"                                  "false" \
+    "$(H "const i=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$UNS'})[0]; print(!!(i&&i.options&&i.options.capped))")"
+chk "creating it capped in the first place is refused"   "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', capped:true, size:4096});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+chk "and as a time series collection too"                "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', timeseries:{timeField:'at'}});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+# The controls. create is an ordinary command and most of what it does is fine,
+# so a guard that refuses it wholesale would be worse than the bug.
+chk "an ordinary create on a tiered name is accepted"    "accepted" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+chk "and a capped collection nothing tiers is fine"      "accepted" \
+    "$(R "db.getSiblingDB(process.env.TC_DB2).capfree.drop();
+          try{db.getSiblingDB(process.env.TC_DB2).runCommand({create:'capfree', capped:true, size:4096});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+R "db.getSiblingDB(process.env.TC_DB2).capfree.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop(); db.getSiblingDB(process.env.TC_DB).${UNS}2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop(); db.getSiblingDB(process.env.TC_DB).${UNS}2.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

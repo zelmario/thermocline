@@ -47,6 +47,9 @@ feeder:
     - "shop.tdrift"
     # testddl.sh: the collection a TTL index is refused on.
     - "shop.tddlttl"
+    # testddl.sh: the collection that may not be made capped or time series.
+    - "shop.tddlcap"
+    - "shop.tddlcap2"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.

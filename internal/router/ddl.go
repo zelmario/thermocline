@@ -51,6 +51,9 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 	case "createIndexes", "collMod":
 		return c.guardTTL(ctx, msg, cmd, db, name)
 
+	case "convertToCapped", "cloneCollectionAsCapped", "create":
+		return c.guardUnmirrorable(ctx, msg, cmd, db, name)
+
 	case "mapReduce", "mapreduce":
 		coll, ok := stringField(cmd, name)
 		if !ok {
@@ -374,4 +377,88 @@ func asksForTTL(cmd bson.Raw, name string) bool {
 		}
 	}
 	return false
+}
+
+// Turning a tiered collection into one the feeder cannot mirror.
+//
+// The feeder refuses a capped or time series namespace at startup, and says
+// why: a capped collection removes its own oldest documents when it fills and
+// nothing announces those, so the archive would tombstone the history it is
+// there to keep. That check runs when the feeder starts. Nothing stopped a
+// client turning a collection into one afterwards.
+//
+// Measured on a tiered collection holding 200 documents of about a kilobyte,
+// with convertToCapped to 4KB through the router. Three things happened and the
+// command reported success:
+//
+//   - the fast tier went from 200 documents to 4, immediately
+//   - the feeder then refused to start at all, so mirroring stopped for every
+//     namespace, not just this one
+//   - and once anything claimed the fast tier was complete, which the warmer
+//     does routinely, the router answered countDocuments with 4 where the
+//     archive holds 200
+//
+// The archive survived the conversion itself, because MongoDB rebuilds the
+// collection rather than deleting its documents one by one, and the feeder
+// ignores that. It would not survive what came next: every insert into a full
+// capped collection pushes out the oldest, and those are ordinary deletes that
+// nothing announces.
+//
+// So it is refused. create is only refused when it asks for capped or time
+// series, because create is otherwise an ordinary thing to send at a namespace
+// that already exists.
+func (c *conn) guardUnmirrorable(ctx context.Context, msg *wire.Message, cmd bson.Raw, db, name string) (*wire.Message, bool) {
+	coll, kind, ok := unmirrorableTarget(cmd, name)
+	if !ok {
+		return nil, false
+	}
+	ns := db + "." + coll
+	if _, _, tiered := c.r.tieredBase(ctx, ns); !tiered {
+		return nil, false
+	}
+
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a command that would make a tiered collection unmirrorable",
+		"ns", ns, "command", name, "kind", kind)
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing to make "+ns+" "+kind+", because the feeder cannot mirror one. "+
+			"A capped collection removes its own oldest documents when it fills and nothing "+
+			"announces those, so the archive would record them as deletions and lose the history "+
+			"it is there to keep; a time series collection keeps its documents in a system bucket "+
+			"collection, which is not what the change stream describes. The fast tier would also "+
+			"be truncated the moment this ran, and it holds documents the archive is still "+
+			"waiting for.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// unmirrorableTarget names the collection a command would make unmirrorable,
+// and what it would become.
+func unmirrorableTarget(cmd bson.Raw, name string) (coll, kind string, ok bool) {
+	switch name {
+	case "convertToCapped":
+		if v, vok := stringField(cmd, "convertToCapped"); vok {
+			return v, "a capped collection", true
+		}
+	case "cloneCollectionAsCapped":
+		// The target is the new collection, not the one being read.
+		if v, vok := stringField(cmd, "toCollection"); vok {
+			return v, "a capped collection", true
+		}
+	case "create":
+		v, vok := stringField(cmd, "create")
+		if !vok {
+			return "", "", false
+		}
+		if capped, cok := cmd.Lookup("capped").BooleanOK(); cok && capped {
+			return v, "a capped collection", true
+		}
+		if _, terr := cmd.LookupErr("timeseries"); terr == nil {
+			return v, "a time series collection", true
+		}
+	}
+	return "", "", false
 }

@@ -242,6 +242,23 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A tiered collection cannot be turned into one the feeder cannot mirror.**
+  `convertToCapped`, `cloneCollectionAsCapped`, and `create` asking for `capped`
+  or `timeseries` are refused on a tiered namespace. The feeder already refuses
+  such a namespace at startup, because a capped collection removes its own
+  oldest documents when it fills and nothing announces those, so the archive
+  would record them as your application deleting; that check runs when the
+  feeder starts, and nothing stopped a client doing it afterwards.
+
+  Measured on a tiered collection of 200 documents of about a kilobyte, with
+  `convertToCapped` to 4KB through the router. Three things happened and the
+  command reported success: the fast tier went to 4 documents immediately, the
+  feeder then refused to start at all so mirroring stopped for every namespace,
+  and once anything claimed the fast tier was complete the router answered
+  `countDocuments` with 4 where the archive holds 200.
+
+  A collection nothing tiers may still be capped or a time series collection,
+  and an ordinary `create` on a tiered name is untouched.
 - **A TTL index on a tiered collection is refused.** It would do the opposite of
   what it says. The command reaches the fast tier, which holds only the recent
   part of the collection, so the index expires the documents that were recent
