@@ -125,8 +125,27 @@ chk "stats().count"             "$TRUTH" "$(R "print(db.getSiblingDB(process.env
 # And the other half: bytes on disk are a per-tier fact, so they must still be
 # the fast tier's. Adding two clusters' compressed sizes together would produce
 # a number describing nothing, and an operator sizing a fast tier reads this one.
+#
+# Let it settle first. Every read above that fell through copied documents up,
+# and those land asynchronously, so storageSize is still growing while this
+# section runs. These are two separately timed measurements of a moving number:
+# under a parallel sweep a copy-up landed between them and the check reported
+# 36864 against 20480, which is the collection growing and not the router
+# changing anything. Alone it passed every time, which is the worst kind of
+# flake.
+settledStorage() {
+  local a b
+  a=$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
+  for _ in $(seq 1 20); do
+    sleep 1
+    b=$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
+    [ "$a" = "$b" ] && break
+    a=$b
+  done
+  echo "$a"
+}
 chk "storage still describes the fast tier" \
-    "$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")" \
+    "$(settledStorage)" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")"
 
 echo "== write paths, with the fast tier still short =="
