@@ -1361,6 +1361,19 @@ a query that says `at >= T`; it cannot cover `find({customer: X})`, because that
 reaches arbitrarily far back and no boundary is far enough. Only a claim on all
 of history covers it.
 
+**And it covers `at >= T` only when `at` is the field the rule ages by.** A
+boundary claim is measured in one dimension, so a bound in another is not a
+bound on the same thing. `find({shippedAt: {$gte: yesterday}})` on a collection
+aged by `createdAt` reaches every order ever placed that happens to have shipped
+recently, and goes to the archive. Measured on a collection claimed complete for
+thirty days, holding a recent order on the fast tier and a two year old one in
+the archive, both shipped yesterday: before this it answered 1 where the archive
+holds 2.
+
+So a collection whose application filters on one date and whose rules age it by
+another gets no benefit from a boundary claim at all. Either age it by the field
+the application queries, or claim it complete for all of history.
+
 This is the sharpest edge in an adoption, because everything looks finished. The
 warm window is set to the age of the data, the warmer copies every document up
 and reports success, and the fast tier holds the entire collection. Measured on
