@@ -175,6 +175,16 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 		return nil, false
 	}
 
+	// Usually it is already here, and asking is much cheaper than finding out
+	// by trying. A copy-up records residency, reads the whole document out of
+	// the archive and then discovers the insert is a duplicate; this is one
+	// indexed lookup by _id. It matters because the shape that reaches this
+	// code most is a queue polled in a loop, where every poll is a sorted
+	// findAndModify against the same collection.
+	if c.r.fastTierHolds(ctx, ns, id) {
+		return nil, false
+	}
+
 	copied, cerr := c.r.copyUp(ctx, ns, id)
 	if cerr != nil {
 		c.log.Warn("could not bring up the document this sort means, so the fast tier's answer stands",
@@ -203,4 +213,17 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	}
 	c.log.Debug("brought up the document a sorted findAndModify names", "ns", ns)
 	return nil, false
+}
+
+// fastTierHolds reports whether the fast tier already has this document.
+//
+// Only ever used to skip work. A false answer costs a copy-up that turns out to
+// be unnecessary, which is what would have happened anyway, so an error here is
+// reported as "not held" and the caller carries on.
+func (r *Router) fastTierHolds(ctx context.Context, ns string, id bson.RawValue) bool {
+	db, coll := splitNS(ns)
+	err := r.hot.Database(db).Collection(coll).
+		FindOne(ctx, bson.D{{Key: "_id", Value: id}},
+			options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+	return err == nil
 }
