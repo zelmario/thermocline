@@ -136,10 +136,15 @@ func (c *conn) identity() string {
 	if c.grants != nil && c.grants.User != "" {
 		return "user:" + c.grants.User
 	}
-	// Authentication is proxied, so the fast tier knows who this is and this
-	// router does not. One connection is one authenticated client, so the
-	// connection is the identity, and the cache helps a client that repeats
-	// itself rather than clients that resemble each other.
+	// Authentication is proxied, so the fast tier decided who this is. It
+	// decided in a conversation that came through here, and it said yes, so the
+	// name is as good as the one terminate_auth produces. See observeauth.go.
+	if c.observedUser != "" {
+		return "user:" + c.observedUser
+	}
+	// Nobody has authenticated, or by a mechanism whose name this cannot read.
+	// One connection is then one client, which is narrower than it needs to be
+	// and never wrong.
 	return "conn:" + strconv.FormatUint(c.id, 10)
 }
 

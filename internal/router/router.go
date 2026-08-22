@@ -443,6 +443,12 @@ type conn struct {
 	// until the reply says whether it did. See finishIndexDrop.
 	indexDrop *pendingIndexDrop
 
+	// observedUser is who the fast tier accepted on this connection while
+	// authentication is proxied, and observedPending is who is mid-handshake.
+	// See observeauth.go.
+	observedUser    string
+	observedPending string
+
 	// id identifies this connection, which is the identity a cached answer is
 	// keyed by while authentication is proxied and the user is unknown here.
 	id uint64
@@ -713,6 +719,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// Who this connection is, while authentication is proxied. Read on the way
+	// past, believed only once the fast tier has accepted it. See
+	// observeauth.go.
+	if nameErr == nil && !c.r.cfg.TerminateAuth && !msg.MoreToCome() {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			c.noteProxiedAuth(name, cmd)
+		}
+	}
+
 	// Which unique indexes a dropIndexes would remove has to be read before the
 	// fast tier removes them, because afterwards there is nothing left to ask.
 	if nameErr == nil && !msg.MoreToCome() && name == "dropIndexes" {
@@ -961,6 +976,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// A collection's collation is fixed at creation, so the only way it
 			// changes is a drop and a recreate, which comes through here.
 			c.r.forgetCollation(db + "." + coll)
+		}
+	}
+
+	// And the fast tier's answer to it, before replyHello answers a handshake
+	// and returns.
+	if !c.r.cfg.TerminateAuth && c.observedPending != "" {
+		if rdoc, derr := reply.ReplyDoc(); derr == nil {
+			c.confirmProxiedAuth(name, rdoc)
 		}
 	}
 
