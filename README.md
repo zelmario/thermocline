@@ -230,6 +230,13 @@ Range queries are governed by the watermark below.
   with MongoDB's ordinary authentication failure and nothing connects that to
   the tier missing the account. It says which ones, once, at startup.
 
+  It also names a cluster-wide read or write concern default the archive has and
+  the fast tier does not. `setDefaultRWConcern` is a decision about durability
+  and about what a read may see, made once and then never mentioned again by the
+  application, and reads and writes through the router are served by the fast
+  tier. So an old cluster answering at majority answers at local through the
+  router, and the application asked for neither.
+
   Roles come first in that list because they come first in the fix. Creating an
   account with a custom role the fast tier does not have is refused with "Could
   not find role", so an application with its own role is one whose every account

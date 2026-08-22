@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -439,6 +440,115 @@ func (r *Router) warnAboutMissingRoles(ctx context.Context) {
 		"meaning", "creating the application's accounts on the fast tier fails while these are "+
 			"missing, because an account cannot be given a role that does not exist there",
 		"action", "create these first, with the same privileges, then the accounts that hold them")
+}
+
+// warnAboutDefaultConcerns says so when the archive carries a cluster-wide read
+// or write concern default that the fast tier does not.
+//
+// setDefaultRWConcern is a decision about durability and about what a read is
+// allowed to see, made once for a whole cluster and then never mentioned again
+// by the application: a driver that names no concern gets the cluster's. The
+// fast tier is a new replica set and has only MongoDB's implicit defaults, and
+// writes and reads through the router are served there.
+//
+// So an application whose old cluster answered reads at majority reads at local
+// through the router, and sees writes that a rollback can still take away. It
+// asked for neither and nothing tells it.
+//
+// Only an explicitly set default counts. Every server reports implicit ones, and
+// comparing those would fire on a pair that agrees about everything anybody
+// chose.
+func (r *Router) warnAboutDefaultConcerns(ctx context.Context) {
+	cold, cerr := defaultConcerns(ctx, r.cold)
+	if cerr != nil {
+		r.log.Debug("could not read the archive's default concerns to compare them", "err", cerr)
+		return
+	}
+	hot, herr := defaultConcerns(ctx, r.hot)
+	if herr != nil {
+		r.log.Debug("could not read the fast tier's default concerns to compare them", "err", herr)
+		return
+	}
+
+	for _, d := range []struct{ kind, coldSet, coldVal, hotVal string }{
+		{"write", cold.writeSource, cold.write, hot.write},
+		{"read", cold.readSource, cold.read, hot.read},
+	} {
+		if d.coldSet != "global" || d.coldVal == d.hotVal {
+			continue
+		}
+		r.log.Warn("the archive has a cluster-wide default the fast tier does not",
+			"concern", d.kind, "archive", d.coldVal, "fast_tier", d.hotVal,
+			"meaning", "a client that names no "+d.kind+" concern gets the fast tier's, so this "+
+				"changed on the day the application was pointed at the router",
+			"action", "run setDefaultRWConcern on the fast tier with the same values")
+	}
+}
+
+type tierConcerns struct {
+	write, read             string
+	writeSource, readSource string
+}
+
+// defaultConcerns reads one tier's cluster-wide defaults, as text, because the
+// only thing done with them is comparing and printing.
+func defaultConcerns(ctx context.Context, client *mongo.Client) (tierConcerns, error) {
+	var raw bson.Raw
+	err := client.Database("admin").
+		RunCommand(ctx, bson.D{{Key: "getDefaultRWConcern", Value: 1}}).Decode(&raw)
+	if err != nil {
+		return tierConcerns{}, err
+	}
+	out := tierConcerns{write: "unset", read: "unset"}
+	if v, lerr := raw.LookupErr("defaultWriteConcern"); lerr == nil {
+		out.write = writeConcernText(v)
+	}
+	if v, lerr := raw.LookupErr("defaultReadConcern"); lerr == nil {
+		if doc, ok := v.DocumentOK(); ok {
+			if lv, lerr := doc.LookupErr("level"); lerr == nil {
+				out.read, _ = lv.StringValueOK()
+			}
+		}
+	}
+	if v, lerr := raw.LookupErr("defaultWriteConcernSource"); lerr == nil {
+		out.writeSource, _ = v.StringValueOK()
+	}
+	if v, lerr := raw.LookupErr("defaultReadConcernSource"); lerr == nil {
+		out.readSource, _ = v.StringValueOK()
+	}
+	return out, nil
+}
+
+// writeConcernText renders a write concern the way it is written in a config,
+// rather than as the extended JSON the server reports. An operator reading this
+// warning is about to retype it.
+func writeConcernText(v bson.RawValue) string {
+	doc, ok := v.DocumentOK()
+	if !ok {
+		return v.String()
+	}
+	out := ""
+	if w, err := doc.LookupErr("w"); err == nil {
+		if s, sok := w.StringValueOK(); sok {
+			out = "w=" + s
+		} else if n, nok := intOf(w); nok {
+			out = "w=" + strconv.Itoa(n)
+		}
+	}
+	if j, err := doc.LookupErr("j"); err == nil {
+		if on, jok := j.BooleanOK(); jok && on {
+			out += " j=true"
+		}
+	}
+	if t, err := doc.LookupErr("wtimeout"); err == nil {
+		if n, nok := intOf(t); nok && n > 0 {
+			out += " wtimeout=" + strconv.Itoa(n)
+		}
+	}
+	if out == "" {
+		return v.String()
+	}
+	return out
 }
 
 // rolesIn lists role@db for every role a tier defines. Only the ones somebody

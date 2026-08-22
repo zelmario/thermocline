@@ -237,6 +237,62 @@ kill $RRP 2>/dev/null; wait $RRP 2>/dev/null
 C "try{db.getSiblingDB('admin').dropUser('roleuser')}catch(e){}
    try{db.getSiblingDB('admin').dropRole('appreader')}catch(e){}" >/dev/null 2>&1
 
+echo "== and the cluster-wide defaults nobody names in a query =="
+# setDefaultRWConcern is a decision about durability and about what a read may
+# see, made once for a whole cluster and then never mentioned again: a driver
+# that names no concern gets the cluster's. The fast tier is new and has only
+# MongoDB's implicit defaults, and reads and writes through the router are
+# served there, so an application whose old cluster answered at majority reads
+# at local through the router and sees writes a rollback can still take away.
+#
+# Both sides are set explicitly rather than one, because a global default cannot
+# be unset once it is set: "The global default write concern cannot be unset
+# once it is set". A section that relies on the fast tier having none passes on
+# a fresh cluster and then fails for ever afterwards on its own leftovers, which
+# is what the first version of this did.
+C "db.getSiblingDB('admin').runCommand({setDefaultRWConcern:1, defaultWriteConcern:{w:2}, defaultReadConcern:{level:'majority'}})" >/dev/null 2>&1
+H "db.getSiblingDB('admin').runCommand({setDefaultRWConcern:1, defaultWriteConcern:{w:1}, defaultReadConcern:{level:'local'}})" >/dev/null 2>&1
+chk "the archive carries an explicit default"     "global" \
+    "$(C "print(db.getSiblingDB('admin').runCommand({getDefaultRWConcern:1}).defaultReadConcernSource)")"
+chk "and the two tiers disagree about it"         "majority/local" \
+    "$(C "print(db.getSiblingDB('admin').runCommand({getDefaultRWConcern:1}).defaultReadConcern.level)")/$(H "print(db.getSiblingDB('admin').runCommand({getDefaultRWConcern:1}).defaultReadConcern.level)")"
+stopDaemons
+rm -f $LOGDIR/auth_rw.log
+startFeeder
+cline router --config $CFG --log-file $LOGDIR/auth_rw.log & RWP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the router names the read concern"           "true" \
+    "$(grep -qE 'concern=read archive=majority fast_tier=local' $LOGDIR/auth_rw.log && echo true || echo false)"
+chk "and the write concern, as it is written"     "true" \
+    "$(grep -qE 'concern=write archive="?w=2' $LOGDIR/auth_rw.log && echo true || echo false)"
+kill $RWP 2>/dev/null; wait $RWP 2>/dev/null
+# Then do what the warning says, and check it stops. A warning that keeps firing
+# after the fix is worth less than none.
+H "db.getSiblingDB('admin').runCommand({setDefaultRWConcern:1, defaultWriteConcern:{w:2}, defaultReadConcern:{level:'majority'}})" >/dev/null 2>&1
+rm -f $LOGDIR/auth_rw2.log
+cline router --config $CFG --log-file $LOGDIR/auth_rw2.log & RWQ=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "and says nothing once they match"            "0" \
+    "$(grep -c 'cluster-wide default' $LOGDIR/auth_rw2.log || true)"
+kill $RWQ 2>/dev/null; wait $RWQ 2>/dev/null
+# Both back to reading at local, because this cannot be undone and every other
+# suite runs against the same cluster. A default of majority is not wrong, it is
+# slower and it can answer with an older document, and a suite that reads back
+# what it just wrote would start failing for a reason belonging to this section.
+# The write concern stays matched at w:2, which is what a three member set
+# resolves majority to anyway.
+for U in "$COLD" "$HOT"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('admin').runCommand({setDefaultRWConcern:1, defaultReadConcern:{level:'local'}})" >/dev/null 2>&1
+done
+chk "the read concern is back to local on both"  "local/local" \
+    "$(C "print(db.getSiblingDB('admin').runCommand({getDefaultRWConcern:1}).defaultReadConcern.level)")/$(H "print(db.getSiblingDB('admin').runCommand({getDefaultRWConcern:1}).defaultReadConcern.level)")"
+
 H "db.getSiblingDB('admin').dropUser('limited')" >/dev/null 2>&1
 stopDaemons
 echo
