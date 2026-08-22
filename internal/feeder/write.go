@@ -357,6 +357,20 @@ const duplicateKey = 11000
 // writeBatch mirrors one namespace's batch, repairing the one failure it can
 // repair rather than retrying it for ever.
 //
+// Document validation is bypassed here, and that is not a shortcut. A validator
+// is a rule about what the application may write, and the fast tier applied it
+// when the application wrote. What arrives here is a copy of a document that
+// already exists, plus the tombstone this project adds to record a deletion,
+// and a schema was never written with that field in mind.
+//
+// Measured on a tiered collection whose validator was an ordinary $jsonSchema
+// with additionalProperties: false. The first delete of a document in it made
+// the archive refuse the tombstone, the batch never succeeded, and the feeder
+// reopened its change stream on the same event fifteen times in a few seconds.
+// Mirroring stopped for every namespace behind it: a write to another
+// collection made afterwards never reached the archive at all. One ordinary
+// delete, and the archive stops receiving anything.
+//
 // A document already at the limit has no room for the tombstone field, so
 // marking it deleted fails. Left alone that is two failures at once: the
 // archive keeps a live copy of a document the application deleted, and a later
@@ -388,7 +402,8 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 	// One repair per pass therefore makes progress; the bound is the batch
 	// itself, so a failure this does not understand still surfaces.
 	for attempt := 0; attempt <= len(models); attempt++ {
-		res, err := c.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(true))
+		res, err := c.BulkWrite(ctx, models,
+			options.BulkWrite().SetOrdered(true).SetBypassDocumentValidation(true))
 		if err == nil {
 			return res, nil
 		}
@@ -418,7 +433,8 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 			"reason", "the document is at the 16MB limit and the tombstone field does not fit",
 			"effect", "the archive keeps the deletion but not the document it stood for",
 			"why", "leaving it unmarked would return a deleted document to a later read, and stop all mirroring")
-		if _, rerr := c.ReplaceOne(ctx, op.key, meta.MinimalTombstone(op.id, now)); rerr != nil {
+		if _, rerr := c.ReplaceOne(ctx, op.key, meta.MinimalTombstone(op.id, now),
+			options.Replace().SetBypassDocumentValidation(true)); rerr != nil {
 			return nil, fmt.Errorf("replace oversized tombstone: %w", rerr)
 		}
 	}

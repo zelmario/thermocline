@@ -389,6 +389,57 @@ chk "and still refuses what the validator refuses" "refused" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+echo "== a validator must not be applied to what moves between the tiers =="
+# A validator is a rule about what the application may write, and the fast tier
+# applies it when the application writes. What reaches the archive afterwards is
+# a copy of a document that already exists, plus the tombstone this project adds
+# to record a deletion, and no schema was written with that field in mind.
+#
+# Measured with an ordinary $jsonSchema carrying additionalProperties: false.
+# The first delete of a document in the collection made the archive refuse the
+# tombstone, the batch never succeeded, and the feeder reopened its change
+# stream on the same event fifteen times in a few seconds. Mirroring stopped for
+# every namespace behind it: a write to another collection afterwards never
+# reached the archive at all. One ordinary delete, and the archive stops
+# receiving anything.
+VNS=tval
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
+VSCHEMA="{validator:{\$jsonSchema:{bsonType:'object',required:['_id','name'],properties:{_id:{bsonType:'int'},name:{bsonType:'string'}},additionalProperties:false}}}"
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$VNS', $VSCHEMA)" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$VNS', $VSCHEMA)" >/dev/null
+# The control: the archive really would refuse a tombstone on its own.
+chk "the archive's validator refuses an extra field" "refused" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).$VNS;
+          c.insertOne({_id:1,name:'ann'});
+          let r;
+          try{c.updateOne({_id:1},{\$set:{_tcDeletedAt:new Date()}});r='ACCEPTED'}catch(e){r='refused'}
+          c.deleteMany({});
+          print(r)")"
+startFeeder
+H "db.getSiblingDB(process.env.TC_DB).$VNS.insertOne({_id:1,name:'ann'})" >/dev/null
+for _ in $(seq 1 20); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$VNS.countDocuments({}))")" = "1" ] && break
+  sleep 0.5
+done
+chk "the insert reached the archive"              "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$VNS.countDocuments({}))")"
+H "db.getSiblingDB(process.env.TC_DB).$VNS.deleteOne({_id:1})" >/dev/null
+sleep 6
+chk "and the deletion was recorded as a tombstone" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$VNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+# The consequence that makes this worth a check of its own: everything behind it.
+H "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId(), vprobe:'after'})" >/dev/null
+sleep 6
+chk "and mirroring is still running behind it"    "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({vprobe:'after'}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

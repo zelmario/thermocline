@@ -242,6 +242,24 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A validator applies to what your application writes, not to what moves
+  between the tiers.** The fast tier enforces it at the moment of the write, the
+  way your cluster always did. What reaches the archive afterwards is a copy of
+  a document that already exists, plus the field this project adds to record a
+  deletion, so document validation is bypassed on the way in. The same goes for
+  a document copied up to the fast tier: it is already in the archive, and a
+  validator added after it was written would otherwise keep it from ever being
+  served from the fast tier.
+
+  Measured with an ordinary `$jsonSchema` carrying `additionalProperties: false`.
+  Before this, the first delete of a document in that collection made the archive
+  refuse the tombstone, the batch never succeeded, and the feeder reopened its
+  change stream on the same event fifteen times in a few seconds. Mirroring
+  stopped for every namespace behind it, so a write to an unrelated collection
+  never reached the archive at all.
+
+  The feeder's account therefore needs `bypassDocumentValidation` on the archive.
+  `dbOwner`, `readWrite` and `root` all carry it.
 - **The catalog names the tiered collections the fast tier does not hold.**
   `listCollections` and `listDatabases` are answered by the fast tier, because
   that is where your collections live and where your writes go. For a tiered

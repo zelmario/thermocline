@@ -40,8 +40,16 @@ import (
 
 // One inserts a single document unless the fast tier already holds it, and
 // reports whether this call is what put it there.
+//
+// Validation is bypassed for the same reason the feeder bypasses it going the
+// other way: a validator is a rule about what the application may write, and
+// this is not the application writing. It is a document the archive already
+// holds being placed where a read can reach it faster. Refusing it here would
+// mean a collection whose validator was added after some of its documents were
+// written could never serve those documents from the fast tier, and every read
+// of one would fall through to the archive for ever.
 func One(ctx context.Context, coll *mongo.Collection, doc bson.Raw) (bool, error) {
-	_, err := coll.InsertOne(ctx, doc)
+	_, err := coll.InsertOne(ctx, doc, options.InsertOne().SetBypassDocumentValidation(true))
 	if err == nil {
 		return true, nil
 	}
@@ -76,7 +84,8 @@ func Many(ctx context.Context, coll *mongo.Collection, docs []bson.Raw) (int, []
 	}
 	// Unordered, so one document the fast tier already holds does not stop the
 	// rest from being moved.
-	res, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	res, err := coll.BulkWrite(ctx, models,
+		options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true))
 	inserted := 0
 	if res != nil {
 		inserted = int(res.InsertedCount)
