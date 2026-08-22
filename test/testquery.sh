@@ -291,6 +291,20 @@ chk "a bound on createdAt answers like the archive too" \
 chk "and an unbounded query does as well"        \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")"
+# $and is how an ORM writes a filter, and every branch of one holds, so a bound
+# in any branch bounds the whole query. Without this it read as unbounded and
+# went to the archive however complete the fast tier was.
+chk "a bound inside \$and answers like the archive" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{n:{\$exists:true}},{createdAt:{\$gte:new Date('$TWODAY')}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{n:{\$exists:true}},{createdAt:{\$gte:new Date('$TWODAY')}}]}))")"
+# And the ones that must not be read as bounds. $or is satisfied by a branch
+# carrying none, so the query reaches as far back as that branch does.
+chk "a bound inside \$or answers like the archive"  \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{n:{\$exists:true}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{n:{\$exists:true}}]}))")"
+chk "and one inside \$and on another field too"     \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")"
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null

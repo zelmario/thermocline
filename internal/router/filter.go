@@ -85,18 +85,50 @@ func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bo
 
 	var best time.Time
 	var found bool
-	for _, e := range elems {
-		if e.Key() != want {
-			continue
-		}
-		t, ok := boundOf(e.Value())
-		if !ok {
-			continue
-		}
+	take := func(t time.Time) {
 		// The tightest bound wins: any of them being inside the complete range
 		// is enough to make the whole answer complete.
 		if !found || t.After(best) {
 			best, found = t, true
+		}
+	}
+
+	for _, e := range elems {
+		// $and means every branch holds, so a bound in any one of them bounds
+		// the whole query. Worth reading, because that is how an ORM writes a
+		// filter: {$and: [{status: "open"}, {createdAt: {$gte: T}}]} is the same
+		// query as the flat one beside it, and without this it was unbounded and
+		// went to the archive however complete the fast tier was.
+		//
+		// Only $and. $or is satisfied by a branch that carries no bound at all,
+		// $nor is about documents that do not match, and $not inverts the range
+		// rather than narrowing it. Reading a bound out of any of those would
+		// claim the query cannot reach further back than it can.
+		if e.Key() == "$and" {
+			arr, aerr := e.Value().ArrayOK()
+			if !aerr {
+				continue
+			}
+			vals, verr := arr.Values()
+			if verr != nil {
+				continue
+			}
+			for _, v := range vals {
+				doc, dok := v.DocumentOK()
+				if !dok {
+					continue
+				}
+				if t, ok := lowerTimeBound(doc, ageField, known); ok {
+					take(t)
+				}
+			}
+			continue
+		}
+		if e.Key() != want {
+			continue
+		}
+		if t, ok := boundOf(e.Value()); ok {
+			take(t)
 		}
 	}
 	return best, found

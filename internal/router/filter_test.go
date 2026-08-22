@@ -175,3 +175,59 @@ func TestLowerTimeBoundOnlyReadsTheAgeField(t *testing.T) {
 		})
 	}
 }
+
+// $and is how an ORM writes a filter, and every branch of one holds, so a bound
+// in any branch bounds the whole query.
+//
+// The others must not be read. $or is satisfied by a branch carrying no bound at
+// all, $nor is about documents that do not match, and $not inverts the range
+// rather than narrowing it: taking a bound from any of them would claim the
+// query cannot reach further back than it can, which is how a read gets
+// answered from a fast tier that does not hold it.
+func TestLowerTimeBoundUnderOperators(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	gte := func(at time.Time) bson.D {
+		return bson.D{{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: at}}}}
+	}
+
+	cases := []struct {
+		name   string
+		filter bson.D
+		want   bool
+		bound  time.Time
+	}{
+		{"a branch of $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "status", Value: "open"}}, gte(late)}}}, true, late},
+		{"the tightest branch of $and", bson.D{{Key: "$and", Value: bson.A{
+			gte(early), gte(late)}}}, true, late},
+		{"$and nested in $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "$and", Value: bson.A{gte(late)}}}}}}, true, late},
+		{"a branch of $and beside a flat bound", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: early}}},
+			{Key: "$and", Value: bson.A{gte(late)}}}, true, late},
+		{"a branch of $and on another field", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "shippedAt", Value: bson.D{{Key: "$gte", Value: late}}}}}}}, false, time.Time{}},
+
+		{"$or, where a branch may carry no bound", bson.D{{Key: "$or", Value: bson.A{
+			gte(late), bson.D{{Key: "status", Value: "open"}}}}}, false, time.Time{}},
+		{"$or, even when every branch carries one", bson.D{{Key: "$or", Value: bson.A{
+			gte(late), gte(early)}}}, false, time.Time{}},
+		{"$nor", bson.D{{Key: "$nor", Value: bson.A{gte(late)}}}, false, time.Time{}},
+		{"$not on the age field", bson.D{{Key: "createdAt", Value: bson.D{
+			{Key: "$not", Value: bson.D{{Key: "$lt", Value: late}}}}}}, false, time.Time{}},
+		{"an empty $and", bson.D{{Key: "$and", Value: bson.A{}}}, false, time.Time{}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := lowerTimeBound(rawDoc(t, c.filter), "createdAt", true)
+			if ok != c.want {
+				t.Fatalf("bounded = %v, want %v", ok, c.want)
+			}
+			if ok && !got.Equal(c.bound) {
+				t.Errorf("bound = %v, want %v", got, c.bound)
+			}
+		})
+	}
+}
