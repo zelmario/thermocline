@@ -94,6 +94,27 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 	ix.mu.Unlock()
 }
 
+// Forget clears the record that a namespace is done, so the next Ensure builds
+// it again.
+//
+// Done means the fast tier had the collection and its indexes when it was
+// asked, which stops being true if the collection is dropped there. Only a
+// caller that has seen the collection missing should call this, and the retry
+// interval is left alone so a namespace that cannot be built is still not
+// hammered.
+func (ix *Indexer) Forget(ns string) {
+	if ix == nil {
+		return
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	st := ix.state[ns]
+	if !st.done {
+		return
+	}
+	ix.state[ns] = indexState{done: false, lastTry: st.lastTry}
+}
+
 func (ix *Indexer) build(ctx context.Context, ns string) error {
 	db, coll := splitNS(ns)
 

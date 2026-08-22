@@ -36,6 +36,13 @@ feeder:
     - "shop.order_events"
     - "shop.tprobe"
     - "shop.tacct"
+    # testrouter.sh: a tiered collection deliberately left off the fast tier, to
+    # check the router still names it in the catalog and reads it.
+    - "shop.tcatalog"
+    # And the same one level up. catdb holds nothing else, so the section can
+    # drop the whole database on the fast tier without reaching a collection
+    # another suite is using.
+    - "catdb.tcatdb"
     # testkeys.sh, one collection per section: the router caches a namespace's
     # unique indexes for a minute, so a name reused with a different index is
     # still enforced under the old one.

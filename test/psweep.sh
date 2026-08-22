@@ -61,6 +61,7 @@ worker() {
   export PDASH=$((PORT + 10))
   export DB="shop_w$n"
   export DB2="wh_w$n"
+  export DB3="catdb_w$n"
   export META="_thermocline_w$n"
   # CFG is deliberately not exported. Several suites name their own config
   # (testauthterm writes a terminate_auth one, testreadprefterm its own, and

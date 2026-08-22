@@ -18,6 +18,9 @@ META=${META:-_thermocline}
 export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
 # A database with nothing tiered in it, for the section that checks it is named.
 LOSTDB=${DB}_lost; export TC_LOSTDB=$LOSTDB
+# Tiered end to end and used by nothing else, so the catalog section can drop
+# the whole database on the fast tier.
+DB3=${DB3:-catdb}; export TC_DB3=$DB3
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
@@ -339,6 +342,91 @@ for _ in $(seq 1 30); do grep -q "router listening" $LOGDIR/coldplain.log 2>/dev
 kill $CQ 2>/dev/null; wait $CQ 2>/dev/null
 chk "and stays quiet when nothing asks for it"     "0" \
     "$(grep -c 'read preference on cold.uri' $LOGDIR/coldplain.log || true)"
+
+
+echo "== a tiered collection the fast tier does not hold is still in the catalog =="
+# listCollections is answered by the fast tier. For a tiered collection that is
+# a partial view: the fast tier holds the recent part, the archive holds the
+# rest, and a read is answered from whichever has the documents. The catalog is
+# not merged that way, so a tiered collection with no copy on the fast tier is
+# reported as not existing, while reads of it work perfectly.
+#
+# That is not an exotic state, it is what an adoption starts in. Found on the
+# pilot: sample_supplies.sales answered countDocuments 5000 and findOne
+# correctly while "show collections" came back empty. Anything that finds its
+# work by asking what exists finds nothing, and it reads as data loss.
+CATNS=tcatalog
+H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+cline router --config $CFG >/dev/null 2>&1 & CATR=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+# In the archive only, which is where an unwarmed tiered collection lives.
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.insertMany([{_id:1,n:'a'},{_id:2,n:'b'},{_id:3,n:'c'}])" >/dev/null
+chk "the fast tier does not have it"               "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+# The control. Without this a listing check passes on a router that cannot read
+# it either, and says nothing about the catalog.
+chk "the router reads it anyway"                   "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CATNS.countDocuments({}))")"
+chk "and names it in the catalog"                  "true" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+chk "with a filter on the name too"                "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({listCollections:1,filter:{name:'$CATNS'}}).cursor.firstBatch.length)")"
+chk "and under nameOnly"                           "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({listCollections:1,nameOnly:true,filter:{name:'$CATNS'}}).cursor.firstBatch.length)")"
+chk "it is not listed twice once both tiers have it" "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({listCollections:1,filter:{name:'tprobe'}}).cursor.firstBatch.length)")"
+
+# Seeing the gap is also what repairs it: the router makes the collection on the
+# fast tier with the archive's options and indexes, which is what lets it be
+# asked for its stats. Bounded well past the indexer's own retry interval.
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")" = "true" ] && break
+  R "db.getSiblingDB(process.env.TC_DB).getCollectionNames()" >/dev/null 2>&1
+  sleep 3
+done
+chk "the fast tier ends up with the collection"    "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
+chk "so stats answers, and for the whole thing"    "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CATNS.stats().count)")"
+
+echo "== and a database the fast tier has no trace of =="
+# The same gap one level up, and it reads worse. A database whose tiered
+# collections are all in the archive is not in listDatabases at all, so it does
+# not show up as empty, it does not show up; and "use" it and the collections
+# and the documents are all there.
+H "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.insertMany([{_id:1},{_id:2}])" >/dev/null
+chk "the fast tier has no trace of the database"   "false" \
+    "$(H "print(db.adminCommand({listDatabases:1,nameOnly:true}).databases.some(function (d) { return d.name === process.env.TC_DB3 }))")"
+chk "the router reads it anyway"                   "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB3).tcatdb.countDocuments({}))")"
+chk "and names it in listDatabases"                "true" \
+    "$(R "print(db.adminCommand({listDatabases:1}).databases.some(function (d) { return d.name === process.env.TC_DB3 }))")"
+chk "under nameOnly as well"                       "true" \
+    "$(R "print(db.adminCommand({listDatabases:1,nameOnly:true}).databases.some(function (d) { return d.name === process.env.TC_DB3 }))")"
+chk "and it reports no size on the fast tier"      "0" \
+    "$(R "print(Number(db.adminCommand({listDatabases:1}).databases.filter(function (d) { return d.name === process.env.TC_DB3 })[0].sizeOnDisk))")"
+# The fast tier holds the bookkeeping database itself, so it is in the list
+# either way. What must not happen is the merge adding the archive's copy on top
+# of it, which would show the operator two of them.
+chk "the bookkeeping database is listed once"      "1" \
+    "$(R "print(db.adminCommand({listDatabases:1}).databases.filter(function (d) { return d.name === process.env.TC_META }).length)")"
+chk "and it is not listed twice"                   "1" \
+    "$(R "print(db.adminCommand({listDatabases:1}).databases.filter(function (d) { return d.name === process.env.TC_DB }).length)")"
+
+# An untiered collection the archive holds is a different case and must stay
+# out. Reads of it go to the fast tier and come back empty, so listing it would
+# be the lie this section removes.
+C "db.getSiblingDB(process.env.TC_LOSTDB).notiering.insertOne({_id:1})" >/dev/null
+chk "an untiered archive collection is not listed" "false" \
+    "$(R "print(db.getSiblingDB(process.env.TC_LOSTDB).getCollectionNames().indexOf('notiering') >= 0)")"
+C "db.getSiblingDB(process.env.TC_LOSTDB).notiering.drop()" >/dev/null
+kill $CATR 2>/dev/null; wait $CATR 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo

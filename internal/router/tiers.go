@@ -341,8 +341,7 @@ func (r *Router) archiveDatabases(ctx context.Context) []string {
 			"err", err)
 	}
 	for _, n := range names {
-		switch n {
-		case "admin", "local", "config", meta.DB:
+		if isSystemDatabase(n) {
 			continue
 		}
 		dbs[n] = true
@@ -610,4 +609,14 @@ func (r *Router) withdrawEcho(ctx context.Context, docIDs []string) {
 	if err != nil {
 		r.log.Warn("could not withdraw a promotion notice", "err", err)
 	}
+}
+
+// isSystemDatabase reports whether a database is the server's own or this
+// project's bookkeeping, rather than the application's.
+func isSystemDatabase(name string) bool {
+	switch name {
+	case "admin", "local", "config", meta.DB:
+		return true
+	}
+	return false
 }

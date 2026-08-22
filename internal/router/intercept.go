@@ -22,6 +22,10 @@ func (c *conn) intercept(ctx context.Context, msg *wire.Message, name, db string
 		return c.interceptWrite(ctx, msg, db, reply, "delete", "deletes", "q")
 	case "findAndModify", "findandmodify":
 		return c.interceptFindAndModify(ctx, msg, db, reply)
+	case "listDatabases":
+		return c.interceptListDatabases(ctx, msg, reply)
+	case "listCollections":
+		return c.interceptListCollections(ctx, msg, db, reply)
 	case "collStats":
 		return c.interceptCollStats(ctx, msg, db, reply)
 	case "aggregate":

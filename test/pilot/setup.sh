@@ -16,6 +16,28 @@ TIERED="sample_mflix.comments sample_supplies.sales sample_weatherdata.data samp
 
 N() { docker exec $NODE bash -c "$1"; }
 
+reset() {
+  # Put the datasets back exactly as MongoDB published them.
+  #
+  # Needed because the harnesses here write, and because a defect can leave real
+  # damage behind: the eviction notice bug tombstoned 441 documents across three
+  # collections before it was found, and a tombstoned document is hidden from
+  # every answer, so every later comparison would have started from a corrupted
+  # baseline and called it agreement.
+  #
+  # mongorestore alone does not undo that. It will not overwrite an existing
+  # _id, so the tombstoned copies would survive the restore with their mark
+  # intact. The databases have to go first.
+  echo "== dropping what is there, on both tiers =="
+  for uri in "$COLD" "$HOT"; do
+    N "mongosh '$uri' --quiet --eval '
+      db.adminCommand({listDatabases:1}).databases
+        .map(function (d) { return d.name })
+        .filter(function (n) { return /^sample_/.test(n) || n === \"_thermocline_pilot\" })
+        .forEach(function (n) { print(\"  \" + n + \": \" + JSON.stringify(db.getSiblingDB(n).dropDatabase())) })'"
+  done
+}
+
 restore() {
   echo "== stocking the archive, and only the archive =="
   if ! docker exec $NODE test -f /root/sampledata.archive; then
@@ -170,12 +192,39 @@ churn() {
   # and after are the control: without them a quiet run proves only that the
   # churn never started.
   echo "== moving documents between the tiers while a client asks =="
-  # A wide window and a residency of seconds. Without the short residency this
-  # is a no-op: a copy-up holds a document against eviction for as long as
-  # warmer.residency says, so a warm immediately followed by a sweep evicts
-  # nothing and the counts before and after are identical. That happened, and
-  # the counts are what showed it, which is why they are printed.
-  N "sed -e 's|      back: 3650d|      back: 5475d|' -e 's|  residency: 30m|  residency: 5s|' /root/pilot.yaml > /root/pilot_wide.yaml"
+  # Empty the tiered collections on the fast tier first, so the warm has work to
+  # do and the evictor has something to take away. Run against an already warmed
+  # tier this is a no-op: every document carries a residency hold from the warm
+  # that put it there, the evictor honours it, and the counts before and after
+  # come back identical while the rounds prove nothing.
+  N "mongosh '$HOT' --quiet --eval '
+    [\"sample_mflix.comments\",\"sample_supplies.sales\",\"sample_training.trips\"].forEach(function (ns) {
+      const p = ns.split(\".\"); db.getSiblingDB(p[0])[p[1]].drop();
+    })'" >/dev/null
+  N "mongosh '$COLD' --quiet --eval '
+    db.getSiblingDB(\"_thermocline_pilot\").residency.deleteMany({})'" >/dev/null
+  # And withdraw the claims by hand rather than waiting for the feeder to notice
+  # the drop. It does notice, within about a second, but this drop is scaffolding
+  # for the churn rather than the thing under test, and asking inside that second
+  # measures how fast the feeder is rather than whether the tiers agree.
+  for ns in sample_mflix.comments sample_supplies.sales sample_training.trips; do
+    N "cline watermark --config /root/pilot.yaml --ns $ns --clear" >/dev/null 2>&1
+  done
+  # Same windows as the pilot itself, and a residency of seconds.
+  #
+  # The windows have to match. A warm reaching further back than the eviction
+  # cutoff is now refused outright, because the two rules then contradict each
+  # other and take turns deciding what the fast tier claims to hold. This used
+  # a fifteen year warm against a one day cutoff and produced eighteen wrong
+  # answers, which is what led to the refusal.
+  #
+  # The short residency is what keeps documents moving inside a legal
+  # configuration: a read of an archived document copies it up and holds it
+  # against eviction for warmer.residency, so at the shipped value a sweep
+  # straight afterwards removes nothing and the counts before and after come
+  # back identical while the rounds prove nothing. That happened, which is why
+  # the counts are printed.
+  N "sed -e 's|  residency: 30m|  residency: 5s|' /root/pilot.yaml > /root/pilot_churn.yaml"
   docker cp test/pilot/churn.sh $NODE:/root/churn.sh >/dev/null
   echo "  fast tier before:"; tierCounts
   docker exec -d $NODE bash /root/churn.sh
@@ -197,6 +246,10 @@ tierCounts() {
 }
 
 case "${1:-all}" in
+  reset)   reset ;;
+  restore) restore ;;
+  copy)    copyUntiered ;;
+  start)   start ;;
   compare) compare ;;
   writes)  writes ;;
   streams) streams ;;
@@ -204,6 +257,6 @@ case "${1:-all}" in
   cache)   cache ;;
   churn)   churn ;;
   rewarm)  rewarm ;;
-  all)     restore; copyUntiered; start; compare; writes; streams; txn ;;
-  *)       echo "usage: $0 [all|compare|writes|streams|txn|cache|churn|rewarm]"; exit 2 ;;
+  all)     reset; restore; copyUntiered; start; compare; writes; streams; txn ;;
+  *)       echo "usage: $0 [all|reset|restore|copy|start|compare|writes|streams|txn|cache|churn|rewarm]"; exit 2 ;;
 esac
