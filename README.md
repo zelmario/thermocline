@@ -1304,9 +1304,24 @@ catches up, bounded again by `max_ttl`.
 documents, which is a bypass this system has had once already. With
 `terminate_auth` on that is the verified user, and answers are shared between
 that user's connections. With authentication proxied the router does not know
-who the client is, so the connection is the identity: the cache then helps an
-application that repeats itself on a connection, which is what a pooled driver
-does, and never one client with another's answer.
+who the client is, so the connection is the identity, and never one client with
+another's answer.
+
+**That costs a pooled driver almost all of it,** which is worth being plain
+about. A pool spreads repeats across its connections, so the second asking of a
+question usually lands somewhere the first was never stored. Measured with
+`test/store`, a shop of 3,000 orders read through five connections with the
+cache on: **7 shapes, 378 lookups, 0 hits.** The same run with
+`terminate_auth` on, where the identity is the user and the pool shares one
+cache: 5 hits in 378.
+
+Five is not a rounding error away from zero, it is the same answer. The cache
+serves a query repeated with the *same parameters*, and a shop asking about a
+different customer each time never repeats one. What it is for is the workload
+that does: a dashboard refreshing the same figures, a report run on a timer, a
+hot lookup every request makes with the same argument. `cline cache` ranks what
+your traffic actually repeats, and if the top of that list is thin then this
+feature is not for you. It stays off by default for that reason.
 
 ## The completeness watermark
 
