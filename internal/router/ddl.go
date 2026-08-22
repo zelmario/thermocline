@@ -48,6 +48,9 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 	case "renameCollection":
 		return c.guardRename(ctx, msg, cmd)
 
+	case "createIndexes", "collMod":
+		return c.guardTTL(ctx, msg, cmd, db, name)
+
 	case "mapReduce", "mapreduce":
 		coll, ok := stringField(cmd, name)
 		if !ok {
@@ -281,6 +284,94 @@ func isNamespaceNotFound(err error) bool {
 	var ce mongo.CommandError
 	if errors.As(err, &ce) {
 		return ce.Code == 26 // NamespaceNotFound
+	}
+	return false
+}
+
+// A TTL index on a tiered collection does the opposite of what it says.
+//
+// The fast tier holds the recent part of the collection and the archive holds
+// the rest, and this command reaches the fast tier. So the index expires the
+// documents that were recent enough to be cached, the feeder reads those
+// expiries as the application deleting them and the archive tombstones its own
+// copies, and the older documents the rule was written for are in the archive
+// where no TTL index is watching them.
+//
+// Measured on a tiered collection with five documents a minute old on both
+// tiers and five over a year old in the archive alone, asking through the
+// router for anything older than thirty seconds to expire: the five recent ones
+// were destroyed on both tiers and the five year-old ones survived. A retention
+// rule that deletes this month and keeps last year, silently, and it reported
+// success.
+//
+// So it is refused, which is the standing rule here: a refusal is a limitation,
+// a wrong answer is a bug. A collection nothing tiers is not affected, because
+// it lives on the fast tier alone and a TTL index there means exactly what it
+// says.
+//
+// The same goes for a collMod that turns an existing index into a TTL one,
+// which is the same instruction written differently.
+func (c *conn) guardTTL(ctx context.Context, msg *wire.Message, cmd bson.Raw, db, name string) (*wire.Message, bool) {
+	coll, ok := stringField(cmd, name)
+	if !ok {
+		return nil, false
+	}
+	ns := db + "." + coll
+	if _, _, tiered := c.r.tieredBase(ctx, ns); !tiered {
+		return nil, false
+	}
+	if !asksForTTL(cmd, name) {
+		return nil, false
+	}
+
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a TTL index on a tiered collection", "ns", ns, "command", name)
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing a TTL index on "+ns+", because it would delete the newest "+
+			"documents and keep the oldest. This command reaches the fast tier, which holds "+
+			"only the recent part of "+ns+": those copies would expire and be recorded as "+
+			"deletions in the archive, while the older documents the rule is written for sit "+
+			"in the archive where no TTL index is watching them. If "+ns+" really should have "+
+			"a retention rule, put the index on the archive yourself and understand that the "+
+			"archive is what keeps this data.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// asksForTTL reports whether a createIndexes or collMod would leave a TTL index
+// behind.
+func asksForTTL(cmd bson.Raw, name string) bool {
+	if name == "collMod" {
+		idx, err := cmd.LookupErr("index")
+		if err != nil {
+			return false
+		}
+		doc, ok := idx.DocumentOK()
+		if !ok {
+			return false
+		}
+		_, err = doc.LookupErr("expireAfterSeconds")
+		return err == nil
+	}
+	v, err := cmd.LookupErr("indexes")
+	if err != nil {
+		return false
+	}
+	specs, err := v.Array().Values()
+	if err != nil {
+		return false
+	}
+	for _, spec := range specs {
+		doc, ok := spec.DocumentOK()
+		if !ok {
+			continue
+		}
+		if _, err := doc.LookupErr("expireAfterSeconds"); err == nil {
+			return true
+		}
 	}
 	return false
 }

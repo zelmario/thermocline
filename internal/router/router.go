@@ -695,9 +695,13 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 	// Renames split a tiered collection between the tiers, and mapReduce reads
 	// every document on whichever tier it runs. Neither can be made whole
-	// across two clusters, so both are refused rather than answered short.
+	// across two clusters, so both are refused rather than answered short. A
+	// TTL index is the third: it would reach the fast tier, which holds the
+	// recent part, and expire exactly the documents the archive was still
+	// keeping while the old ones it is written for go untouched.
 	if nameErr == nil && !msg.MoreToCome() &&
-		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce") {
+		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce" ||
+			name == "createIndexes" || name == "collMod") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
 			return c.send(out)
 		}

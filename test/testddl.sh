@@ -173,6 +173,50 @@ EXP=$(R "
   catch(e) { print('ERR '+e.message.substring(0,50)); }")
 chk "explain is answered"                               "ok" "$EXP"
 
+echo "== a TTL index on a tiered collection =="
+# The fast tier holds the recent part of a tiered collection and the archive
+# holds the rest, and this command reaches the fast tier. So the index expires
+# the documents that were recent enough to be cached, the feeder reads those
+# expiries as the application deleting and the archive tombstones its own
+# copies, while the older documents the rule was written for sit in the archive
+# where no TTL index is watching them.
+#
+# Measured before this was refused, on five documents a minute old on both tiers
+# and five over a year old in the archive alone, asking for anything older than
+# thirty seconds to expire: the five recent ones were destroyed on both tiers
+# and the five year-old ones survived. It reported success.
+TNS=tddlttl
+H "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$TNS.insertOne({_id:1, at:new Date()})" >/dev/null
+chk "a TTL index on a tiered collection is refused"     "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$TNS.createIndex({at:1},{expireAfterSeconds:30});print('ACCEPTED')}catch(e){print('refused')}")"
+chk "and the refusal says which way it would go wrong"  "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$TNS.createIndex({at:1},{expireAfterSeconds:30});print('false')}catch(e){print(/newest documents and keep the oldest/.test(e.message))}")"
+chk "and no TTL index was created"                      "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TNS.getIndexes().filter(function (i) { return i.expireAfterSeconds !== undefined }).length)")"
+# The controls. An ordinary index on the same collection has to keep working, or
+# this guard is refusing far more than it means to.
+chk "an ordinary index on it is still accepted"         "accepted" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$TNS.createIndex({at:1},{name:'plain_at'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+# And a collection nothing tiers lives on the fast tier alone, where a TTL index
+# means exactly what it says.
+H "db.getSiblingDB(process.env.TC_DB).customers.drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).customers.insertOne({_id:1, at:new Date()})" >/dev/null
+chk "an untiered collection may still have one"         "accepted" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).customers.createIndex({at:1},{expireAfterSeconds:3600});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+# The same instruction written differently.
+# Looking for this refusal by name rather than for any refusal at all: on a
+# binary without the guard, the collMod fails anyway because the index it names
+# was never created, and a check that cannot tell those apart passes on the bug.
+chk "a collMod that turns one into a TTL index is refused" "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$TNS', index:{name:'plain_at', expireAfterSeconds:30}});print('false')}catch(e){print(/newest documents and keep the oldest/.test(e.message))}")"
+chk "and a collMod that does not is not"                "accepted" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$TNS', index:{name:'plain_at', hidden:true}});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+H "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).customers.drop()" >/dev/null 2>&1
+
 stopDaemons
 echo
 echo "================================"

@@ -242,6 +242,24 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A TTL index on a tiered collection is refused.** It would do the opposite of
+  what it says. The command reaches the fast tier, which holds only the recent
+  part of the collection, so the index expires the documents that were recent
+  enough to be cached; the feeder reads those expiries as your application
+  deleting them and the archive records the deletions. The older documents the
+  rule was written for are in the archive, where no TTL index is watching them.
+
+  Measured on a tiered collection with five documents a minute old on both tiers
+  and five over a year old in the archive alone, asking for anything older than
+  thirty seconds to expire: the five recent ones were destroyed on both tiers,
+  the five year-old ones survived, and it reported success. A retention rule that
+  deletes this month and keeps last year.
+
+  A collection nothing tiers is unaffected: it lives on the fast tier alone and a
+  TTL index there means exactly what it says. A `collMod` that turns an existing
+  index into a TTL one is the same instruction and is refused the same way. If a
+  tiered collection really needs a retention rule, put the index on the archive
+  yourself, and be clear that the archive is what keeps this data.
 - **The router says when a tiered collection is not the same collection on both
   tiers.** The fast tier's copy is created with the archive's options before
   anything inserts into it, which is what keeps a collation and a validator

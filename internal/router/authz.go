@@ -100,6 +100,16 @@ func (c *conn) probeRead(db, coll string) (bson.Raw, bool) {
 // sent, or a collection that does not exist on the fast tier, is not an
 // authorisation answer and is not read as one.
 func (c *conn) canRead(db, coll string) bool {
+	if c.r.cfg.TerminateAuth {
+		// The connection to the fast tier carries the router's identity, not
+		// this client's, so the probe would ask the wrong question and always
+		// answer yes. It is not needed either: with authentication terminated
+		// the gate decided this command before it ran, and listCollections and
+		// listDatabases are authorised for a whole database and a whole cluster
+		// respectively. A client that got a listing at all was entitled to
+		// everything in it, so adding the archive's half widens nothing.
+		return true
+	}
 	rdoc, got := c.probeRead(db, coll)
 	if !got {
 		return true
