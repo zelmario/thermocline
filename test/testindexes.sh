@@ -283,6 +283,56 @@ chk "and mirroring is still running behind it"     "true" \
 H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 
+echo "== an index the copy has to carry whole =="
+# An index carries more than its keys, and the fast tier's copy is built from
+# the archive's definition. A text index reports its key as {_fts, _ftsx} and
+# keeps the meaning in weights; a wildcard index keeps it in wildcardProjection.
+# Copied without them, one is refused by MongoDB and the other silently becomes
+# an index over every field of every document.
+#
+# createIndexes is one command for the whole batch, so the refusal took the
+# other indexes of the collection with it: measured, this collection ended up
+# holding _id_ and nothing else, retried every minute, for ever. That is an
+# adopted collection with a search box on it, and the only sign is a log line.
+TXNS=tidxtext
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$TXNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TXNS.drop()" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$TXNS;
+   c.insertMany([{_id:1,title:'red widget',body:'a plain widget',a:1,b:2},
+                 {_id:2,title:'blue gadget',body:'red red red',a:3,b:4}]);
+   c.createIndex({title:'text',body:'text'},{name:'txt',weights:{title:10,body:1}});
+   c.createIndex({'\$**':1},{name:'wild',wildcardProjection:{a:1,b:1}});
+   c.createIndex({a:1},{name:'plain_a'})" >/dev/null
+chk "the archive carries all three"                "true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().length === 4)")"
+startFeeder
+startRouter
+# A read of an archived document is what copies the collection up, and the
+# indexer runs with it.
+R "db.getSiblingDB(process.env.TC_DB).$TXNS.findOne({_id:1})" >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().length)")" -ge 4 ] && break
+  sleep 1
+done
+IX() { H "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().filter(function (i) { return i.name === '$1' })[0] || null))"; }
+# The ordinary index is the one that says the batch was not lost wholesale.
+chk "the ordinary index arrived"                   "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().some(function (i) { return i.name === 'plain_a' }))")"
+chk "the text index arrived"                       "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().some(function (i) { return i.name === 'txt' }))")"
+chk "and kept the weights that rank a search"      "10" \
+    "$(H "const i = db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().filter(function (x) { return x.name === 'txt' })[0]; print(i && i.weights ? i.weights.title : 'missing')")"
+chk "the wildcard index kept its projection"       "true" \
+    "$(H "const i = db.getSiblingDB(process.env.TC_DB).$TXNS.getIndexes().filter(function (x) { return x.name === 'wild' })[0]; print(!!(i && i.wildcardProjection && i.wildcardProjection.a === 1))")"
+# And the thing an index exists for: the same search, ranked the same way. With
+# title weighted ten to one, the document whose title matches comes first, and a
+# copy without the weights puts the other one there.
+chk "the router ranks a text search as the archive does" "$(C "print(db.getSiblingDB(process.env.TC_DB).$TXNS.find({\$text:{\$search:'red'}},{score:{\$meta:'textScore'}}).sort({score:{\$meta:'textScore'}}).toArray().map(function (d) { return d._id }).join(','))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$TXNS.find({\$text:{\$search:'red'}},{score:{\$meta:'textScore'}}).sort({score:{\$meta:'textScore'}}).toArray().map(function (d) { return d._id }).join(','))")"
+H "db.getSiblingDB(process.env.TC_DB).$TXNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TXNS.drop()" >/dev/null
+
 echo "== the options an adopted collection carries, which documents do not =="
 # A collection is more than its documents, and the fast tier is filled with
 # documents. In an adoption the existing cluster becomes the archive carrying

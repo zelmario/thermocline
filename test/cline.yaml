@@ -39,6 +39,9 @@ feeder:
     # testrouter.sh: a tiered collection deliberately left off the fast tier, to
     # check the router still names it in the catalog and reads it.
     - "shop.tcatalog"
+    # testindexes.sh: an adopted collection whose indexes carry options the copy
+    # has to bring across whole, a text index and a wildcard one.
+    - "shop.tidxtext"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.
