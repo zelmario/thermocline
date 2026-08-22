@@ -144,7 +144,7 @@ echo "== a sort says which of several matches the caller means =="
 # tier. findOneAndUpdate({}, ..., {sort:{seq:1}}) modified seq 2 and reported
 # it, and findOneAndDelete with the same sort deleted seq 2. One document
 # matched, one was modified, and the count was right.
-SNS=tssort
+SNS=tssort; export TC_SNS=$SNS
 H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany([{_id:1,seq:1,who:'oldest'},{_id:2,seq:2,who:'middle'},{_id:3,seq:3,who:'newest'}])" >/dev/null
@@ -175,6 +175,31 @@ chk "sorting the other way takes the newest"           "newest" \
 # owed for it.
 chk "an unsorted one still answers from the fast tier" "true" \
     "$(R "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOneAndUpdate({seq:{\$gte:0}},{\$set:{any:true}}); print(d!==null)")"
+# And inside a transaction, which is the awkward half. The copy-up is an
+# ordinary write outside the transaction, so this transaction's snapshot was
+# taken before it landed and repeating the statement would still miss the
+# document. The whole transaction is replayed instead, which is the contract
+# every driver already implements for TransientTransactionError.
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany([{_id:1,seq:1,who:'oldest'},{_id:2,seq:2,who:'middle'},{_id:3,seq:3,who:'newest'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany([{_id:2,seq:2,who:'middle'},{_id:3,seq:3,who:'newest'}])" >/dev/null
+TXNPICK=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval '
+const s = db.getMongo().startSession();
+let picked = "none", tries = 0;
+try {
+  s.withTransaction(function () {
+    tries++;
+    const d = s.getDatabase(process.env.TC_DB)[process.env.TC_SNS]
+      .findOneAndUpdate({}, {$set:{txnmark:true}}, {sort:{seq:1}});
+    picked = d ? d.who : "null";
+  });
+  print(picked + ":" + tries);
+} catch (e) { print("ERROR " + e.message.substring(0,60)); }
+s.endSession();' 2>&1 | tail -1)
+chk "a transaction picks it too, after one replay" "oldest:2" "$TXNPICK"
+chk "and that is the document it marked"           "oldest" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOne({txnmark:true}); print(d?d.who:'none')")"
 H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 
