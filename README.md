@@ -242,6 +242,19 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **The feeder stops when its resume point is gone, rather than retrying.** If it
+  is down long enough for the fast tier's oplog to roll past its checkpoint, the
+  writes made in that window are on the fast tier and not in the archive, and
+  reopening the change stream cannot fetch them: those oplog entries no longer
+  exist. Measured before this: 37 reopen attempts in forty seconds, a driver
+  error logged once a second, and nothing anywhere saying that the archive now
+  had a hole in it.
+
+  It exits instead, naming the checkpoint it could not resume from. A daemon
+  that stops is noticed by whatever runs it; a repeating log line is noticed by
+  nobody. Clearing the checkpoint restarts mirroring from now, which hides the
+  gap rather than closing it, so copy the affected namespaces into the archive
+  first.
 - **A sorted `findAndModify` acts on the document the sort really names.** The
   sort is how you say which of several matches you mean, and the fast tier can
   only choose from the part it holds. The repair paths for a write that matched

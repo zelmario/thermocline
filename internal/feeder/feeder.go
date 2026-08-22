@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -28,6 +29,20 @@ import (
 // ErrUnannouncedDelete is returned when policy is "halt" and a delete arrived
 // that the evictor did not announce.
 var ErrUnannouncedDelete = errors.New("unannounced delete on the fast tier")
+
+// ErrResumePointLost is returned when the fast tier's oplog no longer reaches
+// back to where mirroring got to.
+//
+// It stops the feeder, and that is the point. Reopening cannot help: the events
+// between the checkpoint and the start of the oplog are gone, so every write the
+// application made in that window is on the fast tier and not in the archive,
+// and no amount of retrying will fetch them. Left to retry, the feeder logs a
+// driver error once a second for ever while the archive receives nothing, which
+// is the quietest possible way to have a hole in it.
+//
+// Stopping is louder. A daemon that exits is noticed by whatever runs it; a
+// repeating log line is noticed by nobody.
+var ErrResumePointLost = errors.New("the fast tier's oplog no longer reaches the mirroring checkpoint")
 
 // Feeder mirrors one fast tier into one cold tier.
 type Feeder struct {
@@ -195,7 +210,7 @@ func (f *Feeder) Run(ctx context.Context) error {
 		switch {
 		case err == nil, errors.Is(err, context.Canceled):
 			return nil
-		case errors.Is(err, ErrUnannouncedDelete):
+		case errors.Is(err, ErrUnannouncedDelete), errors.Is(err, ErrResumePointLost):
 			return err
 		}
 
@@ -284,6 +299,21 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 
 	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
 	if err != nil {
+		if len(token) > 0 && resumePointGone(err) {
+			// The instant the checkpoint marks, so the log says how much is
+			// missing rather than only that something is.
+			at, _, _ := f.cp.EventAt(ctx, f.cfg.ID)
+			f.log.Error("the fast tier's oplog no longer reaches where mirroring got to",
+				"id", f.cfg.ID, "checkpoint", at.UTC().Format(time.RFC3339), "err", err,
+				"meaning", "every write the application made between that checkpoint and the "+
+					"start of the oplog is on the fast tier and not in the archive",
+				"effect", "reopening cannot fetch them, so the feeder stops rather than run on "+
+					"with a hole in the archive nothing would mention again",
+				"action", "copy the affected namespaces from the fast tier into the archive, then "+
+					"clear the checkpoint; clearing it on its own makes mirroring start from now "+
+					"and hides the gap instead of closing it")
+			return fmt.Errorf("%w: %v", ErrResumePointLost, err)
+		}
 		return fmt.Errorf("open change stream: %w", err)
 	}
 	defer func() { _ = stream.Close(context.WithoutCancel(ctx)) }()
@@ -433,4 +463,31 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		wasInsert: ev.OperationType == "insert",
 	})
 	return nil
+}
+
+// resumePointGone reports whether MongoDB refused the resume token, so
+// mirroring cannot carry on from where it stopped.
+//
+// Two codes and several wordings. ChangeStreamHistoryLost is the specific one.
+// ChangeStreamFatalError is what a server says when the token is simply not
+// there any more: measured against PSMDB 8.0, "cannot resume stream; the resume
+// token was not found". So the code narrows it to a fatal change stream error
+// and the word resume in the message decides, rather than matching one phrasing
+// that a release can change.
+//
+// A token from another cluster lands here too, and belongs here: it names a
+// position this oplog has never had, mirroring cannot resume from it, and the
+// operator has the same hole to think about either way.
+func resumePointGone(err error) bool {
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	if ce.Code == 286 || ce.Name == "ChangeStreamHistoryLost" {
+		return true
+	}
+	if ce.Code == 280 || ce.Name == "ChangeStreamFatalError" {
+		return strings.Contains(strings.ToLower(ce.Message), "resume")
+	}
+	return false
 }
