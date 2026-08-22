@@ -308,14 +308,55 @@ func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll 
 		return true, nil, nil
 	}
 
+	elems, err := odoc.Elements()
+	if err != nil {
+		return true, nil, nil
+	}
 	var out bson.D
-	// Order matters only for reading the log line back; MongoDB does not care.
-	for _, key := range []string{"collation", "validator", "validationLevel", "validationAction"} {
-		if v, lerr := odoc.LookupErr(key); lerr == nil {
-			out = append(out, bson.E{Key: key, Value: v})
+	for _, e := range elems {
+		if notCarried[e.Key()] {
+			continue
 		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
 	}
 	return true, out, nil
+}
+
+// notCarried is the collection options the fast tier's copy must not be given.
+//
+// Everything else goes across. That polarity is deliberate and was learned the
+// expensive way on the indexes beside this: a list of the options worth carrying
+// silently drops every option nobody thought of, and the copy is then a
+// different collection with the same name. The promise is that a client cannot
+// tell the two tiers apart, so an option nobody has considered should follow the
+// archive rather than be discarded.
+//
+// What must not follow, and why each one:
+//
+// capped, size, max. A capped fast tier removes its own oldest documents, the
+// feeder reads those removals as the application deleting them, and the archive
+// tombstones the history it exists to keep. The feeder refuses a capped
+// namespace outright for the same reason.
+//
+// timeseries, and the expireAfterSeconds that goes with it. A time series
+// collection is a view over a hidden bucket collection, so its documents are not
+// where a copy-up would put them, and the feeder refuses one.
+//
+// viewOn and pipeline. A view holds no documents and cannot be tiered; the
+// router leaves views to the fast tier and names the ones it does not have.
+//
+// clusteredIndex, because a clustered collection cannot be given the _id index
+// the rest of this assumes, and the archive's own clustering is a storage
+// decision that buys nothing on a tier holding a subset.
+//
+// idIndex, info, uuid and type are not settable at all: the server reports them
+// and decides them.
+var notCarried = map[string]bool{
+	"capped": true, "size": true, "max": true,
+	"timeseries": true, "expireAfterSeconds": true,
+	"viewOn": true, "pipeline": true,
+	"clusteredIndex": true,
+	"idIndex":        true, "info": true, "uuid": true, "type": true,
 }
 
 // isNamespaceExists reports MongoDB's "collection already exists", which is the
