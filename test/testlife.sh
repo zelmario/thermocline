@@ -104,16 +104,21 @@ cline evictor --config $CFG --once >/dev/null 2>&1
 chk "the expired resident is evicted now" "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$OID')}))")"
 chk "and the archive kept it live"        "true" "$(C "const d=db.getSiblingDB(process.env.TC_DB).orders.findOne({_id:ObjectId('$OID')}); print(!!d && !d._tcDeletedAt)")"
 
-echo "== a copy-up the fast tier refuses must not fail the read =="
+echo "== a validator added later must not stop the archive's documents being cached =="
 # What a collection looks like after an operator adds a validator to one that
 # was already being tiered: the fast tier enforces a rule the archive's copy
 # knows nothing about, because the feeder created that copy by upserting
 # documents and a validator is not a document.
 #
-# The archived documents predate the rule and cannot be inserted back. The read
-# still has to answer, because the document exists and is readable, and the
-# operator has to be told rather than left with a collection that quietly pays
-# archive latency on every read for ever.
+# The archived documents predate the rule, and MongoDB does not go back and
+# delete documents that stop matching a validator. Copying one up is not the
+# application writing, it is the same document being put where a read can reach
+# it faster, so the copy-up is exempt from validation.
+#
+# It used to be refused, and the read was answered from the archive with a
+# warning. That was correct and permanent: every read of a document written
+# before the rule paid archive latency for ever, and the collection could never
+# be served from the fast tier at all.
 H "db.getSiblingDB(process.env.TC_DB).tval.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tval.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).createCollection('tval', {validator:{\$jsonSchema:{
@@ -123,13 +128,18 @@ chk "the fast tier does not hold it"          "0" "$(H "print(db.getSiblingDB(pr
 chk "the read is answered anyway"             "written before the rule" \
     "$(R "const d=db.getSiblingDB(process.env.TC_DB).tval.findOne({_id:1}); print(d?d.n:'MISSING')")"
 sleep 2
-chk "and the copy-up did not happen"          "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).tval.countDocuments({_id:1}))")"
+chk "and the document was copied up"          "1" "$(H "print(db.getSiblingDB(process.env.TC_DB).tval.countDocuments({_id:1}))")"
 chk "the archive still holds it live"         "true" \
     "$(C "const d=db.getSiblingDB(process.env.TC_DB).tval.findOne({_id:1}); print(!!d && !d._tcDeletedAt)")"
-# Silence here would be the real failure: reads keep working and nothing says
-# why they are slow.
-chk "and the router said why"                 "true" \
+chk "and nothing failed on the way"           "false" \
     "$(grep -q 'copy up failed' $LOGDIR/life_r.log && echo true || echo false)"
+# The exemption is for documents moving between the tiers and stops there. What
+# the application writes is still the application writing, and the rule still
+# applies to it.
+chk "an application write is still refused"   "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tval.insertOne({_id:2, email:12345});print('ACCEPTED')}catch(e){print('refused')}")"
+chk "and so is an update to the old document" "refused" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tval.updateOne({_id:1},{\$set:{n:'changed'}});print('ACCEPTED')}catch(e){print('refused')}")"
 
 echo "== dropping a tiered collection =="
 R "db.getSiblingDB(process.env.TC_DB).tdrop.insertMany([{_id:1,v:'a'},{_id:2,v:'b'},{_id:3,v:'c'}])" >/dev/null
