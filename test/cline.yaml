@@ -57,6 +57,8 @@ feeder:
     - "shop.tqbound"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
+    # testevict.sh: the same, on the removing side.
+    - "shop.tevunaged"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.

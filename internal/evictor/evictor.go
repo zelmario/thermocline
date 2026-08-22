@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -48,6 +49,12 @@ type Evictor struct {
 
 	marks   *watermark.Store
 	limiter *limiter
+
+	// unagedSeen records which namespaces have already been counted for
+	// documents the rule cannot age, so the scan that costs happens once per
+	// process rather than once per sweep. See warnAboutUnaged.
+	unagedMu   sync.Mutex
+	unagedSeen map[string]bool
 }
 
 // SetMaxHealthWait bounds how long RunOnce waits for an unhealthy cluster
@@ -205,6 +212,7 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule) (Stats,
 			return stats, nil
 		}
 	}
+	e.warnAboutUnaged(ctx, rule, hotColl)
 
 	boundary := cutoff(time.Now(), rule.OlderThan.D())
 	e.log.Info("evicting",
@@ -600,4 +608,56 @@ func selectorName(rule config.EvictionRule) string {
 		return "_id timestamp"
 	}
 	return rule.DateField
+}
+
+// warnAboutUnaged says so when the fast tier holds documents this rule can
+// never remove.
+//
+// The whole-namespace version of this is refused above: a rule with no
+// date_field against non-ObjectId _ids matches nothing at all. The partial
+// version is quieter and reads as success. MongoDB brackets a range predicate
+// by type, so a cutoff on a date selects only documents whose field holds a
+// date, and one whose field is missing, null or a string is invisible to every
+// sweep. Measured on a fast tier of three documents, one properly dated and two
+// not: "sweep complete, scanned 1, evicted 1", and the two that cannot be aged
+// stayed where they were with nothing mentioning them.
+//
+// That is a fast tier that grows without bound while every sweep reports
+// success, which is the same failure the check above exists to prevent, one
+// field along.
+//
+// Counted once per rule per process rather than per sweep. The predicate cannot
+// use an index, so it is a scan, and a scan on the fast tier every few seconds
+// would cost more than the warning is worth. Once at startup matches the check
+// above it, and a number that changes is a restart away from being seen.
+func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule, hotColl *mongo.Collection) {
+	if rule.UsesObjectIDTime() {
+		return
+	}
+	e.unagedMu.Lock()
+	if e.unagedSeen == nil {
+		e.unagedSeen = map[string]bool{}
+	}
+	seen := e.unagedSeen[rule.NS]
+	e.unagedSeen[rule.NS] = true
+	e.unagedMu.Unlock()
+	if seen {
+		return
+	}
+
+	n, err := hotColl.CountDocuments(ctx, bson.D{{Key: rule.DateField, Value: bson.D{
+		{Key: "$not", Value: bson.D{{Key: "$type", Value: "date"}}},
+	}}})
+	if err != nil || n == 0 {
+		return
+	}
+	e.log.Warn("the fast tier holds documents this rule can never remove",
+		"ns", rule.NS, "not_dated_by_"+rule.DateField, n,
+		"reason", "a cutoff on a date selects only documents whose field holds a date, because "+
+			"MongoDB brackets a range predicate by type; one whose "+rule.DateField+" is missing, "+
+			"null or a string is invisible to every sweep",
+		"effect", "these stay on the fast tier however old they are, so it grows by that much and "+
+			"every sweep goes on reporting success",
+		"action", "give them a date in "+rule.DateField+", or remove them by hand once the archive "+
+			"is confirmed to hold them")
 }

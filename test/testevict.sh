@@ -167,6 +167,71 @@ case "$WMWAS" in
   *"all of history"*) cline watermark --config $CFG --ns $DB.orders --complete-all >/dev/null 2>&1 ;;
 esac
 
+echo "== documents the rule can never remove =="
+# The whole-namespace version of this is already refused: a rule with no
+# date_field against non-ObjectId _ids matches nothing at all. The partial
+# version is quieter and reads as success. MongoDB brackets a range predicate by
+# type, so a cutoff on a date selects only documents whose field holds a date,
+# and one whose field is missing, null or a string is invisible to every sweep.
+#
+# Measured on a fast tier of three documents, one properly dated and two not:
+# "sweep complete, scanned 1, evicted 1", and the two that cannot be aged stayed
+# where they were with nothing mentioning them. That is a fast tier growing
+# without bound while every sweep reports success.
+ENS=tevunaged
+OLDDATE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=400)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$ENS.insertMany([
+    {_id:1, at:new Date('$OLDDATE'), n:'old and evictable'},
+    {_id:2, at:'$OLDDATE',           n:'old, but a string'},
+    {_id:3,                          n:'no field at all'}])" >/dev/null
+done
+DB=$DB WDIR=$WDIR python3 - <<'PY'
+import os
+db, wdir = os.environ['DB'], os.environ['WDIR']
+s = open(wdir + '/cline.yaml').read()
+head, tail = s[:s.index('evictor:')], s[s.index('warmer:'):]
+open(wdir + '/evunaged.yaml', 'w').write(head + """evictor:
+  feeder_id: "test"
+  rate: 500
+  batch_size: 100
+  max_feeder_lag: 30s
+  rules:
+    - ns: "%s.tevunaged"
+      older_than: 40m
+      date_field: "at"
+  backoff:
+    max_replication_lag: 60s
+    max_cache_dirty: 0.9
+    min_write_tickets_free: 0.01
+    min_oplog_window: 1m
+""" % db + tail)
+PY
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
+   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+rm -f $LOGDIR/ev_unaged.log
+cline evictor --config $WDIR/evunaged.yaml --once --log-file $LOGDIR/ev_unaged.log >/dev/null 2>&1
+chkv "the sweep removed the one it could"        "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ENS.countDocuments({}))")"
+chkv "and says the other two can never go"       "true" \
+    "$(grep -q 'this rule can never remove' $LOGDIR/ev_unaged.log && echo true || echo false)"
+chkv "counting them by the field they lack a date in" "true" \
+    "$(grep -q 'not_dated_by_at=2' $LOGDIR/ev_unaged.log && echo true || echo false)"
+chkv "and says the fast tier grows by that much" "true" \
+    "$(grep -q 'grows by that much' $LOGDIR/ev_unaged.log && echo true || echo false)"
+# The control: a namespace whose documents are all properly dated must stay
+# quiet, or the warning is noise on every start and nobody reads it.
+H "db.getSiblingDB(process.env.TC_DB).$ENS.deleteMany({at:{\$not:{\$type:'date'}}})" >/dev/null
+rm -f $LOGDIR/ev_unaged2.log
+cline evictor --config $WDIR/evunaged.yaml --once --log-file $LOGDIR/ev_unaged2.log >/dev/null 2>&1
+chkv "and says nothing when they are all dated"  "0" \
+    "$(grep -c 'this rule can never remove' $LOGDIR/ev_unaged2.log || true)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "PASS $PASS   FAIL $FAIL"
