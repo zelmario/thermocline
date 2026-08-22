@@ -68,6 +68,29 @@ Without it every read would miss and the numbers would describe nothing.
 more than the router run: if a check fails with no proxy and no tiering in the
 way, the check is wrong, and nothing it says afterwards means anything.
 
+## Against the anydbver test cluster
+
+Give it its own database. The obvious one to shop in is `shop.orders`, which the
+suites already tier, and it is the wrong choice: six suites read `shop.orders`
+without dropping it first, so a few thousand seeded orders change what they
+measure and change it quietly.
+
+    python3 test/store/mkconfig.py test/cline.yaml > /tmp/store.yaml
+    docker cp /tmp/store.yaml <node>:/root/store.yaml
+
+That derives the shared config into `shopstore.orders`, its own bookkeeping
+database and ports 27400 and 27410, which is the isolation `mkworker.sh` gives a
+sweep worker. Then, with the feeder running so the archive gets a copy:
+
+    /root/store -uri "$HOT" -db shopstore -orders 4000 -customers 400       -products 200 -seed-only
+    /root/store -uri "$HOT" -db shopstore -skip-seed -rounds 60 -conc 4
+    /root/store -uri "mongodb://dba:secret@127.0.0.1:27400/?authSource=admin"       -db shopstore -skip-seed -rounds 60 -conc 4
+
+Measured on 2026-08-22 with 4,000 orders and the fast tier holding 34 of them,
+so almost every read fell through: 0 errors and 0 violations. Repeated with a
+warmer and an evictor running in a loop underneath, the fast tier moving from 79
+orders to 173 while the shop ran: 0 errors and 0 violations again.
+
 ## What it has found
 
 **The freshness barrier was costing 570ms on every archive read.** Not the
