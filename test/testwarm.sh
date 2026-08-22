@@ -348,6 +348,92 @@ H "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tshrink.drop()" >/dev/null
 
 stopDaemons
+echo "== documents the rule cannot address, which never resolves =="
+# A rule ages a collection by a date field, and a document written before that
+# field existed has none. No window selects it, so no warm will ever copy it up,
+# and the claim it blocks is never going to be made.
+#
+# The guard above already refuses the claim, which is right and is why the
+# router keeps answering from the archive and keeps answering correctly. What it
+# said was wrong: "documents left the fast tier while this warm was filling it,
+# which is what an evictor whose cutoff falls inside the warm window does". That
+# sends somebody looking for an evictor that is not there, for a condition that
+# will still be true tomorrow.
+UNS=twunaged
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.insertMany([
+     {_id:1, at:new Date(), n:'has the field'},
+     {_id:2, at:new Date(), n:'has it too'},
+     {_id:3,                n:'written before the field existed'}])" >/dev/null
+chk "the archive holds one without the field"    "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({at:{\$exists:false}}))")"
+# Its own config: one rule, on this namespace, aged by a date field. Warming the
+# shared config's namespaces here would take minutes and report somebody else's
+# state in the same log.
+DB=$DB WDIR=$WDIR python3 - <<'PY'
+import os
+db, wdir = os.environ['DB'], os.environ['WDIR']
+s = open(wdir + '/cline.yaml').read()
+head = s[:s.index('warmer:')]
+tail = s[s.index('router:'):]
+open(wdir + '/unaged.yaml', 'w').write(head + """warmer:
+  residency: 30m
+  rules:
+    - ns: "%s.twunaged"
+      back: 40m
+      date_field: "at"
+  backoff:
+    max_replication_lag: 60s
+    max_cache_dirty: 0.9
+    min_write_tickets_free: 0.01
+    min_oplog_window: 1m
+""" % db + tail)
+PY
+chk "the derived config warms only this one"     "1" \
+    "$(grep -c "ns: \"$DB.$UNS\"" $WDIR/unaged.yaml)"
+rm -f $LOGDIR/warm_unaged.log
+cline warmer --config $WDIR/unaged.yaml --log-file $LOGDIR/warm_unaged.log >/dev/null 2>&1
+chk "the warm copied only what it could address" "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({}))")"
+chk "it refuses the claim"                       "true" \
+    "$(grep -q 'not claiming' $LOGDIR/warm_unaged.log && echo true || echo false)"
+chk "and says the rule cannot address them"      "true" \
+    "$(grep -q 'this rule cannot address' $LOGDIR/warm_unaged.log && echo true || echo false)"
+chk "counting them by the field they lack"       "true" \
+    "$(grep -q 'without_at=1' $LOGDIR/warm_unaged.log && echo true || echo false)"
+# The part that distinguishes it from an evictor fighting the warm: this one is
+# permanent, and the message has to say so rather than describing a race.
+chk "and that it is never going to be made"      "true" \
+    "$(grep -q 'never going to be made' $LOGDIR/warm_unaged.log && echo true || echo false)"
+# Asked as "the log exists and does not say it", because a missing log makes
+# every grep answer false and the check would pass on a warm that never ran.
+chk "and does not blame an evictor"              "true" \
+    "$([ -s $LOGDIR/warm_unaged.log ] && ! grep -q 'documents left the fast tier' $LOGDIR/warm_unaged.log && echo true || echo false)"
+# The boundary claim is withheld too, but a boundary claim is not the danger and
+# one may legitimately be recorded: it says the fast tier holds everything newer
+# than an instant, and the two documents that have the field are newer than it.
+# The document without the field is not newer than anything, so no bounded query
+# reaches it.
+#
+# The claim that must never be made is the one on all of history, because that
+# is the one an unbounded query is answered from, and this collection can never
+# earn it. A zero completeFrom is how that is recorded.
+chk "no claim on all of history"                 "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).watermarks.countDocuments({_id:process.env.TC_DB+'.$UNS', completeFrom:new Date(0)}))")"
+chk "nor one dated before this collection existed" "0" \
+    "$(C "const w=db.getSiblingDB(process.env.TC_META).watermarks.findOne({_id:process.env.TC_DB+'.$UNS'});
+          print(w && w.completeFrom && w.completeFrom.getFullYear() < 2020 ? 1 : 0)")"
+# And the answers, which is the whole point: the router must still see all three.
+startRouter
+chk "the router still sees every document"       "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

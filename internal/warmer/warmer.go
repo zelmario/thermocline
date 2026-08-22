@@ -270,6 +270,28 @@ func (w *Warmer) stillHolds(ctx context.Context, rule config.WarmRule, from time
 	if hotN >= coldN {
 		return true
 	}
+	// Two very different things bring the counts apart, and an operator sent
+	// after the wrong one loses an afternoon. Documents can leave while the
+	// warm fills, which is an evictor working the same namespace. Or the rule
+	// may not be able to address them at all: a rule ages a collection by a
+	// date field, and a document written before that field existed has none, so
+	// no window ever selects it and no warm will ever copy it up.
+	//
+	// The second one never resolves. Saying "documents left the fast tier"
+	// about it sends somebody looking for an evictor that is not there.
+	if n := w.unagedInArchive(ctx, rule); n > 0 {
+		w.log.Warn("not claiming a window, because the archive holds documents this rule cannot address",
+			"ns", rule.NS,
+			"fast_tier", hotN, "archive", coldN, "missing", coldN-hotN,
+			"without_"+rule.DateField, n,
+			"why", "a rule ages a collection by a date field, and a document that has no such "+
+				"field is selected by no window, so no warm will ever copy it up",
+			"effect", "this claim is never going to be made, so queries with no lower time bound "+
+				"go on being answered by the archive",
+			"action", "give those documents the field, or tier this namespace by the _id timestamp "+
+				"instead, or accept that it is read from the archive")
+		return false
+	}
 	w.log.Warn("not claiming a window the fast tier no longer holds",
 		"ns", rule.NS,
 		"fast_tier", hotN, "archive", coldN, "missing", coldN-hotN,
@@ -870,4 +892,25 @@ func selectorName(rule config.WarmRule) string {
 		return "_id timestamp"
 	}
 	return rule.DateField
+}
+
+// unagedInArchive counts the live documents the archive holds that this rule's
+// date field is missing from.
+//
+// Only ever used to explain a refusal, so a rule that reads age from the _id has
+// nothing to report: every document has one. An error is reported as none,
+// because failing to explain a warning is not worth failing a warm over.
+func (w *Warmer) unagedInArchive(ctx context.Context, rule config.WarmRule) int64 {
+	if rule.UsesObjectIDTime() {
+		return 0
+	}
+	db, coll := splitNS(rule.NS)
+	n, err := w.cold.Database(db).Collection(coll).CountDocuments(ctx, bson.D{
+		meta.NotArchivedDeleted(),
+		{Key: rule.DateField, Value: bson.D{{Key: "$exists", Value: false}}},
+	})
+	if err != nil {
+		return 0
+	}
+	return n
 }
