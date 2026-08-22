@@ -244,6 +244,74 @@ chk "a read is not charged its deadline twice" "true" \
 echo "      (the read took ${ELAPSED_MS} ms of a 1000 ms deadline)"
 
 startFeeder
+echo "== a feeder that has stopped, rather than one that is behind =="
+# The barrier waits for mirroring to reach what this client has already done. A
+# feeder that is merely behind gets there, and waiting is right. A feeder that
+# has stopped never will, and waiting costs the whole archive_wait on every
+# read.
+#
+# It is worse than one wait, because a read of an archived document copies it up,
+# and that copy-up is itself a write the next read then waits to see mirrored.
+# So the cost is the full barrier per read, for ever.
+#
+# Measured with the feeder stopped and the fast tier emptied so every read
+# copies one up: 10 reads took 45,717ms, 4.6 seconds each, with eleven stale
+# read warnings. The same 10 took 13ms once a stale position was read as "this
+# feeder has stopped" rather than "mirroring is behind".
+#
+# A position record that exists and has gone stale is the evidence. A feeder too
+# old to publish one leaves only a checkpoint, and that case still falls back to
+# it, because there is nothing else to go on.
+FNS=tfstopped
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i})))" >/dev/null
+chk "the archive holds them and the fast tier does not" "10/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
+# A feeder runs long enough to publish a position, then stops, which is what
+# leaves the record this reads.
+startFeeder
+sleep 3
+stopDaemons
+sleep 4
+chk "a position was left behind"                  "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).positions.countDocuments({_id:'test'}))")"
+rm -f $LOGDIR/fresh_r.log
+startRouter
+# A write first, so the barrier has something to wait for, then reads that each
+# copy a document up.
+START=$(date +%s%3N)
+R "const d=db.getSiblingDB(process.env.TC_DB); d.$FNS.insertOne({_id:99,n:99});
+   for (let i=0;i<5;i++) d.$FNS.findOne({_id:i});" >/dev/null
+ELAPSED=$(( $(date +%s%3N) - START ))
+echo "      five reads that each copy a document up took ${ELAPSED}ms"
+# Five reads at the 5s barrier would be 25 seconds. Anything under a few seconds
+# means the router stopped waiting for a feeder that is not coming back.
+chk "the reads do not each wait out the barrier"  "true" \
+    "$(awk -v e="$ELAPSED" 'BEGIN{print (e+0 < 5000) ? "true" : "false"}')"
+# And it must still say so: answering without the barrier is a real weakening of
+# what the read promises, and silence about it would be the wrong trade.
+chk "and it says the answer may be behind"        "true" \
+    "$(grep -q 'before mirroring caught up' $LOGDIR/fresh_r.log && echo true || echo false)"
+# Every document the archive holds is still returned, which is the whole point of
+# answering rather than refusing.
+#
+# Ten, not eleven. The insert above is on the fast tier and was never mirrored,
+# because the feeder is stopped, and this read is answered by the archive. That
+# is exactly the staleness the warning announces and it is the trade being made:
+# an answer that may miss a very recent write, rather than 4.6 seconds of waiting
+# for a feeder that is not coming back. Refusing instead would be worse; so
+# would waiting.
+chk "every mirrored document is still returned"   "10" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
+chk "and the archive is what that matches"        "10" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

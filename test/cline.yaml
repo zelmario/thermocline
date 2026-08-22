@@ -59,6 +59,8 @@ feeder:
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.
     - "shop.tevunaged"
+    # testfresh.sh: read while the feeder is stopped, so every read copies up.
+    - "shop.tfstopped"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.

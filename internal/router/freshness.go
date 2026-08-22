@@ -262,9 +262,26 @@ func (r *Router) readPosition(ctx context.Context) (time.Time, bson.Timestamp, b
 	var known bool
 	var everyMS int64
 	rec, ok, err := r.positions.At(ctx, r.cfg.FeederID)
-	if err == nil && ok && rec.Live(time.Now()) {
+	switch {
+	case err == nil && ok && rec.Live(time.Now()):
 		at, ts, known, everyMS = rec.At, rec.TS, true, rec.EveryMS
-	} else {
+	case err == nil && ok:
+		// A position that exists and has gone stale is evidence, not an
+		// absence: this feeder was publishing and has stopped. Falling back to
+		// its checkpoint would read as "mirroring is a little behind" and every
+		// read would then wait out the whole barrier for a feeder that is never
+		// going to catch up.
+		//
+		// Measured with the feeder stopped and a checkpoint left behind: 40
+		// point reads took 185 seconds through the router against 97ms straight
+		// at the archive, which is 4.6 seconds each, the whole archive_wait,
+		// every time. Saying "nothing is mirroring" instead answers at once and
+		// warns, which is what the barrier already does when there is no
+		// checkpoint at all.
+		return time.Time{}, bson.Timestamp{}, false, rec.EveryMS
+	default:
+		// No position record at all, which is a feeder too old to publish one.
+		// Its checkpoint is the only signal there is.
 		at, known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
 	}
 	if err != nil {

@@ -242,6 +242,23 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A feeder that has stopped is not a feeder that is behind.** Reads wait for
+  mirroring to reach what you have already written, up to `router.archive_wait`,
+  and a feeder that is merely behind gets there. One that has stopped never
+  will, so the router stops waiting for it: a position record that exists and
+  has gone stale is the evidence, and it answers at once and says the answer may
+  be behind.
+
+  It matters more than one wait, because a read of an archived document copies
+  it up, and that copy-up is itself a write the next read then waits to see
+  mirrored. Measured with the feeder stopped and the fast tier emptied, so every
+  read copied one up: **10 reads took 45,717ms, 4.6 seconds each**, with eleven
+  stale-read warnings. The same 10 take 13ms now.
+
+  The trade is stated rather than hidden: such an answer can miss a very recent
+  write, which is what the warning says, and every document the archive holds is
+  still returned. A feeder too old to publish a position leaves only a
+  checkpoint, and that case still waits, because there is nothing else to go on.
 - **A completeness claim only covers a query bounded in the same dimension.** The
   claim says the fast tier holds every document newer than an instant, and
   "newer" is measured the way your rules measure age: the `date_field`, or the
