@@ -58,6 +58,10 @@ Usage:
                                           as long as the archive cannot be
                                           trusted, such as while it is restored
   cline resume   --config FILE            let the evictor remove again
+  cline rollback --config FILE [--ns NS] [--clear] [--force]
+                                          count, and then remove, the documents
+                                          the archive holds marked deleted, so it
+                                          can be read directly again
   cline version
 
 Every subcommand takes --log-file PATH to append logs to a file instead of
@@ -101,6 +105,8 @@ func run() error {
 		return runIndexes(os.Args[2:])
 	case "cache":
 		return runCache(os.Args[2:])
+	case "rollback":
+		return runRollback(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil

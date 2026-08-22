@@ -1689,12 +1689,24 @@ answer and a client reading the cluster directly does not.
 
 Measured: three documents in the collection, one of them deleted through the
 router, and the original cluster answering `countDocuments({})` with 3 where the
-router answers 2. Clear them per tiered namespace before you point anything at
-it, and the count agrees again:
+router answers 2.
+
+`cline rollback` counts them, across every tiered namespace, and clears them
+when you ask:
 
 ```
-db.getSiblingDB("app").orders.deleteMany({_tcDeletedAt: {$exists: true}})
+cline rollback --config /etc/cline.yaml
+  app.orders                               2 marked deleted
+
+cline rollback --config /etc/cline.yaml --clear
+  app.orders                               cleared 2
 ```
+
+**Stop the application and the feeder first.** A delete that reaches the archive
+after the clear writes another mark, so clearing while anything is still writing
+leaves you where you started, and the command refuses while a feeder is
+publishing rather than letting you find that out afterwards. `--force` overrides
+it if you know nothing is writing.
 
 **13. Run more than one router by naming them all, not by hiding them.** A read
 the fast tier cannot answer is served from a cursor the router owns in its own
