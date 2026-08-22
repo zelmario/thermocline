@@ -80,7 +80,8 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 
 		mark, known := c.r.completeness(ctx, ns)
 		if known && mark.Claimed {
-			if bound, bounded := lowerTimeBound(fdoc); bounded && mark.Complete(bound) {
+			af, aok := c.r.ageFieldOf(ns)
+			if bound, bounded := lowerTimeBound(fdoc, af, aok); bounded && mark.Complete(bound) {
 				continue
 			} else if !bounded && mark.CoversAll() {
 				continue

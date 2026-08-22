@@ -779,7 +779,8 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 
 	mark, known := c.r.completeness(ctx, judged)
 	if known && mark.Claimed {
-		bound, bounded := boundOfQueryField(cmd)
+		af, aok := c.r.ageFieldOf(judged)
+		bound, bounded := boundOfQueryField(cmd, af, aok)
 		if (bounded && mark.Complete(bound)) || (!bounded && mark.CoversAll()) {
 			return nil, false
 		}
@@ -870,7 +871,7 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 
 // boundOfQueryField reads a lower time bound from the `query` field that count
 // and distinct use in place of find's `filter`.
-func boundOfQueryField(cmd bson.Raw) (time.Time, bool) {
+func boundOfQueryField(cmd bson.Raw, ageField string, known bool) (time.Time, bool) {
 	val, err := cmd.LookupErr("query")
 	if err != nil {
 		return time.Time{}, false
@@ -879,7 +880,7 @@ func boundOfQueryField(cmd bson.Raw) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	return lowerTimeBound(doc)
+	return lowerTimeBound(doc, ageField, known)
 }
 
 // answerSimpleFromArchive runs a count or distinct against the archive and

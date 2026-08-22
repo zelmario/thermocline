@@ -92,56 +92,44 @@ stopDaemons
 sed 's/^  listen:/  terminate_auth: true\n  listen:/' $BASE > $POOLCFG
 chk "the pooled config asks for terminated authentication" "1" "$(grep -c 'terminate_auth: true' $POOLCFG)"
 
-# What the counter does while nothing is being measured.
-#
-# conns() is the primary's total across every client it has, which is what makes
-# the two arms below comparable. It also means that under a parallel sweep the
-# other workers' daemons connect and disconnect inside the measurement window
-# and land in the delta. Measured: this suite reported 8 extra connections for 8
-# idle pooled clients during a four worker run and 0 for the same clients on an
-# idle machine, and failed on the drift rather than on the pooling.
-#
-# So the drift is measured over the same interval the arms use and taken off
-# both. It is not constant, but it moves the check from failing whenever
-# anything else runs to failing only when the drift is unusual.
-settle() {
-  local b; b=$(conns); sleep 6
-  local d=$(( $(conns) - b )); [ "$d" -lt 0 ] && d=0
-  echo "$d"
-}
-
 echo "== with authentication terminated, idle clients share =="
 startRouter $POOLCFG
-NOISE=$(settle)
 BEFORE=$(conns)
 holdClients
-POOLED=$(( $(conns) - BEFORE - NOISE )); [ "$POOLED" -lt 0 ] && POOLED=0
+POOLED=$(( $(conns) - BEFORE ))
 dropClients
 stopDaemons
-echo "      $CLIENTS idle clients cost $POOLED extra connections to the primary (drift $NOISE)"
-# Well under one each is the claim. Not zero exactly: a client that happens to be
-# mid-command holds one, and the pool keeps a few spares.
-chk "idle clients do not each hold a connection"       "true" \
-    "$(awk -v n="$POOLED" -v c="$CLIENTS" 'BEGIN{print (n+0 < c+0) ? "true" : "false"}')"
+echo "      $CLIENTS idle clients cost $POOLED extra connections to the primary"
+# Judged below, against the proxied arm, because that is the claim and because
+# both arms carry the same noise.
+#
+# conns() is the primary's total across every client it has, which is what makes
+# the two arms comparable and also means other work on the cluster lands in the
+# delta. Measured under a parallel sweep: the pooled arm read 0 and 8 on
+# different runs, and the proxied arm 50, 32 and 17. An absolute threshold fails
+# on the first kind of noise; subtracting a separately measured drift, which was
+# the first attempt at this, fails on the second: a drift sample of 15 turned a
+# proxied reading of 17 into 2 and the control failed instead.
 
 echo "== with authentication proxied, they do not =="
 # The control. Without this the numbers above could mean the clients never
 # connected, or that the counting query counts nothing.
 startRouter $BASE
-NOISE=$(settle)
 BEFORE=$(conns)
 holdClients
-PROXIED=$(( $(conns) - BEFORE - NOISE )); [ "$PROXIED" -lt 0 ] && PROXIED=0
+PROXIED=$(( $(conns) - BEFORE ))
 dropClients
 stopDaemons
-echo "      $CLIENTS idle clients cost $PROXIED extra connections to the primary (drift $NOISE)"
+echo "      $CLIENTS idle clients cost $PROXIED extra connections to the primary"
 # One each, which is the limitation this change exists to lift. Checked as most
 # of them rather than exactly all, because the count moves for reasons that have
 # nothing to do with this.
 chk "proxied clients each hold one"                    "true" \
     "$(awk -v p="$PROXIED" -v c="$CLIENTS" 'BEGIN{print (p+0 >= c+0-1) ? "true" : "false"}')"
-chk "and pooling is measurably cheaper"                "true" \
-    "$(awk -v p="$PROXIED" -v n="$POOLED" 'BEGIN{print (n+0 < p+0) ? "true" : "false"}')"
+# The claim, stated as the comparison it is: pooled costs a fraction of proxied,
+# not merely one connection less.
+chk "and pooled clients cost a fraction of that"       "true" \
+    "$(awk -v p="$PROXIED" -v n="$POOLED" 'BEGIN{print (n+0 * 2 < p+0) ? "true" : "false"}')"
 
 echo "== and a transaction keeps the connection it started on =="
 startRouter $POOLCFG

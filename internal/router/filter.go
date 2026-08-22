@@ -48,14 +48,27 @@ func idFromFilter(filter bson.Raw) (bson.RawValue, bool) {
 }
 
 // lowerTimeBound returns the earliest instant a filter can match, when that can
-// be read from the filter itself.
+// be read from the filter itself, in the dimension the namespace is tiered by.
 //
-// Two shapes are recognised: a bound on _id, which carries a timestamp when it
-// is an ObjectId, and a bound on a date field. A query with neither is
-// unbounded and could match anything, including documents that have left the
-// fast tier.
-func lowerTimeBound(filter bson.Raw) (time.Time, bool) {
-	if len(filter) == 0 {
+// The field matters and used to be ignored. A completeness claim says the fast
+// tier holds every document newer than an instant, and "newer" is measured the
+// way the rules measure age: a date field, or the timestamp inside a default
+// ObjectId. A bound on any other date is a bound in a different dimension and
+// says nothing about which documents are here.
+//
+// Measured on a collection tiered by createdAt, claimed complete for the last
+// thirty days, holding one recent order on the fast tier and a two year old one
+// in the archive, both shipped yesterday. The query
+// {shippedAt: {$gte: two days ago}} was read as bounded two days back, judged
+// inside the claim, answered from the fast tier alone, and returned 1 where the
+// archive holds 2. No error, and the number looked reasonable.
+//
+// So the bound has to come from the field the age comes from. Anything else is
+// unbounded, which sends the read to the archive: slower, and right.
+func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bool) {
+	if len(filter) == 0 || !known {
+		// Nothing says how this namespace ages, so nothing can say which
+		// dimension a claim about it is in.
 		return time.Time{}, false
 	}
 	elems, err := filter.Elements()
@@ -63,9 +76,19 @@ func lowerTimeBound(filter bson.Raw) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
+	// An empty ageField means the age is the timestamp inside the _id, which is
+	// the shape a rule with no date_field uses.
+	want := ageField
+	if want == "" {
+		want = "_id"
+	}
+
 	var best time.Time
 	var found bool
 	for _, e := range elems {
+		if e.Key() != want {
+			continue
+		}
 		t, ok := boundOf(e.Value())
 		if !ok {
 			continue
@@ -207,4 +230,11 @@ func writeFailed(reply bson.Raw) bool {
 	}
 	vals, err := arr.Values()
 	return err == nil && len(vals) > 0
+}
+
+// ageFieldOf is the field a namespace's age is read from, and whether anything
+// says. Everything that judges a query against a completeness claim asks this,
+// so the claim and the bound are always read in the same dimension.
+func (r *Router) ageFieldOf(ns string) (string, bool) {
+	return r.cfg.AgeField(ns)
 }

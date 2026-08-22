@@ -27,7 +27,7 @@ func TestCountDocumentsIsSeenAsAnAggregation(t *testing.T) {
 		bson.D{{Key: "$match", Value: bson.D{{Key: "status", Value: "paid"}}}},
 		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: nil}}}},
 	})
-	s, ok := scopeOfAggregate(cmd, "shop")
+	s, ok := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 	if !ok {
 		t.Fatal("scopeOfAggregate refused to read a countDocuments pipeline")
 	}
@@ -48,7 +48,7 @@ func TestLeadingMatchBoundsTheScan(t *testing.T) {
 		}}},
 		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$status"}}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 	if !s.bounded {
 		t.Fatal("a leading $match with $gte was not read as a bound")
 	}
@@ -67,7 +67,7 @@ func TestMatchAfterAnotherStageIsNotABound(t *testing.T) {
 			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: from}}},
 		}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 	if s.bounded {
 		t.Error("a $match behind a $sort was read as bounding the scan, which lets a full scan report as bounded")
 	}
@@ -86,7 +86,7 @@ func TestJoinedCollectionsAreCollected(t *testing.T) {
 		bson.D{{Key: "$unionWith", Value: "returns"}},
 		bson.D{{Key: "$graphLookup", Value: bson.D{{Key: "from", Value: "referrals"}}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 
 	want := map[string]bool{"shop.customers": false, "shop.returns": false, "shop.referrals": false}
 	for _, ns := range s.secondary {
@@ -111,7 +111,7 @@ func TestUnionWithObjectForm(t *testing.T) {
 			{Key: "pipeline", Value: bson.A{}},
 		}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 	if len(s.secondary) != 1 || s.secondary[0] != "shop.archive_orders" {
 		t.Errorf("secondary = %v, want [shop.archive_orders]", s.secondary)
 	}
@@ -137,7 +137,7 @@ func TestNestedJoinsAreFound(t *testing.T) {
 			}},
 		}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 
 	want := map[string]bool{"shop.customers": false, "shop.returns": false, "shop.refunds": false}
 	for _, ns := range s.secondary {
@@ -163,7 +163,7 @@ func TestOnlyRealSubPipelinesAreFollowed(t *testing.T) {
 			{Key: "from", Value: "alsonot"},
 		}}},
 	})
-	s, _ := scopeOfAggregate(cmd, "shop")
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 	if len(s.secondary) != 0 {
 		t.Errorf("secondary = %v, want none: those are field names, not collections", s.secondary)
 	}
@@ -176,7 +176,7 @@ func TestWritingStagesAreFlagged(t *testing.T) {
 		cmd := aggCmd(t, "orders", bson.A{
 			bson.D{{Key: stage, Value: "summary"}},
 		})
-		s, _ := scopeOfAggregate(cmd, "shop")
+		s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
 		if !s.writes {
 			t.Errorf("%s was not recognised as writing its result", stage)
 		}
@@ -193,7 +193,7 @@ func TestDatabaseLevelAggregateHasNoScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if _, ok := scopeOfAggregate(raw, "admin"); ok {
+	if _, ok := scopeOfAggregate(raw, "admin", tieredByCreatedAt); ok {
 		t.Error("aggregate:1 was given a namespace to be complete about")
 	}
 }
@@ -207,7 +207,7 @@ func TestMetadataPipelinesAreNotCompletenessChecked(t *testing.T) {
 			bson.D{{Key: stage, Value: bson.D{}}},
 			bson.D{{Key: "$project", Value: bson.D{{Key: "storageStats", Value: 1}}}},
 		})
-		if _, ok := scopeOfAggregate(cmd, "shop"); ok {
+		if _, ok := scopeOfAggregate(cmd, "shop", tieredByCreatedAt); ok {
 			t.Errorf("%s was treated as reading documents, so it would be refused when the fast tier is short", stage)
 		}
 	}
@@ -216,7 +216,13 @@ func TestMetadataPipelinesAreNotCompletenessChecked(t *testing.T) {
 // A $match at the head still bounds a real read, so the exemption must not leak.
 func TestOrdinaryPipelineStillChecked(t *testing.T) {
 	cmd := aggCmd(t, "orders", bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "x", Value: 1}}}}})
-	if _, ok := scopeOfAggregate(cmd, "shop"); !ok {
+	if _, ok := scopeOfAggregate(cmd, "shop", tieredByCreatedAt); !ok {
 		t.Error("an ordinary pipeline stopped being completeness checked")
 	}
 }
+
+// The namespaces in this file are tiered by created_at, which is what their
+// $match bounds are written against. lowerTimeBound only reads a bound from the
+// field a namespace ages by, so a test that did not say would be asserting that
+// nothing is ever bounded.
+func tieredByCreatedAt(string) (string, bool) { return "created_at", true }

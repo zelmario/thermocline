@@ -170,6 +170,25 @@ type RouterConfig struct {
 	// demanding a completeness claim for it would refuse perfectly good queries.
 	// Empty means every namespace is managed, matching the feeder.
 	Managed []string `yaml:"-"`
+
+	// TieredBy names, for each managed namespace, the field its age is read
+	// from. An entry present and empty means the timestamp inside a default
+	// ObjectId, which is what a rule with no date_field uses. A namespace with
+	// no entry has no rule saying how it ages.
+	//
+	// The router needs this to read a query's lower bound honestly. A
+	// completeness claim says the fast tier holds every document newer than an
+	// instant, and "newer" is measured in the dimension the rules tier by. A
+	// bound on any other date field is a bound in a different dimension and
+	// proves nothing: see lowerTimeBound.
+	TieredBy map[string]string `yaml:"-"`
+}
+
+// AgeField reports the field a namespace's age is read from, and whether
+// anything says. An empty name with ok true means the ObjectId timestamp.
+func (r RouterConfig) AgeField(ns string) (string, bool) {
+	f, ok := r.TieredBy[ns]
+	return f, ok
 }
 
 // Manages reports whether ns is one of the namespaces Thermocline tiers.
@@ -390,6 +409,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
 	cfg.Router.FeederID = cfg.Feeder.ID
+	cfg.Router.TieredBy = tieringFields(cfg)
 	// The router's own account, taken from the fast tier connection string
 	// rather than configured a second time. With terminate_auth on, the raw
 	// upstream connection is the router's rather than the client's, so the
@@ -757,4 +777,36 @@ func credentialsFromURI(uri string) (user, pass, authDB string) {
 		}
 	}
 	return user, pass, authDB
+}
+
+// tieringFields reads, for each namespace with a rule, the field its age comes
+// from.
+//
+// The evictor and the warmer each name one, and they are meant to agree: they
+// are two halves of the same decision about which documents belong on the fast
+// tier. When they do not, the namespace is left out rather than guessed at. A
+// claim about "everything newer than T" measured one way and a query bounded
+// the other way have no relation, and the honest answer is that nothing here
+// knows which dimension the claim is in.
+func tieringFields(c Config) map[string]string {
+	out := map[string]string{}
+	disagreed := map[string]bool{}
+	note := func(ns, field string) {
+		if disagreed[ns] {
+			return
+		}
+		if seen, ok := out[ns]; ok && seen != field {
+			delete(out, ns)
+			disagreed[ns] = true
+			return
+		}
+		out[ns] = field
+	}
+	for _, r := range c.Evictor.Rules {
+		note(r.NS, r.DateField)
+	}
+	for _, r := range c.Warmer.Rules {
+		note(r.NS, r.DateField)
+	}
+	return out
 }

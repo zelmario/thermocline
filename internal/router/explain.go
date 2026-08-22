@@ -95,7 +95,7 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 	name := elems[0].Key()
 
 	if name == "aggregate" {
-		scope, sok := scopeOfAggregate(inner, db)
+		scope, sok := scopeOfAggregate(inner, db, c.r.ageFieldOf)
 		if !sok {
 			return "", false
 		}
@@ -141,7 +141,8 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 		return "nothing has recorded that the fast tier is complete for " + judged, true
 	}
 
-	bound, bounded := explainBound(inner, name)
+	af, aok := c.r.ageFieldOf(judged)
+	bound, bounded := explainBound(inner, name, af, aok)
 	switch {
 	case bounded && mark.Complete(bound):
 		return "", false
@@ -158,7 +159,7 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 
 // explainBound reads the lower time bound out of whichever field this command
 // keeps its selector in.
-func explainBound(inner bson.Raw, name string) (bound time.Time, bounded bool) {
+func explainBound(inner bson.Raw, name, ageField string, known bool) (bound time.Time, bounded bool) {
 	field := "filter"
 	if name != "find" {
 		field = "query"
@@ -167,7 +168,7 @@ func explainBound(inner bson.Raw, name string) (bound time.Time, bounded bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	return lowerTimeBound(doc)
+	return lowerTimeBound(doc, ageField, known)
 }
 
 // inlineExplain reports whether a command plans instead of running.

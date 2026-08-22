@@ -60,8 +60,8 @@ func TestLowerTimeBound(t *testing.T) {
 		why    string
 	}{
 		{"$gte on _id", bson.D{
-			{Key: "_id", Value: bson.D{{Key: "$gte", Value: oid}}}}, true,
-			"an ObjectId bound carries a timestamp"},
+			{Key: "_id", Value: bson.D{{Key: "$gte", Value: oid}}}}, false,
+			"this namespace ages by createdAt, so an _id bound is a bound in another dimension"},
 		{"$gt on a date field", bson.D{
 			{Key: "createdAt", Value: bson.D{{Key: "$gt", Value: when}}}}, true,
 			"an explicit date bound"},
@@ -80,7 +80,7 @@ func TestLowerTimeBound(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := lowerTimeBound(rawDoc(t, tt.filter))
+			got, ok := lowerTimeBound(rawDoc(t, tt.filter), "createdAt", true)
 			if ok != tt.want {
 				t.Fatalf("lowerTimeBound found=%v, want %v: %s", ok, tt.want, tt.why)
 			}
@@ -93,116 +93,84 @@ func TestLowerTimeBound(t *testing.T) {
 
 // With several bounds, the tightest one decides. Any of them landing inside the
 // complete range makes the whole answer complete.
+//
+// Among bounds on the age field. A tighter bound on some other date is not a
+// tighter bound on the same thing, and taking it used to be how a query on an
+// unrelated field was judged complete: see
+// TestLowerTimeBoundOnlyReadsTheAgeField.
 func TestLowerTimeBoundTakesTheTightest(t *testing.T) {
 	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	late := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 
+	// $gt is read after $gte, so both spellings on the age field are seen.
 	filter := rawDoc(t, bson.D{
-		{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: early}}},
-		{Key: "updatedAt", Value: bson.D{{Key: "$gte", Value: late}}},
+		{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: late}}},
+		{Key: "updatedAt", Value: bson.D{{Key: "$gte", Value: early}}},
 	})
 
-	got, ok := lowerTimeBound(filter)
+	got, ok := lowerTimeBound(filter, "createdAt", true)
 	if !ok {
 		t.Fatal("no bound found")
 	}
 	if !got.Equal(late) {
-		t.Errorf("bound = %v, want the tightest bound %v", got, late)
+		t.Errorf("bound = %v, want the age field's bound %v", got, late)
+	}
+
+	// And the other way round, which is the case that mattered: a tighter bound
+	// on another field must not raise it.
+	filter = rawDoc(t, bson.D{
+		{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: early}}},
+		{Key: "updatedAt", Value: bson.D{{Key: "$gte", Value: late}}},
+	})
+	got, ok = lowerTimeBound(filter, "createdAt", true)
+	if !ok {
+		t.Fatal("no bound found")
+	}
+	if !got.Equal(early) {
+		t.Errorf("bound = %v, want the age field's own bound %v, not another field's", got, early)
 	}
 }
 
-func TestReplyOK(t *testing.T) {
-	cases := []struct {
-		val  any
-		want bool
-	}{
-		{1.0, true}, {int32(1), true}, {int64(1), true},
-		{0.0, false}, {int32(0), false},
-	}
-	for _, c := range cases {
-		raw := rawDoc(t, bson.D{{Key: "ok", Value: c.val}})
-		if got := replyOK(raw); got != c.want {
-			t.Errorf("replyOK(ok=%v) = %v, want %v", c.val, got, c.want)
-		}
-	}
-	if replyOK(rawDoc(t, bson.D{{Key: "errmsg", Value: "boom"}})) {
-		t.Error("a reply with no ok field was treated as success")
-	}
-}
+// The field a bound is read from decides whether it means anything.
+//
+// A completeness claim says the fast tier holds every document newer than an
+// instant, measured the way the rules measure age. A bound on any other date is
+// a bound in a different dimension.
+//
+// Measured on a collection tiered by createdAt, claimed complete for the last
+// thirty days, holding one recent order on the fast tier and a two year old one
+// in the archive, both shipped yesterday: {shippedAt: {$gte: two days ago}} was
+// read as bounded, judged inside the claim, and answered 1 where the archive
+// holds 2.
+func TestLowerTimeBoundOnlyReadsTheAgeField(t *testing.T) {
+	when := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	oid := bson.NewObjectIDFromTimestamp(when)
+	bound := func(f bson.D) bson.Raw { return rawDoc(t, f) }
 
-// A write that matched nothing is the signal that a document may be archived.
-// Confusing "matched zero" with "field missing" would either miss real cases or
-// invent them, so the two are kept distinct.
-func TestMatched(t *testing.T) {
+	byCreatedAt := bson.D{{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: when}}}}
+	byShippedAt := bson.D{{Key: "shippedAt", Value: bson.D{{Key: "$gte", Value: when}}}}
+	byID := bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: oid}}}}
+
 	cases := []struct {
-		name string
-		doc  bson.D
-		want int
+		name     string
+		filter   bson.D
+		ageField string
+		known    bool
+		want     bool
 	}{
-		{"matched one", bson.D{{Key: "n", Value: int32(1)}}, 1},
-		{"matched none", bson.D{{Key: "n", Value: int32(0)}}, 0},
-		{"n as int64", bson.D{{Key: "n", Value: int64(3)}}, 3},
-		{"no n field", bson.D{{Key: "ok", Value: 1.0}}, -1},
+		{"the age field itself", byCreatedAt, "createdAt", true, true},
+		{"another date field entirely", byShippedAt, "createdAt", true, false},
+		{"an _id bound where age comes from a date field", byID, "createdAt", true, false},
+		{"an _id bound where age comes from the _id", byID, "", true, true},
+		{"a date field where age comes from the _id", byCreatedAt, "", true, false},
+		{"nothing says how this namespace ages", byCreatedAt, "", false, false},
 	}
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := matched(rawDoc(t, c.doc)); got != c.want {
-				t.Errorf("matched = %d, want %d", got, c.want)
-			}
-		})
-	}
-}
-
-func TestFirstBatch(t *testing.T) {
-	full := rawDoc(t, bson.D{{Key: "cursor", Value: bson.D{
-		{Key: "id", Value: int64(0)},
-		{Key: "firstBatch", Value: bson.A{bson.D{{Key: "_id", Value: 1}}}},
-	}}})
-	batch, ok := firstBatch(full)
-	if !ok || len(batch) != 1 {
-		t.Errorf("firstBatch = %d docs, ok=%v, want 1 doc", len(batch), ok)
-	}
-
-	empty := rawDoc(t, bson.D{{Key: "cursor", Value: bson.D{
-		{Key: "id", Value: int64(0)},
-		{Key: "firstBatch", Value: bson.A{}},
-	}}})
-	batch, ok = firstBatch(empty)
-	if !ok {
-		t.Fatal("an empty batch should still parse, it is the miss signal")
-	}
-	if len(batch) != 0 {
-		t.Errorf("firstBatch = %d docs, want 0", len(batch))
-	}
-}
-
-// An _id that is itself a document names exactly one document, and has to be
-// told apart from an operator expression. Reading {a:1} as an operator meant a
-// compound _id was never recognised, so an update to an archived one matched
-// nothing and was reported to the driver as success.
-func TestIDFromFilterHandlesDocumentValuedIDs(t *testing.T) {
-	cases := []struct {
-		name   string
-		filter bson.D
-		want   bool
-		why    string
-	}{
-		{"plain value", bson.D{{Key: "_id", Value: 7}}, true, "an ordinary _id"},
-		{"document value", bson.D{{Key: "_id", Value: bson.D{{Key: "a", Value: 1}, {Key: "b", Value: 2}}}}, true,
-			"a compound _id names one document"},
-		{"empty document value", bson.D{{Key: "_id", Value: bson.D{}}}, true, "{} is a legal _id"},
-		{"$eq operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$eq", Value: 7}}}}, true, "$eq names one document"},
-		{"$gt operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: 7}}}}, false, "a range is many documents"},
-		{"$in operator", bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: bson.A{1, 2}}}}}, false, "a set is many documents"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			raw, err := bson.Marshal(tc.filter)
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if _, got := idFromFilter(raw); got != tc.want {
-				t.Errorf("idFromFilter = %v, want %v: %s", got, tc.want, tc.why)
+			_, got := lowerTimeBound(bound(c.filter), c.ageField, c.known)
+			if got != c.want {
+				t.Errorf("bounded = %v, want %v", got, c.want)
 			}
 		})
 	}

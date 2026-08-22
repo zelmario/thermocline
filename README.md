@@ -242,6 +242,24 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A completeness claim only covers a query bounded in the same dimension.** The
+  claim says the fast tier holds every document newer than an instant, and
+  "newer" is measured the way your rules measure age: the `date_field`, or the
+  timestamp inside a default ObjectId. A `$gte` on any other date is a bound in
+  a different dimension and says nothing about which documents are here, so it
+  is read as unbounded and the query goes to the archive.
+
+  Measured on a collection aged by `createdAt`, claimed complete for the last
+  thirty days, holding a recent order on the fast tier and a two year old one in
+  the archive, both shipped yesterday. Before this,
+  `{shippedAt: {$gte: two days ago}}` was read as bounded two days back, judged
+  inside the claim, and answered 1 where the archive holds 2. No error, and the
+  number looked reasonable.
+
+  A namespace with no evictor or warmer rule, or with two rules that disagree
+  about which field it ages by, has no dimension anything can name, so its
+  bounded queries go to the archive too. `--complete-all` is unaffected: a claim
+  on all of history needs no bound.
 - **The feeder stops when its resume point is gone, rather than retrying.** If it
   is down long enough for the fast tier's oplog to roll past its checkpoint, the
   writes made in that window are on the fast tier and not in the archive, and

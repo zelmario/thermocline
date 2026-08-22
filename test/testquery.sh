@@ -245,6 +245,56 @@ sleep 7
 chk "the same join answers once the tier is whole"     "true" \
     "$([ "$(R "print(db.getSiblingDB(process.env.TC_DB).tqjoin.aggregate([{\$lookup:{from:'vqview',localField:'grp',foreignField:'grp',as:'h'}}]).toArray()[0].h.length)")" != "REFUSED" ] && echo true || echo false)"
 
+echo "== a bound on a field the collection is not aged by =="
+# A completeness claim says the fast tier holds every document newer than an
+# instant, and "newer" is measured the way the rules measure age: a date field,
+# or the timestamp inside a default ObjectId. A bound on any other date is a
+# bound in a different dimension and proves nothing about which documents are
+# here.
+#
+# Measured before this: a collection aged by createdAt, claimed complete for the
+# last thirty days, holding a recent order on the fast tier and a two year old
+# one in the archive, both shipped yesterday. The query
+# {shippedAt: {$gte: two days ago}} was read as bounded two days back, judged
+# inside the claim, answered from the fast tier alone, and returned 1 where the
+# archive holds 2. No error, and the number looked reasonable.
+BNS=tqbound
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})" >/dev/null
+YEARS=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=730)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+DAYAGO=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+FROM=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+TWODAY=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+# The archive holds both. The fast tier holds only the recent one, which is what
+# a collection aged by createdAt looks like.
+C "db.getSiblingDB(process.env.TC_DB).$BNS.insertMany([
+     {_id:1, createdAt:new Date('$YEARS'),  shippedAt:new Date('$DAYAGO'), n:'old, shipped yesterday'},
+     {_id:2, createdAt:new Date(),          shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$BNS.insertOne(
+     {_id:2, createdAt:new Date(), shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'})" >/dev/null
+startRouter
+cline watermark --config $CFG --ns $DB.$BNS --complete-from "$FROM" >/dev/null
+sleep 7
+chk "the tiers hold different amounts of it"     "2/1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")"
+# The archive is the control: whatever it answers is the right answer.
+chk "a bound on shippedAt answers like the archive" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({shippedAt:{\$gte:new Date('$TWODAY')}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({shippedAt:{\$gte:new Date('$TWODAY')}}))")"
+# And the claim still has to be worth something: a bound on the field the
+# collection really is aged by is answered from the fast tier, as before.
+chk "a bound on createdAt answers like the archive too" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$gte:new Date('$TWODAY')}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$gte:new Date('$TWODAY')}}))")"
+chk "and an unbounded query does as well"        \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

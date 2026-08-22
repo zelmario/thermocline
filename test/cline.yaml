@@ -52,6 +52,9 @@ feeder:
     - "shop.tddlcap2"
     # testsingle.sh: the collection a sorted findAndModify picks from.
     - "shop.tssort"
+    # testquery.sh: aged by createdAt, so a bound on another date field must not
+    # be read as covering the completeness claim.
+    - "shop.tqbound"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.
@@ -205,6 +208,11 @@ evictor:
       older_than: 40m
     - ns: "shop.tcs"
       older_than: 40m
+    # testquery.sh: aged by a date field rather than by the _id, so a bound on
+    # some other date is a bound in a different dimension.
+    - ns: "shop.tqbound"
+      older_than: 40m
+      date_field: "createdAt"
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05
@@ -229,6 +237,9 @@ warmer:
     # that answers changes underneath the application while the cache is on.
     - ns: "shop.tcadopt"
       back: 40m
+    - ns: "shop.tqbound"
+      back: 40m
+      date_field: "createdAt"
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05

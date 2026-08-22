@@ -67,7 +67,11 @@ type aggScope struct {
 //
 // ok is false when there is no collection to be complete about, which is the
 // database-level `aggregate: 1` form behind $currentOp and $listLocalSessions.
-func scopeOfAggregate(cmd bson.Raw, db string) (aggScope, bool) {
+//
+// ageOf says which field a namespace's age is read from, because a $match's
+// lower bound only bears on a completeness claim when the two are measured the
+// same way. See lowerTimeBound.
+func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)) (aggScope, bool) {
 	coll, ok := stringField(cmd, "aggregate")
 	if !ok {
 		return aggScope{}, false
@@ -107,7 +111,8 @@ func scopeOfAggregate(cmd bson.Raw, db string) (aggScope, bool) {
 
 		if i == 0 && name == "$match" {
 			if mdoc, ok := val.DocumentOK(); ok {
-				s.bound, s.bounded = lowerTimeBound(mdoc)
+				af, aok := ageOf(s.primary)
+				s.bound, s.bounded = lowerTimeBound(mdoc, af, aok)
 				s.match = mdoc
 			}
 		}
@@ -277,7 +282,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		return nil, false
 	}
 
-	scope, ok := scopeOfAggregate(cmd, db)
+	scope, ok := scopeOfAggregate(cmd, db, c.r.ageFieldOf)
 	if !ok {
 		return nil, false
 	}

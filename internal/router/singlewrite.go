@@ -53,7 +53,8 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort 
 	// anywhere. This is the same claim the read path trusts, and it keeps the
 	// cost of this at zero for a collection that has been fully warmed.
 	if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed {
-		if bound, bounded := lowerTimeBound(filter); bounded && mark.Complete(bound) {
+		af, known := c.r.ageFieldOf(ns)
+		if bound, bounded := lowerTimeBound(filter, af, known); bounded && mark.Complete(bound) {
 			return bson.RawValue{}, false, nil
 		} else if !bounded && mark.CoversAll() {
 			return bson.RawValue{}, false, nil
@@ -158,7 +159,8 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	}
 
 	if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed {
-		if bound, bounded := lowerTimeBound(fdoc); bounded && mark.Complete(bound) {
+		af, aok := c.r.ageFieldOf(ns)
+		if bound, bounded := lowerTimeBound(fdoc, af, aok); bounded && mark.Complete(bound) {
 			return nil, false
 		} else if !bounded && mark.CoversAll() {
 			return nil, false

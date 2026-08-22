@@ -340,7 +340,8 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	mark, known := c.r.completeness(ctx, judged)
 
 	if known && mark.Claimed {
-		bound, bounded := lowerTimeBound(filter)
+		af, aok := c.r.ageFieldOf(judged)
+		bound, bounded := lowerTimeBound(filter, af, aok)
 		switch {
 		case bounded && mark.Complete(bound):
 			return reply, nil
