@@ -92,14 +92,33 @@ stopDaemons
 sed 's/^  listen:/  terminate_auth: true\n  listen:/' $BASE > $POOLCFG
 chk "the pooled config asks for terminated authentication" "1" "$(grep -c 'terminate_auth: true' $POOLCFG)"
 
+# What the counter does while nothing is being measured.
+#
+# conns() is the primary's total across every client it has, which is what makes
+# the two arms below comparable. It also means that under a parallel sweep the
+# other workers' daemons connect and disconnect inside the measurement window
+# and land in the delta. Measured: this suite reported 8 extra connections for 8
+# idle pooled clients during a four worker run and 0 for the same clients on an
+# idle machine, and failed on the drift rather than on the pooling.
+#
+# So the drift is measured over the same interval the arms use and taken off
+# both. It is not constant, but it moves the check from failing whenever
+# anything else runs to failing only when the drift is unusual.
+settle() {
+  local b; b=$(conns); sleep 6
+  local d=$(( $(conns) - b )); [ "$d" -lt 0 ] && d=0
+  echo "$d"
+}
+
 echo "== with authentication terminated, idle clients share =="
 startRouter $POOLCFG
+NOISE=$(settle)
 BEFORE=$(conns)
 holdClients
-POOLED=$(( $(conns) - BEFORE ))
+POOLED=$(( $(conns) - BEFORE - NOISE )); [ "$POOLED" -lt 0 ] && POOLED=0
 dropClients
 stopDaemons
-echo "      $CLIENTS idle clients cost $POOLED extra connections to the primary"
+echo "      $CLIENTS idle clients cost $POOLED extra connections to the primary (drift $NOISE)"
 # Well under one each is the claim. Not zero exactly: a client that happens to be
 # mid-command holds one, and the pool keeps a few spares.
 chk "idle clients do not each hold a connection"       "true" \
@@ -109,12 +128,13 @@ echo "== with authentication proxied, they do not =="
 # The control. Without this the numbers above could mean the clients never
 # connected, or that the counting query counts nothing.
 startRouter $BASE
+NOISE=$(settle)
 BEFORE=$(conns)
 holdClients
-PROXIED=$(( $(conns) - BEFORE ))
+PROXIED=$(( $(conns) - BEFORE - NOISE )); [ "$PROXIED" -lt 0 ] && PROXIED=0
 dropClients
 stopDaemons
-echo "      $CLIENTS idle clients cost $PROXIED extra connections to the primary"
+echo "      $CLIENTS idle clients cost $PROXIED extra connections to the primary (drift $NOISE)"
 # One each, which is the limitation this change exists to lift. Checked as most
 # of them rather than exactly all, because the count moves for reasons that have
 # nothing to do with this.

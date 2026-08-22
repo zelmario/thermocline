@@ -48,17 +48,16 @@ chkv "no feeder is running" "0" "$(pgrep -cf "cline feeder --config $WDIR/" || t
 # A warm window wider than the eviction cutoff, so both address the same
 # document. That is what "the hot window is too small" means, and it is the
 # configuration the pilot was running when this was found.
-# The warmer's own file, warming 24h back. Its evictor cutoff moves out to match
-# so the file itself is legal: a single config that warms past its own eviction
-# cutoff is refused outright, because the two rules are instructions about the
-# same documents and the components obey them both.
+# The warmer's own file, warming 24h back, against an evictor running from $CFG
+# and removing anything over 40m. Two files rather than one because that is how
+# these run: separate daemons, and an operator can give them windows that
+# contradict each other without either file looking wrong. The rule about
+# announcements has to hold when they do.
 #
-# That refusal only reaches as far as one file. The evictor and the warmer are
-# separate daemons and can be given separate configs, each legal on its own and
-# contradictory together, which is what this section arranges: the evictor runs
-# from $CFG and removes anything over 40m, the warmer runs from this one and
-# copies the last 24h back. Nothing can stop an operator doing that, so the rule
-# about announcements has to hold when they do.
+# The evictor cutoff in this file moves out to match its warm window, so the
+# file says one thing rather than two. A config that warms past its own eviction
+# cutoff is not refused, it is warned about, because it costs the same documents
+# being copied up and removed again rather than a wrong answer.
 sed -e '/^warmer:/,/^router:/ s|^      back: 40m|      back: 24h|' \
     -e '/^evictor:/,/^warmer:/ s|^      older_than: 40m|      older_than: 24h|' \
     $CFG > $WDIR/notice_wide.yaml

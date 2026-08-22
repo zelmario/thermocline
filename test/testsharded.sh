@@ -90,9 +90,8 @@ evictor:
       older_than: 1m
 # The warmer validates its own config before it connects, so without a rule it
 # stops on that and never reaches the question this suite is asking. The window
-# matches the eviction cutoff for the same reason: a warm reaching past it is
-# refused, and this suite would then report that refusal instead of the one it
-# is asking about.
+# matches the eviction cutoff so the startup is quiet: a warm reaching past it
+# is warned about, and the noise belongs to a different question than this one.
 warmer:
   rules:
     - ns: "probe.tiered"

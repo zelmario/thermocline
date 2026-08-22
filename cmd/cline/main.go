@@ -132,6 +132,7 @@ func runFeeder(args []string) error {
 		return err
 	}
 	defer closeLog()
+	warnAboutWindows(log, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -185,6 +186,7 @@ func runEvictor(args []string) error {
 		return err
 	}
 	defer closeLog()
+	warnAboutWindows(log, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -242,6 +244,7 @@ func runWarmer(args []string) error {
 		return err
 	}
 	defer closeLog()
+	warnAboutWindows(log, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -290,6 +293,7 @@ func runRouter(args []string) error {
 		return err
 	}
 	defer closeLog()
+	warnAboutWindows(log, cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -495,5 +499,22 @@ func kindOfTier(ctx context.Context, client *mongo.Client) (tierKind, error) {
 func disconnect(client *mongo.Client, log *slog.Logger) {
 	if err := client.Disconnect(context.Background()); err != nil {
 		log.Warn("disconnect failed", "err", err)
+	}
+}
+
+// warnAboutWindows says so when a warm window reaches past its own eviction
+// cutoff.
+//
+// Every daemon that reads a config says it, not only the two that act on those
+// rules, because an operator reading one log should not have to know which
+// component owns the contradiction. See config.WindowWarnings for what it costs
+// and why it is not refused.
+func warnAboutWindows(log *slog.Logger, cfg config.Config) {
+	for _, w := range cfg.WindowWarnings() {
+		log.Warn("a warm window reaches past its own eviction cutoff",
+			"detail", w,
+			"effect", "the same documents are copied up and removed again for as long as both run",
+			"note", "answers stay correct; the evictor narrows the completeness claim before it "+
+				"removes, and the warmer checks the fast tier still holds a window before claiming it")
 	}
 }

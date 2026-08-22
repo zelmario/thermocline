@@ -176,9 +176,9 @@ s = s.replace('    - ns: "%s.orders"\n      back: 40m' % db,
 s = s.replace('    - "%s.tacct"\n' % db, '    - "%s.tacct"\n    - "%s.dated"\n' % (db, db), 1)
 open(wdir + '/edge_df.yaml', 'w').write(s)
 # The warmer gets its own file, reaching back twelve hours to refill what the
-# evictor took. One config that warms past its own eviction cutoff is refused,
-# because the two rules are instructions about the same documents and the
-# components obey them both. Written as two files it is legal and it is also
+# evictor took. Two files rather than one so neither carries a warm window
+# reaching past its own eviction cutoff, which loads but logs a warning, and a
+# suite that expects a quiet startup would then report that instead. It is also
 # how this runs in practice: the evictor and the warmer are separate daemons.
 w = s.replace('    - ns: "%s.dated"\n      back: 40m' % db,
               '    - ns: "%s.dated"\n      back: 12h' % db)
@@ -205,6 +205,44 @@ chk "and the archive kept everything"    "30" "$(C 'print(db.getSiblingDB(proces
 cline watermark --config $WDIR/edge_df.yaml --ns $DB.dated --clear >/dev/null
 cline warmer --config $WDIR/edge_dfwarm.yaml >/dev/null 2>&1
 chk "date_field warmer refilled"         "30" "$(H 'print(db.getSiblingDB(process.env.TC_DB).dated.countDocuments({}))')"
+
+echo "== a warm window reaching past its own eviction cutoff =="
+# Named at startup, by every daemon that reads a config, and not refused. It
+# costs the same documents being copied out of the archive, written to the fast
+# tier and deleted again for as long as both run, which is worth telling an
+# operator about and is not a wrong answer.
+#
+# This was a refusal first, on the strength of eighteen disagreeing answers
+# measured on the pilot under a fifteen year warm against a one day cutoff.
+# Those belonged to the eviction announcement bug that was tombstoning documents
+# at the same time. Measured again with that fixed, under the same two windows
+# and with the fast tier emptied by the fight while the questions ran, five
+# rounds of 199 questions disagreed nowhere. A refusal would also have been thin
+# protection, because the two daemons can be given separate files that are each
+# legal alone.
+python3 - <<'PY'
+import os
+db, wdir = os.environ['DB'], os.environ['WDIR']
+s = open(wdir + '/cline.yaml').read()
+s = s.replace('    - ns: "%s.orders"\n      back: 40m' % db,
+              '    - ns: "%s.orders"\n      back: 12h' % db)
+open(wdir + '/edge_wide.yaml', 'w').write(s)
+PY
+chk "the derived config warms past the cutoff"  "1"     "$(grep -c 'back: 12h' $WDIR/edge_wide.yaml)"
+rm -f $LOGDIR/edge_wide.log
+cline warmer --config $WDIR/edge_wide.yaml --dry-run --log-file $LOGDIR/edge_wide.log >/dev/null 2>&1
+chk "it loads rather than refusing"             "true"     "$(grep -q 'reaches past its own eviction cutoff' $LOGDIR/edge_wide.log && echo true || echo false)"
+chk "and the warning names the namespace"       "true"     "$(grep -q "$DB.orders: warmer.back is 12h" $LOGDIR/edge_wide.log && echo true || echo false)"
+chk "and says it is work rather than a wrong answer" "true"     "$(grep -q 'answers stay correct' $LOGDIR/edge_wide.log && echo true || echo false)"
+# Every daemon says it, so an operator reading one log does not have to know
+# which component owns the contradiction.
+rm -f $LOGDIR/edge_wide_f.log
+timeout 12 cline feeder --config $WDIR/edge_wide.yaml --log-file $LOGDIR/edge_wide_f.log >/dev/null 2>&1
+chk "the feeder says it too"                    "true"     "$(grep -q 'reaches past its own eviction cutoff' $LOGDIR/edge_wide_f.log && echo true || echo false)"
+# And the ordinary config must be quiet, or the warning means nothing.
+rm -f $LOGDIR/edge_quiet.log
+cline warmer --config $CFG --dry-run --log-file $LOGDIR/edge_quiet.log >/dev/null 2>&1
+chk "the shipped config says nothing"           "0"     "$(grep -c 'reaches past its own eviction cutoff' $LOGDIR/edge_quiet.log || true)"
 
 echo "== unannounced delete policies =="
 stopFeeder

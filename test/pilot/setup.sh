@@ -231,11 +231,17 @@ churn() {
   done
   # Same windows as the pilot itself, and a residency of seconds.
   #
-  # The windows have to match. A warm reaching further back than the eviction
-  # cutoff is now refused outright, because the two rules then contradict each
-  # other and take turns deciding what the fast tier claims to hold. This used
-  # a fifteen year warm against a one day cutoff and produced eighteen wrong
-  # answers, which is what led to the refusal.
+  # The windows match, so the churn measures tiering rather than two rules
+  # fighting. A warm reaching further back than the eviction cutoff copies the
+  # band between them up and has the evictor take it away, indefinitely.
+  #
+  # That is waste, not wrong answers, and it is worth recording why the
+  # distinction was hard won. This churn once ran a fifteen year warm against a
+  # one day cutoff and produced eighteen disagreements, which I attributed to
+  # the windows. They belonged to the eviction announcement bug that was
+  # tombstoning documents at the same time. Measured again with that fixed,
+  # under the same two windows, with the fast tier emptied by the fight while
+  # the questions ran: five rounds of 199 questions, no disagreements.
   #
   # The short residency is what keeps documents moving inside a legal
   # configuration: a read of an archived document copies it up and holds it
