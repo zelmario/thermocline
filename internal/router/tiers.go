@@ -401,6 +401,70 @@ func (r *Router) warnAboutMissingUsers(ctx context.Context) {
 		"action", "create them on the fast tier with the same names, passwords and roles")
 }
 
+// warnAboutMissingRoles is the same courtesy for the roles those accounts hold.
+//
+// The action for a missing account is to create it on the fast tier with the
+// same roles, and a custom role the fast tier does not have makes that step fail
+// with "Could not find role: appreader@admin". Measured, and it is the ordinary
+// case: an application with its own role is an application whose users all
+// reference it, so the first adoption step refuses every one of them and the
+// reason is a role nobody was thinking about.
+//
+// Built-in roles are left out. Every server has them, so naming them would bury
+// the one that matters.
+func (r *Router) warnAboutMissingRoles(ctx context.Context) {
+	cold, cerr := rolesIn(ctx, r.cold)
+	if cerr != nil {
+		r.log.Debug("could not read the archive's roles to compare them", "err", cerr)
+		return
+	}
+	hot, herr := rolesIn(ctx, r.hot)
+	if herr != nil {
+		r.log.Debug("could not read the fast tier's roles to compare them", "err", herr)
+		return
+	}
+
+	var missing []string
+	for role := range cold {
+		if !hot[role] {
+			missing = append(missing, role)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	r.log.Warn("the archive has roles the fast tier does not",
+		"roles", missing,
+		"meaning", "creating the application's accounts on the fast tier fails while these are "+
+			"missing, because an account cannot be given a role that does not exist there",
+		"action", "create these first, with the same privileges, then the accounts that hold them")
+}
+
+// rolesIn lists role@db for every role a tier defines. Only the ones somebody
+// made: admin.system.roles holds no built-ins.
+func rolesIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+	cur, err := client.Database("admin").Collection("system.roles").
+		Find(ctx, bson.D{}, options.Find().SetProjection(bson.D{{Key: "role", Value: 1}, {Key: "db", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	out := map[string]bool{}
+	for cur.Next(ctx) {
+		var role struct {
+			Role string `bson:"role"`
+			DB   string `bson:"db"`
+		}
+		if cur.Decode(&role) != nil || role.Role == "" {
+			continue
+		}
+		out[role.Role+"@"+role.DB] = true
+	}
+	return out, cur.Err()
+}
+
 // usersIn lists user@db for every account a tier holds.
 func usersIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
 	cur, err := client.Database("admin").Collection("system.users").

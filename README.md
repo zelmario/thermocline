@@ -224,6 +224,17 @@ Range queries are governed by the watermark below.
   `sample_training.trips` reported 0 documents where the archive holds 10,000,
   because none of that collection was inside the hot window, while
   `countDocuments` on it answered 10,000 throughout. See `test/pilot`.
+- **The router names the accounts and roles the fast tier is missing.** The fast
+  tier is a new replica set and carries none of the application's users, and the
+  router authenticates against it, so on day one every connection is refused
+  with MongoDB's ordinary authentication failure and nothing connects that to
+  the tier missing the account. It says which ones, once, at startup.
+
+  Roles come first in that list because they come first in the fix. Creating an
+  account with a custom role the fast tier does not have is refused with "Could
+  not find role", so an application with its own role is one whose every account
+  fails the first adoption step. Create the roles, then the accounts that hold
+  them.
 - **The catalog names the tiered collections the fast tier does not hold.**
   `listCollections` and `listDatabases` are answered by the fast tier, because
   that is where your collections live and where your writes go. For a tiered

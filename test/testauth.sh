@@ -202,6 +202,41 @@ chk "and the account still cannot log in"            "true" \
     "$(mongosh --port $PORT -u oldapp -p oldpass --authenticationDatabase admin --quiet --eval 'print(1)' 2>&1 | grep -qiE 'authentication failed' && echo true || echo false)"
 C "try{db.getSiblingDB('admin').dropUser('oldapp')}catch(e){}" >/dev/null 2>&1
 
+echo "== and the roles those accounts hold =="
+# The action for a missing account is to create it on the fast tier with the
+# same roles, and a custom role the fast tier does not have makes that step fail
+# with "Could not find role". An application with its own role is one whose
+# accounts all reference it, so the first adoption step refuses every one of
+# them for a reason nobody was thinking about.
+C "try{db.getSiblingDB('admin').dropUser('roleuser')}catch(e){}
+   try{db.getSiblingDB('admin').dropRole('appreader')}catch(e){}
+   db.getSiblingDB('admin').createRole({role:'appreader', privileges:[{resource:{db:process.env.TC_DB,collection:''}, actions:['find']}], roles:[]});
+   db.getSiblingDB('admin').createUser({user:'roleuser',pwd:'pw',roles:[{role:'appreader',db:'admin'}]})" >/dev/null 2>&1
+chk "the archive has the role and the fast tier does not" "1/0" \
+    "$(C "print(db.getSiblingDB('admin').system.roles.countDocuments({role:'appreader'}))")/$(H "print(db.getSiblingDB('admin').system.roles.countDocuments({role:'appreader'}))")"
+# The consequence, measured rather than assumed: the documented step refuses.
+chk "creating the account on the fast tier refuses" "true" \
+    "$(H "try{db.getSiblingDB('admin').createUser({user:'roleuser',pwd:'pw',roles:[{role:'appreader',db:'admin'}]}); print('false')}catch(e){print(/Could not find role/.test(e.message))}")"
+stopDaemons
+rm -f $LOGDIR/auth_roles.log
+startFeeder
+cline router --config $CFG --log-file $LOGDIR/auth_roles.log & RRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the router names the role at startup"       "true" \
+    "$(grep -q 'appreader@admin' $LOGDIR/auth_roles.log && echo true || echo false)"
+chk "and says to create it before the accounts"  "true" \
+    "$(grep -qE 'then the accounts that hold them' $LOGDIR/auth_roles.log && echo true || echo false)"
+# Built-in roles are on every server, so naming them would bury the one that
+# matters.
+chk "and does not name the built-in roles"       "false" \
+    "$(grep -q 'readWrite@admin' $LOGDIR/auth_roles.log && echo true || echo false)"
+kill $RRP 2>/dev/null; wait $RRP 2>/dev/null
+C "try{db.getSiblingDB('admin').dropUser('roleuser')}catch(e){}
+   try{db.getSiblingDB('admin').dropRole('appreader')}catch(e){}" >/dev/null 2>&1
+
 H "db.getSiblingDB('admin').dropUser('limited')" >/dev/null 2>&1
 stopDaemons
 echo
