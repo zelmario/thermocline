@@ -91,13 +91,20 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 		return s, true
 	}
 
+	// leading tracks the run of $match stages at the front of the pipeline. A
+	// stage that cannot be read ends it: not knowing what a stage does is not
+	// the same as knowing it is a filter, and a $match after it would otherwise
+	// be read as bounding what the collection was read for.
+	leading := true
 	for i, st := range stages {
 		doc, ok := st.DocumentOK()
 		if !ok {
+			leading = false
 			continue
 		}
 		elems, err := doc.Elements()
 		if err != nil || len(elems) == 0 {
+			leading = false
 			continue
 		}
 		name := elems[0].Key()
@@ -109,12 +116,30 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 			return aggScope{}, false
 		}
 
-		if i == 0 && name == "$match" {
+		// Every $match at the front of the pipeline, not only the first.
+		// Consecutive ones are a conjunction, so a bound in any of them bounds
+		// what the pipeline reads, and a helper that prepends its own filter is
+		// the ordinary way a second one appears. Reading only the first sent
+		// such a pipeline to the archive and the flat one beside it to the fast
+		// tier.
+		//
+		// Only at the front. A $match after a $group or a $project is about the
+		// documents those produced, and a bound there says nothing about how
+		// far back the collection was read.
+		if leading && name == "$match" {
 			if mdoc, ok := val.DocumentOK(); ok {
 				af, aok := ageOf(s.primary)
-				s.bound, s.bounded = lowerTimeBound(mdoc, af, aok)
-				s.match = mdoc
+				if t, ok := lowerTimeBound(mdoc, af, aok); ok && (!s.bounded || t.After(s.bound)) {
+					s.bound, s.bounded = t, true
+				}
+				if i == 0 {
+					// The filter for copying documents up stays the first one,
+					// which is the broadest of them and so the safe choice.
+					s.match = mdoc
+				}
 			}
+		} else {
+			leading = false
 		}
 
 		switch name {

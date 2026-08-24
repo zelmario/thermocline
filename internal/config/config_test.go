@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -163,4 +164,43 @@ func mustDur(t *testing.T, s string) Duration {
 		t.Fatalf("parse %q: %v", s, err)
 	}
 	return d
+}
+
+// A namespace aged one way by the evictor and another by the warmer costs more
+// than the two daemons disagreeing: the router stops reading bounds out of
+// queries on it, so every one of them is answered by the archive.
+func TestAgeFieldWarnings(t *testing.T) {
+	withFields := func(evictField, warmField string) Config {
+		return Config{
+			Evictor: EvictorConfig{Rules: []EvictionRule{
+				{NS: "shop.orders", OlderThan: Duration(24 * time.Hour), DateField: evictField},
+			}},
+			Warmer: WarmerConfig{Rules: []WarmRule{
+				{NS: "shop.orders", Back: Duration(24 * time.Hour), DateField: warmField},
+			}},
+		}
+	}
+
+	if w := withFields("createdAt", "createdAt").AgeFieldWarnings(); len(w) != 0 {
+		t.Errorf("agreeing rules warned: %v", w)
+	}
+	if w := withFields("", "").AgeFieldWarnings(); len(w) != 0 {
+		t.Errorf("both ageing by the _id warned: %v", w)
+	}
+
+	w := withFields("createdAt", "").AgeFieldWarnings()
+	if len(w) != 1 {
+		t.Fatalf("a disagreement gave %d warnings, want 1: %v", len(w), w)
+	}
+	if !strings.Contains(w[0], "createdAt") || !strings.Contains(w[0], "_id timestamp") {
+		t.Errorf("the warning names neither field: %s", w[0])
+	}
+
+	// A namespace only one of them tiers is not a disagreement.
+	only := Config{Warmer: WarmerConfig{Rules: []WarmRule{
+		{NS: "shop.orders", Back: Duration(24 * time.Hour), DateField: "createdAt"},
+	}}}
+	if w := only.AgeFieldWarnings(); len(w) != 0 {
+		t.Errorf("a namespace with no eviction rule warned: %v", w)
+	}
 }

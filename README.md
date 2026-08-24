@@ -1683,6 +1683,15 @@ scanned zero and evicted nothing, and would go on doing that until the
 migration itself was older than the window. Nothing is wrong from where it
 stands: the rule addresses documents and tiers by the wrong clock.
 
+And set `date_field` to the *same* field on both rules for a namespace. Ageing
+one collection two ways costs more than the two daemons picking different
+documents. The router will not read a lower time bound out of a query on such a
+namespace, because it cannot tell which of the two a completeness claim is
+measured in, so every bounded query on it is answered by the archive. One word
+of configuration turns the whole thing off for that collection, and neither file
+shows it on its own, since the daemons are usually given separate ones. Each
+daemon names the namespace at startup.
+
 `mongorestore` keeps the original `_id`s and is fine. Anything that re-inserted
 the documents is not. Compare the two before you trust a rule that has no
 `date_field`:

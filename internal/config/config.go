@@ -496,6 +496,46 @@ func (c Config) Validate() error {
 // and the warmer are separate daemons and can be given separate files, each
 // legal alone and contradictory together, which is how they are usually
 // deployed and is not visible from any one file.
+// AgeFieldWarnings names every namespace whose two rules age it differently.
+//
+// This is worse than it looks, and none of it is visible from either file
+// alone. The evictor and the warmer then select different documents, which is
+// the obvious half. The quiet half is the router: it will not read a lower
+// bound out of a query on such a namespace, because it cannot tell which
+// dimension a claim about it is measured in, so *every* bounded query on it is
+// answered by the archive and nothing says why. One word of configuration turns
+// the whole optimisation off for that collection. See tieringFields, which
+// drops the namespace, and lowerTimeBound, which then has nothing to read.
+//
+// A warning rather than a refusal, for the same reason as WindowWarnings: the
+// two daemons are usually given separate files, each legal alone.
+func (c Config) AgeFieldWarnings() []string {
+	field := make(map[string]string, len(c.Evictor.Rules))
+	for _, r := range c.Evictor.Rules {
+		field[r.NS] = r.DateField
+	}
+	var out []string
+	for _, w := range c.Warmer.Rules {
+		ef, ok := field[w.NS]
+		if !ok || ef == w.DateField {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"%s: the evictor ages it by %s and the warmer by %s. Set date_field to the same field "+
+				"on both rules", w.NS, fieldName(ef), fieldName(w.DateField)))
+	}
+	return out
+}
+
+// fieldName says which field a rule ages by, in the words the message needs:
+// an empty date_field means the timestamp inside the ObjectId _id.
+func fieldName(f string) string {
+	if f == "" {
+		return "the _id timestamp"
+	}
+	return f
+}
+
 func (c Config) WindowWarnings() []string {
 	evict := make(map[string]Duration, len(c.Evictor.Rules))
 	for _, r := range c.Evictor.Rules {

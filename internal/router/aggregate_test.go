@@ -226,3 +226,58 @@ func TestOrdinaryPipelineStillChecked(t *testing.T) {
 // field a namespace ages by, so a test that did not say would be asserting that
 // nothing is ever bounded.
 func tieredByCreatedAt(string) (string, bool) { return "created_at", true }
+
+// Consecutive $match stages at the front are one conjunction, and a helper that
+// prepends its own filter is the ordinary way a second one appears. Reading only
+// the first sent such a pipeline to the archive and the flat one beside it to
+// the fast tier.
+func TestEveryLeadingMatchBoundsTheScan(t *testing.T) {
+	early := time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC)
+	late := early.Add(72 * time.Hour)
+
+	cmd := aggCmd(t, "orders", bson.A{
+		bson.D{{Key: "$match", Value: bson.D{{Key: "status", Value: "open"}}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: early}}},
+		}}},
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$status"}}}},
+	})
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
+	if !s.bounded {
+		t.Fatal("a bound in the second of two leading $match stages was not read")
+	}
+	if !s.bound.Equal(early) {
+		t.Errorf("bound = %v, want %v", s.bound, early)
+	}
+
+	// Both bounded: they both have to hold, so the later one is the bound.
+	cmd = aggCmd(t, "orders", bson.A{
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: early}}},
+		}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: late}}},
+		}}},
+	})
+	s, _ = scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
+	if !s.bounded || !s.bound.Equal(late) {
+		t.Errorf("bound = %v (found %v), want %v", s.bound, s.bounded, late)
+	}
+}
+
+// And the run ends at the first stage that is not a $match, however many
+// filters follow it.
+func TestMatchAfterTheLeadingRunIsNotABound(t *testing.T) {
+	from := time.Date(2026, 8, 14, 15, 0, 0, 0, time.UTC)
+	cmd := aggCmd(t, "orders", bson.A{
+		bson.D{{Key: "$match", Value: bson.D{{Key: "status", Value: "open"}}}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: "created_at", Value: 1}}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "created_at", Value: bson.D{{Key: "$gte", Value: from}}},
+		}}},
+	})
+	s, _ := scopeOfAggregate(cmd, "shop", tieredByCreatedAt)
+	if s.bounded {
+		t.Error("a $match behind a $project was read as bounding the scan")
+	}
+}

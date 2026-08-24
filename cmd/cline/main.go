@@ -516,6 +516,13 @@ func disconnect(client *mongo.Client, log *slog.Logger) {
 // component owns the contradiction. See config.WindowWarnings for what it costs
 // and why it is not refused.
 func warnAboutWindows(log *slog.Logger, cfg config.Config) {
+	for _, w := range cfg.AgeFieldWarnings() {
+		log.Warn("a namespace is aged two different ways",
+			"detail", w,
+			"effect", "the evictor and the warmer select different documents, and the router cannot "+
+				"tell which of the two a completeness claim is measured in, so every bounded query "+
+				"on this namespace is answered by the archive")
+	}
 	for _, w := range cfg.WindowWarnings() {
 		log.Warn("a warm window reaches past its own eviction cutoff",
 			"detail", w,
