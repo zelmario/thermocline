@@ -155,10 +155,15 @@ type watermarkEntry struct {
 	fetched time.Time
 }
 
-// completenessTTL is how long a watermark reading is reused. It changes only
-// when the warmer or evictor runs, so a few seconds of staleness is harmless,
-// and reading it per query would put a round trip on the hot path.
-const completenessTTL = 5 * time.Second
+// completenessTTL is how long a watermark reading is reused, because reading it
+// per query would put an archive round trip on the hot path.
+//
+// It is not merely an optimisation with a harmless amount of staleness, which
+// is what this comment used to say. A stale claim is always the more permissive
+// one, so anything that narrows a claim has to wait this long before acting on
+// the narrowing. See watermark.ClaimCacheTTL, which is where that contract is
+// written down and which this must equal.
+const completenessTTL = watermark.ClaimCacheTTL
 
 // completeness returns what the fast tier claims to hold for ns, and whether
 // the claim could be read at all.

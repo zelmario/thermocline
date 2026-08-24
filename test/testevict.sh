@@ -92,6 +92,7 @@ chkv() {
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-50s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 H() { mongosh "$HOT"  --quiet --eval "$1" 2>&1 | tail -1; }
+R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 # The feeder is stopped for this, so it cannot mirror the fast tier write and
 # clear the tombstone underneath the sweep. Briefly, though: the evictor fails
@@ -166,6 +167,73 @@ case "$WMWAS" in
       --complete-from "${WMWAS##*newer than }" >/dev/null 2>&1 ;;
   *"all of history"*) cline watermark --config $CFG --ns $DB.orders --complete-all >/dev/null 2>&1 ;;
 esac
+
+echo "== a claim narrowed and acted on in the same breath =="
+# The evictor raises the completeness watermark before removing, so an
+# interrupted sweep never leaves a claim wider than the truth. That protects a
+# reader who reads the claim fresh. The router does not: it caches one, because
+# reading it per query would put an archive round trip on the hot path.
+#
+# So for a few seconds after the raise there are two copies of the claim and the
+# router's is the older, wider one. Removing in that window means it answers
+# from a fast tier that no longer holds what it believes it holds.
+#
+# Measured before the wait existed, with a fast tier claiming all of history and
+# a sweep removing 905 of 2,000 documents: the router answered countDocuments
+# with 1,095 where the archive holds 2,000, and answered 2,000 again seven
+# seconds later. No error either time, which is this system's worst failure.
+CNS=tevclaim
+stopFeeder 2>/dev/null || true
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+OLDD=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=400)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$CNS.insertMany([
+    {_id:1, at:new Date('$OLDD')}, {_id:2, at:new Date('$OLDD')},
+    {_id:3, at:new Date()},        {_id:4, at:new Date()}])" >/dev/null
+done
+DB=$DB WDIR=$WDIR python3 - <<'PY'
+import os
+db, wdir = os.environ['DB'], os.environ['WDIR']
+s = open(wdir + '/cline.yaml').read()
+head, tail = s[:s.index('evictor:')], s[s.index('warmer:'):]
+open(wdir + '/evclaim.yaml', 'w').write(head + """evictor:
+  feeder_id: "test"
+  rate: 500
+  batch_size: 100
+  max_feeder_lag: 30s
+  rules:
+    - ns: "%s.tevclaim"
+      older_than: 40m
+      date_field: "at"
+  backoff:
+    max_replication_lag: 60s
+    max_cache_dirty: 0.9
+    min_write_tickets_free: 0.01
+    min_oplog_window: 1m
+""" % db + tail)
+PY
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
+   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+cline watermark --config $WDIR/evclaim.yaml --ns $DB.$CNS --complete-all >/dev/null 2>&1
+cline router --config $WDIR/evclaim.yaml --log-file $LOGDIR/evclaim_r.log >/dev/null 2>&1 & CRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+# The router reads once, which is what puts the claim in its cache.
+chkv "the router sees all four"                  "4" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+cline evictor --config $WDIR/evclaim.yaml --once >/dev/null 2>&1
+# Immediately, which is the whole point: no sleep between the sweep and this.
+chkv "and still sees all four straight afterwards" "4" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+# The control: the sweep really did remove something, or this proves nothing.
+chkv "the sweep did remove the old ones"          "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+chkv "and the archive still holds them all"       "4" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+kill $CRP 2>/dev/null; wait $CRP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 
 echo "== documents the rule can never remove =="
 # The whole-namespace version of this is already refused: a rule with no

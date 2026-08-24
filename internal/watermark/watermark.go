@@ -54,6 +54,25 @@ func (m Mark) CoversAll() bool {
 	return m.Claimed && m.From.IsZero()
 }
 
+// ClaimCacheTTL is how long a reader may reuse a claim it has read.
+//
+// The router caches one, because reading it per query would put an archive
+// round trip on the hot path. That makes the claim a value with two copies, and
+// the copies disagree for as long as this.
+//
+// Which way they disagree is what matters. The evictor only ever raises a
+// claim, narrowing it, so a stale copy is always the more permissive one: a
+// router holding it believes the fast tier covers more than it does. Anything
+// that writes a claim and then removes what it described has to let this much
+// time pass in between, or every reader with a cached copy answers from a tier
+// that no longer holds it.
+//
+// Measured with a fast tier claiming all of history and an eviction sweep
+// removing 905 of 2,000 documents: the router answered countDocuments with
+// 1,095 where the archive holds 2,000, and answered 2,000 again seven seconds
+// later. No error either time.
+const ClaimCacheTTL = 5 * time.Second
+
 // Store reads and writes watermarks on the cold tier.
 type Store struct {
 	coll *mongo.Collection

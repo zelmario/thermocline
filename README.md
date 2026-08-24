@@ -242,6 +242,21 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **An eviction sweep waits before it removes what it has just stopped
+  claiming.** The evictor raises the completeness watermark first, so an
+  interrupted sweep never leaves a claim wider than the truth. That protects a
+  reader who reads the claim fresh; the router caches one, because reading it
+  per query would put an archive round trip on the hot path.
+
+  So for a few seconds after the raise there are two copies of the claim and the
+  router's is the older, wider one. Measured before this, with a fast tier
+  claiming all of history and a sweep removing 905 of 2,000 documents: the
+  router answered `countDocuments` with **1,095 where the archive holds 2,000**,
+  and answered 2,000 again seven seconds later. No error either time.
+
+  The sweep now waits out that window between raising the claim and acting on
+  it. Once per rule per sweep, only when the boundary actually moved, and a
+  sweep that scans thousands of documents does not notice it.
 - **The newest N is answered by the fast tier, without a claim on all of
   history.** "The last ten orders" carries no lower time bound, so nothing short
   of `--complete-all` used to cover it, and a fast tier holding the last thirty

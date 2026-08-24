@@ -61,6 +61,8 @@ feeder:
     - "shop.tevunaged"
     # testfresh.sh: read while the feeder is stopped, so every read copies up.
     - "shop.tfstopped"
+    # testevict.sh: a claim narrowed and acted on in the same sweep.
+    - "shop.tevclaim"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.

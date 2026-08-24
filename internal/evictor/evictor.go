@@ -237,6 +237,25 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule) (Stats,
 		if raised {
 			e.log.Info("completeness watermark raised to the eviction boundary",
 				"ns", rule.NS, "complete_from", boundary.Format(time.RFC3339))
+			// And then wait, before removing anything the old claim covered.
+			//
+			// A router caches the claim, so for a short while after this write
+			// there are two copies of it and the router's is the older, wider
+			// one. Removing now means it answers from a fast tier that no
+			// longer holds what it believes it holds, and answers short without
+			// any error.
+			//
+			// Measured before this wait existed, with a fast tier claiming all
+			// of history and a sweep removing 905 of 2,000 documents: the
+			// router answered countDocuments with 1,095 where the archive holds
+			// 2,000, then answered 2,000 again seven seconds later.
+			//
+			// Once per rule per sweep, not per batch, and only when the
+			// boundary actually moved. A sweep that scans thousands of
+			// documents does not notice it.
+			if err := e.settleClaim(ctx); err != nil {
+				return stats, err
+			}
 		}
 	}
 
@@ -660,4 +679,22 @@ func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule,
 			"every sweep goes on reporting success",
 		"action", "give them a date in "+rule.DateField+", or remove them by hand once the archive "+
 			"is confirmed to hold them")
+}
+
+// settleClaim waits long enough for every reader holding the previous claim to
+// have re-read it. See watermark.ClaimCacheTTL.
+//
+// The margin is a second, because the two clocks involved are different
+// machines' and the TTL is measured from when a reader fetched rather than from
+// when this wrote.
+func (e *Evictor) settleClaim(ctx context.Context) error {
+	if e.dryRun {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(watermark.ClaimCacheTTL + time.Second):
+		return nil
+	}
 }
