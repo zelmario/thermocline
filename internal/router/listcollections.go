@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -169,6 +170,19 @@ func (c *conn) archiveOnlyCollections(ctx context.Context, cmd bson.Raw, db stri
 		// with the rest, and hand one to the indexer to be built as a
 		// collection. Views the fast tier lacks are warned about at startup.
 		if kind, kok := stringField(cur.Current, "type"); kok && kind != "collection" {
+			continue
+		}
+		// Nor a system collection. These are a node's own bookkeeping and not
+		// the application's data: system.profile, system.views, system.js. They
+		// are not tiered, nothing reads them through here, and handing one to
+		// the indexer is worse than listing it. Measured: an archive with
+		// profiling once enabled had shop.system.profile, the indexer built it
+		// on the fast tier from the archive's options, and capped is one of the
+		// options a build deliberately does not carry. The result is a
+		// system.profile that is not capped, which mongod refuses to use:
+		// setProfilingLevel(2) fails with NamespaceExists on that database from
+		// then on, and there is no way back except dropping it by hand.
+		if isSystemCollection(name) {
 			continue
 		}
 		// And only what this client would have been allowed to see. The fast
@@ -355,4 +369,15 @@ func (c *conn) canReadAnyOf(ctx context.Context, db string) bool {
 		return false
 	}
 	return c.canRead(db, names[0])
+}
+
+// isSystemCollection reports whether a collection is a node's own bookkeeping
+// rather than the application's data.
+//
+// MongoDB puts all of them under a system. prefix inside each database:
+// system.profile, system.views, system.js, system.buckets.* for time series.
+// None is tiered, none is read through here, and none may be created from
+// another node's options.
+func isSystemCollection(name string) bool {
+	return strings.HasPrefix(name, "system.")
 }

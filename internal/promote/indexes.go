@@ -72,6 +72,15 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 	if ix == nil {
 		return
 	}
+	// Never a system collection. Building one means creating it from the
+	// archive's options, and capped is an option a build does not carry, so a
+	// system.profile made here is not capped and mongod will not use it:
+	// setProfilingLevel fails with NamespaceExists on that database from then
+	// on. Guarded here as well as at the callers, because there are three of
+	// them and this is the one place that does the creating.
+	if _, coll := splitNS(ns); strings.HasPrefix(coll, "system.") {
+		return
+	}
 	ix.mu.Lock()
 	st := ix.state[ns]
 	if st.done || time.Since(st.lastTry) < retryAfter {

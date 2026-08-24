@@ -48,6 +48,7 @@ chk() {
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-54s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
+C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 P() { mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin&readPreference=$1" --quiet --eval "$2" 2>&1 | tail -1; }
 N() { mongosh "mongodb://dba:secret@$1:27017/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
 
@@ -77,6 +78,13 @@ sed 's/^  listen:/  terminate_auth: true\n  listen:/' $BASE > $CFG
 chk "the config asks for terminated authentication"     "1" "$(grep -c 'terminate_auth: true' $CFG)"
 
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+# The archive's copy too. Only the fast tier's was dropped, so the archive kept
+# whatever earlier runs had mirrored into it: 22 documents against the 20
+# inserted below, on every worker. Nothing noticed, because the claim recorded
+# below says the fast tier holds everything and the archive was therefore never
+# read. It became visible when cline watermark started checking that claim
+# against the two tiers and refused to record it, which is the check working.
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:20},(_,i)=>({_id:i,n:i})),{writeConcern:{w:3}})" >/dev/null
 chk "the fast tier holds the documents"                 "20" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
