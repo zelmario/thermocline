@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -991,13 +992,48 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// that it holds all of it is wrong from this instant. See
 				// forgetCompleteness.
 				c.r.forgetCompleteness(db + "." + coll)
-				// And a drop and a recreate can put differently typed ages
-				// under the same name. See sortSafeAges.
+			}
+			// drop and create are the two that change which collection lives
+			// under a name, and either half can arrive here without the other:
+			// a collection dropped out of band and created through this router
+			// leaves it remembering the one before.
+			if name == "drop" || name == "create" {
+				// A drop and a recreate can put differently typed ages under
+				// the same name. See sortSafeAges.
 				c.r.forgetBrackets(db + "." + coll)
+				// The indexer records a namespace as done once the fast tier
+				// has the collection and its indexes, and never asks again. A
+				// drop makes that untrue and a create is where it becomes
+				// worth asking: without this the collection comes back with
+				// nothing but _id_, every query on it scans, and a unique
+				// index the archive still carries is not enforced on the fast
+				// tier at all. It noticed only when a catalog listing happened
+				// to find the collection missing, which is a later and much
+				// weaker signal than the DDL itself.
+				c.r.indexer.Forget(db + "." + coll)
+			}
+			if name == "create" {
+				// Forgetting only clears the record that it was done; the
+				// build happens on the next Ensure, and without this that
+				// waited for a client to list the catalog. The collection
+				// exists on the fast tier from this moment and has nothing but
+				// _id_, so this is exactly when there is something to do.
+				//
+				// In the background and rate limited inside the indexer, the
+				// same as the catalog path.
+				ns := db + "." + coll
+				go c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
 			}
 			// A collection's collation is fixed at creation, so the only way it
 			// changes is a drop and a recreate, which comes through here.
 			c.r.forgetCollation(db + "." + coll)
+		}
+		// dropDatabase names no collection, so nothing above sees it, and every
+		// collection it removed is one this router still remembers something
+		// about. The query cache already had its own case for this; the rest
+		// did not. See forgetEverythingIn.
+		if name == "dropDatabase" {
+			c.r.forgetEverythingIn(db)
 		}
 	}
 
@@ -1318,4 +1354,31 @@ func isClosed(err error) bool {
 	return errors.Is(err, io.EOF) ||
 		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// forgetEverythingIn drops what this router remembers about every namespace it
+// manages in one database.
+//
+// For dropDatabase, which removes them all at once and names none of them. The
+// per collection path is driven by indexDDL, and a command naming no collection
+// never reaches it, so a database dropped through the router left every cached
+// claim, index listing and collation in it standing.
+//
+// The claim recorded in the archive is a separate matter and outlives this: the
+// warmer notices a fast tier that has lost its contents and withdraws it. This
+// closes the router's own window, which is the one that opens immediately.
+func (r *Router) forgetEverythingIn(db string) {
+	prefix := db + "."
+	for _, ns := range r.cfg.Managed {
+		if !strings.HasPrefix(ns, prefix) {
+			continue
+		}
+		r.forgetCompleteness(ns)
+		r.forgetIndexes(ns)
+		r.forgetHint(ns)
+		r.forgetBrackets(ns)
+		r.forgetCollation(ns)
+		r.forgetView(ns)
+		r.indexer.Forget(ns)
+	}
 }

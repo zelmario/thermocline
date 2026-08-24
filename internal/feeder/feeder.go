@@ -133,6 +133,30 @@ func (f *Feeder) withdrawCompleteness(ctx context.Context, ns string) {
 	}
 }
 
+// withdrawDatabase drops every completeness claim for one database.
+//
+// Logged rather than returned, for the same reason as withdrawCompleteness:
+// mirroring is worth more than a bookkeeping write, and the warmer checks the
+// claim against reality as a second defence.
+func (f *Feeder) withdrawDatabase(ctx context.Context, db string) {
+	if f.marks == nil || db == "" {
+		return
+	}
+	n, err := f.marks.ClearDatabase(ctx, db)
+	if err != nil {
+		f.log.Error("could not withdraw the completeness claims after a database was dropped",
+			"db", db, "err", err,
+			"note", "the router may answer range queries from a fast tier that no longer holds them; "+
+				"clear them with: cline watermark --ns <db.collection> --clear")
+		return
+	}
+	if n > 0 {
+		f.log.Warn("withdrew every completeness claim in a dropped database",
+			"db", db, "claims", n,
+			"note", "range queries fall through to the archive until the warmer refills it")
+	}
+}
+
 // pendingOp is one decoded change waiting to be written.
 type pendingOp struct {
 	ns   string
@@ -488,6 +512,15 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// router must go there for them instead of answering from nothing.
 		if ev.OperationType == "drop" {
 			f.withdrawCompleteness(ctx, ns)
+		}
+		// And the same one level up. dropDatabase names no collection, so the
+		// line above never fired for it and every claim in that database stayed
+		// exactly as it was: the router went on answering bounded reads from a
+		// fast tier holding nothing, and returning empty, while the archive
+		// still held the documents. The twin of the case above, and the same
+		// silent short answer it exists to prevent.
+		if ev.OperationType == "dropDatabase" {
+			f.withdrawDatabase(ctx, ev.NS.DB)
 		}
 		return nil
 	}

@@ -232,3 +232,49 @@ func TestCompleteBoundary(t *testing.T) {
 }
 
 var _ = meta.Watermarks
+
+// dropDatabase names no collection, so the claims to withdraw are the ones
+// keyed by a namespace in that database. It has to reach all of them and stop
+// exactly there: a database whose name is a prefix of another one is the case a
+// careless match gets wrong.
+func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
+	s, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	when := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, ns := range []string{"shop.orders", "shop.events", "shopping.orders", "warehouse.stock"} {
+		if err := s.Set(ctx, ns, when); err != nil {
+			t.Fatalf("Set %s: %v", ns, err)
+		}
+	}
+
+	n, err := s.ClearDatabase(ctx, "shop")
+	if err != nil {
+		t.Fatalf("ClearDatabase: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("withdrew %d claims, want 2", n)
+	}
+
+	for ns, wantClaimed := range map[string]bool{
+		"shop.orders":     false,
+		"shop.events":     false,
+		"shopping.orders": true,
+		"warehouse.stock": true,
+	} {
+		got, lerr := s.Load(ctx, ns)
+		if lerr != nil {
+			t.Fatalf("Load %s: %v", ns, lerr)
+		}
+		if got.Claimed != wantClaimed {
+			t.Errorf("%s claimed=%v, want %v", ns, got.Claimed, wantClaimed)
+		}
+	}
+
+	// A database with nothing recorded is not an error, so the feeder can call
+	// this on every dropDatabase it sees.
+	if n, err = s.ClearDatabase(ctx, "nothing"); err != nil || n != 0 {
+		t.Errorf("ClearDatabase on an untouched database: %d, %v", n, err)
+	}
+}

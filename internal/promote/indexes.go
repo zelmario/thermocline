@@ -94,24 +94,33 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 }
 
 // Forget clears the record that a namespace is done, so the next Ensure builds
-// it again.
+// it again, and lets that happen at once.
 //
 // Done means the fast tier had the collection and its indexes when it was
 // asked, which stops being true if the collection is dropped there. Only a
-// caller that has seen the collection missing should call this, and the retry
-// interval is left alone so a namespace that cannot be built is still not
-// hammered.
+// caller that has seen the collection go should call this.
+//
+// The retry interval goes with it, and that is the whole point. It used to be
+// kept, on the reasoning that a namespace which cannot be built should not be
+// hammered. That reasoning does not apply here: this only acts on a state that
+// says done, which means the last attempt *succeeded*, and a rate limit for
+// failures has nothing to say about it. Keeping it meant a collection dropped
+// and created again within a minute of its last build was not rebuilt at all
+// until that minute was up, which is exactly when an application is writing to
+// the empty collection.
+//
+// Repeated failures are still limited, because a failed build leaves done
+// false and this returns without touching anything.
 func (ix *Indexer) Forget(ns string) {
 	if ix == nil {
 		return
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	st := ix.state[ns]
-	if !st.done {
+	if !ix.state[ns].done {
 		return
 	}
-	ix.state[ns] = indexState{done: false, lastTry: st.lastTry}
+	ix.state[ns] = indexState{}
 }
 
 func (ix *Indexer) build(ctx context.Context, ns string) error {

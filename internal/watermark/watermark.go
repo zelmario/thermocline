@@ -112,6 +112,27 @@ func (s *Store) Clear(ctx context.Context, ns string) (bool, error) {
 	return res.DeletedCount > 0, nil
 }
 
+// ClearDatabase withdraws every claim for collections in one database, and
+// returns how many it removed.
+//
+// For dropDatabase, which removes them all at once and names none of them. A
+// claim is keyed by namespace, so the ones to withdraw are exactly those whose
+// key begins with the database and a dot.
+//
+// A range rather than a regular expression: no escaping to get wrong, and the
+// _id index answers it directly. The upper bound is the byte after '.', so it
+// stops at the end of this database's names and reaches no further.
+func (s *Store) ClearDatabase(ctx context.Context, db string) (int64, error) {
+	res, err := s.coll.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{
+		{Key: "$gte", Value: db + "."},
+		{Key: "$lt", Value: db + "/"},
+	}}})
+	if err != nil {
+		return 0, fmt.Errorf("clear watermarks for %s: %w", db, err)
+	}
+	return res.DeletedCount, nil
+}
+
 // All returns every recorded watermark, for reporting.
 func (s *Store) All(ctx context.Context) (map[string]Mark, error) {
 	cur, err := s.coll.Find(ctx, bson.D{})

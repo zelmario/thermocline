@@ -304,6 +304,10 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 	c.r.forgetIndexes(op.to)
 	c.r.forgetHint(op.from)
 	c.r.forgetHint(op.to)
+	// Both names: the old one no longer holds a collection, and the new one
+	// holds a different collection from whatever the indexer last saw there.
+	c.r.indexer.Forget(op.from)
+	c.r.indexer.Forget(op.to)
 	c.r.forgetBrackets(op.from)
 	c.r.forgetBrackets(op.to)
 	c.r.forgetView(op.from)

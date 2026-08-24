@@ -67,6 +67,9 @@ feeder:
     - "shop.tmenag2"
     # a probe namespace for measuring what mirroring costs under load.
     - "shop.tfeed"
+    # testindexes.sh: dropped through the router and brought back, to check the
+    # indexer is told rather than left to notice.
+    - "shop.tidxdrop"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.

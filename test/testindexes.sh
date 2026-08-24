@@ -426,6 +426,50 @@ chk "and the indexer then builds it"               "true" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
 kill $LRP 2>/dev/null; wait $LRP 2>/dev/null
 
+echo "== a collection dropped through the router has to be built again =="
+# The indexer records a namespace as done once the fast tier has the collection
+# and its indexes, and never asks again. A drop makes that untrue. Without being
+# told, it noticed only when a catalog listing happened to find the collection
+# missing, which is a later and much weaker signal than the drop itself: until
+# then the collection comes back with nothing but _id_, every query on it scans,
+# and a unique index the archive still carries is not enforced on the fast tier
+# at all.
+#
+# The same router throughout, because the point is what it does without being
+# restarted. A restart repairs this and hides it.
+DNS=tidxdrop
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.createIndex({code:1},{unique:true,name:'dropcode_u'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:1, code:'a'})" >/dev/null
+rm -f $LOGDIR/idxdrop.log
+cline router --config $CFG --log-file $LOGDIR/idxdrop.log >/dev/null 2>&1 & DRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+hasIdx() {
+  H "print(db.getSiblingDB(process.env.TC_DB).$DNS.getIndexes().some(function (i) { return i.name === 'dropcode_u' }))"
+}
+for _ in $(seq 1 20); do [ "$(hasIdx)" = "true" ] && break; sleep 1; done
+chk "the indexer builds it on the way up"          "true" "$(hasIdx)"
+# Now drop it through the router, which is the signal that used to be ignored,
+# and let the collection come back.
+R "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+# Created again through the router, which is the other half of the signal.
+# Ensure creates the collection as well as its indexes, so it must not be called
+# on the drop itself: that would put back what the client had just removed. The
+# create is where there is something to build.
+#
+# An implicit create, which is what an insert into a dropped collection is,
+# sends no create command and is not covered by this. It is repaired at the next
+# catalog listing or router start, and until then reads fall through to the
+# archive, which still holds both the documents and the indexes.
+R "db.getSiblingDB(process.env.TC_DB).createCollection('$DNS')" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:2, code:'b'})" >/dev/null
+for _ in $(seq 1 30); do [ "$(hasIdx)" = "true" ] && break; sleep 1; done
+chk "and builds it again after a drop and create"   "true" "$(hasIdx)"
+kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+
 echo "== dropping a unique index has to reach both tiers =="
 # DDL is not mirrored, so the drop used to reach the fast tier alone. From then
 # on the router accepted a value the archive refused and the document stayed on

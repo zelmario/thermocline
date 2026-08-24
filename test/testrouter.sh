@@ -416,6 +416,29 @@ chk "the bookkeeping database is listed once"      "1" \
 chk "and it is not listed twice"                   "1" \
     "$(R "print(db.adminCommand({listDatabases:1}).databases.filter(function (d) { return d.name === process.env.TC_DB }).length)")"
 
+# Dropping the whole database has to withdraw every claim in it. The feeder does
+# that for a single collection, because the drop event names one. dropDatabase
+# names none, so every claim in the database used to stand exactly as it was:
+# the router went on answering bounded reads from a fast tier holding nothing
+# and returning empty, while the archive still held the documents.
+H "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.insertMany([{_id:1},{_id:2},{_id:3}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB3).tcatdb.insertMany([{_id:1},{_id:2},{_id:3}])" >/dev/null
+cline watermark --config $CFG --ns $DB3.tcatdb --complete-all >/dev/null
+chk "the claim covers all of it"                   "3"     "$(R "print(db.getSiblingDB(process.env.TC_DB3).tcatdb.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+# The feeder sees the event and withdraws; give it the time it needs rather than
+# a fixed sleep, since what is being tested is that it happens at all.
+for _ in $(seq 1 40); do
+  cline watermark --config $CFG --ns $DB3.tcatdb 2>&1 | grep -q 'claims nothing' && break
+  sleep 0.5
+done
+chk "the archive still holds them after the drop"  "3"     "$(C "print(db.getSiblingDB(process.env.TC_DB3).tcatdb.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chk "and the router reads them rather than none"   "3"     "$(R "print(db.getSiblingDB(process.env.TC_DB3).tcatdb.countDocuments({}))")"
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).tcatdb.insertMany([{_id:1},{_id:2}])" >/dev/null
+
 # A view is a different case again and must stay out. It holds no documents, the
 # feeder refuses to tier one, and a read of it goes to the fast tier and finds
 # nothing, so listing it would be the same lie. With no namespaces configured
