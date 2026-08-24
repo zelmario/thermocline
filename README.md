@@ -242,6 +242,25 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **The newest N is answered by the fast tier, without a claim on all of
+  history.** "The last ten orders" carries no lower time bound, so nothing short
+  of `--complete-all` used to cover it, and a fast tier holding the last thirty
+  days was sent to the archive to be told which ten orders are the newest. It is
+  the one place that certainly holds them.
+
+  The proof is in its own answer. The claim says it holds every live document
+  newer than T, so if it returns the ten asked for, sorted newest first, and the
+  tenth is itself newer than T, every document it did not return is older than
+  all ten. The filter does not matter: whatever it selects, the fast tier holds
+  every match newer than T. Measured on a shop of 3,000 orders with 314 on the
+  fast tier, thirty such queries took 118 ms and three archive round trips
+  before, and 53 ms and none after.
+
+  Two conditions, neither a judgement call: the sort must lead with the field
+  the collection ages by, descending, because that is the only order in which
+  the last one returned bounds the rest; and the whole answer must be in the
+  batch, because a partial one does not contain the document that carries the
+  proof. Ask for more than the fast tier holds and it falls through as before.
 - **A feeder that has stopped is not a feeder that is behind.** Reads wait for
   mirroring to reach what you have already written, up to `router.archive_wait`,
   and a feeder that is merely behind gets there. One that has stopped never

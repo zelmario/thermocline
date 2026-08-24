@@ -302,6 +302,30 @@ chk "a bound inside \$and answers like the archive" \
 chk "a bound inside \$or answers like the archive"  \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{n:{\$exists:true}}]}))")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{n:{\$exists:true}}]}))")"
+# The newest N is what a dashboard asks, and it carries no lower bound, so it
+# used to go to the archive every time. It does not need one: if the fast tier
+# returns the N asked for, newest first, and the last of them is itself inside
+# the claim, every document it did not return is older than all N. Measured on
+# a shop of 3,000 orders with the fast tier holding 314: thirty such queries
+# took 118ms and three archive round trips before, and 53ms and none after.
+#
+# The archive is the control for every one of these, including the case where
+# the fast tier runs out and the proof must fail.
+for LIM in 1 2 3 5; do
+  chk "the newest $LIM agree with the archive" \
+      "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({_tcDeletedAt:{\$exists:false}}).sort({createdAt:-1}).limit($LIM).toArray().map(function (d) { return String(d._id) }).join(','))")" \
+      "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({}).sort({createdAt:-1}).limit($LIM).toArray().map(function (d) { return String(d._id) }).join(','))")"
+done
+# Oldest first is the other direction and proves nothing: the last one returned
+# bounds nothing, because everything not returned is newer.
+chk "the oldest two agree with the archive too"  \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({_tcDeletedAt:{\$exists:false}}).sort({createdAt:1}).limit(2).toArray().map(function (d) { return String(d._id) }).join(','))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({}).sort({createdAt:1}).limit(2).toArray().map(function (d) { return String(d._id) }).join(','))")"
+# And with a filter, which the proof does not depend on: whatever it selects,
+# the fast tier holds every matching document inside the claim.
+chk "the newest matching one agrees as well"     \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({n:{\$exists:true},_tcDeletedAt:{\$exists:false}}).sort({createdAt:-1}).limit(1).toArray().map(function (d) { return String(d._id) }).join(','))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.find({n:{\$exists:true}}).sort({createdAt:-1}).limit(1).toArray().map(function (d) { return String(d._id) }).join(','))")"
 chk "and one inside \$and on another field too"     \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")"

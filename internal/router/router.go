@@ -153,11 +153,15 @@ func (r *Router) Addr() string {
 // needs: copy-up rate says whether the boundary is cut too deep, and incomplete
 // says whether queries are being answered from a tier that cannot answer them.
 type Stats struct {
-	Commands      atomic.Int64
-	ReadMisses    atomic.Int64
-	WriteMisses   atomic.Int64
-	CopiedUp      atomic.Int64
-	Incomplete    atomic.Int64
+	Commands    atomic.Int64
+	ReadMisses  atomic.Int64
+	WriteMisses atomic.Int64
+	CopiedUp    atomic.Int64
+	Incomplete  atomic.Int64
+	// NewestFirst counts reads for the newest N that the fast tier proved it
+	// could answer from its own reply. Each one is an archive round trip that
+	// did not happen. See newestfirst.go.
+	NewestFirst   atomic.Int64
 	Refused       atomic.Int64
 	Archived      atomic.Int64
 	TxnReplays    atomic.Int64

@@ -350,6 +350,19 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 			// a tier claiming all of history can answer that on its own.
 			return reply, nil
 		}
+
+		// A query for the newest N carries no lower bound and does not need
+		// one: the fast tier's own answer can prove it holds all of them. See
+		// newestfirst.go.
+		cmd, cerr := msg.CommandDoc()
+		rdoc, derr := reply.ReplyDoc()
+		if cerr == nil && derr == nil && replyOK(rdoc) {
+			af, aok := c.r.ageFieldOf(judged)
+			if provenNewestFirst(cmd, rdoc, af, aok, mark) {
+				c.r.Stats.NewestFirst.Add(1)
+				return reply, nil
+			}
+		}
 	}
 
 	// Everything below this line is a query the fast tier cannot be shown to
