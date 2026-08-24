@@ -171,6 +171,27 @@ const completenessTTL = watermark.ClaimCacheTTL
 // A read failure is reported as unknown rather than folded into an unclaimed
 // Mark. Both refuse in strict mode, but they need different words: one is "warm
 // this namespace", the other is "the cold tier is unreachable".
+// forgetCompleteness drops a cached claim, for the moment the router itself
+// makes it untrue.
+//
+// A drop removes every document of a collection from the fast tier, and the
+// claim that it holds them all outlives it: the feeder withdraws the claim when
+// it sees the event, and this router keeps its cached copy for ClaimCacheTTL
+// after that. Measured on a collection claimed complete for all of history and
+// dropped through the router: countDocuments answered 0 where the archive holds
+// 3, with no error.
+//
+// A drop this router forwarded is one it knows about at once, so there is no
+// reason to learn it again later. A drop applied straight to the fast tier is
+// not, and that window stays: the router is not watching for it, and the answer
+// corrects itself once the feeder has withdrawn the claim and this cache has
+// expired.
+func (r *Router) forgetCompleteness(ns string) {
+	r.wmCache.mu.Lock()
+	delete(r.wmCache.entries, ns)
+	r.wmCache.mu.Unlock()
+}
+
 func (r *Router) completeness(ctx context.Context, ns string) (watermark.Mark, bool) {
 	r.wmCache.mu.RLock()
 	e, ok := r.wmCache.entries[ns]

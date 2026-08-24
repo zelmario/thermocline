@@ -977,6 +977,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		if coll, ok := indexDDL(cmd, name); ok {
 			c.r.forgetIndexes(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
+			if name == "drop" {
+				// The fast tier no longer holds any of it, so a cached claim
+				// that it holds all of it is wrong from this instant. See
+				// forgetCompleteness.
+				c.r.forgetCompleteness(db + "." + coll)
+			}
 			// A collection's collation is fixed at creation, so the only way it
 			// changes is a drop and a recreate, which comes through here.
 			c.r.forgetCollation(db + "." + coll)

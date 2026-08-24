@@ -147,7 +147,23 @@ sleep 4
 chk "mirrored before the drop" "3" "$(C "print(db.getSiblingDB(process.env.TC_DB).tdrop.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 cline watermark --config $CFG --ns $DB.tdrop --complete-all >/dev/null
 sleep 7
+# Read through the router once first, which is what puts the claim in its cache.
+# Without this the router has nothing cached at the moment of the drop, reads
+# the claim fresh, and by then the feeder has already withdrawn it: the section
+# then passes whether or not the cache is handled at all.
+chk "the router sees all three before the drop"   "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tdrop.countDocuments({}))")"
 R "db.getSiblingDB(process.env.TC_DB).tdrop.drop()" >/dev/null
+# Immediately, with no sleep, because that is what a client does.
+#
+# The drop empties the fast tier at once. The claim that it holds everything
+# outlives it: the feeder withdraws the claim when it sees the event, and the
+# router keeps a cached copy for ClaimCacheTTL after that. Everything below this
+# line waits four seconds first and so measured the state after the window
+# rather than during it. Measured during it: countDocuments answered 0 where the
+# archive holds 3, with no error.
+chk "a read straight after the drop is not empty" "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tdrop.countDocuments({}))")"
 sleep 4
 chk "the feeder survived the drop" "1" "$(pgrep -fc "cline feeder --config $WDIR/" || true)"
 chk "the archive kept its copy"    "3" "$(C "print(db.getSiblingDB(process.env.TC_DB).tdrop.countDocuments({_tcDeletedAt:{\$exists:false}}))")"

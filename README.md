@@ -242,6 +242,17 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **A drop through the router stops the claim at once.** Dropping a tiered
+  collection empties the fast tier immediately, and the claim that it holds
+  everything outlives it: the feeder withdraws the claim when it sees the event,
+  and the router keeps a cached copy for a few seconds after that. Measured on a
+  collection claimed complete for all of history: `countDocuments` straight
+  after the drop answered **0 where the archive holds 3**, with no error.
+
+  A drop the router forwarded is one it knows about at once, so it forgets the
+  claim there and then. A drop applied straight to the fast tier, out of band, is
+  not: that window remains, and the answer corrects itself once the feeder has
+  withdrawn the claim and the cache has expired.
 - **An eviction sweep waits before it removes what it has just stopped
   claiming.** The evictor raises the completeness watermark first, so an
   interrupted sweep never leaves a claim wider than the truth. That protects a
