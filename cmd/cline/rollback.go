@@ -66,13 +66,30 @@ func runRollback(args []string) error {
 	defer disconnect(cold, log)
 
 	namespaces := cfg.Feeder.Namespaces
-	if *nsFlag != "" {
+	switch {
+	case *nsFlag != "":
 		namespaces = []string{*nsFlag}
-	}
-	if len(namespaces) == 0 {
-		fmt.Println("No namespaces are configured, so nothing here knows which collections to look at.")
-		fmt.Println("Name one with --ns.")
-		return nil
+	case len(namespaces) == 0:
+		// An empty feeder.namespaces means every collection is tiered, which is
+		// a supported configuration and the one where this command was least
+		// use: it told the operator to name them one at a time, which is the
+		// hand-typed process it exists to replace, during an incident, with the
+		// missed collection being the one that answers wrongly afterwards.
+		//
+		// The archive holds every document, so it also knows every collection.
+		// Asking it is the same answer the configuration would have given.
+		fmt.Println("No namespaces are configured, so every collection is tiered.")
+		fmt.Println("Asking the archive which ones it holds.")
+		found, derr := archiveNamespaces(ctx, cold)
+		if derr != nil {
+			return fmt.Errorf("could not ask the archive which collections it holds, so this "+
+				"cannot know what to look at; name one with --ns: %w", derr)
+		}
+		if len(found) == 0 {
+			return fmt.Errorf("the archive holds no collections to look at")
+		}
+		namespaces = found
+		fmt.Printf("Found %d.\n", len(namespaces))
 	}
 	sort.Strings(namespaces)
 
@@ -167,4 +184,44 @@ func feederPublishing(ctx context.Context, cold *mongo.Client, id string) (bool,
 func splitNS(ns string) (db, coll string) {
 	db, coll, _ = strings.Cut(ns, ".")
 	return db, coll
+}
+
+// archiveNamespaces lists every collection the archive holds, for the
+// configuration that tiers all of them.
+//
+// System databases and system collections are left out: they are a node's own
+// bookkeeping, they carry no tombstones, and clearing anything in them is not
+// what rollback means. Views too, which hold no documents.
+func archiveNamespaces(ctx context.Context, cold *mongo.Client) ([]string, error) {
+	dbs, err := cold.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, db := range dbs {
+		switch db {
+		case "admin", "local", "config":
+			continue
+		}
+		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+			continue
+		}
+		cur, lerr := cold.Database(db).ListCollections(ctx, bson.D{{Key: "type", Value: "collection"}})
+		if lerr != nil {
+			return nil, fmt.Errorf("list collections in %s: %w", db, lerr)
+		}
+		for cur.Next(ctx) {
+			name, ok := cur.Current.Lookup("name").StringValueOK()
+			if !ok || strings.HasPrefix(name, "system.") {
+				continue
+			}
+			out = append(out, db+"."+name)
+		}
+		cerr := cur.Err()
+		_ = cur.Close(ctx)
+		if cerr != nil {
+			return nil, fmt.Errorf("list collections in %s: %w", db, cerr)
+		}
+	}
+	return out, nil
 }
