@@ -224,6 +224,23 @@ ask2 "re-sorted after the limit"               "const F=$IDS; print(F(t.aggregat
 # And the claim still buys something here: asking for two is answered by the
 # fast tier, because its second is inside the claim.
 ask2 "the newest two, which it can prove"      "const F=$IDS; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:2}])))"
+# And what the fall-through leaves behind. The fast tier ran this query too, and
+# with a batchSize below the limit it kept the rest back and holds a cursor for
+# it. The client is given the archive's cursor instead, so nothing will ever ask
+# for that rest and it sits there until mongod's own timeout.
+#
+# Counted for this collection alone, because the fast tier's total is a moving
+# number that other workers move too.
+idleHere() {
+  H "print(db.getSiblingDB('admin').aggregate([{\$currentOp:{idleCursors:true,allUsers:true}}])
+       .toArray().filter(o => o.type === 'idleCursor' && o.ns === process.env.TC_DB + '.$N2').length)"
+}
+for _ in 1 2 3 4 5; do
+  R "db.getSiblingDB(process.env.TC_DB).$N2.find({}).sort({createdAt:-1}).limit(3).batchSize(1).toArray()" >/dev/null
+done
+sleep 1
+chk "the fall-through left no cursor behind" "0" "$(idleHere)"
+
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
