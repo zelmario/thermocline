@@ -24,6 +24,9 @@
 # because they range from under a minute to several, and a worker that finishes
 # early should take the next one rather than idle.
 WORKERS=${WORKERS:-4}
+# How long one suite may take before it is killed and reported as a failure.
+# Generous next to testconform, the longest, at about seven minutes.
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-25m}
 OUT=${OUT:-/root/psweep}
 SHARED=${SHARED:-/root/cline.yaml}
 SUITES=${SUITES:-"testconform testauthterm testkeys testtxn testconcerns
@@ -80,10 +83,26 @@ worker() {
     [ -z "$s" ] && break
     [ -f "/root/$s.sh" ] || { printf '%-18s MISSING\n' "$s" >> "$OUT/summary.txt"; continue; }
     start=$(date +%s)
-    bash "/root/$s.sh" > "$OUT/$s.log" 2>&1
+    # Bounded, because a suite that hangs used to stall the whole sweep and
+    # there is nothing to read while it does: no failure, no output, just a
+    # worker that never claims again. Twice in one day a run was lost to one
+    # stuck process, once a mongosh that never reached the router on an idle
+    # machine and never gave up either.
+    #
+    # A suite killed here is reported as a failure with the time it was given,
+    # which is what makes it visible. The bound is generous next to the longest
+    # suite, which is testconform at about seven minutes, so reaching it means
+    # something is wrong rather than slow.
+    timeout --kill-after=30s "$SUITE_TIMEOUT" bash "/root/$s.sh" > "$OUT/$s.log" 2>&1
     rc=$?
     secs=$(( $(date +%s) - start ))
     line=$(grep -E '^PASS [0-9]+ +FAIL [0-9]+' "$OUT/$s.log" | tail -1)
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+      line="TIMED OUT after ${SUITE_TIMEOUT}, killed. ${line:-no tally}"
+      # Whatever it left running is this worker's to clear, and the cleanup
+      # below only reaches daemons. A shell it was waiting on outlives it.
+      pkill -f "bash /root/$s.sh" 2>/dev/null
+    fi
     [ -z "$line" ] && line="(no tally, rc=$rc)"
     # One append per suite, and every line is written by a single printf, so the
     # writes are small enough that the kernel does not interleave them.

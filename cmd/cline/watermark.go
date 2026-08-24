@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/mongo"
+
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -31,6 +33,8 @@ func runWatermark(args []string) error {
 		"declare --ns complete for all of history, for a fast tier that is the original cluster")
 	completeFrom := fs.String("complete-from", "",
 		"declare --ns complete for everything newer than this RFC3339 instant")
+	force := fs.Bool("force", false,
+		"record a claim the two tiers' counts contradict, for a warm that is still running")
 	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -70,6 +74,37 @@ func runWatermark(args []string) error {
 
 	marks := watermark.New(cold)
 
+	// declaring is the only path that needs the fast tier: a claim is a
+	// statement about what it holds, and the command used not to look.
+	declaring := *completeAll || *completeFrom != ""
+	var hot *mongo.Client
+	if declaring {
+		hot, err = connect(ctx, cfg.Hot.URI, "hot")
+		if err != nil {
+			return err
+		}
+		defer disconnect(hot, log)
+	}
+
+	// verify counts both tiers and refuses a claim they contradict. --force
+	// turns that into a warning, because an operator watching a warm fill knows
+	// something the counts do not.
+	verify := func(from time.Time) error {
+		why, err := checkClaim(ctx, hot, cold, cfg, *ns, from)
+		if err != nil {
+			return err
+		}
+		if why == "" {
+			return nil
+		}
+		if !*force {
+			return errors.New(why)
+		}
+		fmt.Println("warning: recording a claim the counts contradict, because --force was given")
+		fmt.Println(why)
+		return nil
+	}
+
 	switch {
 	case *clear:
 		existed, err := marks.Clear(ctx, *ns)
@@ -85,6 +120,9 @@ func runWatermark(args []string) error {
 		return nil
 
 	case *completeAll:
+		if err := verify(time.Time{}); err != nil {
+			return err
+		}
 		if err := marks.Set(ctx, *ns, time.Time{}); err != nil {
 			return err
 		}
@@ -96,6 +134,9 @@ func runWatermark(args []string) error {
 		from, err := time.Parse(time.RFC3339, *completeFrom)
 		if err != nil {
 			return fmt.Errorf("--complete-from must be RFC3339, like 2026-08-14T15:00:00Z: %w", err)
+		}
+		if err := verify(from.UTC()); err != nil {
+			return err
 		}
 		if err := marks.Set(ctx, *ns, from.UTC()); err != nil {
 			return err
