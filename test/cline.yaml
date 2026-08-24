@@ -59,6 +59,9 @@ feeder:
     # createdAt is a Timestamp rather than a date. A sort orders across types
     # where a range predicate does not, so it belongs first.
     - "shop.tqtype"
+    # a probe collection holding a document of every BSON type in the field it
+    # is aged by, compared against the archive question by question.
+    - "shop.tmenag"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.
@@ -234,6 +237,9 @@ evictor:
     - ns: "shop.tqtype"
       older_than: 40m
       date_field: "createdAt"
+    - ns: "shop.tmenag"
+      older_than: 40m
+      date_field: "createdAt"
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05
@@ -262,6 +268,9 @@ warmer:
       back: 40m
       date_field: "createdAt"
     - ns: "shop.tqtype"
+      back: 40m
+      date_field: "createdAt"
+    - ns: "shop.tmenag"
       back: 40m
       date_field: "createdAt"
   backoff:

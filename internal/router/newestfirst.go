@@ -31,6 +31,18 @@ import (
 // order in which "the last one returned" bounds the rest; and the whole answer
 // must be in the batch, because the proof is the last document of the N and a
 // partial batch does not contain it.
+//
+// A skip is safe and does not need saying in the command, though it is worth
+// saying here. It drops documents off the front, so "everything not returned is
+// older than all N" stops being true of the skipped ones. The claim is what
+// carries the proof either way: a live document the fast tier does not hold is
+// not newer than the claim, and the last one returned is, so nothing in the
+// archive can enter the page. The boundaries line up exactly for this, because
+// the evictor removes strictly older than its cutoff and claims from that same
+// instant, and the warmer warms from its floor and claims that floor.
+//
+// What it cannot survive is a value the sort ranks above the claim's own
+// bracket. See agebracket.go.
 
 // provenNewestFirst reports whether the fast tier's own reply proves it
 // answered a newest-first query completely.

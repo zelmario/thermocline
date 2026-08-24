@@ -261,6 +261,11 @@ echo "== a collation decides which strings are one key =="
 # says so whichever way it was set.
 fresh tkcoll
 H 'db.getSiblingDB(process.env.TC_DB).tkcoll.createIndex({email:1},{unique:true,collation:{locale:"en",strength:2}})' >/dev/null
+# The comparison has to be made in the index's own collation, which means asking
+# the archive, and asking without an index there would scan the whole collection
+# on every insert. An adopted archive is the original cluster and carries it; one
+# the feeder built has only _id_, so the test creates it as the warning says to.
+C 'db.getSiblingDB(process.env.TC_DB).tkcoll.createIndex({email:1},{collation:{locale:"en",strength:2}})' >/dev/null
 R 'db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:1,email:"Bob@x.com"})' >/dev/null
 waitMirrored tkcoll 1
 evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll.deleteOne({_id:1})'
@@ -272,6 +277,13 @@ chk "a value nobody holds is still accepted"         "ok"    "$(R 'try{db.getSib
 chk "and rewriting a value to itself is allowed"     "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:4},{$set:{email:"eve@x.com"}});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "an update onto the archived key is rejected"    "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:4},{$set:{email:"BOB@x.com"}});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and the document was not changed"             "eve@x.com" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tkcoll.findOne({_id:4}); print(d?d.email:"MISSING")')"
+# The archive is behind the fast tier by however long mirroring takes, so a
+# document that has just moved off a value still looks like it holds it there.
+# Refusing on that would refuse a legitimate write for the length of the lag.
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:5,email:"moves@x.com"})' >/dev/null
+waitMirrored tkcoll 3
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:5},{$set:{email:"moved@x.com"}})' >/dev/null
+chk "the value it just moved off is free at once"    "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:6,email:"MOVES@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they

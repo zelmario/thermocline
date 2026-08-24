@@ -2,10 +2,8 @@ package router
 
 import (
 	"context"
-	"errors"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -38,6 +36,9 @@ func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx unique
 	if len(idx.collation) == 0 || len(vals) != len(idx.fields) {
 		return false
 	}
+	if !r.archiveCanAnswerCollated(ctx, ns, idx) {
+		return false
+	}
 
 	filter := bson.D{meta.NotArchivedDeleted()}
 	for i, f := range idx.fields {
@@ -53,24 +54,46 @@ func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx unique
 		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
 	}
 
+	// More than one, because the archive is behind the fast tier by however
+	// long mirroring takes. A document that has just moved off this value still
+	// looks like it holds it there, and taking only the first match could hand
+	// back that one and hide a real clash sitting behind it. That is the same
+	// staleness claimIsLive resolves for a byte key, and the same answer
+	// applies: a document the fast tier holds has already been judged by its
+	// own index, so only an archive-only one is a cross tier clash.
+	//
+	// The cap is what one key can honestly be expected to match. Reaching it
+	// means the constraint was already broken by more documents than this, and
+	// refusing on the first archive-only one among them is right either way.
 	db, coll := splitNS(ns)
-	err := r.cold.Database(db).Collection(coll).FindOne(ctx, filter,
-		options.FindOne().
+	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, filter,
+		options.Find().
 			SetCollation(collationFromSpec(idx.collation)).
-			SetProjection(bson.D{{Key: "_id", Value: 1}}),
-	).Err()
-	switch {
-	case err == nil:
-		return true
-	case errors.Is(err, mongo.ErrNoDocuments):
-		return false
-	default:
+			SetProjection(bson.D{{Key: "_id", Value: 1}}).
+			SetLimit(collatedCandidates),
+	)
+	if err != nil {
 		r.log.Warn("could not ask the archive about a collated unique key, not enforcing it across tiers",
 			"ns", ns, "index", idx.name, "err", err,
 			"effect", "a duplicate of an archived document could be inserted, spelled differently")
 		return false
 	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	for cur.Next(ctx) {
+		id, lerr := bson.Raw(cur.Current).LookupErr("_id")
+		if lerr != nil {
+			return true
+		}
+		if !r.fastTierHolds(ctx, ns, id) {
+			return true
+		}
+	}
+	return false
 }
+
+// collatedCandidates bounds how many archived documents one key is compared
+// against. See collatedArchiveClash.
+const collatedCandidates = 8
 
 // collationFromSpec turns an index's reported collation into one a query can
 // carry. The report includes the version of the collator that built the index,
@@ -101,4 +124,72 @@ func collationFromSpec(spec bson.Raw) *options.Collation {
 		Normalization:   c.Normalization,
 		Backwards:       c.Backwards,
 	}
+}
+
+// archiveCanAnswerCollated reports whether the archive can answer the lookup
+// above from an index, and says so once when it cannot.
+//
+// The lookup is by the index's own fields, and an adopted archive is the
+// original cluster, so it usually carries the very index this is about. An
+// archive the feeder built has only _id_, because nothing creates an
+// application's indexes there. Running the lookup anyway would put a collection
+// scan on every insert into that collection, which is a far worse thing to do
+// quietly than the under-enforcement it would be fixing.
+//
+// A query with a collation can only use an index built with the same one, so
+// the collation has to match and not merely be present.
+func (r *Router) archiveCanAnswerCollated(ctx context.Context, ns string, idx uniqueIndex) bool {
+	key := ns + "|" + idx.name
+	r.brackets.mu.RLock()
+	usable, asked := r.brackets.collated[key]
+	r.brackets.mu.RUnlock()
+	if asked {
+		return usable
+	}
+
+	db, coll := splitNS(ns)
+	cur, err := r.cold.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		// Do not remember a failure to ask as an answer.
+		return false
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	want := collationFromSpec(idx.collation)
+	for cur.Next(ctx) {
+		var spec struct {
+			Key       bson.Raw `bson:"key"`
+			Collation bson.Raw `bson:"collation"`
+		}
+		if cur.Decode(&spec) != nil || len(spec.Collation) == 0 {
+			continue
+		}
+		elems, kerr := spec.Key.Elements()
+		if kerr != nil || len(elems) == 0 || elems[0].Key() != idx.fields[0] {
+			continue
+		}
+		have := collationFromSpec(spec.Collation)
+		if have == nil || want == nil || have.Locale != want.Locale || have.Strength != want.Strength {
+			continue
+		}
+		usable = true
+		break
+	}
+
+	r.brackets.mu.Lock()
+	if r.brackets.collated == nil {
+		r.brackets.collated = map[string]bool{}
+	}
+	r.brackets.collated[key] = usable
+	r.brackets.mu.Unlock()
+
+	if !usable {
+		r.log.Warn("not enforcing a collated unique index across tiers",
+			"ns", ns, "index", idx.name,
+			"reason", "the value has to be compared in the index's own collation, which means asking the "+
+				"archive, and the archive has no index on "+idx.fields[0]+" with that collation",
+			"effect", "a duplicate of an archived document can be inserted, spelled differently; asking "+
+				"anyway would scan the whole archived collection on every insert",
+			"action", "create the same index on the archive, with the same collation")
+	}
+	return usable
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -41,12 +42,19 @@ var (
 	aboveObjectID = bson.A{"bool", "date", "timestamp", "regex", "maxKey"}
 )
 
+// bracketProbeTimeout bounds the one question above. See sortSafeAges.
+const bracketProbeTimeout = 2 * time.Second
+
 // bracketCache remembers, per namespace, whether the archive holds a document
 // whose age field sorts above everything the claim can speak for.
 type bracketCache struct {
 	mu    sync.RWMutex
 	byNS  map[string]bool
 	asked map[string]bool
+
+	// collated remembers, per namespace and index, whether the archive can
+	// answer a collated key lookup from an index. See collatedkeys.go.
+	collated map[string]bool
 }
 
 // sortSafeAges reports whether a sort on ns's age field can be trusted to put
@@ -68,17 +76,38 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 		field, types = "_id", aboveObjectID
 	}
 	db, coll := splitNS(ns)
-	err := r.cold.Database(db).Collection(coll).FindOne(ctx, bson.D{
+	// Bounded, because an archive the feeder built has only _id_ and this
+	// question is asked of another field, which makes it a collection scan.
+	// It is asked once per namespace, on the path of a client's query, so a
+	// large archive without that index must not turn the first newest-first
+	// query of a router's life into a minute of waiting. Running out of time
+	// is answered the same way an error is: the optimisation does not apply.
+	probeCtx, cancel := context.WithTimeout(ctx, bracketProbeTimeout)
+	defer cancel()
+	err := r.cold.Database(db).Collection(coll).FindOne(probeCtx, bson.D{
 		{Key: field, Value: bson.D{{Key: "$type", Value: types}}},
 		meta.NotArchivedDeleted(),
 	}).Err()
 
+	found := false
 	switch {
 	case err == nil:
 		// One exists, so a sort can put it above the answer.
-		safe = false
+		safe, found = false, true
 	case errors.Is(err, mongo.ErrNoDocuments):
 		safe = true
+	case errors.Is(err, context.DeadlineExceeded):
+		// Remembered, unlike an error: asking again would cost the same scan
+		// on the next query and every one after it. The answer stands until
+		// the operator indexes the field and restarts the router, which is
+		// what the action below asks for.
+		safe = false
+		r.log.Warn("gave up asking whether the archive ages every document the same way",
+			"ns", ns, "field", field, "waited", bracketProbeTimeout.String(),
+			"reason", "the archive has no index on "+field+", so the question is a collection scan",
+			"effect", "newest-first queries on this namespace consult the archive, which is slower "+
+				"and always correct",
+			"action", "create an index on "+field+" in the archive, then restart the router")
 	default:
 		// Do not remember a failure to ask as an answer.
 		r.log.Warn("cannot tell whether the archive ages every document the same way",
@@ -97,7 +126,7 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	r.brackets.asked[ns] = true
 	r.brackets.mu.Unlock()
 
-	if !safe {
+	if found {
 		r.log.Info("the archive ages some documents by a value that outranks a date",
 			"ns", ns, "field", field,
 			"meaning", "a sort orders across types where a range predicate does not, so such a document "+
