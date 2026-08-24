@@ -119,6 +119,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"incomplete":         r.Stats.Incomplete.Load(),
 			"newest_first":       r.Stats.NewestFirst.Load(),
 			"superseded_cursors": r.Stats.SupersededCursors.Load(),
+			"panics":             r.Stats.Panics.Load(),
 			"refused":            r.Stats.Refused.Load(),
 			"from_archive":       r.Stats.Archived.Load(),
 			"txn_replays":        r.Stats.TxnReplays.Load(),

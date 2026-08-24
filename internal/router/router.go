@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -171,13 +172,16 @@ type Stats struct {
 	// SupersededCursors counts fast tier cursors closed because the archive's
 	// answer replaced the one they belonged to. See superseded.go.
 	SupersededCursors atomic.Int64
-	Refused           atomic.Int64
-	Archived          atomic.Int64
-	TxnReplays        atomic.Int64
-	WarmedForTxn      atomic.Int64
-	DuplicateKeys     atomic.Int64
-	ChangeStreams     atomic.Int64
-	Unauthorized      atomic.Int64
+	// Panics counts connections closed by a recovered panic. Any value above
+	// zero is a defect, and the stack is in the log beside it. See serve.
+	Panics        atomic.Int64
+	Refused       atomic.Int64
+	Archived      atomic.Int64
+	TxnReplays    atomic.Int64
+	WarmedForTxn  atomic.Int64
+	DuplicateKeys atomic.Int64
+	ChangeStreams atomic.Int64
+	Unauthorized  atomic.Int64
 	// FailoverReplays counts commands re-sent after the fast tier changed
 	// primary underneath them. Any value above zero is an election the clients
 	// did not have to see.
@@ -379,6 +383,34 @@ func (r *Router) reapCursors(ctx context.Context) {
 // sharing one would mean re-implementing SCRAM here instead of letting the real
 // server do it.
 func (r *Router) serve(ctx context.Context, client net.Conn) {
+	// A panic here takes one client down, not the process.
+	//
+	// Go kills the whole program for an unrecovered panic in any goroutine, and
+	// this one parses whatever a client sends. Without this, a single malformed
+	// message, or any defect in a rarely reached branch, would disconnect every
+	// other application using this router and stop the proxy. net/http recovers
+	// per connection for the same reason.
+	//
+	// It is not a way to live with panics. The log carries the stack at ERROR
+	// and the dashboard counts them, because a panic is a defect that has to be
+	// found; what this decides is who pays for it while it is being found.
+	//
+	// The state a panic could leave behind is this connection's, and it goes
+	// with the connection. The shared caches are guarded by mutexes released by
+	// defer, or held across nothing that can panic, so unwinding does not leave
+	// one locked.
+	defer func() {
+		if p := recover(); p != nil {
+			r.Stats.Panics.Add(1)
+			r.log.Error("recovered a panic while serving a client, closing that connection",
+				"panic", fmt.Sprint(p),
+				"remote", remoteAddr(client),
+				"stack", string(debug.Stack()),
+				"effect", "this client's connection is closed and it will reconnect; every other "+
+					"client is unaffected",
+				"action", "this is a defect: report the stack above")
+		}
+	}()
 	defer func() { _ = client.Close() }()
 	r.Stats.ClientsOpen.Add(1)
 	r.Stats.ClientsTotal.Add(1)
@@ -1382,4 +1414,17 @@ func (r *Router) forgetEverythingIn(db string) {
 		r.forgetView(ns)
 		r.indexer.Forget(ns)
 	}
+}
+
+// remoteAddr names a client for a log line, without assuming there is one: a
+// connection can be closed by the time a panic is being reported.
+func remoteAddr(c net.Conn) string {
+	if c == nil {
+		return "unknown"
+	}
+	a := c.RemoteAddr()
+	if a == nil {
+		return "unknown"
+	}
+	return a.String()
 }
