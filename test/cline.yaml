@@ -62,6 +62,9 @@ feeder:
     # a probe collection holding a document of every BSON type in the field it
     # is aged by, compared against the archive question by question.
     - "shop.tmenag"
+    # testbson.sh: dates only, and a fast tier holding one document older than
+    # its own claim, which is what makes the newest-first proof fail honestly.
+    - "shop.tmenag2"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.
@@ -240,6 +243,9 @@ evictor:
     - ns: "shop.tmenag"
       older_than: 40m
       date_field: "createdAt"
+    - ns: "shop.tmenag2"
+      older_than: 40m
+      date_field: "createdAt"
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05
@@ -271,6 +277,9 @@ warmer:
       back: 40m
       date_field: "createdAt"
     - ns: "shop.tmenag"
+      back: 40m
+      date_field: "createdAt"
+    - ns: "shop.tmenag2"
       back: 40m
       date_field: "createdAt"
   backoff:

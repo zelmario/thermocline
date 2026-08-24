@@ -100,6 +100,11 @@ C "
   d.push({_id: 'arr',     createdAt: [new Date(now - 3600000), new Date(now - 7200000)]});
   d.push({_id: 'doc',     createdAt: {at: new Date(now)}});
   d.push({_id: 'bin',     createdAt: BinData(0, 'AAAA')});
+  // Every document also carries a recent updatedAt. Nothing above reads it:
+  // it is there so a pipeline that rewrites createdAt from it would be proved
+  // against a date that is always inside the claim, which is the mistake the
+  // check below exists to catch.
+  d.forEach(x => { x.updatedAt = new Date(now); });
   t.insertMany(d);" >/dev/null
 
 # The fast tier holds the warm window. Copied out of the archive rather than
@@ -108,10 +113,10 @@ C "
 # asking each tier about its own data. That mistake read as a product bug.
 HOTDOCS=$(C "
   const src = db.getSiblingDB(process.env.TC_DB).$NS.find({_id:{\$regex:'^new'}}).toArray();
-  print(JSON.stringify(src.map(d => ({_id: d._id, at: d.createdAt.getTime(), k: d.k}))));")
+  print(JSON.stringify(src.map(d => ({_id: d._id, at: d.createdAt.getTime(), k: d.k, up: d.updatedAt.getTime()}))));")
 H "const src = $HOTDOCS;
    db.getSiblingDB(process.env.TC_DB).$NS.insertMany(
-     src.map(d => ({_id: d._id, createdAt: new Date(d.at), k: d.k})));" >/dev/null
+     src.map(d => ({_id: d._id, createdAt: new Date(d.at), k: d.k, updatedAt: new Date(d.up)})));" >/dev/null
 
 startRouter
 # Complete from the oldest document the fast tier holds, which is what warming
@@ -153,12 +158,76 @@ for L in 1 3 5; do
   ask "the newest $L as a pipeline" "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:$L}])))"
 done
 ask "the newest 3 as a filtered pipeline" "const F=$AGG; print(F(t.aggregate([{\$match:Object.assign({k:'a'},LIVE)},{\$sort:{createdAt:-1}},{\$limit:3}])))"
+# A stage after the $limit reshapes documents already chosen, so it cannot change
+# which ones they are. This one keeps the field the proof reads.
+ask "the newest 3 then projected"         "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$project:{_id:1,createdAt:1}}])))"
+ask "the newest 3 then unset"             "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$unset:'k'}])))"
+# And the two that would let the pipeline tell the proof what to believe. The
+# first rewrites the age from a field that is always recent; the second moves a
+# different document into the place the proof reads. Both must go to the archive.
+ask "the newest 3 with the age rewritten" "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$addFields:{createdAt:'\$updatedAt'}}])))"
+ask "the newest 3 then re-sorted"         "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$sort:{createdAt:1}}])))"
 # Oldest first is not this shape and must go on being answered by the archive.
 ask "the oldest 3 as a pipeline"          "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:1}},{\$limit:3}])))"
 # Nor is a pipeline with no limit, which reads everything.
 ask "sorted with no limit as a pipeline"  "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}}])))"
 # Nor one that computes rather than selects.
 ask "a group as a pipeline"               "print(t.aggregate([{\$match:LIVE},{\$group:{_id:null,n:{\$sum:1}}}]).toArray()[0].n)"
+
+echo "== where only the shape of the pipeline stands between right and wrong =="
+# The two checks above cannot fail on tmenag, because that collection has ages
+# outranking a date and the router declines to prove anything about it however
+# the pipeline is shaped. A check that cannot fail is not a check.
+#
+# So: dates only, and a fast tier holding one document older than its own claim.
+# The fast tier's own three newest are then not the collection's three newest,
+# and the only thing that catches it is the proof reading the age of the last
+# document the sort put there. Anything that rewrites that value or moves a
+# different document into that place turns a correct fall-through into a wrong
+# answer.
+N2=tmenag2
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$N2'})" >/dev/null
+C "
+  const t = db.getSiblingDB(process.env.TC_DB).$N2;
+  const now = Date.now();
+  const d = [];
+  for (let i = 0; i < 2; i++) d.push({_id: 'r' + i, createdAt: new Date(now - i*60000)});
+  for (let i = 0; i < 8; i++) d.push({_id: 'm' + i, createdAt: new Date(now - (i+10)*3600000)});
+  d.forEach(x => { x.updatedAt = new Date(now); });
+  t.insertMany(d);" >/dev/null
+# The fast tier holds the two recent ones and the very oldest, which is what a
+# warm plus a document nothing has evicted yet leaves behind.
+D2=$(C "
+  const src = db.getSiblingDB(process.env.TC_DB).$N2.find({_id:{\$in:['r0','r1','m7']}}).toArray();
+  print(JSON.stringify(src.map(d => ({_id: d._id, at: d.createdAt.getTime(), up: d.updatedAt.getTime()}))));")
+H "const src = $D2;
+   db.getSiblingDB(process.env.TC_DB).$N2.insertMany(
+     src.map(d => ({_id: d._id, createdAt: new Date(d.at), updatedAt: new Date(d.up)})));" >/dev/null
+startRouter
+F2=$(H "print(db.getSiblingDB(process.env.TC_DB).$N2.findOne({_id:'r1'}).createdAt.toISOString())")
+cline watermark --config $CFG --ns $DB.$N2 --complete-from "$F2" >/dev/null
+ask2() {
+  local want got
+  want=$(C "const LIVE={_tcDeletedAt:{\$exists:false}}; const t=db.getSiblingDB(process.env.TC_DB).$N2; $2")
+  got=$(R  "const LIVE={};                               const t=db.getSiblingDB(process.env.TC_DB).$N2; $2")
+  chk "$1" "$want" "$got"
+}
+# The fast tier holds r0, r1 and m7; the collection's three newest are r0, r1
+# and m0. So a proof that accepts the fast tier's answer here is visibly wrong.
+ask2 "the fast tier's three are not the three" "const F=$IDS; print(F(t.find(LIVE).sort({createdAt:-1}).limit(3)))"
+ask2 "the same as a pipeline"                  "const F=$IDS; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3}])))"
+ask2 "with the age rewritten after the limit"  "const F=$IDS; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$addFields:{createdAt:'\$updatedAt'}}])))"
+ask2 "re-sorted after the limit"               "const F=$IDS; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:3},{\$sort:{createdAt:1}}])))"
+# And the claim still buys something here: asking for two is answered by the
+# fast tier, because its second is inside the claim.
+ask2 "the newest two, which it can prove"      "const F=$IDS; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:2}])))"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
+startRouter
 
 echo "== the directions and orders the proof does not cover =="
 # Oldest first proves nothing: everything not returned is newer, not older.

@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -26,11 +27,87 @@ import (
 // way back exactly as a find is, and if the proof does not hold the archive
 // answers, which is where it was going anyway.
 //
-// The shape is deliberately narrow: an optional leading $match, then a $sort
-// leading with the field the collection ages by, descending, then a $limit.
-// A $project or $addFields before the $sort could remove or rewrite the field
-// the proof reads, and one after the $limit hides it from the reply, so neither
-// is admitted. Widening this is a measurement, not a guess.
+// The shape is an optional leading $match, then a $sort leading with the field
+// the collection ages by descending, then a $limit, then any number of stages
+// that only reshape the documents already chosen.
+//
+// Nothing may come between the front of the pipeline and the $limit, because a
+// $project or $addFields there could remove or rewrite the field the sort and
+// the proof both read. After the $limit the N are already chosen, and reshaping
+// them cannot change which N they are.
+//
+// What may not appear anywhere is a stage naming another collection. A $lookup
+// or a $unionWith reads that collection by key rather than by time, so no
+// watermark covers it, and this pipeline may be here precisely because the
+// joined collection is the incomplete one.
+//
+// A trailing stage that drops the age field is not a danger, it is a miss: the
+// proof reads the age off the last document returned, does not find it, and the
+// query goes to the archive as it did before.
+//
+// A trailing stage that *rewrites* it is a danger, and this is the part that
+// took two goes. The proof reads a date out of the reply and compares it to the
+// claim, so a stage putting some other date at that path is telling the proof
+// what to believe:
+//
+//	[{$sort:{date:-1}},{$limit:10},{$addFields:{date:"$updatedAt"}}]
+//
+// would be proved against updatedAt. A trailing $sort is the same defect in
+// another form: the proof needs the *oldest* of the N, which is the last one
+// the sort put there, and re-sorting moves a different document into that
+// place. So a trailing stage may drop the age field or leave it alone, and may
+// not compute it, and may not reorder.
+
+// reshapeKeepsAge reports whether a stage after the $limit leaves the field the
+// proof reads either untouched or absent.
+func reshapeKeepsAge(name string, arg bson.Raw, ageField string) bool {
+	root := ageField
+	if root == "" {
+		root = "_id"
+	}
+	switch name {
+	case "$unset":
+		// It can only remove, and removing makes the proof fail rather than lie.
+		return true
+	case "$project", "$addFields", "$set":
+		elems, err := arg.Elements()
+		if err != nil {
+			return false
+		}
+		for _, e := range elems {
+			if !pathsTouch(e.Key(), root) {
+				continue
+			}
+			// $project says include or exclude with a flag, and that is the
+			// only mention of this field that changes nothing about its value.
+			// $addFields and $set have no such form: any mention is a rewrite.
+			if name != "$project" || !plainProjectionFlag(e.Value()) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// pathsTouch reports whether two dotted field paths can name the same value,
+// which includes one being inside the other.
+func pathsTouch(a, b string) bool {
+	return a == b ||
+		strings.HasPrefix(a, b+".") ||
+		strings.HasPrefix(b, a+".")
+}
+
+// plainProjectionFlag reports whether a projection value is an include or
+// exclude rather than an expression computing a new one.
+func plainProjectionFlag(v bson.RawValue) bool {
+	if _, ok := v.BooleanOK(); ok {
+		return true
+	}
+	n, ok := intOf(v)
+	return ok && (n == 0 || n == 1)
+}
 
 // newestFirstPipeline reads the limit off a pipeline of that shape.
 func newestFirstPipeline(cmd bson.Raw, ageField string) (int, bool) {
@@ -39,24 +116,36 @@ func newestFirstPipeline(cmd bson.Raw, ageField string) (int, bool) {
 		return 0, false
 	}
 	stages, err := arr.Values()
-	if err != nil || len(stages) < 2 || len(stages) > 3 {
+	if err != nil || len(stages) < 2 {
 		return 0, false
 	}
-	if len(stages) == 3 {
+	// Any number of leading $match stages, because a filter does not enter the
+	// proof at all and two of them are one filter. A driver or a helper that
+	// prepends its own is the ordinary way a second one appears.
+	for len(stages) > 0 {
 		if name, _ := soleStage(stages[0]); name != "$match" {
-			return 0, false
+			break
 		}
 		stages = stages[1:]
+	}
+	if len(stages) < 2 {
+		return 0, false
 	}
 
 	name, sortDoc := soleStage(stages[0])
 	if name != "$sort" || !sortsNewestFirst(sortDoc, ageField) {
 		return 0, false
 	}
-	name, _ = soleStage(stages[1])
-	if name != "$limit" {
+	if name, _ = soleStage(stages[1]); name != "$limit" {
 		return 0, false
 	}
+	for _, st := range stages[2:] {
+		n, arg := soleStage(st)
+		if !reshapeKeepsAge(n, arg, ageField) {
+			return 0, false
+		}
+	}
+
 	lim, ok := stages[1].DocumentOK()
 	if !ok {
 		return 0, false

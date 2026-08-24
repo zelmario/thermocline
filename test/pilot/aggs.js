@@ -79,4 +79,29 @@ ask("comments in 2017", "sample_mflix", d =>
   A(d.comments, [{$match: {date: {$gte: new Date("2017-01-01")}}},
                  {$group: {_id: null, n: {$sum: 1}}}]));
 
+// The newest N, which is what a dashboard panel asks and no aggregation above
+// asks: every sort here is ascending or on something computed by a $group. The
+// router proves this one from the fast tier's own answer instead of sending it
+// to the archive, so it is the shape most worth comparing against real data.
+// These comments carry dates from 1970 to 2017, and the fast tier holds a
+// window at the recent end of that.
+ask("the newest 10 comments", "sample_mflix", d =>
+  A(d.comments, [{$sort: {date: -1}}, {$limit: 10}, {$project: {_id: 0, name: 1, date: 1}}]));
+ask("the newest 25 comments", "sample_mflix", d =>
+  A(d.comments, [{$sort: {date: -1}}, {$limit: 25}, {$project: {_id: 0, date: 1}}]));
+// With a filter, which the proof does not depend on and must not change.
+ask("the newest 5 by one author", "sample_mflix", d =>
+  A(d.comments, [{$match: {name: "Andrea Le"}}, {$sort: {date: -1}}, {$limit: 5},
+                 {$project: {_id: 0, date: 1}}]));
+// This collection is aged by "start time", so the two below are a pair: the
+// first is the shape the router can prove, and the second sorts by something
+// else and has to go on being answered by the archive.
+ask("the newest 10 trips", "sample_training", d =>
+  A(d.trips, [{$sort: {"start time": -1}}, {$limit: 10}, {$project: {_id: 0, tripduration: 1}}]));
+ask("the newest 10 trips by _id", "sample_training", d =>
+  A(d.trips, [{$sort: {_id: -1}}, {$limit: 10}, {$project: {_id: 0, tripduration: 1}}]));
+// And the same question as a find, which must agree with the pipeline above.
+ask("the newest 10 comments as a find", "sample_mflix", d =>
+  d.comments.find(LIVE, {_id: 0, name: 1, date: 1}).sort({date: -1}).limit(10).toArray());
+
 print(JSON.stringify(out));
