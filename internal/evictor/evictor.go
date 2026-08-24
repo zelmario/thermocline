@@ -153,8 +153,30 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 		e.log.Info("dry run, nothing will be removed")
 	}
 
+	// Fixed here, so the boundary a claim is narrowed to is the same one the
+	// sweep then evicts against. Computing it again inside the rule would move
+	// it forward by however long the wait took, and evict a slice the claim was
+	// never narrowed past.
+	boundaries := make(map[string]time.Time, len(e.cfg.Rules))
 	for _, rule := range e.cfg.Rules {
-		s, err := e.runRule(ctx, rule)
+		boundaries[rule.NS] = cutoff(time.Now(), rule.OlderThan.D())
+	}
+
+	// Every claim narrowed first, then one wait, then the removals.
+	//
+	// The wait is what lets readers holding a cached claim re-read it before
+	// anything it covered is removed, and it has to come after the raise. Doing
+	// it inside each rule means paying it once per rule: a deployment tiering
+	// twenty namespaces would spend two minutes of every sweep waiting, and an
+	// evictor on a one minute cycle would never keep up. Raising them all first
+	// makes one wait serve all of them, because by the time the first removal
+	// happens every claim has been narrowed and the window has passed.
+	if err := e.narrowClaims(ctx, boundaries); err != nil {
+		return total, err
+	}
+
+	for _, rule := range e.cfg.Rules {
+		s, err := e.runRule(ctx, rule, boundaries[rule.NS])
 		total.Scanned += s.Scanned
 		total.Evicted += s.Evicted
 		total.Held += s.Held
@@ -185,7 +207,7 @@ func (e *Evictor) Run(ctx context.Context, every time.Duration) error {
 	}
 }
 
-func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule) (Stats, error) {
+func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundary time.Time) (Stats, error) {
 	var stats Stats
 	var after bson.RawValue
 	db, coll := splitNS(rule.NS)
@@ -214,50 +236,11 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule) (Stats,
 	}
 	e.warnAboutUnaged(ctx, rule, hotColl)
 
-	boundary := cutoff(time.Now(), rule.OlderThan.D())
 	e.log.Info("evicting",
 		"ns", rule.NS,
 		"older_than", rule.OlderThan.String(),
 		"cutoff", boundary.Format(time.RFC3339),
 		"selector", selectorName(rule))
-
-	// Raise the completeness watermark before removing anything.
-	//
-	// Everything older than the boundary is about to leave the fast tier, so it
-	// cannot go on claiming to hold that range completely. Doing this first,
-	// rather than after, means an interrupted sweep still leaves an honest
-	// watermark: it may understate what is there, and it will never overstate
-	// it. An overstated watermark makes range queries return short results and
-	// report success, which is the failure this system exists to avoid.
-	if !e.dryRun {
-		raised, err := e.marks.RaiseTo(ctx, rule.NS, boundary)
-		if err != nil {
-			return stats, err
-		}
-		if raised {
-			e.log.Info("completeness watermark raised to the eviction boundary",
-				"ns", rule.NS, "complete_from", boundary.Format(time.RFC3339))
-			// And then wait, before removing anything the old claim covered.
-			//
-			// A router caches the claim, so for a short while after this write
-			// there are two copies of it and the router's is the older, wider
-			// one. Removing now means it answers from a fast tier that no
-			// longer holds what it believes it holds, and answers short without
-			// any error.
-			//
-			// Measured before this wait existed, with a fast tier claiming all
-			// of history and a sweep removing 905 of 2,000 documents: the
-			// router answered countDocuments with 1,095 where the archive holds
-			// 2,000, then answered 2,000 again seven seconds later.
-			//
-			// Once per rule per sweep, not per batch, and only when the
-			// boundary actually moved. A sweep that scans thousands of
-			// documents does not notice it.
-			if err := e.settleClaim(ctx); err != nil {
-				return stats, err
-			}
-		}
-	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -697,4 +680,46 @@ func (e *Evictor) settleClaim(ctx context.Context) error {
 	case <-time.After(watermark.ClaimCacheTTL + time.Second):
 		return nil
 	}
+}
+
+// narrowClaims raises every rule's completeness watermark to the boundary this
+// sweep will evict against, and then waits for readers to have seen it.
+//
+// Before removing anything, and in that order. A claim says the fast tier holds
+// everything newer than an instant; the documents about to be removed are older
+// than that instant, so the claim has to stop covering them first. Doing it this
+// way round also means an interrupted sweep leaves a claim that understates what
+// is there and never one that overstates it, which is the direction that cannot
+// produce a wrong answer.
+//
+// The wait afterwards is the other half, and the reason it is here rather than
+// inside each rule. A router caches the claim, so for ClaimCacheTTL after the
+// raise its copy is the older and wider one, and removing in that window means
+// it answers from a fast tier that no longer holds what it believes. Waiting
+// once for the whole sweep serves every rule, because by the time the first
+// removal happens every claim has already been narrowed.
+func (e *Evictor) narrowClaims(ctx context.Context, boundaries map[string]time.Time) error {
+	if e.dryRun {
+		return nil
+	}
+	raisedAny := false
+	for _, rule := range e.cfg.Rules {
+		boundary, ok := boundaries[rule.NS]
+		if !ok {
+			continue
+		}
+		raised, err := e.marks.RaiseTo(ctx, rule.NS, boundary)
+		if err != nil {
+			return err
+		}
+		if raised {
+			raisedAny = true
+			e.log.Info("completeness watermark raised to the eviction boundary",
+				"ns", rule.NS, "complete_from", boundary.Format(time.RFC3339))
+		}
+	}
+	if !raisedAny {
+		return nil
+	}
+	return e.settleClaim(ctx)
 }
