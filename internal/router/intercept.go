@@ -432,6 +432,11 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// working, instead of turning it into an error nobody asked for.
 	if c.r.cfg.Completeness == config.Archive {
 		db, coll := splitNS(ns)
+		// The fast tier ran this and may be holding the rest of it. Nothing
+		// will ever ask for that rest. See superseded.go.
+		if fdoc, ferr := reply.ReplyDoc(); ferr == nil {
+			c.dropSupersededCursor(ctx, fdoc, db)
+		}
 		out, aerr := c.answerFromArchive(ctx, msg, db, coll)
 		if aerr == nil {
 			c.log.Debug("read answered from the archive", "ns", ns, "because", because)

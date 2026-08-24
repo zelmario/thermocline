@@ -316,6 +316,18 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		return nil, false
 	}
 
+	// A read-only pipeline asking for the newest N is sent to the fast tier
+	// instead, and judged on the way back the way a find is. The reason this
+	// command is judged early does not apply to one that only reads, and the
+	// archive is still where it goes if the proof does not hold.
+	//
+	// Before the count below, not after: this pipeline may well be answered in
+	// full, and counting it incomplete here would report the opposite of what
+	// happens. See aggnewest.go, which counts it if the proof fails.
+	if c.deferNewestAgg(ctx, cmd, scope.primary, scope.writes) {
+		return nil, false
+	}
+
 	c.r.Stats.Incomplete.Add(1)
 
 	// Same rule as a find: an aggregation inside a transaction cannot be sent to
@@ -345,15 +357,6 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 			return nil, false
 		}
 		return out, true
-	}
-
-	// A read-only pipeline asking for the newest N is sent to the fast tier
-	// instead, and judged on the way back the way a find is. The reason this
-	// command is judged early does not apply to one that only reads, and the
-	// archive is still where it goes if the proof does not hold. See
-	// aggnewest.go.
-	if c.deferNewestAgg(ctx, cmd, scope.primary, scope.writes) {
-		return nil, false
 	}
 
 	// The archive holds every document, so it can answer in full what the fast

@@ -136,6 +136,9 @@ func (c *conn) interceptAggNewest(ctx context.Context, msg *wire.Message, db str
 	}
 
 	c.r.Stats.Incomplete.Add(1)
+	// The fast tier ran this and may be holding the rest of it. Nothing will
+	// ever ask for that rest. See superseded.go.
+	c.dropSupersededCursor(ctx, rdoc, db)
 	out, aerr := c.answerFromArchive(ctx, msg, db, coll)
 	if aerr == nil {
 		c.log.Debug("aggregation answered from the archive", "ns", ns,

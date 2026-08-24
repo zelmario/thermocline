@@ -162,14 +162,17 @@ type Stats struct {
 	// NewestFirst counts reads for the newest N that the fast tier proved it
 	// could answer from its own reply. Each one is an archive round trip that
 	// did not happen. See newestfirst.go.
-	NewestFirst   atomic.Int64
-	Refused       atomic.Int64
-	Archived      atomic.Int64
-	TxnReplays    atomic.Int64
-	WarmedForTxn  atomic.Int64
-	DuplicateKeys atomic.Int64
-	ChangeStreams atomic.Int64
-	Unauthorized  atomic.Int64
+	NewestFirst atomic.Int64
+	// SupersededCursors counts fast tier cursors closed because the archive's
+	// answer replaced the one they belonged to. See superseded.go.
+	SupersededCursors atomic.Int64
+	Refused           atomic.Int64
+	Archived          atomic.Int64
+	TxnReplays        atomic.Int64
+	WarmedForTxn      atomic.Int64
+	DuplicateKeys     atomic.Int64
+	ChangeStreams     atomic.Int64
+	Unauthorized      atomic.Int64
 	// FailoverReplays counts commands re-sent after the fast tier changed
 	// primary underneath them. Any value above zero is an election the clients
 	// did not have to see.
