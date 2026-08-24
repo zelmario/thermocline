@@ -1697,6 +1697,13 @@ already in it starts with none of them claimed. It reads the constraint from the
 fast tier's unique indexes, which the router builds there at startup, so run it
 after the router has been up once.
 
+Run it again after upgrading past 0.1.0-dev if any of your unique keys are
+numbers. A key is derived from the value, and whole numbers are now derived the
+way mongod compares them, so int, long, double and decimal 7 arrive at one key
+instead of four. Claims made by an older build carry the old id, and an old id
+matches nothing, so the values they hold are not enforced until the rebuild
+reclaims them.
+
 **8. Start change stream consumers fresh, do not resume them.** A resume token
 minted on the old cluster is accepted by the router and delivers nothing.
 Measured with one token and one collection: against the cluster it came from it

@@ -267,7 +267,10 @@ func keyIDFromValues(ns string, idx uniqueIndex, vals []any) (string, bool) {
 	}
 	key := make(bson.D, 0, len(idx.fields))
 	for i, f := range idx.fields {
-		key = append(key, bson.E{Key: f, Value: vals[i]})
+		// Numbers first, because mongod makes one key out of the same whole
+		// number written as an int, a long, a double or a decimal, and
+		// marshalling gives each of them different bytes. See numkey.go.
+		key = append(key, bson.E{Key: f, Value: canonicalKeyValue(vals[i])})
 	}
 	raw, err := bson.Marshal(key)
 	if err != nil {

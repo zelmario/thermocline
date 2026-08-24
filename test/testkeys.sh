@@ -229,6 +229,30 @@ chk "the same value outside the filter is fine" "ok"    "$(R 'try{db.getSiblingD
 chk "an update moving it into the filter rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkpart.updateOne({_id:3},{$set:{active:true}});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and the document was not changed"           "false" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tkpart.findOne({_id:3}); print(d?d.active:"MISSING")')"
 
+echo "== the same number written two ways is one key =="
+# A unique index makes one key out of int, long, double and decimal: a
+# collection holding NumberLong(7) rejects an insert of 7. The registry encodes
+# the value as BSON, where those four have different bytes, so it made four keys
+# where mongod makes one.
+#
+# Only the cross tier case reaches it. Inside the fast tier mongod's own index
+# still refuses the duplicate, which is why the first of these is the check that
+# matters and the rest are there to say the key did not become too broad.
+fresh tknum '{n:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:1,n:NumberLong("7")})' >/dev/null
+waitMirrored tknum 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tknum.deleteOne({_id:1})'
+chk "a double against an archived long is rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:2,n:7});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and an int32 against it as well"               "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:3,n:NumberInt(7)});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and a decimal that reads the same"             "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:4,n:NumberDecimal("7.00")});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# And a key that merged more than mongod does would refuse writes mongod takes,
+# which is a visible failure caused by bookkeeping.
+chk "a different number is still accepted"          "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:5,n:8});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "so is one that is not a whole number"          "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:6,n:7.5});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# A string that reads as a number is not a number, and a unique index does not
+# treat it as one.
+chk "and the string \"7\" is not the number 7"       "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:7,n:"7"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a

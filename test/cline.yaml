@@ -80,6 +80,9 @@ feeder:
     - "shop.tkcomp"
     - "shop.tknull"
     - "shop.tklate"
+    # testkeys.sh: the same number written as a long and as a double. MongoDB
+    # compares numbers across int, long and double, so both are one key.
+    - "shop.tknum"
     - "shop.tkspar"
     - "shop.tkpart"
     - "shop.tkddl"
