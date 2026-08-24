@@ -301,6 +301,8 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 
 	c.r.forgetIndexes(op.from)
 	c.r.forgetIndexes(op.to)
+	c.r.forgetBrackets(op.from)
+	c.r.forgetBrackets(op.to)
 	c.r.forgetView(op.from)
 	c.r.forgetView(op.to)
 }

@@ -333,6 +333,50 @@ stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$BNS.drop()" >/dev/null
 
+echo "== a date field holding something that is not a date =="
+# A completeness claim is a range predicate, and MongoDB brackets those by type:
+# a date bound never matches a Timestamp. So a document whose createdAt is a
+# Timestamp is honestly outside the claim, and outside every bounded query the
+# claim answers. The archive would not return it either, and the two agree.
+#
+# A sort is not bracketed. Timestamp sorts above Date, so that same document
+# belongs at the top of a newest-first answer, and the newest-first proof used
+# to hand back the N below it. Measured: MongoDB answers 99,0,1 and the router
+# answered 0,1,2, with no error.
+TNS=tqtype
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})" >/dev/null
+# The archive is the original cluster, so it holds everything. The odd one is
+# what an adoption leaves behind: no warm window's predicate ever matches it.
+C "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
+     {_id:0, createdAt:new Date()},
+     {_id:1, createdAt:new Date(Date.now()-3600*1000)},
+     {_id:2, createdAt:new Date(Date.now()-2*3600*1000)},
+     {_id:99, createdAt:new Timestamp({t: Math.floor(Date.now()/1000), i: 1})}])" >/dev/null
+# The fast tier holds the two newest by date, which is what warming that window
+# leaves behind.
+H "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
+     {_id:0, createdAt:new Date()},
+     {_id:1, createdAt:new Date(Date.now()-3600*1000)}])" >/dev/null
+startRouter
+TFROM=$(H "print(db.getSiblingDB(process.env.TC_DB).$TNS.find().sort({createdAt:1}).limit(1).toArray()[0].createdAt.toISOString())")
+cline watermark --config $CFG --ns $DB.$TNS --complete-from "$TFROM" >/dev/null
+chk "the newest two agree with the archive" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$TNS.find({_tcDeletedAt:{\$exists:false}}).sort({createdAt:-1}).limit(2).toArray().map(function (d) { return String(d._id) }).join(','))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$TNS.find({}).sort({createdAt:-1}).limit(2).toArray().map(function (d) { return String(d._id) }).join(','))")"
+# And the claim still buys something on this namespace: a query bounded inside
+# it is answered from the fast tier, because a bound and a claim are the same
+# kind of predicate and the odd document is outside both.
+chk "a bound inside the claim still agrees"  \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$TNS.countDocuments({createdAt:{\$gte:new Date('$TWODAY')},_tcDeletedAt:{\$exists:false}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$TNS.countDocuments({createdAt:{\$gte:new Date('$TWODAY')}}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
+
+
 stopDaemons
 echo
 echo "================================"

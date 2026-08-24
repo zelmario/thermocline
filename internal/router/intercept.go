@@ -358,7 +358,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		rdoc, derr := reply.ReplyDoc()
 		if cerr == nil && derr == nil && replyOK(rdoc) {
 			af, aok := c.r.ageFieldOf(judged)
-			if provenNewestFirst(cmd, rdoc, af, aok, mark) {
+			if provenNewestFirst(cmd, rdoc, af, aok, mark) && c.r.sortSafeAges(ctx, judged, af) {
 				c.r.Stats.NewestFirst.Add(1)
 				return reply, nil
 			}

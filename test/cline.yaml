@@ -55,6 +55,10 @@ feeder:
     # testquery.sh: aged by createdAt, so a bound on another date field must not
     # be read as covering the completeness claim.
     - "shop.tqbound"
+    # testquery.sh: aged by createdAt, with one document in the archive whose
+    # createdAt is a Timestamp rather than a date. A sort orders across types
+    # where a range predicate does not, so it belongs first.
+    - "shop.tqtype"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.
@@ -221,6 +225,9 @@ evictor:
     - ns: "shop.tqbound"
       older_than: 40m
       date_field: "createdAt"
+    - ns: "shop.tqtype"
+      older_than: 40m
+      date_field: "createdAt"
   backoff:
     max_replication_lag: 10s
     max_cache_dirty: 0.05
@@ -246,6 +253,9 @@ warmer:
     - ns: "shop.tcadopt"
       back: 40m
     - ns: "shop.tqbound"
+      back: 40m
+      date_field: "createdAt"
+    - ns: "shop.tqtype"
       back: 40m
       date_field: "createdAt"
   backoff:

@@ -92,6 +92,7 @@ type Router struct {
 
 	wmCache  watermarkCache
 	idxCache indexCache
+	brackets bracketCache
 	// hintCache holds each namespace's sparse and partial indexes, the ones
 	// whose hint decides which documents are looked at rather than how. See
 	// hint.go.
@@ -982,6 +983,9 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// that it holds all of it is wrong from this instant. See
 				// forgetCompleteness.
 				c.r.forgetCompleteness(db + "." + coll)
+				// And a drop and a recreate can put differently typed ages
+				// under the same name. See sortSafeAges.
+				c.r.forgetBrackets(db + "." + coll)
 			}
 			// A collection's collation is fixed at creation, so the only way it
 			// changes is a drop and a recreate, which comes through here.
