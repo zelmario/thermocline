@@ -56,6 +56,13 @@ type Feeder struct {
 
 	// buffered work, flushed together
 	pending []pendingOp
+	// Where mirroring's time goes, since the rate it sustains is a ceiling on
+	// how fast the fast tier can take writes before every fall-through read
+	// waits. End-to-end timing on a loaded machine varied by 70% between runs
+	// of the same config, which is more than any change worth making, so the
+	// split is measured inside one run instead. See reportRate.
+	pace mirrorPace
+
 	// spentNotices are the eviction announcements this run has used and not yet
 	// written off, held until the checkpoint covering those events is saved.
 	//
@@ -327,15 +334,26 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 
 		// TryNext blocks up to MaxAwaitTime, so an idle stream still paces the
 		// loop and flushes at least that often.
-		if stream.TryNext(ctx) {
+		if f.pace.since.IsZero() {
+			f.pace.since = time.Now()
+		}
+		waitFrom := time.Now()
+		got := stream.TryNext(ctx)
+		f.pace.waiting += time.Since(waitFrom)
+		if got {
+			readFrom := time.Now()
 			if err := f.handle(ctx, stream.Current); err != nil {
 				return err
 			}
+			f.pace.reading += time.Since(readFrom)
+			f.pace.events++
 			f.lastToken = stream.ResumeToken()
 			if len(f.pending) >= f.cfg.BatchSize {
+				writeFrom := time.Now()
 				if err := f.flushAndCheckpoint(ctx); err != nil {
 					return err
 				}
+				f.pace.writing += time.Since(writeFrom)
 			}
 			continue
 		}
@@ -374,6 +392,44 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 }
 
 // pipeline restricts the stream to the operations and namespaces we mirror.
+// mirrorPace accumulates where one stretch of mirroring spent its time.
+type mirrorPace struct {
+	events  int
+	waiting time.Duration // blocked on the change stream having something
+	reading time.Duration // decoding events and buffering the work they imply
+	writing time.Duration // putting that work in the archive, all of the below
+	asking  time.Duration // asking the archive what to suppress, before writing
+	bulk    time.Duration // the bulk writes themselves
+	since   time.Time
+}
+
+// reportRate says how fast mirroring is going and what the time went on, once
+// per checkpoint. Debug, because it is a question asked while tuning rather
+// than something an idle deployment needs in its log every few seconds.
+//
+// waiting is the honest idle measure: a feeder that has caught up sits in
+// TryNext, so a high share there means there was nothing to mirror rather than
+// that mirroring is slow.
+func (f *Feeder) reportRate() {
+	if f.pace.events == 0 || f.pace.since.IsZero() {
+		return
+	}
+	elapsed := time.Since(f.pace.since)
+	if elapsed <= 0 {
+		return
+	}
+	f.log.Debug("mirroring pace",
+		"events", f.pace.events,
+		"per_second", int(float64(f.pace.events)/elapsed.Seconds()),
+		"waiting_ms", f.pace.waiting.Milliseconds(),
+		"reading_ms", f.pace.reading.Milliseconds(),
+		"writing_ms", f.pace.writing.Milliseconds(),
+		"asking_ms", f.pace.asking.Milliseconds(),
+		"bulk_ms", f.pace.bulk.Milliseconds(),
+		"elapsed_ms", elapsed.Milliseconds())
+	f.pace = mirrorPace{since: time.Now()}
+}
+
 func (f *Feeder) pipeline() mongo.Pipeline {
 	match := bson.D{
 		{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{

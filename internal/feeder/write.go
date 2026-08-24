@@ -108,6 +108,7 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 		return err
 	}
 	f.lastSaved = time.Now()
+	f.reportRate()
 
 	// Only now are the eviction announcements this run has used written off.
 	//
@@ -145,6 +146,10 @@ func (f *Feeder) flush(ctx context.Context) error {
 	if len(f.pending) == 0 {
 		return nil
 	}
+	// Three questions to the archive before a single document is written, and
+	// they are asked once per flush rather than once per event. See reportRate:
+	// this is where the split says the time is going.
+	askedFrom := time.Now()
 	if err := f.resolveDeletes(ctx); err != nil {
 		return err
 	}
@@ -158,6 +163,7 @@ func (f *Feeder) flush(ctx context.Context) error {
 	} else if dropped > 0 {
 		f.log.Debug("suppressed promoted documents", "count", dropped)
 	}
+	f.pace.asking += time.Since(askedFrom)
 
 	now := time.Now().UTC()
 	byNS := make(map[string][]mongo.WriteModel)
@@ -192,6 +198,8 @@ func (f *Feeder) flush(ctx context.Context) error {
 		opsByNS[op.ns] = append(opsByNS[op.ns], op)
 	}
 
+	bulkFrom := time.Now()
+	defer func() { f.pace.bulk += time.Since(bulkFrom) }()
 	for _, ns := range order {
 		res, err := f.writeBatch(ctx, ns, byNS[ns], opsByNS[ns], now)
 		if err != nil {

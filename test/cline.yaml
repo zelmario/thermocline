@@ -65,6 +65,8 @@ feeder:
     # testbson.sh: dates only, and a fast tier holding one document older than
     # its own claim, which is what makes the newest-first proof fail honestly.
     - "shop.tmenag2"
+    # a probe namespace for measuring what mirroring costs under load.
+    - "shop.tfeed"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
     # testevict.sh: the same, on the removing side.
