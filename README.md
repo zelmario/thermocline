@@ -1834,6 +1834,15 @@ assumed: with one router answering from its cache, nine hits deep, and the other
 taking a write before each read, twenty rounds in a row gave the new answer and
 none gave the old one.
 
+One cache is not that one. Each router keeps its own listing of which unique
+indexes a collection has, for a minute, and no change stream carries index DDL.
+So a unique index created on a running system is enforced across tiers
+immediately by the router the command went through, and within a minute by the
+others. In that window another router does not claim keys for it, and lets
+through a duplicate of an archived document that the fast tier's own index
+cannot see. Restart the routers if you need it enforced everywhere at once, and
+run `cline keys --rebuild` either way, which the rollout list already asks for.
+
 **14. The archive is a hard dependency, and not only for its documents.** The
 completeness watermarks, the feeder's checkpoint and its published position all
 live on the archive, so a router that cannot reach it does not know what the

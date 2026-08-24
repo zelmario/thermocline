@@ -209,10 +209,23 @@ func TestLowerTimeBoundUnderOperators(t *testing.T) {
 		{"a branch of $and on another field", bson.D{{Key: "$and", Value: bson.A{
 			bson.D{{Key: "shippedAt", Value: bson.D{{Key: "$gte", Value: late}}}}}}}, false, time.Time{}},
 
-		{"$or, where a branch may carry no bound", bson.D{{Key: "$or", Value: bson.A{
+		// $or is satisfied by any one branch, so it is bounded only when every
+		// branch is, and then at the earliest of them. This used to read as
+		// never bounded, which is safe and left the common shape on the table:
+		// alternatives written by hand or by an ORM usually bound every branch.
+		{"$or, where a branch carries no bound", bson.D{{Key: "$or", Value: bson.A{
 			gte(late), bson.D{{Key: "status", Value: "open"}}}}}, false, time.Time{}},
-		{"$or, even when every branch carries one", bson.D{{Key: "$or", Value: bson.A{
-			gte(late), gte(early)}}}, false, time.Time{}},
+		{"$or, every branch bounded, at the earliest", bson.D{{Key: "$or", Value: bson.A{
+			gte(late), gte(early)}}}, true, early},
+		{"$or, a branch bounded on another field", bson.D{{Key: "$or", Value: bson.A{
+			gte(late), bson.D{{Key: "shippedAt", Value: bson.D{
+				{Key: "$gte", Value: late}}}}}}}, false, time.Time{}},
+		{"$or nested in $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "$or", Value: bson.A{gte(late), gte(early)}}}}}}, true, early},
+		{"$or beside a flat bound, which both hold", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: late}}},
+			{Key: "$or", Value: bson.A{gte(early), gte(early)}}}, true, late},
+		{"an empty $or", bson.D{{Key: "$or", Value: bson.A{}}}, false, time.Time{}},
 		{"$nor", bson.D{{Key: "$nor", Value: bson.A{gte(late)}}}, false, time.Time{}},
 		{"$not on the age field", bson.D{{Key: "createdAt", Value: bson.D{
 			{Key: "$not", Value: bson.D{{Key: "$lt", Value: late}}}}}}, false, time.Time{}},
@@ -299,5 +312,29 @@ func TestLowerTimeBoundTakesTheLatestOperator(t *testing.T) {
 	}
 	if !got.Equal(late) {
 		t.Errorf("bound = %v, want %v: every operator has to hold", got, late)
+	}
+}
+
+// The router reads a client's filter before mongod has seen it, so a document
+// nested deeper than mongod would accept still arrives here first. Past the
+// limit nothing is read, which is the same answer as a filter carrying no
+// bound: the query goes to the archive.
+func TestLowerTimeBoundStopsDescending(t *testing.T) {
+	when := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	nest := func(deep int) bson.D {
+		inner := bson.D{{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: when}}}}
+		for i := 0; i < deep; i++ {
+			inner = bson.D{{Key: "$and", Value: bson.A{inner}}}
+		}
+		return inner
+	}
+
+	if _, ok := lowerTimeBound(rawDoc(t, nest(20)), "createdAt", true); !ok {
+		t.Error("a bound twenty levels down was not read; that is an ordinary filter")
+	}
+	// Deeper than anything mongod would accept, and it must return rather than
+	// recurse. The assertion is that this completes at all.
+	if _, ok := lowerTimeBound(rawDoc(t, nest(filterDepthLimit+50)), "createdAt", true); ok {
+		t.Error("a bound past the depth limit was read")
 	}
 }

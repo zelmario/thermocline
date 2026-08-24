@@ -66,6 +66,25 @@ func idFromFilter(filter bson.Raw) (bson.RawValue, bool) {
 // So the bound has to come from the field the age comes from. Anything else is
 // unbounded, which sends the read to the archive: slower, and right.
 func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bool) {
+	return boundInFilter(filter, ageField, known, 0)
+}
+
+// filterDepthLimit bounds how far $and and $or nesting is followed.
+//
+// mongod enforces a maximum BSON depth of 100, but this reads the client's
+// filter before mongod has seen it, so a document nested deeper than anything
+// it would accept still arrives here first. A hundred is past any filter an
+// application writes and short of anything that could exhaust the stack.
+// joinedCollections bounds itself for the same reason.
+//
+// Past the limit, nothing is read, which is the same answer as a filter
+// carrying no bound: the query goes to the archive.
+const filterDepthLimit = 100
+
+func boundInFilter(filter bson.Raw, ageField string, known bool, depth int) (time.Time, bool) {
+	if depth > filterDepthLimit {
+		return time.Time{}, false
+	}
 	if len(filter) == 0 || !known {
 		// Nothing says how this namespace ages, so nothing can say which
 		// dimension a claim about it is in.
@@ -100,10 +119,9 @@ func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bo
 		// query as the flat one beside it, and without this it was unbounded and
 		// went to the archive however complete the fast tier was.
 		//
-		// Only $and. $or is satisfied by a branch that carries no bound at all,
-		// $nor is about documents that do not match, and $not inverts the range
-		// rather than narrowing it. Reading a bound out of any of those would
-		// claim the query cannot reach further back than it can.
+		// Only $and and $or. $nor is about documents that do not match, and
+		// $not inverts the range rather than narrowing it. Reading a bound out
+		// of either would claim the query cannot reach further back than it can.
 		if e.Key() == "$and" {
 			arr, aerr := e.Value().ArrayOK()
 			if !aerr {
@@ -118,12 +136,28 @@ func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bo
 				if !dok {
 					continue
 				}
-				if t, ok := lowerTimeBound(doc, ageField, known); ok {
+				if t, ok := boundInFilter(doc, ageField, known, depth+1); ok {
 					take(t)
 				}
 			}
 			continue
 		}
+
+		// $or is satisfied by any one branch, so it is bounded only when every
+		// branch is, and then at the earliest of them: a matching document
+		// satisfies at least one branch and is therefore no older than that
+		// branch's bound. One branch carrying none makes the whole thing reach
+		// as far back as that branch does.
+		//
+		// This is how alternatives are written, by hand and by an ORM, and
+		// leaving it out sent a query bounded in every branch to the archive.
+		if e.Key() == "$or" {
+			if t, ok := earliestBranchBound(e.Value(), ageField, known, depth+1); ok {
+				take(t)
+			}
+			continue
+		}
+
 		if e.Key() != want {
 			continue
 		}
@@ -132,6 +166,36 @@ func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bo
 		}
 	}
 	return best, found
+}
+
+// earliestBranchBound reads the bound on an $or: the earliest of its branches'
+// bounds, and only when every branch has one.
+func earliestBranchBound(val bson.RawValue, ageField string, known bool, depth int) (time.Time, bool) {
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return time.Time{}, false
+	}
+	vals, err := arr.Values()
+	if err != nil || len(vals) == 0 {
+		// An empty $or matches nothing, which mongod refuses anyway. Nothing to
+		// read either way.
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	for i, v := range vals {
+		doc, dok := v.DocumentOK()
+		if !dok {
+			return time.Time{}, false
+		}
+		t, tok := boundInFilter(doc, ageField, known, depth)
+		if !tok {
+			return time.Time{}, false
+		}
+		if i == 0 || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest, true
 }
 
 // boundOf reads a lower bound from one filter value.

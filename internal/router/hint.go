@@ -66,6 +66,23 @@ type hintCache struct {
 	fetched map[string]time.Time
 }
 
+// forgetHint drops what is remembered about ns's selective indexes, so the next
+// fallback read re-lists them.
+//
+// The twin of forgetIndexes, and it was missing. That one is called wherever
+// index DDL passes through, and this one was not, so a router that had just
+// taken a dropIndexes went on reproducing the dropped index's filter against
+// the archive for up to indexRefresh. An index recreated without its
+// partialFilterExpression, or with a different one, is the case that bites: the
+// archive is then asked a narrower question than the client asked, and answers
+// short. See hintPredicate for why the filter is reproduced at all.
+func (r *Router) forgetHint(ns string) {
+	r.hintCache.mu.Lock()
+	delete(r.hintCache.byNS, ns)
+	delete(r.hintCache.fetched, ns)
+	r.hintCache.mu.Unlock()
+}
+
 // selectiveIndexes lists the sparse and partial indexes on the fast tier's copy
 // of a namespace.
 //

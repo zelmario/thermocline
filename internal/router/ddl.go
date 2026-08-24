@@ -278,6 +278,7 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 	for _, ns := range []string{op.from, op.to} {
 		c.r.forgetCompleteness(ns)
 		c.r.forgetIndexes(ns)
+		c.r.forgetHint(ns)
 		c.r.forgetView(ns)
 		c.r.forgetCollation(ns)
 	}
@@ -301,6 +302,8 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 
 	c.r.forgetIndexes(op.from)
 	c.r.forgetIndexes(op.to)
+	c.r.forgetHint(op.from)
+	c.r.forgetHint(op.to)
 	c.r.forgetBrackets(op.from)
 	c.r.forgetBrackets(op.to)
 	c.r.forgetView(op.from)

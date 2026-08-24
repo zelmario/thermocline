@@ -325,6 +325,23 @@ chk "a \$in reaching past the claim finds both"       \
 chk "a \$in holding something else is not a bound"    \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),'yesterday']}}))")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),'yesterday']}}))")"
+# $or is satisfied by any one branch, so it is bounded only when every branch is,
+# and then at the earliest of them: a matching document satisfies at least one
+# branch and is no older than that branch's bound. Alternatives written by hand
+# or by an ORM usually do bound every branch.
+chk "an \$or bounded in every branch"                 \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{createdAt:{\$gte:new Date('$RECENT')}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$TWODAY')}},{createdAt:{\$gte:new Date('$RECENT')}}]}))")"
+# One branch reaching past the claim makes the whole thing reach that far, so
+# this one has to consult the archive and find both.
+chk "an \$or whose earliest branch reaches back"      \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$YEARS')}},{createdAt:{\$gte:new Date('$RECENT')}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$YEARS')}},{createdAt:{\$gte:new Date('$RECENT')}}]}))")"
+# And a branch bounded on another field is a bound in another dimension, so the
+# whole $or is unbounded whatever the other branches say.
+chk "an \$or with a branch on another field"          \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$RECENT')}},{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$or:[{createdAt:{\$gte:new Date('$RECENT')}},{shippedAt:{\$gte:new Date('$TWODAY')}}]}))")"
 # And the ones that must not be read as bounds. $or is satisfied by a branch
 # carrying none, so the query reaches as far back as that branch does.
 chk "a bound inside \$or answers like the archive"  \

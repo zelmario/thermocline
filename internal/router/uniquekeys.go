@@ -41,6 +41,21 @@ const keysCollection = "keys"
 
 // indexRefresh is how long a listing of unique indexes is reused. Indexes are
 // created rarely, and re-listing them on every insert would be absurd.
+//
+// It is also a contract, and the direction it is stale in is the unsafe one.
+// A router that has not noticed a new unique index does not claim keys for it,
+// so it lets through a duplicate of an archived document that mongod's own
+// index cannot see. The router the createIndexes went through drops its listing
+// at once; every *other* router keeps the old one for up to this long, and no
+// change stream carries index DDL to tell them.
+//
+// So: after creating a unique index on a tiered collection, cross tier
+// enforcement is immediate on the router that took the command and arrives
+// within this on the rest. See the rollout list in README, which says to run
+// cline keys --rebuild at that point anyway.
+//
+// The same shape as watermark.ClaimCacheTTL, and found by asking the same
+// question of it: which way is this cache stale, and who is relying on it?
 const indexRefresh = time.Minute
 
 // uniqueIndex is one unique constraint the router has to enforce itself.

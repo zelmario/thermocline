@@ -984,6 +984,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if cmd, cerr := msg.CommandDoc(); cerr == nil {
 		if coll, ok := indexDDL(cmd, name); ok {
 			c.r.forgetIndexes(db + "." + coll)
+			c.r.forgetHint(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
 			if name == "drop" {
 				// The fast tier no longer holds any of it, so a cached claim

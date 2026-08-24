@@ -238,6 +238,25 @@ same 'hint a sparse index by key' "print(JSON.stringify(COLL.find({}).hint({opt:
 same 'count through a sparse hint' "print(COLL.find({}).hint('conf_sparse').itcount())"
 same 'hint a partial index'    "print(JSON.stringify(COLL.find({}).hint('conf_partial')$S"
 same 'count through a partial hint' "print(COLL.find({}).hint('conf_partial').itcount())"
+# An index recreated with a different filter is the case the router's own cache
+# gets wrong. It remembers which indexes are selective, and reproduces their
+# filter against the archive because the archive does not have the index. That
+# listing is reused for a minute, so a partial index dropped and put back
+# without its filter left the router asking the archive a narrower question than
+# the client asked, and answering short. Both collections are changed the same
+# way, so the comparison is still differential.
+RECREATE="c.dropIndex('conf_partial'); c.createIndex({f:1},{name:'conf_partial'});"
+RALL "const d=db.getSiblingDB(process.env.TC_DB);
+      for (const c of [d.tcref, d.tcon]) { $RECREATE }" >/dev/null
+same 'hint a partial index made plain' "print(JSON.stringify(COLL.find({}).hint('conf_partial')$S"
+same 'count through it'                "print(COLL.find({}).hint('conf_partial').itcount())"
+# And back, so nothing after this inherits the changed shape.
+RALL "const d=db.getSiblingDB(process.env.TC_DB);
+      for (const c of [d.tcref, d.tcon]) {
+        c.dropIndex('conf_partial');
+        c.createIndex({f:1},{partialFilterExpression:{n:{\$gt:10}},name:'conf_partial'});
+      }" >/dev/null
+
 # min and max are bounds on an index key, so they mean nothing without the index
 # that defines the key, and MongoDB has required a hint alongside them since
 # 4.2. Dropping that hint does not cost a plan, it turns a working query into
