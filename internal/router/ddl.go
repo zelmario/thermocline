@@ -259,6 +259,29 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 		}
 	}
 
+	// And this router's own memory of both names, which is now about the wrong
+	// collection. The name-keyed caches are not covered by the DDL sweep that
+	// handles drop and collMod, because a rename is not in that list: what is
+	// cached under the old name describes a collection that has moved, and what
+	// is cached under the new one describes whatever used to be called that.
+	//
+	// A stale claim is the one that matters, because it is the one that decides
+	// whether a read may skip the archive. See forgetCompleteness.
+	//
+	// No reproduction to point at, and that is stated rather than dressed up: a
+	// rename does enough work that ClaimCacheTTL expires during it, so the
+	// window closes on its own before a client can be shown a wrong answer. The
+	// invalidation is here because holding a cache entry that names a
+	// collection which has moved is wrong on its face, and because the next
+	// change to either side of it should not have to rediscover that the timing
+	// happens to save it.
+	for _, ns := range []string{op.from, op.to} {
+		c.r.forgetCompleteness(ns)
+		c.r.forgetIndexes(ns)
+		c.r.forgetView(ns)
+		c.r.forgetCollation(ns)
+	}
+
 	// Unique key claims are the registry's, and they name the collection.
 	if _, kerr := c.r.keys().UpdateMany(ctx,
 		bson.D{{Key: "ns", Value: op.from}},

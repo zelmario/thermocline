@@ -229,7 +229,10 @@ func (r *Router) forgetIndexes(ns string) {
 // and on which collection.
 func indexDDL(cmd bson.Raw, name string) (string, bool) {
 	switch name {
-	case "createIndexes", "dropIndexes", "drop", "collMod":
+	// create belongs here too: it makes a new collection under a name this
+	// router may still remember something about, and what it remembers is about
+	// whatever was called that before.
+	case "createIndexes", "dropIndexes", "drop", "collMod", "create":
 		coll, ok := stringField(cmd, name)
 		return coll, ok
 	}
