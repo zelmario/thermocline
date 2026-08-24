@@ -92,3 +92,64 @@ func TestProvenNewestFirst(t *testing.T) {
 		}
 	})
 }
+
+// skip is the case the proof was not written with in mind, and it holds.
+//
+// The fast tier holds every document newer than T, so among those its ordering
+// is the collection's ordering. If the last document returned is newer than T,
+// then everything skipped over was newer still, and every document not returned
+// is older. Ranks skip+1 through skip+N on the fast tier are therefore the
+// collection's.
+func TestProvenNewestFirstWithSkip(t *testing.T) {
+	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	mark := watermark.Mark{Claimed: true, From: from}
+	inside, outside := from.Add(time.Hour), from.Add(-time.Hour)
+
+	cmd := rawDoc(t, bson.D{
+		{Key: "find", Value: "orders"},
+		{Key: "filter", Value: bson.D{}},
+		{Key: "sort", Value: bson.D{{Key: "at", Value: -1}}},
+		{Key: "skip", Value: 5},
+		{Key: "limit", Value: 2},
+	})
+	replyOf := func(ages ...time.Time) bson.Raw {
+		docs := make(bson.A, 0, len(ages))
+		for i, at := range ages {
+			docs = append(docs, bson.D{{Key: "_id", Value: i}, {Key: "at", Value: at}})
+		}
+		return rawDoc(t, bson.D{
+			{Key: "cursor", Value: bson.D{
+				{Key: "id", Value: int64(0)}, {Key: "ns", Value: "shop.orders"},
+				{Key: "firstBatch", Value: docs}}},
+			{Key: "ok", Value: 1.0}})
+	}
+
+	if !provenNewestFirst(cmd, replyOf(inside, inside), "at", true, mark) {
+		t.Error("a skip with the last one inside the claim is still proven")
+	}
+	if provenNewestFirst(cmd, replyOf(inside, outside), "at", true, mark) {
+		t.Error("the last one is older than the claim, so nothing is proven")
+	}
+}
+
+// A negative limit is MongoDB's way of asking for one batch, and it is not a
+// count of documents this can reason about.
+func TestProvenNewestFirstRefusesANegativeLimit(t *testing.T) {
+	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	mark := watermark.Mark{Claimed: true, From: from}
+	cmd := rawDoc(t, bson.D{
+		{Key: "find", Value: "orders"},
+		{Key: "sort", Value: bson.D{{Key: "at", Value: -1}}},
+		{Key: "limit", Value: -2},
+	})
+	reply := rawDoc(t, bson.D{
+		{Key: "cursor", Value: bson.D{
+			{Key: "id", Value: int64(0)}, {Key: "ns", Value: "shop.orders"},
+			{Key: "firstBatch", Value: bson.A{
+				bson.D{{Key: "_id", Value: 1}, {Key: "at", Value: from.Add(time.Hour)}},
+				bson.D{{Key: "_id", Value: 2}, {Key: "at", Value: from.Add(time.Hour)}}}}}},
+		{Key: "ok", Value: 1.0}})
+	if provenNewestFirst(cmd, reply, "at", true, mark) {
+		t.Error("a negative limit was read as a count")
+	}
+}
