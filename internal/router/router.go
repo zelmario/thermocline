@@ -261,6 +261,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	if err := r.refreshPrimary(ctx); err != nil {
 		return err
 	}
+	r.warnAboutVersionSkew(ctx)
 	r.warnAboutMissingWatermarks(ctx)
 	r.warnAboutStrandedCollections(ctx)
 	r.warnAboutMissingUsers(ctx)

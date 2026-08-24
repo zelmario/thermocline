@@ -1873,6 +1873,20 @@ stepdown against plain MongoDB, with no router in the way, cost no errors at
 all. Before this was fixed the same test never recovered; see the proxied
 authentication bullet under "What it does not do yet".
 
+**14a. Keep `evictor.max_feeder_lag` well under an hour, and keep the clocks
+together.** The evictor announces a removal before it makes it, and the feeder
+asks whether a delete was announced. That announcement is kept for an hour and
+then expires. A delete the feeder only reaches after the announcement has gone
+reads as the application's own, the archive tombstones its copy, and the
+document is gone from both tiers with nothing said. So `max_feeder_lag` and that
+hour are one setting in two places: the config refuses a lag that reaches it.
+
+The same relationship depends on the two machines agreeing about the time. The
+announcement is stamped by the evictor and expired by the archive's TTL monitor,
+so an evictor whose clock runs behind the archive's has its announcements
+expiring early, and far enough behind they are gone before they are read. Both
+daemons check their clock against the archive at startup and say what they find.
+
 **15. Expect the warm to cost something and the evictor not to.** With a shop
 running against the router while all four daemons worked underneath it, 38,248
 operations completed with no errors and no violated invariants, so the pieces do

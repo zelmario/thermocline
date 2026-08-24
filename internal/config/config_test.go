@@ -204,3 +204,43 @@ func TestAgeFieldWarnings(t *testing.T) {
 		t.Errorf("a namespace with no eviction rule warned: %v", w)
 	}
 }
+
+// The announcement that says a delete was an eviction expires on a TTL, and the
+// feeder only sees that delete once it has caught up to it. A max_feeder_lag
+// that reaches the TTL means evictions are read as application deletes and the
+// documents are lost from both tiers, so the config refuses it rather than
+// leaving it to be discovered.
+func TestMaxFeederLagMustStayUnderTheNoticeTTL(t *testing.T) {
+	withLag := func(d time.Duration) EvictorConfig {
+		return EvictorConfig{
+			Rate:         100,
+			BatchSize:    100,
+			MaxFeederLag: Duration(d),
+			FeederID:     "test",
+			Backoff: BackoffConfig{
+				MaxReplicationLag:   Duration(10 * time.Second),
+				MaxCacheDirty:       0.05,
+				MinWriteTicketsFree: 0.25,
+				MinOplogWindow:      Duration(time.Minute),
+			},
+		}
+	}
+
+	if err := withLag(30 * time.Second).Validate(); err != nil {
+		t.Errorf("an ordinary lag was refused: %v", err)
+	}
+	if err := withLag(meta.NoticeTTL - time.Minute).Validate(); err != nil {
+		t.Errorf("a lag just under the notice TTL was refused: %v", err)
+	}
+
+	for _, d := range []time.Duration{meta.NoticeTTL, meta.NoticeTTL + time.Hour, 24 * time.Hour} {
+		err := withLag(d).Validate()
+		if err == nil {
+			t.Errorf("max_feeder_lag %s was accepted, and it loses documents", d)
+			continue
+		}
+		if !strings.Contains(err.Error(), "announcement") {
+			t.Errorf("the refusal does not say why: %v", err)
+		}
+	}
+}

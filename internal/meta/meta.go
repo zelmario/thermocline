@@ -187,6 +187,19 @@ type ResidencyRecord struct {
 	PromotedAt time.Time     `bson:"promotedAt,omitempty"`
 }
 
+// NoticeTTL is how long an eviction or warming announcement is kept.
+//
+// It is the other half of evictor.max_feeder_lag and the two have to be read
+// together. The evictor announces a removal, then makes it. The feeder reads
+// the delete `lag` later and asks whether it was announced: if the notice has
+// expired by then the delete reads as the application's, the archive tombstones
+// its copy, and the document is gone from both tiers with nothing said.
+//
+// So a deployment that lets mirroring fall further behind than this is one
+// where eviction destroys data. The config refuses that combination rather than
+// leaving it to be discovered; see EvictorConfig.Validate.
+const NoticeTTL = time.Hour
+
 // EvictionNotice is one row of the evicting announcement collection. Notices
 // expire through a TTL index; they only have to outlive the feeder's lag.
 type EvictionNotice struct {

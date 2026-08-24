@@ -53,6 +53,10 @@ type Evictor struct {
 	// unagedSeen records which namespaces have already been counted for
 	// documents the rule cannot age, so the scan that costs happens once per
 	// process rather than once per sweep. See warnAboutUnaged.
+	// clockOnce keeps the comparison with the archive's clock to one per run:
+	// it is a property of the machines, not of a sweep.
+	clockOnce sync.Once
+
 	unagedMu   sync.Mutex
 	unagedSeen map[string]bool
 }
@@ -147,6 +151,8 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 		e.publish(ctx, s)
 		return s, nil
 	}
+
+	e.checkClock(ctx)
 
 	total := Stats{DryRun: e.dryRun}
 	if e.dryRun {
@@ -722,4 +728,46 @@ func (e *Evictor) narrowClaims(ctx context.Context, boundaries map[string]time.T
 		return nil
 	}
 	return e.settleClaim(ctx)
+}
+
+// checkClock says how far this machine's clock is from the archive's, once.
+//
+// The direction that destroys data is behind: an eviction announcement is
+// stamped here and expired by the archive's TTL monitor, so a clock running
+// behind has its announcements expiring early, and far enough behind they are
+// gone before the feeder reads the delete they explain. It then takes that
+// delete for the application's own, the archive tombstones its copy, and the
+// document is gone from both tiers. See health.Skew and meta.NoticeTTL.
+//
+// Reported rather than refused. A clock can be corrected while this runs, and a
+// sweep that stops because of one is a fast tier that fills up instead.
+func (e *Evictor) checkClock(ctx context.Context) {
+	e.clockOnce.Do(func() {
+		skew, err := health.Skew(ctx, e.cold)
+		if err != nil {
+			e.log.Debug("could not compare this clock with the archive's", "err", err)
+			return
+		}
+		behind := -skew
+		switch {
+		case behind >= meta.NoticeTTL:
+			e.log.Error("this clock is far enough behind the archive's to lose documents",
+				"behind", behind.Round(time.Second).String(),
+				"notice_ttl", meta.NoticeTTL.String(),
+				"reason", "an eviction announcement is stamped here and expired by the archive, so "+
+					"one written now is already older than the archive keeps them",
+				"effect", "the feeder reads every eviction as the application's own delete and "+
+					"tombstones the archive's copy, losing the document from both tiers",
+				"action", "fix the clock on this machine before letting a sweep run")
+		case skew > health.SkewWarn || behind > health.SkewWarn:
+			e.log.Warn("this clock and the archive's do not agree",
+				"skew", skew.Round(time.Millisecond).String(),
+				"note", "eviction announcements are stamped here and expired there, and residency "+
+					"holds are written by the router and read here",
+				"action", "run NTP on both, or expect the windows to differ from the configuration "+
+					"by about this much")
+		default:
+			e.log.Debug("clocks agree with the archive", "skew", skew.Round(time.Millisecond).String())
+		}
+	})
 }

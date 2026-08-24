@@ -658,6 +658,20 @@ func (e EvictorConfig) Validate() error {
 	if e.MaxFeederLag <= 0 {
 		return errors.New("evictor.max_feeder_lag must be positive: eviction without a mirroring check loses data")
 	}
+	// The announcement that says a delete was an eviction expires on a TTL, and
+	// the feeder only sees that delete once it has caught up to it. Letting
+	// mirroring fall behind further than the notice lives means the feeder
+	// reads an eviction as the application's own delete, tombstones the
+	// archive's copy, and the document is gone from both tiers with nothing
+	// said. Refused rather than warned, because this one destroys data and the
+	// evictor's own file is enough to see it.
+	if e.MaxFeederLag.D() >= meta.NoticeTTL {
+		return fmt.Errorf("evictor.max_feeder_lag is %s, which reaches the %s an eviction "+
+			"announcement is kept: a delete the feeder sees after the announcement has expired "+
+			"is read as the application's and the archive tombstones its copy, losing the "+
+			"document from both tiers. Set it well below %s",
+			e.MaxFeederLag.String(), meta.NoticeTTL, meta.NoticeTTL)
+	}
 	if e.FeederID == "" {
 		return errors.New("evictor.feeder_id is required so lag can be read")
 	}

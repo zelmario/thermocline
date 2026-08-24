@@ -202,11 +202,13 @@ func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Fe
 // Safe to call on every start.
 func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 	// Eviction notices expire on their own. They only have to outlive feeder
-	// lag, and an hour is generous next to a 30 second alerting threshold.
+	// lag, and the config refuses a max_feeder_lag that reaches this far. See
+	// meta.NoticeTTL, which is where the two are tied together.
+	ttl := int32(meta.NoticeTTL.Seconds())
 	_, err := f.cold.Database(meta.DB).Collection(meta.Evicting).Indexes().
 		CreateOne(ctx, mongo.IndexModel{
 			Keys:    bson.D{{Key: "at", Value: 1}},
-			Options: options.Index().SetExpireAfterSeconds(3600).SetName("tc_notice_ttl"),
+			Options: options.Index().SetExpireAfterSeconds(ttl).SetName("tc_notice_ttl"),
 		})
 	if err != nil {
 		return fmt.Errorf("create evicting ttl index: %w", err)
@@ -216,7 +218,7 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 	_, err = f.cold.Database(meta.DB).Collection(meta.Warming).Indexes().
 		CreateOne(ctx, mongo.IndexModel{
 			Keys:    bson.D{{Key: "at", Value: 1}},
-			Options: options.Index().SetExpireAfterSeconds(3600).SetName("tc_warm_ttl"),
+			Options: options.Index().SetExpireAfterSeconds(ttl).SetName("tc_warm_ttl"),
 		})
 	if err != nil {
 		return fmt.Errorf("create warming ttl index: %w", err)
