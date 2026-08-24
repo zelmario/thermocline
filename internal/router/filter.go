@@ -135,6 +135,9 @@ func lowerTimeBound(filter bson.Raw, ageField string, known bool) (time.Time, bo
 }
 
 // boundOf reads a lower bound from one filter value.
+//
+// Every operator here is one the document has to satisfy along with the others
+// beside it, so the latest of the bounds they give is the bound on the query.
 func boundOf(val bson.RawValue) (time.Time, bool) {
 	// An exact ObjectId or date is its own lower bound.
 	if t, ok := timeOf(val); ok {
@@ -145,16 +148,64 @@ func boundOf(val bson.RawValue) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	for _, op := range []string{"$gte", "$gt"} {
+
+	var best time.Time
+	var found bool
+	take := func(t time.Time) {
+		if !found || t.After(best) {
+			best, found = t, true
+		}
+	}
+
+	// $eq is the same statement as the bare value beside it, and a driver
+	// writes one or the other depending on how the query was built. Reading
+	// only the bare form sent an ORM's query to the archive and the hand
+	// written one to the fast tier.
+	for _, op := range []string{"$gte", "$gt", "$eq"} {
 		v, err := doc.LookupErr(op)
 		if err != nil {
 			continue
 		}
 		if t, ok := timeOf(v); ok {
-			return t, true
+			take(t)
 		}
 	}
-	return time.Time{}, false
+
+	// $in is bounded at its earliest member, and only when every member is an
+	// instant. One that is not matches documents whose age field holds
+	// something else, and no claim about time covers those: MongoDB brackets a
+	// range predicate by type, and an equality list is not bracketed at all.
+	if v, err := doc.LookupErr("$in"); err == nil {
+		if t, ok := earliestOf(v); ok {
+			take(t)
+		}
+	}
+
+	return best, found
+}
+
+// earliestOf reads the earliest instant from an $in list, or false when the
+// list is empty or holds anything that is not one.
+func earliestOf(val bson.RawValue) (time.Time, bool) {
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return time.Time{}, false
+	}
+	vals, err := arr.Values()
+	if err != nil || len(vals) == 0 {
+		return time.Time{}, false
+	}
+	var earliest time.Time
+	for i, v := range vals {
+		t, ok := timeOf(v)
+		if !ok {
+			return time.Time{}, false
+		}
+		if i == 0 || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest, true
 }
 
 // timeOf reads an instant from an ObjectId or a date.

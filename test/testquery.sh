@@ -272,8 +272,13 @@ TWODAY=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timez
 C "db.getSiblingDB(process.env.TC_DB).$BNS.insertMany([
      {_id:1, createdAt:new Date('$YEARS'),  shippedAt:new Date('$DAYAGO'), n:'old, shipped yesterday'},
      {_id:2, createdAt:new Date(),          shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'}])" >/dev/null
+# The fast tier's copy carries the archive's own createdAt rather than a second
+# new Date(). Two documents with the same _id and different dates are two
+# documents, and a check comparing an exact value then asks each tier about its
+# own data. The counts below did not notice; a $eq on that value does.
+NEWAT=$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.findOne({_id:2}).createdAt.toISOString())")
 H "db.getSiblingDB(process.env.TC_DB).$BNS.insertOne(
-     {_id:2, createdAt:new Date(), shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'})" >/dev/null
+     {_id:2, createdAt:new Date('$NEWAT'), shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'})" >/dev/null
 startRouter
 cline watermark --config $CFG --ns $DB.$BNS --complete-from "$FROM" >/dev/null
 sleep 7
@@ -297,6 +302,29 @@ chk "and an unbounded query does as well"        \
 chk "a bound inside \$and answers like the archive" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{n:{\$exists:true}},{createdAt:{\$gte:new Date('$TWODAY')}}]}))")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({\$and:[{n:{\$exists:true}},{createdAt:{\$gte:new Date('$TWODAY')}}]}))")"
+# $eq and $in say the same thing as the forms above, and a driver writes one or
+# the other depending on how the query was built. Reading only the bare form
+# sent an ORM's query to the archive and the hand written one to the fast tier.
+#
+# The recent document's own createdAt, so these match something. A check whose
+# answer is zero on both sides passes whatever the router does.
+RECENT=$NEWAT
+chk "a bound written as \$eq answers like the archive" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$eq:new Date('$RECENT')}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$eq:new Date('$RECENT')}}))")"
+chk "and one written as \$in"                        \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),new Date('$TWODAY')]}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),new Date('$TWODAY')]}}))")"
+# A list reaching past the claim is bounded where its earliest member is, which
+# is outside it, so this one has to consult the archive and find both.
+chk "a \$in reaching past the claim finds both"       \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$YEARS'),new Date('$RECENT')]}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$YEARS'),new Date('$RECENT')]}}))")"
+# And a list with a member that is not an instant matches documents no claim
+# about time covers, so it is not a bound at all.
+chk "a \$in holding something else is not a bound"    \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),'yesterday']}}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$BNS.countDocuments({createdAt:{\$in:[new Date('$RECENT'),'yesterday']}}))")"
 # And the ones that must not be read as bounds. $or is satisfied by a branch
 # carrying none, so the query reaches as far back as that branch does.
 chk "a bound inside \$or answers like the archive"  \

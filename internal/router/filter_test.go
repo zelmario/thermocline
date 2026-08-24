@@ -231,3 +231,73 @@ func TestLowerTimeBoundUnderOperators(t *testing.T) {
 		})
 	}
 }
+
+// $eq and $in state the same thing as the forms already read, and a driver
+// writes one or the other depending on how the query was built.
+func TestLowerTimeBoundReadsEqAndIn(t *testing.T) {
+	when := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	later := when.Add(48 * time.Hour)
+	oid := bson.NewObjectIDFromTimestamp(when)
+
+	tests := []struct {
+		name   string
+		filter bson.D
+		want   bool
+		why    string
+	}{
+		{"$eq on the age field", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$eq", Value: when}}}}, true,
+			"the same statement as the bare date beside it"},
+		{"$eq on something else", bson.D{
+			{Key: "shippedAt", Value: bson.D{{Key: "$eq", Value: when}}}}, false,
+			"a bound in another dimension"},
+		{"$eq on a value that is not an instant", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$eq", Value: "yesterday"}}}}, false,
+			"it matches documents no claim about time covers"},
+		{"$in of dates", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{later, when}}}}}, true,
+			"bounded at its earliest member"},
+		{"$in of ObjectIds", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{oid}}}}}, true,
+			"an ObjectId carries its own instant"},
+		{"$in with one that is not an instant", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{when, "yesterday"}}}}}, false,
+			"that member matches documents outside the date bracket, which no claim covers"},
+		{"an empty $in", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{}}}}}, false,
+			"nothing to read a bound from"},
+		{"$nin, which is not a bound at all", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$nin", Value: bson.A{when}}}}}, false,
+			"it is about documents that do not match, which reach any distance back"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := lowerTimeBound(rawDoc(t, tt.filter), "createdAt", true)
+			if ok != tt.want {
+				t.Fatalf("found=%v, want %v: %s", ok, tt.want, tt.why)
+			}
+			if ok && !got.Equal(when) {
+				t.Errorf("bound = %v, want %v", got, when)
+			}
+		})
+	}
+}
+
+// Several operators on the same field all have to hold, so the latest of the
+// bounds they give is the bound on the query.
+func TestLowerTimeBoundTakesTheLatestOperator(t *testing.T) {
+	early := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	late := early.Add(72 * time.Hour)
+
+	got, ok := lowerTimeBound(rawDoc(t, bson.D{{Key: "createdAt", Value: bson.D{
+		{Key: "$gte", Value: early},
+		{Key: "$in", Value: bson.A{late, late.Add(time.Hour)}},
+	}}}), "createdAt", true)
+	if !ok {
+		t.Fatal("no bound found")
+	}
+	if !got.Equal(late) {
+		t.Errorf("bound = %v, want %v: every operator has to hold", got, late)
+	}
+}
