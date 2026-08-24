@@ -378,16 +378,23 @@ C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})" >/dev/null
 # The archive is the original cluster, so it holds everything. The odd one is
 # what an adoption leaves behind: no warm window's predicate ever matches it.
+# The instants are fixed in the shell, not written as new Date() on each side.
+# Each mongosh evaluates its own, and two documents with the same _id and
+# different dates are two documents, so every comparison then asks each tier
+# about its own data.
+T0=$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+T1=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+T2=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 C "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
-     {_id:0, createdAt:new Date()},
-     {_id:1, createdAt:new Date(Date.now()-3600*1000)},
-     {_id:2, createdAt:new Date(Date.now()-2*3600*1000)},
+     {_id:0, createdAt:new Date('$T0')},
+     {_id:1, createdAt:new Date('$T1')},
+     {_id:2, createdAt:new Date('$T2')},
      {_id:99, createdAt:new Timestamp({t: Math.floor(Date.now()/1000), i: 1})}])" >/dev/null
 # The fast tier holds the two newest by date, which is what warming that window
 # leaves behind.
 H "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
-     {_id:0, createdAt:new Date()},
-     {_id:1, createdAt:new Date(Date.now()-3600*1000)}])" >/dev/null
+     {_id:0, createdAt:new Date('$T0')},
+     {_id:1, createdAt:new Date('$T1')}])" >/dev/null
 startRouter
 TFROM=$(H "print(db.getSiblingDB(process.env.TC_DB).$TNS.find().sort({createdAt:1}).limit(1).toArray()[0].createdAt.toISOString())")
 cline watermark --config $CFG --ns $DB.$TNS --complete-from "$TFROM" >/dev/null

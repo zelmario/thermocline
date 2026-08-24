@@ -187,10 +187,16 @@ stopFeeder 2>/dev/null || true
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 OLDD=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=400)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+# Fixed here rather than written as new Date() inside the loop. The loop runs
+# the same eval against each tier in its own mongosh, so new Date() gives each
+# tier a different instant, and two documents with the same _id and different
+# dates are two documents. Nothing here compares that value today, which is
+# exactly why it would sit unnoticed until something did.
+NOWD=$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 for U in "$HOT" "$COLD"; do
   mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$CNS.insertMany([
     {_id:1, at:new Date('$OLDD')}, {_id:2, at:new Date('$OLDD')},
-    {_id:3, at:new Date()},        {_id:4, at:new Date()}])" >/dev/null
+    {_id:3, at:new Date('$NOWD')}, {_id:4, at:new Date('$NOWD')}])" >/dev/null
 done
 DB=$DB WDIR=$WDIR python3 - <<'PY'
 import os
