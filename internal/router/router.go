@@ -302,11 +302,11 @@ func (r *Router) Listen(ctx context.Context) error {
 	defer func() { _ = ln.Close() }()
 	r.addr.Store(ln.Addr().String())
 
-	go func() {
+	r.goSafely("closing the listener on shutdown", func() {
 		<-ctx.Done()
 		_ = ln.Close()
-	}()
-	go r.reapCursors(ctx)
+	})
+	r.goSafely("reaping abandoned cursors", func() { r.reapCursors(ctx) })
 	// The advisor publishes one last report as it stops, and that write has to
 	// finish before this function returns or the process exits out from under
 	// it. Started fire-and-forget, it usually won that race on an idle machine
@@ -316,10 +316,13 @@ func (r *Router) Listen(ctx context.Context) error {
 	// load that lost it.
 	adviceDone := make(chan struct{})
 	go func() {
+		// The close is outside the recovery: whoever waits on this must be
+		// released whether the report finished or panicked.
 		defer close(adviceDone)
-		r.reportAdvice(ctx)
+		r.safely("reporting what the cache learned", func() { r.reportAdvice(ctx) })
 	}()
-	go r.watchForInvalidation(ctx)
+	r.goSafely("watching the fast tier for changes the cache must hear about",
+		func() { r.watchForInvalidation(ctx) })
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),
@@ -1055,7 +1058,9 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// In the background and rate limited inside the indexer, the
 				// same as the catalog path.
 				ns := db + "." + coll
-				go c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+				c.r.goSafely("building the archive's indexes on the fast tier", func() {
+					c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+				})
 			}
 			// A collection's collation is fixed at creation, so the only way it
 			// changes is a drop and a recreate, which comes through here.
@@ -1289,19 +1294,25 @@ func (r *Router) primaryMoved() {
 	r.primaryProbeMu.Unlock()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), primaryProbeWait)
-		defer cancel()
-		err := r.refreshPrimary(ctx)
-
-		r.primaryProbeMu.Lock()
-		r.primaryProbing = nil
-		r.primaryProbeMu.Unlock()
-		close(done)
-
-		if err != nil {
-			r.log.Warn("the fast tier refused a command as not primary, and which member took over could not be resolved",
-				"pinned", r.currentPrimary(), "err", err)
-		}
+		// Releasing the waiters is outside the recovery and in a defer, so it
+		// happens whether the probe finished or panicked. Inside, a panic would
+		// leave primaryProbing set and every caller of awaitPrimaryProbe
+		// waiting on a channel nothing will ever close: the process used to die
+		// instead, which at least did not hang.
+		defer func() {
+			r.primaryProbeMu.Lock()
+			r.primaryProbing = nil
+			r.primaryProbeMu.Unlock()
+			close(done)
+		}()
+		r.safely("finding the fast tier's primary", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), primaryProbeWait)
+			defer cancel()
+			if err := r.refreshPrimary(ctx); err != nil {
+				r.log.Warn("the fast tier refused a command as not primary, and which member took over could not be resolved",
+					"pinned", r.currentPrimary(), "err", err)
+			}
+		})
 	}()
 }
 

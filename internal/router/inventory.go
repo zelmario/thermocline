@@ -103,13 +103,17 @@ func (r *Router) readInventory(ctx context.Context) {
 		}
 		wg.Add(1)
 		go func(i int, ns, db, coll string) {
+			// wg.Done outside the recovery, so a panic here still releases the
+			// wait rather than hanging the caller.
 			defer wg.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			size := NamespaceSize{NS: ns}
-			size.FastDocs, size.FastBytes = collSize(ctx, r, true, db, coll)
-			size.ArchiveDocs, size.ArchiveBytes = collSize(ctx, r, false, db, coll)
-			sizes[i] = size
+			r.safely("measuring a namespace for the dashboard", func() {
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				size := NamespaceSize{NS: ns}
+				size.FastDocs, size.FastBytes = collSize(ctx, r, true, db, coll)
+				size.ArchiveDocs, size.ArchiveBytes = collSize(ctx, r, false, db, coll)
+				sizes[i] = size
+			})
 		}(i, ns, db, coll)
 	}
 	wg.Wait()

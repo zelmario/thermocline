@@ -196,7 +196,7 @@ func (r *Router) startPolling(ctx context.Context) {
 	r.ckptCache.mu.Unlock()
 	// Detached: the poller outlives the read that started it, and serves the
 	// reads that follow.
-	go r.poll(context.WithoutCancel(ctx))
+	r.goSafely("polling mirroring's position", func() { r.poll(context.WithoutCancel(ctx)) })
 }
 
 // noteOpTime remembers the newest cluster time the fast tier has reported.

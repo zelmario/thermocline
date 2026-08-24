@@ -88,7 +88,9 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	// immediately, and cancelling it must not abandon the build half done.
 	if inserted {
 		ns := ns
-		go r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+		r.goSafely("building the archive's indexes on the fast tier", func() {
+			r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+		})
 	}
 	if !inserted {
 		// The fast tier already held it, so no insert happened and no echo is
@@ -109,13 +111,13 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 func (r *Router) copyUpAsync(ns string, id bson.RawValue) {
 	// Detached from the client's context on purpose: the reply has been sent,
 	// and the client hanging up must not abandon a half-finished copy.
-	go func() {
+	r.goSafely("copying a document up", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := r.copyUp(ctx, ns, id); err != nil {
 			r.log.Warn("copy up failed", "ns", ns, "err", err)
 		}
-	}()
+	})
 }
 
 // recordResidency keeps a copied-up document in the fast tier for a while.

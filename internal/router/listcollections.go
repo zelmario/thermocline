@@ -191,7 +191,9 @@ func (c *conn) archiveOnlyCollections(ctx context.Context, cmd bson.Raw, db stri
 		// become a create attempt per connection.
 		ns := db + "." + name
 		c.r.indexer.Forget(ns)
-		go c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+		c.r.goSafely("building the archive's indexes on the fast tier", func() {
+			c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+		})
 	}
 	return out, cur.Err()
 }

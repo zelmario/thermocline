@@ -146,7 +146,7 @@ func (r *Router) SnapshotAll() Snapshot {
 // reports traffic, so it belongs on an operator network rather than on the
 // address the application already reaches.
 func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
-	go r.refreshInventory(ctx)
+	r.goSafely("refreshing the dashboard's inventory", func() { r.refreshInventory(ctx) })
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -189,12 +189,12 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 	}
 	r.log.Info("dashboard listening", "addr", ln.Addr().String())
 
-	go func() {
+	r.goSafely("shutting the dashboard down", func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
-	}()
+	})
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
