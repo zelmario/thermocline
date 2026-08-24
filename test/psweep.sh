@@ -30,7 +30,7 @@ SUITES=${SUITES:-"testconform testauthterm testkeys testtxn testconcerns
         testall testrouter testops testedge testlife testchange testquery
         testddl testcache testfresh testaggwrite testexplain testindexes
         testmerge testecho testunack testupsert testsingle testauth testbulk
-        testreadpref testreadprefterm testtypes testwarm testevict
+        testreadpref testreadprefterm testtypes testbson testwarm testevict
         testdaemonmetrics testretry testpool testnotice"}
 
 rm -rf "$OUT"; mkdir -p "$OUT"
