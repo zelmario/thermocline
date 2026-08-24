@@ -186,9 +186,38 @@ func (c *conn) deferNewestAgg(ctx context.Context, cmd bson.Raw, ns string, writ
 	if !aok {
 		return false
 	}
-	_, ok := newestFirstPipeline(cmd, af)
-	return ok
+	limit, ok := newestFirstPipeline(cmd, af)
+	if !ok {
+		return false
+	}
+	return limit <= firstBatchCap(cmd)
 }
+
+// firstBatchCap is the most documents the fast tier's first batch can carry,
+// which is what decides whether deferring is worth anything.
+//
+// The proof needs the whole of the N in that batch, so a limit larger than it
+// cannot be proved however the query goes. Sending it to the fast tier anyway
+// would have it sort everything it holds, return a batch too short to prove
+// anything, and then be asked again at the archive. That is a sort nobody reads,
+// paid on a pipeline that reaches far enough back to be worth caring about.
+//
+// The default is mongod's own first batch for an aggregation, and a client that
+// asks for more is taken at its word. Fewer can still come back, because the
+// batch is also capped by 16 MB, and that case is the same miss as any other:
+// the proof fails and the archive answers.
+func firstBatchCap(cmd bson.Raw) int {
+	if cur, ok := cmd.Lookup("cursor").DocumentOK(); ok {
+		if n, ok := positiveInt(cur.Lookup("batchSize")); ok {
+			return n
+		}
+	}
+	return defaultFirstBatch
+}
+
+// defaultFirstBatch is what mongod puts in an aggregation's first batch when
+// nothing asks for a size.
+const defaultFirstBatch = 101
 
 // interceptAggNewest judges a deferred pipeline by its own answer, and sends it
 // to the archive when the proof does not hold.

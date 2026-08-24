@@ -1651,6 +1651,14 @@ until they exist every connection is refused with MongoDB's ordinary
 `Authentication failed`, which says nothing about which tier is missing them.
 The router names them at startup.
 
+Give the router's own account `killAnyCursor` on the fast tier while you are
+there. When the archive answers a query the fast tier had started, the fast tier
+is left holding a cursor for the rest of it that nothing will ever read, and the
+router closes it. It sends that on its own account, and mongod lets an account
+close only its own cursors without that privilege. Without it those cursors sit
+until mongod's timeout, ten minutes by default. The router says so once if it
+cannot.
+
 **4. Deal with the collections nothing tiers.** A collection the archive holds
 that is not in `feeder.namespaces` lives only on the archive, and the router
 correctly forwards reads of it to the fast tier, which has never held it. The

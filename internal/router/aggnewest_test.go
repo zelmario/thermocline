@@ -108,3 +108,32 @@ func TestNewestFirstPipelineByObjectID(t *testing.T) {
 		t.Error("rewriting _id taken, want refused")
 	}
 }
+
+// A limit larger than the first batch can carry cannot be proved however the
+// query goes, so it must not be sent to the fast tier to find that out.
+func TestDeferOnlyWhatTheBatchCanCarry(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		batchSize int
+		want      int
+	}{
+		{"nothing asked, mongod's own default", 0, 101},
+		{"a client asking for more", 0, 101},
+	} {
+		cmd := pipelineCmd(t, bson.D{{Key: "$limit", Value: 1}})
+		if got := firstBatchCap(cmd); got != tc.want {
+			t.Errorf("%s: cap %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	raw, err := bson.Marshal(bson.D{
+		{Key: "aggregate", Value: "orders"},
+		{Key: "pipeline", Value: bson.A{}},
+		{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: 500}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := firstBatchCap(bson.Raw(raw)); got != 500 {
+		t.Errorf("a stated batchSize: cap %d, want 500", got)
+	}
+}

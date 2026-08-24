@@ -2,8 +2,10 @@ package router
 
 import (
 	"context"
+	"errors"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 // When the archive's answer replaces the fast tier's, the fast tier has already
@@ -44,6 +46,23 @@ func (c *conn) dropSupersededCursor(ctx context.Context, rdoc bson.Raw, db strin
 	}).Err()
 	if err != nil {
 		// Not worth failing the client's read over. It expires on its own.
+		//
+		// Said out loud once, though, because the likely reason is a privilege
+		// and an operator cannot guess that from a cursor count creeping up.
+		// The kill goes out on the router's own account, and mongod lets a
+		// user kill only their own cursors unless they hold killAnyCursor. In
+		// a test where the router and the application share an account this
+		// never shows; in a deployment where they do not, it always does.
+		if isUnauthorized(err) && !c.r.warnedKillCursor.Swap(true) {
+			c.log.Warn("cannot close the fast tier cursors this router's answers replace",
+				"db", db, "err", err,
+				"reason", "the kill is sent on the router's own account, and mongod lets an account "+
+					"close only its own cursors without the killAnyCursor privilege",
+				"effect", "a query the archive answers leaves the fast tier holding a cursor for the "+
+					"rest of it until mongod's own timeout, which is ten minutes by default",
+				"action", "grant the router's account a role carrying killAnyCursor on the fast tier")
+			return
+		}
 		c.log.Debug("could not close the fast tier cursor this answer replaced",
 			"db", db, "cursor", id, "err", err)
 		return
@@ -67,4 +86,14 @@ func collectionOfCursorNS(cdoc bson.Raw) (string, bool) {
 		return "", false
 	}
 	return coll, true
+}
+
+// isUnauthorized reports whether mongod refused this for want of a privilege,
+// which is the one failure here worth telling an operator about.
+func isUnauthorized(err error) bool {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return ce.Code == 13 || ce.Name == "Unauthorized"
+	}
+	return false
 }

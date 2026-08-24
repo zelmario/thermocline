@@ -93,6 +93,10 @@ type Router struct {
 	wmCache  watermarkCache
 	idxCache indexCache
 	brackets bracketCache
+
+	// warnedKillCursor keeps the privilege warning in superseded.go to one per
+	// router, since the condition does not change while it runs.
+	warnedKillCursor atomic.Bool
 	// hintCache holds each namespace's sparse and partial indexes, the ones
 	// whose hint decides which documents are looked at rather than how. See
 	// hint.go.
