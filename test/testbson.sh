@@ -143,6 +143,23 @@ ask "the newest 3 after skipping 2"  "const F=$IDS; print(F(t.find(LIVE).sort({c
 ask "the newest 3 with a filter"     "const F=$IDS; print(F(t.find(Object.assign({k:'a'},LIVE)).sort({createdAt:-1}).limit(3)))"
 ask "the newest 3 of the not-dates"  "const F=$IDS; print(F(t.find(Object.assign({createdAt:{\$not:{\$type:'date'}}},LIVE)).sort({createdAt:-1}).limit(3)))"
 
+echo "== the same questions as a pipeline, which is how a BI tool asks =="
+# A read-only newest-N pipeline is sent to the fast tier and judged on the way
+# back, the way a find is, rather than answered from the archive. It has to give
+# the archive's answer, and on this collection that means the documents whose
+# createdAt outranks a date, which the fast tier does not hold.
+AGG='function(c){return c.toArray().map(function(d){return String(d._id)}).join(",")}'
+for L in 1 3 5; do
+  ask "the newest $L as a pipeline" "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}},{\$limit:$L}])))"
+done
+ask "the newest 3 as a filtered pipeline" "const F=$AGG; print(F(t.aggregate([{\$match:Object.assign({k:'a'},LIVE)},{\$sort:{createdAt:-1}},{\$limit:3}])))"
+# Oldest first is not this shape and must go on being answered by the archive.
+ask "the oldest 3 as a pipeline"          "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:1}},{\$limit:3}])))"
+# Nor is a pipeline with no limit, which reads everything.
+ask "sorted with no limit as a pipeline"  "const F=$AGG; print(F(t.aggregate([{\$match:LIVE},{\$sort:{createdAt:-1}}])))"
+# Nor one that computes rather than selects.
+ask "a group as a pipeline"               "print(t.aggregate([{\$match:LIVE},{\$group:{_id:null,n:{\$sum:1}}}]).toArray()[0].n)"
+
 echo "== the directions and orders the proof does not cover =="
 # Oldest first proves nothing: everything not returned is newer, not older.
 for L in 1 3 10; do

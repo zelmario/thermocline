@@ -53,7 +53,8 @@ func provenNewestFirst(cmd, reply bson.Raw, ageField string, known bool, mark wa
 		return false
 	}
 
-	if !sortsNewestFirst(cmd, ageField) {
+	sortDoc, hasSort := cmd.Lookup("sort").DocumentOK()
+	if !hasSort || !sortsNewestFirst(sortDoc, ageField) {
 		return false
 	}
 	limit, ok := positiveInt(cmd.Lookup("limit"))
@@ -62,7 +63,13 @@ func provenNewestFirst(cmd, reply bson.Raw, ageField string, known bool, mark wa
 		// this cannot speak for.
 		return false
 	}
+	return provenBatch(reply, limit, ageField, mark)
+}
 
+// provenBatch is the proof itself, once the sort and the limit have been read
+// off whichever kind of command carried them. A find carries them as fields; an
+// aggregation carries them as stages. See aggnewest.go.
+func provenBatch(reply bson.Raw, limit int, ageField string, mark watermark.Mark) bool {
 	batch, ok := firstBatch(reply)
 	if !ok || len(batch) != limit {
 		// Fewer than asked for means the fast tier ran out, which proves
@@ -89,12 +96,8 @@ func provenNewestFirst(cmd, reply bson.Raw, ageField string, known bool, mark wa
 //
 // Leads with, rather than consists of. A later key only breaks ties, and the
 // documents that tie are all newer than the claim too, so they are all here.
-func sortsNewestFirst(cmd bson.Raw, ageField string) bool {
-	doc, ok := cmd.Lookup("sort").DocumentOK()
-	if !ok {
-		return false
-	}
-	elems, err := doc.Elements()
+func sortsNewestFirst(sortDoc bson.Raw, ageField string) bool {
+	elems, err := sortDoc.Elements()
 	if err != nil || len(elems) == 0 {
 		return false
 	}

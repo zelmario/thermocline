@@ -29,8 +29,15 @@ func (c *conn) intercept(ctx context.Context, msg *wire.Message, name, db string
 	case "collStats":
 		return c.interceptCollStats(ctx, msg, db, reply)
 	case "aggregate":
-		// Only a pipeline led by $collStats, which is what db.coll.stats()
-		// sends. Everything else an aggregate can be is decided before it runs.
+		// A read-only newest-N pipeline is the one an aggregation defers to
+		// here, because judging it early cannot use its own answer. See
+		// aggnewest.go.
+		if out, done := c.interceptAggNewest(ctx, msg, db, reply); done {
+			return out, nil
+		}
+		// Otherwise only a pipeline led by $collStats, which is what
+		// db.coll.stats() sends. Everything else an aggregate can be is
+		// decided before it runs.
 		return c.interceptAggCollStats(ctx, msg, db, reply)
 	default:
 		return reply, nil

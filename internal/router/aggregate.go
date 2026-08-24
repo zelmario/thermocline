@@ -347,6 +347,15 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		return out, true
 	}
 
+	// A read-only pipeline asking for the newest N is sent to the fast tier
+	// instead, and judged on the way back the way a find is. The reason this
+	// command is judged early does not apply to one that only reads, and the
+	// archive is still where it goes if the proof does not hold. See
+	// aggnewest.go.
+	if c.deferNewestAgg(ctx, cmd, scope.primary, scope.writes) {
+		return nil, false
+	}
+
 	// The archive holds every document, so it can answer in full what the fast
 	// tier cannot.
 	if c.r.cfg.Completeness == config.Archive {
