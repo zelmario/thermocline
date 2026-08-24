@@ -439,11 +439,12 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		if !c.constrainsAfter(ctx, ns, idx, sh, doc, st.filter) {
 			continue
 		}
-		kid, kok := keyIDFromValues(ns, idx, sh.newKeyValues(idx, doc, st.filter))
+		nvals := sh.newKeyValues(idx, doc, st.filter)
+		kid, kok := keyIDFromValues(ns, idx, nvals)
 		if !kok {
 			continue
 		}
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id)
+		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, nvals)
 		if terr != nil {
 			return false, claimed, terr
 		}
@@ -459,12 +460,13 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		if !c.constrainsAfter(ctx, ns, idx, sh, nil, st.filter) {
 			return false, claimed, nil
 		}
-		kid, kok := keyIDFromValues(ns, idx, sh.newKeyValues(idx, nil, st.filter))
+		nvals := sh.newKeyValues(idx, nil, st.filter)
+		kid, kok := keyIDFromValues(ns, idx, nvals)
 		if !kok {
 			return false, claimed, nil
 		}
 		owner, _ := lookupPath(st.filter, "_id")
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, owner)
+		got, terr := c.r.tryClaim(ctx, ns, idx, kid, owner, nvals)
 		if terr != nil {
 			return false, claimed, terr
 		}
@@ -630,7 +632,7 @@ func (c *conn) claimEvaluated(ctx context.Context, ns string, idx uniqueIndex, d
 			continue
 		}
 		id, _ := doc.LookupErr("_id")
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id)
+		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, keyValues(idx, doc))
 		if terr != nil {
 			return false, claimed, terr
 		}

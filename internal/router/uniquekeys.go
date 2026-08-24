@@ -57,6 +57,11 @@ type uniqueIndex struct {
 	// them can move a document into the index without touching an indexed
 	// field at all, and that is the moment its key has to be claimed.
 	partialFields []string
+
+	// collation, when the index carries one. Two strings it calls equal are
+	// one key, and their bytes are not, so the id derived here cannot see the
+	// clash. See collatedkeys.go.
+	collation bson.Raw
 }
 
 // partialFieldNames lists the fields a partial filter reads, descending through
@@ -178,6 +183,7 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 				Sparse                  bool     `bson:"sparse"`
 				Key                     bson.Raw `bson:"key"`
 				PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
+				Collation               bson.Raw `bson:"collation"`
 			}
 			if derr := cur.Decode(&spec); derr != nil {
 				continue
@@ -194,6 +200,7 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 				sparse:        spec.Sparse,
 				partial:       spec.PartialFilterExpression,
 				partialFields: partialFieldNames(spec.PartialFilterExpression),
+				collation:     spec.Collation,
 			}
 			for _, e := range elems {
 				ui.fields = append(ui.fields, e.Key())
@@ -245,6 +252,12 @@ func indexDDL(cmd bson.Raw, name string) (string, bool) {
 // too, or two documents both missing the field would look like different keys
 // and both be allowed.
 func keyID(ns string, idx uniqueIndex, doc bson.Raw) (string, bool) {
+	return keyIDFromValues(ns, idx, keyValues(idx, doc))
+}
+
+// keyValues reads one document's value of each of an index's fields, in order.
+// A nil entry means the field is absent, which MongoDB indexes as null.
+func keyValues(idx uniqueIndex, doc bson.Raw) []any {
 	vals := make([]any, len(idx.fields))
 	for i, f := range idx.fields {
 		val, err := doc.LookupErr(strings.Split(f, ".")...)
@@ -253,7 +266,7 @@ func keyID(ns string, idx uniqueIndex, doc bson.Raw) (string, bool) {
 		}
 		vals[i] = val
 	}
-	return keyIDFromValues(ns, idx, vals)
+	return vals
 }
 
 // keyIDFromValues builds the same id from field values worked out some other
@@ -318,7 +331,7 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 			if !ok {
 				continue
 			}
-			got, terr := r.tryClaim(ctx, ns, idxs[i], kid, id)
+			got, terr := r.tryClaim(ctx, ns, idxs[i], kid, id, keyValues(idxs[i], doc))
 			if terr != nil {
 				return claimed, nil, terr
 			}
@@ -344,7 +357,15 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 //
 // Both the insert and the update path go through here, so a value is reserved
 // the same way whichever command is about to write it.
-func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid string, owner bson.RawValue) (bool, error) {
+func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid string, owner bson.RawValue, vals []any) (bool, error) {
+	// An index with a collation calls strings equal that the id derived above
+	// keeps apart, so the archive is asked in the comparison the index itself
+	// uses. See collatedkeys.go. This costs one indexed lookup, and only on an
+	// index that carries a collation.
+	if r.collatedArchiveClash(ctx, ns, idx, vals, owner) {
+		return false, nil
+	}
+
 	now := time.Now().UTC()
 	_, err := r.keys().InsertOne(ctx, keyClaim{
 		ID: kid, NS: ns, Index: idx.name, Doc: owner, At: now,

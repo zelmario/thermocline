@@ -83,6 +83,9 @@ feeder:
     # testkeys.sh: the same number written as a long and as a double. MongoDB
     # compares numbers across int, long and double, so both are one key.
     - "shop.tknum"
+    # testkeys.sh: a unique index with a case-insensitive collation, where two
+    # spellings are one key and their bytes are not.
+    - "shop.tkcoll"
     - "shop.tkspar"
     - "shop.tkpart"
     - "shop.tkddl"

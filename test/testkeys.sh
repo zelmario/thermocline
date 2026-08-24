@@ -253,6 +253,26 @@ chk "so is one that is not a whole number"          "ok"    "$(R 'try{db.getSibl
 # treat it as one.
 chk "and the string \"7\" is not the number 7"       "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknum.insertOne({_id:7,n:"7"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== a collation decides which strings are one key =="
+# Under en/strength 2, Bob@x.com and bob@x.com are one value and a unique index
+# rejects the second. The registry derives its id from the value's bytes, and
+# those two spellings have different bytes, so it made two keys where mongod
+# makes one. An index inherits its collection's default collation, so the spec
+# says so whichever way it was set.
+fresh tkcoll
+H 'db.getSiblingDB(process.env.TC_DB).tkcoll.createIndex({email:1},{unique:true,collation:{locale:"en",strength:2}})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:1,email:"Bob@x.com"})' >/dev/null
+waitMirrored tkcoll 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll.deleteOne({_id:1})'
+chk "the other spelling of an archived key rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:2,email:"bob@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and the exact spelling too"                     "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:3,email:"Bob@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# And it must not become a blanket refusal: a value nobody holds is still free,
+# and a document is still allowed to keep the value it already has.
+chk "a value nobody holds is still accepted"         "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:4,email:"eve@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and rewriting a value to itself is allowed"     "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:4},{$set:{email:"eve@x.com"}});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "an update onto the archived key is rejected"    "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:4},{$set:{email:"BOB@x.com"}});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and the document was not changed"             "eve@x.com" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tkcoll.findOne({_id:4}); print(d?d.email:"MISSING")')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a
