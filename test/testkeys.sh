@@ -151,6 +151,31 @@ chk "upsert onto the evicted key rejected"   "11000" "$(R 'try{db.getSiblingDB(p
 chk "  and it created nothing"               "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkups.countDocuments({_id:50}))')"
 chk "upsert onto a free key still works"     "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkups.updateOne({_id:51},{$set:{email:"spare@x.com"}},{upsert:true}).upsertedCount)')"
 
+# The upsert above names the key in its update document. This one does not: it
+# names it in the filter, which is where mongod takes it from when it creates
+# the document. The guard read the update document alone to decide whether a
+# statement could touch a unique index, so this shape was never checked at all.
+# Measured on the pilot against a live archived comment's key: accepted, the
+# archive then refused to mirror it with E11000, and a read of the key answered
+# 1 where two documents existed.
+chk "upsert taking the key from its filter rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkups.updateOne({email:"taken@x.com",tag:"filter"},{$setOnInsert:{n:1}},{upsert:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and it created nothing"               "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkups.countDocuments({tag:"filter"}))')"
+
+# An insert that lets the server name the document has no _id to record as the
+# claim's owner. bson cannot marshal that at all, and the guard's answer to a
+# registry it cannot write is to let the write through, so the one case with no
+# owner was the one case nothing was enforced.
+chk "insert with no _id onto the evicted key rejected" "11000" "$(R 'const r=db.getSiblingDB(process.env.TC_DB).runCommand({insert:"tkups",documents:[{email:"taken@x.com",tag:"noid"}]}); print(r.writeErrors?r.writeErrors[0].code:"ACCEPTED")')"
+chk "  and it created nothing"               "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkups.countDocuments({tag:"noid"}))')"
+chk "insert with no _id onto a free key works" "1" "$(R 'const r=db.getSiblingDB(process.env.TC_DB).runCommand({insert:"tkups",documents:[{email:"noid@x.com",tag:"noid2"}]}); print(r.writeErrors?r.writeErrors[0].code:r.n)')"
+
+# A claim that records no owner must still be resolvable, or the value it holds
+# is blocked for ever: nothing could prove it free again.
+R 'db.getSiblingDB(process.env.TC_DB).tkups.updateOne({email:"reuse@x.com",tag:"reuse"},{$setOnInsert:{n:1}},{upsert:true})' >/dev/null
+chk "the same upsert again is not refused by its own claim" "0" "$(R 'try{print(db.getSiblingDB(process.env.TC_DB).tkups.updateOne({email:"reuse@x.com",tag:"reuse"},{$set:{n:2}},{upsert:true}).upsertedCount||0)}catch(e){print(e.code||e.message.substring(0,40))}')"
+R 'db.getSiblingDB(process.env.TC_DB).tkups.deleteMany({tag:"reuse"})' >/dev/null
+chk "and the key it gave up is usable again" "ok" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkups.insertOne({_id:60,email:"reuse@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== a key a document moves off must become reusable =="
 # Nothing is evicted here. One document takes a value and then leaves it, so the
 # value is unused and the next document must be allowed to have it. A claim that

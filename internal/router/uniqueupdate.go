@@ -145,6 +145,16 @@ func relates(a, b string) bool {
 
 // affects reports whether the statement can change idx's key at all, or move
 // the document into or out of the set of documents idx covers.
+//
+// It reads the update document alone, which is the whole answer for a statement
+// that modifies a document that exists. It is not the answer for an upsert:
+// the document mongod creates inherits the filter's equality fields too, so
+// updateOne({email, date}, {$setOnInsert: {name}}, {upsert: true}) writes a key
+// the update document never mentions. Callers check an upsert whatever this
+// says. Measured on the pilot: that upsert was accepted against a key a live
+// archived comment held, the write was acknowledged, the archive refused to
+// mirror it with E11000, and a read of the key answered 1 where two documents
+// existed.
 func (sh updateShape) affects(idx uniqueIndex) bool {
 	if sh.isReplace {
 		return true
@@ -374,7 +384,7 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 	for s, st := range stmts {
 		sh := parseUpdate(st.update)
 		for i := range idxs {
-			if !sh.affects(idxs[i]) {
+			if !sh.affects(idxs[i]) && !st.upsert {
 				continue
 			}
 			clash, kids, cerr := c.claimStatement(ctx, ns, idxs[i], sh, st)

@@ -923,10 +923,19 @@ tier is rebuilt, since it lives there. If it finds one key held by two live
 documents it says so and picks no winner, because that means the constraint was
 already broken.
 
-Two limits worth knowing. **Sparse and partial unique indexes are not enforced
+Every path that can write a unique value goes through the registry: inserts,
+updates, replacements, `findAndModify`, `bulkWrite`, and an upsert creating a
+document. An upsert is checked whatever its update document appears to touch,
+because the document mongod creates takes its key from the filter's equalities
+too: `updateOne({email, date}, {$setOnInsert: {name}}, {upsert: true})` writes a
+key the update never mentions. Measured on the pilot before that was true, on a
+key a live archived comment held: the write was accepted, the archive refused to
+mirror it with `E11000`, and a read of the key answered 1 where two documents
+existed.
+
+One limit worth knowing. **Sparse and partial unique indexes are not enforced
 across tiers**, because a registry cannot evaluate the same condition; the
-router says which ones it skipped. And **an update that changes a unique field
-to a value held by an evicted document is not caught yet**, only inserts are.
+router says which ones it skipped.
 
 ### Transactions
 

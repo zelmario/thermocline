@@ -10,6 +10,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/wire"
@@ -320,6 +321,30 @@ func (r *Router) keys() *mongo.Collection {
 	return r.hot.Database(meta.DB).Collection(keysCollection)
 }
 
+// claimRow is the registry row to write, with the owner left out when there is
+// none to record.
+//
+// An owner is not always known at the moment a key has to be claimed. An upsert
+// whose filter carries no _id is about to create a document mongod will name
+// itself, and an insert can arrive without an _id for the same reason. Writing
+// keyClaim directly in that state does not fail the write, it fails the claim:
+// bson cannot marshal a zero RawValue at all, "the RawValue Type specifies an
+// invalid BSON type: 0x0", and the guard's answer to a registry it cannot write
+// is to let the write through. So the one case the owner is unknown was the one
+// case nothing was enforced.
+func claimRow(kid, ns, index string, owner bson.RawValue, now time.Time) bson.D {
+	row := bson.D{
+		{Key: "_id", Value: kid},
+		{Key: "ns", Value: ns},
+		{Key: "idx", Value: index},
+		{Key: "at", Value: now},
+	}
+	if !owner.IsZero() {
+		row = append(row, bson.E{Key: "doc", Value: owner})
+	}
+	return row
+}
+
 // keyClash is one document in a batch whose unique key is already taken.
 type keyClash struct {
 	doc   int    // position in the client's batch
@@ -382,9 +407,7 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 	}
 
 	now := time.Now().UTC()
-	_, err := r.keys().InsertOne(ctx, keyClaim{
-		ID: kid, NS: ns, Index: idx.name, Doc: owner, At: now,
-	})
+	_, err := r.keys().InsertOne(ctx, claimRow(kid, ns, idx.name, owner, now))
 	if err == nil {
 		return true, nil
 	}
@@ -398,9 +421,7 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 	derr := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&claim)
 	if errors.Is(derr, mongo.ErrNoDocuments) {
 		// Released between the failed insert and this read. Try once more.
-		_, ierr := r.keys().InsertOne(ctx, keyClaim{
-			ID: kid, NS: ns, Index: idx.name, Doc: owner, At: now,
-		})
+		_, ierr := r.keys().InsertOne(ctx, claimRow(kid, ns, idx.name, owner, now))
 		if ierr == nil {
 			return true, nil
 		}
@@ -418,7 +439,7 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 		return true, nil
 	}
 
-	live, lerr := r.claimIsLive(ctx, ns, idx, kid, claim)
+	live, lerr := r.claimIsLive(ctx, ns, idx, kid, claim, vals, owner)
 	if lerr != nil {
 		return false, lerr
 	}
@@ -427,9 +448,20 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 	}
 
 	// Stale. Take it over, unless somebody else just did.
-	res, uerr := r.keys().UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: bson.D{{Key: "$ne", Value: owner}}}},
-		bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: owner}, {Key: "at", Value: now}}}})
+	filter := bson.D{{Key: "_id", Value: kid}}
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: owner}, {Key: "at", Value: now}}}}
+	if owner.IsZero() {
+		// Nothing to write as the owner, so the row keeps none, and "somebody
+		// else just did" means the owner it was judged stale for is still there.
+		filter = append(filter, bson.E{Key: "doc", Value: bson.D{{Key: "$exists", Value: !claim.Doc.IsZero()}}})
+		update = bson.D{
+			{Key: "$set", Value: bson.D{{Key: "at", Value: now}}},
+			{Key: "$unset", Value: bson.D{{Key: "doc", Value: ""}}},
+		}
+	} else {
+		filter = append(filter, bson.E{Key: "doc", Value: bson.D{{Key: "$ne", Value: owner}}})
+	}
+	res, uerr := r.keys().UpdateOne(ctx, filter, update)
 	if uerr != nil {
 		return false, uerr
 	}
@@ -445,10 +477,14 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 // would then block a perfectly legitimate insert of a value nobody holds. So
 // the owner is read in full and its key recomputed, rather than probed for
 // existence.
-func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, kid string, claim keyClaim) (bool, error) {
+func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, kid string,
+	claim keyClaim, vals []any, newOwner bson.RawValue) (bool, error) {
 	if claim.Doc.IsZero() {
-		// No owner recorded, so nothing can be proven gone. Treat as taken.
-		return true, nil
+		// No owner to re-read, so the question is asked of the tiers instead:
+		// does any live document hold this value? Treating it as taken without
+		// asking would block the value for ever, since nothing could ever prove
+		// it free again.
+		return r.keyHeldByLiveDocument(ctx, ns, idx, vals, newOwner), nil
 	}
 
 	db, coll := splitNS(ns)
@@ -871,4 +907,53 @@ func (r *Router) UniqueNamespaces(ctx context.Context, candidates []string) []st
 		}
 	}
 	return out
+}
+
+// keyHeldByLiveDocument reports whether either tier holds a live document with
+// this key, in the comparison the index itself uses.
+//
+// It answers for a claim that records no owner. Errors read as held: a value
+// that cannot be checked is one this must not hand to a second document.
+func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) bool {
+	if len(vals) != len(idx.fields) {
+		return true
+	}
+	filter := bson.D{}
+	for i, f := range idx.fields {
+		// A missing field is indexed as null, exactly as keyID encodes it.
+		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+	}
+	if !owner.IsZero() {
+		// The document being written is allowed to hold its own value.
+		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
+	}
+
+	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
+	if len(idx.collation) > 0 {
+		opts.SetCollation(collationFromSpec(idx.collation))
+	}
+	db, coll := splitNS(ns)
+
+	var doc bson.Raw
+	err := r.hot.Database(db).Collection(coll).FindOne(ctx, filter, opts).Decode(&doc)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		r.log.Warn("could not ask the fast tier whether a unique key is still held",
+			"ns", ns, "index", idx.name, "err", err)
+		return true
+	}
+
+	cold := append(bson.D{meta.NotArchivedDeleted()}, filter...)
+	err = r.cold.Database(db).Collection(coll).FindOne(ctx, cold, opts).Decode(&doc)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		r.log.Warn("could not ask the archive whether a unique key is still held",
+			"ns", ns, "index", idx.name, "err", err)
+		return true
+	}
+	return false
 }

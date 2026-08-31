@@ -245,7 +245,10 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		case "update":
 			sh := parseUpdate(op.stmt.update)
 			for i := range idxs {
-				if !sh.affects(idxs[i]) {
+				// An upsert is checked whatever it appears to touch, because
+				// the document it creates takes its key from the filter as
+				// much as from the update. See affects.
+				if !sh.affects(idxs[i]) && !op.stmt.upsert {
 					continue
 				}
 				clash, kids, cerr := c.claimStatement(ctx, op.ns, idxs[i], sh, op.stmt)
