@@ -101,3 +101,37 @@ func atoi(t *testing.T, s string) int64 {
 	}
 	return n
 }
+
+// Every counter an alert is written against has to be exported, not only shown
+// on the dashboard: an alert cannot be written against a page somebody has to
+// open. panics was readable only there, and it is the first thing worth paging
+// on, because any value above zero is a defect with a stack in the log.
+func TestMetricsExportsWhatIsWorthPagingOn(t *testing.T) {
+	r := &Router{
+		cfg:     config.RouterConfig{Completeness: config.Archive},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: NewMetrics(metricsWindow),
+		started: time.Now(),
+	}
+	r.Stats.Panics.Store(2)
+	r.Stats.StaleReads.Store(3)
+	r.Stats.Refused.Store(4)
+
+	var b strings.Builder
+	r.writeMetrics(context.Background(), &b)
+	out := b.String()
+
+	for _, want := range []string{
+		"thermocline_panics_total 2",
+		"thermocline_stale_reads_total 3",
+		"thermocline_refused_total 4",
+		"thermocline_superseded_cursors_total",
+		"thermocline_unauthorized_total",
+		"thermocline_duplicate_keys_total",
+		"thermocline_unreadable_total",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the exporter does not carry %q", want)
+		}
+	}
+}

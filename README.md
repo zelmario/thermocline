@@ -1278,6 +1278,91 @@ scrape_configs:
       - targets: ["router-1.internal:27101"]
 ```
 
+### What to alert on
+
+Six signals, and the reason each one is worth waking somebody for. Everything
+here is already published; what was missing was saying which numbers mean
+something.
+
+**1. `thermocline_panics_total` above zero. Page.** A panic is a defect, with a
+stack in the log, and the connection it happened on was closed. Nothing about
+the tiering is wrong at that moment, but something the router was asked to do it
+could not, and the next client to ask will hit it too.
+
+**2. `thermocline_stale_reads_total` above zero. Page.** A read fell through to
+the archive and was answered before mirroring reached the moment the read
+started, so it may miss a write that already returned. Every other counter here
+is about work; this one is about a wrong answer.
+
+**3. `thermocline_mirroring_lag_seconds` above the eviction notice's lifetime.
+Page.** Past that point the evictor stops, which is the safe behaviour, and a
+delete the feeder reaches after the notice has expired is read as the
+application's own and the document is lost from both tiers. The config refuses
+the combination that would allow it, so this alert is about the lag getting
+there. Warn at a minute, page at ten.
+
+**4. `thermocline_refused_total` rising. Investigate, do not page.** The router
+would not answer a command, and every refusal names its reason in the log. A
+steady trickle is an application asking for something this system does not do; a
+step change means completeness claims no longer cover what is being asked, which
+is usually a warm that has not run.
+
+**5. `thermocline_daemon_seconds_since_pass` climbing. Page at ten minutes.** A
+daemon that has stopped shows this climbing rather than going silent, which is
+the whole reason it is a gauge from the last published report rather than a
+heartbeat. The feeder stopping is the serious one: mirroring stops, the evictor
+halts behind it, and every fall-through read pays the freshness barrier.
+
+**6. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
+zero. Investigate.** The first is a client reading a collection it has no
+permission for, refused. The second is a message the router could not inspect,
+which means it was forwarded unguarded; a compressed connection is the cause, and
+the remedy is removing the client's compressors.
+
+```yaml
+groups:
+  - name: thermocline
+    rules:
+      - alert: ThermoclinePanic
+        expr: increase(thermocline_panics_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "the router recovered a panic; there is a stack in its log"
+      - alert: ThermoclineStaleRead
+        expr: increase(thermocline_stale_reads_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "an archive read was answered before mirroring caught up"
+      - alert: ThermoclineMirroringBehind
+        expr: thermocline_mirroring_lag_seconds > 600
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "mirroring is far enough behind that eviction has stopped"
+      - alert: ThermoclineDaemonStopped
+        expr: thermocline_daemon_seconds_since_pass > 600
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.daemon }} has not finished a pass in ten minutes"
+      - alert: ThermoclineRefusalsRising
+        expr: increase(thermocline_refused_total[15m]) > 10
+        labels: {severity: ticket}
+        annotations:
+          summary: "the router is refusing commands; the log says why"
+      - alert: ThermoclineUnguardedOrUnauthorized
+        expr: increase(thermocline_unauthorized_total[15m]) > 0
+          or increase(thermocline_unreadable_total[15m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "a client read what it may not, or sent what could not be inspected"
+```
+
+Two things are deliberately **not** alerts. `copied_up_total` rising means the
+eviction boundary is cut deeper than the application reads, which is a tuning
+conversation rather than an incident. And `duplicate_keys_total` counts writes
+refused for duplicating an archived key, which for an application that relies on
+`E11000` is ordinary behaviour working correctly.
+
 ## Which queries are worth caching
 
 The router sees every read and every answer, which is what a cache advisor

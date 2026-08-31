@@ -61,6 +61,10 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("primary_only_reads_total", "Reads that asked for a secondary and were served by the primary. Answers are correct and fresher than asked for; the read load stays on the primary.", snap.Counters["primary_only_reads"])
 	counter("unreadable_total", "Messages the router could not inspect, which are therefore unguarded. Compressed connections cause these; any value above zero needs the client's compressors removed.", snap.Counters["unreadable"])
 	counter("stale_reads_total", "Archive reads answered before mirroring caught up. Any of these is worth investigating.", snap.Counters["stale_reads"])
+	// The first thing worth paging on, and it was readable only from the
+	// dashboard: an alert cannot be written against a page somebody has to open.
+	counter("panics_total", "Client connections closed by a recovered panic. Any value above zero is a defect, with a stack in the log.", snap.Counters["panics"])
+	counter("superseded_cursors_total", "Cursors the fast tier was left holding after the archive answered the query, closed by the router. Rising with no reads falling through means the router cannot close them and they sit until mongod's timeout.", snap.Counters["superseded_cursors"])
 	counter("clients_total", "Client connections accepted since start.", snap.Counters["clients_total"])
 	gauge("clients_open", "Client connections open now.", float64(snap.Counters["clients_open"]))
 	gauge("uptime_seconds", "How long this router has been running.", float64(snap.UptimeS))
