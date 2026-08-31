@@ -256,6 +256,31 @@ chk "the archive holds that result too"     "[1,2]" \
 chk "and no temporary was left behind"      "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 
+echo "== \$out onto the collection it reads =="
+# mongod allows it, because it builds the result beside the target and renames
+# over it, so the input is intact while it is read. Clearing the target first is
+# what this used to do, and the input was deleted before it was read: measured on
+# three documents with a $match keeping two, nought left on either tier where
+# MongoDB leaves two. The result is built in a temporary collection now, exactly
+# as mongod does, and moved in at the end.
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:1,n:1},{_id:2,n:2},{_id:3,n:3}])" >/dev/null
+waitMirrored 3
+chk "three documents to begin with"        "3" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
+chk "\$out onto itself is accepted"        "ok" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$match:{n:{\$gte:2}}},{\$out:'$NS'}]).toArray();print('ok')}catch(e){print(e.code||e.message.substring(0,50))}")"
+chk "  and it kept what the filter kept"   "[2,3]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$NS.find({}).sort({_id:1}).toArray().map(d=>d._id)))")"
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "2" ] && break
+  sleep 1
+done
+chk "  the archive agrees"                 "[2,3]" \
+    "$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$NS.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+chk "  and no temporary was left behind"   "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+
 stopDaemons
 echo
 echo "================================"

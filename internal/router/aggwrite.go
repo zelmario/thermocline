@@ -167,6 +167,19 @@ type writeSink struct {
 	rename   bool
 	tempName string
 	finalNS  string
+
+	// A tiered target is filled from a temporary collection rather than
+	// directly, because clearing it is part of the write and $out is allowed to
+	// read the collection it replaces.
+	//
+	// Measured with the target cleared first, on a tiered collection holding
+	// three documents, aggregate([{$match: {n: {$gte: 2}}}, {$out: itself}]):
+	// nought documents left on either tier, where MongoDB leaves two. The
+	// input had been deleted before it was read. This is what mongod's own
+	// temporary collection is for, and the only difference here is that the
+	// last step cannot be a rename, because a rename is not mirrored.
+	tieredColl    *mongo.Collection
+	tieredArchive *mongo.Collection
 }
 
 // newWriteSink prepares the destination and reports how the write will be done.
@@ -185,48 +198,18 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		// Only ordinary writes reach it: the feeder ignores the rename $out
 		// would otherwise use, because replaying destructive DDL into the
 		// archive is what would let one accident on the fast tier destroy it.
-		coll := c.r.hot.Database(outDB).Collection(outColl)
-		if _, err := coll.DeleteMany(ctx, bson.D{}); err != nil {
-			return nil, fmt.Errorf("clear %s: %w", target, err)
-		}
-		// Clearing the fast tier only reaches what the fast tier holds. A
-		// document that has been evicted lives in the archive alone, so nothing
-		// above deletes it and a read after this would return it beside the
-		// result. Measured: a $out promising exactly one document answered with
-		// two, the extra one being an evicted document from before it ran.
 		//
-		// $out says the target holds the result and nothing else, so the
-		// archive's live copies are marked deleted as well. This is the one
-		// place the router removes archived data, and it is deliberate: a drop
-		// is not replayed into the archive precisely so that one accident
-		// cannot destroy it, and a $out is not an accident, it is an
-		// application saying what this collection should now contain.
-		//
-		// After the fast tier, not before. If this fails, the collection still
-		// reads as what it held, because the archive is what answers once the
-		// fast tier is empty, and the caller gets an error rather than a
-		// half-replaced collection reported as success.
-		//
-		// It is also the expensive half, and worth knowing about: this reaches
-		// every live document the archive holds for the namespace, however many
-		// that is, where clearing the fast tier only reaches the working set. A
-		// $out over a collection with years of history behind it is a large
-		// write, so it says how large.
-		archived := c.r.cold.Database(outDB).Collection(outColl)
-		res, err := archived.UpdateMany(ctx,
-			bson.D{meta.NotArchivedDeleted()}, meta.Tombstone(time.Now().UTC()))
-		if err != nil {
-			return nil, fmt.Errorf("clear the archive's copy of %s: %w", target, err)
-		}
-		if res.ModifiedCount > 0 {
-			c.log.Info("$out marked the archive's copies deleted",
-				"ns", target, "documents", res.ModifiedCount,
-				"why", "$out says the target holds the result and nothing else, and clearing "+
-					"the fast tier reaches only what the fast tier held")
-		}
+		// The result is built in a temporary collection and moved in at the
+		// end, because clearing the target is part of this write and the
+		// pipeline is allowed to be reading the target. See writeSink.
+		temp := fmt.Sprintf("tmp.thermocline.out.%d", time.Now().UnixNano())
 		return &writeSink{
 			r: c.r, how: "replaced on both tiers, so the result is all that is left",
-			target: target, outColl: coll, claimNS: target,
+			target: target, claimNS: target,
+			outColl:       c.r.hot.Database(outDB).Collection(temp),
+			tempName:      outDB + "." + temp,
+			tieredColl:    c.r.hot.Database(outDB).Collection(outColl),
+			tieredArchive: c.r.cold.Database(outDB).Collection(outColl),
 		}, nil
 	}
 
@@ -240,14 +223,91 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 	}, nil
 }
 
+// fill moves a tiered $out's result from the temporary collection into the
+// target, having first cleared what the target held on both tiers.
+func (s *writeSink) fill(ctx context.Context) error {
+	if _, err := s.tieredColl.DeleteMany(ctx, bson.D{}); err != nil {
+		return fmt.Errorf("clear %s: %w", s.target, err)
+	}
+	// Clearing the fast tier only reaches what the fast tier holds. A document
+	// that has been evicted lives in the archive alone, so nothing above
+	// deletes it and a read after this would return it beside the result.
+	// Measured: a $out promising exactly one document answered with two, the
+	// extra one being an evicted document from before it ran.
+	//
+	// $out says the target holds the result and nothing else, so the archive's
+	// live copies are marked deleted as well. This is the one place the router
+	// removes archived data, and it is deliberate: a drop is not replayed into
+	// the archive precisely so that one accident cannot destroy it, and a $out
+	// is not an accident, it is an application saying what this collection
+	// should now contain.
+	//
+	// After the fast tier, not before. If this fails, the collection still
+	// reads as what it held, because the archive is what answers once the fast
+	// tier is empty, and the caller gets an error rather than a half-replaced
+	// collection reported as success.
+	//
+	// It is also the expensive half, and worth knowing about: this reaches
+	// every live document the archive holds for the namespace, however many
+	// that is, where clearing the fast tier only reaches the working set. A
+	// $out over a collection with years of history behind it is a large write,
+	// so it says how large.
+	res, err := s.tieredArchive.UpdateMany(ctx,
+		bson.D{meta.NotArchivedDeleted()}, meta.Tombstone(time.Now().UTC()))
+	if err != nil {
+		return fmt.Errorf("clear the archive's copy of %s: %w", s.target, err)
+	}
+	if res.ModifiedCount > 0 {
+		s.r.log.Info("$out marked the archive's copies deleted",
+			"ns", s.target, "documents", res.ModifiedCount,
+			"why", "$out says the target holds the result and nothing else, and clearing "+
+				"the fast tier reaches only what the fast tier held")
+	}
+
+	// Then the result, in the batches the registry claims keys in.
+	cur, err := s.outColl.Find(ctx, bson.D{})
+	if err != nil {
+		return fmt.Errorf("read back the result for %s: %w", s.target, err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	batch := make([]any, 0, writeBatch)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if cerr := s.claim(ctx, batch); cerr != nil {
+			return cerr
+		}
+		if _, ierr := s.tieredColl.InsertMany(ctx, batch); ierr != nil {
+			return ierr
+		}
+		batch = batch[:0]
+		return nil
+	}
+	for cur.Next(ctx) {
+		doc := make(bson.Raw, len(cur.Current))
+		copy(doc, cur.Current)
+		batch = append(batch, doc)
+		if len(batch) >= writeBatch {
+			if ferr := flush(); ferr != nil {
+				return ferr
+			}
+		}
+	}
+	if cerr := cur.Err(); cerr != nil {
+		return cerr
+	}
+	return flush()
+}
+
 func (s *writeSink) write(ctx context.Context, batch []any) error {
 	if len(batch) == 0 {
 		return nil
 	}
 	if s.outColl != nil {
-		if err := s.claim(ctx, batch); err != nil {
-			return err
-		}
+		// Into the temporary collection. The claims are made when the target is
+		// filled from it, because a key claimed for a result that never lands
+		// blocks that value for nothing.
 		_, err := s.outColl.InsertMany(ctx, batch)
 		return err
 	}
@@ -264,6 +324,13 @@ func (s *writeSink) write(ctx context.Context, batch []any) error {
 }
 
 func (s *writeSink) commit(ctx context.Context) error {
+	if s.tieredColl != nil {
+		if err := s.fill(ctx); err != nil {
+			return err
+		}
+		s.dropTemp(ctx)
+		return nil
+	}
 	if !s.rename {
 		return nil
 	}
@@ -283,12 +350,16 @@ func (s *writeSink) commit(ctx context.Context) error {
 // abandon removes a half-written temporary collection. Leaving one behind would
 // be litter that nothing else ever cleans up.
 func (s *writeSink) abandon(ctx context.Context) {
-	if !s.rename {
+	if s.tempName == "" {
 		return
 	}
+	s.dropTemp(ctx)
+}
+
+func (s *writeSink) dropTemp(ctx context.Context) {
 	if err := s.r.hot.Database(splitDB(s.tempName)).Collection(splitColl(s.tempName)).
 		Drop(context.WithoutCancel(ctx)); err != nil {
-		s.r.log.Warn("could not remove a temporary collection left by a failed aggregation",
+		s.r.log.Warn("could not remove a temporary collection left by an aggregation",
 			"ns", s.tempName, "err", err)
 	}
 }
