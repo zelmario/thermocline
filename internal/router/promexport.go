@@ -122,6 +122,32 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			}
 			fmt.Fprintf(b, "thermocline_daemon_dry_run{daemon=\"%s\"} %d\n", promEscape(rep.ID), dry)
 		}
+		// Values that go up and down, and may be negative, so they cannot
+		// travel with the counters: the evictor's clock skew against the
+		// archive is why this exists. Far enough behind and an eviction
+		// announcement expires before the feeder reads the delete it explains,
+		// and the document is lost from both tiers.
+		gauged := false
+		for _, rep := range reports {
+			if len(rep.Gauges) == 0 {
+				continue
+			}
+			if !gauged {
+				fmt.Fprintf(b, "# HELP thermocline_daemon_gauge What each daemon last measured about itself. clock_skew_seconds is this daemon's clock less the archive's; negative means behind, which is the direction that loses documents.\n")
+				fmt.Fprintf(b, "# TYPE thermocline_daemon_gauge gauge\n")
+				gauged = true
+			}
+			names := make([]string, 0, len(rep.Gauges))
+			for k := range rep.Gauges {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				fmt.Fprintf(b, "thermocline_daemon_gauge{daemon=\"%s\",gauge=\"%s\"} %s\n",
+					promEscape(rep.ID), promEscape(k),
+					strconv.FormatFloat(rep.Gauges[k], 'f', -1, 64))
+			}
+		}
 		fmt.Fprintf(b, "# HELP thermocline_daemon_documents_total Documents each daemon has handled since it started, by outcome.\n")
 		fmt.Fprintf(b, "# TYPE thermocline_daemon_documents_total counter\n")
 		for _, rep := range reports {

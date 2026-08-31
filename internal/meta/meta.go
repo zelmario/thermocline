@@ -385,16 +385,25 @@ type DaemonReport struct {
 	At       time.Time        `bson:"at"`
 	DryRun   bool             `bson:"dryRun"`
 	Counters map[string]int64 `bson:"counters"`
+
+	// Gauges are values that go up and down, and may be negative, so they
+	// cannot travel in Counters: Prometheus reads a counter that went backwards
+	// as a restart. The evictor's clock skew against the archive is the reason
+	// this exists, and it was the one signal on the alerting list that could not
+	// be alerted on, because it was only ever written to a log.
+	Gauges map[string]float64 `bson:"gauges,omitempty"`
 }
 
 // PublishDaemonReport records what a daemon has done so far.
-func PublishDaemonReport(ctx context.Context, cold *mongo.Client, id string, dryRun bool, counters map[string]int64) error {
+func PublishDaemonReport(ctx context.Context, cold *mongo.Client, id string, dryRun bool,
+	counters map[string]int64, gauges map[string]float64) error {
 	_, err := cold.Database(DB).Collection(DaemonStats).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: id}},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "at", Value: time.Now().UTC()},
 			{Key: "dryRun", Value: dryRun},
 			{Key: "counters", Value: counters},
+			{Key: "gauges", Value: gauges},
 		}}},
 		options.UpdateOne().SetUpsert(true))
 	return err

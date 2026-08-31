@@ -59,6 +59,20 @@ type Evictor struct {
 
 	unagedMu   sync.Mutex
 	unagedSeen map[string]bool
+
+	// skew is how far this clock is from the archive's, as last measured. It is
+	// published rather than only logged, because it is the difference that loses
+	// documents: see checkClock.
+	skewMu    sync.Mutex
+	skew      time.Duration
+	skewKnown bool
+}
+
+// lastSkew reports the most recent clock comparison with the archive.
+func (e *Evictor) lastSkew() (time.Duration, bool) {
+	e.skewMu.Lock()
+	defer e.skewMu.Unlock()
+	return e.skew, e.skewKnown
 }
 
 // SetMaxHealthWait bounds how long RunOnce waits for an unhealthy cluster
@@ -85,7 +99,13 @@ func (e *Evictor) publish(ctx context.Context, s Stats) {
 		"unconfirmed": int64(e.total.Unconfirmed),
 		"backoffs":    int64(e.total.Backoffs),
 	}
-	if err := meta.PublishDaemonReport(ctx, e.cold, "evictor", s.DryRun, counters); err != nil {
+	var gauges map[string]float64
+	if skew, ok := e.lastSkew(); ok {
+		// Published every pass, because a clock drifts while a daemon runs and
+		// the log said this once at startup and never again.
+		gauges = map[string]float64{"clock_skew_seconds": skew.Seconds()}
+	}
+	if err := meta.PublishDaemonReport(ctx, e.cold, "evictor", s.DryRun, counters, gauges); err != nil {
 		e.log.Warn("could not publish evictor statistics", "err", err)
 	}
 }
@@ -742,12 +762,19 @@ func (e *Evictor) narrowClaims(ctx context.Context, boundaries map[string]time.T
 // Reported rather than refused. A clock can be corrected while this runs, and a
 // sweep that stops because of one is a fast tier that fills up instead.
 func (e *Evictor) checkClock(ctx context.Context) {
+	skew, err := health.Skew(ctx, e.cold)
+	if err != nil {
+		e.log.Debug("could not compare this clock with the archive's", "err", err)
+		return
+	}
+	e.skewMu.Lock()
+	e.skew, e.skewKnown = skew, true
+	e.skewMu.Unlock()
+
+	// Measured every pass and published every pass; said out loud once, because
+	// a clock that disagrees disagrees on every sweep and the log is not where
+	// an alert should live.
 	e.clockOnce.Do(func() {
-		skew, err := health.Skew(ctx, e.cold)
-		if err != nil {
-			e.log.Debug("could not compare this clock with the archive's", "err", err)
-			return
-		}
 		behind := -skew
 		switch {
 		case behind >= meta.NoticeTTL:

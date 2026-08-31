@@ -118,6 +118,15 @@ chk "the counters are exported by outcome"             "true" \
     "$(M | grep -q 'thermocline_daemon_documents_total{daemon="evictor",outcome="scanned"}' && echo true || echo false)"
 chk "the dry run is visible"                           "1" \
     "$(M | awk -F' ' '/^thermocline_daemon_dry_run\{daemon="evictor"\}/{print $2}')"
+# The clock skew against the archive is the difference that loses documents: an
+# eviction announcement is stamped by the evictor and expired by the archive, so
+# a clock running behind has its announcements expiring early. It used to be
+# written to a log once at startup, which is not something an alert can read.
+chk "the clock skew is exported"                       "true" \
+    "$(M | grep -q 'thermocline_daemon_gauge{daemon="evictor",gauge="clock_skew_seconds"}' && echo true || echo false)"
+chk "  and these clocks agree, within a second"        "true" \
+    "$(M | awk -F' ' '/^thermocline_daemon_gauge\{daemon="evictor",gauge="clock_skew_seconds"\}/{print $2}' \
+       | awk '{v=$1<0?-$1:$1; print (v < 1) ? "true" : "false (" $1 ")"}')"
 # The gauge has to move, or it is a timestamp pretending to be an age.
 FIRST=$(M | awk -F' ' '/^thermocline_daemon_seconds_since_pass\{daemon="evictor"\}/{print $2}')
 sleep 3

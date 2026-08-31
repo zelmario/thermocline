@@ -71,7 +71,7 @@ func (w *Warmer) publish(ctx context.Context, s Stats) {
 		"already_present": int64(w.total.Present),
 		"backoffs":        int64(w.total.Backoffs),
 	}
-	if err := meta.PublishDaemonReport(ctx, w.cold, "warmer", s.DryRun, counters); err != nil {
+	if err := meta.PublishDaemonReport(ctx, w.cold, "warmer", s.DryRun, counters, nil); err != nil {
 		w.log.Warn("could not publish warmer statistics", "err", err)
 	}
 }

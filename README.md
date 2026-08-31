@@ -1289,7 +1289,7 @@ scrape_configs:
 
 ### What to alert on
 
-Six signals, and the reason each one is worth waking somebody for. Everything
+Seven signals, and the reason each one is worth waking somebody for. Everything
 here is already published; what was missing was saying which numbers mean
 something.
 
@@ -1322,7 +1322,17 @@ the whole reason it is a gauge from the last published report rather than a
 heartbeat. The feeder stopping is the serious one: mirroring stops, the evictor
 halts behind it, and every fall-through read pays the freshness barrier.
 
-**6. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
+**6. `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` past a minute.
+Investigate; past the eviction notice's lifetime, page.** An eviction
+announcement is stamped by the evictor and expired by the archive's TTL monitor,
+so an evictor whose clock runs behind has its announcements expiring early. Far
+enough behind and they are gone before the feeder reads the delete they explain:
+the feeder takes that delete for the application's own, the archive tombstones
+its copy, and the document is lost from both tiers. Negative is behind, which is
+the direction that loses data. The evictor measures this against the archive on
+every pass.
+
+**7. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
 zero. Investigate.** The first is a client reading a collection it has no
 permission for, refused. The second is a message the router could not inspect,
 which means it was forwarded unguarded; a compressed connection is the cause, and
@@ -1358,6 +1368,18 @@ groups:
         labels: {severity: ticket}
         annotations:
           summary: "the router is refusing commands; the log says why"
+      - alert: ThermoclineClockBehind
+        expr: thermocline_daemon_gauge{gauge="clock_skew_seconds"} < -60
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.daemon }}'s clock is behind the archive's; eviction notices expire early"
+      - alert: ThermoclineClockAhead
+        expr: thermocline_daemon_gauge{gauge="clock_skew_seconds"} > 60
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $labels.daemon }}'s clock is ahead of the archive's; the windows differ from the configuration"
       - alert: ThermoclineUnguardedOrUnauthorized
         expr: increase(thermocline_unauthorized_total[15m]) > 0
           or increase(thermocline_unreadable_total[15m]) > 0
