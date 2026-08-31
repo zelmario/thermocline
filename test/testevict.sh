@@ -68,10 +68,15 @@ rm -f $LOGDIR/t_ev.log
 # collection this check had emptied: two failures with nothing wrong.
 cline evictor --config $CFG --every 2s --dry-run --log-file $LOGDIR/t_ev.log &
 EP=$!
-# Wait for the second sweep rather than for a fixed nine seconds. One sweep over
-# this config's namespaces takes between four and eleven seconds on this box, so
-# a fixed window counted one or two depending on the machine's mood and this
-# check failed for a reason that had nothing to do with looping.
+# Wait for the second sweep rather than for a fixed nine seconds.
+#
+# A sweep itself is fast: 0.05s over this config's thirty namespaces with nothing
+# to evict. What is slow is the health backoff, and correctly so. The feeder was
+# restarted a few sections above, so it resumes from a checkpoint that may be far
+# behind, and the evictor pauses five seconds at a time while mirroring lag is
+# over max_feeder_lag. A fixed nine second window therefore counted one sweep or
+# two depending on how far behind the feeder happened to be, and this check
+# failed for a reason that had nothing to do with looping.
 N=0
 for _ in $(seq 1 90); do
   N=$(grep -c "sweep complete" $LOGDIR/t_ev.log 2>/dev/null); N=${N:-0}
