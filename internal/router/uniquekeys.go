@@ -351,18 +351,34 @@ type keyClash struct {
 	index string // the unique index that rejected it
 }
 
+// claimCandidate is one key one document in the batch needs.
+type claimCandidate struct {
+	doc   int // position in the client's batch
+	idx   int // position in idxs
+	kid   string
+	owner bson.RawValue
+	vals  []any
+}
+
 // claimKeys reserves every unique key the batch needs.
 //
 // Rejection is per document, not per batch, because that is what mongod does. An
 // unordered insertMany with one duplicate still inserts the rest and reports one
 // error, and an application relying on that would silently lose documents if the
 // whole batch were refused. Ordered stops at the first clash, again like mongod,
-// so nothing after it is claimed either.
-func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex, ordered bool) (claimed []string, clashes []keyClash, err error) {
+// so nothing after it is inserted and nothing after it keeps a claim.
+//
+// The claims go in one round trip. They used to go one at a time, which is the
+// same shape as inserting a batch of documents one by one and costs the same:
+// measured on this box, 500 documents into a tiered collection with one unique
+// index took 8,052 ms, against 54 ms for the same insert into a collection the
+// guard steps aside for. The registry was 150 times the cost of the write it
+// protects.
+func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex, ordered bool) ([]string, []keyClash, error) {
 	dbName, _ := splitNS(ns)
+	cands := make([]claimCandidate, 0, len(docs))
 	for d, doc := range docs {
 		id, _ := doc.LookupErr("_id")
-		clashed := false
 		for i := range idxs {
 			if !r.constrains(ctx, dbName, idxs[i], doc) {
 				continue
@@ -371,25 +387,133 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 			if !ok {
 				continue
 			}
-			got, terr := r.tryClaim(ctx, ns, idxs[i], kid, id, keyValues(idxs[i], doc))
-			if terr != nil {
-				return claimed, nil, terr
-			}
-			if got {
-				claimed = append(claimed, kid)
-				continue
-			}
-			clashes = append(clashes, keyClash{doc: d, index: idxs[i].name})
-			clashed = true
-			break
-		}
-		if clashed && ordered {
-			// mongod stops an ordered batch at the first failure, so nothing
-			// after this point is inserted and nothing after it may be claimed.
-			break
+			cands = append(cands, claimCandidate{
+				doc: d, idx: i, kid: kid, owner: id, vals: keyValues(idxs[i], doc),
+			})
 		}
 	}
-	return claimed, clashes, nil
+	if len(cands) == 0 {
+		return nil, nil, nil
+	}
+
+	settled, err := r.bulkClaim(ctx, ns, idxs, cands)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var claimed []string
+	var claimedFor []int
+	var clashes []keyClash
+	rejected := map[int]bool{}
+	for i, cd := range cands {
+		// mongod reports one reason per document, and the first index to reject
+		// it is the one it names.
+		if rejected[cd.doc] {
+			continue
+		}
+		got := settled[i]
+		if !got {
+			// Somebody holds this key, or it is a collated index the bulk pass
+			// left alone. Either way it is decided one at a time, because that
+			// is where a stale claim is resolved and where the archive is asked
+			// in the index's own comparison.
+			var terr error
+			got, terr = r.tryClaim(ctx, ns, idxs[cd.idx], cd.kid, cd.owner, cd.vals)
+			if terr != nil {
+				r.releaseKeys(ctx, claimed)
+				return nil, nil, terr
+			}
+		}
+		if got {
+			claimed = append(claimed, cd.kid)
+			claimedFor = append(claimedFor, cd.doc)
+			continue
+		}
+		clashes = append(clashes, keyClash{doc: cd.doc, index: idxs[cd.idx].name})
+		rejected[cd.doc] = true
+	}
+
+	if len(clashes) == 0 {
+		return claimed, nil, nil
+	}
+
+	// The bulk pass claimed keys before anything knew which documents would be
+	// rejected, and a document that is not going to be inserted must not keep
+	// one: it would block that value until something collided with it.
+	drop := map[int]bool{}
+	for _, cl := range clashes {
+		drop[cl.doc] = true
+	}
+	if ordered {
+		for d := clashes[0].doc; d < len(docs); d++ {
+			drop[d] = true
+		}
+	}
+	keep := make([]string, 0, len(claimed))
+	var give []string
+	for i, kid := range claimed {
+		if drop[claimedFor[i]] {
+			give = append(give, kid)
+			continue
+		}
+		keep = append(keep, kid)
+	}
+	r.releaseKeys(ctx, give)
+	return keep, clashes, nil
+}
+
+// bulkClaim writes every claim the batch needs in one round trip and reports
+// which of them are now this batch's.
+//
+// A duplicate key error here means somebody already holds that key, which is not
+// yet an answer: the claim may be stale. Those go back to tryClaim, one at a
+// time, which is where staleness is resolved. So the fast path is one insert and
+// the slow path is only paid where there is a real collision.
+func (r *Router) bulkClaim(ctx context.Context, ns string, idxs []uniqueIndex, cands []claimCandidate) (map[int]bool, error) {
+	now := time.Now().UTC()
+	rows := make([]any, 0, len(cands))
+	at := make([]int, 0, len(cands))
+	for i, cd := range cands {
+		if len(idxs[cd.idx].collation) > 0 {
+			// A collated index calls strings equal that the key id keeps apart,
+			// so the archive has to be asked in the index's own comparison
+			// before the key can be taken. That is per key work: see
+			// collatedArchiveClash.
+			continue
+		}
+		rows = append(rows, claimRow(cd.kid, ns, idxs[cd.idx].name, cd.owner, now))
+		at = append(at, i)
+	}
+	got := make(map[int]bool, len(at))
+	if len(rows) == 0 {
+		return got, nil
+	}
+	for _, i := range at {
+		got[i] = true
+	}
+
+	_, err := r.keys().InsertMany(ctx, rows, options.InsertMany().SetOrdered(false))
+	if err == nil {
+		return got, nil
+	}
+	var bwe mongo.BulkWriteException
+	if !errors.As(err, &bwe) {
+		return nil, err
+	}
+	if bwe.WriteConcernError != nil {
+		// The rows may or may not be there. Treating them as claimed would hand
+		// out keys on a maybe.
+		return nil, err
+	}
+	for _, we := range bwe.WriteErrors {
+		if we.Code != 11000 {
+			return nil, err
+		}
+		if we.Index >= 0 && we.Index < len(at) {
+			delete(got, at[we.Index])
+		}
+	}
+	return got, nil
 }
 
 // tryClaim reserves one key for one document, resolving a stale claim if that
