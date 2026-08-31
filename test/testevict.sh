@@ -63,9 +63,21 @@ ok "--once -v"                 0 "sweep complete" -- cline evictor --config $CFG
 ok "--once --health-timeout"   0 "sweep complete" -- cline evictor --config $CFG --once --health-timeout 30s
 
 rm -f $LOGDIR/t_ev.log
-cline evictor --config $CFG --every 2s --log-file $LOGDIR/t_ev.log &
-EP=$!; sleep 9
-N=$(grep -c "sweep complete" $LOGDIR/t_ev.log 2>/dev/null); N=${N:-0}
+# A dry run, because this check is about looping and nothing else. Left as a
+# real one it evicted while it waited, and the fixtures below then measured a
+# collection this check had emptied: two failures with nothing wrong.
+cline evictor --config $CFG --every 2s --dry-run --log-file $LOGDIR/t_ev.log &
+EP=$!
+# Wait for the second sweep rather than for a fixed nine seconds. One sweep over
+# this config's namespaces takes between four and eleven seconds on this box, so
+# a fixed window counted one or two depending on the machine's mood and this
+# check failed for a reason that had nothing to do with looping.
+N=0
+for _ in $(seq 1 90); do
+  N=$(grep -c "sweep complete" $LOGDIR/t_ev.log 2>/dev/null); N=${N:-0}
+  [ "$N" -ge 2 ] && break
+  sleep 1
+done
 if [ "$N" -ge 2 ]; then PASS=$((PASS+1)); echo "  PASS  --every loops ($N sweeps)"
 else FAIL=$((FAIL+1)); FAILED+=("--every"); echo "  FAIL  --every loops (saw $N)"; fi
 kill $EP 2>/dev/null; wait $EP 2>/dev/null
