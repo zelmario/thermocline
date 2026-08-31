@@ -176,6 +176,34 @@ chk "the same upsert again is not refused by its own claim" "0" "$(R 'try{print(
 R 'db.getSiblingDB(process.env.TC_DB).tkups.deleteMany({tag:"reuse"})' >/dev/null
 chk "and the key it gave up is usable again" "ok" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkups.insertOne({_id:60,email:"reuse@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== a \$merge writes documents too, so it claims their keys =="
+# The target guard brings archived documents up so the merge matches them, which
+# settles the fields it matches *on*. It settles nothing about any other unique
+# index on the target: the archive holds that key, the fast tier's index cannot
+# see it, and $merge inserts. Measured before this was checked: MongoDB refused
+# the statement with E11000, the router accepted it, the archive then refused to
+# mirror the document, and a count of the key answered 1 where two existed.
+fresh tkmrg '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkmrg.insertOne({_id:1,email:"taken@x.com",n:1})' >/dev/null
+waitMirrored tkmrg 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkmrg.deleteOne({_id:1})'
+chk "the fast tier is empty"                  "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({}))')"
+
+# MRG DOCUMENT MERGESPEC: run one $merge through the router and say what it did.
+MRG() {
+  R "try{db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[$1]},{\$merge:$2}]).toArray();print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}"
+}
+BY_ID="{into:'tkmrg',on:'_id',whenMatched:'merge',whenNotMatched:'insert'}"
+chk "an insert holding the archived key rejected" "11000" "$(MRG '{_id:2,email:"taken@x.com",n:2}' "$BY_ID")"
+chk "  and it created nothing"                "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({_id:2}))')"
+chk "whenMatched replace onto that key rejected" "11000" "$(MRG '{_id:3,email:"taken@x.com",n:3}' "{into:'tkmrg',on:'_id',whenMatched:'replace',whenNotMatched:'insert'}")"
+chk "a free key still merges in"              "ACCEPTED" "$(MRG '{_id:4,email:"free@x.com",n:4}' "$BY_ID")"
+chk "the archived document is still updatable" "ACCEPTED" "$(MRG '{_id:1,email:"taken@x.com",n:9}' "$BY_ID")"
+chk "  and it did not become a duplicate"     "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({email:"taken@x.com"}))')"
+chk "matching on the unique field is allowed" "ACCEPTED" "$(MRG '{email:"taken@x.com",n:8}' "{into:'tkmrg',on:'email',whenMatched:'merge',whenNotMatched:'insert'}")"
+chk "whenNotMatched discard writes nothing"   "ACCEPTED" "$(MRG '{_id:5,email:"taken@x.com",n:5}' "{into:'tkmrg',on:'_id',whenMatched:'merge',whenNotMatched:'discard'}")"
+chk "  so nothing was created for it"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({_id:5}))')"
+
 echo "== a key a document moves off must become reusable =="
 # Nothing is evicted here. One document takes a value and then leaves it, so the
 # value is unused and the next document must be allowed to have it. A claim that

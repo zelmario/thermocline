@@ -74,7 +74,8 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		return nil, false
 	}
 
-	keys, err := c.mergeKeys(ctx, cmd, stages, db, onFields)
+	idxs := c.r.uniqueIndexes(ctx, target)
+	keys, produced, err := c.mergeKeys(ctx, cmd, stages, db, onFields, uniqueFields(idxs))
 	if err != nil {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
@@ -111,7 +112,27 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		c.log.Info("copied documents up so a $merge would find them rather than replace them",
 			"ns", target, "documents", n)
 	}
+
+	// The copy-up settles what the merge can see. What it is about to write
+	// there is a different question, and the fast tier's unique indexes cannot
+	// answer it either: see guardMergeKeys.
+	if len(idxs) > 0 {
+		if out, done := c.guardMergeKeys(ctx, msg, target, db, idxs, onFields, produced, keys, mergeVal); done {
+			return out, true
+		}
+	}
 	return nil, false
+}
+
+// uniqueFields is every field the target's unique indexes are built on, so the
+// pipeline's output can be projected to exactly what the registry needs.
+func uniqueFields(idxs []uniqueIndex) []string {
+	var out []string
+	for _, idx := range idxs {
+		out = append(out, idx.fields...)
+		out = append(out, idx.partialFields...)
+	}
+	return out
 }
 
 // mergeTarget reads where a $merge writes and what it matches on.
@@ -177,24 +198,33 @@ func mergeTarget(v bson.RawValue, db string) (ns string, on []string, ok bool) {
 // This is deliberately not the archive: the input's own completeness is a
 // separate question that the aggregate guard has already decided, and reading it
 // from somewhere else here would answer a question nobody asked.
-func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawValue, db string, on []string) (bson.Raw, error) {
+func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawValue, db string,
+	on []string, extra []string) (bson.Raw, []bson.Raw, error) {
 	aggVal, err := cmd.LookupErr("aggregate")
 	if err != nil {
-		return nil, fmt.Errorf("read the aggregate target: %w", err)
+		return nil, nil, fmt.Errorf("read the aggregate target: %w", err)
 	}
 
 	read := make(bson.A, 0, len(stages)-1)
 	for _, st := range stages[:len(stages)-1] {
 		doc, ok := st.DocumentOK()
 		if !ok {
-			return nil, fmt.Errorf("a stage could not be read")
+			return nil, nil, fmt.Errorf("a stage could not be read")
 		}
 		read = append(read, doc)
 	}
 	// Only the fields matched on, so a large result costs the keys rather than
-	// the documents.
+	// the documents. extra carries the fields of the target's unique indexes,
+	// which are needed for the same reason: what the merge is about to write
+	// there has to be checked against the registry, and nothing else in the
+	// document matters.
 	proj := bson.D{}
-	for _, f := range on {
+	want := map[string]bool{}
+	for _, f := range append(append([]string{}, on...), extra...) {
+		if f == "" || want[f] {
+			continue
+		}
+		want[f] = true
 		proj = append(proj, bson.E{Key: f, Value: 1})
 	}
 	if len(proj) > 0 {
@@ -203,7 +233,7 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 
 	var aggAny any
 	if err := aggVal.Unmarshal(&aggAny); err != nil {
-		return nil, fmt.Errorf("read the aggregate target: %w", err)
+		return nil, nil, fmt.Errorf("read the aggregate target: %w", err)
 	}
 	// The pipeline is the client's own, so it runs with the client's own
 	// variables. A $lookup or a $match in it may refer to them, and a rerun
@@ -218,18 +248,20 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 	}
 	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, rerun)
 	if err != nil {
-		return nil, fmt.Errorf("run the pipeline to find what it would merge: %w", err)
+		return nil, nil, fmt.Errorf("run the pipeline to find what it would merge: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	var clauses bson.A
+	var produced []bson.Raw
 	seen := 0
 	for cur.Next(ctx) {
 		if seen >= maxCopyUpForWrite {
-			return nil, fmt.Errorf("this $merge would touch more than %d documents; warm the target first",
+			return nil, nil, fmt.Errorf("this $merge would touch more than %d documents; warm the target first",
 				maxCopyUpForWrite)
 		}
-		doc := bson.Raw(cur.Current)
+		doc := make(bson.Raw, len(cur.Current))
+		copy(doc, cur.Current)
 		clause := bson.D{}
 		complete := true
 		for _, f := range on {
@@ -251,18 +283,19 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 			continue
 		}
 		clauses = append(clauses, clause)
+		produced = append(produced, doc)
 		seen++
 	}
 	if err := cur.Err(); err != nil {
-		return nil, fmt.Errorf("read what the pipeline would merge: %w", err)
+		return nil, nil, fmt.Errorf("read what the pipeline would merge: %w", err)
 	}
 	if len(clauses) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	filter, err := bson.Marshal(bson.D{{Key: "$or", Value: clauses}})
 	if err != nil {
-		return nil, fmt.Errorf("build the filter: %w", err)
+		return nil, nil, fmt.Errorf("build the filter: %w", err)
 	}
-	return filter, nil
+	return filter, produced, nil
 }

@@ -718,6 +718,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// Cleared before any guard runs, because a $merge claims unique keys as well
+	// as an insert does, and its guard runs further up this function than the
+	// write guards below. Left where it was, those claims were forgotten before
+	// the reply could give them back.
+	c.pendingKeys = nil
+
 	// Aggregations are judged before they run, not on the way back. A pipeline
 	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
@@ -833,7 +839,6 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// like the commands there: it names its collections in nsInfo and its
 	// operations point at them by position, so none of the per-command guards
 	// can find a collection to act on.
-	c.pendingKeys = nil
 	if nameErr == nil && name == "bulkWrite" {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
 			if out, done := c.guardBulkWrite(ctx, msg, cmd); done {
