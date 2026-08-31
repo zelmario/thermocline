@@ -2188,6 +2188,19 @@ mongosh --port 28018 --eval '
   live document the archive holds for that namespace, so a `$out` over a
   collection with years behind it is a large write. The router logs how many it
   marked.
+
+  **A `$out` whose target is tiered is performed by the router whatever its
+  input reads.** mongod does a `$out` by building the result beside the target
+  and renaming over it, and a rename is not mirrored: a forwarded one put the
+  result on the fast tier and nowhere else. Measured, two documents written and
+  the archive holding none of them a minute later, with a count through the
+  router answering 1 where the fast tier held 2. The result is built in a
+  temporary collection here too, because clearing the target is part of the
+  write and `$out` is allowed to read the collection it replaces: clearing first
+  left nought documents on either tier where MongoDB leaves two. The last step
+  moves the result in with ordinary inserts, which is the only difference from
+  mongod, and claims its unique keys so the registry still holds them once those
+  documents are evicted.
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection
