@@ -256,6 +256,26 @@ chk "the archive holds that result too"     "[1,2]" \
 chk "and no temporary was left behind"      "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 
+echo "== \$out creates the target the way the archive has it =="
+# A collection brought into existence by an insert carries no options at all,
+# and a default collation decides which documents match. Measured before this:
+# the archive held the collection with {locale: "en", strength: 2} and the copy
+# a $out left on the fast tier had none, so the query the application has always
+# run answered differently as soon as the fast tier held the documents.
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('rollup',{collation:{locale:'en',strength:2}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.insertMany([{_id:1,name:'alice'},{_id:2,name:'ALICE'}])" >/dev/null
+chk "the archive holds it with a collation"  "en" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'rollup'})[0]; print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+chk "the fast tier does not hold it at all"  "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'rollup'}).length)")"
+R "db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:3,name:'alice'},{_id:4,name:'ALICE'}]},{\$out:'rollup'}]).toArray()" >/dev/null
+chk "the copy it created carries the collation" "en" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'rollup'})[0]; print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+chk "so the router matches the way the archive does" "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({name:'alice'}))")"
+
 echo "== \$out onto the collection it reads =="
 # mongod allows it, because it builds the result beside the target and renames
 # over it, so the input is intact while it is read. Clearing the target first is

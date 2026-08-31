@@ -199,6 +199,18 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		// would otherwise use, because replaying destructive DDL into the
 		// archive is what would let one accident on the fast tier destroy it.
 		//
+		// The fast tier's copy is created the way the archive has it before
+		// anything is written into it. A collection brought into existence by
+		// an insert carries no options at all, and a default collation decides
+		// which documents match: measured on an adopted collection with
+		// {locale: "en", strength: 2}, a $out into a namespace the fast tier
+		// did not hold left a copy with no collation, so the query the
+		// application has always run answers differently. Forget first, because
+		// the indexer remembers having built this namespace and the copy it
+		// built may since have been dropped.
+		c.r.indexer.Forget(target)
+		c.r.indexer.Ensure(ctx, target)
+
 		// The result is built in a temporary collection and moved in at the
 		// end, because clearing the target is part of this write and the
 		// pipeline is allowed to be reading the target. See writeSink.
