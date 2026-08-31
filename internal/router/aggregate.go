@@ -307,6 +307,14 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		return nil, false
 	}
 
+	// Before the scope, because the scope is about what the pipeline reads and
+	// this is about where it writes. A pipeline beginning with $documents reads
+	// nothing at all, so it has no scope, and it can still $out into a tiered
+	// collection: see guardTieredOut.
+	if out, done := c.guardTieredOut(ctx, msg, cmd, db); done {
+		return out, true
+	}
+
 	scope, ok := scopeOfAggregate(cmd, db, c.r.ageFieldOf)
 	if !ok {
 		return nil, false
@@ -399,7 +407,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		// clusters: the input read from the archive, the write performed on the
 		// fast tier, where the application will look for the result.
 		if scope.writes {
-			if out, done := c.runWritePipeline(ctx, msg, cmd, db, coll, scope); done {
+			if out, done := c.runWritePipeline(ctx, msg, cmd, db, coll, scope, true); done {
 				return out, true
 			}
 		} else {

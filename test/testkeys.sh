@@ -204,6 +204,22 @@ chk "matching on the unique field is allowed" "ACCEPTED" "$(MRG '{email:"taken@x
 chk "whenNotMatched discard writes nothing"   "ACCEPTED" "$(MRG '{_id:5,email:"taken@x.com",n:5}' "{into:'tkmrg',on:'_id',whenMatched:'merge',whenNotMatched:'discard'}")"
 chk "  so nothing was created for it"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({_id:5}))')"
 
+echo "== a \$out writes documents too, so it claims their keys =="
+# $out clears both tiers first, so nothing it writes can duplicate what was
+# there. The claims are for afterwards: a document written by $out and later
+# evicted lives in the archive alone, and without a claim the registry has
+# nothing to enforce. Measured before this: a $out left no rows in the registry
+# at all, and once the evictor had taken those documents off the fast tier an
+# insert of one of their keys was accepted, leaving one live copy in the archive
+# and another on the fast tier that the archive refused to mirror.
+fresh tkmrg '{email:1}'
+chk "\$out into a tiered collection accepted" "ok" "$(R 'try{db.getSiblingDB(process.env.TC_DB).aggregate([{$documents:[{_id:1,email:"o1@x.com"},{_id:2,email:"o2@x.com"}]},{$out:"tkmrg"}]).toArray();print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and it claimed both keys"             "2" "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkmrg"}))')"
+waitMirrored tkmrg 2
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkmrg.deleteMany({})'
+chk "  the fast tier is empty again"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({}))')"
+chk "  and a duplicate of one is refused"    "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkmrg.insertOne({_id:9,email:"o1@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== a key a document moves off must become reusable =="
 # Nothing is evicted here. One document takes a value and then leaves it, so the
 # value is unused and the next document must be allowed to have it. A claim that

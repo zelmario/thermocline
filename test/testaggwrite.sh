@@ -194,6 +194,68 @@ chk "and the archive holds only that"    "[99]" \
 chk "the evicted one is tombstoned, not gone" "true" \
     "$(C "print(!!db.getSiblingDB(process.env.TC_DB).rollup.findOne({_id:1,_tcDeletedAt:{\$exists:true}}))")"
 
+echo "== \$out into a tiered target that could have been forwarded =="
+# Every section above makes the fast tier unable to answer the input, which is
+# what sends the whole pipeline through the router. A $out whose input the fast
+# tier *can* answer was forwarded, and mongod does a $out by building the result
+# beside the target and renaming over it. The feeder ignores a rename on purpose,
+# so the result reached the fast tier and nothing else.
+#
+# Measured before the fix: two documents written, the archive holding none of
+# them sixty seconds later with its own earlier document still live, and a count
+# through the router answering 1 where the fast tier held 2.
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).rollup.insertOne({_id:7, v:'here before the \$out'})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({_id:7}))")" = "1" ] && break
+  sleep 1
+done
+chk "the archive holds what was there"     "1" "$(C "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({_id:7,_tcDeletedAt:{\$exists:false}}))")"
+
+# A pipeline that reads no collection at all: nothing about its input could send
+# it to the archive, so this is the shape that was always forwarded.
+chk "a \$documents pipeline is accepted"    "ok" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:8,v:'from documents'},{_id:9,v:'from documents'}]},{\$out:'rollup'}]).toArray();print('ok')}catch(e){print(e.code||e.message.substring(0,50))}")"
+chk "the fast tier holds the result"        "[8,9]" \
+    "$(H "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))")"
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({v:'from documents',_tcDeletedAt:{\$exists:false}}))")" = "2" ] && break
+  sleep 1
+done
+chk "and so does the archive"               "[8,9]" \
+    "$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+chk "what was there before is gone"         "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({_id:7}))")"
+chk "and the router answers the result"     "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({}))")"
+
+# The same with an input collection the fast tier claims in full, which is the
+# other way a $out gets forwarded.
+#
+# On both tiers, by hand. A drop through the router is deliberately not replayed
+# into the archive, so dropping it there and reinserting leaves the archive
+# holding what the collection used to be, and the $out then reads that instead:
+# 19 documents where the fixture meant 2.
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:1,n:1},{_id:2,n:2}])" >/dev/null
+waitMirrored 2
+cline watermark --config $CFG --ns $DB.$NS --complete-all >/dev/null 2>&1
+# The router caches a completeness claim, so a fresh one is not seen at once and
+# the pipeline would be read from the archive as if the claim had never changed.
+sleep 7
+chk "a claimed input is accepted"           "ok" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$match:{n:{\$gte:1}}},{\$out:'rollup'}]).toArray();print('ok')}catch(e){print(e.code||e.message.substring(0,50))}")"
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "2" ] && break
+  sleep 1
+done
+chk "the archive holds that result too"     "[1,2]" \
+    "$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+chk "and no temporary was left behind"      "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+
 stopDaemons
 echo
 echo "================================"

@@ -8,6 +8,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -45,9 +46,16 @@ import (
 // writeBatch is how many result documents are sent to the fast tier at a time.
 const writeBatch = 1000
 
-// runWritePipeline reads a $out or $merge pipeline's input from the archive and
-// performs its final stage on the fast tier.
-func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson.Raw, db, coll string, s aggScope) (*wire.Message, bool) {
+// runWritePipeline reads a $out or $merge pipeline's input and performs its
+// final stage on the fast tier, and on the archive where the target is tiered.
+//
+// fromArchive says where the input comes from. It is the archive whenever the
+// pipeline reads more than the fast tier holds, which is why this exists; it is
+// the fast tier for a $out whose target is tiered but whose input the fast tier
+// can answer, where the reason to be here is the target rather than the input.
+// See runTieredOut.
+func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson.Raw, db, coll string,
+	s aggScope, fromArchive bool) (*wire.Message, bool) {
 	stages, ok := pipelineStages(cmd)
 	if !ok || len(stages) == 0 {
 		return nil, false
@@ -72,20 +80,42 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 		return c.writePipelineError(msg, s, "preparing the target failed", err)
 	}
 
-	n, err := c.streamFromArchive(ctx, db, coll, read, sink.write)
+	var n int
+	if fromArchive {
+		n, err = c.streamFromArchive(ctx, db, coll, read, sink.write)
+	} else {
+		aggVal, verr := cmd.LookupErr("aggregate")
+		if verr != nil {
+			sink.abandon(ctx)
+			return c.writePipelineError(msg, s, "reading the aggregate target failed", verr)
+		}
+		n, err = c.streamFromFastTier(ctx, db, aggVal, read, sink.write)
+	}
 	if err != nil {
 		sink.abandon(ctx)
-		return c.writePipelineError(msg, s, "reading its input from the archive failed", err)
+		where := "the archive"
+		if !fromArchive {
+			where = "the fast tier"
+		}
+		return c.writePipelineError(msg, s, "reading its input from "+where+" failed", err)
 	}
 	if err := sink.commit(ctx); err != nil {
 		sink.abandon(ctx)
 		return c.writePipelineError(msg, s, "writing its result to the fast tier failed", err)
 	}
 
-	c.r.Stats.Archived.Add(1)
-	c.cls = ClassArchive
-	c.log.Info("aggregation read from the archive and written to the fast tier",
-		"ns", s.primary, "into", sink.target, "documents", n, "how", sink.how)
+	if fromArchive {
+		c.r.Stats.Archived.Add(1)
+		c.cls = ClassArchive
+	}
+	from := "the archive"
+	if !fromArchive {
+		from = "the fast tier"
+	}
+	c.log.Info("aggregation performed here rather than forwarded",
+		"ns", s.primary, "read_from", from, "into", sink.target, "documents", n, "how", sink.how,
+		"note", "$out into a tiered collection cannot be forwarded: mongod does it by renaming over "+
+			"the target, and a rename is not mirrored")
 
 	// mongod answers a writing aggregation with an empty, already-exhausted
 	// cursor, and so does this.
@@ -114,6 +144,18 @@ type writeSink struct {
 	r      *Router
 	how    string
 	target string
+
+	// claimNS is the target, set only when it is tiered and carries a unique
+	// index, and it means these documents claim their keys as they are written.
+	//
+	// $out clears both tiers first, so nothing it writes can duplicate what was
+	// there. The claims are for afterwards: a document written here and later
+	// evicted lives in the archive alone, and without a claim the registry has
+	// nothing to enforce. Measured: a $out of two documents left no rows in the
+	// registry, and once the evictor had taken them off the fast tier an insert
+	// of one of their keys was accepted, leaving one live copy in the archive
+	// and another on the fast tier that the archive refused to mirror.
+	claimNS string
 
 	// merge feeds batches back through the caller's own stage.
 	mergeStage bson.Raw
@@ -184,7 +226,7 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		}
 		return &writeSink{
 			r: c.r, how: "replaced on both tiers, so the result is all that is left",
-			target: target, outColl: coll,
+			target: target, outColl: coll, claimNS: target,
 		}, nil
 	}
 
@@ -203,6 +245,9 @@ func (s *writeSink) write(ctx context.Context, batch []any) error {
 		return nil
 	}
 	if s.outColl != nil {
+		if err := s.claim(ctx, batch); err != nil {
+			return err
+		}
 		_, err := s.outColl.InsertMany(ctx, batch)
 		return err
 	}
@@ -339,4 +384,155 @@ func outTarget(stage bson.Raw, db string) (string, string, bool) {
 		}
 	}
 	return "", "", false
+}
+
+// streamFromFastTier is the same reading half against the fast tier, for a
+// pipeline the fast tier can answer in full.
+//
+// It takes the aggregate target as the client wrote it, because a pipeline
+// beginning with $documents names no collection: its target is the number 1, and
+// asking for a collection called "1" is not the same command.
+func (c *conn) streamFromFastTier(ctx context.Context, db string, aggVal bson.RawValue, read []bson.Raw,
+	sink func(context.Context, []any) error) (int, error) {
+	pipeline := bson.A{}
+	for _, st := range read {
+		pipeline = append(pipeline, st)
+	}
+
+	var target any
+	if err := aggVal.Unmarshal(&target); err != nil {
+		return 0, fmt.Errorf("read the aggregate target: %w", err)
+	}
+	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, bson.D{
+		{Key: "aggregate", Value: target},
+		{Key: "pipeline", Value: pipeline},
+		{Key: "cursor", Value: bson.D{}},
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	batch := make([]any, 0, writeBatch)
+	total := 0
+	for cur.Next(ctx) {
+		doc := make(bson.Raw, len(cur.Current))
+		copy(doc, cur.Current)
+		batch = append(batch, doc)
+		total++
+		if len(batch) >= writeBatch {
+			if err := sink(ctx, batch); err != nil {
+				return total, err
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := cur.Err(); err != nil {
+		return total, err
+	}
+	if err := sink(ctx, batch); err != nil {
+		return total, err
+	}
+	return total, nil
+}
+
+// runTieredOut performs a $out whose target this system tiers, whatever the
+// pipeline reads.
+//
+// mongod implements $out by building the result beside the target and renaming
+// over it. The feeder ignores a rename on purpose, because replaying destructive
+// DDL into the archive is what would let one accident on the fast tier destroy
+// it. So a forwarded $out into a tiered collection puts the result on the fast
+// tier and nowhere else, and leaves the archive holding the collection as it
+// was, live.
+//
+// Measured on a tiered collection: two documents written by $out, the archive
+// holding none of them sixty seconds later, its own earlier document still live,
+// and a count through the router answering 1 where the fast tier held 2. $out
+// says the target holds the result and nothing else, and the durable tier said
+// otherwise.
+//
+// The input side is a separate question from the target. fromArchive says the
+// pipeline reads more than the fast tier holds, in which case the input comes
+// from the archive exactly as it does for an incomplete read; otherwise the fast
+// tier answers it, which is what it would have done had this been forwarded.
+func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	stages, ok := pipelineStages(cmd)
+	if !ok || len(stages) == 0 {
+		return nil, false
+	}
+	final, fok := stages[len(stages)-1].DocumentOK()
+	if !fok {
+		return nil, false
+	}
+	outDB, outColl, isOut := outTarget(final, db)
+	if !isOut || !c.r.cfg.Manages(outDB+"."+outColl) {
+		// Not a $out, or a target nothing tiers. A forwarded $merge is ordinary
+		// updates and inserts, which mirror by themselves.
+		return nil, false
+	}
+	if inTransaction(cmd) {
+		// $out is not allowed in a transaction, so mongod refuses it for us.
+		return nil, false
+	}
+
+	// Where the input comes from is a separate question, and the same one a
+	// read-only pipeline asks. A pipeline with no input collection reads
+	// nothing the archive could add to.
+	coll, named := stringField(cmd, "aggregate")
+	scope := aggScope{primary: db + "." + coll, writes: true}
+	fromArchive := false
+	if named {
+		if sc, sok := scopeOfAggregate(cmd, db, c.r.ageFieldOf); sok {
+			scope = sc
+			if _, _, fine := c.r.checkAggregate(ctx, scope); !fine {
+				if c.r.cfg.Completeness != config.Archive {
+					// Reading the input from the archive is exactly what strict
+					// and permissive decline, so this stays out of the way and
+					// the ordinary refusal stands.
+					return nil, false
+				}
+				fromArchive = true
+			}
+		}
+	}
+	return c.runWritePipeline(ctx, msg, cmd, db, coll, scope, fromArchive)
+}
+
+// claim reserves the unique keys of the documents about to be written, so the
+// registry holds them once they are evicted. See writeSink.claimNS.
+func (s *writeSink) claim(ctx context.Context, batch []any) error {
+	if s.claimNS == "" {
+		return nil
+	}
+	idxs := s.r.uniqueIndexes(ctx, s.claimNS)
+	if len(idxs) == 0 {
+		return nil
+	}
+	docs := make([]bson.Raw, 0, len(batch))
+	for _, d := range batch {
+		raw, ok := d.(bson.Raw)
+		if !ok {
+			// Not a document this can key. Writing it unclaimed is what used to
+			// happen to all of them, and it is better than failing the write.
+			continue
+		}
+		docs = append(docs, raw)
+	}
+	_, clashes, err := s.r.claimKeys(ctx, s.claimNS, docs, idxs, false)
+	if err != nil {
+		s.r.log.Warn("could not claim the keys a $out writes",
+			"ns", s.claimNS, "err", err,
+			"effect", "these documents are unprotected once they are evicted; "+
+				"run cline keys --rebuild")
+		return nil
+	}
+	if len(clashes) > 0 {
+		// The pipeline produced two documents with one unique value, which
+		// mongod would refuse when the second reached the index.
+		return fmt.Errorf("E11000 duplicate key error collection: %s index: %s :: "+
+			"this pipeline produces more than one document with the same unique value",
+			s.claimNS, clashes[0].index)
+	}
+	return nil
 }
