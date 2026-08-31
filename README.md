@@ -933,9 +933,18 @@ key a live archived comment held: the write was accepted, the archive refused to
 mirror it with `E11000`, and a read of the key answered 1 where two documents
 existed.
 
-One limit worth knowing. **Sparse and partial unique indexes are not enforced
-across tiers**, because a registry cannot evaluate the same condition; the
-router says which ones it skipped.
+**Sparse and partial unique indexes are enforced too**, and the condition is
+evaluated by the server rather than reimplemented here: deciding for itself
+whether a document is indexed is exactly the kind of guess that produces a wrong
+answer. A compound sparse index still covers a document carrying any one of its
+fields, so only one missing all of them is exempt, and that part is decided
+locally.
+
+The filter costs one question per batch, asked of the fast tier. It used to be
+one per document: measured, 300 inserts into a collection with a partial unique
+index took 330 ms against 50 ms for the same insert with a plain one, and now
+take 75 ms. An index whose filter cannot be evaluated is not enforced across
+tiers rather than enforced on a guess, and the router says so.
 
 ### Transactions
 

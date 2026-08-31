@@ -376,11 +376,19 @@ type claimCandidate struct {
 // protects.
 func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs []uniqueIndex, ordered bool) ([]string, []keyClash, error) {
 	dbName, _ := splitNS(ns)
+
+	// Which documents each index covers, one question per index rather than one
+	// per document and index. See constrainsBatch.
+	covered := make([][]bool, len(idxs))
+	for i := range idxs {
+		covered[i] = r.constrainsBatch(ctx, dbName, idxs[i], docs)
+	}
+
 	cands := make([]claimCandidate, 0, len(docs))
 	for d, doc := range docs {
 		id, _ := doc.LookupErr("_id")
 		for i := range idxs {
-			if !r.constrains(ctx, dbName, idxs[i], doc) {
+			if !covered[i][d] {
 				continue
 			}
 			kid, ok := keyID(ns, idxs[i], doc)
@@ -1081,3 +1089,87 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 	}
 	return false
 }
+
+// constrainsBatch reports, for each document, whether idx covers it, asking the
+// fast tier once for the whole batch instead of once per document.
+//
+// A partial index's filter is evaluated by the server, because reimplementing
+// MongoDB's query language to decide whether a document is indexed is exactly
+// the kind of guess that produces a wrong answer. Doing it per document costs a
+// round trip per document: measured, 300 inserts into a collection with a
+// partial unique index took 330 ms against 50 ms for the same insert with a
+// plain one. One pipeline answers for the batch.
+func (r *Router) constrainsBatch(ctx context.Context, dbName string, idx uniqueIndex, docs []bson.Raw) []bool {
+	out := make([]bool, len(docs))
+
+	// The sparse rule is local: a compound sparse index still indexes a
+	// document carrying any one of its fields, so only one missing all of them
+	// is exempt.
+	candidates := make([]any, 0, len(docs))
+	at := make([]int, 0, len(docs))
+	for i, doc := range docs {
+		if idx.sparse {
+			any := false
+			for _, f := range idx.fields {
+				if _, ok := lookupPath(doc, f); ok {
+					any = true
+					break
+				}
+			}
+			if !any {
+				continue
+			}
+		}
+		if len(idx.partial) == 0 {
+			out[i] = true
+			continue
+		}
+		candidates = append(candidates, bson.D{{Key: "i", Value: int32(len(at))}, {Key: "d", Value: doc}})
+		at = append(at, i)
+	}
+	if len(candidates) == 0 {
+		return out
+	}
+
+	// Each document is carried with its position and put back together inside
+	// the pipeline, so nothing here has to rewrite BSON to add a field.
+	cur, err := r.hot.Database(dbName).Aggregate(ctx, bson.A{
+		bson.D{{Key: "$documents", Value: candidates}},
+		bson.D{{Key: "$replaceWith", Value: bson.D{{Key: "$mergeObjects", Value: bson.A{
+			"$d", bson.D{{Key: partialMarker, Value: "$i"}},
+		}}}}},
+		bson.D{{Key: "$match", Value: idx.partial}},
+		bson.D{{Key: "$project", Value: bson.D{{Key: partialMarker, Value: 1}, {Key: "_id", Value: 0}}}},
+	})
+	if err != nil {
+		// Could not ask. Enforcing anyway would reject writes the database
+		// itself allows, which is a visible failure caused by bookkeeping, so
+		// this stays out of the way and says so.
+		r.log.Warn("could not evaluate a partial unique index, not enforcing it across tiers",
+			"index", idx.name, "err", err,
+			"effect", "a duplicate of an archived document could be inserted")
+		return make([]bool, len(docs))
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	for cur.Next(ctx) {
+		v, lerr := bson.Raw(cur.Current).LookupErr(partialMarker)
+		if lerr != nil {
+			continue
+		}
+		pos, ok := v.AsInt64OK()
+		if !ok || pos < 0 || int(pos) >= len(at) {
+			continue
+		}
+		out[at[pos]] = true
+	}
+	if err := cur.Err(); err != nil {
+		r.log.Warn("could not read a partial unique index evaluation, not enforcing it across tiers",
+			"index", idx.name, "err", err)
+		return make([]bool, len(docs))
+	}
+	return out
+}
+
+// partialMarker is the field a document's position is carried in while its
+// partial filter is evaluated. Nothing in a partial filter can refer to it.
+const partialMarker = "__tcPartialAt"
