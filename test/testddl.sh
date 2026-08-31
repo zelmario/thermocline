@@ -167,6 +167,34 @@ MR=$(R "
 chk "mapReduce does not silently count three"           "true" \
     "$([ "$MR" = "REFUSED" ] || [ "$MR" = "10" ] && echo true || echo "false (got $MR)")"
 
+# Where it writes was never asked about, only what it reads. A replacing output
+# is built beside the target and renamed over it, and a rename is not mirrored,
+# so the result would reach the fast tier and nothing else; a merging one writes
+# per document against a tier holding part of the collection. The input here is
+# untiered on purpose, so the check above cannot be what refuses it.
+H "db.getSiblingDB(process.env.TC_DB).umrsrc.drop(); db.getSiblingDB(process.env.TC_DB).umrsrc.insertMany([{_id:1,n:1},{_id:2,n:2}])" >/dev/null
+MRO() { # MRO OUTSPEC
+  R "
+  try {
+    const r = db.getSiblingDB(process.env.TC_DB).runCommand({
+      mapReduce: 'umrsrc',
+      map: function() { emit('all', 1); },
+      reduce: function(k, vals) { return Array.sum(vals); },
+      out: $1});
+    print(r.ok === 1 ? 'ALLOWED' : JSON.stringify(r).substring(0,60));
+  } catch(e) { print('REFUSED'); }"
+}
+chk "mapReduce replacing a tiered collection refused"   "REFUSED" "$(MRO "{replace:'$NS'}")"
+chk "mapReduce merging into one refused"                "REFUSED" "$(MRO "{merge:'$NS'}")"
+chk "mapReduce reducing into one refused"               "REFUSED" "$(MRO "{reduce:'$NS'}")"
+chk "  and it wrote nothing there"                      "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chk "an untiered output is still allowed"               "ALLOWED" "$(MRO "{replace:'umrout'}")"
+chk "  and it wrote the total there"                    "2" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).umrout.findOne({_id:'all'}); print(d?d.value:'MISSING')")"
+chk "an inline output is untouched"                     "true" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({mapReduce:'umrsrc',map:function(){emit('all',1);},reduce:function(k,v){return Array.sum(v);},out:{inline:1}}); print(r.results&&r.results[0].value===2)")"
+
 echo "== explain does not crash, whatever it says =="
 EXP=$(R "
   try { const e=db.getSiblingDB(process.env.TC_DB).$NS.find({}).explain(); print(e.ok===1||e.queryPlanner?'ok':'odd'); }

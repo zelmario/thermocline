@@ -60,6 +60,11 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 		if !ok {
 			return nil, false
 		}
+		// Where it writes is a separate question from what it reads, and the
+		// answer is the same either way: it cannot be done across two clusters.
+		if out, done := c.refuseMapReduceOutput(msg, cmd, db); done {
+			return out, true
+		}
 		ns := db + "." + coll
 		base, _, tiered := c.r.tieredBase(ctx, ns)
 		if !tiered {
@@ -620,4 +625,72 @@ func isIndexNotFound(err error) bool {
 		return ce.Name == "IndexNotFound" || ce.Code == 27
 	}
 	return false
+}
+
+// refuseMapReduceOutput refuses a mapReduce that would write into a tiered
+// collection.
+//
+// The guard above asks whether the collection being read is complete. Nothing
+// asked where the output goes, and every way it can go is wrong here. `replace`
+// is implemented the way $out is, by building the result beside the target and
+// renaming over it, and a rename is not mirrored, so the result would reach the
+// fast tier and nothing else. `merge` and `reduce` write per document, so they
+// meet a fast tier holding part of the collection: an upsert against a document
+// that lives only in the archive creates one in its place, and the feeder then
+// mirrors that over the archived record.
+//
+// $out has all of this handled, in aggwrite.go, because an aggregation says what
+// it produces in a form this router can run itself. A mapReduce says it in
+// JavaScript. So this is a refusal, which is the standing rule: a refusal is a
+// limitation, a wrong answer is a bug.
+func (c *conn) refuseMapReduceOutput(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	target, ok := mapReduceOutput(cmd, db)
+	if !ok || !c.r.cfg.Manages(target) {
+		return nil, false
+	}
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a mapReduce writing into a tiered collection", "into", target)
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this mapReduce because its output collection "+target+" is tiered. "+
+			"A replacing output is written beside the target and renamed over it, and a rename is "+
+			"not mirrored, so the result would reach the fast tier and nothing else; a merging one "+
+			"writes per document against a tier that holds only part of the collection. Express it "+
+			"as an aggregation ending in $out or $merge, which this router performs on both tiers, "+
+			"or send the output to a collection nothing tiers.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// mapReduceOutput reads the namespace a mapReduce would write into, and whether
+// it writes into one at all. `out: {inline: 1}` returns the result to the client
+// and touches no collection.
+func mapReduceOutput(cmd bson.Raw, db string) (string, bool) {
+	v, err := cmd.LookupErr("out")
+	if err != nil {
+		return "", false
+	}
+	if coll, isStr := v.StringValueOK(); isStr {
+		return db + "." + coll, true
+	}
+	doc, isDoc := v.DocumentOK()
+	if !isDoc {
+		return "", false
+	}
+	outDB := db
+	if d, derr := doc.LookupErr("db"); derr == nil {
+		if s, sok := d.StringValueOK(); sok && s != "" {
+			outDB = s
+		}
+	}
+	for _, mode := range []string{"replace", "merge", "reduce"} {
+		if mv, merr := doc.LookupErr(mode); merr == nil {
+			if s, sok := mv.StringValueOK(); sok && s != "" {
+				return outDB + "." + s, true
+			}
+		}
+	}
+	return "", false
 }

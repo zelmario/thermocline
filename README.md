@@ -2112,6 +2112,15 @@ mongosh --port 28018 --eval '
 
 ## What is not handled yet
 
+- **mapReduce cannot write into a tiered collection**, and is refused when it
+  tries. A replacing output is built beside the target and renamed over it, and a
+  rename is not mirrored, so the result would reach the fast tier and nothing
+  else; a merging one writes per document against a tier that holds only part of
+  the collection. The same job expressed as an aggregation ending in `$out` or
+  `$merge` is performed on both tiers, which is the remedy the refusal names.
+  Reading a tiered collection with mapReduce is refused for a different reason,
+  already: it totals whatever tier it runs on.
+
 - **Cursors are not shared between routers.** A read answered from the archive
   is served from a cursor this router holds open against the archive, in its own
   memory, so another router cannot continue it. This is what a mongos does too,
