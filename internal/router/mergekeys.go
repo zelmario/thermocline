@@ -178,20 +178,30 @@ func overlay(existing, produced bson.Raw) bson.Raw {
 	return raw
 }
 
-// onKey identifies a document by the values the merge matches on, as bytes so
-// two spellings of one number stay apart and an ObjectId compares as itself.
+// onKey identifies a document by the values the merge matches on.
+//
+// The values are canonicalised first, because mongod matches a number against
+// the same number written another way: a driver sends a JavaScript number as a
+// double and an older writer stored a long, and $merge treats them as one
+// document. Comparing the raw bytes here would call them different, so a
+// produced document would be read as creating a new one when it is updating the
+// one that already holds the key, and its own key would be refused as a
+// duplicate of itself. See canonicalKeyValue, which the registry uses for the
+// same reason.
 func onKey(doc bson.Raw, on []string) (string, bool) {
-	out := make([]byte, 0, 32)
+	key := bson.D{}
 	for _, f := range on {
 		v, ok := lookupPath(doc, f)
 		if !ok {
 			return "", false
 		}
-		out = append(out, byte(v.Type))
-		out = append(out, v.Value...)
-		out = append(out, 0)
+		key = append(key, bson.E{Key: f, Value: canonicalKeyValue(v)})
 	}
-	return string(out), true
+	raw, err := bson.Marshal(key)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
 }
 
 // mergeExisting reads the documents the merge will match, keyed the same way the

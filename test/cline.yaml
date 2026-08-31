@@ -156,6 +156,9 @@ feeder:
     # Its own collection, because the router caches a namespace's unique indexes
     # and a name shared with another section is enforced under the wrong one.
     - "shop.tkmrg"
+    # testkeys.sh again, for a $merge matching on a numeric field. A separate
+    # collection for the same reason: its unique index is on another field.
+    - "shop.tkmrg2"
     # testmerge.sh again, in another database, because $merge resolves its
     # target through `into: {db, coll}` and that resolution is what a guard
     # reading only the collection name would get wrong. tmrefx is the untiered

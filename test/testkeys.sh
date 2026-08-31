@@ -204,6 +204,18 @@ chk "matching on the unique field is allowed" "ACCEPTED" "$(MRG '{email:"taken@x
 chk "whenNotMatched discard writes nothing"   "ACCEPTED" "$(MRG '{_id:5,email:"taken@x.com",n:5}' "{into:'tkmrg',on:'_id',whenMatched:'merge',whenNotMatched:'discard'}")"
 chk "  so nothing was created for it"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({_id:5}))')"
 
+# mongod matches a number against the same number written another way, so a
+# $merge whose `on` value is a double updates the document stored with a long.
+# The guard identified the documents it had read by their raw bytes, which calls
+# those two different, so the merge was read as creating a document that takes a
+# key another document already holds: refused with E11000 where MongoDB merges.
+fresh tkmrg2 '{acct:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkmrg2.insertOne({_id:1,acct:NumberLong(7),v:"first"})' >/dev/null
+waitMirrored tkmrg2 1
+chk "a numeric key written another way still matches" "ACCEPTED" "$(MRG '{acct:Double(7),v:"merged"}' "{into:'tkmrg2',on:'acct',whenMatched:'merge',whenNotMatched:'insert'}")"
+chk "  and it merged rather than duplicating"        "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkmrg2.countDocuments({}))')"
+chk "  onto the document that was there"            "merged" "$(R 'const d=db.getSiblingDB(process.env.TC_DB).tkmrg2.findOne({_id:1}); print(d?d.v:"MISSING")')"
+
 echo "== a \$out writes documents too, so it claims their keys =="
 # $out clears both tiers first, so nothing it writes can duplicate what was
 # there. The claims are for afterwards: a document written by $out and later
