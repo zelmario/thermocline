@@ -386,6 +386,35 @@ chk "the router still answers case-insensitively" "2" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
 chk "and still refuses what the validator refuses" "refused" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).$ONS.insertOne({_id:9,email:12345});print('ACCEPTED')}catch(e){print('refused')}")"
+
+echo "== the same, when a copy-up is what recreates the collection =="
+# Everything above was carried by the router's startup pass, which runs once and
+# sees every managed namespace as it was then. An application that drops the
+# collection and keeps reading gets the fast tier's copy back from the first
+# copy-up, and an insert carries no options at all. Measured before this: the
+# collation carried at startup was gone from the recreated copy, and the query
+# the application has always run answered 1 where its own cluster answers 2.
+R "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+chk "the fast tier no longer holds it"            "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('$ONS'))")"
+chk "and the archive kept its documents"          "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+R "[1,2,3].forEach(i=>db.getSiblingDB(process.env.TC_DB).$ONS.findOne({_id:i}))" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({}))")" = "3" ] && break
+  sleep 0.5
+done
+chk "the copy-up recreated it with the collation" "en" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+chk "and with the validator"                      "true" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(!!(c&&c.options&&c.options.validator))")"
+cline watermark --config $CFG --ns $DB.$ONS --complete-all >/dev/null 2>&1
+sleep 7
+chk "so the router still answers the same"        "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 

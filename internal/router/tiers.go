@@ -70,6 +70,14 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	r.notePromoting(ctx)
 
 	db, coll := splitNS(ns)
+	// Before the insert, because an insert is what creates the collection when
+	// the fast tier does not hold it, and a collection created that way carries
+	// none of the archive's options. A default collation decides which documents
+	// match and cannot be added afterwards. Memoised inside the indexer, so this
+	// is a map lookup once the fast tier has the collection. See
+	// Indexer.EnsureCollection.
+	r.indexer.EnsureCollection(ctx, ns)
+
 	// An insert, never a replace and never an upsert built from modifiers. If
 	// the fast tier gained this document while we were reading the archive, its
 	// copy is the newer one and the duplicate key says so. See package promote

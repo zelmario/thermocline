@@ -54,6 +54,13 @@ type Indexer struct {
 type indexState struct {
 	done    bool
 	lastTry time.Time
+
+	// created records that the fast tier has the collection with the archive's
+	// options. It is separate from done, which also means the indexes are
+	// built, because the two are wanted at different moments: the options have
+	// to be there before the first document is written and the indexes do not.
+	created     bool
+	lastCreated time.Time
 }
 
 // retryAfter bounds how often a namespace whose indexes would not build is
@@ -102,6 +109,57 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 	ix.mu.Unlock()
 }
 
+// EnsureCollection gives the fast tier the collection the way the archive has
+// it, and does not wait for its indexes.
+//
+// The difference from Ensure is when it can be called. A collection created by
+// an insert carries no options at all, and they cannot be added afterwards: a
+// validator applied later does not judge what is already there and a collation
+// cannot be added to an existing collection at any time. So the paths that
+// bring a namespace into existence by writing to it have to ask for this
+// *before* they write.
+//
+// Measured on an adopted collection the archive holds with {locale: "en",
+// strength: 2}, whose fast tier copy had been dropped: a point read copied the
+// document up, the collection came back with no collation, and the query the
+// application has always run then matched differently. The copy-up asked the
+// indexer immediately afterwards, and by then there was nothing it could do,
+// because the collection existed.
+//
+// The index build stays where it was, in the background after the write, because
+// that is a scan and this is a create.
+func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) {
+	if ix == nil {
+		return
+	}
+	if _, coll := splitNS(ns); strings.HasPrefix(coll, "system.") {
+		return
+	}
+	ix.mu.Lock()
+	st := ix.state[ns]
+	if st.done || st.created || time.Since(st.lastCreated) < retryAfter {
+		ix.mu.Unlock()
+		return
+	}
+	st.lastCreated = time.Now()
+	ix.state[ns] = st
+	ix.mu.Unlock()
+
+	db, coll := splitNS(ns)
+	if err := ix.createWithOptions(ctx, db, coll); err != nil {
+		ix.log.Warn("could not create the collection on the fast tier the way the archive has it",
+			"ns", ns, "err", err,
+			"effect", "a copy-up will create it with no options, and a default collation decides "+
+				"which documents match")
+		return
+	}
+	ix.mu.Lock()
+	st = ix.state[ns]
+	st.created = true
+	ix.state[ns] = st
+	ix.mu.Unlock()
+}
+
 // Forget clears the record that a namespace is done, so the next Ensure builds
 // it again, and lets that happen at once.
 //
@@ -126,7 +184,8 @@ func (ix *Indexer) Forget(ns string) {
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	if !ix.state[ns].done {
+	st := ix.state[ns]
+	if !st.done && !st.created {
 		return
 	}
 	ix.state[ns] = indexState{}

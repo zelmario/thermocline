@@ -270,6 +270,12 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		}
 		r.notePromoting(ctx)
 
+		// Before the insert, for the same reason the single copy-up does it: the
+		// insert is what creates the collection when the fast tier does not hold
+		// it, and a collection created that way carries none of the archive's
+		// options. See Indexer.EnsureCollection.
+		r.indexer.EnsureCollection(ctx, ns)
+
 		// Only the inserts moved a document. The rest were refused as duplicates
 		// of a copy the fast tier already had, which is the case the old
 		// $setOnInsert expressed by matching and doing nothing.
