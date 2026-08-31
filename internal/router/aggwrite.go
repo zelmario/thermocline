@@ -77,7 +77,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 
 	sink, err := c.newWriteSink(ctx, final, db)
 	if err != nil {
-		return c.writePipelineError(msg, s, "preparing the target failed", err)
+		return c.writePipelineError(msg, s, "preparing the target failed", false, err)
 	}
 
 	var n int
@@ -87,7 +87,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 		aggVal, verr := cmd.LookupErr("aggregate")
 		if verr != nil {
 			sink.abandon(ctx)
-			return c.writePipelineError(msg, s, "reading the aggregate target failed", verr)
+			return c.writePipelineError(msg, s, "reading the aggregate target failed", false, verr)
 		}
 		n, err = c.streamFromFastTier(ctx, db, aggVal, read, sink.write)
 	}
@@ -97,11 +97,15 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 		if !fromArchive {
 			where = "the fast tier"
 		}
-		return c.writePipelineError(msg, s, "reading its input from "+where+" failed", err)
+		// Nothing has been cleared yet: the result is still being built beside
+		// the target.
+		return c.writePipelineError(msg, s, "reading its input from "+where+" failed", false, err)
 	}
 	if err := sink.commit(ctx); err != nil {
 		sink.abandon(ctx)
-		return c.writePipelineError(msg, s, "writing its result to the fast tier failed", err)
+		// This is the step that clears the target and moves the result in, so
+		// the target may hold part of it.
+		return c.writePipelineError(msg, s, "writing its result to the fast tier failed", sink.tieredColl != nil, err)
 	}
 
 	if fromArchive {
@@ -126,13 +130,35 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 	return out, true
 }
 
-func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, err error) (*wire.Message, bool) {
+// writePipelineError says the aggregation did not complete, and what state that
+// leaves.
+//
+// The reason it was run here rather than forwarded is one of two, and the client
+// should be told which: its input reached past what the fast tier holds, or its
+// target is tiered and mongod would have done the write as a rename that nothing
+// mirrors.
+//
+// half says the target may be partly replaced. mongod's own $out is atomic
+// because it builds the result beside the target and renames over it; the last
+// step here cannot be a rename, so a failure while the result is being moved in
+// leaves the target holding some of it. Saying so is the difference between an
+// operator re-running the aggregation and an operator wondering why a report is
+// short.
+func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, half bool, err error) (*wire.Message, bool) {
 	c.r.Stats.Refused.Add(1)
 	c.cls = ClassRefused
-	c.log.Warn("a writing aggregation could not be completed", "ns", s.primary, "what", what, "err", err)
-	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-		"thermocline: this aggregation's input reaches past what the fast tier holds, so it was run against "+
-			"the archive, and "+what+": "+err.Error())
+	c.log.Warn("a writing aggregation could not be completed",
+		"ns", s.primary, "what", what, "target_partly_replaced", half, "err", err)
+
+	text := "thermocline: this aggregation was performed by the router rather than forwarded, because " +
+		"its input reaches past what the fast tier holds or its target is tiered, and " + what + ": " +
+		err.Error()
+	if half {
+		text += ". The target may hold part of the result: it is cleared on both tiers before the " +
+			"result is moved in, and that last step cannot be the rename mongod would use, because a " +
+			"rename is not mirrored. Re-run the aggregation once the cause is fixed"
+	}
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID, text)
 	if rerr != nil {
 		return nil, false
 	}
