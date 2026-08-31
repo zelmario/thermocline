@@ -66,8 +66,16 @@ echo "== watermark =="
 # On a fresh archive there is nothing to list, so declare the claim this section
 # reads back. Without it "list all" fails on a clean environment and passes only
 # because some earlier run happened to leave a claim behind.
-cline watermark --config $CFG --ns $DB.orders --complete-all >/dev/null
-ok "list all"                           0 "$DB"              -- cline watermark --config $CFG
+#
+# On tc.probe rather than a tiered collection, because --complete-all checks the
+# claim against both tiers now and refuses one the counts contradict. Claiming
+# $DB.orders here therefore fails whenever an earlier suite left documents in
+# the archive and none on the fast tier, which is a state this section neither
+# creates nor cares about: it read "the fast tier holds 0 of everything in
+# shop_w0.orders and the archive holds 2" in a sweep on 2026-08-31. No rule ages
+# tc.probe, so its claim is recorded unchecked, which is all a listing needs.
+cline watermark --config $CFG --ns tc.probe --complete-all >/dev/null
+ok "list all"                           0 "tc.probe"         -- cline watermark --config $CFG
 ok "single namespace"                   0 "$DB.orders"       -- cline watermark --config $CFG --ns $DB.orders
 ok "unknown namespace claims nothing"   0 "claims nothing"    -- cline watermark --config $CFG --ns no.such
 ok "--clear without --ns rejected"      1 "ns is required"    -- cline watermark --config $CFG --clear
