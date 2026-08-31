@@ -160,7 +160,12 @@ chk "client errors while everything runs" "0" "$ERRS"
 # down, three checks above: that refusal is the whole point of that section, so
 # counting it here reports a fault for behaviour this suite has just demanded.
 # It did, on every run, until it was named.
-chk "no unexpected daemon error" "0" "$(docker exec $NODE sh -c 'cat /var/log/cline/chaos_*.log 2>/dev/null | grep -iE "level=ERROR|panic" | grep -vEc "change stream ended, reopening|refused an insert because the archive could not be checked" || true' 2>/dev/null | tail -1)"
+# The third exclusion is the evictor refusing a namespace whose _id values are
+# not ObjectIds, which it says at ERROR on purpose. This suite runs against the
+# shared cluster, where other suites leave collections keyed by strings, so it is
+# a fixture next door rather than anything chaos did. Every other ERROR and every
+# panic still fails this check.
+chk "no unexpected daemon error" "0" "$(docker exec $NODE sh -c 'cat /var/log/cline/chaos_*.log 2>/dev/null | grep -iE "level=ERROR|panic" | grep -vEc "change stream ended, reopening|refused an insert because the archive could not be checked|not evicting a namespace this rule cannot address" || true' 2>/dev/null | tail -1)"
 
 docker exec $NODE pkill -f 'cline feeder|cline router' 2>/dev/null
 echo
