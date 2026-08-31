@@ -265,7 +265,11 @@ func (r *Router) Listen(ctx context.Context) error {
 	if err := r.refreshPrimary(ctx); err != nil {
 		return err
 	}
-	r.warnAboutVersionSkew(ctx)
+	// Before anything else a start could get wrong: the pair itself has to be
+	// one this system can serve. See internal/tierver.
+	if err := r.checkTierVersions(ctx); err != nil {
+		return err
+	}
 	r.warnAboutMissingWatermarks(ctx)
 	r.warnAboutStrandedCollections(ctx)
 	r.warnAboutMissingUsers(ctx)

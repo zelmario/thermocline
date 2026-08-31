@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +101,50 @@ func TestExampleConfigLoads(t *testing.T) {
 		if cfg.Meta.DB == "" {
 			t.Errorf("%s left the bookkeeping database empty", path)
 		}
+	}
+}
+
+// allow_version_skew belongs to the deployment, not to the router, but the
+// router is where it is read: every daemon that touches both tiers checks the
+// pair, and the router receives its half of the config as RouterConfig alone. A
+// setting that parses and never reaches the code that reads it is silent, so
+// this is the wiring, not the parsing.
+func TestAllowVersionSkewReachesTheRouter(t *testing.T) {
+	dir := t.TempDir()
+	base := `hot:
+  uri: "mongodb://hot1/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://cold1/?replicaSet=rsCold"
+feeder:
+  id: "vercheck"
+  namespaces:
+    - "app.orders"
+`
+	for _, c := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"absent, which is the default", base, false},
+		{"off", base + "allow_version_skew: false\n", false},
+		{"on", base + "allow_version_skew: true\n", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(dir, "cline.yaml")
+			if err := os.WriteFile(path, []byte(c.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("does not load: %v", err)
+			}
+			if cfg.AllowVersionSkew != c.want {
+				t.Errorf("AllowVersionSkew = %v, want %v", cfg.AllowVersionSkew, c.want)
+			}
+			if cfg.Router.AllowVersionSkew != c.want {
+				t.Errorf("the router was given %v, want %v", cfg.Router.AllowVersionSkew, c.want)
+			}
+		})
 	}
 }
 

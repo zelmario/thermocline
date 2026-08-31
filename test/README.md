@@ -60,6 +60,7 @@ Or one at a time:
     bash test/testsharded.sh                       # a mongos fast tier, which is refused (host side)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
+    bash test/testversion.sh                       # tiers that do not run the same MongoDB (host side)
     go run ./test/store -uri ... -skip-seed        # a shop, checking what a shop would notice (see store/README.md)
 
 `test/store` answers a different question from all of the above. Every suite here

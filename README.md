@@ -1624,6 +1624,12 @@ it is. The fast tier is a new, smaller replica set with nothing in it. The
 application is pointed at the router.** Nothing is loaded into the fast tier by
 hand.
 
+**Upgrade it to the fast tier's MongoDB release first.** Both tiers must run the
+same release and every daemon refuses to start otherwise: the reason and the way
+out are in [Both tiers run the same MongoDB release](#both-tiers-run-the-same-mongodb-release).
+The cluster you are adopting is usually the older side, so this is part of the
+adoption rather than something to do afterwards.
+
 The order matters, because most of what goes wrong goes wrong quietly.
 
 **1. Point the router at both, and read what it says at startup.** It compares
@@ -1951,6 +1957,59 @@ make build
 cp cline.example.yaml cline.yaml     # then edit the two URIs
 bin/cline feeder --config cline.yaml
 ```
+
+### Both tiers run the same MongoDB release
+
+Every daemon reads both tiers' versions at startup and refuses to run when they
+differ:
+
+```
+error: the tiers run different MongoDB releases: fast tier 8.0.26-11, archive
+7.0.30-1. Both tiers must run the same major.minor release, because a read the
+fast tier cannot answer in full is sent to the archive as the application wrote
+it, so the archive has to understand every stage, operator and option the
+application uses. Upgrade the older tier to 8.0, or set allow_version_skew: true
+to start anyway
+```
+
+The archive runs the client's own queries, not a rewritten shape of them. That
+is what makes a fall-through correct, and it is also what makes a mismatched
+pair dangerous: a proxy cannot rewrite a pipeline into an older dialect, so a
+query using anything the archive does not understand works for as long as the
+documents it reads are on the fast tier, and then fails with the archive's own
+error naming a stage the application has always used. Nothing about that reads
+as a version problem.
+
+Patch releases may differ, and the log says so once. One tier is always upgraded
+before the other, so demanding an identical patch would refuse to start in the
+middle of every rolling upgrade, in exchange for nothing: a patch release adds
+no stage, operator or option for the other tier to fail on.
+
+`allow_version_skew: true` starts anyway. It is for a migration you are watching,
+not a state to run in, and the log repeats the warning at every start.
+
+**The same release is not the whole of it.** Two servers on one release still
+refuse different commands when their `featureCompatibilityVersion` differs, and
+which tier answers a query is decided by how old its documents are. So that is
+checked too, and refused the same way:
+
+```
+error: the tiers are both on 7.0 but disagree on featureCompatibilityVersion:
+fast tier 7.0, archive 6.0. ... Run
+db.adminCommand({setFeatureCompatibilityVersion: "7.0"}) on the tier that is
+behind, or set allow_version_skew: true to start anyway
+```
+
+A version that cannot be read is not a refusal. `buildInfo` failing is a
+connection problem, and whatever needs that connection says so in its own words
+a moment later; the log names which tier could not be asked, so silence is not
+mistaken for agreement. Reading the feature compatibility version needs a
+privilege the router's own account may not have, and an account that cannot read
+it on both tiers skips that half of the check rather than refusing to start.
+
+The four daemons check this: feeder, evictor, warmer and router. The one-shot
+tools do not, because a mismatched pair is exactly when you need `cline
+watermark`, `cline keys` and `cline rollback` to work.
 
 ### Logs
 

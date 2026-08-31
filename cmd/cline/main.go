@@ -29,6 +29,7 @@ import (
 	"github.com/zelmario/thermocline/internal/evictor"
 	"github.com/zelmario/thermocline/internal/feeder"
 	"github.com/zelmario/thermocline/internal/router"
+	"github.com/zelmario/thermocline/internal/tierver"
 	"github.com/zelmario/thermocline/internal/warmer"
 )
 
@@ -155,6 +156,10 @@ func runFeeder(args []string) error {
 	}
 	defer disconnect(cold, log)
 
+	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
+
 	log.Info("connected to both tiers", "feeder", cfg.Feeder.ID)
 
 	f := feeder.New(hot, cold, cfg.Feeder, log)
@@ -208,6 +213,10 @@ func runEvictor(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+
+	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
 
 	e := evictor.New(hot, cold, cfg.Evictor, *dryRun, log)
 	if *once {
@@ -266,6 +275,10 @@ func runWarmer(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+
+	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
 
 	w := warmer.New(hot, cold, cfg.Warmer, cfg.Feeder.UnannouncedDeletes, *dryRun, log)
 	stats, err := w.Run(ctx)

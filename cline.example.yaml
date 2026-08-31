@@ -10,6 +10,27 @@ hot:
 cold:
   uri: "mongodb://rs-cold-1,rs-cold-2,rs-cold-3/?replicaSet=rsCold"
 
+# Both tiers must run the same MongoDB release, and every daemon refuses to
+# start when they do not. Patch releases may differ, which is what a rolling
+# upgrade looks like from here.
+#
+# The reason is that a read the fast tier cannot answer in full is sent to the
+# archive as the application wrote it. The archive therefore has to understand
+# every stage, operator and option the application uses, and a proxy cannot
+# rewrite a pipeline into an older dialect. On a mismatched pair a query works
+# for months and then fails on the day its documents age out of the fast tier,
+# with the archive's own error naming a stage the application has always used.
+#
+# An adoption is where this bites: your existing cluster becomes the archive and
+# is usually the older side, so upgrading it is part of the adoption.
+#
+# The same release is not the whole of it: two servers on one release refuse
+# different commands when their featureCompatibilityVersion differs, so that is
+# checked too and this setting covers both.
+#
+# Setting this to true starts anyway and accepts that failure.
+allow_version_skew: false
+
 log:
   # Where the daemons write. Leave empty for stderr, which is what you want
   # under systemd: journald captures the stream and rotation is not your

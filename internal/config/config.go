@@ -42,6 +42,13 @@ type Config struct {
 	Evictor EvictorConfig `yaml:"evictor"`
 	Warmer  WarmerConfig  `yaml:"warmer"`
 	Router  RouterConfig  `yaml:"router"`
+
+	// AllowVersionSkew starts the daemons against tiers running different
+	// MongoDB releases. Off, because the archive runs the client's own queries
+	// and has to understand everything the application says: see
+	// internal/tierver. Turning it on accepts that a query can work for months
+	// and then fail on the day its documents age out of the fast tier.
+	AllowVersionSkew bool `yaml:"allow_version_skew"`
 }
 
 // MetaConfig names the database Thermocline keeps its own bookkeeping in.
@@ -182,6 +189,12 @@ type RouterConfig struct {
 	// bound on any other date field is a bound in a different dimension and
 	// proves nothing: see lowerTimeBound.
 	TieredBy map[string]string `yaml:"-"`
+
+	// AllowVersionSkew is the top-level setting of the same name, copied at
+	// load time rather than configured twice. It belongs to the whole
+	// deployment rather than the router: every daemon that touches both tiers
+	// checks the pair.
+	AllowVersionSkew bool `yaml:"-"`
 }
 
 // AgeField reports the field a namespace's age is read from, and whether
@@ -410,6 +423,7 @@ func Load(path string) (Config, error) {
 	cfg.Router.Managed = cfg.Feeder.Namespaces
 	cfg.Router.FeederID = cfg.Feeder.ID
 	cfg.Router.TieredBy = tieringFields(cfg)
+	cfg.Router.AllowVersionSkew = cfg.AllowVersionSkew
 	// The router's own account, taken from the fast tier connection string
 	// rather than configured a second time. With terminate_auth on, the raw
 	// upstream connection is the router's rather than the client's, so the
