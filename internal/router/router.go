@@ -284,6 +284,9 @@ func (r *Router) Listen(ctx context.Context) error {
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
 	r.ensureFastTierIndexes(ctx)
+	// And the definitions that hold no documents, in the other direction: a view
+	// the fast tier has and the archive does not. See mirrorViewsToArchive.
+	r.mirrorViewsToArchive(ctx)
 
 	// Open one pooled connection before accepting anybody, so the first client's
 	// handshake can be answered from the fast tier's own reply. Without it that

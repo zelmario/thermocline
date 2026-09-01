@@ -296,6 +296,28 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if coll, isCS := changeStreamCollection(cmd, db); isCS {
 		if c.r.cfg.Manages(coll) {
 			c.r.Stats.ChangeStreams.Add(1)
+			// A resumed stream is worth saying out loud, because the way it
+			// fails is silence. A resume token is a position in one replica
+			// set's oplog, and change streams are served from the fast tier, so
+			// a token minted on the cluster being adopted is not a position in
+			// it. MongoDB accepts it rather than refusing it: measured, the same
+			// token delivered the write that followed it against the cluster it
+			// came from, and delivered nothing at all through the router, with
+			// ok: 1. Refusing it would mean parsing resume tokens, which are an
+			// undocumented encoding that changes between releases, so this names
+			// it instead.
+			if from, resumed := changeStreamResumedFrom(cmd); resumed {
+				c.log.Warn("a change stream was resumed from a token or timestamp",
+					"ns", coll, "from", from,
+					"caveat", "a resume token is a position in one replica set's oplog, and this "+
+						"stream is served from the fast tier, so a token minted on the cluster that "+
+						"was adopted names nothing here",
+					"effect", "MongoDB accepts such a token and delivers no events, with ok: 1, so a "+
+						"consumer resuming across the cutover loses everything the old cluster saw "+
+						"after its last token",
+					"action", "start consumers fresh after a cutover, and check this stream is "+
+						"delivering rather than merely open")
+			}
 			c.log.Info("a change stream was opened on a tiered collection",
 				"ns", coll,
 				"note", "eviction and copy-up move documents in and out of the fast tier, and the "+
@@ -492,4 +514,35 @@ func changeStreamCollection(cmd bson.Raw, db string) (string, bool) {
 		return "", true
 	}
 	return db + "." + coll, true
+}
+
+// changeStreamResumedFrom reports which of the resume options a change stream
+// carries, and whether it carries any. See the warning at the caller.
+func changeStreamResumedFrom(cmd bson.Raw) (string, bool) {
+	pv, err := cmd.LookupErr("pipeline")
+	if err != nil {
+		return "", false
+	}
+	arr, ok := pv.ArrayOK()
+	if !ok {
+		return "", false
+	}
+	vals, err := arr.Values()
+	if err != nil || len(vals) == 0 {
+		return "", false
+	}
+	first, ok := vals[0].DocumentOK()
+	if !ok {
+		return "", false
+	}
+	spec, ok := first.Lookup("$changeStream").DocumentOK()
+	if !ok {
+		return "", false
+	}
+	for _, opt := range []string{"resumeAfter", "startAfter", "startAtOperationTime"} {
+		if _, err := spec.LookupErr(opt); err == nil {
+			return opt, true
+		}
+	}
+	return "", false
 }

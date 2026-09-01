@@ -90,6 +90,32 @@ OPENED=$(R "
   catch(e) { print('ERR '+e.message.substring(0,70)); }")
 chk "watch() is accepted on a tiered collection"       "opened" "$OPENED"
 
+echo "== a resumed stream is named, because its failure is silence =="
+# A resume token is a position in one replica set's oplog, and change streams are
+# served from the fast tier, so a token minted on the cluster that was adopted
+# names nothing here. MongoDB accepts it and delivers no events, with ok: 1, so a
+# consumer resuming across the cutover loses everything the old cluster saw after
+# its last token. Refusing it would mean parsing resume tokens, an undocumented
+# encoding that changes between releases. So it is said out loud, once per stream.
+RESUMED=$(R "
+  const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cs=c.watch(); c.insertOne({_id:900,v:'token'});
+  let tok=null;
+  for (let i=0;i<40 && !tok;i++) { const e=cs.tryNext(); if (e) tok=e._id; else sleep(250); }
+  cs.close();
+  if (!tok) { print('no token'); } else {
+    // tryNext before close, because watch() is lazy: mongosh sends no command
+    // until the cursor is read, so closing it first opens nothing and the router
+    // has nothing to say about it.
+    const again=c.watch([], {resumeAfter: tok}); again.tryNext(); again.close(); print('resumed');
+  }")
+chk "a stream can be resumed from its own token"       "resumed" "$RESUMED"
+chk "and the router said so"                           "true" \
+    "$(grep -q 'a change stream was resumed from a token or timestamp' $LOGDIR/cs_r.log && echo true || echo false)"
+chk "naming which option carried it"                   "true" \
+    "$(grep -q 'from=resumeAfter' $LOGDIR/cs_r.log && echo true || echo false)"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:900})" >/dev/null
+
 echo "== it reports the application's own writes =="
 SEEN=$(R "
   const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();

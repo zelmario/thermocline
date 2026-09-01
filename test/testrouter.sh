@@ -221,6 +221,32 @@ chk "and it counted every document"      "$NOWLIVE" "$(H 'const d=db.getSiblingD
 
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
+echo "== a view the archive has never heard of =="
+# A view created through the router is given to the archive as it is created. Two
+# kinds are not: one that predates that being true, and one an operator made
+# straight on the fast tier, which is what the adoption runbook tells them to do.
+# Both matter twice over. Repointing the application at the archive is what
+# rollback is, and a view the archive has never heard of is an error there. And a
+# read through a view the fast tier cannot answer goes to the archive only when
+# the archive holds the same view.
+VNS=tprobe
+H "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createView('vstart','$VNS',[{\$match:{n:{\$exists:true}}}])" >/dev/null
+chk "the archive does not have it"        "none" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vstart'})[0]; print(c?c.type:'none')")"
+# A router starting is what notices. Its own port, so the one this suite has been
+# using stays up for everything after this.
+cline router --config $CFG --listen 0.0.0.0:$P3 --log-file $LOGDIR/rv.log &
+VP=$!; sleep 6
+chk "a router starting gives it to the archive" "view" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vstart'})[0]; print(c?c.type:'none')")"
+chk "and reads the same collection it did here" "$VNS" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vstart'})[0]; print(c&&c.options?c.options.viewOn:'none')")"
+kill $VP 2>/dev/null; wait $VP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
+
 echo "== completeness: strict =="
 sed 's/completeness: archive/completeness: strict/' $CFG > $WDIR/strict.yaml
 cline router --config $WDIR/strict.yaml --listen 0.0.0.0:$P1 --log-file $LOGDIR/rs.log &

@@ -2296,6 +2296,12 @@ mongosh --port 28018 --eval '
   undocumented encoding that changes between server releases, so this is a step
   in the rollout rather than a guard: start consumers fresh.
 
+  **What it does now is say so.** A change stream opened with `resumeAfter`,
+  `startAfter` or `startAtOperationTime` on a tiered collection is named in the
+  log at WARN, with which option carried it. That does not make a stale token
+  work; it means the one failure whose symptom is silence has a line somewhere
+  that mentions it.
+
 - **Sharded fast tiers are refused, with the reason.** Everything here assumes
   the fast tier is a replica set. The router proxies bytes to one primary
   address and a mongos does not have one: measured, its `hello` answers

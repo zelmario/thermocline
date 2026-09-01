@@ -3,12 +3,15 @@ package router
 import (
 	"bytes"
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -385,4 +388,61 @@ func (r *Router) refuseView(requestID, responseTo int32, view, base, because str
 			". The view reads "+base+", which the fast tier does not hold completely, and a view "+
 			"read is not sent to the archive. Warm "+base+", or query it directly, where the "+
 			"archive answers in full.")
+}
+
+// mirrorViewsToArchive gives the archive every view the fast tier has that it
+// does not, once, at startup.
+//
+// A view created through the router is mirrored down as it is created. Two kinds
+// are not: one that existed before that was true, and one an operator created
+// straight on the fast tier. Both matter for the same two reasons. Repointing the
+// application at the archive is what rollback is, and a view the archive has
+// never heard of is an error rather than a wrong answer there. And a read through
+// a view the fast tier cannot answer goes to the archive only when the archive
+// holds the same view, so a view missing there is refused where it could have
+// been answered.
+//
+// It creates and never changes: a view the archive already has is left exactly as
+// it is, because the archive's definition may be the one somebody meant and this
+// has no way to tell. A difference is reported by the read path instead, as a
+// refusal naming the view.
+func (r *Router) mirrorViewsToArchive(ctx context.Context) {
+	dbs, err := r.hot.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		r.log.Debug("could not list the fast tier's databases to compare its views", "err", err)
+		return
+	}
+	var carried []string
+	for _, db := range dbs {
+		if isSystemDatabase(db) {
+			continue
+		}
+		hotViews, herr := r.hot.Database(db).ListCollectionNames(ctx,
+			bson.D{{Key: "type", Value: "view"}})
+		if herr != nil || len(hotViews) == 0 {
+			continue
+		}
+		coldNames, cerr := r.cold.Database(db).ListCollectionNames(ctx, bson.D{})
+		if cerr != nil {
+			continue
+		}
+		have := map[string]bool{}
+		for _, n := range coldNames {
+			have[n] = true
+		}
+		for _, name := range hotViews {
+			if have[name] || strings.HasPrefix(name, "system.") {
+				continue
+			}
+			promote.MirrorCollection(ctx, r.hot, r.cold, db, name, r.log)
+			carried = append(carried, db+"."+name)
+		}
+	}
+	if len(carried) > 0 {
+		sort.Strings(carried)
+		r.log.Info("gave the archive views it did not have",
+			"views", carried,
+			"why", "repointing the application at the archive is what rollback is, and a view read "+
+				"the fast tier cannot answer goes there only when the archive holds the same view")
+	}
 }
