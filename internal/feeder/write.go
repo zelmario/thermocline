@@ -182,6 +182,10 @@ func (f *Feeder) flush(ctx context.Context) error {
 				SetReplacement(op.doc).
 				SetUpsert(true)
 		case actionTombstone:
+			// The first tombstone in a namespace is also when its expiry index
+			// is settled, so retention costs nothing on a namespace nothing
+			// deletes from. See settleTombstoneTTL.
+			f.settleTombstoneTTL(ctx, op.ns)
 			// No upsert. If the archive never received this document there is
 			// nothing to mark, and inventing an empty tombstone would be worse
 			// than doing nothing.

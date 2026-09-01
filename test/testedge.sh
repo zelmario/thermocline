@@ -286,6 +286,71 @@ chk "halt stops the feeder"              "1"    "$HALTRC"
 # mid-sentence and explain nothing.
 chk "and says why in the log file"       "true" "$(grep -qE 'level=ERROR.*feeder stopped.*unannounced' $LOGDIR/edge_halt.log && echo true || echo false)"
 
+echo "== tombstone retention =="
+# A delete through the router marks the archive's copy and keeps it. That is an
+# audit trail by design, and on a deployment that runs for years it is also an
+# archive that grows with every delete it has ever seen, plus a delete that was
+# meant to erase and did not. feeder.tombstone_retention is the knob that puts
+# an end date on the copy, and these checks are about the knob being honest:
+# absent means keep for ever, a value means mongod expires it, and changing the
+# value changes what mongod does rather than leaving the first one in place.
+stopFeeder
+sed '0,/^  batch_size:/s/^  batch_size:/  tombstone_retention: 2m\n  batch_size:/' $CFG > $WDIR/edge_ttl.yaml
+sed '0,/^  batch_size:/s/^  batch_size:/  tombstone_retention: 3m\n  batch_size:/' $CFG > $WDIR/edge_ttl3.yaml
+sed '0,/^  batch_size:/s/^  batch_size:/  tombstone_retention: 30s\n  batch_size:/' $CFG > $WDIR/edge_ttlshort.yaml
+sed '0,/^  batch_size:/s/^  batch_size:/  tombstone_retention: -5m\n  batch_size:/' $CFG > $WDIR/edge_ttlneg.yaml
+chk "a retention the TTL monitor cannot honour is refused" "true" \
+  "$(cline watermark --config $WDIR/edge_ttlshort.yaml 2>&1 | grep -q 'expires TTL indexes once a minute' && echo true || echo false)"
+chk "and a negative retention is refused"       "true" \
+  "$(cline watermark --config $WDIR/edge_ttlneg.yaml 2>&1 | grep -q 'cannot be negative' && echo true || echo false)"
+
+ttlSecs() {
+  C "const i=db.getSiblingDB(process.env.TC_DB).$NS.getIndexes().find(x=>x.name=='tc_tombstone_ttl'); print(i?i.expireAfterSeconds:'none')"
+}
+
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+rm -f $LOGDIR/edge_ttl.log
+startFeeder $WDIR/edge_ttl.yaml edge_ttl.log
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:1,v:'keep'},{_id:2,v:'gone'}])" >/dev/null
+waitMirrored $NS 2
+chk "no expiry index before anything is deleted" "none" "$(ttlSecs)"
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:2})" >/dev/null
+waitMirrored $NS 1
+chk "the first tombstone creates the expiry index" "120" "$(ttlSecs)"
+chk "and the feeder says so"                    "true" \
+  "$(grep -q 'deleted documents expire from the archive' $LOGDIR/edge_ttl.log && echo true || echo false)"
+chk "the tombstone is still there to be expired" "yes" \
+  "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:2}); print(d?(d._tcDeletedAt?'yes':'no'):'GONE')")"
+chk "and the document nothing deleted is untouched" "1" \
+  "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:1,_tcDeletedAt:{\$exists:false}}))")"
+
+# A changed retention has to replace the index. createIndex refuses the same
+# name with different options, so a feeder that only created would leave the
+# first schedule running for ever while the config said otherwise.
+stopFeeder
+rm -f $LOGDIR/edge_ttl3.log
+startFeeder $WDIR/edge_ttl3.yaml edge_ttl3.log
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:3,v:'x'})" >/dev/null
+waitMirrored $NS 2
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:3})" >/dev/null
+waitFor "the expiry index on the new schedule" "180" "ttlSecs"
+chk "a changed retention replaces the index"    "180" "$(ttlSecs)"
+
+# And removing the knob has to stop the expiry, or the config lies in the other
+# direction: an operator who wants the audit trail back would keep losing it.
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:4,v:'y'})" >/dev/null
+rm -f $LOGDIR/edge_ttloff.log
+startFeeder $CFG edge_ttloff.log
+waitMirrored $NS 2
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:4})" >/dev/null
+waitFor "the expiry index gone" "none" "ttlSecs"
+chk "removing the knob drops the index"         "none" "$(ttlSecs)"
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

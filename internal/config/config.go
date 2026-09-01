@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -332,6 +333,19 @@ type FeederConfig struct {
 	PositionEvery time.Duration `yaml:"position_every"`
 	// BatchSize caps documents per bulk write to the cold tier.
 	BatchSize int `yaml:"batch_size"`
+	// TombstoneRetention is how long the archive keeps a document the
+	// application deleted. Zero, the default, keeps it for ever.
+	//
+	// A delete through the router does not erase the archive's copy, it marks
+	// it with meta.TombstoneField so reads stop returning it. That is an audit
+	// trail on purpose, and it is also two problems on a deployment that runs
+	// for years: the archive grows with every delete it has ever seen, and a
+	// delete the application issued to erase data does not erase it.
+	//
+	// Setting this gives the archive a TTL index on the mark, so mongod removes
+	// the copy that long after the delete. Reads are unaffected either way: a
+	// tombstoned copy is already invisible to them.
+	TombstoneRetention Duration `yaml:"tombstone_retention"`
 	// MaxAwait is how long a change stream poll blocks before returning empty.
 	//
 	// It is also the floor on every fallback read, which is not obvious and is
@@ -456,6 +470,24 @@ func (c Config) Validate() error {
 	}
 	if c.Feeder.BatchSize < 1 {
 		return errors.New("feeder.batch_size must be at least 1")
+	}
+	// mongod's TTL monitor runs once a minute, so anything shorter than that is
+	// a number that cannot be honoured. Refusing it is how a misplaced unit is
+	// caught before a deployment believes its deletes erase in seconds.
+	if c.Feeder.TombstoneRetention < 0 {
+		return errors.New("feeder.tombstone_retention cannot be negative: leave it out to keep deleted documents for ever")
+	}
+	if c.Feeder.TombstoneRetention > 0 && c.Feeder.TombstoneRetention.D() < time.Minute {
+		return fmt.Errorf("feeder.tombstone_retention is %s, and mongod expires TTL indexes once a minute: "+
+			"give at least 1m", c.Feeder.TombstoneRetention.String())
+	}
+	// expireAfterSeconds is a 32 bit integer at the server, so a longer
+	// retention than this cannot be expressed. Caught here rather than sent, or
+	// it arrives as a negative number of seconds.
+	if secs := c.Feeder.TombstoneRetention.D().Seconds(); secs > math.MaxInt32 {
+		return fmt.Errorf("feeder.tombstone_retention is %s, and the longest a TTL index can express "+
+			"is about 68 years: leave it out to keep deleted documents for ever",
+			c.Feeder.TombstoneRetention.String())
 	}
 	switch c.Feeder.UnannouncedDeletes {
 	case Tombstone, Ignore, Halt:

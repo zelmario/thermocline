@@ -290,3 +290,59 @@ func TestMaxFeederLagMustStayUnderTheNoticeTTL(t *testing.T) {
 		}
 	}
 }
+
+// A retention shorter than mongod's TTL sweep is a number that cannot be
+// honoured, and the likeliest way to write one is a misplaced unit. Refused
+// rather than rounded up, so a deployment does not believe its deletes erase in
+// seconds.
+func TestTombstoneRetentionBounds(t *testing.T) {
+	dir := t.TempDir()
+	base := `hot:
+  uri: "mongodb://hot1/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://cold1/?replicaSet=rsCold"
+feeder:
+  id: "ttl"
+  namespaces:
+    - "app.orders"
+`
+	for _, c := range []struct {
+		name string
+		yaml string
+		want time.Duration
+		err  string
+	}{
+		{name: "absent keeps deleted documents for ever", yaml: base, want: 0},
+		{name: "a day is fine", yaml: base + "  tombstone_retention: 1d\n", want: 24 * time.Hour},
+		{name: "a minute is the floor and is accepted", yaml: base + "  tombstone_retention: 1m\n", want: time.Minute},
+		{name: "under a minute is refused", yaml: base + "  tombstone_retention: 30s\n",
+			err: "once a minute"},
+		{name: "negative is refused", yaml: base + "  tombstone_retention: -1h\n",
+			err: "cannot be negative"},
+		{name: "longer than a TTL index can express is refused",
+			yaml: base + "  tombstone_retention: 40000d\n", err: "about 68 years"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(dir, "cline.yaml")
+			if err := os.WriteFile(path, []byte(c.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if c.err != "" {
+				if err == nil {
+					t.Fatalf("loaded, want an error naming %q", c.err)
+				}
+				if !strings.Contains(err.Error(), c.err) {
+					t.Errorf("error is %q, want it to name %q", err, c.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("does not load: %v", err)
+			}
+			if got := cfg.Feeder.TombstoneRetention.D(); got != c.want {
+				t.Errorf("TombstoneRetention = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
