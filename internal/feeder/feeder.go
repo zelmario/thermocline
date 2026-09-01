@@ -96,6 +96,11 @@ type Feeder struct {
 	// not fill the log.
 	warnedReserved map[string]bool
 
+	// ttlSettled remembers which archive collections have had the tombstone TTL
+	// index put in the state the config asks for. One namespace is one round
+	// trip per feeder run, and only namespaces that actually tombstone.
+	ttlSettled map[string]bool
+
 	// cached view of whether a warmer is running, see echo.go
 	warmActive    bool
 	warmCheckedAt time.Time
@@ -222,6 +227,34 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 		})
 	if err != nil {
 		return fmt.Errorf("create warming ttl index: %w", err)
+	}
+
+	// Residency holds expire at an instant they carry themselves, so the TTL is
+	// zero seconds past that instant rather than a duration of its own. Once
+	// hotUntil is in the past the hold is over: the evictor reads an expired one
+	// as no hold at all, so the record is dead weight from that moment.
+	//
+	// The evictor deletes the records of the documents it evicts, which is most
+	// of them. What it cannot delete is a hold whose document the application
+	// removed instead, and those accumulated for ever in a collection nothing
+	// else cleans. One row per copy-up is not large, and "for ever" is the part
+	// that matters on a deployment that runs for years.
+	//
+	// This one warns instead of refusing to start. The notice TTLs above are
+	// load-bearing: an announcement that outlives its expiry is read as an
+	// application delete and the archive tombstones a live record, so a feeder
+	// that cannot create them should not run. Housekeeping is not worth a
+	// stopped feeder, and an index somebody already made on hotUntil under
+	// another name would be exactly that.
+	if _, err := f.cold.Database(meta.DB).Collection(meta.Residency).Indexes().
+		CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "hotUntil", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).SetName("tc_residency_ttl"),
+		}); err != nil {
+		f.log.Warn("could not create the residency expiry index",
+			"err", err,
+			"note", "residency records of documents the application deleted are never cleared, "+
+				"so "+meta.DB+"."+meta.Residency+" grows slowly; mirroring is unaffected")
 	}
 	return nil
 }
