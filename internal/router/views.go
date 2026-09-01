@@ -177,10 +177,20 @@ func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
 // against the archive's copy of the underlying collection is possible and is
 // worth doing, but guessing at that translation would risk returning a
 // different answer rather than a short one, which would be worse than saying no.
+// refuseView says why a view over an incomplete collection is not answered.
+//
+// It used to say the archive could not answer it because a view exists only on
+// the fast tier. That stopped being true when a view created through the router
+// began to be mirrored down: the archive can hold the view and every document it
+// reads. What is still true is that this router does not send a view read there,
+// because the two definitions are only identical for a view it mirrored itself,
+// and a view whose pipeline differs between the tiers would answer differently
+// without anything saying so. The message says what to do rather than what
+// cannot be done.
 func (r *Router) refuseView(requestID, responseTo int32, view, base, because string) (*wire.Message, error) {
 	return r.commandError(requestID, responseTo,
 		"thermocline: refusing this query on the view "+view+" because "+because+
 			". The view reads "+base+", which the fast tier does not hold completely, and a view "+
-			"exists only on the fast tier so the archive cannot answer it. Warm "+base+
-			", or query it directly, where the archive can.")
+			"read is not sent to the archive. Warm "+base+", or query it directly, where the "+
+			"archive answers in full.")
 }
