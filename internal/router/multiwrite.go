@@ -262,11 +262,8 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// Residency first, for the same reason copyUp does it first: these
 		// writes are what a client's change stream sees, and it must be able
 		// to tell a promotion from an insert the moment the event arrives.
-		for _, id := range raw {
-			if rerr := r.recordResidency(ctx, ns, id); rerr != nil {
-				r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
-				break
-			}
+		if rerr := r.recordResidencyMany(ctx, ns, raw); rerr != nil {
+			r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
 		}
 		r.notePromoting(ctx)
 

@@ -195,6 +195,25 @@ chkrb() { # chkrb NAME WANT GOT
 }
 chkrb "counting changed nothing" "3" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RBNS.countDocuments({}))")"
+
+# What the archive is missing, which is the half an operator cannot fix
+# afterwards. Neither of these is a document, so nothing mirrored it: an account
+# cannot be mirrored at all, because MongoDB derives SCRAM credentials per
+# cluster, and a view holds no documents for the feeder to carry. Repointing an
+# application at an archive without its accounts fails to log in at all, and
+# MongoDB answers that with an ordinary authentication failure naming nothing.
+HRB() { mongosh "$HOTU" --quiet --eval "$1" 2>&1 | tail -1; }
+HRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop();
+     db.getSiblingDB(process.env.TC_DB).createView('${RBNS}v','$RBNS',[{\$match:{n:'live'}}])" >/dev/null
+HRB "try{db.getSiblingDB('admin').createUser({user:'rbprobe',pwd:'x',roles:[]})}catch(e){}" >/dev/null
+RBOUT=$(cline rollback --config $CFG --ns $DB.$RBNS 2>&1)
+chkrb "rollback names the view the archive lacks" "true" \
+    "$(grep -q "${RBNS}v" <<<"$RBOUT" && echo true || echo false)"
+chkrb "and the account the archive lacks"        "true" \
+    "$(grep -q 'rbprobe@admin' <<<"$RBOUT" && echo true || echo false)"
+chkrb "and says credentials could not be copied" "true" \
+    "$(grep -q 'credentials are per cluster' <<<"$RBOUT" && echo true || echo false)"
+HRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop(); db.getSiblingDB('admin').dropUser('rbprobe')" >/dev/null
 # The ordering guard, which is the part nobody was being told about.
 C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},
      {\$set:{at:new Date(), savedAt:new Date(), everyMS:1000}},{upsert:true})" >/dev/null

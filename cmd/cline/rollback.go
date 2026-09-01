@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
@@ -13,6 +14,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -92,6 +94,12 @@ func runRollback(args []string) error {
 		fmt.Printf("Found %d.\n", len(namespaces))
 	}
 	sort.Strings(namespaces)
+
+	// What the archive is missing, before anything about tombstones, because it
+	// is the half an operator cannot fix afterwards: an application repointed at
+	// an archive without its accounts cannot log in at all, and MongoDB answers
+	// that with an ordinary authentication failure naming nothing.
+	reportArchiveGaps(ctx, cfg, log)
 
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
 	if *clear && alive && !*force {
@@ -221,6 +229,150 @@ func archiveNamespaces(ctx context.Context, cold *mongo.Client) ([]string, error
 		_ = cur.Close(ctx)
 		if cerr != nil {
 			return nil, fmt.Errorf("list collections in %s: %w", db, cerr)
+		}
+	}
+	return out, nil
+}
+
+// reportArchiveGaps names what the fast tier has and the archive does not, for
+// somebody about to point an application at the archive.
+//
+// Two kinds, and neither is a document, which is why nothing mirrored them.
+//
+// Accounts cannot be mirrored at all: MongoDB stores SCRAM credentials derived
+// per cluster, so an account created on the fast tier after the cutover can only
+// be recreated in the archive with its password, which this does not have. The
+// router says the same thing at startup for the other direction, which is the
+// one an adoption meets.
+//
+// Views hold no documents, so the feeder never carries one. A view created
+// through the router is mirrored down as it is created now, but one made before
+// that, or made out of band, is not, and a read of it after repointing is an
+// error rather than a wrong answer.
+//
+// Best effort throughout. This runs during an incident, the fast tier may be the
+// thing that is broken, and a rollback must not depend on it being reachable.
+func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger) {
+	hot, err := connect(ctx, cfg.Hot.URI, "hot")
+	if err != nil {
+		fmt.Printf("Could not reach the fast tier to compare it: %v\n", err)
+		fmt.Println("Nothing below is affected; this section is a courtesy.")
+		fmt.Println()
+		return
+	}
+	defer disconnect(hot, log)
+	cold, err := connect(ctx, cfg.Cold.URI, "cold")
+	if err != nil {
+		return
+	}
+	defer disconnect(cold, log)
+
+	users := missingAccounts(ctx, hot, cold)
+	views := missingViews(ctx, hot, cold)
+	if len(users) == 0 && len(views) == 0 {
+		return
+	}
+
+	fmt.Println("The fast tier has things the archive does not:")
+	if len(users) > 0 {
+		fmt.Printf("  accounts  %s\n", strings.Join(users, ", "))
+		fmt.Println("            create them in the archive with the same names, passwords and roles;")
+		fmt.Println("            credentials are per cluster, so nothing could have copied them")
+	}
+	if len(views) > 0 {
+		fmt.Printf("  views     %s\n", strings.Join(views, ", "))
+		fmt.Println("            recreate them in the archive with createView")
+	}
+	fmt.Println()
+}
+
+// missingAccounts names accounts the fast tier has and the archive does not.
+func missingAccounts(ctx context.Context, hot, cold *mongo.Client) []string {
+	h, err := accountsIn(ctx, hot)
+	if err != nil {
+		return nil
+	}
+	c, err := accountsIn(ctx, cold)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for u := range h {
+		if !c[u] {
+			out = append(out, u)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func accountsIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+	cur, err := client.Database("admin").Collection("system.users").Find(ctx, bson.D{},
+		options.Find().SetProjection(bson.D{{Key: "user", Value: 1}, {Key: "db", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	out := map[string]bool{}
+	for cur.Next(ctx) {
+		var u struct {
+			User string `bson:"user"`
+			DB   string `bson:"db"`
+		}
+		if cur.Decode(&u) != nil || u.User == "" {
+			continue
+		}
+		out[u.User+"@"+u.DB] = true
+	}
+	return out, cur.Err()
+}
+
+// missingViews names views the fast tier has and the archive does not.
+func missingViews(ctx context.Context, hot, cold *mongo.Client) []string {
+	h, err := viewsIn(ctx, hot)
+	if err != nil {
+		return nil
+	}
+	c, err := viewsIn(ctx, cold)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for v := range h {
+		if !c[v] {
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func viewsIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+	dbs, err := client.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, db := range dbs {
+		switch db {
+		case "admin", "local", "config":
+			continue
+		}
+		// The same two spellings archiveNamespaces skips: the configured
+		// bookkeeping database and the default one.
+		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+			continue
+		}
+		names, lerr := client.Database(db).ListCollectionNames(ctx,
+			bson.D{{Key: "type", Value: "view"}})
+		if lerr != nil {
+			return nil, lerr
+		}
+		for _, n := range names {
+			if strings.HasPrefix(n, "system.") {
+				continue
+			}
+			out[db+"."+n] = true
 		}
 	}
 	return out, nil

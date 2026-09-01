@@ -1065,7 +1065,18 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// there. Synchronously, and before the index build below,
 				// because the write that follows a create can be immediate and
 				// the feeder is mirroring it within the second.
-				if c.r.cfg.Manages(ns) {
+				//
+				// A view arrives as a create too, carrying viewOn and a
+				// pipeline, and it is mirrored whether or not anything tiers
+				// it. A view holds no documents, so nothing ever mirrors one:
+				// the archive would not have it, and repointing the
+				// application at the archive is what rollback is. The runbook
+				// already says an adoption's views have to exist on both
+				// sides, and this keeps that true for the ones created
+				// afterwards.
+				_, viewErr := cmd.LookupErr("viewOn")
+				isView := viewErr == nil
+				if isView || c.r.cfg.Manages(ns) {
 					promote.MirrorCollection(ctx, c.r.hot, c.r.cold, db, coll, c.log)
 				}
 

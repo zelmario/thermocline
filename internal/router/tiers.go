@@ -153,6 +153,43 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 	return err
 }
 
+// recordResidencyMany does the same for a batch, in one round trip.
+//
+// The single-document version is called once per document by the multi-write
+// copy-up path, and every one of those is a write to the archive, which is the
+// far cluster in the shape this system is built for. Measured on this box, where
+// it is not far at all: an updateMany over 200 archived documents took 465 ms,
+// and the 200 residency holds were most of it.
+//
+// The warmer has done it this way all along; this is the same shape.
+func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.RawValue) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	until := now.Add(r.cfg.Residency.D())
+	models := make([]mongo.WriteModel, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
+			SetUpdate(bson.D{{Key: "$set", Value: bson.D{
+				{Key: "ns", Value: ns},
+				{Key: "doc", Value: id},
+				{Key: "hotUntil", Value: until},
+				{Key: "promotedAt", Value: now},
+				// One echo expected per document, the same as the single
+				// version records. See promotion echoes in the feeder.
+				{Key: "echoPending", Value: true},
+			}}}).
+			SetUpsert(true))
+	}
+	// Unordered: these are independent holds, and one that cannot be written
+	// must not stop the rest. The error is what the caller acts on.
+	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	return err
+}
+
 // watermarkCache holds one namespace's completeness for a short while.
 type watermarkCache struct {
 	mu      sync.RWMutex

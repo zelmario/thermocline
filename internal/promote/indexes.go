@@ -387,11 +387,14 @@ func MirrorCollection(ctx context.Context, hot, cold *mongo.Client, db, coll str
 		return
 	}
 
-	opts, err := carryableOptions(ctx, hot, db, coll)
+	opts, isView, err := carryableOptions(ctx, hot, db, coll)
 	if err != nil || len(opts) == 0 {
 		// Nothing worth carrying, so the feeder's first insert creating it is
 		// the same collection.
 		return
+	}
+	if isView {
+		log = log.With("kind", "view")
 	}
 	cmd := append(bson.D{{Key: "create", Value: coll}}, opts...)
 	if err := cold.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
@@ -415,37 +418,64 @@ func MirrorCollection(ctx context.Context, hot, cold *mongo.Client, db, coll str
 }
 
 // carryableOptions reads one tier's options for a collection, minus the ones
-// that must not be given to the other. The test file next door has a helper of
-// its own called collectionOptions, which reads them unfiltered.
-func carryableOptions(ctx context.Context, from *mongo.Client, db, coll string) (bson.D, error) {
+// that must not be given to the other, and says whether it is a view. The test
+// file next door has a helper of its own called collectionOptions, which reads
+// them unfiltered.
+//
+// A view is the exception to the deny-list rather than a case of it. viewOn and
+// pipeline are kept from crossing *upward* because a view holds no documents and
+// cannot be tiered. Downward they are the entire definition, and stripping them
+// would give the archive an empty collection wearing the view's name, which
+// reads as an empty result instead of a missing view: worse than not carrying it
+// at all.
+func carryableOptions(ctx context.Context, from *mongo.Client, db, coll string) (bson.D, bool, error) {
 	cur, err := from.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	if !cur.Next(ctx) {
-		return nil, cur.Err()
+		return nil, false, cur.Err()
 	}
 	var raw bson.Raw
 	if err := cur.Decode(&raw); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	kind, _ := raw.Lookup("type").StringValueOK()
+	isView := kind == "view"
+
 	odoc, ok := raw.Lookup("options").DocumentOK()
 	if !ok {
-		return nil, nil
+		return nil, isView, nil
 	}
 	elems, err := odoc.Elements()
 	if err != nil {
-		return nil, nil
+		return nil, isView, nil
 	}
 	var out bson.D
 	for _, e := range elems {
-		if notCarried[e.Key()] {
+		if notCarried[e.Key()] && !(isView && (e.Key() == "viewOn" || e.Key() == "pipeline")) {
 			continue
 		}
 		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
 	}
-	return out, nil
+	if isView {
+		// Without both halves it is not a view, and creating it as anything
+		// else is the failure this avoids.
+		var haveOn, havePipeline bool
+		for _, e := range out {
+			switch e.Key {
+			case "viewOn":
+				haveOn = true
+			case "pipeline":
+				havePipeline = true
+			}
+		}
+		if !haveOn || !havePipeline {
+			return nil, isView, nil
+		}
+	}
+	return out, isView, nil
 }
 
 // archiveCollectionOptions reports whether the archive holds the collection, and
