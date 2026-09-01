@@ -253,6 +253,15 @@ Range queries are governed by the watermark below.
   claim there and then. A drop applied straight to the fast tier, out of band, is
   not: that window remains, and the answer corrects itself once the feeder has
   withdrawn the claim and the cache has expired.
+
+  **It also leaves the indexer remembering a collection that has gone**, and that
+  one does not correct itself. The router creates the fast tier's copy the way the
+  archive has it before any write that would otherwise create it bare, and
+  remembers having done so; a drop it forwarded clears that memory, and a drop it
+  never saw does not. The next write then recreates the collection with no
+  collation and no validator, and a query the application has always run answers
+  differently. So drop a tiered collection **through the router**, which is where
+  every other consequence of a drop is handled too.
 - **An eviction sweep waits before it removes what it has just stopped
   claiming.** The evictor raises the completeness watermark first, so an
   interrupted sweep never leaves a claim wider than the truth. That protects a
