@@ -55,6 +55,18 @@ type indexState struct {
 	done    bool
 	lastTry time.Time
 
+	// building says an attempt is running now. Without it a build that hangs is
+	// started again every retryAfter for as long as it hangs, and each attempt
+	// holds a goroutine and a connection: on a fast tier missing a voting member
+	// that was one new build a minute per namespace, for ever. See
+	// createIndexes, where the commit quorum that caused it is set.
+	building bool
+	// again says somebody asked while that attempt was running, so what it built
+	// may be a list from before a drop. The rate limit is dropped when it
+	// finishes, so the next ask does the work instead of waiting out a minute it
+	// has already spent.
+	again bool
+
 	// created records that the fast tier has the collection with the archive's
 	// options. It is separate from done, which also means the indexes are
 	// built, because the two are wanted at different moments: the options have
@@ -90,6 +102,12 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 	}
 	ix.mu.Lock()
 	st := ix.state[ns]
+	if st.building {
+		st.again = true
+		ix.state[ns] = st
+		ix.mu.Unlock()
+		return
+	}
 	if st.done || time.Since(st.lastTry) < retryAfter {
 		ix.mu.Unlock()
 		return
@@ -99,20 +117,35 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 	// an Ensure that forgot the collection was already made cost the next insert
 	// a create it did not need. Forget is what clears it, because a drop is the
 	// only thing that makes it untrue.
-	ix.state[ns] = indexState{lastTry: time.Now(), created: st.created, lastCreated: st.lastCreated}
+	ix.state[ns] = indexState{
+		lastTry: time.Now(), building: true,
+		created: st.created, lastCreated: st.lastCreated,
+	}
 	ix.mu.Unlock()
 
-	if err := ix.build(ctx, ns); err != nil {
+	err := ix.build(ctx, ns)
+
+	ix.mu.Lock()
+	st = ix.state[ns]
+	st.building = false
+	st.done = err == nil
+	if st.again {
+		// Asked again while this was running. What it just built may be the list
+		// from before a drop, so it does not count as done and the next ask is
+		// not rate limited.
+		st.again = false
+		st.done = false
+		st.lastTry = time.Time{}
+	}
+	ix.state[ns] = st
+	ix.mu.Unlock()
+
+	if err != nil {
 		ix.log.Warn("could not build the archive's indexes on the fast tier",
 			"ns", ns, "err", err,
 			"effect", "the fast tier scans for these reads until they exist",
 			"note", "a unique index that will not build means the values are already duplicated there")
-		return
 	}
-	ix.mu.Lock()
-	st = ix.state[ns]
-	ix.state[ns] = indexState{done: true, lastTry: time.Now(), created: st.created, lastCreated: st.lastCreated}
-	ix.mu.Unlock()
 }
 
 // EnsureCollection gives the fast tier the collection the way the archive has
@@ -332,10 +365,57 @@ func (ix *Indexer) createIndexes(ctx context.Context, db, coll string, specs []b
 	for i, s := range specs {
 		list[i] = s
 	}
-	return ix.hot.Database(db).RunCommand(ctx, bson.D{
+	cmd := bson.D{
 		{Key: "createIndexes", Value: coll},
 		{Key: "indexes", Value: list},
-	}).Err()
+		// A majority, not the default.
+		//
+		// mongod's default is every voting member, and a member that cannot vote
+		// then stops the build for ever: no error, no timeout, the build sitting
+		// in currentOp with waitingForLock false while everything else on the
+		// cluster carries on working. Measured on a three member 8.0.26 set with
+		// a thousand documents: all members up, 164ms. One member stopped, the
+		// same build did not return in ninety seconds. The same state with this
+		// option, 117ms.
+		//
+		// It costs a router that will not start, because the fast tier's unique
+		// indexes are built before the listener opens, and there is nothing an
+		// operator can do about it from there. Found the hard way on this
+		// project's own cluster, where one member came up on the wrong address:
+		// a build sat for nineteen minutes and read exactly like a hung proxy.
+		//
+		// Worth knowing while reading that measurement: a build on an *empty*
+		// collection skips the two-phase protocol and needs no votes at all, so
+		// the shape that stalls is a fast tier that already holds documents,
+		// which is every fast tier after the first warm.
+		//
+		// A majority is the promise the rest of this system already makes:
+		// mirroring, claims and watermarks are all majority-durable and nothing
+		// waits on the last member. A member behind builds the index when it
+		// catches up, the same as it applies everything else.
+		{Key: "commitQuorum", Value: "majority"},
+	}
+	err := ix.hot.Database(db).RunCommand(ctx, cmd).Err()
+	if err == nil || !rejectsCommitQuorum(err) {
+		return err
+	}
+	// A server that will not take the option at all. Nothing here should stop
+	// building indexes over a preference about when they commit, and an index
+	// build that quietly stopped happening is the kind of regression that hides
+	// for weeks.
+	ix.log.Warn("the fast tier will not take a commit quorum, building without one",
+		"ns", db+"."+coll, "err", err,
+		"note", "the build then waits for every voting member, so one away for maintenance "+
+			"means it does not finish")
+	return ix.hot.Database(db).RunCommand(ctx, cmd[:len(cmd)-1]).Err()
+}
+
+// rejectsCommitQuorum reports a server refusing the option rather than the
+// index. Matched on the message because the codes differ by version and
+// topology, and the fallback is harmless when it is wrong.
+func rejectsCommitQuorum(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "commitquorum") || strings.Contains(msg, "commit quorum")
 }
 
 // createWithOptions makes the fast tier's copy of a collection the way the

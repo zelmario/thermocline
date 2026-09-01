@@ -153,6 +153,64 @@ for (let i=0;i<60;i++){
 print(err);")
 docker exec $NODE pkill -f 'cline evictor' 2>/dev/null
 chk "client errors while everything runs" "0" "$ERRS"
+echo "== an index build with one fast tier member away =="
+# mongod's default commit quorum for an index build is every voting member, so a
+# member that cannot vote means the build never commits and createIndexes never
+# returns. No error, no timeout, and everything else on the cluster keeps working,
+# which is what makes it unreadable: on this project's own cluster a build sat
+# nineteen minutes and looked exactly like a hung proxy.
+#
+# It matters here because the router builds the archive's indexes on the fast
+# tier before it opens its listener, so what hangs is the start of the proxy.
+#
+# The fast tier's copy is seeded first, and that is the part this check turns on.
+# A build on an empty collection skips the two-phase protocol and needs no votes
+# at all, so the first version of this section passed against a binary that did
+# not send a commit quorum: there was nothing to vote on. Measured separately on
+# a three member 8.0.26 set with a thousand documents: 164ms with all members up,
+# no answer in ninety seconds with one stopped, 117ms with the quorum set to
+# majority.
+XNS=tchaosidx
+SN=$(nodeFor "$(H 'print(rs.status().members.filter(m=>m.stateStr=="SECONDARY")[0].name.split(":")[0])')")
+if [ -z "$SN" ]; then echo "  SKIP  no fast tier secondary resolved"; else
+  echo "  stopping fast tier secondary $SN"
+  docker exec $NODE pkill -f 'cline [fr]outer|cline [f]eeder' 2>/dev/null; sleep 2
+  H "db.getSiblingDB('shop').$XNS.drop()" >/dev/null
+  C "db.getSiblingDB('shop').$XNS.drop()" >/dev/null
+  C "const c=db.getSiblingDB('shop').$XNS; c.insertOne({_id:1,email:'a@x'});
+     c.createIndex({email:1},{unique:true,name:'chaos_email'});" >/dev/null
+  # Documents on the fast tier and no index on them, which is what the router
+  # finds at startup and what makes the build a two-phase one. Distinct emails,
+  # because the index it is about to build is unique.
+  H "const c=db.getSiblingDB('shop').$XNS;
+     c.insertMany(Array.from({length:2000},(_,i)=>({_id:1000+i,email:'u'+i+'@x'})));" >/dev/null
+  chk "the fast tier holds documents and no index"    "1" \
+      "$(H "print(db.getSiblingDB('shop').$XNS.getIndexes().length)")"
+  docker exec $SN systemctl stop mongod; sleep 10
+  # Bounded, or a regression hangs this suite instead of failing it. The router
+  # has to be answering, and the index has to exist, inside the bound.
+  docker exec -d $NODE cline router --config $CFG --log-file /var/log/cline/chaos_r.log
+  UP=false
+  for _ in $(seq 1 40); do
+    docker exec $NODE mongosh --port 27100 -u dba -p secret --authenticationDatabase admin \
+      --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && { UP=true; break; }
+    sleep 2
+  done
+  chk "the router starts with a member away"      "true" "$UP"
+  BUILT=false
+  for _ in $(seq 1 20); do
+    [ "$(H "print(db.getSiblingDB('shop').$XNS.getIndexes().some(i=>i.name=='chaos_email'))")" = "true" ] \
+      && { BUILT=true; break; }
+    sleep 2
+  done
+  chk "and the unique index is built on the fast tier" "true" "$BUILT"
+  docker exec $SN systemctl start mongod; sleep 15
+  H "db.getSiblingDB('shop').$XNS.drop()" >/dev/null
+  C "db.getSiblingDB('shop').$XNS.drop()" >/dev/null
+  docker exec $NODE pkill -f 'cline [fr]outer' 2>/dev/null; sleep 1
+  feederUp; routerUp; sleep 5
+fi
+
 # Two ERROR lines here are the product working and are excluded by name.
 #
 # The feeder logs a reopen when the primary it was tailing goes away, which is

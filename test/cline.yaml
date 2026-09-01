@@ -162,6 +162,10 @@ feeder:
     # testkeys.sh: pruning the registry, which needs its own collection because
     # the check counts the claims for exactly one namespace.
     - "shop.tkprune"
+    # testchaos.sh: an index build while a fast tier member is away. Its own
+    # collection, because the check is that the router's startup build finishes
+    # and any other suite's leftovers there would decide it.
+    - "shop.tchaosidx"
     # testmerge.sh again, in another database, because $merge resolves its
     # target through `into: {db, coll}` and that resolution is what a guard
     # reading only the collection name would get wrong. tmrefx is the untiered

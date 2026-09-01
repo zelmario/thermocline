@@ -921,9 +921,59 @@ func (r *Router) ensureFastTierIndexes(ctx context.Context) {
 			// Only real collections: a view holds no documents, so there is
 			// nothing to copy up and no index of its own to build.
 			if _, coll := splitNS(ns); cold[coll] == "collection" {
-				r.indexer.Ensure(ctx, ns)
+				r.ensureIndexesBounded(ctx, ns)
 			}
 		}
+	}
+}
+
+// startupIndexBudget bounds one namespace's index build during startup.
+//
+// Generous, because the build is real work: on an adoption whose fast tier has
+// already been warmed it runs over documents rather than over an empty
+// collection. Bounded, because this happens before the listener opens and a
+// build that never finishes is a router that never starts, with nothing in the
+// log to say why.
+const startupIndexBudget = 5 * time.Minute
+
+// ensureIndexesBounded builds one namespace's indexes with a deadline, and says
+// what is missing if the deadline is reached.
+//
+// Startup waits for these on purpose: the router reads the fast tier's unique
+// indexes to know what it must protect across the tiers, and one built after a
+// duplicate has been accepted is too late. What it must not do is wait for ever.
+// Index builds are the one command whose default commit quorum is every voting
+// member, so a member that cannot vote used to hang this with no error at all.
+// That is fixed where the command is sent, and this is the second half: whatever
+// the reason, the wait ends and the reason is named.
+//
+// It then goes on starting rather than refusing. The window this leaves is the
+// one it was already leaving before the fix, and an application in front of a
+// proxy that will not start is down; the ERROR says which namespace and what is
+// not being enforced, and the build usually completes on its own shortly after.
+func (r *Router) ensureIndexesBounded(ctx context.Context, ns string) {
+	bctx, cancel := context.WithTimeout(ctx, startupIndexBudget)
+	defer cancel()
+
+	done := make(chan struct{})
+	r.goSafely("building the archive's indexes on the fast tier at startup", func() {
+		defer close(done)
+		r.indexer.Ensure(bctx, ns)
+	})
+	select {
+	case <-done:
+	case <-bctx.Done():
+		if ctx.Err() != nil {
+			return
+		}
+		r.log.Error("gave up waiting for the fast tier's indexes before opening the listener",
+			"ns", ns, "waited", startupIndexBudget.String(),
+			"effect", "if one of them is unique, neither mongod nor the key registry is enforcing "+
+				"that constraint on this namespace until the build finishes",
+			"likely", "an index build commits on a majority of the fast tier, so check rs.status() "+
+				"there, and currentOp for a createIndexes still running",
+			"action", "cline indexes reports what each tier is missing; the router is starting anyway, "+
+				"because an application in front of a proxy that will not start is down")
 	}
 }
 
