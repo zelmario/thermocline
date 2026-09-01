@@ -2288,6 +2288,27 @@ mongosh --port 28018 --eval '
   Reading a tiered collection with mapReduce is refused for a different reason,
   already: it totals whatever tier it runs on.
 
+- **A pipeline answered by the archive that also reads an untiered collection
+  comes back short for that half**, and the router names it rather than refusing.
+
+  The archive holds every document of what it is told to tier, which is what
+  makes the fallback correct. It holds whatever it happened to hold of everything
+  else: the feeder mirrors the namespaces in `feeder.namespaces` and nothing
+  else, so anything written to an untiered collection since the cutover is on the
+  fast tier alone. A `$lookup` or `$unionWith` of one, in a pipeline the fast tier
+  cannot answer, is therefore read from a copy that stopped being updated.
+
+  Measured on a `$unionWith` of an untiered collection with a view over a tiered
+  one: the answer was 10 where the two clusters together hold 11, the missing
+  document being the one written to the untiered collection after the cutover.
+
+  It is a warning and not a refusal because the shape is one tiering exists for:
+  a report joining a small reference collection that has not changed since the
+  adoption is right far more often than it is wrong, and refusing it would take
+  away a working query to prevent a possible short answer. The remedy is one of
+  two: tier the collections the report reads, or warm the tiered ones so the fast
+  tier can answer the whole pipeline itself.
+
 - **Cursors are not shared between routers.** A read answered from the archive
   is served from a cursor this router holds open against the archive, in its own
   memory, so another router cannot continue it. This is what a mongos does too,

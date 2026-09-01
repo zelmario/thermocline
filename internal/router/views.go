@@ -407,7 +407,7 @@ func (r *Router) refuseView(requestID, responseTo int32, view, base, because str
 // has no way to tell. A difference is reported by the read path instead, as a
 // refusal naming the view.
 func (r *Router) mirrorViewsToArchive(ctx context.Context) {
-	dbs, err := r.hot.ListDatabaseNames(ctx, bson.D{})
+	dbs, err := r.viewDatabases(ctx)
 	if err != nil {
 		r.log.Debug("could not list the fast tier's databases to compare its views", "err", err)
 		return
@@ -445,4 +445,34 @@ func (r *Router) mirrorViewsToArchive(ctx context.Context) {
 			"why", "repointing the application at the archive is what rollback is, and a view read "+
 				"the fast tier cannot answer goes there only when the archive holds the same view")
 	}
+}
+
+// viewDatabases is where this router will look for views to give the archive.
+//
+// The databases this deployment tiers something in, not every database the fast
+// tier happens to hold. A router creating collections in the archive for a
+// database it knows nothing about is wrong twice over: it is not its business,
+// and on a cluster shared by two deployments, or by three test workers, each one
+// would be writing into the others' namespaces. Measured: one worker's router
+// gave the archive another worker's view, and a suite that asserts a view is
+// fast-tier-only then found it answered.
+//
+// An empty feeder.namespaces means everything is tiered, and then every database
+// is this deployment's.
+func (r *Router) viewDatabases(ctx context.Context) ([]string, error) {
+	if len(r.cfg.Managed) == 0 {
+		names, err := r.hot.ListDatabaseNames(ctx, bson.D{})
+		return names, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, ns := range r.cfg.Managed {
+		db, _ := splitNS(ns)
+		if db == "" || seen[db] {
+			continue
+		}
+		seen[db] = true
+		out = append(out, db)
+	}
+	return out, nil
 }

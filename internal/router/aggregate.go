@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -427,6 +428,25 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if c.r.cfg.Completeness == config.Archive {
 		coll, _ := stringField(cmd, "aggregate")
 
+		// Every document of what this system tiers. A collection it does not
+		// tier is a different matter, and a pipeline reading one is about to be
+		// answered by the wrong tier for that half of it: the feeder mirrors the
+		// namespaces it is told to and nothing else, so the archive's copy of an
+		// untiered collection is whatever it held on the day it was adopted.
+		//
+		// Measured on a $unionWith of an untiered collection with a view over a
+		// tiered one: the answer was 10 where the two clusters together hold 11,
+		// the missing document being the one written to the untiered collection
+		// after the cutover.
+		//
+		// Not a refusal, because the shape is a legitimate one this often gets
+		// right: a report joining a small reference collection that has not
+		// changed since the adoption is exactly what tiering is for, and
+		// refusing it would take away a working query to prevent a possible
+		// short answer. So it is named, every time, which is what an operator
+		// can act on. See the limitation in README.
+		c.warnUntieredFromArchive(scope)
+
 		// Judged before it runs, so the fast tier has not seen it and nothing
 		// has consulted this client's permissions yet.
 		if denied, ok := c.mayRead(msg, db, coll); !ok {
@@ -545,4 +565,33 @@ func changeStreamResumedFrom(cmd bson.Raw) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// warnUntieredFromArchive names the collections in a pipeline that this system
+// does not tier, when the pipeline is about to be answered by the archive.
+//
+// The archive holds every document of a tiered collection, which is what makes
+// the fallback correct. It holds whatever it happened to hold of an untiered one:
+// the feeder mirrors the namespaces it is told to tier and nothing else, so
+// anything written to an untiered collection since the cutover is on the fast
+// tier alone. A pipeline that reads both is answered by one tier, and for that
+// half the answer is short.
+func (c *conn) warnUntieredFromArchive(s aggScope) {
+	var untiered []string
+	for _, ns := range append([]string{s.primary}, s.secondary...) {
+		if ns == "" || c.r.cfg.Manages(ns) {
+			continue
+		}
+		untiered = append(untiered, ns)
+	}
+	if len(untiered) == 0 {
+		return
+	}
+	sort.Strings(untiered)
+	c.log.Warn("answering from the archive a pipeline that reads collections nothing tiers",
+		"ns", s.primary, "untiered", untiered,
+		"effect", "the archive holds whatever it held of those on the day it was adopted, so "+
+			"anything written to them since is missing from this answer",
+		"action", "tier the collections this pipeline reads, or warm the tiered ones so the fast "+
+			"tier can answer it whole")
 }

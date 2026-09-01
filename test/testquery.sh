@@ -160,6 +160,14 @@ echo "== a view over a tiered collection =="
 # short answer this system exists to prevent.
 H "db.getSiblingDB(process.env.TC_DB).tqview.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tqview.drop()" >/dev/null
+# The views too, on both tiers. A view created on the fast tier is given to the
+# archive by any router starting afterwards, so one left there by an earlier run
+# makes "the archive has never heard of this view" false before the run begins,
+# and every check that rests on it then passes or fails for that reason instead.
+for v in vqview vqview2 vqchain vqchainbad vqjoin; do
+  H "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
+done
 R "db.getSiblingDB(process.env.TC_DB).tqview.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i,grp:'g'})))" >/dev/null
 waitMirrored tqview 10
 H "db.getSiblingDB(process.env.TC_DB).createView('vqview','tqview',[{\$match:{grp:'g'}}])" >/dev/null
@@ -202,8 +210,10 @@ chk "a view the archive has too answers in full"       "10" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.countDocuments({}))}catch(e){print('REFUSED')}")"
 chk "and a find through it returns every document"     "10" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.find({}).toArray().length)}catch(e){print('REFUSED')}")"
+# The number, not just "answered": a view answered from the fast tier alone comes
+# back short, and short and full both read as answered.
 chk "while the fast-tier-only view is still refused"   "REFUSED" \
-    "$(R "try{db.getSiblingDB(process.env.TC_DB).vqview.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview.countDocuments({}))}catch(e){print('REFUSED')}")"
 
 # A view whose own pipeline reads another collection stays refused, and the
 # reason is what the archive holds rather than what the view is. The feeder
@@ -226,7 +236,7 @@ chk "a view over a view answers in full"               "10" \
 # link is one the archive has never heard of.
 R "db.getSiblingDB(process.env.TC_DB).createView('vqchainbad','vqview',[])" >/dev/null
 chk "a chain whose second link is missing is refused"  "REFUSED" \
-    "$(R "try{db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}))}catch(e){print('REFUSED')}")"
 
 echo "== a pipeline that joins a view over a tiered collection =="
 # The same blindness, reached from the other side. $lookup, $graphLookup and
@@ -260,6 +270,24 @@ UNIONED=$(R "
   } catch(e) { print('REFUSED'); }")
 chk "a unioned view does not come in short"            "true" \
     "$([ "$UNIONED" = "11" ] || [ "$UNIONED" = "REFUSED" ] && echo true || echo "false (got $UNIONED)")"
+
+# And the half of this that cannot be fixed by refusing: a pipeline answered by
+# the archive that also reads a collection nothing tiers. The archive holds every
+# document of what it is given to tier, and whatever it happened to hold of the
+# rest, so anything written to an untiered collection since the cutover is on the
+# fast tier alone and missing from that answer. Naming it is what the router can
+# do; refusing would take away a report joining a reference collection, which is
+# a shape tiering exists for.
+UNTIERED=$(R "
+  try {
+    print(db.getSiblingDB(process.env.TC_DB).tqview.aggregate([
+      {\$unionWith:{coll:'tqjoin'}}, {\$count:'n'}
+    ]).toArray()[0].n);
+  } catch(e) { print('REFUSED'); }")
+chk "a pipeline reading an untiered collection is named" "true" \
+    "$(grep -q 'answering from the archive a pipeline that reads collections nothing tiers' $LOGDIR/q_r.log && echo true || echo false)"
+chk "and the warning says which collection"             "true" \
+    "$(grep -q 'untiered=\[shop.*tqjoin\]' $LOGDIR/q_r.log && echo true || echo false)"
 
 # A join can also be named from inside a sub-pipeline, where a scan of the
 # top-level stages never looks. $facet is the ordinary way to compute several
