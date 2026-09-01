@@ -2132,6 +2132,12 @@ mistaken for agreement. Reading the feature compatibility version needs a
 privilege the router's own account may not have, and an account that cannot read
 it on both tiers skips that half of the check rather than refusing to start.
 
+There is one ordinary case of that, and it is worth knowing which: **a sharded
+archive.** A mongos answers `buildInfo`, so the releases are still compared, and
+it does not answer `getParameter` for `featureCompatibilityVersion`, so that half
+is skipped. `test/testshardedcold.sh` pins both, along with the rest of what a
+sharded archive has to do.
+
 The four daemons check this: feeder, evictor, warmer and router. The one-shot
 tools do not, because a mismatched pair is exactly when you need `cline
 watermark`, `cline keys` and `cline rollback` to work.
