@@ -62,6 +62,12 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 		return nil, false
 	}
 
+	// An upsert that matches nothing creates a document, and creates the
+	// collection with it when the fast tier does not hold one. A collection
+	// created by a write carries none of the archive's options, and a collation
+	// cannot be added afterwards. See Indexer.EnsureCollection.
+	c.r.indexer.EnsureCollection(ctx, ns)
+
 	// A fast tier that holds all of history has nothing archived that is not
 	// also here, so an upsert matching nothing here matches nothing anywhere and
 	// creating a document is the right answer. This is the same claim the read

@@ -418,6 +418,46 @@ chk "so the router still answers the same"        "2" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+echo "== and the other writes that create the collection =="
+# A copy-up is not the only write that brings a namespace into existence on the
+# fast tier. An insert, an upsert and a bulkWrite each do it too, and a collection
+# created by a write carries none of the archive's options. Measured on a
+# collection the archive holds with {locale:'en',strength:2}: the copy an insert
+# created had none, so the archive answered countDocuments({name:'alice'}) with 3
+# and the fast tier's copy with 0.
+#
+# The drop goes through the router each time, which is what tells the indexer to
+# forget the namespace. A drop straight at the fast tier does not, and that is a
+# limitation of its own.
+#
+# The archive's copy is made here, because the section above ends by dropping
+# both tiers. Without this the archive has no collection to take options from and
+# every check below reads "none" for a reason that has nothing to do with the
+# write paths.
+C "const d=db.getSiblingDB(process.env.TC_DB);
+   d.createCollection('$ONS', {collation:{locale:'en',strength:2},
+     validator:{\$jsonSchema:{bsonType:'object',required:['email'],
+                properties:{email:{bsonType:'string'}}}}});
+   d.$ONS.insertMany([{_id:1,name:'Alice',email:'a@x'},{_id:2,name:'alice',email:'b@x'}]);" >/dev/null
+chk "the archive holds it with a collation again" "en" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+for path in insert upsert bulkWrite; do
+  R "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+  case $path in
+    insert)
+      R "db.getSiblingDB(process.env.TC_DB).$ONS.insertOne({_id:50,name:'Carol',email:'c1@x'})" >/dev/null ;;
+    upsert)
+      R "db.getSiblingDB(process.env.TC_DB).$ONS.updateOne({_id:51},{\$set:{name:'Carol',email:'c2@x'}},{upsert:true})" >/dev/null ;;
+    bulkWrite)
+      R "db.getSiblingDB(process.env.TC_DB).$ONS.bulkWrite([{insertOne:{document:{_id:52,name:'Carol',email:'c3@x'}}}])" >/dev/null ;;
+  esac
+  chk "a $path creates it with the collation"     "en" \
+      "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+            print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+done
+R "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+
 echo "== the same options going the other way, into the archive =="
 # Options travel upward on their own, because an adoption starts with the
 # archive holding everything. Downward nothing carried them: a collection

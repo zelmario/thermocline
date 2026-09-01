@@ -702,6 +702,16 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		return nil, false
 	}
 
+	// An insert is what creates the collection when the fast tier does not hold
+	// it, and a collection created that way carries none of the archive's
+	// options: a default collation decides which documents match and cannot be
+	// added afterwards. Measured on a collection the archive holds with
+	// {locale: "en", strength: 2}: the copy this insert created had none, so the
+	// archive answered countDocuments({name: "alice"}) with 3 and the fast tier's
+	// copy with 0. Memoised inside the indexer, so this is a map lookup once the
+	// fast tier has the collection. See Indexer.EnsureCollection.
+	c.r.indexer.EnsureCollection(ctx, ns)
+
 	ordered := true
 	if v, lerr := cmd.LookupErr("ordered"); lerr == nil {
 		if b, bok := v.BooleanOK(); bok {
