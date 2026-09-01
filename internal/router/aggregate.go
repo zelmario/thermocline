@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -439,13 +440,16 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		// the missing document being the one written to the untiered collection
 		// after the cutover.
 		//
-		// Not a refusal, because the shape is a legitimate one this often gets
-		// right: a report joining a small reference collection that has not
-		// changed since the adoption is exactly what tiering is for, and
-		// refusing it would take away a working query to prevent a possible
-		// short answer. So it is named, every time, which is what an operator
-		// can act on. See the limitation in README.
-		c.warnUntieredFromArchive(scope)
+		// Refused, which is the standing rule here: a refusal is a limitation
+		// and a wrong answer is a bug. It was a warning for one afternoon, on
+		// the reasoning that a report joining a reference collection that has
+		// not changed since the adoption is right more often than it is wrong.
+		// That reasoning trades somebody else's correctness for our convenience,
+		// and the answer it lets through is short with no error on it, which is
+		// the failure this project treats as worst.
+		if out, done := c.refuseUntieredFromArchive(msg, scope); done {
+			return out, true
+		}
 
 		// Judged before it runs, so the fast tier has not seen it and nothing
 		// has consulted this client's permissions yet.
@@ -567,8 +571,8 @@ func changeStreamResumedFrom(cmd bson.Raw) (string, bool) {
 	return "", false
 }
 
-// warnUntieredFromArchive names the collections in a pipeline that this system
-// does not tier, when the pipeline is about to be answered by the archive.
+// refuseUntieredFromArchive refuses a pipeline the archive would answer that also
+// reads a collection this system does not tier.
 //
 // The archive holds every document of a tiered collection, which is what makes
 // the fallback correct. It holds whatever it happened to hold of an untiered one:
@@ -576,7 +580,14 @@ func changeStreamResumedFrom(cmd bson.Raw) (string, bool) {
 // anything written to an untiered collection since the cutover is on the fast
 // tier alone. A pipeline that reads both is answered by one tier, and for that
 // half the answer is short.
-func (c *conn) warnUntieredFromArchive(s aggScope) {
+//
+// Measured on a $unionWith of an untiered collection with a view over a tiered
+// one: 10 where the two clusters together hold 11, the missing document being the
+// one written to the untiered collection after the cutover. Neither the pilot nor
+// the comparison harness can see that. The pilot's untiered collections were
+// restored into the archive and never written to again, and the harness asks the
+// archive the same question and gets the same short answer.
+func (c *conn) refuseUntieredFromArchive(msg *wire.Message, s aggScope) (*wire.Message, bool) {
 	var untiered []string
 	for _, ns := range append([]string{s.primary}, s.secondary...) {
 		if ns == "" || c.r.cfg.Manages(ns) {
@@ -585,13 +596,29 @@ func (c *conn) warnUntieredFromArchive(s aggScope) {
 		untiered = append(untiered, ns)
 	}
 	if len(untiered) == 0 {
-		return
+		return nil, false
 	}
 	sort.Strings(untiered)
-	c.log.Warn("answering from the archive a pipeline that reads collections nothing tiers",
+
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a pipeline the archive would answer that reads collections nothing tiers",
 		"ns", s.primary, "untiered", untiered,
-		"effect", "the archive holds whatever it held of those on the day it was adopted, so "+
-			"anything written to them since is missing from this answer",
+		"reason", "the archive holds whatever it held of those on the day it was adopted, because "+
+			"the feeder mirrors only what it is told to tier",
+		"effect", "answering would have been short by everything written to them since the cutover, "+
+			"with no error on it",
 		"action", "tier the collections this pipeline reads, or warm the tiered ones so the fast "+
 			"tier can answer it whole")
+	out, err := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this pipeline because the fast tier cannot answer it whole and it "+
+			"reads "+strings.Join(untiered, ", ")+", which nothing here tiers. The archive would "+
+			"answer the rest of it, and it holds only what those collections contained when it was "+
+			"adopted: everything written to them since is on the fast tier alone, so the answer "+
+			"would be short with no error on it. Tier them, or warm the tiered collections this "+
+			"pipeline reads so the fast tier can answer it whole.")
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }

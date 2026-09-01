@@ -271,23 +271,31 @@ UNIONED=$(R "
 chk "a unioned view does not come in short"            "true" \
     "$([ "$UNIONED" = "11" ] || [ "$UNIONED" = "REFUSED" ] && echo true || echo "false (got $UNIONED)")"
 
-# And the half of this that cannot be fixed by refusing: a pipeline answered by
-# the archive that also reads a collection nothing tiers. The archive holds every
-# document of what it is given to tier, and whatever it happened to hold of the
-# rest, so anything written to an untiered collection since the cutover is on the
-# fast tier alone and missing from that answer. Naming it is what the router can
-# do; refusing would take away a report joining a reference collection, which is
-# a shape tiering exists for.
+# A pipeline the archive would answer that also reads a collection nothing tiers.
+# The archive holds every document of what it is given to tier, and whatever it
+# happened to hold of the rest, so anything written to an untiered collection
+# since the cutover is on the fast tier alone. Answering would be short for that
+# half, with no error on it, which is the failure this project treats as worst.
+# Measured before it was refused: 10 where the two clusters together hold 11.
 UNTIERED=$(R "
   try {
     print(db.getSiblingDB(process.env.TC_DB).tqview.aggregate([
       {\$unionWith:{coll:'tqjoin'}}, {\$count:'n'}
     ]).toArray()[0].n);
   } catch(e) { print('REFUSED'); }")
-chk "a pipeline reading an untiered collection is named" "true" \
-    "$(grep -q 'answering from the archive a pipeline that reads collections nothing tiers' $LOGDIR/q_r.log && echo true || echo false)"
-chk "and the warning says which collection"             "true" \
-    "$(grep -q 'untiered=\[shop.*tqjoin\]' $LOGDIR/q_r.log && echo true || echo false)"
+chk "a pipeline reading an untiered collection is refused" "REFUSED" "$UNTIERED"
+chk "and the refusal names the collection"                 "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tqview.aggregate([{\$unionWith:{coll:'tqjoin'}},{\$count:'n'}]).toArray();print('ANSWERED')}catch(e){print(/tqjoin/.test(e.message))}")"
+chk "and says what to do about it"                        "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tqview.aggregate([{\$unionWith:{coll:'tqjoin'}},{\$count:'n'}]).toArray();print('ANSWERED')}catch(e){print(/Tier them, or warm/.test(e.message))}")"
+# And the same pipeline once the fast tier can answer it whole is not refused,
+# because then nothing goes to the archive and the untiered half is right here.
+cline watermark --config $CFG --ns $DB.tqview --complete-all --force >/dev/null 2>&1
+sleep 7
+chk "but allowed once the fast tier claims it all"        "4" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).tqview.aggregate([{\$unionWith:{coll:'tqjoin'}},{\$count:'n'}]).toArray()[0].n)}catch(e){print('REFUSED')}")"
+cline watermark --config $CFG --ns $DB.tqview --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+sleep 7
 
 # A join can also be named from inside a sub-pipeline, where a scan of the
 # top-level stages never looks. $facet is the ordinary way to compute several
