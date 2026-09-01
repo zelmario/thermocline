@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sort"
 	"syscall"
+	"time"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/router"
@@ -25,6 +26,10 @@ func runKeys(args []string) error {
 	fs := flag.NewFlagSet("keys", flag.ExitOnError)
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
 	rebuild := fs.Bool("rebuild", false, "claim a key for every document that already exists")
+	prune := fs.Bool("prune", false,
+		"remove claims no live document holds any more, which is how the registry stops growing")
+	pruneFor := fs.Duration("prune-for", time.Minute,
+		"how long to spend pruning before stopping; a claim not reached is a claim that stays")
 	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -66,12 +71,42 @@ func runKeys(args []string) error {
 		return nil
 	}
 
+	if *prune {
+		// The registry only ever grew: a claim is permanent on purpose, because
+		// evicting a document takes its index entry off the fast tier and the
+		// claim is what remembers the value was taken. Nothing removed one whose
+		// document has been deleted from both tiers, and the registry lives on
+		// the fast tier. Measured on 500 inserts and 500 deletes: nought
+		// documents on either tier, 500 claims still there.
+		removed, err := r.PruneKeys(ctx, guarded, *pruneFor)
+		if err != nil {
+			return err
+		}
+		names := make([]string, 0, len(removed))
+		total := 0
+		for ns, n := range removed {
+			names = append(names, ns)
+			total += n
+		}
+		sort.Strings(names)
+		for _, ns := range names {
+			if removed[ns] > 0 {
+				fmt.Printf("%s: removed %d claim(s) nothing holds\n", ns, removed[ns])
+			}
+		}
+		if total == 0 {
+			fmt.Println("every claim is still held by a live document, so nothing was removed")
+		}
+		return nil
+	}
+
 	if !*rebuild {
 		fmt.Println("unique indexes enforced across both tiers:")
 		for _, ns := range guarded {
 			fmt.Printf("  %s\n", ns)
 		}
-		fmt.Println("\nrun with --rebuild to claim keys for documents that already exist")
+		fmt.Println("\nrun with --rebuild to claim keys for documents that already exist,")
+		fmt.Println("or --prune to remove claims no live document holds any more")
 		return nil
 	}
 

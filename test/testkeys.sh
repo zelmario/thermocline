@@ -232,6 +232,43 @@ evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkmrg.deleteMany({})'
 chk "  the fast tier is empty again"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkmrg.countDocuments({}))')"
 chk "  and a duplicate of one is refused"    "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkmrg.insertOne({_id:9,email:"o1@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== the registry has to stop growing, without forgetting what matters =="
+# A claim is permanent on purpose: evicting a document takes its index entry off
+# the fast tier, and the claim is what remembers the value was taken. Nothing
+# removed one whose document had been deleted from both tiers, and the registry
+# lives on the fast tier, which is the small expensive one. Measured on 500
+# inserts and 500 deletes: nought documents on either tier, 500 claims still
+# there, which is history-shaped growth on the wrong tier.
+#
+# What makes pruning safe is that it asks the question a collision asks: does any
+# live document still hold this value. The claim that must survive is the evicted
+# one, which is the only reason the registry exists.
+fresh tkprune '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkprune.insertMany([{_id:1,email:"pev@x.com"},{_id:2,email:"pdel@x.com"},{_id:3,email:"plive@x.com"}])' >/dev/null
+waitMirrored tkprune 3
+R 'db.getSiblingDB(process.env.TC_DB).tkprune.deleteOne({_id:2})' >/dev/null
+waitMirrored tkprune 2
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkprune.deleteOne({_id:1})'
+chk "three keys are claimed to begin with"     "3" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkprune"}))')"
+chk "the fast tier holds one of the three"     "1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkprune.countDocuments({}))')"
+PRUNED=$(cline keys --config $CFG --prune 2>&1 | tail -2 | tr '\n' ' ')
+chk "pruning removes the deleted one only"     "2" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkprune"}))')"
+chk "and says what it removed"                 "true" \
+    "$(grep -q 'removed 1 claim' <<<"$PRUNED" && echo true || echo false)"
+# The two that matter, after the prune: the evicted document's key is still
+# defended, and the deleted document's key is free.
+chk "a duplicate of the evicted key is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkprune.insertOne({_id:9,email:"pev@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and the deleted key can be taken again"    "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkprune.insertOne({_id:10,email:"pdel@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# Twice in a row removes nothing more: it is the state that decides, not the run.
+cline keys --config $CFG --prune >/dev/null 2>&1
+chk "a second prune removes nothing"            "3" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkprune"}))')"
+
 echo "== a key a document moves off must become reusable =="
 # Nothing is evicted here. One document takes a value and then leaves it, so the
 # value is unused and the next document must be allowed to have it. A claim that

@@ -1224,3 +1224,218 @@ type idCheck struct {
 // the one answer that is safe: an insert of an id the archive holds is mirrored
 // over the archived document, which destroys it.
 var errIDCheckPanicked = errors.New("the check for archived ids panicked")
+
+// pruneBatch is how many claims are checked with one query per tier.
+const pruneBatch = 200
+
+// PruneKeys removes claims no live document holds any more.
+//
+// A claim is permanent on purpose: evicting a document takes its index entry off
+// the fast tier, and the registry is what remembers the value was taken. Nothing
+// removed a claim whose document has been deleted from both tiers, though, and
+// the registry lives on the fast tier, which is the small expensive one. Measured
+// on 500 inserts into a collection with one unique index, then deleting all 500:
+// the fast tier held nought documents, the archive nought live ones, and the
+// registry still held 500 claims. At any real insert rate that grows with history
+// for ever, which is the cost tiering exists to avoid, on the wrong tier.
+//
+// What makes removing one safe is that it is the same test a collision applies.
+// tryClaim already asks whether the owner still exists and still carries the
+// value, and hands the key over when it does not. This asks the same question
+// ahead of the collision, in batches: for a batch of claims, ask each tier which
+// of those key values a live document still holds, and delete the rest.
+//
+// Bounded by budget, and safe to interrupt: a claim it did not reach is a claim
+// that stays, and the next run starts again. Nothing is written except deletions.
+func (r *Router) PruneKeys(ctx context.Context, namespaces []string, budget time.Duration) (map[string]int, error) {
+	removed := map[string]int{}
+	deadline := time.Now().Add(budget)
+	if budget <= 0 {
+		deadline = time.Now().Add(time.Minute)
+	}
+
+	for _, ns := range namespaces {
+		idxs := r.uniqueIndexes(ctx, ns)
+		byName := map[string]uniqueIndex{}
+		for _, idx := range idxs {
+			byName[idx.name] = idx
+		}
+
+		cur, err := r.keys().Find(ctx, bson.D{{Key: "ns", Value: ns}})
+		if err != nil {
+			return removed, err
+		}
+		batch := map[string][]keyClaim{}
+		flush := func() error {
+			for name, claims := range batch {
+				idx, known := byName[name]
+				if !known {
+					// The index itself is gone, so nothing enforces this value
+					// any more and the claim describes a constraint that does
+					// not exist. Those go wholesale.
+					ids := make([]string, 0, len(claims))
+					for _, c := range claims {
+						ids = append(ids, c.ID)
+					}
+					if _, derr := r.keys().DeleteMany(ctx,
+						bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}); derr != nil {
+						return derr
+					}
+					removed[ns] += len(ids)
+					continue
+				}
+				n, perr := r.pruneClaims(ctx, ns, idx, claims)
+				if perr != nil {
+					return perr
+				}
+				removed[ns] += n
+			}
+			batch = map[string][]keyClaim{}
+			return nil
+		}
+
+		count := 0
+		for cur.Next(ctx) {
+			var claim keyClaim
+			if cur.Decode(&claim) != nil {
+				continue
+			}
+			batch[claim.Index] = append(batch[claim.Index], claim)
+			count++
+			if count%pruneBatch == 0 {
+				if ferr := flush(); ferr != nil {
+					_ = cur.Close(context.WithoutCancel(ctx))
+					return removed, ferr
+				}
+				if time.Now().After(deadline) {
+					_ = cur.Close(context.WithoutCancel(ctx))
+					r.log.Info("stopped pruning the key registry at the time budget",
+						"ns", ns, "removed", removed[ns],
+						"note", "a claim not reached is a claim that stays; run it again")
+					return removed, nil
+				}
+			}
+		}
+		if cerr := cur.Err(); cerr != nil {
+			_ = cur.Close(context.WithoutCancel(ctx))
+			return removed, cerr
+		}
+		_ = cur.Close(context.WithoutCancel(ctx))
+		if ferr := flush(); ferr != nil {
+			return removed, ferr
+		}
+	}
+	return removed, nil
+}
+
+// pruneClaims deletes the claims in one batch that no live document holds.
+//
+// One query per tier for the whole batch, asked in the index's own comparison,
+// and the answer is turned back into key ids so a document that has moved off a
+// value does not keep it alive.
+func (r *Router) pruneClaims(ctx context.Context, ns string, idx uniqueIndex, claims []keyClaim) (int, error) {
+	if len(claims) == 0 {
+		return 0, nil
+	}
+	want := map[string]bool{}
+	var clauses bson.A
+	for _, c := range claims {
+		vals, ok := valuesFromKeyID(ns, idx, c.ID)
+		if !ok {
+			// A key id this cannot read is one it must not act on.
+			continue
+		}
+		want[c.ID] = true
+		clause := bson.D{}
+		for i, f := range idx.fields {
+			clause = append(clause, bson.E{Key: f, Value: vals[i]})
+		}
+		clauses = append(clauses, clause)
+	}
+	if len(clauses) == 0 {
+		return 0, nil
+	}
+
+	db, coll := splitNS(ns)
+	held := map[string]bool{}
+	for _, src := range []struct {
+		client *mongo.Client
+		filter bson.D
+	}{
+		{r.hot, bson.D{{Key: "$or", Value: clauses}}},
+		{r.cold, bson.D{meta.NotArchivedDeleted(), {Key: "$or", Value: clauses}}},
+	} {
+		opts := options.Find()
+		if len(idx.collation) > 0 {
+			opts.SetCollation(collationFromSpec(idx.collation))
+		}
+		cur, err := src.client.Database(db).Collection(coll).Find(ctx, src.filter, opts)
+		if err != nil {
+			return 0, err
+		}
+		for cur.Next(ctx) {
+			doc := bson.Raw(cur.Current)
+			if !r.constrains(ctx, db, idx, doc) {
+				continue
+			}
+			if kid, ok := keyID(ns, idx, doc); ok {
+				held[kid] = true
+			}
+		}
+		if cerr := cur.Err(); cerr != nil {
+			_ = cur.Close(context.WithoutCancel(ctx))
+			return 0, cerr
+		}
+		_ = cur.Close(context.WithoutCancel(ctx))
+	}
+
+	var dead []string
+	for id := range want {
+		if !held[id] {
+			dead = append(dead, id)
+		}
+	}
+	if len(dead) == 0 {
+		return 0, nil
+	}
+	res, err := r.keys().DeleteMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: dead}}}})
+	if err != nil {
+		return 0, err
+	}
+	return int(res.DeletedCount), nil
+}
+
+// valuesFromKeyID reads a key id back into the values it was built from.
+//
+// The id is ns|index|base64(bson document of the index's fields), which is
+// exactly the values, canonicalised. Reading them back is how a prune can ask
+// whether anything still holds a key without having the document that made it.
+func valuesFromKeyID(ns string, idx uniqueIndex, id string) ([]any, bool) {
+	prefix := ns + "|" + idx.name + "|"
+	if !strings.HasPrefix(id, prefix) {
+		return nil, false
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(id, prefix))
+	if err != nil {
+		return nil, false
+	}
+	doc := bson.Raw(raw)
+	elems, err := doc.Elements()
+	if err != nil || len(elems) != len(idx.fields) {
+		return nil, false
+	}
+	out := make([]any, len(idx.fields))
+	for i, f := range idx.fields {
+		v, lerr := doc.LookupErr(f)
+		if lerr != nil {
+			return nil, false
+		}
+		if v.Type == bson.TypeNull {
+			out[i] = nil
+			continue
+		}
+		out[i] = v
+	}
+	return out, true
+}

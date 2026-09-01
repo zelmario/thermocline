@@ -928,7 +928,27 @@ bin/cline keys --config cline.yaml --rebuild    # claim keys for existing docume
 ```
 
 It is safe to re-run, and it is also how the registry comes back after a fast
-tier is rebuilt, since it lives there. If it finds one key held by two live
+tier is rebuilt, since it lives there.
+
+**And it has to be pruned, or it grows with history on the wrong tier.** A claim
+is permanent on purpose: evicting a document takes its index entry off the fast
+tier, and the claim is what remembers the value was taken. Nothing removed one
+whose document had been deleted from both tiers. Measured on 500 inserts into a
+collection with one unique index, then deleting all 500: nought documents on
+either tier, 500 claims still there, about 100 bytes each, on the fast tier.
+
+```
+bin/cline keys --config cline.yaml --prune              # remove claims nothing holds
+bin/cline keys --config cline.yaml --prune --prune-for 10m
+```
+
+It asks the question a collision asks: does any live document still hold this
+value, in the index's own comparison, one query per tier for a batch of claims. A
+claim whose document lives in the archive alone is kept, which is the only reason
+the registry exists; a claim whose document has been deleted from both tiers goes,
+and that key can be used again. Bounded by `--prune-for` and safe to interrupt: a
+claim it did not reach is a claim that stays. Run it on a schedule beside
+whatever else maintains the deployment. If it finds one key held by two live
 documents it says so and picks no winner, because that means the constraint was
 already broken.
 

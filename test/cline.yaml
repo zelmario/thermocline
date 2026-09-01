@@ -159,6 +159,9 @@ feeder:
     # testkeys.sh again, for a $merge matching on a numeric field. A separate
     # collection for the same reason: its unique index is on another field.
     - "shop.tkmrg2"
+    # testkeys.sh: pruning the registry, which needs its own collection because
+    # the check counts the claims for exactly one namespace.
+    - "shop.tkprune"
     # testmerge.sh again, in another database, because $merge resolves its
     # target through `into: {db, coll}` and that resolution is what a guard
     # reading only the collection name would get wrong. tmrefx is the untiered

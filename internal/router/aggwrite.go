@@ -601,6 +601,15 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 					// the ordinary refusal stands.
 					return nil, false
 				}
+				// And the same refusal a read gets, for the same reason: an
+				// input read from the archive that also reads a collection
+				// nothing tiers is short by whatever was written to it since
+				// the cutover, and this one would write that short answer into
+				// the target. This path runs before the read guard, so it has
+				// to ask for itself.
+				if out, done := c.refuseUntieredFromArchive(msg, scope); done {
+					return out, true
+				}
 				fromArchive = true
 			}
 		}
