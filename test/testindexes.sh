@@ -222,6 +222,64 @@ chk "the report then shows only the TTL one left" "true" \
 H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
 
+echo "== a TTL index on the archive, which is the archive deleting history =="
+# The one finding here that is not about speed. Every other line this suite
+# checks is a read being slower than it could be; a TTL index on the archive is
+# documents leaving the only tier that was keeping them, on a schedule nothing
+# here set. On an adoption it arrives with the cluster, and it is invisible from
+# the fast tier: a read the fast tier answers whole never asks the archive, and a
+# read that falls through comes back short with no error on it.
+#
+# Nothing reported it, which is what these checks are about. Both the report an
+# operator runs before adopting and the daemons that read the archive's indexes
+# have to say it.
+XNS=tidxrep
+H "db.getSiblingDB(process.env.TC_DB).$XNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$XNS.drop()" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$XNS;
+   c.insertOne({_id:1, createdAt:new Date()});
+   c.createIndex({createdAt:1},{expireAfterSeconds:2592000, name:'arch_ttl'});" >/dev/null
+XREP=$(cline indexes --config $CFG --ns $DB.$XNS 2>&1)
+chk "the report says the archive expires this one" "true" \
+    "$(grep -q 'the ARCHIVE expires documents of this collection' <<<"$XREP" && echo true || echo false)"
+chk "and names the index and the interval"        "true" \
+    "$(grep -qE 'arch_ttl.*720h' <<<"$XREP" && echo true || echo false)"
+chk "and says the fall-through answer is short"   "true" \
+    "$(grep -q 'short by whatever expired' <<<"$XREP" && echo true || echo false)"
+chk "--commands offers the drop, not a create"    "1" \
+    "$(cline indexes --config $CFG --ns $DB.$XNS --commands 2>&1 | grep -c "dropIndex(\"arch_ttl\")" || true)"
+# Two tiers whose indexes agree perfectly can still be losing history, so the
+# finding must not be hidden behind "every index the fast tier has, the archive
+# has too".
+H "const c=db.getSiblingDB(process.env.TC_DB).$XNS;
+   c.insertOne({_id:2, createdAt:new Date()});" >/dev/null
+chk "and it is reported even when nothing is missing" "true" \
+    "$(cline indexes --config $CFG --ns $DB.$XNS 2>&1 | grep -q 'expiring documents of tiered collections' && echo true || echo false)"
+
+# And the daemons say it themselves, because an operator who never runs the
+# report should still find it in a log. The router asks the indexer for every
+# namespace it manages at startup, which is where the archive's indexes are read.
+stopDaemons
+rm -f $LOGDIR/idx_r.log
+startRouter
+# The indexer runs in the background behind the router's port, so the warning can
+# land a moment after it answers a ping.
+for _ in $(seq 1 40); do
+  grep -q 'the archive expires documents of a tiered collection' $LOGDIR/idx_r.log && break
+  sleep 0.5
+done
+chk "the router warns about it once per namespace" "1" \
+    "$(grep -c 'the archive expires documents of a tiered collection' $LOGDIR/idx_r.log || true)"
+chk "and the warning names the interval"          "true" \
+    "$(grep -qE 'after=720h' $LOGDIR/idx_r.log && echo true || echo false)"
+chk "and it says what the operator can do"        "true" \
+    "$(grep -q 'drop it on the archive to keep that history' $LOGDIR/idx_r.log && echo true || echo false)"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$XNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$XNS.drop()" >/dev/null
+startFeeder
+startRouter
+
 echo "== the collection an adoption starts with, written to before it is read =="
 # The shape every adoption has: the existing cluster becomes the archive
 # carrying the application's indexes, the fast tier is new and empty, and the

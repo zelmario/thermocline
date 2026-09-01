@@ -94,7 +94,12 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 		ix.mu.Unlock()
 		return
 	}
-	ix.state[ns] = indexState{lastTry: time.Now()}
+	// The create half is carried through rather than reset. Ensure and
+	// EnsureCollection answer different questions about the same namespace, and
+	// an Ensure that forgot the collection was already made cost the next insert
+	// a create it did not need. Forget is what clears it, because a drop is the
+	// only thing that makes it untrue.
+	ix.state[ns] = indexState{lastTry: time.Now(), created: st.created, lastCreated: st.lastCreated}
 	ix.mu.Unlock()
 
 	if err := ix.build(ctx, ns); err != nil {
@@ -105,7 +110,8 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 		return
 	}
 	ix.mu.Lock()
-	ix.state[ns] = indexState{done: true, lastTry: time.Now()}
+	st = ix.state[ns]
+	ix.state[ns] = indexState{done: true, lastTry: time.Now(), created: st.created, lastCreated: st.lastCreated}
 	ix.mu.Unlock()
 }
 
@@ -216,10 +222,11 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 		return err
 	}
 
-	want, err := archiveIndexes(ctx, ix.cold, db, coll)
+	want, expiring, err := archiveIndexes(ctx, ix.cold, db, coll)
 	if err != nil {
 		return err
 	}
+	ix.warnArchiveExpires(ns, expiring)
 	if len(want) == 0 {
 		// A collection the archive has no indexes for is nothing to do, and
 		// counts as done: there is no point asking again every minute.
@@ -285,6 +292,34 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 			"why", "the fast tier is filled with documents and an index is not a document")
 	}
 	return failed
+}
+
+// warnArchiveExpires reports a TTL index on the archive's side of a tiered
+// collection.
+//
+// The archive is the tier that exists to keep history, and a TTL index on it
+// deletes that history on a schedule nothing here set. On an adoption it arrives
+// with the cluster: the application put it on what used to be its only database,
+// and the day that database became the archive the index went on doing what it
+// always did. Nothing said so, and the loss is invisible from the fast tier,
+// because a read the fast tier answers whole never asks the archive. A read that
+// falls through gets an answer short by whatever expired, with no error on it.
+//
+// A warning rather than a refusal, and rather than dropping it. Expiry may be
+// exactly what the deployment wants, and an index the application created is not
+// ours to remove. What was missing was the sentence saying it is happening.
+//
+// Once per namespace per process: build runs once per namespace unless it fails.
+func (ix *Indexer) warnArchiveExpires(ns string, expiring []ttlIndex) {
+	for _, t := range expiring {
+		ix.log.Warn("the archive expires documents of a tiered collection",
+			"ns", ns, "index", t.name, "field", t.field,
+			"after", (time.Duration(t.secs) * time.Second).String(),
+			"effect", "history leaves the tier that exists to keep it, and a read that falls "+
+				"through to the archive is short by whatever has expired, with no error on it",
+			"action", "drop it on the archive to keep that history, or leave it if the expiry is "+
+				"deliberate; the fast tier never carries a TTL index, see cline indexes")
+	}
 }
 
 // createIndexes sends the archive's own index specifications to the fast tier.
@@ -619,6 +654,14 @@ type archiveIndex struct {
 	unique bool
 }
 
+// A ttlIndex is one the archive expires documents with, which is not copied and
+// is worth saying out loud. See archiveIndexes.
+type ttlIndex struct {
+	name  string
+	field string
+	secs  float64
+}
+
 // archiveIndexes lists what the archive has, minus the two kinds that must not
 // be copied.
 //
@@ -632,14 +675,19 @@ type archiveIndex struct {
 // deployment wants that is a decision about the application's data, not
 // something to be inherited silently by warming a namespace, so the archive
 // goes on expiring its own copies and the fast tier does not.
-func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([]archiveIndex, error) {
+//
+// "Goes on expiring its own copies" is the part that was silent, and on an
+// adoption it is the archive deleting the history it was adopted to keep. The
+// ones found are returned separately so the caller can say so.
+func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([]archiveIndex, []ttlIndex, error) {
 	cur, err := cold.Database(db).Collection(coll).Indexes().List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list archive indexes for %s.%s: %w", db, coll, err)
+		return nil, nil, fmt.Errorf("list archive indexes for %s.%s: %w", db, coll, err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	var out []archiveIndex
+	var expiring []ttlIndex
 	for cur.Next(ctx) {
 		var spec bson.D
 		if err := bson.Unmarshal(cur.Current, &spec); err != nil {
@@ -650,6 +698,8 @@ func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([
 			unique bool
 			keyed  bool
 			ttl    bool
+			secs   float64
+			field  string
 			kept   = make(bson.D, 0, len(spec))
 		)
 		for _, e := range spec {
@@ -660,19 +710,48 @@ func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([
 				continue
 			case "expireAfterSeconds":
 				ttl = true
+				secs = numeric(e.Value)
 			case "name":
 				name, _ = e.Value.(string)
 			case "key":
 				keyed = true
+				field = firstKey(e.Value)
 			case "unique":
 				unique, _ = e.Value.(bool)
 			}
 			kept = append(kept, e)
 		}
-		if name == "_id_" || !keyed || ttl {
+		if name == "_id_" || !keyed {
+			continue
+		}
+		if ttl {
+			expiring = append(expiring, ttlIndex{name: name, field: field, secs: secs})
 			continue
 		}
 		out = append(out, archiveIndex{name: name, spec: kept, unique: unique})
 	}
-	return out, cur.Err()
+	return out, expiring, cur.Err()
+}
+
+// numeric reads expireAfterSeconds, which the server may report as any of the
+// number types depending on how it was created.
+func numeric(v any) float64 {
+	switch n := v.(type) {
+	case int32:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case float64:
+		return n
+	}
+	return 0
+}
+
+// firstKey names the field a TTL index expires on, for the warning to quote.
+func firstKey(v any) string {
+	d, ok := v.(bson.D)
+	if !ok || len(d) == 0 {
+		return ""
+	}
+	return d[0].Key
 }

@@ -59,6 +59,10 @@ type indexInfo struct {
 	// take this one with the rest, so it is named rather than left to be
 	// noticed.
 	ttl bool
+	// ttlSecs is how long after the indexed date a document is deleted, quoted
+	// in the report so an operator can tell a 90 day expiry from a 90 second one
+	// without going to look.
+	ttlSecs float64
 	// keyJSON is the key pattern quoted so it can be pasted into a command.
 	// spec is the readable form and is not always valid JavaScript, because an
 	// index on a nested path has a dot in its field name.
@@ -106,6 +110,8 @@ func runIndexes(args []string) error {
 
 	missingTotal := 0
 	var toCreate []nsMissing
+	// Namespaces whose archive copy is being expired by an index of its own.
+	var toStopExpiring []nsMissing
 	for _, ns := range namespaces {
 		db, coll := splitNamespace(ns)
 		if db == "" || coll == "" {
@@ -172,8 +178,32 @@ func runIndexes(args []string) error {
 			}
 		}
 
+		// A TTL index on the archive is not a missing index in either
+		// direction, so nothing above prints it, and on an adoption it is the
+		// archive deleting the history it was adopted to keep. It arrives with
+		// the cluster: the application put it on what used to be its only
+		// database, and the day that database became the archive the index went
+		// on doing what it always did.
+		var expiring []indexInfo
+		for _, m := range coldIdx {
+			if m.ttl {
+				expiring = append(expiring, m)
+			}
+		}
+		if len(expiring) > 0 {
+			sort.Slice(expiring, func(i, j int) bool { return expiring[i].name < expiring[j].name })
+			fmt.Printf("  the ARCHIVE expires documents of this collection:\n")
+			for _, m := range expiring {
+				fmt.Printf("    %-34s %s   (after %s)\n", m.name, m.spec,
+					(time.Duration(m.ttlSecs) * time.Second).String())
+			}
+			fmt.Printf("  that history leaves the tier that exists to keep it, and a read falling\n" +
+				"  through is then short by whatever expired, with no error on it\n")
+			toStopExpiring = append(toStopExpiring, nsMissing{ns: ns, missing: expiring})
+		}
+
 		if len(missing) == 0 {
-			if len(bare) == 0 {
+			if len(bare) == 0 && len(expiring) == 0 {
 				fmt.Printf("  the archive can answer anything the fast tier can\n")
 			}
 			fmt.Print("\n")
@@ -198,6 +228,11 @@ func runIndexes(args []string) error {
 		toCreate = append(toCreate, nsMissing{ns: ns, missing: missing, bare: bare})
 	}
 
+	// Before the index comparison's own verdict, because this one is about data
+	// rather than speed, and because two tiers whose indexes agree perfectly can
+	// still be losing history to an index they both have.
+	printExpiring(toStopExpiring, *commands)
+
 	if missingTotal == 0 {
 		fmt.Println("Every index the fast tier has, the archive has too.")
 		return nil
@@ -218,6 +253,53 @@ number to look at before deciding.
 		printCreateCommands(toCreate)
 	}
 	return nil
+}
+
+// printExpiring says which tiered collections the archive is expiring documents
+// of, and how to stop it.
+//
+// This is the finding that is not about speed. Every other line this command
+// prints is about a read being slower than it could be; a TTL index on the
+// archive is documents leaving the only tier that was keeping them. The fast
+// tier never carries one, so the loss is invisible from there: a read the fast
+// tier answers whole never asks the archive, and a read that falls through comes
+// back short with no error on it.
+//
+// It reports, like the rest of the command. An index the application created is
+// not ours to drop, and a deployment may want the expiry.
+func printExpiring(groups []nsMissing, commands bool) {
+	if len(groups) == 0 {
+		return
+	}
+	total := 0
+	for _, g := range groups {
+		total += len(g.missing)
+	}
+	fmt.Printf("%d TTL index(es) on the archive are expiring documents of tiered collections.\n\n", total)
+	fmt.Print(`The archive is the tier that keeps what the fast tier has stopped holding, and
+these delete from it on a schedule. On an adoption they arrive with the cluster:
+the application put them on what used to be its only database, and the day that
+database became the archive they went on doing what they always did.
+
+Keep them if the expiry is deliberate and the retention they encode is what the
+data should get. Drop them if the archive is meant to hold that history, and
+remember the fast tier never carries a TTL index, so nothing there is expiring.
+`)
+	if !commands {
+		return
+	}
+	fmt.Print("\nRun these against the archive to stop the expiry, if that history should be kept:\n\n")
+	for _, g := range groups {
+		db, coll := splitNamespace(g.ns)
+		for _, m := range g.missing {
+			fmt.Printf("  db.getSiblingDB(%q).%s.dropIndex(%q)\n", db, coll, m.name)
+		}
+	}
+	fmt.Print(`
+Dropping the index does not bring back what has already expired. A document that
+was deleted from the archive is gone unless the fast tier still holds it, and the
+fast tier holds only what is recent enough to be there.
+`)
 }
 
 // printCreateCommands writes the createIndex calls for what the archive is
@@ -361,8 +443,13 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 		if u, ok := raw.Lookup("unique").BooleanOK(); ok && u {
 			info.unique = true
 		}
-		if _, err := raw.LookupErr("expireAfterSeconds"); err == nil {
+		if v, err := raw.LookupErr("expireAfterSeconds"); err == nil {
 			info.ttl = true
+			if secs, ok := v.AsInt64OK(); ok {
+				info.ttlSecs = float64(secs)
+			} else if f, ok := v.DoubleOK(); ok {
+				info.ttlSecs = f
+			}
 		}
 		out[name] = info
 	}

@@ -1177,6 +1177,26 @@ would have the feeder read those expiries as application deletes and tombstone
 the archive's copies, so an index whose job is to remove data would reach into
 the tier that exists to keep it. The archive goes on expiring its own copies.
 
+**And that last sentence used to be the whole of the warning.** An adoption
+inherits the application's TTL index on what is now the archive, so the tier that
+was adopted to keep history goes on deleting it, on a schedule nothing here set.
+It is invisible from the fast tier: a read the fast tier answers whole never asks
+the archive, and a read that falls through comes back short with no error on it.
+So it is now said out loud, in both places an operator looks. The router and the
+warmer warn once per namespace, naming the index, the field and the interval, and
+`cline indexes` reports it as its own finding:
+
+    shop.orders
+      fast tier  4 index(es), archive  5
+      the ARCHIVE expires documents of this collection:
+        created_ttl                        {createdAt: 1}   (after 720h0m0s)
+      that history leaves the tier that exists to keep it, and a read falling
+      through is then short by whatever expired, with no error on it
+
+Reported rather than dropped. The expiry may be exactly what the deployment
+wants, an index the application created is not ours to remove, and dropping it
+does not bring back what has already gone.
+
 **The consequence is that a read which falls through runs with whatever indexes
 the archive happens to have.** For a filter that is slower. For a sort it can be
 worse: past the server's sort memory limit a blocking sort does not degrade, it
@@ -1798,6 +1818,42 @@ holds, which is the hardest shape of bug to notice.
 The feeder now says so, once per collection, naming the field and what it costs.
 It reports rather than refuses, because refusing would stop mirroring that
 collection, which is a larger failure than the one being reported.
+
+### Deleted documents can be given an end date
+
+Keeping the copy is the default and it is deliberate: the archive is where you
+look for what the application no longer has. On a deployment that runs for years
+it is also two problems. The archive grows with every delete it has ever seen,
+and a delete the application issued in order to erase data did not erase it.
+
+`feeder.tombstone_retention` puts an end date on the copy:
+
+    feeder:
+      tombstone_retention: 90d
+
+Absent or zero keeps deleted documents for ever, which is what every version
+before this did. A value gives the archive a TTL index on `_tcDeletedAt`, so
+mongod removes the copy that long after the delete was mirrored. Reads are
+unaffected either way, because a tombstoned copy is already invisible to them:
+what changes is whether the row is still on disk.
+
+Three details worth knowing:
+
+1. **The index is created on the first delete in a namespace,** not at startup.
+   A collection nothing deletes from never gets one, and a feeder that never
+   sees a delete does no extra work.
+2. **Changing the value replaces the index.** `createIndexes` refuses the same
+   name with different options, so a feeder that only created would leave the
+   first schedule running while the config claimed the second. Removing the knob
+   drops the index, which is how you get the audit trail back.
+3. **mongod expires TTL indexes once a minute,** so a retention is a floor, not
+   an instant. Anything under `1m` is refused rather than rounded, because a
+   misplaced unit is worth catching before a deployment believes its deletes
+   erase in seconds.
+
+Retention is per feeder, not per namespace. A deployment that needs one
+collection kept for ever and another purged after a month wants two feeders with
+their own namespace lists, which is also how you would split the mirroring load.
 
 ## Adopting a cluster you already have
 
