@@ -393,6 +393,26 @@ Range queries are governed by the watermark below.
 
   A collection nothing tiers may still be capped or a time series collection,
   and an ordinary `create` on a tiered name is untouched.
+- **A collection using queryable encryption cannot be tiered.** Its documents
+  would copy across the way any binary field does, so mirroring reports success.
+  What does not copy is the state that makes its fields searchable: mongod keeps
+  that in the `enxcol_` collections it creates beside the data, and nothing here
+  tiers those. An encrypted read that fell through would be answered from an
+  archive holding the documents without it. The feeder refuses such a namespace
+  at startup, and refuses an `enxcol_` collection named directly, which belongs
+  to mongod rather than to the application.
+- **An empty `feeder.namespaces` is checked as well now.** It means every
+  collection of every database, and it used to mean nothing was checked at all:
+  the configuration that mirrors the most did the least checking, so a capped
+  collection anywhere in the deployment was mirrored and the archive tombstoned
+  its history at the first rollover. The refusal now names it and says to list
+  the namespaces to mirror instead.
+
+  Only the kinds that are actually mirrored block it. Nothing of a view or a
+  time series collection is ever mirrored, so finding one while mirroring
+  everything is not a mistake and does not stop the feeder; naming one in the
+  config still is, because that says the namespace is being tiered and it never
+  will be.
 - **A TTL index on a tiered collection is refused.** It would do the opposite of
   what it says. The command reaches the fast tier, which holds only the recent
   part of the collection, so the index expires the documents that were recent
@@ -1197,6 +1217,41 @@ Reported rather than dropped. The expiry may be exactly what the deployment
 wants, an index the application created is not ours to remove, and dropping it
 does not bring back what has already gone.
 
+**Every index build this system starts commits on a majority**, not on every
+voting member, which is mongod's default. The default is what lets one member
+stop an index build: it never commits, `createIndexes` never returns, and
+everything else on that cluster carries on working. The router builds the fast
+tier's indexes before it opens its listener, so what hangs is the start of the
+proxy, with nothing in the log to say why. Found on this project's own cluster
+after one member came up on the wrong address: a build sat nineteen minutes and
+read exactly like a hung proxy.
+
+Measured afterwards on a three member 8.0.26 set with a thousand documents:
+
+| commit quorum | members up | build |
+|---|---|---|
+| `votingMembers` (default) | 3 of 3 | 164ms |
+| `votingMembers` (default) | 2 of 3 | did not return in 90s |
+| `majority` | 2 of 3 | 117ms |
+
+One detail decides whether you ever see this: a build on an **empty** collection
+skips the two-phase protocol and needs no votes, so the shape that stalls is a
+fast tier that already holds documents, which is every fast tier after the first
+warm.
+
+A majority is what the rest of this system already waits for, and a member behind
+builds the index when it catches up, the same as it applies everything else. The
+startup build is bounded as well, at five minutes per namespace, after which the
+router says which namespace it gave up on and what is not being enforced, and
+goes on starting: an application in front of a proxy that will not start is down.
+
+The warmer deliberately does not have that bound. It builds a namespace's indexes
+before it fills it, and a unique index built after the duplicates have been
+written will not build at all, so a warmer that gave up and filled anyway would
+trade a stalled pass for a constraint that never comes back. A stalled pass is
+visible: `thermocline_daemon_seconds_since_pass{daemon="warmer"}` climbs, which
+is alert 5.
+
 **The consequence is that a read which falls through runs with whatever indexes
 the archive happens to have.** For a filter that is slower. For a sort it can be
 worse: past the server's sort memory limit a blocking sort does not degrade, it
@@ -1396,7 +1451,19 @@ its copy, and the document is lost from both tiers. Negative is behind, which is
 the direction that loses data. The evictor measures this against the archive on
 every pass.
 
-**7. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
+**7. A series that is absent, which is the failure no threshold catches.** Every
+alert above compares a number, and a daemon that never started publishes no
+number at all: the evictor's `seconds_since_pass` climbs when it stops and does
+not exist when it was never run, so `> 600` never fires. Name the daemons you
+expect and alert on their absence.
+
+Mirroring is handled in the export instead, because it is the one that matters
+most: with no position and no checkpoint, `thermocline_mirroring_lag_seconds`
+reports `+Inf` rather than vanishing, so the first alert anyone builds fires for a
+feeder that has never run as well as one that has stopped. The router's own
+absence is the scrape target going down, which is `up == 0` on the job.
+
+**8. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
 zero. Investigate.** The first is a client reading a collection it has no
 permission for, refused. The second is a message the router could not inspect,
 which means it was forwarded unguarded; a compressed connection is the cause, and
@@ -1444,6 +1511,22 @@ groups:
         labels: {severity: ticket}
         annotations:
           summary: "{{ $labels.daemon }}'s clock is ahead of the archive's; the windows differ from the configuration"
+      - alert: ThermoclineDaemonMissing
+        # One per daemon you run: absent() needs the label spelled out, and an
+        # evictor nobody configured is not a fault. This is what a daemon that
+        # has never started looks like, where seconds_since_pass has nothing to
+        # compare.
+        expr: absent(thermocline_daemon_seconds_since_pass{daemon="evictor"})
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "the evictor has never reported; check whether it is running at all"
+      - alert: ThermoclineRouterDown
+        expr: up{job="thermocline"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "the router is not answering its metrics endpoint"
       - alert: ThermoclineUnguardedOrUnauthorized
         expr: increase(thermocline_unauthorized_total[15m]) > 0
           or increase(thermocline_unreadable_total[15m]) > 0
@@ -2227,6 +2310,18 @@ documents it reads are on the fast tier, and then fails with the archive's own
 error naming a stage the application has always used. Nothing about that reads
 as a version problem.
 
+Measured on 8.0.26 over 7.0.37 with the skew allowed: `$convert` with `format`,
+which 8.0 accepts and 7.0 refuses, answered a point read from fast tier documents
+and failed over the same collection when the archive had to answer it, with
+`$convert found an unknown argument: format`.
+
+**So the router adds a sentence to that error**, naming both releases and saying
+that a read the fast tier cannot answer in full is sent to the archive as the
+application wrote it. Only when the archive is the older tier, and only for an
+error that is a server refusing to recognise a name: a duplicate key, a timeout
+or a genuinely malformed query gets the archive's words and nothing added, or a
+version note becomes something to chase on every unrelated error.
+
 Patch releases may differ, and the log says so once. One tier is always upgraded
 before the other, so demanding an identical patch would refuse to start in the
 middle of every rolling upgrade, in exchange for nothing: a patch release adds
@@ -2262,6 +2357,73 @@ note rather than a case.
 The four daemons check this: feeder, evictor, warmer and router. The one-shot
 tools do not, because a mismatched pair is exactly when you need `cline
 watermark`, `cline keys` and `cline rollback` to work.
+
+**Upgrading a major.minor release, then, is a procedure rather than a restart.**
+The tiers differ for as long as it takes, and the rule says they may not, so the
+order matters and one direction is safer than the other:
+
+1. **Set `allow_version_skew: true`** and restart the daemons. Nothing else in
+   this list can happen while they refuse to start.
+2. **Upgrade the archive first.** This is the half that is not obvious and it
+   follows from how a fall-through works: the archive runs the client's own
+   query, not a rewritten one, so an archive newer than the fast tier understands
+   everything the application can send it. The other order gives you an archive
+   that fails on a stage the fast tier has just learned, and only for the
+   queries whose documents have aged out, which is the hardest shape of failure
+   to attribute.
+3. **Then the fast tier.**
+4. **Then `setFeatureCompatibilityVersion` on the archive, then on the fast
+   tier**, for the same reason in the same order.
+5. **Remove `allow_version_skew`** and restart the daemons, so the guard is back
+   on before the next thing goes wrong.
+
+Between steps 1 and 5 the pair is unguarded, which is why the log repeats the
+warning at every start. `cline indexes` and `cline watermark` keep working
+throughout; they never checked.
+
+### Backups
+
+The archive is the complete copy, so it is the one to back up. That is the whole
+point of the shape: the fast tier holds a recent slice, and a `mongodump` of it
+captures exactly that slice however long the cluster has been running.
+
+What to take, and where each piece lives:
+
+- **The archive's application databases.** Every document the feeder has
+  mirrored, live and tombstoned, lagging by mirroring lag. The router's
+  dashboard and `thermocline_mirroring_lag_seconds` say how far behind that is at
+  the moment you take it.
+- **The archive's bookkeeping database**, `_thermocline` by default. Watermarks,
+  mirroring checkpoints and positions, residency holds, the eviction and warming
+  notices, the singleton markers. Restoring documents without these leaves a
+  system whose claims describe a fast tier that no longer matches.
+- **The fast tier's `_thermocline.keys`.** The unique key registry is the one
+  piece of bookkeeping that lives on the fast tier, because it constrains the
+  data there. It is also the one piece you can rebuild rather than restore, with
+  `cline keys --rebuild`.
+- **The fast tier's documents, optionally.** They are a subset of the archive
+  except for anything the feeder never mirrored, which the daemons name at
+  startup as documents "the archive has none of". Warming refills the rest.
+
+Restoring the archive under a live fast tier needs eviction held first:
+
+    cline pause --config cline.yaml --reason "restoring the archive"
+    # restore, then
+    cline resume --config cline.yaml
+
+That order is not a formality. The evictor's check is per document and presence
+only, so an archive holding an *older* version of a document confirms it as
+present, and the fast tier's newer copy is removed: the restore would cost you
+the writes made since the backup rather than recovering them.
+
+**And the limit worth knowing before you need it.** A restored archive is a
+restored past. Documents written after the backup are still on the fast tier if
+they are recent enough to be there, and the feeder cannot fetch them: a change
+stream reports changes from now, and mirroring only moves forward. Anything
+written after the backup and already evicted is in neither tier. So the archive's
+backup interval is the real exposure of this system, not the fast tier's, and
+`cline rollback`, which counts rather than removes unless you pass `--clear`, is
+what tells you what the two tiers disagree about afterwards.
 
 ### Logs
 
@@ -2399,6 +2561,15 @@ mongosh --port 28018 --eval '
   load balanced address in front of several routers: the driver sees one server,
   its pool sends the getMore down whichever connection is free, and it lands on
   a router that never had the cursor.
+
+  What the application sees then is `CursorNotFound`, code 43, from the fast
+  tier: the router does not recognise the id, forwards the getMore, and the fast
+  tier has never heard of that cursor either. It cannot tell you more than that,
+  and it is worth knowing why. A cursor id says nothing about who minted it:
+  measured on PSMDB 8.0, mongod's own ids cover the whole positive int64 range,
+  so an id from another router is indistinguishable from an expired one. A
+  `CursorNotFound` on a read that falls through, behind a load balanced address,
+  is this and not an expiry.
 
 - **A change stream cannot be resumed across the cutover, and nothing says so.**
   A resume token is a position in one replica set's oplog. The router serves
