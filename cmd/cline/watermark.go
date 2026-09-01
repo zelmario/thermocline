@@ -35,6 +35,8 @@ func runWatermark(args []string) error {
 		"declare --ns complete for everything newer than this RFC3339 instant")
 	force := fs.Bool("force", false,
 		"record a claim the two tiers' counts contradict, for a warm that is still running")
+	countFor := fs.Duration("count-for", claimCheckBudget,
+		"how long to spend counting both tiers before recording the claim unchecked")
 	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -90,7 +92,7 @@ func runWatermark(args []string) error {
 	// turns that into a warning, because an operator watching a warm fill knows
 	// something the counts do not.
 	verify := func(from time.Time) error {
-		why, err := checkClaim(ctx, hot, cold, cfg, *ns, from)
+		why, err := checkClaim(ctx, hot, cold, cfg, *ns, from, *countFor)
 		if err != nil {
 			return err
 		}

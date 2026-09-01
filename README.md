@@ -1648,6 +1648,20 @@ bin/cline watermark --config cline.yaml --ns app.orders --complete-all
 bin/cline watermark --config cline.yaml --ns app.orders --clear
 ```
 
+**A claim is checked against both tiers before it is recorded**, because it is
+otherwise a promise typed by hand: it says the fast tier holds everything, and
+recording one it does not have makes the router answer short with no error. So
+this counts what each tier holds and refuses a claim the numbers contradict,
+naming both. `--force` records it anyway, for the case where the operator knows
+something the counts cannot show, such as a warm still running.
+
+Counting is not free on a large collection, so it is bounded, and past the bound
+the claim is recorded **unchecked** rather than refused: blocking a rollout on a
+count would be the worse failure. `--count-for` sets that bound, a minute by
+default. On the collection big enough for the default to run out, raising it is
+usually what you want, because "recorded unchecked" is the one outcome nobody
+asked for.
+
 A claim also has to be withdrawn when the fast tier loses documents by any route
 the evictor did not drive, because the claim then describes data that is no
 longer there. Two things handle that:

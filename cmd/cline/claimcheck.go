@@ -26,13 +26,18 @@ import (
 // is not free on a large collection, which is the price of not finding out from
 // an application instead.
 
-// claimCheckBudget bounds the counting.
+// claimCheckBudget bounds the counting by default.
 //
 // A claim is declared by hand during a rollout, on a collection that may hold
 // millions of documents, and counting both tiers is not free. Running out of
 // time is not a refusal: it is answered by saying the claim could not be
 // checked, which leaves the operator exactly where they were before this
 // existed rather than blocking a rollout on a count.
+//
+// A minute is the default rather than the rule, because "recorded unchecked" is
+// the one outcome nobody wants and on a large collection it was the only one
+// available. --count-for raises it for an operator willing to wait, which is the
+// usual case for the collection big enough to need it.
 const claimCheckBudget = time.Minute
 
 // checkClaim reports why a claim must not be recorded, or an empty string when
@@ -42,7 +47,10 @@ const claimCheckBudget = time.Minute
 // history. force turns a refusal into a warning, for the case where the
 // operator knows something the counts cannot show, such as a warm still running.
 func checkClaim(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
-	ns string, from time.Time) (string, error) {
+	ns string, from time.Time, budget time.Duration) (string, error) {
+	if budget <= 0 {
+		budget = claimCheckBudget
+	}
 
 	db, coll := splitNamespace(ns)
 	if db == "" || coll == "" {
@@ -75,7 +83,7 @@ func checkClaim(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
 		}
 	}
 
-	counting, cancel := context.WithTimeout(ctx, claimCheckBudget)
+	counting, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	coldFilter := append(bson.D{meta.NotArchivedDeleted()}, filter...)

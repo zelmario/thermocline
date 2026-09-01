@@ -81,6 +81,12 @@ ok "unknown namespace claims nothing"   0 "claims nothing"    -- cline watermark
 ok "--clear without --ns rejected"      1 "ns is required"    -- cline watermark --config $CFG --clear
 ok "two actions rejected"               1 "give one"          -- cline watermark --config $CFG --ns $DB.orders --clear --complete-all
 ok "bad --complete-from rejected"       1 "RFC3339"           -- cline watermark --config $CFG --ns $DB.orders --complete-from notadate
+# Counting both tiers is bounded, and past the bound a claim is recorded
+# unchecked rather than refused. The bound is a flag now, because on the
+# collection big enough for a minute to run out, "recorded unchecked" is the one
+# outcome nobody asked for.
+ok "--count-for is accepted"            0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all --count-for 5s
+ok "a nonsense duration is refused"     2 ""                  -- cline watermark --config $CFG --ns tc.probe --complete-all --count-for banana
 ok "--complete-from sets"               0 "newer than"        -- cline watermark --config $CFG --ns tc.probe --complete-from 2026-01-01T00:00:00Z
 ok "--complete-all sets"                0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all
 ok "--clear withdraws"                  0 "withdrew"          -- cline watermark --config $CFG --ns tc.probe --clear
