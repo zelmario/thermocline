@@ -126,27 +126,28 @@ chk "stats().count"             "$TRUTH" "$(R "print(db.getSiblingDB(process.env
 # the fast tier's. Adding two clusters' compressed sizes together would produce
 # a number describing nothing, and an operator sizing a fast tier reads this one.
 #
-# Let it settle first. Every read above that fell through copied documents up,
-# and those land asynchronously, so storageSize is still growing while this
-# section runs. These are two separately timed measurements of a moving number:
-# under a parallel sweep a copy-up landed between them and the check reported
-# 36864 against 20480, which is the collection growing and not the router
-# changing anything. Alone it passed every time, which is the worst kind of
-# flake.
-settledStorage() {
-  local a b
-  a=$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
-  for _ in $(seq 1 20); do
-    sleep 1
-    b=$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
-    [ "$a" = "$b" ] && break
-    a=$b
-  done
-  echo "$a"
-}
-chk "storage still describes the fast tier" \
-    "$(settledStorage)" \
-    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")"
+# Not by equality, which is what this asked for twice and lost twice. Every read
+# above that fell through copied documents up, those land asynchronously, and
+# WiredTiger moves storageSize on its own at a checkpoint, so two separately
+# timed readings of it are two measurements of a moving number. Waiting for it to
+# settle was the first attempt and it still failed under a parallel sweep: 36864
+# against 20480, which is the collection growing and not the router changing
+# anything.
+#
+# What the check is actually for is one specific wrong answer: the router adding
+# two clusters' compressed sizes together, which an operator sizing a fast tier
+# would read as its own. That answer is not a checkpoint out, it is the archive
+# out: ten thousand documents against a handful. So the assertion is that the
+# router's number is the fast tier's order of magnitude and nowhere near the sum.
+HOTSZ=$(H "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
+COLDSZ=$(C "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
+RSZ=$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'$NS'}).storageSize)")
+chk "storage still describes the fast tier" "true" \
+    "$(awk -v r="$RSZ" -v h="$HOTSZ" -v c="$COLDSZ" 'BEGIN{
+        if (r+0 <= 0 || h+0 <= 0) { print "false (router " r ", fast tier " h ")"; exit }
+        if (r+0 > 4*(h+0)) { print "false (router " r " against fast tier " h ")"; exit }
+        if (r+0 >= (h+0)+(c+0)) { print "false (router " r " is the sum of " h " and " c ")"; exit }
+        print "true" }')"
 
 echo "== write paths, with the fast tier still short =="
 # Deliberately left incomplete. Declaring it complete here would be a lie the
