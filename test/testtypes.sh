@@ -81,6 +81,82 @@ pkill -f "cline feeder --config $WDIR/" 2>/dev/null
 chk "the feeder refuses to mirror a time series"        "true" \
     "$(echo "$OUT2" | grep -qiE "time series|timeseries" && echo true || echo "false ($(echo "$OUT2" | tail -1 | cut -c1-60))")"
 
+echo "== a queryable encryption collection in feeder.namespaces =="
+# The quietest of the three. Its documents copy across the way any binary field
+# would, so mirroring would report success; what does not copy is the state
+# mongod keeps beside them, in the enxcol_ collections it creates alongside. An
+# encrypted read that falls through would then be answered from an archive
+# holding the documents without the state that makes their fields searchable.
+#
+# In its own database, because creating one also creates two enxcol_ collections
+# and every other suite that lists a catalog would see them.
+QEDB=qe_$DB
+export TC_QEDB=$QEDB
+H "db.getSiblingDB(process.env.TC_QEDB).dropDatabase()" >/dev/null
+H "db.getSiblingDB(process.env.TC_QEDB).createCollection('tqe',{encryptedFields:{fields:[{path:'ssn',bsonType:'string',keyId:UUID('12345678-1234-9876-1234-123456789012')}]}})" >/dev/null
+chk "the fast tier collection is encrypted"             "true" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_QEDB).getCollectionInfos({name:'tqe'})[0]; print(!!(c&&c.options&&c.options.encryptedFields))")"
+chk "and mongod made its state collections"             "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_QEDB).getCollectionInfos().filter(c=>c.name.startsWith('enxcol_')).length)")"
+sed 's|    - "'$DB'.tcap"|    - "'$DB'.tcap"\n    - "'$QEDB'.tqe"|' $CFG > $WDIR/withqe.yaml
+# tail -20, not tail -3: the capped and time series collections from the sections
+# above are still configured, so the refusal names three namespaces and the last
+# three lines are not the ones this is about.
+OUTQ=$(timeout 20 cline feeder --config $WDIR/withqe.yaml 2>&1 | tail -20)
+STARTEDQ=$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+chk "the feeder refuses to mirror it"                   "true" \
+    "$(echo "$OUTQ" | grep -qi "queryable encryption" && echo true || echo "false ($(echo "$OUTQ" | tail -1 | cut -c1-60))")"
+chk "and it did not stay running"                       "0"    "$STARTEDQ"
+# And the state collection named directly, which is the other way to configure
+# this wrong: it belongs to mongod rather than to the application.
+sed 's|    - "'$DB'.tcap"|    - "'$DB'.tcap"\n    - "'$QEDB'.enxcol_.tqe.esc"|' $CFG > $WDIR/withesc.yaml
+OUTE=$(timeout 20 cline feeder --config $WDIR/withesc.yaml 2>&1 | tail -20)
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+chk "the state collection is refused as well"           "true" \
+    "$(echo "$OUTE" | grep -qi "state collection" && echo true || echo "false ($(echo "$OUTE" | tail -1 | cut -c1-60))")"
+H "db.getSiblingDB(process.env.TC_QEDB).dropDatabase()" >/dev/null
+
+echo "== an empty namespace list is checked too =="
+# "Mirror everything" used to mean "check nothing": unmirrorable returned early
+# on an empty list, so the configuration that mirrors the most did the least
+# checking. A capped collection anywhere in the deployment was then mirrored, and
+# the archive tombstoned its history at the first rollover.
+#
+# The capped collection from the section above is recreated for this, because
+# what has to be caught is a collection nothing named.
+H "db.getSiblingDB(process.env.TC_DB).createCollection('tcap',{capped:true,size:4096})" >/dev/null 2>&1
+cat > $WDIR/typesall.yaml <<YEOF
+hot:
+  uri: "$HOT"
+cold:
+  uri: "$COLD"
+meta:
+  db: "$META"
+feeder:
+  id: "test"
+  namespaces: []
+YEOF
+OUTA=$(timeout 40 cline feeder --config $WDIR/typesall.yaml 2>&1 | tail -20)
+STARTEDA=$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+chk "the feeder refuses on a collection nobody named" "true" \
+    "$(echo "$OUTA" | grep -qi "cannot be mirrored" && echo true || echo "false ($(echo "$OUTA" | tail -1 | cut -c1-60))")"
+chk "and names the capped one it found"               "true" \
+    "$(echo "$OUTA" | grep -q "$DB.tcap is a capped collection" && echo true || echo false)"
+chk "and says what to do about an empty list"        "true" \
+    "$(echo "$OUTA" | grep -q 'feeder.namespaces is empty' && echo true || echo false)"
+chk "and it did not stay running"                    "0" "$STARTEDA"
+# And not over a view or a time series collection, which is the other half of
+# this. Nothing of either is ever mirrored, so a deployment that mirrors
+# everything and happens to have a view must still start: refusing there would
+# make an empty namespace list unusable on almost any real cluster. The suites
+# leave views behind on this cluster, so the message above having named only the
+# capped one is the check.
+chk "and not over a view it found on the way"        "0" \
+    "$(echo "$OUTA" | grep -c 'is a view' || true)"
+H "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+
 echo "== and an ordinary collection is unaffected =="
 H "db.getSiblingDB(process.env.TC_DB).tcap.drop(); db.getSiblingDB(process.env.TC_DB).tts.drop()" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null

@@ -10,7 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// Two kinds of collection cannot be mirrored, and mirroring them does damage
+// Some kinds of collection cannot be mirrored, and mirroring them does damage
 // rather than nothing, so the feeder refuses to start against either.
 //
 // A capped collection removes its own oldest documents when it fills. Nobody
@@ -26,19 +26,41 @@ import (
 // buckets and the archive would fill with a shape the application has never
 // seen and cannot read back.
 //
+// A queryable encryption collection is the third, and it is the quietest of them.
+// Its documents copy across the way any binary field would, so mirroring reports
+// success; what does not copy is the state mongod keeps beside them, in enxcol_
+// collections nothing here tiers. An encrypted read that falls through is then
+// answered from an archive holding the documents without the state that makes
+// their fields searchable.
+//
 // Both are configuration mistakes rather than states to recover from, so this
 // fails loudly at startup with the namespaces named. A feeder that started and
 // skipped them would be mirroring less than its configuration says, which is
 // the kind of quiet difference that is found months later.
 
 // unmirrorable reports the configured namespaces that cannot be mirrored.
+//
+// An empty namespace list means every collection of every database, so the check
+// covers every collection of every database. It used to return nothing at all
+// there, which left the config that mirrors the most doing the least checking: a
+// capped collection anywhere in the deployment was mirrored, and the archive
+// tombstoned its history at the first rollover.
 func (f *Feeder) unmirrorable(ctx context.Context) ([]string, error) {
-	if len(f.cfg.Namespaces) == 0 {
-		return nil, nil
-	}
-
-	// One listCollections per database, rather than per namespace.
+	// One listCollections per database, rather than per namespace. A nil set of
+	// collections for a database means every collection in it.
 	wanted := map[string]map[string]bool{}
+	if len(f.cfg.Namespaces) == 0 {
+		dbs, err := f.mirroredDatabases(ctx)
+		if err != nil {
+			// Not being able to look is not a reason to refuse to run, the same
+			// as a database that cannot be listed below.
+			f.log.Warn("could not list databases to check collection types before mirroring", "err", err)
+			return nil, nil
+		}
+		for _, db := range dbs {
+			wanted[db] = nil
+		}
+	}
 	for _, ns := range f.cfg.Namespaces {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
@@ -80,11 +102,30 @@ func (f *Feeder) unmirrorable(ctx context.Context) ([]string, error) {
 					continue
 				}
 				name, _ := raw.Lookup("name").StringValueOK()
-				if !colls[name] {
+				// A nil set is every collection, which is what an empty
+				// namespace list asks for.
+				if colls != nil && !colls[name] {
 					continue
 				}
-				kind, why := unmirrorableKind(raw)
+				// mongod's own, which the change stream never reports anyway.
+				if strings.HasPrefix(name, "system.") {
+					continue
+				}
+				kind, why, namedOnly := unmirrorableKind(raw)
 				if kind == "" {
+					continue
+				}
+				// A kind that is only a problem when somebody named it. Nothing
+				// of a view or a time series collection is ever mirrored: a view
+				// holds no documents, and a time series collection's writes are
+				// reported against its system bucket collection, which the
+				// change stream and this check both leave alone. Naming one in
+				// the config is a mistake, because it says that namespace is
+				// being tiered and it never will be. Finding one while mirroring
+				// everything is not: it is a collection nobody claimed, and
+				// refusing to start over it would make an empty namespace list
+				// unusable on any deployment that has a view.
+				if namedOnly && len(f.cfg.Namespaces) == 0 {
 					continue
 				}
 				// One complaint per namespace, however many tiers hold it, so
@@ -103,38 +144,85 @@ func (f *Feeder) unmirrorable(ctx context.Context) ([]string, error) {
 	return bad, nil
 }
 
+// mirroredDatabases lists the databases an empty namespace list covers, from
+// both tiers, minus the ones the feeder never mirrors.
+func (f *Feeder) mirroredDatabases(ctx context.Context) ([]string, error) {
+	seen := map[string]bool{}
+	for _, client := range []*mongo.Client{f.hot, f.cold} {
+		names, err := client.ListDatabaseNames(ctx, bson.D{})
+		if err != nil {
+			return nil, err
+		}
+		for _, db := range names {
+			if skipNamespace(db) {
+				continue
+			}
+			seen[db] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for db := range seen {
+		out = append(out, db)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // unmirrorableKind names the problem with one collection, or empty when it has
 // none.
-func unmirrorableKind(info bson.Raw) (kind, why string) {
+//
+// namedOnly separates the two reasons a kind is reported. Some are mirrored and
+// do damage: a capped collection loses its history in the archive, an encrypted
+// one arrives without the state that makes it searchable. Others are never
+// mirrored at all, and the mistake is only in the configuration claiming they
+// are. See the caller for why that distinction decides whether an empty
+// namespace list refuses to start.
+func unmirrorableKind(info bson.Raw) (kind, why string, namedOnly bool) {
 	if t, ok := info.Lookup("type").StringValueOK(); ok && t == "view" {
 		return "a view",
 			"holds no documents of its own, only a pipeline over another collection, so there is " +
-				"nothing to mirror and the collection it reads from is what wants tiering"
+				"nothing to mirror and the collection it reads from is what wants tiering", true
 	}
 	if t, ok := info.Lookup("type").StringValueOK(); ok && t == "timeseries" {
 		return "a time series collection",
 			"stores its documents in a system bucket collection, so what the change stream " +
-				"describes is not the collection the application reads"
+				"describes is not the collection the application reads", true
 	}
 	opts, err := info.LookupErr("options")
 	if err != nil {
-		return "", ""
+		return "", "", false
 	}
 	odoc, ok := opts.DocumentOK()
 	if !ok {
-		return "", ""
+		return "", "", false
 	}
 	if capped, ok := odoc.Lookup("capped").BooleanOK(); ok && capped {
 		return "a capped collection",
 			"removes its own oldest documents when it fills, and nothing announces those, so " +
-				"the archive would tombstone them and lose the history it is there to keep"
+				"the archive would tombstone them and lose the history it is there to keep", false
 	}
 	if _, terr := odoc.LookupErr("timeseries"); terr == nil {
 		return "a time series collection",
 			"stores its documents in a system bucket collection, so what the change stream " +
-				"describes is not the collection the application reads"
+				"describes is not the collection the application reads", true
 	}
-	return "", ""
+	// Queryable encryption. The documents themselves would copy across as any
+	// other binary would, and that is what makes this worth refusing rather than
+	// leaving: what does not copy is the state that makes them searchable. mongod
+	// keeps it in companion enxcol_ collections beside the data, nothing here
+	// tiers those, and an encrypted read that falls through would be answered
+	// from an archive holding documents whose index state was never mirrored.
+	if _, eerr := odoc.LookupErr("encryptedFields"); eerr == nil {
+		return "encrypted with queryable encryption",
+			"keeps the state that makes its fields searchable in companion enxcol_ collections " +
+				"that nothing here tiers, so the archive would hold the documents without it", false
+	}
+	if name, ok := info.Lookup("name").StringValueOK(); ok && strings.HasPrefix(name, "enxcol_") {
+		return "queryable encryption's own state collection",
+			"belongs to mongod rather than to the application, and tiering it would move the " +
+				"state out from under the collection it describes", false
+	}
+	return "", "", false
 }
 
 // checkCollectionKinds refuses to run when any configured namespace cannot be
@@ -147,8 +235,16 @@ func (f *Feeder) checkCollectionKinds(ctx context.Context) error {
 	if len(bad) == 0 {
 		return nil
 	}
+	action := "Remove them from feeder.namespaces."
+	if len(f.cfg.Namespaces) == 0 {
+		// An empty list is "mirror everything", so there is nothing to remove
+		// from. Naming the namespaces to mirror is the fix, and it is the
+		// configuration a deployment wants anyway.
+		action = "feeder.namespaces is empty, which means every collection of every database, " +
+			"so these are included. List the namespaces to mirror instead."
+	}
 	return fmt.Errorf("these namespaces cannot be mirrored:\n  %s\n"+
-		"Remove them from feeder.namespaces. Mirroring them does not fail, it fills the "+
+		"%s Mirroring them does not fail, it fills the "+
 		"archive with something the application cannot use, or empties it as the collection rolls",
-		strings.Join(bad, "\n  "))
+		strings.Join(bad, "\n  "), action)
 }
