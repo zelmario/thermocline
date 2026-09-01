@@ -1,0 +1,77 @@
+# Two applications, each with its own shop, sharing one pair of tiers.
+#
+# Blocker 4 of the plan: everything else here writes from one application, or
+# from a BI tool that mostly reads. Two writers at once is a different question,
+# and the parts they share are the ones that could get it wrong: one feeder
+# reading one change stream for both, one evictor sweeping both, one router
+# holding one claim cache, one registry of keys.
+#
+# Separate databases on purpose. The shop's invariants are per customer, and two
+# writers on one customer's orders would break "placing one order moves that
+# customer's count by exactly one" by racing it rather than by being wrong.
+# Two applications is the shape being tested; two writers on one collection is a
+# different test and it belongs to whoever writes it.
+hot:
+  uri: "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin"
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+meta:
+  db: "_thermocline_two"
+
+feeder:
+  id: "two"
+  namespaces:
+    - "shopA.orders"
+    - "shopA.order_events"
+    - "shopB.orders"
+    - "shopB.order_events"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 20ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "two"
+  rate: 2000
+  batch_size: 200
+  max_feeder_lag: 30s
+  rules:
+    # Both shops age the same way, so the evictor is doing the same work for two
+    # applications at once, which is the thing under test.
+    - ns: "shopA.orders"
+      older_than: 20m
+    - ns: "shopA.order_events"
+      older_than: 20m
+    - ns: "shopB.orders"
+      older_than: 20m
+    - ns: "shopB.order_events"
+      older_than: 20m
+  backoff:
+    min_oplog_window: 1m
+
+warmer:
+  rate: 2000
+  batch_size: 200
+  residency: 2m
+  rules:
+    # Inside the eviction cutoff, not past it. A warm reaching further back than
+    # older_than copies the band between them up and has the evictor take it
+    # away again, indefinitely, and the router says so at startup.
+    - ns: "shopA.orders"
+      back: 15m
+    - ns: "shopB.orders"
+      back: 15m
+  backoff:
+    min_oplog_window: 1m
+
+router:
+  # Clear of every port the suites and the pilot use.
+  listen: "0.0.0.0:27600"
+  dashboard: "0.0.0.0:27610"
+  completeness: archive
+  residency: 2m
+  archive_wait: 5s
