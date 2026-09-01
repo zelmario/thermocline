@@ -158,9 +158,11 @@ func (ac *archiveCursor) close(ctx context.Context) {
 // and would have failed against a pooled application driver, with the getMore
 // falling through to a fast tier that has never heard of the cursor.
 //
-// Ids start high and climb, and every getMore is checked against the registry
-// before it is treated as ours. A real cursor id landing exactly on a live
-// synthetic one would need a random int64 collision, and the worst case is a
+// Ownership is decided by the registry and by nothing else. Magnitude says
+// nothing: measured on PSMDB 8.0, mongod hands out cursor ids across the whole
+// positive int64 range, and three of five samples were above 2^62. So an id is
+// ours if it is in this map, and a real cursor id landing exactly on a live
+// synthetic one would need a random int64 collision. The worst case there is a
 // getMore sent to the wrong tier, which errors rather than returning wrong data.
 type cursorRegistry struct {
 	mu   sync.Mutex
@@ -174,11 +176,12 @@ func (reg *cursorRegistry) add(ac *archiveCursor) int64 {
 	if reg.open == nil {
 		reg.open = make(map[int64]*archiveCursor)
 	}
-	// The top bit of the range keeps these clear of the ids mongod is handing
-	// out, and the rest is random so that nobody can name one they were not
-	// given. They used to run in sequence from a fixed start, which meant the
-	// first cursor was always 2^62+1 and the second always 2^62+2. Ownership is
-	// checked as well, and this is the half that costs nothing.
+	// Random, so that nobody can name one they were not given. They used to run
+	// in sequence from a fixed start, which meant the first cursor was always
+	// 2^62+1 and the second always 2^62+2. The top bit is set to keep them clear
+	// of zero and of the small ids a driver might treat specially; it does not
+	// separate them from mongod's own, which cover the whole range. Ownership is
+	// the registry's answer, and this is the half that costs nothing.
 	var id int64
 	for {
 		id = 1<<62 | (randomInt63() >> 1)
@@ -1021,9 +1024,14 @@ func (r *Router) serverErrorReply(requestID, responseTo int32, err error) (*wire
 	case 13, 18: // Unauthorized, AuthenticationFailed
 		return nil, false
 	}
+	// The archive's own error, plus a sentence when it is the shape a release
+	// gap makes. See archiveDialectNote: the message is the only place an
+	// application's developer will look, and "$convert found an unknown
+	// argument" says nothing about two clusters on different releases.
+	message := ce.Message + r.archiveDialectNote(ce.Code, ce.Message)
 	out := bson.D{
 		{Key: "ok", Value: 0.0},
-		{Key: "errmsg", Value: ce.Message},
+		{Key: "errmsg", Value: message},
 		{Key: "code", Value: ce.Code},
 	}
 	if ce.Name != "" {

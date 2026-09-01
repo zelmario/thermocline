@@ -164,6 +164,50 @@ chk "and warns rather than saying nothing"            "true" \
     "$(grep -q 'different MongoDB releases, allowed by allow_version_skew' "$DIR/skew.log" && echo true || echo false)"
 chk "and it serves a read that reaches the archive"   "4" \
     "$(timeout 30 mongosh "mongodb://127.0.0.1:$PORT/?directConnection=true" --quiet --eval 'print(db.getSiblingDB("probe").tiered.countDocuments({}))' 2>&1 | tail -1)"
+
+# What the mismatch actually costs, on the pair this refuses, which is why the
+# rollout guide says to upgrade the archive first and not the fast tier.
+#
+# The archive runs the client's own query. So a query using anything the archive
+# does not understand works for as long as the documents it reads are on the fast
+# tier, and then fails with the archive's own error naming an argument the
+# application has always used. That is the whole argument for the ordering, and
+# it was an argument until this measured it.
+#
+# The expression is found rather than assumed: mongod's dialect differs by
+# release in ways that move, so the check asks both servers which one separates
+# them and skips if none does. Measured on 8.0.26 and 7.0.37: $convert with
+# format is accepted by the first and refused by the second with "$convert found
+# an unknown argument".
+NEWEXPR='{$convert:{input:"aGk=",to:"binData",format:"base64"}}'
+newOK() { # port
+  timeout 20 mongosh --quiet --port "$1" --eval \
+    "try { db.getSiblingDB('probe').aggregate([{\$documents:[{a:1}]},{\$addFields:{v:$NEWEXPR}}]).toArray(); print('yes') } catch(e) { print('no') }" 2>&1 | tail -1
+}
+if [ "$(newOK $HOTPORT)" != "yes" ] || [ "$(newOK $COLDPORT)" != "no" ]; then
+  echo "  SKIP  no expression separates $HOTREL from $COLDREL any more"
+else
+  # _id 3 and 4 are in the archive only, so a pipeline over this collection has
+  # to be answered there, and nothing claims the fast tier is complete anyway.
+  ARCHIVED=$(timeout 30 mongosh "mongodb://127.0.0.1:$PORT/?directConnection=true" --quiet --eval \
+    "try { const r=db.getSiblingDB('probe').tiered.aggregate([{\$addFields:{v:$NEWEXPR}}]).toArray(); print('answered '+r.length) } catch(e) { print('failed: '+e.message) }" 2>&1 | tail -1)
+  chk "a pipeline the archive cannot parse fails there" "true" \
+      "$(grep -q 'unknown argument' <<<"$ARCHIVED" && echo true || echo "false ($ARCHIVED)")"
+  # And the two halves of what makes that happen, stated rather than assumed:
+  # the newer tier parses the expression and the older one does not. Which tier
+  # answers is the router's completeness decision, and a namespace nothing
+  # claims is answered from the archive whatever the filter narrows it to, which
+  # is why this pair is asserted against the servers themselves.
+  chk "  the fast tier's release parses it"            "yes" "$(newOK $HOTPORT)"
+  chk "  and the archive's release does not"           "no"  "$(newOK $COLDPORT)"
+  # And the error has to say why, because this is the message a developer will
+  # read. The archive's own words name an argument the application has always
+  # used and nothing about two clusters on different releases.
+  chk "  and the error names the release gap"          "true" \
+      "$(grep -q "archive, which runs MongoDB $COLDREL" <<<"$ARCHIVED" && echo true || echo false)"
+  chk "  and the fast tier's release too"              "true" \
+      "$(grep -q "fast tier runs $HOTREL" <<<"$ARCHIVED" && echo true || echo false)"
+fi
 pkill -9 -f "cline.*$DIR/skew.yaml" 2>/dev/null; sleep 1
 
 echo "== a patch apart, which is a rolling upgrade half done =="

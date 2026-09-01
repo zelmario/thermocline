@@ -44,6 +44,12 @@ type Router struct {
 	marks *watermark.Store
 	log   *slog.Logger
 
+	// olderArchive holds the two releases when the archive is behind the fast
+	// tier, which only a deployment running with allow_version_skew reaches. It
+	// is read on an error path to explain what the archive refused. See
+	// archiveDialectNote.
+	olderArchive atomic.Pointer[releaseGap]
+
 	// primary is the fast tier address raw connections are proxied to. It is
 	// re-resolved after a failure, so a failover is survivable.
 	primaryMu sync.RWMutex
