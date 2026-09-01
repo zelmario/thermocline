@@ -1058,6 +1058,17 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				c.r.indexer.Forget(db + "." + coll)
 			}
 			if name == "create" {
+				ns := db + "." + coll
+				// The archive's copy is created by the feeder's first mirrored
+				// insert, which carries no options at all, so a collection
+				// created here with a collation is a different collection down
+				// there. Synchronously, and before the index build below,
+				// because the write that follows a create can be immediate and
+				// the feeder is mirroring it within the second.
+				if c.r.cfg.Manages(ns) {
+					promote.MirrorCollection(ctx, c.r.hot, c.r.cold, db, coll, c.log)
+				}
+
 				// Forgetting only clears the record that it was done; the
 				// build happens on the next Ensure, and without this that
 				// waited for a client to list the catalog. The collection
@@ -1066,7 +1077,6 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				//
 				// In the background and rate limited inside the indexer, the
 				// same as the catalog path.
-				ns := db + "." + coll
 				c.r.goSafely("building the archive's indexes on the fast tier", func() {
 					c.r.indexer.Ensure(context.WithoutCancel(ctx), ns)
 				})

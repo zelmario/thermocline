@@ -418,6 +418,46 @@ chk "so the router still answers the same"        "2" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+echo "== the same options going the other way, into the archive =="
+# Options travel upward on their own, because an adoption starts with the
+# archive holding everything. Downward nothing carried them: a collection
+# created through the router exists on the fast tier with its options, and the
+# archive's copy is brought into existence by the feeder's first mirrored
+# insert, which carries none.
+#
+# Measured before this: the fast tier answered countDocuments({name:'alice'})
+# with 2 and the archive with 1, so every read that fell through, which is every
+# read of an evicted document, matched differently from the tier the application
+# had been talking to.
+R "db.getSiblingDB(process.env.TC_DB).createCollection('$ONS',{collation:{locale:'en',strength:2},
+     validator:{\$jsonSchema:{bsonType:'object',required:['email'],
+                properties:{email:{bsonType:'string'}}}}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$ONS.insertMany([{_id:1,name:'Alice',email:'a@x'},
+     {_id:2,name:'alice',email:'b@x'},{_id:3,name:'BOB',email:'c@x'}])" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({}))")" = "3" ] && break
+  sleep 0.5
+done
+chk "the archive's copy carries the collation"    "en" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(c&&c.options&&c.options.collation?c.options.collation.locale:'none')")"
+chk "and the validator"                           "true" \
+    "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS'})[0];
+          print(!!(c&&c.options&&c.options.validator))")"
+chk "so the archive answers the same as the fast tier" "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+# And what the client sees once the fast tier no longer holds them, which is
+# what eviction leaves: the read falls through, and the archive is what answers.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ONS.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder
+startRouter
+chk "and the router still answers the same"       "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
+
 echo "== a unique index the archive has and the fast tier does not =="
 # The router reads the FAST TIER's unique indexes to know what to protect across
 # both tiers, so while this is true it accepts a value the archive refuses. The

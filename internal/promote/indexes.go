@@ -355,6 +355,99 @@ func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error
 	return nil
 }
 
+// MirrorCollection gives the archive the collection the way the fast tier has
+// it, when the archive does not hold it yet.
+//
+// Options travel upward on their own, because an adoption starts with the
+// archive holding everything. They do not travel downward, and nothing carried
+// them: a collection created through the router exists on the fast tier with its
+// options, and the archive's copy is brought into existence by the feeder's
+// first mirrored insert, which carries none.
+//
+// Measured on a collection created through the router with {locale: "en",
+// strength: 2}: the fast tier answered countDocuments({name: "alice"}) with 2
+// and the archive with 1, so every read that fell through to the archive, which
+// is every read of an evicted document, matched differently from the tier the
+// application had been talking to.
+//
+// The same deny-list decides what may cross, in the same polarity: everything
+// the fast tier has except what the other tier must not be given.
+func MirrorCollection(ctx context.Context, hot, cold *mongo.Client, db, coll string, log *slog.Logger) {
+	if strings.HasPrefix(coll, "system.") {
+		return
+	}
+	names, err := cold.Database(db).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		log.Warn("could not check whether the archive holds this collection",
+			"ns", db+"."+coll, "err", err)
+		return
+	}
+	if len(names) > 0 {
+		// Already there, and its options cannot be changed now anyway.
+		return
+	}
+
+	opts, err := carryableOptions(ctx, hot, db, coll)
+	if err != nil || len(opts) == 0 {
+		// Nothing worth carrying, so the feeder's first insert creating it is
+		// the same collection.
+		return
+	}
+	cmd := append(bson.D{{Key: "create", Value: coll}}, opts...)
+	if err := cold.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
+		if isNamespaceExists(err) {
+			return
+		}
+		log.Warn("could not create the collection in the archive the way the fast tier has it",
+			"ns", db+"."+coll, "err", err,
+			"effect", "the archive's copy will be created by the first mirrored insert, with no "+
+				"options, and a collation decides which documents match")
+		return
+	}
+	carried := make([]string, 0, len(opts))
+	for _, e := range opts {
+		carried = append(carried, e.Key)
+	}
+	log.Info("created the collection in the archive the way the fast tier has it",
+		"ns", db+"."+coll, "options", carried,
+		"why", "the archive answers every read the fast tier cannot, and a collation decides which "+
+			"documents match")
+}
+
+// carryableOptions reads one tier's options for a collection, minus the ones
+// that must not be given to the other. The test file next door has a helper of
+// its own called collectionOptions, which reads them unfiltered.
+func carryableOptions(ctx context.Context, from *mongo.Client, db, coll string) (bson.D, error) {
+	cur, err := from.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	if !cur.Next(ctx) {
+		return nil, cur.Err()
+	}
+	var raw bson.Raw
+	if err := cur.Decode(&raw); err != nil {
+		return nil, err
+	}
+	odoc, ok := raw.Lookup("options").DocumentOK()
+	if !ok {
+		return nil, nil
+	}
+	elems, err := odoc.Elements()
+	if err != nil {
+		return nil, nil
+	}
+	var out bson.D
+	for _, e := range elems {
+		if notCarried[e.Key()] {
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	return out, nil
+}
+
 // archiveCollectionOptions reports whether the archive holds the collection, and
 // which of its options are worth carrying upward.
 //
