@@ -205,6 +205,29 @@ chk "and a find through it returns every document"     "10" \
 chk "while the fast-tier-only view is still refused"   "REFUSED" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).vqview.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
 
+# A view whose own pipeline reads another collection stays refused, and the
+# reason is what the archive holds rather than what the view is. The feeder
+# mirrors the namespaces it tiers and nothing else, so an untiered collection's
+# documents never reach the archive: its copy there is empty, and a $lookup
+# against it returns no rows. That is a wrong answer rather than a refusal, and
+# the completeness check cannot see it, because the join is in the definition and
+# not in the query.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqjoin','tqview',[{\$lookup:{from:'tqjoined',localField:'n',foreignField:'n',as:'j'}}])" >/dev/null
+chk "a view that joins another collection is refused"  "REFUSED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).vqjoin.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
+
+# A chain, because a view may read another view and comparing only the one the
+# query named would pass a chain whose second link differs. Both links here were
+# created through the router, so both are in the archive.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqchain','vqview2',[])" >/dev/null
+chk "a view over a view answers in full"               "10" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqchain.countDocuments({}))}catch(e){print('REFUSED')}")"
+# And the same chain over the fast-tier-only view is refused, because its second
+# link is one the archive has never heard of.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqchainbad','vqview',[])" >/dev/null
+chk "a chain whose second link is missing is refused"  "REFUSED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
+
 echo "== a pipeline that joins a view over a tiered collection =="
 # The same blindness, reached from the other side. $lookup, $graphLookup and
 # $unionWith all accept a view, and the joined namespace is checked by asking

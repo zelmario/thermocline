@@ -183,6 +183,13 @@ C "db.getSiblingDB(process.env.TC_DB).rollup.insertOne({_id:1, v:'evicted long a
 chk "the router sees both to begin with" "[1,2]" \
     "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))")"
 R "db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:99, v:'from the pipeline'})" >/dev/null
+# The pipeline's input is read from the archive, because the watermark above says
+# the fast tier cannot answer for tprobe. So the document has to be in the
+# archive before the $out runs, not merely written. The freshness barrier waits
+# for mirroring, but only up to archive_wait, and in a three-worker sweep that
+# was not always enough: the input came back empty and the $out then replaced the
+# target with nothing. A wait rather than a hope.
+waitMirrored 1
 R "db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{\$match:{_id:99}},{\$out:'rollup'}]).toArray()" >/dev/null
 sleep 5
 chk "the target is exactly the result"   "[99]" \

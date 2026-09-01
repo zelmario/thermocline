@@ -185,10 +185,26 @@ func (ix *Indexer) Forget(ns string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	st := ix.state[ns]
-	if !st.done && !st.created {
-		return
+
+	// The create half is always forgotten, timestamp and all. Its rate limit
+	// exists to stop a build being hammered, and a create that has to happen
+	// before the next write is the opposite case: skipping it because it ran a
+	// minute ago is how a collection comes back without its options. Measured
+	// under a three-worker sweep, where the earlier sections of the suite took
+	// long enough to leave the timestamp inside the window: the copy-up recreated
+	// the collection bare and the case-insensitive count answered 1 where the
+	// archive answers 2. Alone, the same suite passed.
+	st.created = false
+	st.lastCreated = time.Time{}
+
+	// The build half keeps its limit. A namespace whose indexes will not build
+	// leaves done false, and repeating that on every drop would fill the log
+	// rather than fix anything.
+	if st.done {
+		st.done = false
+		st.lastTry = time.Time{}
 	}
-	ix.state[ns] = indexState{}
+	ix.state[ns] = st
 }
 
 func (ix *Indexer) build(ctx context.Context, ns string) error {

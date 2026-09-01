@@ -203,9 +203,7 @@ func (r *Router) archiveCanAnswerView(ctx context.Context, ns string) bool {
 		return cached
 	}
 
-	hot, hotOK := viewDefinition(ctx, r.hot, ns)
-	cold, coldOK := viewDefinition(ctx, r.cold, ns)
-	same := hotOK && coldOK && hot.equals(cold)
+	same := r.viewChainMatches(ctx, ns)
 
 	r.viewMatch.mu.Lock()
 	if r.viewMatch.same == nil {
@@ -217,6 +215,38 @@ func (r *Router) archiveCanAnswerView(ctx context.Context, ns string) bool {
 	r.viewMatch.mu.Unlock()
 	return same
 }
+
+// viewChainMatches compares every link of a view chain, not only the view the
+// query named.
+//
+// A view may read another view. Comparing the named one alone would pass a chain
+// whose second link differs, and the second link is where the pipeline that
+// decides the answer might live. So this follows viewOn down until it reaches a
+// collection, comparing each definition as it goes, and stops at a depth mongod
+// itself would refuse to create.
+func (r *Router) viewChainMatches(ctx context.Context, ns string) bool {
+	db, _ := splitNS(ns)
+	at := ns
+	for hop := 0; hop < maxViewHops; hop++ {
+		hot, hotOK := viewDefinition(ctx, r.hot, at)
+		if !hotOK {
+			// Not a view on the fast tier: the chain has reached a collection,
+			// and the archive holds every document of a tiered one.
+			return hop > 0
+		}
+		cold, coldOK := viewDefinition(ctx, r.cold, at)
+		if !coldOK || !hot.equals(cold) || hot.joins() {
+			return false
+		}
+		at = db + "." + hot.on
+	}
+	return false
+}
+
+// maxViewHops bounds the chain this will follow. MongoDB refuses to resolve a
+// view more than a handful deep, and a loop cannot be created at all, so this is
+// a guard against a catalog that says otherwise rather than a real depth.
+const maxViewHops = 10
 
 // viewMatchCache remembers whether the archive's copy of a view matches the fast
 // tier's. Creating or dropping a view is rare and the router sees the DDL, the
@@ -232,6 +262,68 @@ type viewSpec struct {
 	on        string
 	pipeline  []byte
 	collation []byte
+}
+
+// joins reports whether the view's own pipeline reads another collection.
+//
+// Such a view cannot be answered from the archive, whatever its definition says,
+// and the reason is what the archive holds rather than what the view is. The
+// feeder mirrors the namespaces it is told to tier and nothing else, so an
+// untiered collection's documents never reach the archive: its copy there is
+// empty, or is whatever the cluster held on the day it was adopted. A $lookup
+// against that returns no rows, which is a wrong answer rather than a refusal,
+// and the completeness machinery cannot see it because the join is inside the
+// definition and not in the query.
+//
+// So this stays a refusal, and the refusal is the one that was there before.
+func (v viewSpec) joins() bool {
+	arr, ok := bson.Raw(v.pipeline).Values()
+	if ok != nil {
+		// A pipeline that cannot be read is one whose stages are unknown, and
+		// an unknown stage is assumed to be the dangerous kind.
+		return true
+	}
+	return stagesJoin(arr)
+}
+
+// stagesJoin walks a pipeline for a stage that names another collection, and
+// into the one stage that carries pipelines of its own.
+func stagesJoin(stages []bson.RawValue) bool {
+	for _, st := range stages {
+		doc, ok := st.DocumentOK()
+		if !ok {
+			return true
+		}
+		elems, err := doc.Elements()
+		if err != nil {
+			return true
+		}
+		for _, e := range elems {
+			switch e.Key() {
+			case "$lookup", "$graphLookup", "$unionWith", "$out", "$merge":
+				return true
+			case "$facet":
+				sub, sok := e.Value().DocumentOK()
+				if !sok {
+					return true
+				}
+				fields, ferr := sub.Elements()
+				if ferr != nil {
+					return true
+				}
+				for _, f := range fields {
+					inner, ierr := f.Value().Array().Values()
+					if ierr != nil {
+						return true
+					}
+					if stagesJoin(inner) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (v viewSpec) equals(o viewSpec) bool {
