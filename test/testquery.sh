@@ -192,6 +192,18 @@ VIEWANS=$(R "
 # Ten or a refusal are both acceptable. Three is the silent short answer.
 chk "the view does not answer short"                   "true" \
     "$([ "$VIEWANS" = "10" ] || [ "$VIEWANS" = "REFUSED" ] && echo true || echo "false (got $VIEWANS)")"
+# That view was created straight on the fast tier, so the archive has never
+# heard of it and a refusal is the only answer available. A view created through
+# the router is mirrored down as it is created, and then the archive holds both
+# the documents and the definition, so the same read has a correct answer
+# instead of an error. Ten, not three, and not a refusal.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqview2','tqview',[{\$match:{grp:'g'}}])" >/dev/null
+chk "a view the archive has too answers in full"       "10" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.countDocuments({}))}catch(e){print('REFUSED')}")"
+chk "and a find through it returns every document"     "10" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.find({}).toArray().length)}catch(e){print('REFUSED')}")"
+chk "while the fast-tier-only view is still refused"   "REFUSED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).vqview.countDocuments({}); print('ANSWERED')}catch(e){print('REFUSED')}")"
 
 echo "== a pipeline that joins a view over a tiered collection =="
 # The same blindness, reached from the other side. $lookup, $graphLookup and

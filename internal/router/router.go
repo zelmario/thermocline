@@ -110,6 +110,10 @@ type Router struct {
 	indexer   *promote.Indexer
 	collCache collationCache
 	viewCache viewCache
+	// viewMatch remembers whether the archive's copy of a view is defined the
+	// way the fast tier's is, which decides whether a view read the fast tier
+	// cannot answer can be sent there instead of refused.
+	viewMatch viewMatchCache
 
 	// changeStreams are the client cursors whose events need this system's own
 	// housekeeping filtered out of them.

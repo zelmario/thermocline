@@ -332,16 +332,24 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		if fine {
 			return nil, false
 		}
-		c.r.Stats.Incomplete.Add(1)
-		c.r.Stats.Refused.Add(1)
-		c.cls = ClassRefused
-		c.log.Warn("refused a read through a view over an incomplete collection",
-			"view", view, "reads", base, "because", because)
-		out, err := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, view, base, because)
-		if err != nil {
-			return nil, false
+		// The archive can be asked the same question when it holds the view
+		// defined the same way. Falling through leaves the completeness branch
+		// below to send it there, which is what it does for a collection.
+		if c.r.cfg.Completeness == config.Archive && c.r.archiveCanAnswerView(ctx, view) {
+			c.log.Debug("a view the fast tier cannot answer, sent to the archive",
+				"view", view, "reads", base, "because", because)
+		} else {
+			c.r.Stats.Incomplete.Add(1)
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused a read through a view over an incomplete collection",
+				"view", view, "reads", base, "because", because)
+			out, err := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, view, base, because)
+			if err != nil {
+				return nil, false
+			}
+			return out, true
 		}
-		return out, true
 	}
 
 	because, remedy, fine := c.r.checkAggregate(ctx, scope)

@@ -1070,6 +1070,21 @@ advice differs, and the advice for a collection cannot be followed for a view:
 tiering one is meaningless, so the feeder refuses it. Recreate them on the fast
 tier with `createView` and tier the collections they read from.
 
+**A view created through the router is given to the archive as well**, and that
+buys something beyond a rollback working. A read through a view used to be
+refused whenever the collection underneath it was incomplete, because the archive
+held the documents and not the definition; when it holds both, the read has a
+correct answer instead of an error. Measured on a view over a collection the fast
+tier held one document of, with the archive holding three: refused before,
+answers two now, which is what the archive's own view answers.
+
+Only when the two definitions are identical, and that is the whole of the
+condition: the collection read, the pipeline and the collation all matching. A
+view whose pipeline differs between the tiers answers a different question, and
+answering the archive's version of it would be exactly the silent difference this
+system exists to prevent. A view the archive does not have, or has differently,
+is still refused with the reason.
+
 **The accounts are the other thing the new tier does not have.** The existing
 cluster carries the application's users; the fast tier is a new replica set and
 carries none of them. The router authenticates against the fast tier, so on day

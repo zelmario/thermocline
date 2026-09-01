@@ -1,11 +1,13 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -177,6 +179,104 @@ func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
 // against the archive's copy of the underlying collection is possible and is
 // worth doing, but guessing at that translation would risk returning a
 // different answer rather than a short one, which would be worse than saying no.
+// archiveCanAnswerView reports whether the archive holds this view defined
+// exactly as the fast tier holds it.
+//
+// A view read used to be refused whenever the collection underneath it was
+// incomplete, on the grounds that the archive could not be asked: it holds the
+// documents and not the definition. A view created through the router is
+// mirrored down now, so the archive can hold both, and then the read has a
+// correct answer instead of an error.
+//
+// Exactly as, and nothing less. A view whose pipeline differs between the tiers
+// answers a different question, and answering the archive's version of it would
+// be the silent difference this whole system exists to avoid. Two definitions
+// count as the same when the collection read, the pipeline and the collation all
+// match; anything else, including a view the archive does not have, is a
+// refusal.
+func (r *Router) archiveCanAnswerView(ctx context.Context, ns string) bool {
+	r.viewMatch.mu.RLock()
+	at, seen := r.viewMatch.fetched[ns]
+	cached := r.viewMatch.same[ns]
+	r.viewMatch.mu.RUnlock()
+	if seen && time.Since(at) < viewTTL {
+		return cached
+	}
+
+	hot, hotOK := viewDefinition(ctx, r.hot, ns)
+	cold, coldOK := viewDefinition(ctx, r.cold, ns)
+	same := hotOK && coldOK && hot.equals(cold)
+
+	r.viewMatch.mu.Lock()
+	if r.viewMatch.same == nil {
+		r.viewMatch.same = map[string]bool{}
+		r.viewMatch.fetched = map[string]time.Time{}
+	}
+	r.viewMatch.same[ns] = same
+	r.viewMatch.fetched[ns] = time.Now()
+	r.viewMatch.mu.Unlock()
+	return same
+}
+
+// viewMatchCache remembers whether the archive's copy of a view matches the fast
+// tier's. Creating or dropping a view is rare and the router sees the DDL, the
+// same reasoning viewTTL rests on.
+type viewMatchCache struct {
+	mu      sync.RWMutex
+	fetched map[string]time.Time
+	same    map[string]bool
+}
+
+// viewSpec is what makes a view the question it is.
+type viewSpec struct {
+	on        string
+	pipeline  []byte
+	collation []byte
+}
+
+func (v viewSpec) equals(o viewSpec) bool {
+	return v.on == o.on &&
+		bytes.Equal(v.pipeline, o.pipeline) &&
+		bytes.Equal(v.collation, o.collation)
+}
+
+// viewDefinition reads one tier's definition of a view, and reports false when
+// the namespace is not a view there at all.
+func viewDefinition(ctx context.Context, client *mongo.Client, ns string) (viewSpec, bool) {
+	db, coll := splitNS(ns)
+	cur, err := client.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return viewSpec{}, false
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	if !cur.Next(ctx) {
+		return viewSpec{}, false
+	}
+	var raw bson.Raw
+	if err := cur.Decode(&raw); err != nil {
+		return viewSpec{}, false
+	}
+	if kind, _ := raw.Lookup("type").StringValueOK(); kind != "view" {
+		return viewSpec{}, false
+	}
+	opts, ok := raw.Lookup("options").DocumentOK()
+	if !ok {
+		return viewSpec{}, false
+	}
+	on, ok := opts.Lookup("viewOn").StringValueOK()
+	if !ok || on == "" {
+		return viewSpec{}, false
+	}
+	spec := viewSpec{on: on}
+	if v, err := opts.LookupErr("pipeline"); err == nil {
+		spec.pipeline = append([]byte(nil), v.Value...)
+	}
+	if v, err := opts.LookupErr("collation"); err == nil {
+		spec.collation = append([]byte(nil), v.Value...)
+	}
+	return spec, true
+}
+
 // refuseView says why a view over an incomplete collection is not answered.
 //
 // It used to say the archive could not answer it because a view exists only on

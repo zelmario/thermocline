@@ -796,9 +796,10 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 
 	c.r.Stats.Incomplete.Add(1)
 
-	// The archive holds the documents but not the view, so it cannot be asked
-	// this question at all.
-	if viaView {
+	// The archive holds the documents, and it holds the view too when the router
+	// mirrored it down. When it does not, or its definition differs, the
+	// question cannot be put to it at all. See archiveCanAnswerView.
+	if viaView && !c.r.archiveCanAnswerView(ctx, ns) {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a read through a view over an incomplete collection",

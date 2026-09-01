@@ -391,10 +391,10 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 
 	c.r.Stats.Incomplete.Add(1)
 
-	// A view exists only on the fast tier, because the feeder mirrors documents
-	// and never collection definitions, so the archive cannot be asked this
-	// question however complete it is.
-	if viaView {
+	// A view read can be sent to the archive when the archive holds the view
+	// defined the same way, which is the case for one this router mirrored down.
+	// Otherwise the question cannot be put to it however complete it is.
+	if viaView && !c.r.archiveCanAnswerView(ctx, ns) {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a read through a view over an incomplete collection",
