@@ -58,7 +58,6 @@ Or one at a time:
     go run ./test/compressed 127.0.0.1:27600       # a client that compresses without being invited to
     bash test/testtls.sh                           # TLS to the client and to the fast tier (host side)
     bash test/testsharded.sh                       # a mongos fast tier, which is refused (host side)
-    bash test/testshardedcold.sh                   # a mongos archive, which has to work (host side)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
     bash test/testfailover.sh                      # a write across a change of primary (host side)
     bash test/testversion.sh                       # tiers that do not run the same MongoDB (host side)

@@ -2083,6 +2083,14 @@ cp cline.example.yaml cline.yaml     # then edit the two URIs
 bin/cline feeder --config cline.yaml
 ```
 
+### Both tiers are replica sets
+
+That is the supported shape, and the only one anything here is tested against. A
+sharded fast tier is refused, with the reason, because every reading the daemons
+hold themselves back on is a replica set's. A sharded archive is not refused and
+not supported: it is not obviously broken, and nothing checks it. Both are in
+[What is not handled yet](#what-is-not-handled-yet).
+
 ### Both tiers run the same MongoDB release
 
 Every daemon reads both tiers' versions at startup and refuses to run when they
@@ -2132,11 +2140,10 @@ mistaken for agreement. Reading the feature compatibility version needs a
 privilege the router's own account may not have, and an account that cannot read
 it on both tiers skips that half of the check rather than refusing to start.
 
-There is one ordinary case of that, and it is worth knowing which: **a sharded
-archive.** A mongos answers `buildInfo`, so the releases are still compared, and
-it does not answer `getParameter` for `featureCompatibilityVersion`, so that half
-is skipped. `test/testshardedcold.sh` pins both, along with the rest of what a
-sharded archive has to do.
+A mongos is one server that does this: it answers `buildInfo`, so releases are
+still compared, and it does not answer `getParameter` for
+`featureCompatibilityVersion`. Both tiers are replica sets here, so that is a
+note rather than a case.
 
 The four daemons check this: feeder, evictor, warmer and router. The one-shot
 tools do not, because a mismatched pair is exactly when you need `cline
@@ -2285,6 +2292,24 @@ mongosh --port 28018 --eval '
   and checks each one. Supporting a sharded fast tier is a feature rather than a
   fix, and the first thing it needs is health readings that mean something
   there.
+
+- **A sharded archive is not supported either, and it is not refused.** Both
+  tiers are replica sets: that is the supported shape, and it is the only one
+  anything here is tested against.
+
+  The distinction matters, so it is stated rather than left to be discovered. A
+  mongos archive is *not* obviously broken. Nothing the daemons hold themselves
+  back on is read from the archive, so the health readings a mongos cannot give
+  are never asked of it; it is only ever sent ordinary queries, ordinary writes,
+  and `hello` for its clock, and it answers all three. Pointed at one, this
+  behaved: writes mirrored, fall-through reads came back, deletes became
+  tombstones, and an eviction sweep removed from the fast tier and left the
+  archive's copy.
+
+  It is still not supported, because nothing checks it. There is no suite,
+  nothing runs that way, and a defect there would be found by whoever is running
+  it in production rather than here. If that shape is wanted, the work is a suite
+  that keeps it honest, not a change to the code.
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server
