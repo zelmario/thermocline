@@ -429,9 +429,12 @@ echo "== the same options going the other way, into the archive =="
 # with 2 and the archive with 1, so every read that fell through, which is every
 # read of an evicted document, matched differently from the tier the application
 # had been talking to.
+# additionalProperties false on purpose: it is the shape that refuses a
+# tombstone, which is the document with a mark added, and the archive did not
+# have a validator to refuse one with until this carried it down.
 R "db.getSiblingDB(process.env.TC_DB).createCollection('$ONS',{collation:{locale:'en',strength:2},
-     validator:{\$jsonSchema:{bsonType:'object',required:['email'],
-                properties:{email:{bsonType:'string'}}}}})" >/dev/null
+     validator:{\$jsonSchema:{bsonType:'object',required:['email'],additionalProperties:false,
+                properties:{_id:{},name:{},email:{bsonType:'string'}}}}})" >/dev/null
 R "db.getSiblingDB(process.env.TC_DB).$ONS.insertMany([{_id:1,name:'Alice',email:'a@x'},
      {_id:2,name:'alice',email:'b@x'},{_id:3,name:'BOB',email:'c@x'}])" >/dev/null
 for _ in $(seq 1 40); do
@@ -455,6 +458,28 @@ startFeeder
 startRouter
 chk "and the router still answers the same"       "2" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({name:'alice'}))")"
+
+# Carrying the validator down is only safe because mirroring bypasses document
+# validation. A tombstone is the document with a mark added, and for one at the
+# 16 MB limit the body is dropped entirely, so a validator that refuses unknown
+# properties refuses the tombstone. That is how mirroring stopped for every
+# namespace once before, and this is the guard on the fix above rather than a
+# check of the fix itself: with no validator in the archive it passes trivially.
+R "db.getSiblingDB(process.env.TC_DB).$ONS.insertOne({_id:9,name:'carol',email:'d@x'})" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({_id:9}))")" = "1" ] && break
+  sleep 0.5
+done
+R "db.getSiblingDB(process.env.TC_DB).$ONS.deleteOne({_id:9})" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({_id:9,_tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+  sleep 0.5
+done
+chk "a delete still becomes a tombstone there"    "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({_id:9,_tcDeletedAt:{\$exists:true}}))")"
+chk "and mirroring refused nothing"               "0" \
+    "$({ grep -c 'the archive refuses a document the fast tier accepted' $LOGDIR/idx_f.log 2>/dev/null || true; } | head -1)"
+
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
