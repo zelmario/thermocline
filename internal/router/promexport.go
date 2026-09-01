@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,10 +93,21 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	}
 
 	// Mirroring lag: the first alert anyone should build.
+	//
+	// Infinity, not a missing series, when nothing has ever been mirrored. A
+	// feeder that has stopped shows the lag climbing and pages; a feeder that
+	// never started at all left no position and no checkpoint, so this used to
+	// publish nothing, and an alert on a series that is absent does not fire.
+	// The worst state of the system was the one the first alert anyone builds
+	// could not see. Unbounded is also the honest reading: without a checkpoint,
+	// how far the archive trails the fast tier is unknown.
+	const lagHelp = "How far the archive trails the fast tier. Eviction safety, recovery " +
+		"exposure and fallback read latency all hang off this. +Inf means nothing has been " +
+		"mirrored at all, which is a feeder that has never run."
 	if lag, ok := r.mirroringLag(ctx); ok {
-		gauge("mirroring_lag_seconds",
-			"How far the archive trails the fast tier. Eviction safety, recovery exposure and fallback read latency all hang off this.",
-			lag.Seconds())
+		gauge("mirroring_lag_seconds", lagHelp, lag.Seconds())
+	} else if r.cfg.FeederID != "" {
+		gauge("mirroring_lag_seconds", lagHelp, math.Inf(1))
 	}
 
 	// The background daemons, which have no listening socket of their own.

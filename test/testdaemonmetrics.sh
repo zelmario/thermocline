@@ -134,6 +134,48 @@ SECOND=$(M | awk -F' ' '/^thermocline_daemon_seconds_since_pass\{daemon="evictor
 chk "and it climbs while the daemon is not running"    "true" \
     "$(awk -v a="$FIRST" -v b="$SECOND" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
 
+echo "== mirroring lag when nothing has been mirrored at all =="
+# The failure the first alert anyone builds could not see. A feeder that has
+# stopped shows the lag climbing past any threshold; a feeder that never started
+# left no position and no checkpoint, and the series was simply absent, so
+# "mirroring_lag_seconds > 600" had nothing to compare. Infinity is also the
+# honest reading: without a checkpoint, how far the archive trails is unknown.
+stopDaemons
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'});
+   db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
+cline router --config $CFG --log-file $LOGDIR/dmet_r2.log &
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+sleep 2
+chk "the lag is still exported with no checkpoint"     "true" \
+    "$(M | grep -q '^thermocline_mirroring_lag_seconds' && echo true || echo false)"
+chk "and it says unbounded rather than zero"           "+Inf" \
+    "$(M | awk -F' ' '/^thermocline_mirroring_lag_seconds/{print $2}')"
+chk "and the help text says what +Inf means"           "true" \
+    "$(M | grep -q 'HELP thermocline_mirroring_lag_seconds.*never run' && echo true || echo false)"
+# And a real checkpoint puts a number back, or the metric is useless the rest of
+# the time.
+stopDaemons
+cline feeder --config $CFG --log-file $LOGDIR/dmet_f2.log &
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+cline router --config $CFG --log-file $LOGDIR/dmet_r3.log &
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+sleep 2
+chk "a running feeder puts a number back"              "true" \
+    "$(M | awk -F' ' '/^thermocline_mirroring_lag_seconds/{print $2}' \
+       | awk '{print ($1 != "+Inf" && $1+0 >= 0) ? "true" : "false (" $1 ")"}')"
+# The router and feeder stay up: the sections below scrape /metrics.
+
 echo "== an operator can hold eviction, and the hold is visible =="
 # The case this exists for is a restored archive. The evictor's own check is per
 # document and presence only, so an archive holding an older version of a
