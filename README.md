@@ -1709,6 +1709,20 @@ That distinction is the whole point: a fast tier built empty has no claim, and
 answering range queries from it would return short results and call them
 success. Range queries are refused until something records a claim.
 
+**And the claim is the `completeFrom` field, not the row it sits in.** A row in
+the watermarks collection carrying nothing but its `_id` used to read as
+complete from the zero time, which is the most permissive claim this system can
+hold: every range query on that namespace answered from the fast tier alone,
+however far back it reached. Measured through `cline watermark` on such a row:
+`complete for all of history`. Nothing here writes one, which is why it was
+never seen, and that is what made it worth closing — an `$unset`, a hand-edited
+row, a backup restored from an older schema, or the next feature to `$set` some
+other field on that collection with `upsert: true` would all have made one. A
+row without the field now claims nothing. A `completeFrom` that is present but
+is not a date is refused rather than guessed at, because "the claim cannot be
+read" and "nothing has claimed this" need different words and have different
+remedies.
+
 **A rule with no `date_field` reads each document's age from the timestamp
 inside its `_id`, and that only exists in an ObjectId.** Against any other `_id`
 type the rule does not merely approximate, it addresses nothing: MongoDB

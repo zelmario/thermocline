@@ -86,15 +86,51 @@ func New(cold *mongo.Client) *Store {
 // Load returns the recorded completeness for ns. A missing watermark is not an
 // error; it returns an unclaimed Mark, meaning nothing is guaranteed.
 func (s *Store) Load(ctx context.Context, ns string) (Mark, error) {
-	var wm meta.Watermark
-	err := s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: ns}}).Decode(&wm)
+	var raw bson.Raw
+	err := s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: ns}}).Decode(&raw)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return Mark{}, nil
 	}
 	if err != nil {
 		return Mark{}, fmt.Errorf("load watermark for %s: %w", ns, err)
 	}
-	return Mark{From: wm.CompleteFrom.UTC(), Claimed: true}, nil
+
+	return markOf(raw, ns)
+}
+
+// markOf reads one row into a Mark.
+//
+// The claim is the completeFrom field, not the row. Claimed used to come from
+// the row existing, and completeFrom was decoded into a plain time.Time, so a
+// row carrying nothing but its _id read as "complete from the zero time", which
+// is the most permissive claim this system can hold: every range query on that
+// namespace answered from the fast tier alone, however far back it reaches.
+// Measured through `cline watermark` on a row inserted with no other field:
+// "complete for all of history".
+//
+// Nothing here wrote such a row, which is why it was never seen, and that is
+// exactly what made it worth closing: the next thing to $set a field on this
+// collection with upsert:true would have created one, and so would an $unset, a
+// hand-edited row, or a backup restored from an older schema. A row without the
+// field is not a claim.
+//
+// One function for both readers on purpose. Load and All had the same two lines
+// written out twice, and a fix to one of them would have left the other saying
+// every row is a claim.
+func markOf(raw bson.Raw, ns string) (Mark, error) {
+	v, lerr := raw.LookupErr("completeFrom")
+	if lerr != nil {
+		return Mark{}, nil
+	}
+	// Present but not a date is a different matter and stays an error: the
+	// caller reports the claim as unreadable and refuses, rather than guessing
+	// at what somebody meant.
+	t, ok := v.TimeOK()
+	if !ok {
+		return Mark{}, fmt.Errorf("watermark for %s: completeFrom is %s, not a date",
+			ns, v.Type.String())
+	}
+	return Mark{From: t.UTC(), Claimed: true}, nil
 }
 
 // Clear withdraws the claim for ns, so nothing is guaranteed until something
@@ -143,11 +179,24 @@ func (s *Store) All(ctx context.Context) (map[string]Mark, error) {
 
 	out := map[string]Mark{}
 	for cur.Next(ctx) {
-		var wm meta.Watermark
-		if err := cur.Decode(&wm); err != nil {
+		var raw bson.Raw
+		if err := cur.Decode(&raw); err != nil {
 			return nil, fmt.Errorf("list watermarks: %w", err)
 		}
-		out[wm.NS] = Mark{From: wm.CompleteFrom.UTC(), Claimed: true}
+		ns, ok := raw.Lookup("_id").StringValueOK()
+		if !ok {
+			continue
+		}
+		// A row that is not a claim is left out of the listing rather than
+		// reported as one covering all of history.
+		mark, merr := markOf(raw, ns)
+		if merr != nil {
+			return nil, fmt.Errorf("list watermarks: %w", merr)
+		}
+		if !mark.Claimed {
+			continue
+		}
+		out[ns] = mark
 	}
 	return out, cur.Err()
 }
