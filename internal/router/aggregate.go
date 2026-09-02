@@ -241,8 +241,16 @@ func subDoc(val bson.RawValue) bson.Raw {
 // checkAggregate reports why an aggregation cannot be trusted, or ok when it
 // can.
 func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remedy string, ok bool) {
+	// An aggregation that writes is judged strictly, however it reads. Its
+	// input feeds $out or $merge, so a claim that has become false does not
+	// shorten an answer a client can retry, it writes a short answer into a
+	// collection. router.claim_grace was not offered for that. See completeness.
+	claimOf := r.completenessForRead
+	if s.writes {
+		claimOf = r.completeness
+	}
 	if r.cfg.Manages(s.primary) {
-		mark, known := r.completeness(ctx, s.primary)
+		mark, known := claimOf(ctx, s.primary)
 		switch {
 		case !known:
 			return "the completeness watermark could not be read",
@@ -267,7 +275,7 @@ func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remed
 		if !r.cfg.Manages(ns) {
 			continue
 		}
-		mark, known := r.completeness(ctx, ns)
+		mark, known := claimOf(ctx, ns)
 		if !known {
 			return "the completeness watermark for the joined collection " + ns + " could not be read",
 				"the archive is unreachable; retry once it is back", false

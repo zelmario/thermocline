@@ -56,7 +56,7 @@ func (c *conn) correctedCount(ctx context.Context, ns string) (int64, bool) {
 	if !tiered {
 		return 0, false
 	}
-	if mark, known := c.r.completeness(ctx, base); known && mark.CoversAll() {
+	if mark, known := c.r.completenessForRead(ctx, base); known && mark.CoversAll() {
 		return 0, false
 	}
 

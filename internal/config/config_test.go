@@ -369,6 +369,44 @@ feeder:
 	}
 }
 
+// router.claim_grace only means anything where reads fall through to the
+// archive, and it is off unless it is asked for. A knob that silently does
+// nothing is worse than one that is absent: it reads as protection in place.
+func TestClaimGraceBounds(t *testing.T) {
+	if got := valid().Router.ClaimGrace; got != 0 {
+		t.Fatalf("claim_grace defaults to %v, want off", got)
+	}
+
+	cases := []struct {
+		name  string
+		grace Duration
+		mode  Completeness
+		want  string
+	}{
+		{"off, in every mode", 0, Strict, ""},
+		{"a minute, falling through to the archive", Duration(time.Minute), Archive, ""},
+		{"negative", Duration(-time.Second), Archive, "cannot be negative"},
+		{"set, but nothing falls through", Duration(time.Minute), Strict, "only applies to completeness: archive"},
+		{"set, but permissive", Duration(time.Minute), Permissive, "only applies to completeness: archive"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := valid()
+			cfg.Router.ClaimGrace = c.grace
+			cfg.Router.Completeness = c.mode
+			err := cfg.Validate()
+			switch {
+			case c.want == "" && err != nil:
+				t.Fatalf("refused: %v", err)
+			case c.want != "" && err == nil:
+				t.Fatalf("accepted, want a refusal naming %q", c.want)
+			case c.want != "" && !strings.Contains(err.Error(), c.want):
+				t.Fatalf("refused with %q, which does not name %q", err, c.want)
+			}
+		})
+	}
+}
+
 // A key the loader does not know is refused rather than ignored.
 //
 // It used to be ignored, which is the worst shape a configuration mistake can

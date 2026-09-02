@@ -344,7 +344,8 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		judged = base
 	}
 
-	mark, known := c.r.completeness(ctx, judged)
+	// A read, so a claim held under router.claim_grace is allowed to answer it.
+	mark, known := c.r.completenessForRead(ctx, judged)
 
 	if known && mark.Claimed {
 		af, aok := c.r.ageFieldOf(judged)

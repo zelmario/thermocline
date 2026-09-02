@@ -608,6 +608,7 @@ function drawCounters(s) {
     {k: "duplicates stopped", v: c.duplicate_keys, hint: "cross-tier unique key violations refused", good: true},
     {k: "refused",         v: c.refused,        hint: "commands the router would not answer", alert: c.refused > 0},
     {k: "stale reads",     v: c.stale_reads,    hint: "archive reads answered before mirroring caught up", warn: c.stale_reads > 0},
+    {k: "claim grace reads", v: c.claim_grace_reads, hint: "answered from a claim the archive could not be asked for again", warn: c.claim_grace_reads > 0},
     {k: "unauthorized",    v: c.unauthorized,   hint: "archive answers refused because the fast tier would not have served that client", alert: c.unauthorized > 0},
     {k: "primary-only reads", v: c.primary_only_reads, hint: "reads that asked for a secondary and were served by the primary: correct and fresher, but the load stays on the primary", warn: c.primary_only_reads > 0},
     {k: "clients",         v: c.clients_open,   hint: "connections open now"},

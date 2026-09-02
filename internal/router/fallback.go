@@ -780,7 +780,8 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 		judged = base
 	}
 
-	mark, known := c.r.completeness(ctx, judged)
+	// A read, so router.claim_grace applies. Nothing here writes.
+	mark, known := c.r.completenessForRead(ctx, judged)
 	if known && mark.Claimed {
 		af, aok := c.r.ageFieldOf(judged)
 		bound, bounded := boundOfQueryField(cmd, af, aok)

@@ -133,7 +133,9 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 		judged = base
 	}
 
-	mark, known := c.r.completeness(ctx, judged)
+	// An explain never performs the command, so this is a read however the
+	// explained command would be classified. See explain.go's own rule.
+	mark, known := c.r.completenessForRead(ctx, judged)
 	if !known {
 		return "the completeness watermark could not be read, so the archive is unreachable", true
 	}

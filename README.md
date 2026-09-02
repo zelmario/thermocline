@@ -1408,7 +1408,7 @@ scrape_configs:
 
 ### What to alert on
 
-Eight signals, and the reason each one is worth waking somebody for. Everything
+Nine signals, and the reason each one is worth waking somebody for. Everything
 here is already published; what was missing was saying which numbers mean
 something.
 
@@ -1463,7 +1463,16 @@ reports `+Inf` rather than vanishing, so the first alert anyone builds fires for
 feeder that has never run as well as one that has stopped. The router's own
 absence is the scrape target going down, which is `up == 0` on the job.
 
-**8. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
+**8. `thermocline_claim_grace_reads_total` above zero, if you set
+`router.claim_grace`. Page.** Every read it counts was answered from a
+completeness claim the router could not check, because the archive was
+unreachable. That is the trade you asked for, and it is also the only signal
+that says the trade is being taken: the answers are correct if the archive is
+down and short if only this router is cut off, and the counter cannot tell those
+apart. Find out which it is. On a deployment that leaves the grace off this
+counter stays at zero for ever, so the alert costs nothing.
+
+**9. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
 zero. Investigate.** The first is a client reading a collection it has no
 permission for, refused. The second is a message the router could not inspect,
 which means it was forwarded unguarded; a compressed connection is the cause, and
@@ -1527,6 +1536,14 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "the router is not answering its metrics endpoint"
+      - alert: ThermoclineAnsweringWithoutTheArchive
+        # Only ever fires where router.claim_grace is set. Reads are being
+        # answered from a claim that cannot be checked: correct if the archive
+        # is down, short if only this router is cut off from it.
+        expr: increase(thermocline_claim_grace_reads_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "the router is answering from an unverifiable completeness claim; is the archive down, or is the router partitioned?"
       - alert: ThermoclineUnguardedOrUnauthorized
         expr: increase(thermocline_unauthorized_total[15m]) > 0
           or increase(thermocline_unreadable_total[15m]) > 0
@@ -2181,6 +2198,55 @@ nothing, including the reads the fast tier could have served alone. Plan
 restarts accordingly, and remember that on day one almost every read needs the
 archive anyway.
 
+**That one stays as it is, deliberately.** A router that has never read a claim
+knows which namespaces are tiered and nothing about what the fast tier holds of
+them, so anything it served would be a guess dressed as an answer. Starting and
+refusing every tiered namespace by name was considered and is not obviously
+better than not starting: the application gets errors either way, and a process
+that is up is a process monitoring reports as healthy.
+
+**A router that is already running is a different case, and it has a knob.**
+About five seconds into an archive outage it stops answering tiered reads too,
+even the ones the fast tier owns, because the claim it caches expires and cannot
+be re-read.
+
+**What that cost was measured to be, and it was worse than "stops answering".**
+One claim read against an address nothing answers on takes **30.002 seconds**,
+the driver's default server selection timeout, which nothing here shortens. Each
+tiered read paid it in full and was then refused, so an archive outage was not a
+router refusing reads promptly, it was a router hanging for half a minute per
+read and then refusing. Any client with a socket timeout gave up first and saw a
+broken proxy. A failed claim read is now remembered for the same five seconds the
+claim itself is cached, so one read per namespace per five seconds pays the
+timeout and the rest are answered from what is held. That applies whether or not
+a grace is configured: with none, the refusals simply arrive promptly.
+
+`router.claim_grace` says how much longer a claim already read may be believed.
+It is off by default and the trade is exact:
+
+- **Safe against an archive outage.** Narrowing a claim and evicting what it
+  stops covering are both writes to the archive, so while nobody can reach it
+  neither can happen and the last claim read is still true.
+- **Not safe against a partition that isolates only the router.** The archive is
+  up, the evictor is working, claims are being narrowed and documents removed,
+  and this router answers from a claim covering documents the fast tier no
+  longer holds. Those reads are short with no error on them, for as long as the
+  grace lasts.
+- **Writes are never covered by it.** An insert skips the archive's own
+  duplicate check when the fast tier claims all of history, so a claim that has
+  become false would let through an `_id` the archive still holds and the feeder
+  would mirror the new document over the archived one. Measured, while the grace
+  still applied everywhere: an insert the same router refused without a grace
+  was accepted and landed. Every write path refuses while the archive is
+  unreachable, whatever the grace is set to. The trade on offer is a short read
+  against a refused read, and never a destroyed document.
+- **It invents nothing.** A namespace this router was never asked about has no
+  claim to hold over and is refused, and so is every namespace if the outage
+  started before the router was asked anything at all.
+
+`thermocline_claim_grace_reads_total` counts the reads it allowed. Alert on it:
+the counter cannot tell a correct answer from a short one, and you can.
+
 An archive *failover* is a different matter and was measured rather than
 assumed. With its primary stepped down under load, and both kinds of read
 running throughout, nothing failed: 19 reads the fast tier owned and 13 that
@@ -2295,7 +2361,7 @@ with a hyphen where the key has an underscore, loaded as `false`. The router
 proxied authentication while the operator believed it was terminating it and
 checking privileges itself. Nothing failed, nothing was logged, and the setting
 simply did not exist. A misspelt `tombstone_retention` keeps deleted documents
-for ever; a misspelt `older_than` leaves a namespace that nothing ages.
+for ever; a misspelt `claim_grace` gives no grace.
 
 The cost of refusing is a restart with an error naming the line. The cost of the
 silence is a setting you think you have.

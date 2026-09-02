@@ -207,8 +207,13 @@ type Stats struct {
 	Unreadable       atomic.Int64
 	EventsHidden     atomic.Int64
 	StaleReads       atomic.Int64
-	ClientsOpen      atomic.Int64
-	ClientsTotal     atomic.Int64
+	// ClaimGraceReads counts reads answered from a completeness claim the
+	// router could not re-read, which router.claim_grace allowed. Any value
+	// above zero means the archive was unreachable and this router answered
+	// anyway. See completeness.
+	ClaimGraceReads atomic.Int64
+	ClientsOpen     atomic.Int64
+	ClientsTotal    atomic.Int64
 }
 
 // New builds a Router. It does not listen or connect.

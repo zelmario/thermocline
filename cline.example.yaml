@@ -234,6 +234,40 @@ router:
   # How long a copied-up document is protected from the evictor.
   residency: 30d
 
+  # How much longer than five seconds this router may answer from a completeness
+  # claim it can no longer re-read, because the archive is unreachable. Absent
+  # or 0s is no grace at all, which is the default.
+  #
+  # What it buys. The claim that says what the fast tier holds lives on the
+  # archive, and this router caches it for five seconds. So about five seconds
+  # into an archive outage a running router stops answering tiered reads, even
+  # the ones the fast tier owns on its own. A grace keeps those working.
+  #
+  # Why it is safe against an outage. Narrowing a claim and evicting the
+  # documents it stops covering are both writes to the archive. An archive
+  # nobody can reach is an archive where neither can happen, so the claim this
+  # router last read is still true.
+  #
+  # What it is not safe against. A network fault that isolates only this router
+  # leaves the archive up and the evictor working: claims are narrowed,
+  # documents are removed, and this router answers from a claim that covers
+  # documents the fast tier no longer holds. Those answers are short, with no
+  # error on them, for as long as the grace lasts. There is no value that is
+  # safe in both faults, which is why the default is off.
+  #
+  # Writes are not covered by it and cannot be. An insert skips the archive's
+  # own duplicate check when the fast tier claims all of history, so a claim
+  # that has become false would let an _id the archive still holds through, and
+  # the feeder would mirror the new document over the archived one. Every write
+  # path keeps refusing while the archive cannot be reached, whatever this is
+  # set to. So the trade on offer is short read answers against refused reads,
+  # and never a destroyed document.
+  #
+  # Watch thermocline_claim_grace_reads_total. Every read it counts was answered
+  # from a claim that could not be checked.
+  #
+  # claim_grace: 2m
+
   # The operator dashboard: one page showing what each tier is holding, how
   # commands were served, and what each kind of command cost. Empty means off.
   #

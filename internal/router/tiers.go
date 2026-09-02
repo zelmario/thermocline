@@ -200,6 +200,20 @@ type watermarkEntry struct {
 	mark    watermark.Mark
 	known   bool
 	fetched time.Time
+	// lastFail is when reading the claim last failed, kept so an unreachable
+	// archive is paid for once per completenessTTL instead of once per read.
+	//
+	// Measured with nothing answering on the archive's address: one claim read
+	// costs 30.002 seconds, the driver's default server selection timeout,
+	// which no daemon here shortens. Every tiered read paid that and was then
+	// refused, so an archive outage was not a router refusing reads, it was a
+	// router hanging for half a minute and then refusing them. A client with a
+	// socket timeout gives up first and sees nothing but a broken proxy.
+	//
+	// The claim's two copies already disagree for completenessTTL by design, so
+	// a failure is allowed to be that stale as well: the first read after one
+	// pays the timeout, the rest of that window are answered from what is held.
+	lastFail time.Time
 }
 
 // completenessTTL is how long a watermark reading is reused, because reading it
@@ -212,12 +226,6 @@ type watermarkEntry struct {
 // written down and which this must equal.
 const completenessTTL = watermark.ClaimCacheTTL
 
-// completeness returns what the fast tier claims to hold for ns, and whether
-// the claim could be read at all.
-//
-// A read failure is reported as unknown rather than folded into an unclaimed
-// Mark. Both refuse in strict mode, but they need different words: one is "warm
-// this namespace", the other is "the cold tier is unreachable".
 // forgetCompleteness drops a cached claim, for the moment the router itself
 // makes it untrue.
 //
@@ -239,28 +247,145 @@ func (r *Router) forgetCompleteness(ns string) {
 	r.wmCache.mu.Unlock()
 }
 
+// claimReadFailedRecently reports whether reading this claim failed inside the
+// last completenessTTL, in which case reading it again is not worth another
+// server selection timeout.
+func claimReadFailedRecently(e watermarkEntry, cached bool, now time.Time) bool {
+	return cached && !e.lastFail.IsZero() && now.Sub(e.lastFail) < completenessTTL
+}
+
+// claimWithinGrace reports whether a claim the archive can no longer be asked
+// for again may still be answered from.
+//
+// Four conditions, and each one has a reason to be here. There has to be a
+// grace configured, because the whole thing is off by default. There has to be
+// a cached entry, and it has to be one that was read successfully: a router
+// that started during the outage has nothing to hold over, and an entry
+// recording a previous failure is not a claim. And the window runs from the
+// moment the claim was last read, not from the moment reading it started
+// failing, so an outage that took a while to notice does not extend it.
+func claimWithinGrace(e watermarkEntry, cached bool, grace time.Duration, now time.Time) bool {
+	if grace <= 0 || !cached || !e.known {
+		return false
+	}
+	return now.Sub(e.fetched) < completenessTTL+grace
+}
+
+// completeness returns what the fast tier claims to hold for ns, and whether
+// the claim could be read at all.
+//
+// A read failure is reported as unknown rather than folded into an unclaimed
+// Mark. Both refuse in strict mode, but they need different words: one is "warm
+// this namespace", the other is "the cold tier is unreachable".
+//
+// A claim held only under router.claim_grace is reported as unknown here, so
+// every caller that has not deliberately asked for the grace keeps refusing.
+//
+// That is the safe direction for a call site nobody thought about. The grace
+// trades a window of short answers for availability, which the operator chose,
+// and a short answer is the worst a read can do. A write is not bounded that
+// way: an insert skips the archive's own duplicate check when the fast tier
+// claims all of history, so a claim that is false lets through an _id the
+// archive still holds, and the feeder then mirrors the new document over the
+// archived one. Measured, before this split existed: with a grace configured
+// and the archive stopped, an insert the plain router refused was accepted and
+// landed on the fast tier. A few minutes of short answers is a trade worth
+// offering. A few minutes in which an archived document can be destroyed is
+// not, and it was not what was asked for.
 func (r *Router) completeness(ctx context.Context, ns string) (watermark.Mark, bool) {
+	mark, known, graced := r.completenessClaim(ctx, ns)
+	if graced {
+		return mark, false
+	}
+	return mark, known
+}
+
+// completenessForRead is completeness for the paths where believing a claim
+// that has become false shortens an answer and does nothing else. Those are the
+// paths router.claim_grace exists for.
+func (r *Router) completenessForRead(ctx context.Context, ns string) (watermark.Mark, bool) {
+	mark, known, _ := r.completenessClaim(ctx, ns)
+	return mark, known
+}
+
+// completenessClaim reads the claim, saying also whether it is believed only
+// because router.claim_grace is holding one that can no longer be re-read.
+//
+// Named in full because "claim" alone means a key claim in the registry
+// everywhere else in this package.
+func (r *Router) completenessClaim(ctx context.Context, ns string) (watermark.Mark, bool, bool) {
 	r.wmCache.mu.RLock()
 	e, ok := r.wmCache.entries[ns]
 	r.wmCache.mu.RUnlock()
 	if ok && time.Since(e.fetched) < completenessTTL {
-		return e.mark, e.known
+		return e.mark, e.known, false
+	}
+
+	// A read of this claim failed a moment ago, so the archive is unreachable
+	// and asking again costs half a minute to learn the same thing.
+	if now := time.Now(); claimReadFailedRecently(e, ok, now) {
+		if grace := r.cfg.ClaimGrace.D(); claimWithinGrace(e, ok, grace, now) {
+			r.Stats.ClaimGraceReads.Add(1)
+			return e.mark, true, true
+		}
+		return watermark.Mark{}, false, false
 	}
 
 	mark, err := r.marks.Load(ctx, ns)
-	entry := watermarkEntry{mark: mark, known: err == nil, fetched: time.Now()}
 	if err != nil {
-		r.log.Warn("could not read the completeness watermark", "ns", ns, "err", err)
-	}
+		// An archive that cannot be reached is an archive where nothing can be
+		// evicted and no claim can be narrowed, because both of those are
+		// writes to it. So the claim this router last read is still true, and
+		// router.claim_grace says for how much longer it may be believed. Off
+		// by default; the fault it does not protect against is written up on
+		// the field.
+		//
+		// Measured from the last successful read rather than from the failure,
+		// so the window is what the operator configured and not that plus
+		// however long the outage took to notice.
+		//
+		// The failure is recorded first and on both paths. It keeps the claim
+		// and the moment it was read, because the grace window is measured from
+		// that, and it is recorded before the grace is consulted because a
+		// graced read that did not remember the failure would pay the 30 second
+		// timeout again on the very next query, which is the cost this exists
+		// to avoid.
+		now := time.Now()
+		held := e
+		if !ok {
+			held = watermarkEntry{}
+		}
+		held.lastFail = now
+		r.rememberClaim(ns, held)
 
+		if grace := r.cfg.ClaimGrace.D(); claimWithinGrace(e, ok, grace, now) {
+			r.Stats.ClaimGraceReads.Add(1)
+			r.log.Warn("answering from a completeness claim that can no longer be re-read",
+				"ns", ns, "age", now.Sub(e.fetched).Truncate(time.Second).String(),
+				"grace", grace.String(), "err", err,
+				"reason", "router.claim_grace is set and the archive is unreachable, so no claim "+
+					"can have been narrowed and none of what it covers can have been evicted",
+				"effect", "if only this router is cut off, rather than the archive being down, "+
+					"the evictor may be removing documents this answer counts as present",
+				"action", "check whether the archive is down or this router is partitioned from it")
+			return e.mark, true, true
+		}
+		r.log.Warn("could not read the completeness watermark", "ns", ns, "err", err)
+		return watermark.Mark{}, false, false
+	}
+	entry := watermarkEntry{mark: mark, known: true, fetched: time.Now()}
+
+	r.rememberClaim(ns, entry)
+	return entry.mark, entry.known, false
+}
+
+func (r *Router) rememberClaim(ns string, entry watermarkEntry) {
 	r.wmCache.mu.Lock()
 	if r.wmCache.entries == nil {
 		r.wmCache.entries = make(map[string]watermarkEntry)
 	}
 	r.wmCache.entries[ns] = entry
 	r.wmCache.mu.Unlock()
-
-	return entry.mark, entry.known
 }
 
 // warnAboutMissingWatermarks says out loud what an empty watermarks collection

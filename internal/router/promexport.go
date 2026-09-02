@@ -62,6 +62,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("primary_only_reads_total", "Reads that asked for a secondary and were served by the primary. Answers are correct and fresher than asked for; the read load stays on the primary.", snap.Counters["primary_only_reads"])
 	counter("unreadable_total", "Messages the router could not inspect, which are therefore unguarded. Compressed connections cause these; any value above zero needs the client's compressors removed.", snap.Counters["unreadable"])
 	counter("stale_reads_total", "Archive reads answered before mirroring caught up. Any of these is worth investigating.", snap.Counters["stale_reads"])
+	counter("claim_grace_reads_total", "Reads answered from a completeness claim the router could not re-read, allowed by router.claim_grace. Any value above zero means the archive was unreachable and this router answered anyway.", snap.Counters["claim_grace_reads"])
 	// The first thing worth paging on, and it was readable only from the
 	// dashboard: an alert cannot be written against a page somebody has to open.
 	counter("panics_total", "Client connections closed by a recovered panic. Any value above zero is a defect, with a stack in the log.", snap.Counters["panics"])

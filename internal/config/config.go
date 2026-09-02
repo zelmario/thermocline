@@ -122,6 +122,31 @@ type RouterConfig struct {
 	// keeps up, which is the normal case. Set it to zero to answer immediately
 	// and accept secondary-read freshness.
 	ArchiveWait Duration `yaml:"archive_wait"`
+	// ClaimGrace is how much longer than the ordinary claim cache TTL a router
+	// may keep answering from a completeness claim it can no longer re-read,
+	// because the archive is unreachable. Zero, the default, is no grace at all.
+	//
+	// It buys availability during an archive outage and it is the one knob here
+	// that trades a guarantee for it, so the reasoning is worth stating.
+	//
+	// The claim is a value with two copies and they disagree for
+	// watermark.ClaimCacheTTL, which is safe because the disagreement only ever
+	// runs one way: the evictor raises a claim before it removes anything, and
+	// waits out that TTL in between. Both of those writes go to the archive. So
+	// an archive nobody can reach is an archive where no claim can be narrowed
+	// and nothing can be evicted, and a claim held past its TTL is still true.
+	//
+	// That argument holds for an outage and fails for a partition that isolates
+	// only this router: the evictor still reaches the archive, still narrows
+	// claims, still removes documents, and this router answers from a claim
+	// that covers documents the fast tier no longer holds. The answer is short
+	// with no error on it, for as long as this grace lasts.
+	//
+	// Set it if a few minutes of short answers during a network fault is a
+	// better outcome for the application than a few minutes of refusals. Leave
+	// it at zero if it is not. There is no value that is safe in both faults,
+	// which is why there is no default other than off.
+	ClaimGrace Duration `yaml:"claim_grace"`
 	// Dashboard is the address the operator dashboard listens on, empty for
 	// off. It is deliberately a separate address from Listen: the page names
 	// collections and reports traffic, so it belongs on an operator network
@@ -727,6 +752,15 @@ func (r RouterConfig) Validate() error {
 	}
 	if r.Residency <= 0 {
 		return errors.New("router.residency must be positive, or the evictor removes what was just copied up")
+	}
+	if r.ClaimGrace < 0 {
+		return errors.New("router.claim_grace cannot be negative")
+	}
+	if r.ClaimGrace > 0 && r.Completeness != Archive {
+		// Nothing reads a claim it cannot re-read in the other two modes: they
+		// refuse rather than fall through, so the grace would silently do
+		// nothing and look like protection that is in place.
+		return fmt.Errorf("router.claim_grace only applies to completeness: archive, not %q", r.Completeness)
 	}
 	if r.Dashboard != "" && samePort(r.Dashboard, r.Listen) {
 		// Both would bind it and one would lose, leaving either no dashboard or

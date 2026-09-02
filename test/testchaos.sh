@@ -122,6 +122,27 @@ echo "  the archive runs on:$CLDNODES"
 if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
   C "db.getSiblingDB('shop').$NS.deleteMany({_id:'outage'}); db.getSiblingDB('shop').$NS.insertOne({_id:'outage',v:'archived, precious'})" >/dev/null
   H "db.getSiblingDB('shop').$NS.deleteMany({_id:'outage'})" >/dev/null
+  # A second router, identical but for a claim grace and its own two ports. It
+  # has to be started before the archive goes away, because a router will not
+  # start without it, which is the whole reason that limitation exists.
+  docker exec $NODE sh -c "sed -e 's|^  listen: .*|  listen: \"0.0.0.0:27104\"|' \
+                               -e 's|^  dashboard: .*|  dashboard: \"0.0.0.0:27114\"|' \
+                               -e 's|^  completeness:|  claim_grace: 5m\n  completeness:|' \
+                               $CFG > /root/cline_grace.yaml"
+  docker exec -d $NODE cline router --config /root/cline_grace.yaml --log-file /var/log/cline/chaos_grace.log
+  for _ in $(seq 1 30); do
+    docker exec $NODE mongosh --port 27104 -u dba -p secret --authenticationDatabase admin \
+      --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+    sleep 1
+  done
+  # No expected value anywhere here: the fast tier's count is whatever the
+  # sections above left, and the claim is that it does not change because the
+  # archive went away.
+  COUNT() { docker exec $NODE mongosh --port "$1" -u dba -p secret --authenticationDatabase admin --quiet --eval "
+    try { print(db.getSiblingDB('shop').$NS.countDocuments({})); }
+    catch(e) { print('REFUSED'); }" 2>&1 | tail -1; }
+  WANT=$(COUNT 27100)
+  chk "the grace router answers as the plain one does, before the outage" "$WANT" "$(COUNT 27104)"
   for n in $CLDNODES; do docker exec $n systemctl stop mongod; done
   sleep 3
   OUT=$(docker exec $NODE mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
@@ -129,12 +150,66 @@ if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
     catch(e) { print(e.message.indexOf('archive could not be reached') >= 0 ? 'REFUSED' : 'OTHER: '+e.message.substring(0,50)); }" 2>&1 | tail -1)
   chk "an insert is refused while the archive is down" "REFUSED" "$OUT"
   chk "and nothing landed on the fast tier"            "0"       "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:'outage'}))")"
+
+  # And a read of what the fast tier owns, which is what router.claim_grace is
+  # for. A running router stops answering tiered reads about five seconds into
+  # an archive outage, because the completeness claim lives on the archive and
+  # the cached copy expires. The grace says how much longer the cached claim may
+  # be believed, and the argument for it is that an archive nobody can reach is
+  # an archive where nothing can be evicted.
+  #
+  # Both arms in the one outage window, because that is the only way to be sure
+  # they met the same fault: the grace router answers and the default one
+  # refuses. Off by default is half of what this checks.
+  #
+  # Both routers read the claim before the outage, on purpose. A claim never
+  # read is nothing to hold over, and the grace deliberately does not invent one.
+  sleep 7   # past ClaimCacheTTL, so neither router still holds a claim read before the outage began
+  # Timed, because a claim read that cannot be served costs 30.002 seconds of
+  # server selection and that used to be paid on every read: an archive outage
+  # was a router hanging for half a minute per read and then refusing, not a
+  # router refusing. A failure is remembered for the claim cache's own TTL, so
+  # the first read here pays it and the two after it must not.
+  T0=$(date +%s%N); FIRST=$(COUNT 27104); T1=$(date +%s%N)
+  SECOND=$(COUNT 27104); THIRD=$(COUNT 27104); T2=$(date +%s%N)
+  echo "  claim reads during the outage: first $(( (T1-T0)/1000000 ))ms, next two $(( (T2-T1)/1000000 ))ms"
+  chk "the grace router still answers it, past the claim cache TTL" "$WANT" "$FIRST"
+  chk "and again"                                       "$WANT"   "$SECOND"
+  chk "and again"                                       "$WANT"   "$THIRD"
+  chk "a remembered failure is not paid for twice"      "true"    "$([ $(( (T2-T1)/1000000 )) -lt 5000 ] && echo true || echo false)"
+  chk "the same read without a grace is refused"        "REFUSED" "$(COUNT 27100)"
+  chk "and the grace router counted what it did"        "true" \
+      "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:27114/api/snapshot" 2>/dev/null \
+          | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["counters"]["claim_grace_reads"] > 0 else "false")' 2>/dev/null | tail -1)"
+
+  # What the grace must not cover, which is how the split between reads and
+  # writes was found. A grace that covered everything let an insert through:
+  # the archive's duplicate check is skipped when the fast tier claims all of
+  # history, so a claim that has become false lets an _id the archive still
+  # holds onto the fast tier, and the feeder then mirrors it over the archived
+  # document. Measured before the split: ACCEPTED, and it landed.
+  INS=$(docker exec $NODE mongosh --port 27104 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+    try { db.getSiblingDB('shop').$NS.insertOne({_id:'graceclobber',v:'x'}); print('ACCEPTED'); }
+    catch(e) { print(e.message.indexOf('archive could not be reached') >= 0 ? 'REFUSED' : 'OTHER: '+e.message.substring(0,60)); }" 2>&1 | tail -1)
+  chk "an insert on the grace router is still refused"  "REFUSED" "$INS"
+  chk "and nothing landed on the fast tier"             "0"       "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:'graceclobber'}))")"
+  # A namespace this router was never asked about has no claim to hold over, and
+  # the grace deliberately does not invent one.
+  chk "a namespace never asked about is refused"        "REFUSED" \
+      "$(docker exec $NODE mongosh --port 27104 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+          try { print(db.getSiblingDB('shop').tqbound.countDocuments({})); } catch(e) { print('REFUSED'); }" 2>&1 | tail -1)"
+
   for n in $CLDNODES; do docker exec $n systemctl start mongod; done
   for _ in $(seq 1 60); do
     [ "$(C 'print(rs.status().members.filter(m=>m.stateStr=="PRIMARY").length)' 2>/dev/null)" = "1" ] && break
     sleep 2
   done
   chk "and the archive kept what it had"              "archived, precious"       "$(C "const d=db.getSiblingDB('shop').$NS.findOne({_id:'outage'}); print(d?d.v:'MISSING')")"
+  sleep 3
+  chk "the claim is read again once the archive answers" "$WANT" "$(COUNT 27104)"
+  chk "and so is the one that would not hold it over"    "$WANT" "$(COUNT 27100)"
+  H "db.getSiblingDB('shop').$NS.deleteMany({_id:'graceclobber'})" >/dev/null
+  docker exec $NODE pkill -f 'config /root/cline_grace.yaml' 2>/dev/null
 fi
 
 echo "== every daemon at once under client load =="

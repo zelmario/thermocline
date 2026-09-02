@@ -178,7 +178,9 @@ func (c *conn) deferNewestAgg(ctx context.Context, cmd bson.Raw, ns string, writ
 	if writes || c.r.cfg.Completeness != config.Archive || inTransaction(cmd) {
 		return false
 	}
-	mark, known := c.r.completeness(ctx, ns)
+	// Anything that writes has returned above, so this is a read and
+	// router.claim_grace applies.
+	mark, known := c.r.completenessForRead(ctx, ns)
 	if !known || !mark.Claimed || mark.From.IsZero() {
 		return false
 	}
@@ -246,7 +248,7 @@ func (c *conn) interceptAggNewest(ctx context.Context, msg *wire.Message, db str
 	}
 	af, _ := c.r.ageFieldOf(ns)
 	limit, _ := newestFirstPipeline(cmd, af)
-	mark, _ := c.r.completeness(ctx, ns)
+	mark, _ := c.r.completenessForRead(ctx, ns)
 
 	if provenBatch(rdoc, limit, af, mark) && c.r.sortSafeAges(ctx, ns, af) {
 		c.r.Stats.NewestFirst.Add(1)
