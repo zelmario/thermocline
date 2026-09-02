@@ -398,8 +398,14 @@ func (r *Router) rememberClaim(ns string, entry watermarkEntry) {
 // adoption path this project recommends, the safe reading is that an absent
 // claim guarantees nothing.
 func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
+	// Looking for a claim rather than for a row. A row without completeFrom is
+	// not a claim, and counting it as one would suppress this warning while
+	// nothing is actually claimed. The same mistake as reading Claimed from the
+	// row's existence, in a third place: see watermark.markOf.
 	cur, err := r.cold.Database(meta.DB).Collection(meta.Watermarks).
-		Find(ctx, bson.D{}, options.Find().SetLimit(1))
+		Find(ctx,
+			bson.D{{Key: "completeFrom", Value: bson.D{{Key: "$exists", Value: true}}}},
+			options.Find().SetLimit(1))
 	if err != nil {
 		return
 	}
