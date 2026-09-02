@@ -608,6 +608,20 @@ func (c *conn) refuseUntieredFromArchive(msg *wire.Message, s aggScope) (*wire.M
 	}
 	sort.Strings(untiered)
 
+	// The operator has said these are reference data that has not moved since
+	// the cutover, which is a claim about their application that this cannot
+	// check. Say what is being answered and what it may be short of, every
+	// time: the alternative to a refusal is a warning nobody sees once.
+	if c.r.cfg.AllowUntieredJoin {
+		c.log.Warn("answering from the archive a pipeline that reads collections nothing tiers",
+			"ns", s.primary, "untiered", untiered,
+			"reason", "router.allow_untiered_join is set, so this is answered rather than refused",
+			"effect", "the answer is short by anything written to those collections since the "+
+				"archive was adopted, and there is no error on it",
+			"action", "unset router.allow_untiered_join to have it refused instead")
+		return nil, false
+	}
+
 	c.r.Stats.Refused.Add(1)
 	c.cls = ClassRefused
 	c.log.Warn("refused a pipeline the archive would answer that reads collections nothing tiers",

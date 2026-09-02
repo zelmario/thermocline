@@ -62,6 +62,39 @@ copyUntiered() {
   N "mongorestore --uri='$HOT' /root/pilotdump 2>&1 | tail -1"
 }
 
+uniqueIndexes() {
+  # The four unique indexes, measured for real uniqueness in the sample data.
+  #
+  # They go on the archive, because that is where an adoption's indexes already
+  # are: the router copies the specs up at startup and the `cline keys --rebuild`
+  # in start() claims their keys. Without this step the pilot carries no unique
+  # index on any tiered collection, and the key registry, which only matters on a
+  # tiered collection, is never asked anything by real data. The upsert defect of
+  # 2026-08-31 was invisible until these existed, and a reset loses them, so the
+  # step belongs here rather than in a note.
+  #
+  # trips is the shape worth having: 10,000 documents in the archive and none on
+  # the fast tier, so every one of its keys is invisible to mongod there. The
+  # collated index exercises the collated key path and bikeid the numeric one.
+  echo "== the unique indexes, on the tiered collections =="
+  N "mongosh '$COLD' --quiet --eval '
+    [[\"sample_mflix\", \"comments\", {email:1, date:1}, \"email_date_uniq\", null],
+     [\"sample_mflix\", \"comments\", {name:1, date:1}, \"name_date_ci_uniq\",
+      {locale:\"en\", strength:2}],
+     [\"sample_training\", \"trips\", {bikeid:1, \"start time\":1}, \"bike_start_uniq\", null],
+     [\"sample_supplies\", \"sales\", {saleDate:1}, \"saledate_uniq\", null]
+    ].forEach(function (s) {
+      const opts = {unique: true, name: s[3]};
+      if (s[4]) { opts.collation = s[4]; }
+      try {
+        db.getSiblingDB(s[0])[s[1]].createIndex(s[2], opts);
+        print(\"    \" + s[0] + \".\" + s[1] + \"  \" + s[3]);
+      } catch (e) {
+        print(\"    \" + s[0] + \".\" + s[1] + \"  \" + s[3] + \"  REFUSED \" + e.codeName);
+      }
+    })'"
+}
+
 start() {
   echo "== the daemons, in runbook order =="
   docker cp test/pilot/pilot.yaml $NODE:/root/pilot.yaml
@@ -109,13 +142,54 @@ compare() {
     return 2
   fi
   local plan; plan=$(cat /tmp/pilot_plan.json)
-  for h in agree aggs; do
+  for h in ${HARNESSES:-agree aggs}; do
     docker cp test/pilot/$h.js $NODE:/root/$h.js >/dev/null
     docker exec -e TC_TARGET=router -e TC_REPEAT="${TC_REPEAT:-1}" -e TC_PLAN="$plan" $NODE \
       mongosh "$ROUTER" --quiet --file /root/$h.js > /tmp/${h}_router.json 2>&1
     docker exec -e TC_TARGET=archive -e TC_PLAN="$plan" $NODE \
       mongosh "$COLD" --quiet --file /root/$h.js > /tmp/${h}_archive.json 2>&1
     python3 test/pilot/diff.py "$h" || rc=1
+  done
+  return $rc
+}
+
+join() {
+  # The untiered join, answered rather than refused.
+  #
+  # A pipeline the archive has to answer that also reads a collection nothing
+  # tiers is refused by default, because the archive holds only what that
+  # collection contained on the day it was adopted and the answer would be short
+  # by everything written to it since, with no error on it. Two of the nineteen
+  # aggregations here are that shape, and the comparison reports them as refused.
+  #
+  # router.allow_untiered_join answers them instead, for an operator who knows
+  # those collections are reference data nobody has written to. This runs it,
+  # rather than trusting it, because the pilot is the one place that assumption
+  # is actually true: the untiered collections were restored into the archive and
+  # never written to again, so the archive's copy is whole and the answer must be
+  # the archive's own. Anything else means the router mangles a pipeline it falls
+  # through with, which the refusal would have gone on hiding.
+  echo "== the untiered join, answered rather than refused =="
+  N "sed 's|^  completeness: archive|  allow_untiered_join: true\n  completeness: archive|' /root/pilot.yaml > /root/pilot_join.yaml"
+  N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
+  sleep 2
+  docker exec -d $NODE cline router --config /root/pilot_join.yaml --log-file /root/pilotlog/router_join.log
+  for _ in $(seq 1 30); do
+    N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  local rc=0
+  HARNESSES=aggs compare || rc=1
+  echo "  -- and it said so every time --"
+  N "grep -c 'answering from the archive a pipeline that reads collections nothing tiers' /root/pilotlog/router_join.log"
+  # Put the shipped configuration back, so nothing after this runs with the
+  # guard off without asking for it.
+  N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
+  sleep 2
+  docker exec -d $NODE cline router --config /root/pilot.yaml --log-file /root/pilotlog/router.log
+  for _ in $(seq 1 30); do
+    N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
+    sleep 1
   done
   return $rc
 }
@@ -274,14 +348,16 @@ case "${1:-all}" in
   reset)   reset ;;
   restore) restore ;;
   copy)    copyUntiered ;;
+  uniq)    uniqueIndexes ;;
   start)   start ;;
   compare) compare ;;
   writes)  writes ;;
   streams) streams ;;
   txn)     txn ;;
   cache)   cache ;;
+  join)    join ;;
   churn)   churn ;;
   rewarm)  rewarm ;;
-  all)     reset; restore; copyUntiered; start; compare; writes; streams; txn ;;
-  *)       echo "usage: $0 [all|reset|restore|copy|start|compare|writes|streams|txn|cache|churn|rewarm]"; exit 2 ;;
+  all)     reset; restore; copyUntiered; uniqueIndexes; start; compare; writes; streams; txn ;;
+  *)       echo "usage: $0 [all|reset|restore|copy|uniq|start|compare|writes|streams|txn|cache|join|churn|rewarm]"; exit 2 ;;
 esac

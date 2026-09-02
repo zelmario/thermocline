@@ -268,6 +268,22 @@ router:
   #
   # claim_grace: 2m
 
+  # Answer, rather than refuse, a pipeline that the archive has to answer and
+  # that also reads a collection nothing here tiers.
+  #
+  # Refusing is the default. The feeder mirrors the namespaces it is told to
+  # tier and nothing else, so the archive's copy of an untiered collection is
+  # whatever it held on the day it was adopted, and a pipeline reading both is
+  # answered by one tier and short by everything written to that collection
+  # since. Measured on a $unionWith of an untiered collection with a view over
+  # a tiered one: 10, where the two clusters together hold 11.
+  #
+  # Set this only if you know the untiered collections such a pipeline reads are
+  # reference data nobody writes to. The router then answers it and names those
+  # collections in a warning every time.
+  #
+  # allow_untiered_join: true
+
   # The operator dashboard: one page showing what each tier is holding, how
   # commands were served, and what each kind of command cost. Empty means off.
   #

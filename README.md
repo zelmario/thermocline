@@ -2638,6 +2638,14 @@ mongosh --port 28018 --eval '
   two remedies, and the refusal lifts by itself once either is done: **tier the
   collections the pipeline reads**, or **warm the tiered ones** so the fast tier
   answers the whole pipeline and nothing goes to the archive at all.
+  There is a third way out, for the case the afternoon's reasoning was actually
+  about: `router.allow_untiered_join` answers the pipeline instead and names the
+  untiered collections in a warning every time. It is a claim about your own
+  application, not about this system, so nothing here can check it: set it only
+  where those collections really are reference data nobody writes to. The pilot
+  runs both ways, because it is the one place the claim is true, and with it on
+  all nineteen aggregations agree with the archive: `bash test/pilot/setup.sh
+  join`.
 
 - **Cursors are not shared between routers.** A read answered from the archive
   is served from a cursor this router holds open against the archive, in its own

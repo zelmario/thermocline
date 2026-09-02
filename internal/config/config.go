@@ -147,6 +147,16 @@ type RouterConfig struct {
 	// it at zero if it is not. There is no value that is safe in both faults,
 	// which is why there is no default other than off.
 	ClaimGrace Duration `yaml:"claim_grace"`
+	// AllowUntieredJoin downgrades to a warning the refusal of a pipeline that
+	// the archive would answer and that also reads a collection nothing tiers.
+	//
+	// Refusing is the default, because the archive holds only what such a
+	// collection contained on the day it was adopted and answering would be
+	// short by everything written to it since, with no error on it. An operator
+	// who knows the untiered collections a pipeline reads are reference data
+	// that has not changed since the cutover can set this and get the answer
+	// instead. The warning names them every time.
+	AllowUntieredJoin bool `yaml:"allow_untiered_join"`
 	// Dashboard is the address the operator dashboard listens on, empty for
 	// off. It is deliberately a separate address from Listen: the page names
 	// collections and reports traffic, so it belongs on an operator network
