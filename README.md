@@ -1408,7 +1408,7 @@ scrape_configs:
 
 ### What to alert on
 
-Seven signals, and the reason each one is worth waking somebody for. Everything
+Eight signals, and the reason each one is worth waking somebody for. Everything
 here is already published; what was missing was saying which numbers mean
 something.
 
@@ -2279,6 +2279,26 @@ make build
 cp cline.example.yaml cline.yaml     # then edit the two URIs
 bin/cline feeder --config cline.yaml
 ```
+
+### A key the config does not know is an error
+
+Every daemon refuses to start on a setting it cannot place, naming the line:
+
+```
+error: parse config: yaml: unmarshal errors:
+  line 311: field terminate-auth not found in type config.RouterConfig
+```
+
+This used to be a silence, and a silently ignored setting is the worst shape a
+configuration mistake can take. Measured on one file: `terminate-auth: true`,
+with a hyphen where the key has an underscore, loaded as `false`. The router
+proxied authentication while the operator believed it was terminating it and
+checking privileges itself. Nothing failed, nothing was logged, and the setting
+simply did not exist. A misspelt `tombstone_retention` keeps deleted documents
+for ever; a misspelt `older_than` leaves a namespace that nothing ages.
+
+The cost of refusing is a restart with an error naming the line. The cost of the
+silence is a setting you think you have.
 
 ### Both tiers are replica sets
 

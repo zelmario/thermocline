@@ -91,6 +91,24 @@ func TestMetaDBOverTieredNamespace(t *testing.T) {
 // TestExampleConfigLoads keeps the documented config honest. It is the file
 // operators copy, and a new option documented there with a name the loader does
 // not accept, or a value it refuses, is found here rather than by them.
+// Every configuration this repository ships, not only the example. The loader
+// refuses a key it does not know, so a setting renamed in the code and left
+// behind in one of these files stops that file from loading at all, and the
+// suite or the pilot it belongs to fails in a way that reads like the product.
+func TestEveryShippedConfigLoads(t *testing.T) {
+	for _, path := range []string{
+		"../../cline.example.yaml",
+		"../../cline.test.yaml",
+		"../../test/cline.yaml",
+		"../../test/pilot/pilot.yaml",
+		"../../test/store/two.yaml",
+	} {
+		if _, err := Load(path); err != nil {
+			t.Errorf("%s does not load: %v", path, err)
+		}
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	for _, path := range []string{"../../cline.example.yaml", "../../test/cline.yaml"} {
 		cfg, err := Load(path)
@@ -163,6 +181,9 @@ feeder:
 func TestContradictoryWindowsAreNamed(t *testing.T) {
 	withWindows := func(back, older string) Config {
 		c := valid()
+		// Both rules name a namespace the feeder tiers, because a rule for one
+		// it does not is refused outright now: see validateRulesAreTiered.
+		c.Feeder.Namespaces = []string{"app.orders", "app.audit"}
 		c.Warmer.Rules = []WarmRule{{NS: "app.orders", DateField: "at", Back: mustDur(t, back)}}
 		c.Evictor.Rules = []EvictionRule{{NS: "app.orders", DateField: "at", OlderThan: mustDur(t, older)}}
 		return c
@@ -196,6 +217,7 @@ func TestContradictoryWindowsAreNamed(t *testing.T) {
 	// A namespace the evictor never touches is not a contradiction whatever the
 	// warm window says.
 	other := valid()
+	other.Feeder.Namespaces = []string{"app.orders", "app.audit"}
 	other.Warmer.Rules = []WarmRule{{NS: "app.audit", DateField: "at", Back: mustDur(t, "3650d")}}
 	other.Evictor.Rules = []EvictionRule{{NS: "app.orders", DateField: "at", OlderThan: mustDur(t, "90d")}}
 	if w := other.WindowWarnings(); len(w) != 0 {
@@ -344,5 +366,114 @@ feeder:
 				t.Errorf("TombstoneRetention = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// A key the loader does not know is refused rather than ignored.
+//
+// It used to be ignored, which is the worst shape a configuration mistake can
+// take: measured on one file, `terminate-auth: true` with a hyphen loaded as
+// false, so the router proxied authentication while the operator believed it
+// was terminating it and checking privileges itself. Nothing failed and nothing
+// was logged. The setting simply did not exist.
+func TestAMistypedKeyIsRefused(t *testing.T) {
+	base := `hot:
+  uri: "mongodb://hot1/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://cold1/?replicaSet=rsCold"
+feeder:
+  id: "test"
+  namespaces: ["shop.orders"]
+router:
+  listen: "127.0.0.1:27100"
+`
+	cases := []struct {
+		name string
+		add  string
+		want string
+	}{
+		{"nothing added", "", ""},
+		{"a hyphen where the key has an underscore", "  terminate-auth: true\n", "terminate-auth"},
+		{"a misspelt claim grace", "  claim_grase: 5m\n", "claim_grase"},
+		{"a setting under the wrong daemon", "  rate: 2000\n", "rate"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "cline.yaml")
+			if err := os.WriteFile(p, []byte(base+c.add), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(p)
+			switch {
+			case c.want == "":
+				if err != nil {
+					t.Fatalf("refused a config with nothing wrong with it: %v", err)
+				}
+			case err == nil:
+				t.Fatalf("accepted %q, and terminate_auth came out %v", strings.TrimSpace(c.add), cfg.Router.TerminateAuth)
+			case !strings.Contains(err.Error(), c.want):
+				t.Fatalf("refused with %q, which does not name %q", err, c.want)
+			}
+		})
+	}
+}
+
+// A warmer or evictor rule for a namespace the feeder does not mirror.
+//
+// The two lists name the same collections in the same file and nothing checked
+// that they agreed, which made this an accepted configuration. It hides
+// documents: an untiered collection is the fast tier's alone as far as the
+// router is concerned, reads of it never fall through, and the evictor removes
+// its old documents as soon as it can see a copy in the archive. On an adoption
+// it always can, because the archive is the old cluster and holds everything it
+// ever held, so the copy satisfying the guard is a cutover snapshot rather than
+// a mirror. The warmer's version copies that snapshot back up, returning
+// documents the application deleted.
+func TestRulesMustNameATieredNamespace(t *testing.T) {
+	rule := func(ns string) Config {
+		c := valid() // feeder.namespaces is shop.orders
+		c.Evictor.Rules = []EvictionRule{{NS: ns, OlderThan: Duration(90 * 24 * time.Hour)}}
+		return c
+	}
+	warm := func(ns string) Config {
+		c := valid()
+		c.Warmer.Rules = []WarmRule{{NS: ns, Back: Duration(90 * 24 * time.Hour)}}
+		return c
+	}
+
+	if err := rule("shop.orders").Validate(); err != nil {
+		t.Errorf("an eviction rule for a tiered namespace was refused: %v", err)
+	}
+	if err := warm("shop.orders").Validate(); err != nil {
+		t.Errorf("a warm rule for a tiered namespace was refused: %v", err)
+	}
+
+	err := rule("shop.invoices").Validate()
+	if err == nil {
+		t.Fatal("an eviction rule for a namespace nothing tiers was accepted, and it removes documents from the only tier that answers for them")
+	}
+	for _, want := range []string{"evictor.rules", "shop.invoices", "feeder.namespaces"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+
+	err = warm("shop.invoices").Validate()
+	if err == nil {
+		t.Fatal("a warm rule for a namespace nothing tiers was accepted, and it copies the archive's cutover snapshot back up")
+	}
+	for _, want := range []string{"warmer.rules", "shop.invoices"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+
+	// An empty list means the feeder mirrors everything, so every rule has its
+	// copy and nothing here applies.
+	c := rule("shop.invoices")
+	c.Feeder.Namespaces = nil
+	if err := c.Validate(); err != nil {
+		t.Errorf("a feeder that mirrors everything refused a rule: %v", err)
 	}
 }

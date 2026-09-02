@@ -2,8 +2,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -431,7 +433,24 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read config: %w", err)
 	}
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+	// Strict: a key this does not know is an error rather than a silence.
+	//
+	// It was a silence, and that is the worst shape a configuration mistake can
+	// take. Measured on one file: `terminate-auth: true` with a hyphen loaded
+	// as false, so the router proxied authentication while the operator
+	// believed it was terminating it and checking privileges itself. Nothing
+	// was logged, nothing failed, and the setting simply did not exist. The
+	// same goes for a misspelt retention, which keeps everything for ever, and
+	// for a misspelt claim_grace, which gives no grace.
+	//
+	// Refusing costs an operator a restart with an error naming the line. The
+	// silence costs them a setting they think they have.
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
+		// io.EOF is an empty file, which is a config that changes nothing
+		// rather than a broken one: every daemon then fails validation on the
+		// missing URIs, which is the honest error.
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
@@ -508,6 +527,9 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := c.Warmer.Validate(); err != nil {
+		return err
+	}
+	if err := c.validateRulesAreTiered(); err != nil {
 		return err
 	}
 	return c.Router.Validate()
@@ -634,6 +656,60 @@ func (c Config) validateMetaDB() error {
 		if nsDB, _, ok := strings.Cut(ns, "."); ok && nsDB == db {
 			return fmt.Errorf("meta.db %q also holds the tiered namespace %q, so the feeder would skip mirroring it",
 				db, ns)
+		}
+	}
+	return nil
+}
+
+// validateRulesAreTiered refuses a warmer or evictor rule for a namespace the
+// feeder does not mirror.
+//
+// The two lists name the same collections in the same file and nothing checked
+// that they agreed, so leaving a collection out of feeder.namespaces while
+// naming it in evictor.rules was an accepted configuration. It is the obvious
+// mistake to make, because the adoption runbook has an operator tier some
+// collections and copy others up whole.
+//
+// What it does is hide documents. An untiered collection belongs to the fast
+// tier alone as far as the router is concerned: reads of it are answered there
+// and never fall through, because a collection Thermocline does not tier is
+// whole by definition. The evictor, which consults its own rules and nothing
+// else, removes the old documents from the fast tier as soon as it can see a
+// copy in the archive. On an adoption it always can: the archive *is* the old
+// cluster and carries everything it ever held. So the copy that satisfies the
+// guard is a snapshot from the cutover rather than a mirror, the documents go
+// from the only tier that answers for them, and no error is raised anywhere.
+//
+// The warmer's version of the same mistake is the mirror image: it copies the
+// archive's cutover snapshot up, so a document the application deleted after
+// the cutover comes back.
+//
+// Refused rather than warned. Both outcomes are silent wrong answers, the file
+// alone is enough to see the mistake, and no correct deployment needs either
+// rule: eviction is only safe because the feeder put the copy there.
+func (c Config) validateRulesAreTiered() error {
+	// Empty means the feeder mirrors everything, so every rule has its copy.
+	if len(c.Feeder.Namespaces) == 0 {
+		return nil
+	}
+	tiered := make(map[string]bool, len(c.Feeder.Namespaces))
+	for _, ns := range c.Feeder.Namespaces {
+		tiered[ns] = true
+	}
+	for _, r := range c.Evictor.Rules {
+		if !tiered[r.NS] {
+			return fmt.Errorf("evictor.rules names %q, which feeder.namespaces does not tier: "+
+				"nothing mirrors it, so the router answers it from the fast tier alone and never "+
+				"reads the archive for it, and evicting it would remove the documents from the "+
+				"only tier that answers. Add it to feeder.namespaces, or drop the rule", r.NS)
+		}
+	}
+	for _, r := range c.Warmer.Rules {
+		if !tiered[r.NS] {
+			return fmt.Errorf("warmer.rules names %q, which feeder.namespaces does not tier: "+
+				"nothing mirrors it, so the archive holds whatever it held when it was adopted "+
+				"and warming would copy that back up, returning documents the application has "+
+				"since deleted. Add it to feeder.namespaces, or drop the rule", r.NS)
 		}
 	}
 	return nil
