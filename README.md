@@ -219,6 +219,14 @@ Range queries are governed by the watermark below.
   you want when sizing a fast tier. `dbStats` is the fast tier's throughout,
   including its `objects`.
 
+  **That inconsistency is deliberate, and it is a decision rather than an
+  oversight.** `collStats` corrects its count and `dbStats` does not. Correcting
+  `dbStats` means a per-collection count against the archive on a command
+  monitoring agents poll every few seconds, and the number it would replace is
+  the one thing in that reply an operator sizing a fast tier actually wants.
+  Read `dbStats` as a physical fact about the fast tier, and ask
+  `countDocuments` or `collStats` for a logical one.
+
   The count used to be the fast tier's too, which was wrong rather than
   partial. Measured on MongoDB's sample datasets adopted as an archive:
   `sample_training.trips` reported 0 documents where the archive holds 10,000,
@@ -2638,6 +2646,7 @@ mongosh --port 28018 --eval '
   two remedies, and the refusal lifts by itself once either is done: **tier the
   collections the pipeline reads**, or **warm the tiered ones** so the fast tier
   answers the whole pipeline and nothing goes to the archive at all.
+
   There is a third way out, for the case the afternoon's reasoning was actually
   about: `router.allow_untiered_join` answers the pipeline instead and names the
   untiered collections in a warning every time. It is a claim about your own
