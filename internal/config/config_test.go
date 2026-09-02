@@ -103,8 +103,19 @@ func TestEveryShippedConfigLoads(t *testing.T) {
 		"../../test/pilot/pilot.yaml",
 		"../../test/store/two.yaml",
 	} {
-		if _, err := Load(path); err != nil {
+		cfg, err := Load(path)
+		if err != nil {
 			t.Errorf("%s does not load: %v", path, err)
+			continue
+		}
+		// And none of them may produce a startup warning. Every daemon prints
+		// these, so one that fires on the repository's own configs is noise in
+		// every suite log and teaches an operator to skip the block.
+		for _, w := range cfg.FeederIDWarnings() {
+			t.Errorf("%s warns at startup: %s", path, w)
+		}
+		for _, w := range cfg.AgeFieldWarnings() {
+			t.Errorf("%s warns at startup: %s", path, w)
 		}
 	}
 }
@@ -513,5 +524,73 @@ func TestRulesMustNameATieredNamespace(t *testing.T) {
 	c.Feeder.Namespaces = nil
 	if err := c.Validate(); err != nil {
 		t.Errorf("a feeder that mirrors everything refused a rule: %v", err)
+	}
+}
+
+// evictor.feeder_id names the checkpoint the mirroring-lag gate reads, and it
+// has to be an id some feeder is actually writing.
+//
+// It defaulted to the literal "default" rather than to feeder.id, so a file
+// that named its feeder anything else pointed the gate at a checkpoint nothing
+// writes. The lag then reads as unknown, which is the safe direction: the
+// evictor pauses instead of removing. So nothing was lost and nothing was aged,
+// for ever, and the message said mirroring lag was unknown while the feeder ran
+// perfectly. Two settings that must agree, one of which silently disabled a
+// daemon when they drifted.
+func TestEvictorFeederIDFollowsTheFeeder(t *testing.T) {
+	write := func(t *testing.T, extra string) Config {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "cline.yaml")
+		base := `hot:
+  uri: "mongodb://hot1/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://cold1/?replicaSet=rsCold"
+feeder:
+  id: "prod"
+  namespaces: ["shop.orders"]
+router:
+  listen: "127.0.0.1:27100"
+`
+		if err := os.WriteFile(p, []byte(base+extra), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatalf("does not load: %v", err)
+		}
+		return cfg
+	}
+
+	// Not spelled out: it follows the feeder, and the router's already did.
+	cfg := write(t, "")
+	if cfg.Evictor.FeederID != "prod" {
+		t.Errorf("evictor.feeder_id came out %q, want the feeder's own %q", cfg.Evictor.FeederID, "prod")
+	}
+	if cfg.Router.FeederID != "prod" {
+		t.Errorf("router.feeder_id came out %q, want %q", cfg.Router.FeederID, "prod")
+	}
+	if w := cfg.FeederIDWarnings(); len(w) != 0 {
+		t.Errorf("an inherited id was warned about: %v", w)
+	}
+
+	// Spelled out and the same: no warning either.
+	if w := write(t, "evictor:\n  feeder_id: \"prod\"\n").FeederIDWarnings(); len(w) != 0 {
+		t.Errorf("an id that agrees was warned about: %v", w)
+	}
+
+	// Spelled out and different: legal, because the daemons can be run from
+	// separate files, and named because it is usually a mistake.
+	cfg = write(t, "evictor:\n  feeder_id: \"stale\"\n")
+	if cfg.Evictor.FeederID != "stale" {
+		t.Fatalf("an explicit id was overridden: %q", cfg.Evictor.FeederID)
+	}
+	w := cfg.FeederIDWarnings()
+	if len(w) != 1 {
+		t.Fatalf("a mismatched id produced %d warnings, want 1", len(w))
+	}
+	for _, want := range []string{"stale", "prod", "evicted"} {
+		if !strings.Contains(w[0], want) {
+			t.Errorf("the warning does not carry %q: %s", want, w[0])
+		}
 	}
 }

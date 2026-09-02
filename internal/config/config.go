@@ -422,7 +422,10 @@ func Default() Config {
 			Rate:         1000,
 			BatchSize:    500,
 			MaxFeederLag: Duration(30 * time.Second),
-			FeederID:     "default",
+			// No default id here on purpose: Load takes it from feeder.id.
+			// A literal "default" was the default until it was measured, and a
+			// file that renamed its feeder without renaming this one pointed
+			// the mirroring-lag gate at a checkpoint nothing writes.
 			Backoff: BackoffConfig{
 				MaxReplicationLag:   Duration(10 * time.Second),
 				MaxCacheDirty:       0.05,
@@ -490,6 +493,19 @@ func Load(path string) (Config, error) {
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
 	cfg.Router.FeederID = cfg.Feeder.ID
+	// evictor.feeder_id names the checkpoint the mirroring-lag gate reads, and
+	// it has to be the id of a feeder that is actually running. Taken from
+	// feeder.id when it is not spelled out, the way the router's already is.
+	//
+	// It defaulted to the literal "default" instead. A file that set
+	// feeder.id and left this alone pointed the gate at a checkpoint nothing
+	// writes: the lag reads as unknown, which is the safe direction, so the
+	// evictor never removed anything and said "mirroring lag is unknown" every
+	// minute for ever. Nothing was lost and nothing was aged, and the message
+	// blamed the feeder, which was running perfectly.
+	if cfg.Evictor.FeederID == "" {
+		cfg.Evictor.FeederID = cfg.Feeder.ID
+	}
 	cfg.Router.TieredBy = tieringFields(cfg)
 	cfg.Router.AllowVersionSkew = cfg.AllowVersionSkew
 	// The router's own account, taken from the fast tier connection string
@@ -568,6 +584,30 @@ func (c Config) Validate() error {
 		return err
 	}
 	return c.Router.Validate()
+}
+
+// FeederIDWarnings names an evictor pointed at a feeder id this file does not
+// describe.
+//
+// Load fills evictor.feeder_id from feeder.id when it is not spelled out, so a
+// difference here means somebody wrote both and wrote them differently. That is
+// legal, because the daemons can be run from separate files, and it is far more
+// often a mistake: the gate reads a checkpoint under that id, finds none, and
+// pauses eviction for ever while reporting a mirroring problem.
+//
+// A warning rather than a refusal, because a deployment that really does run
+// its feeder from another file is not wrong, and refusing would break it on an
+// upgrade. The verdict names the id too, so an operator who misses this at
+// startup meets it again in the pause.
+func (c Config) FeederIDWarnings() []string {
+	if c.Evictor.FeederID == "" || c.Evictor.FeederID == c.Feeder.ID {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"evictor.feeder_id is %q and feeder.id is %q. The evictor reads mirroring lag from the "+
+			"checkpoint the feeder writes under its own id, so unless a feeder with id %q is "+
+			"running from another config, nothing will be evicted",
+		c.Evictor.FeederID, c.Feeder.ID, c.Evictor.FeederID)}
 }
 
 // WindowWarnings names each namespace whose warm window reaches further back
@@ -838,9 +878,10 @@ func (e EvictorConfig) Validate() error {
 			"document from both tiers. Set it well below %s",
 			e.MaxFeederLag.String(), meta.NoticeTTL, meta.NoticeTTL)
 	}
-	if e.FeederID == "" {
-		return errors.New("evictor.feeder_id is required so lag can be read")
-	}
+	// Empty is not a problem here: Load fills it from feeder.id, which is
+	// itself required. A config built in code and never loaded can still be
+	// empty, and an empty id finds no checkpoint, which pauses eviction rather
+	// than allowing it.
 	if e.Backoff.MinWriteTicketsFree < 0 || e.Backoff.MinWriteTicketsFree > 1 {
 		return fmt.Errorf("evictor.backoff.min_write_tickets_free must be a fraction between 0 and 1, got %v",
 			e.Backoff.MinWriteTicketsFree)

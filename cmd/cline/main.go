@@ -529,6 +529,14 @@ func disconnect(client *mongo.Client, log *slog.Logger) {
 // component owns the contradiction. See config.WindowWarnings for what it costs
 // and why it is not refused.
 func warnAboutWindows(log *slog.Logger, cfg config.Config) {
+	for _, w := range cfg.FeederIDWarnings() {
+		log.Warn("the evictor is pointed at a feeder this config does not describe",
+			"detail", w,
+			"effect", "the mirroring lag gate finds no checkpoint under that id, so eviction "+
+				"pauses on every pass and nothing is ever removed",
+			"action", "leave evictor.feeder_id out to take it from feeder.id, or set it to the id "+
+				"of the feeder that is actually running")
+	}
 	for _, w := range cfg.AgeFieldWarnings() {
 		log.Warn("a namespace is aged two different ways",
 			"detail", w,

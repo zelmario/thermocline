@@ -134,9 +134,15 @@ feeder:
   unannounced_deletes: tombstone
 
 evictor:
-  # Must match feeder.id. The evictor reads mirroring lag from that feeder's
-  # checkpoint and refuses to remove anything while it is behind.
-  feeder_id: "default"
+  # Which feeder's mirroring lag to read. The evictor refuses to remove anything
+  # while that feeder is behind, so this has to name a feeder that is running.
+  #
+  # Leave it out and it follows feeder.id, which is what you want when every
+  # daemon reads this one file. Set it only to name a feeder run from another
+  # config, and expect a startup warning otherwise: an id nothing writes a
+  # checkpoint under reads as "lag unknown", which pauses eviction for ever.
+  #
+  # feeder_id: "default"
 
   # Documents removed per second, smoothed across the whole run. Start low and
   # raise it only after watching a full business day. This is the knob that

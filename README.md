@@ -2374,6 +2374,24 @@ for ever; a misspelt `claim_grace` gives no grace.
 The cost of refusing is a restart with an error naming the line. The cost of the
 silence is a setting you think you have.
 
+### Two settings that have to agree
+
+`evictor.feeder_id` names the feeder whose mirroring lag the evictor reads, and
+the evictor will not remove anything while that feeder is behind. Leave it out
+and it follows `feeder.id`, which is what you want when every daemon reads the
+one file.
+
+It used to default to the literal `default` instead, so a deployment that named
+its feeder anything else pointed the gate at a checkpoint nothing writes. The
+lag then reads as unknown, which is the safe direction — the evictor pauses
+rather than removing — so nothing was lost and nothing was ever aged, and the
+log said `mirroring lag is unknown` once a minute while the feeder ran
+perfectly. The pause now names the id it went looking for, because a feeder that
+is not running and an id nothing writes look identical from a log line.
+
+Spelling the key out and disagreeing with `feeder.id` is still allowed, for a
+feeder run from a separate config, and every daemon says so at startup.
+
 ### Both tiers are replica sets
 
 That is the supported shape, and the only one anything here is tested against. A

@@ -32,11 +32,16 @@ type Reading struct {
 	WriteTicketsTotal int
 	OplogWindow       time.Duration
 
-	// Missing names the checks that could not be taken, usually a permissions
 	// FreeDisk is the fraction of the fast tier's filesystem still free, from
 	// dbStats. The warmer acts on it; the evictor deliberately does not.
 	FreeDisk float64
 
+	// FeederID is the id the lag was looked for under, carried so a reading
+	// that could not be taken can say which checkpoint it went looking for.
+	// A wrong id and a stopped feeder look identical without it.
+	FeederID string
+
+	// Missing names the checks that could not be taken, usually a permissions
 	// problem or a MongoDB version that reports the metric elsewhere.
 	Missing []string
 }
@@ -71,7 +76,15 @@ type Verdict struct {
 // MongoDB release would be its own kind of outage.
 func Evaluate(r Reading, limits config.BackoffConfig, maxFeederLag time.Duration) Verdict {
 	if r.isMissing("feeder lag") {
-		return Verdict{Reason: "mirroring lag is unknown, so removing anything could lose it"}
+		// Named, because the two ways to get here are a feeder that is not
+		// running and an id that names a checkpoint nothing writes, and they
+		// look identical from a log line. evictor.feeder_id used to default to
+		// the literal "default" rather than to feeder.id, so a deployment that
+		// renamed its feeder and left the evictor alone paused for ever while
+		// reporting a mirroring problem it did not have.
+		return Verdict{Reason: fmt.Sprintf("mirroring lag is unknown for feeder id %q, so removing "+
+			"anything could lose it: either no feeder with that id is running, or the id is wrong "+
+			"(check evictor.feeder_id against feeder.id)", r.FeederID)}
 	}
 	if r.FeederLag > maxFeederLag {
 		return Verdict{Reason: fmt.Sprintf("mirroring is %s behind, limit %s", r.FeederLag.Round(time.Second), maxFeederLag)}
@@ -115,7 +128,7 @@ func New(hot, cold *mongo.Client, feederID string) *Checker {
 // Sample takes one reading. It never returns an error for a single unavailable
 // metric; those land in Reading.Missing so Evaluate can decide.
 func (c *Checker) Sample(ctx context.Context) Reading {
-	var r Reading
+	r := Reading{FeederID: c.feederID}
 	c.sampleFeederLag(ctx, &r)
 	c.sampleServerStatus(ctx, &r)
 	c.sampleReplicationLag(ctx, &r)
