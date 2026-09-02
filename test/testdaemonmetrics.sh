@@ -170,10 +170,20 @@ for _ in $(seq 1 30); do
     --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
   sleep 1
 done
-sleep 2
+# Waited for rather than slept on. This check read the metric two seconds after
+# the router answered a ping, and what it is waiting for is a feeder publishing
+# its first position or checkpoint, which is not the same event. It failed once
+# on a loaded box while passing alone, which is the shape of a check that
+# measures a race: see test/README.md. Waiting cannot make it pass wrongly,
+# because a metric that stays +Inf still fails.
+LAGV=""
+for _ in $(seq 1 30); do
+  LAGV=$(M | awk -F' ' '/^thermocline_mirroring_lag_seconds/{print $2}')
+  [ -n "$LAGV" ] && [ "$LAGV" != "+Inf" ] && break
+  sleep 1
+done
 chk "a running feeder puts a number back"              "true" \
-    "$(M | awk -F' ' '/^thermocline_mirroring_lag_seconds/{print $2}' \
-       | awk '{print ($1 != "+Inf" && $1+0 >= 0) ? "true" : "false (" $1 ")"}')"
+    "$(echo "$LAGV" | awk '{print ($1 != "+Inf" && $1 != "" && $1+0 >= 0) ? "true" : "false (" $1 ")"}')"
 # The router and feeder stay up: the sections below scrape /metrics.
 
 echo "== an operator can hold eviction, and the hold is visible =="
