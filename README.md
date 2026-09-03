@@ -1569,6 +1569,19 @@ groups:
           summary: "a client read what it may not, or sent what could not be inspected"
 ```
 
+**These rules are extracted from this file and run**, by `test/testalerts.sh`,
+against a real Prometheus scraping a real router. They were written down and
+never executed until 2026-09-03, which is a strange thing to leave unproved: a
+rule that does not fire is indistinguishable from a system with nothing wrong.
+
+It checks the three ways they fail quietly. `promtool` rejects a typo. A metric
+this file names and the exporter does not is reported by name, which is the
+drift that matters and the one `promtool` cannot see: a renamed counter is
+valid PromQL that never matches anything. And with the router stopped,
+`ThermoclineRouterDown` has to actually reach `firing`, while
+`ThermoclinePanic` has to stay quiet, because two rules that both fire on
+everything are worth as much as neither.
+
 Two things are deliberately **not** alerts. `copied_up_total` rising means the
 eviction boundary is cut deeper than the application reads, which is a tuning
 conversation rather than an incident. And `duplicate_keys_total` counts writes
