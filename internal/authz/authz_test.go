@@ -245,3 +245,88 @@ func TestInitialSourcesDoNotNeedFind(t *testing.T) {
 		}
 	}
 }
+
+// The diagnostic surface, which is most of what a driver, a shell and a
+// monitoring agent send.
+//
+// None of it was judged, and an unjudged command is refused, so with
+// terminate_auth on the router refused all of it. Measured through a router
+// with the setting on before this existed: fourteen out of fourteen ordinary
+// administrative commands refused, and the Go driver's own connection setup
+// sends getParameter, so every shop connection produced a refusal nobody asked
+// for.
+//
+// Each action here was verified against mongod rather than remembered. A custom
+// role granting exactly these and nothing else makes each command allowed for a
+// user who otherwise holds read on one database, and the two that need no
+// privilege were established the same way.
+func TestDiagnosticCommandsAreJudged(t *testing.T) {
+	cases := []struct {
+		name    string
+		db      string
+		cmd     bson.D
+		cluster bool
+		wantDB  string
+		wantCol string
+		action  string
+	}{
+		{name: "getParameter", db: "admin", cmd: bson.D{{Key: "getParameter", Value: 1}}, cluster: true, action: "getParameter"},
+		{name: "serverStatus", db: "admin", cmd: bson.D{{Key: "serverStatus", Value: 1}}, cluster: true, action: "serverStatus"},
+		{name: "replSetGetStatus", db: "admin", cmd: bson.D{{Key: "replSetGetStatus", Value: 1}}, cluster: true, action: "replSetGetStatus"},
+		{name: "hostInfo", db: "admin", cmd: bson.D{{Key: "hostInfo", Value: 1}}, cluster: true, action: "hostInfo"},
+		{name: "getLog", db: "admin", cmd: bson.D{{Key: "getLog", Value: "startupWarnings"}}, cluster: true, action: "getLog"},
+		{name: "getCmdLineOpts", db: "admin", cmd: bson.D{{Key: "getCmdLineOpts", Value: 1}}, cluster: true, action: "getCmdLineOpts"},
+		// The one place the action is not the command's name.
+		{name: "currentOp", db: "admin", cmd: bson.D{{Key: "currentOp", Value: 1}}, cluster: true, action: "inprog"},
+		{name: "killOp", db: "admin", cmd: bson.D{{Key: "killOp", Value: 1}}, cluster: true, action: "killop"},
+
+		{name: "usersInfo", db: "admin", cmd: bson.D{{Key: "usersInfo", Value: 1}}, wantDB: "admin", action: "viewUser"},
+		{name: "dbHash", db: "shop", cmd: bson.D{{Key: "dbHash", Value: 1}}, wantDB: "shop", action: "dbHash"},
+		{name: "profile", db: "shop", cmd: bson.D{{Key: "profile", Value: -1}}, wantDB: "shop", action: "enableProfiler"},
+
+		{name: "validate", db: "shop", cmd: bson.D{{Key: "validate", Value: "orders"}}, wantDB: "shop", wantCol: "orders", action: "validate"},
+		{name: "reIndex", db: "shop", cmd: bson.D{{Key: "reIndex", Value: "orders"}}, wantDB: "shop", wantCol: "orders", action: "reIndex"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(c.cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			needs, nerr := Needs(c.name, c.db, bson.Raw(raw))
+			if nerr != nil {
+				t.Fatalf("still refused as unjudged: %v", nerr)
+			}
+			if len(needs) != 1 {
+				t.Fatalf("got %d needs, want 1: %+v", len(needs), needs)
+			}
+			n := needs[0]
+			if n.Cluster != c.cluster {
+				t.Errorf("Cluster = %v, want %v", n.Cluster, c.cluster)
+			}
+			if n.DB != c.wantDB || n.Coll != c.wantCol {
+				t.Errorf("resource = %q.%q, want %q.%q", n.DB, n.Coll, c.wantDB, c.wantCol)
+			}
+			if len(n.Actions) != 1 || n.Actions[0] != c.action {
+				t.Errorf("actions = %v, want [%s]", n.Actions, c.action)
+			}
+		})
+	}
+}
+
+// connectionStatus reports the caller's own authentication state and nothing
+// else, and mongod requires no privilege for it: measured, a user with read on
+// one database is allowed to run it. mongosh sends it on connect.
+func TestConnectionStatusNeedsNothing(t *testing.T) {
+	if !NoAuthNeeded["connectionStatus"] {
+		t.Error("connectionStatus is judged, and mongod asks no privilege for it")
+	}
+	// And the counterexample, so this is not just a list of true things: a
+	// command that can be pointed at data is never in that list.
+	for _, name := range []string{"find", "aggregate", "listCollections", "serverStatus"} {
+		if NoAuthNeeded[name] {
+			t.Errorf("%s is exempt from authorisation", name)
+		}
+	}
+}

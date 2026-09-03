@@ -40,7 +40,12 @@ var NoAuthNeeded = map[string]bool{
 	"endSessions": true, "startSession": true, "refreshSessions": true,
 	"killCursors": true, "getLastError": true,
 	"commitTransaction": true, "abortTransaction": true,
-	"whatsmyuri": true, "getCmdLineOpts": false,
+	"whatsmyuri": true,
+	// connectionStatus reports the caller's own authentication state and
+	// nothing else, and mongod requires no privilege for it: measured, a user
+	// with read on one database is allowed to run it. mongosh sends it on
+	// connect.
+	"connectionStatus": true,
 }
 
 // Needs returns what a command requires, or an error naming the command when it
@@ -189,6 +194,58 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 	// Cluster level.
 	case "listDatabases":
 		return []Need{{Cluster: true, Actions: []string{"listDatabases"}}}, nil
+
+	// The diagnostic surface, which is what a driver, a shell and a monitoring
+	// agent spend most of their commands on. None of it was here, and an
+	// unjudged command is refused, so with terminate_auth on the router refused
+	// all of it. Measured through a router with the setting on: fourteen out of
+	// fourteen ordinary administrative commands refused, and the Go driver's own
+	// connection setup sends getParameter, so every shop connection produced a
+	// refusal nobody had asked for.
+	//
+	// Every action below was verified against mongod rather than remembered: a
+	// custom role granting exactly these, and nothing else, makes each command
+	// allowed for a user who otherwise has read on one database. The two that
+	// need no privilege at all were established the same way, by a read-only
+	// user being allowed to run them.
+	case "getParameter":
+		return []Need{{Cluster: true, Actions: []string{"getParameter"}}}, nil
+	case "serverStatus":
+		return []Need{{Cluster: true, Actions: []string{"serverStatus"}}}, nil
+	case "replSetGetStatus":
+		return []Need{{Cluster: true, Actions: []string{"replSetGetStatus"}}}, nil
+	case "hostInfo":
+		return []Need{{Cluster: true, Actions: []string{"hostInfo"}}}, nil
+	case "getLog":
+		return []Need{{Cluster: true, Actions: []string{"getLog"}}}, nil
+	case "getCmdLineOpts":
+		return []Need{{Cluster: true, Actions: []string{"getCmdLineOpts"}}}, nil
+	// currentOp and killOp are spelled inprog and killop as actions, which is
+	// the one place in this list where the action is not the command's name.
+	case "currentOp":
+		return []Need{{Cluster: true, Actions: []string{"inprog"}}}, nil
+	case "killOp":
+		return []Need{{Cluster: true, Actions: []string{"killop"}}}, nil
+
+	// Database level.
+	case "usersInfo":
+		return []Need{{DB: db, Actions: []string{"viewUser"}}}, nil
+	case "dbHash":
+		return []Need{{DB: db, Actions: []string{"dbHash"}}}, nil
+	// Reading the profiling level and setting it are the same command, and
+	// mongod requires enableProfiler for both.
+	case "profile":
+		return []Need{{DB: db, Actions: []string{"enableProfiler"}}}, nil
+
+	// Collection level.
+	case "validate":
+		return []Need{{DB: db, Coll: coll(), Actions: []string{"validate"}}}, nil
+	// reIndex is only allowed on a standalone, and both tiers here are replica
+	// sets, so mongod refuses it with IllegalOperation whatever the privileges
+	// are. Judged anyway, because the refusal that reaches the client should be
+	// mongod's own rather than this proxy declining to think about it.
+	case "reIndex":
+		return []Need{{DB: db, Coll: coll(), Actions: []string{"reIndex"}}}, nil
 	}
 
 	return nil, fmt.Errorf("thermocline: refusing %q because it does not know what privilege the command requires, "+

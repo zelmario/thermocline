@@ -16,6 +16,19 @@ ORDERS=${ORDERS:-8000}
 ROUNDS=${ROUNDS:-300}
 CONC=${CONC:-6}
 CFG=/root/two.yaml
+# terminate_auth moves the decision about who may read what out of mongod and
+# into this proxy, and it is off by default precisely because it should not ship
+# on until it has carried traffic that was not a fixture. Two shops writing
+# continuously is the closest thing here to that traffic:
+#
+#   TERMINATE_AUTH=1 bash test/store/two.sh
+#
+# With it on the router owns its upstream connections and pools them, verifies
+# each client's password against the keys mongod stores, and loads that user's
+# privileges to check every command against. What the shops assert does not
+# change, which is the point: the invariants are about orders, not about how the
+# connection was authenticated.
+if [ -n "${TERMINATE_AUTH:-}" ]; then CFG=/root/two_ta.yaml; fi
 ROUTER=${ROUTER:-'mongodb://dba:secret@127.0.0.1:27600/?authSource=admin'}
 
 N() { docker exec "$NODE" bash -c "$1"; }
@@ -23,13 +36,17 @@ ND() { docker exec -d "$NODE" bash -c "$1"; }
 
 echo "== installing =="
 docker cp test/store/two.yaml "$NODE":/root/two.yaml >/dev/null
+if [ "$CFG" != /root/two.yaml ]; then
+  N "sed 's|^  listen:|  terminate_auth: true\n  listen:|' /root/two.yaml > $CFG"
+  echo "  terminate_auth on, from $CFG"
+fi
 docker cp bin/store "$NODE":/usr/local/bin/store >/dev/null
 # Nothing of a previous run: both shops, and this deployment's own bookkeeping.
 # Both the daemons, which carry the config path, and the loop that starts them,
 # which does not: a previous run's churn shell survived a kill matched on the
 # config alone and its evictor then emptied this run's seed out of the fast tier
 # while the setup was still checking it.
-N "for p in \$(pgrep -f 'config /root/two[.]yaml'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
+N "for p in \$(pgrep -f 'config /root/tw[o]'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
 sleep 1
 docker exec "$NODE" mongosh "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin" \
   --quiet --eval 'db.getSiblingDB("shopA").dropDatabase(); db.getSiblingDB("shopB").dropDatabase(); db.getSiblingDB("_thermocline_two").dropDatabase()' >/dev/null
@@ -92,12 +109,12 @@ docker exec "$NODE" mongosh "$ROUTER" --quiet --eval 'db.adminCommand({ping:1})'
 
 # A warm and an evictor looping underneath both shops for as long as the run
 # lasts, so neither application is reading a tier that stands still.
-cat > /tmp/two_churn.sh <<'CH'
+cat > /tmp/two_churn.sh <<CH
 #!/bin/bash
-trap 'for p in $(pgrep -f "config /root/two.yaml" | grep -v $$); do kill -9 $p 2>/dev/null; done' EXIT
-for i in $(seq 1 40); do
-  cline warmer --config /root/two.yaml >/dev/null 2>&1
-  cline evictor --config /root/two.yaml --once >/dev/null 2>&1
+trap 'for p in \$(pgrep -f "config /root/tw[o]" | grep -v \$\$); do kill -9 \$p 2>/dev/null; done' EXIT
+for i in \$(seq 1 40); do
+  cline warmer --config $CFG >/dev/null 2>&1
+  cline evictor --config $CFG --once >/dev/null 2>&1
   sleep 5
 done
 CH
@@ -132,5 +149,5 @@ for k in ('commands','read_misses','write_misses','copied_up','from_archive','in
     print('  %-16s %s' % (k, c.get(k)))
 " 2>/dev/null
 
-N "for p in \$(pgrep -f 'config /root/two[.]yaml'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
+N "for p in \$(pgrep -f 'config /root/tw[o]'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
 exit $rc
