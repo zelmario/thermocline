@@ -224,14 +224,25 @@ func (r *Router) mirroringLag(ctx context.Context) (time.Duration, bool) {
 	if r.cfg.FeederID == "" {
 		return 0, false
 	}
+	// Clamped at zero, the way internal/health does it for the same value.
+	//
+	// The instant comes from the feeder, and the feeder stamps it from the tier
+	// it is reading rather than from this process's clock. A router whose clock
+	// trails that one by a little reports a negative lag, which is not a small
+	// number, it is a nonsense one: measured -1.62 seconds on a healthy
+	// deployment where the feeder had just published.
+	//
+	// The evictor's copy of this arithmetic has clamped since it was written,
+	// and this one is the twin nobody treated: the same quantity was honest in
+	// the health check and wrong in the metric an operator graphs.
 	if rec, ok, err := r.positions.At(ctx, r.cfg.FeederID); err == nil && ok {
-		return time.Since(rec.At), true
+		return max(time.Since(rec.At), 0), true
 	}
 	at, ok, err := r.checkpoints.EventAt(ctx, r.cfg.FeederID)
 	if err != nil || !ok {
 		return 0, false
 	}
-	return time.Since(at), true
+	return max(time.Since(at), 0), true
 }
 
 // daemonReports reads what the background daemons last published.

@@ -72,6 +72,9 @@ feeder:
     - "shop.tidxdrop"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
+    # testkeys.sh: the collection a second router has to notice a new unique
+    # index on, without being restarted.
+    - "shop.tkddl2"
     # testevict.sh: the collection the restored-archive section mirrors, updates
     # and then restores to an older backup underneath a live fast tier.
     - "shop.trestore"

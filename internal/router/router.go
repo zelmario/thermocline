@@ -1053,6 +1053,22 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			c.r.forgetIndexes(db + "." + coll)
 			c.r.forgetHint(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
+			// And tell the other routers, which have no other way to hear it:
+			// no change stream carries index DDL. They read the claim on the
+			// hot path anyway, so the number rides there. Best effort, because
+			// the DDL has already been applied and failing the client's command
+			// over a bookkeeping write would be worse than the minute of
+			// disagreement this exists to shorten.
+			if c.r.cfg.Manages(db + "." + coll) {
+				if berr := c.r.marks.BumpIndexGen(ctx, db+"."+coll); berr != nil {
+					c.log.Warn("could not tell the other routers the unique indexes changed",
+						"ns", db+"."+coll, "err", berr,
+						"effect", "another router keeps its old listing for up to a minute, and "+
+							"does not claim keys for an index it has not seen",
+						"action", "run cline keys --rebuild, or restart the routers to have it "+
+							"enforced everywhere at once")
+				}
+			}
 			if name == "drop" {
 				// The fast tier no longer holds any of it, so a cached claim
 				// that it holds all of it is wrong from this instant. See

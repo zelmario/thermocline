@@ -179,6 +179,17 @@ type indexCache struct {
 // documents, so each candidate document is tested against the same condition
 // the index itself uses before its key is claimed. See constrains.
 func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
+	// Before reading what this router remembers, give it the chance to hear
+	// that another one changed the indexes. The count of changes rides on the
+	// completeness claim, and reading that claim is what notices it.
+	//
+	// Here rather than left to the write path's own claim read, because those
+	// two run concurrently: the insert guard checks archived ids in a goroutine
+	// while this runs on the main path. Measured that way round, the listing
+	// was read before the claim refresh landed, the insert that should have been
+	// refused was accepted, and only the *next* one was judged correctly.
+	r.noticeIndexChanges(ctx, ns)
+
 	r.idxCache.mu.RLock()
 	at, seen := r.idxCache.fetched[ns]
 	cached := r.idxCache.byNS[ns]
@@ -234,6 +245,22 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	r.idxCache.fetched[ns] = time.Now()
 	r.idxCache.mu.Unlock()
 	return found
+}
+
+// noticeIndexChanges reads the completeness claim so that a unique index
+// another router created is seen before this one enforces from its own listing.
+//
+// Cheap: the claim is cached for watermark.ClaimCacheTTL, so this is a map
+// lookup on all but one call in five seconds, and that one call is a read the
+// write path was going to make anyway. Skipped for a namespace nothing tiers,
+// which has no claim to read and would otherwise cost a round trip per write.
+func (r *Router) noticeIndexChanges(ctx context.Context, ns string) {
+	if !r.cfg.Manages(ns) {
+		return
+	}
+	// The side effect is the point: completenessClaim drops the cached listing
+	// when the number it reads has moved. See tiers.go.
+	_, _, _ = r.completenessClaim(ctx, ns)
 }
 
 // forgetIndexes drops what is remembered about ns, so the next write re-lists.

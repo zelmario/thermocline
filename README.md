@@ -2242,14 +2242,27 @@ assumed: with one router answering from its cache, nine hits deep, and the other
 taking a write before each read, twenty rounds in a row gave the new answer and
 none gave the old one.
 
-One cache is not that one. Each router keeps its own listing of which unique
-indexes a collection has, for a minute, and no change stream carries index DDL.
-So a unique index created on a running system is enforced across tiers
-immediately by the router the command went through, and within a minute by the
-others. In that window another router does not claim keys for it, and lets
-through a duplicate of an archived document that the fast tier's own index
-cannot see. Restart the routers if you need it enforced everywhere at once, and
-run `cline keys --rebuild` either way, which the rollout list already asks for.
+One cache is not that one, and it used to be the sharp edge here. Each router
+keeps its own listing of which unique indexes a collection has, for a minute,
+and no change stream carries index DDL. So a unique index created on a running
+system was enforced across tiers immediately by the router the command went
+through and only within a minute by the others, and in that window another
+router did not claim keys for it: it let through a duplicate of an archived
+document that the fast tier's own index cannot see, because the document is not
+there. Measured, with a second router that had written to the collection before
+the index existed: the duplicate was accepted and landed.
+
+**That window is now the claim's five seconds rather than the listing's minute.**
+The router that takes the DDL increments a count on the completeness claim, and
+every other router reads that claim on the hot path anyway, once per five
+seconds per namespace, so it costs no round trip. Seeing the number move drops
+the listing, and the listing is re-read before it is enforced from rather than
+after: the two happen concurrently otherwise, and the insert that should have
+been refused was accepted while only the next one was judged.
+
+It is a narrowing and not a closure. Five seconds is still a window, the bump is
+best effort because failing a client's DDL over a bookkeeping write would be
+worse, and `cline keys --rebuild` is still what the rollout list asks for.
 
 **14. The archive is a hard dependency, and not only for its documents.** The
 completeness watermarks, the feeder's checkpoint and its published position all

@@ -375,6 +375,21 @@ func (r *Router) completenessClaim(ctx context.Context, ns string) (watermark.Ma
 	}
 	entry := watermarkEntry{mark: mark, known: true, fetched: time.Now()}
 
+	// Another router changed this namespace's unique indexes, so the listing
+	// this one is enforcing from is out of date. It rides on the claim because
+	// the claim is already being read here: no extra round trip, and the window
+	// where two routers disagree about what is unique shrinks from indexRefresh
+	// to the claim cache's own TTL.
+	//
+	// Only when a previous reading exists to compare against. A first read
+	// learns the number rather than reacting to it, or every router would drop
+	// its listing on the first query after starting, for nothing.
+	if ok && e.known && e.mark.IndexGen != mark.IndexGen {
+		r.log.Info("another router changed the unique indexes here, re-reading them",
+			"ns", ns, "was", e.mark.IndexGen, "now", mark.IndexGen)
+		r.forgetIndexes(ns)
+	}
+
 	r.rememberClaim(ns, entry)
 	return entry.mark, entry.known, false
 }

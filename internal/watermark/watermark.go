@@ -37,6 +37,20 @@ import (
 type Mark struct {
 	From    time.Time
 	Claimed bool
+	// IndexGen counts unique index changes on this namespace, so a router can
+	// tell that another one changed them without a second round trip.
+	//
+	// It rides on this document because this document is already read on the
+	// hot path, once per ClaimCacheTTL per namespace, by every router that
+	// serves the namespace. A unique index created on one router used to go
+	// unenforced by the others for up to indexRefresh, a minute, and closing
+	// that properly needs a broadcast nothing here has. This narrows it to the
+	// claim's own five seconds and costs no round trip at all.
+	//
+	// Carried whether or not the namespace is Claimed: a DDL can happen before
+	// anything has warmed, and dropping the number then would leave the other
+	// routers on their old listing for the full minute.
+	IndexGen int64
 }
 
 // Complete reports whether a query reaching back to bound can be answered from
@@ -118,9 +132,16 @@ func (s *Store) Load(ctx context.Context, ns string) (Mark, error) {
 // written out twice, and a fix to one of them would have left the other saying
 // every row is a claim.
 func markOf(raw bson.Raw, ns string) (Mark, error) {
+	// Read before the claim, and returned even when there is no claim.
+	var gen int64
+	if g, gerr := raw.LookupErr("indexGen"); gerr == nil {
+		if n, ok := g.AsInt64OK(); ok {
+			gen = n
+		}
+	}
 	v, lerr := raw.LookupErr("completeFrom")
 	if lerr != nil {
-		return Mark{}, nil
+		return Mark{IndexGen: gen}, nil
 	}
 	// Present but not a date is a different matter and stays an error: the
 	// caller reports the claim as unreadable and refuses, rather than guessing
@@ -130,7 +151,24 @@ func markOf(raw bson.Raw, ns string) (Mark, error) {
 		return Mark{}, fmt.Errorf("watermark for %s: completeFrom is %s, not a date",
 			ns, v.Type.String())
 	}
-	return Mark{From: t.UTC(), Claimed: true}, nil
+	return Mark{From: t.UTC(), Claimed: true, IndexGen: gen}, nil
+}
+
+// BumpIndexGen records that this namespace's unique indexes have changed.
+//
+// Upserted, because a namespace can have its indexes changed before anything
+// has claimed it complete, and the row this creates carries no completeFrom and
+// is therefore not a claim. That is exactly why Claimed had to stop meaning
+// "the row exists" before this could be written: see markOf.
+func (s *Store) BumpIndexGen(ctx context.Context, ns string) error {
+	_, err := s.coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: ns}},
+		bson.D{{Key: "$inc", Value: bson.D{{Key: "indexGen", Value: 1}}}},
+		options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("record an index change for %s: %w", ns, err)
+	}
+	return nil
 }
 
 // Clear withdraws the claim for ns, so nothing is guaranteed until something

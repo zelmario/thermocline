@@ -62,6 +62,46 @@ func TestMarkOf(t *testing.T) {
 		},
 	}
 
+	// The index generation rides on this document because it is already read on
+	// the hot path. It has to survive both shapes of row: a claim, and a row
+	// that is only there to carry the number because the indexes changed before
+	// anything warmed. Dropping it in the second case would leave every other
+	// router on its old listing for the full minute.
+	t.Run("the index generation is carried with a claim", func(t *testing.T) {
+		raw, _ := bson.Marshal(bson.D{
+			{Key: "_id", Value: "shop.orders"},
+			{Key: "completeFrom", Value: at},
+			{Key: "indexGen", Value: int64(7)},
+		})
+		m, err := markOf(bson.Raw(raw), "shop.orders")
+		if err != nil || !m.Claimed || m.IndexGen != 7 {
+			t.Fatalf("got %+v, err %v; want a claim carrying generation 7", m, err)
+		}
+	})
+	t.Run("and without one", func(t *testing.T) {
+		raw, _ := bson.Marshal(bson.D{
+			{Key: "_id", Value: "shop.orders"},
+			{Key: "indexGen", Value: int64(3)},
+		})
+		m, err := markOf(bson.Raw(raw), "shop.orders")
+		if err != nil {
+			t.Fatalf("refused: %v", err)
+		}
+		if m.Claimed {
+			t.Error("a row carrying only a generation reads as a claim")
+		}
+		if m.IndexGen != 3 {
+			t.Errorf("IndexGen = %d, want 3", m.IndexGen)
+		}
+	})
+	t.Run("an absent generation is zero, not an error", func(t *testing.T) {
+		raw, _ := bson.Marshal(bson.D{{Key: "_id", Value: "shop.orders"}, {Key: "completeFrom", Value: at}})
+		m, err := markOf(bson.Raw(raw), "shop.orders")
+		if err != nil || m.IndexGen != 0 || !m.Claimed {
+			t.Fatalf("got %+v, err %v; want a claim with generation 0", m, err)
+		}
+	})
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			raw, err := bson.Marshal(c.doc)

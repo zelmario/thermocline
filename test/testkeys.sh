@@ -441,6 +441,56 @@ R 'db.getSiblingDB(process.env.TC_DB).tkddl.createIndex({email:1},{unique:true})
 cline keys --config $CFG --rebuild >/dev/null 2>&1
 chk "enforced without restarting the router" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkddl.insertOne({_id:2,email:"d@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== and by the other routers, without restarting them =="
+# The one this suite could not check before, because there was nothing to check.
+# No change stream carries index DDL, so a router that did not take the command
+# had only its own listing, kept for indexRefresh, a minute. In that window it
+# claims no keys for the new index and lets through a duplicate of an archived
+# document, which mongod's own index cannot see because the document is not
+# there.
+#
+# The claim document is read on the hot path anyway, once per five seconds per
+# namespace, so the count of index changes rides on it. This waits past that
+# five seconds and well inside the minute: before, the second router accepted
+# the duplicate here.
+fresh tkddl2
+# Truncated, because a check below greps this file and a previous run's line
+# would answer for this one.
+rm -f $LOGDIR/keys_r2.log
+cline router --config $CFG --listen 0.0.0.0:$P2 --log-file $LOGDIR/keys_r2.log & RP2=$!
+for _ in $(seq 1 30); do
+  mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+R2() { mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+R 'db.getSiblingDB(process.env.TC_DB).tkddl2.insertOne({_id:1,email:"other@x.com"})' >/dev/null
+waitMirrored tkddl2 1
+# Two things the second router needs before the index is created, and the first
+# version of this check had only one, so it passed against a binary with none of
+# this in it.
+#
+# It has to have read the claim, or there is no earlier generation to notice a
+# change against. And it has to have *written*, because that is what makes it
+# list the unique indexes and cache them: a router with no cached listing lists
+# them fresh on its first write and sees the new index anyway, which is not the
+# window this is about.
+R2 'print(db.getSiblingDB(process.env.TC_DB).tkddl2.countDocuments({}))' >/dev/null
+R2 'db.getSiblingDB(process.env.TC_DB).tkddl2.insertOne({_id:9,email:"warm@x.com"})' >/dev/null
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkddl2.deleteOne({_id:1})'
+R 'db.getSiblingDB(process.env.TC_DB).tkddl2.createIndex({email:1},{unique:true})' >/dev/null
+cline keys --config $CFG --rebuild >/dev/null 2>&1
+sleep 8
+chk "the other router refuses the duplicate too" "11000" \
+    "$(R2 'try{db.getSiblingDB(process.env.TC_DB).tkddl2.insertOne({_id:2,email:"other@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and nothing of it reached the fast tier"  "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkddl2.countDocuments({_id:2}))')"
+chk "  while a free value still goes through"    "ok" \
+    "$(R2 'try{db.getSiblingDB(process.env.TC_DB).tkddl2.insertOne({_id:3,email:"free@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and it said why it re-read them"          "true" \
+    "$(grep -q 'another router changed the unique indexes here' $LOGDIR/keys_r2.log && echo true || echo false)"
+kill $RP2 2>/dev/null; wait $RP2 2>/dev/null
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"
