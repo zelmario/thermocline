@@ -10,9 +10,25 @@
 #
 #   HOURS=3 bash test/pilot/soak.sh
 #
-# What it is looking for is in the last three columns: stale_reads, refused and
-# panics are meant to stay at zero, and every other number is meant to be
-# explainable. A disagreement in any round is the run failing.
+# Three things fail the run, and they are asserted rather than printed for
+# somebody to notice:
+#
+#   a disagreement in any round;
+#   a panic, ever, which is a defect with a stack in the log beside it;
+#   a refusal the comparison did not itself report.
+#
+# That last one used to be "refused is meant to stay at zero", which stopped
+# being true when a pipeline reading an untiered collection became a refusal:
+# two of the nineteen aggregations here are that shape, so the counter climbs by
+# two every round by design. A column that grows for a good reason teaches a
+# reader to ignore the column, so the round asserts the router's refusals equal
+# the ones the comparison printed, and an unexplained one fails.
+#
+# stale_reads is printed and not asserted, on purpose. A fall-through read that
+# waited the full archive_wait during an eviction burst and answered anyway is
+# the documented trade rather than a wrong answer; a previous run reached 13 of
+# them. The comparison cannot see that kind of staleness either, because it asks
+# the archive the same question.
 #
 # It leaves the pilot running. Stop it early with: touch /tmp/soak.stop
 NODE=${NODE:-thermocline-zelmar-node0}
@@ -39,6 +55,11 @@ printf 'round\telapsed\tdisagree\tstale\trefused\tpanics\tcursors\tcopied\tfrom_
 
 round=0
 worst=0
+panics=0
+unexplained=0
+# The counters are cumulative and the pilot may have been used before this run,
+# so the first round is measured against wherever they already stood.
+refprev=$(metric refused_total); refprev=${refprev:-0}; refprev=${refprev%%.*}
 while [ "$(date +%s)" -lt "$END" ]; do
   [ -f /tmp/soak.stop ] && { echo "stopped by /tmp/soak.stop"; break; }
   round=$((round + 1))
@@ -50,9 +71,13 @@ while [ "$(date +%s)" -lt "$END" ]; do
   out=$(bash test/pilot/setup.sh compare 2>&1)
   dis=$(grep -oE '[0-9]+ disagreements' <<<"$out" | awk '{s+=$1} END{print s+0}')
   [ "$dis" -gt "$worst" ] && worst=$dis
+  # What the comparison says it was refused, so the counter can be held to it.
+  saidref=$(grep -oE '[0-9]+ refused' <<<"$out" | awk '{s+=$1} END{print s+0}')
 
+  # Number(), because serverStatus returns a 64 bit integer and mongosh prints
+  # one as Long('7'), which is not a number to anything reading this column.
   cursors=$(docker exec "$NODE" mongosh "$HOT" --quiet --eval \
-    'print(db.getSiblingDB("admin").serverStatus().metrics.cursor.open.total)' 2>/dev/null | tail -1)
+    'print(Number(db.getSiblingDB("admin").serverStatus().metrics.cursor.open.total))' 2>/dev/null | tail -1)
   tombs=$(docker exec "$NODE" mongosh "$COLD" --quiet --eval \
     'let n=0; ["sample_mflix.comments","sample_supplies.sales","sample_training.trips"].forEach(function(ns){
        const p=ns.split("."); n += db.getSiblingDB(p[0])[p[1]].countDocuments({_tcDeletedAt:{$exists:true}}); });
@@ -61,15 +86,33 @@ while [ "$(date +%s)" -lt "$END" ]; do
   rss=$(( ${rss:-0} / 1024 ))
   swap=$(free -m | awk '/Swap:/{print $3}')
 
+  refnow=$(metric refused_total); refnow=${refnow:-0}
+  pan=$(metric panics_total); pan=${pan:-0}
+  # Integers: the exporter prints these as floats, and 2 != 2.0 in a shell test.
+  refnow=${refnow%%.*}; pan=${pan%%.*}
+  grew=$(( refnow - refprev )); refprev=$refnow
+
   printf '%d\t%ds\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$round" "$(( $(date +%s) - start ))" "${dis:-?}" \
-    "$(metric stale_reads_total)" "$(metric refused_total)" "$(metric panics_total)" \
+    "$(metric stale_reads_total)" "$refnow" "$pan" \
     "${cursors:-?}" "$(metric copied_up_total)" "$(metric from_archive_total)" \
     "${tombs:-?}" "$rss" "${swap:-?}" | tee -a "$OUT"
+
+  if [ "$pan" -gt 0 ] 2>/dev/null; then
+    echo "  PANIC: the router recovered $pan panic(s); the stack is in /root/pilotlog/router.log"
+    panics=$pan
+  fi
+  if [ "$grew" -ne "$saidref" ] 2>/dev/null; then
+    echo "  UNEXPLAINED REFUSAL: the router refused $grew this round and the comparison reported $saidref"
+    unexplained=$((unexplained + 1))
+  fi
 done
 
 echo
 echo "================================"
 echo "rounds: $round   worst round: $worst disagreements"
+echo "panics: $panics   rounds with an unexplained refusal: $unexplained"
 [ "$worst" -gt 0 ] && exit 1
+[ "$panics" -gt 0 ] && exit 1
+[ "$unexplained" -gt 0 ] && exit 1
 exit 0
