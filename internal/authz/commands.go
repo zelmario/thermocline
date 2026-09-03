@@ -46,6 +46,18 @@ var NoAuthNeeded = map[string]bool{
 	// with read on one database is allowed to run it. mongosh sends it on
 	// connect.
 	"connectionStatus": true,
+	// atlasVersion is how mongosh asks whether it is talking to Atlas, and it
+	// is not a mongod command at all: measured against 8.0.26, mongod answers
+	// CommandNotFound. Forwarding it therefore hands the client exactly what a
+	// client talking to mongod directly gets, which is the whole point. Refused
+	// as unjudged, it made terminate_auth answer differently from proxied
+	// authentication for a command every shell sends on connect, and put two
+	// refusals per round into a counter that is an alert signal.
+	//
+	// Exempted by name rather than by a rule that forwards anything unknown.
+	// An unknown command may well read data, and letting one through on the
+	// router's own connection is the bypass this whole package exists to stop.
+	"atlasVersion": true,
 }
 
 // Needs returns what a command requires, or an error naming the command when it

@@ -322,6 +322,16 @@ func TestConnectionStatusNeedsNothing(t *testing.T) {
 	if !NoAuthNeeded["connectionStatus"] {
 		t.Error("connectionStatus is judged, and mongod asks no privilege for it")
 	}
+	// atlasVersion is how mongosh asks whether it is talking to Atlas, and
+	// mongod does not have the command at all: measured, it answers
+	// CommandNotFound. Refusing it as unjudged made terminate_auth answer
+	// differently from proxied authentication for something every shell sends
+	// on connect. Found by the pilot's soak, which holds the router's refusals
+	// to the ones the comparison reported and flagged two a round it could not
+	// account for.
+	if !NoAuthNeeded["atlasVersion"] {
+		t.Error("atlasVersion is judged, and mongod does not have the command to require anything for")
+	}
 	// And the counterexample, so this is not just a list of true things: a
 	// command that can be pointed at data is never in that list.
 	for _, name := range []string{"find", "aggregate", "listCollections", "serverStatus"} {
