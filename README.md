@@ -1443,6 +1443,15 @@ steady trickle is an application asking for something this system does not do; a
 step change means completeness claims no longer cover what is being asked, which
 is usually a warm that has not run.
 
+Read the *shape* of the curve, not the value, and read the log before concluding
+anything. Several ordinary things refuse on purpose: a pipeline reading an
+untiered collection, a transaction spanning both tiers, a write the archive's
+unique index already holds. A report that runs every hour and joins a reference
+collection puts a step in this counter on a schedule and nothing is wrong. That
+is why the pilot's own soak stopped asserting this counter is zero and started
+holding it to the refusals the comparison itself reported: a number that grows
+for a good reason teaches whoever is watching to stop watching it.
+
 **5. `thermocline_daemon_seconds_since_pass` climbing. Page at ten minutes.** A
 daemon that has stopped shows this climbing rather than going silent, which is
 the whole reason it is a gauge from the last published report rather than a

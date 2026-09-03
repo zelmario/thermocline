@@ -308,6 +308,38 @@ chk "  the archive agrees"                 "[2,3]" \
 chk "  and no temporary was left behind"   "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 
+echo "== a scratch collection a dead router left behind =="
+# Every failing path inside an aggregation drops the collection its result is
+# being assembled in. A process that dies takes none of those paths, and nothing
+# else ever looks at that collection again, so it sits in the application's own
+# database for ever. A starting router removes the stale ones.
+#
+# The bar is an hour, from the nanosecond stamp in the name, because another
+# router on this fast tier may be filling one right now and dropping its
+# half-built result would turn litter into a wrong answer. So both arms: an old
+# one goes and a new one stays.
+#
+# The mirror-everything arm is deliberately not here. The exclusion that keeps
+# these out of the archive only matters with feeder.namespaces empty, and a
+# feeder with an empty list inside a parallel sweep would watch every other
+# worker's collections too, which is the one thing mkworker.sh exists to
+# prevent. It was measured against the feeder's own pipeline instead.
+NOWNS=$(( $(date +%s) * 1000000000 ))
+OLDNS=$(( NOWNS - 7200 * 1000000000 ))
+H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.$OLDNS').insertOne({v:1});
+   db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.$NOWNS').insertOne({v:1})" >/dev/null
+chk "two scratch collections, one stale one fresh" "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+startRouter
+chk "  the stale one is gone"              "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('tmp.thermocline.out.$OLDNS') >= 0)")"
+chk "  and the fresh one is left alone"    "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('tmp.thermocline.out.$NOWNS') >= 0)")"
+chk "  and it said so"                     "true" \
+    "$(grep -qc 'removed a scratch collection a previous router left behind' $LOGDIR/aggw_r.log && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.$NOWNS').drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"
