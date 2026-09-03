@@ -513,6 +513,52 @@ H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB3).tcatdb.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 
+echo "== the claim is the field, not the row =="
+# "No completeness watermarks recorded" is the first thing an operator reads
+# when the router starts refusing range queries, and it used to be a count of
+# rows in that collection rather than of claims.
+#
+# Mark.Claimed came from the row existing at all, so a row carrying nothing but
+# its _id read as complete from the zero time: the most permissive claim this
+# system can hold, every range query on that namespace answered from the fast
+# tier alone however far back it reaches. Measured through `cline watermark` on
+# such a row before the fix: "complete for all of history". Nothing here writes
+# one, which is why it was never seen and exactly why it was worth closing: an
+# $unset makes one, so does a hand-edited row, a backup restored from an older
+# schema, or the next feature to $set some other field here with upsert:true.
+#
+# Last in this file and restored afterwards, because it empties the collection
+# every other section depends on.
+WMSAVE=$(C 'print(JSON.stringify(db.getSiblingDB(process.env.TC_META).watermarks.find().toArray()))')
+wmArm() {
+  pkill -f "config $CFG --log-file $LOGDIR/wm_r.log" 2>/dev/null
+  sleep 1
+  rm -f $LOGDIR/wm_r.log
+  cline router --config $CFG --listen 0.0.0.0:$PALT --log-file $LOGDIR/wm_r.log &
+  WMR=$!
+  for _ in $(seq 1 30); do
+    mongosh --port $PALT -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+    sleep 1
+  done
+  sleep 1
+  local got
+  got=$(grep -c 'no completeness watermarks recorded' $LOGDIR/wm_r.log 2>/dev/null | tail -1)
+  kill $WMR 2>/dev/null; wait $WMR 2>/dev/null
+  chk "$1" "$2" "$got"
+}
+C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})' >/dev/null
+wmArm "nothing recorded is named at startup" "1"
+C 'db.getSiblingDB(process.env.TC_META).watermarks.insertOne({_id:process.env.TC_DB+".tprobe"})' >/dev/null
+wmArm "and so is a row that is not a claim"  "1"
+chk "which claims nothing rather than everything" "true" \
+    "$(cline watermark --config $CFG --ns $DB.tprobe 2>&1 | grep -qc 'claims nothing' && echo true || echo false)"
+C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).watermarks.insertOne({_id:process.env.TC_DB+".tprobe", completeFrom:new Date(0)})' >/dev/null
+wmArm "a real claim is quiet"                "0"
+chk "and that one reads as a claim from its date" "true" \
+    "$(cline watermark --config $CFG --ns $DB.tprobe 2>&1 | grep -qc 'newer than 1970-01-01' && echo true || echo false)"
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); const s=$WMSAVE; if (s.length) db.getSiblingDB(process.env.TC_META).watermarks.insertMany(s.map(function(r){ if (r.completeFrom) r.completeFrom=new Date(r.completeFrom); if (r.updatedAt) r.updatedAt=new Date(r.updatedAt); return r; }))" >/dev/null
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "================================"
