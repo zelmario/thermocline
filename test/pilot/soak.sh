@@ -45,11 +45,17 @@ metric() { N "curl -s http://127.0.0.1:27510/metrics" 2>/dev/null | awk -v k="th
 
 echo "== the pilot, for $HOURS hours =="
 bash test/pilot/setup.sh start >/dev/null 2>&1 || { echo "the pilot would not start"; exit 2; }
+[ -n "${TERMINATE_AUTH:-}" ] && echo "  terminate_auth on"
 
 # The churn loops are short-lived on purpose, so this restarts them each round
 # rather than running one long warm that finishes in the first ten minutes.
 docker cp test/pilot/churn.sh "$NODE":/root/churn.sh >/dev/null
-N "sed -e 's|  residency: 30m|  residency: 5s|' /root/pilot.yaml > /root/pilot_churn.yaml"
+# Derived from whichever config setup.sh drove, so TERMINATE_AUTH=1 reaches the
+# warmer and evictor that run underneath every round rather than the router
+# alone.
+PCFG=${PCFG:-/root/pilot.yaml}
+if [ -n "${TERMINATE_AUTH:-}" ]; then PCFG=/root/pilot_ta.yaml; fi
+N "sed -e 's|  residency: 30m|  residency: 5s|' $PCFG > /root/pilot_churn.yaml"
 
 printf 'round\telapsed\tdisagree\tstale\trefused\tpanics\tcursors\tcopied\tfrom_archive\ttombstones\trss_mb\tswap_mb\n' | tee "$OUT"
 

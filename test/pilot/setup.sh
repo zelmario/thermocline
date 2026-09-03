@@ -11,6 +11,20 @@ NODE=${NODE:-thermocline-zelmar-node0}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 ROUTER=${ROUTER:-'mongodb://dba:secret@127.0.0.1:27500/?authSource=admin'}
+# The config every step below drives. terminate_auth moves the decision about
+# who may read what out of mongod and into the router, and it is off by default
+# because it should not ship on until it has carried traffic that was not a
+# fixture. The pilot is the closest thing here to that traffic, on data nobody
+# wrote for this:
+#
+#   TERMINATE_AUTH=1 bash test/pilot/setup.sh all
+#   TERMINATE_AUTH=1 HOURS=3 bash test/pilot/soak.sh
+#
+# It also puts mongosh's own connection sequence through the guard, which is
+# where the first defect this found lived: every command a shell or driver sends
+# to set a connection up used to be refused as unjudged.
+PCFG=${PCFG:-/root/pilot.yaml}
+if [ -n "${TERMINATE_AUTH:-}" ]; then PCFG=/root/pilot_ta.yaml; fi
 ARCHIVE_URL=${ARCHIVE_URL:-https://atlas-education.s3.amazonaws.com/sampledata.archive}
 TIERED="sample_mflix.comments sample_supplies.sales sample_weatherdata.data sample_training.trips"
 
@@ -98,11 +112,15 @@ uniqueIndexes() {
 start() {
   echo "== the daemons, in runbook order =="
   docker cp test/pilot/pilot.yaml $NODE:/root/pilot.yaml
+  if [ "$PCFG" != /root/pilot.yaml ]; then
+    N "sed 's|^  listen:|  terminate_auth: true\n  listen:|' /root/pilot.yaml > $PCFG"
+    echo "  terminate_auth on, from $PCFG"
+  fi
   N "mkdir -p /root/pilotlog"
   N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
-  docker exec -d $NODE cline feeder --config /root/pilot.yaml --log-file /root/pilotlog/feeder.log
+  docker exec -d $NODE cline feeder --config $PCFG --log-file /root/pilotlog/feeder.log
   sleep 3
-  docker exec -d $NODE cline router --config /root/pilot.yaml --log-file /root/pilotlog/router.log
+  docker exec -d $NODE cline router --config $PCFG --log-file /root/pilotlog/router.log
   for _ in $(seq 1 30); do
     N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
     sleep 1
@@ -110,8 +128,8 @@ start() {
   echo "-- what the router says at startup, which is runbook step 1 --"
   N "grep level=WARN /root/pilotlog/router.log | sed -E 's/ meaning=.*//'"
   echo "== warming =="
-  N "cline warmer --config /root/pilot.yaml 2>&1 | grep 'warm complete'"
-  N "cline keys --config /root/pilot.yaml --rebuild 2>&1 | tail -1"
+  N "cline warmer --config $PCFG 2>&1 | grep 'warm complete'"
+  N "cline keys --config $PCFG --rebuild 2>&1 | tail -1"
 }
 
 compare() {
@@ -170,7 +188,7 @@ join() {
   # the archive's own. Anything else means the router mangles a pipeline it falls
   # through with, which the refusal would have gone on hiding.
   echo "== the untiered join, answered rather than refused =="
-  N "sed 's|^  completeness: archive|  allow_untiered_join: true\n  completeness: archive|' /root/pilot.yaml > /root/pilot_join.yaml"
+  N "sed 's|^  completeness: archive|  allow_untiered_join: true\n  completeness: archive|' $PCFG > /root/pilot_join.yaml"
   N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
   sleep 2
   docker exec -d $NODE cline router --config /root/pilot_join.yaml --log-file /root/pilotlog/router_join.log
@@ -186,7 +204,7 @@ join() {
   # guard off without asking for it.
   N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
   sleep 2
-  docker exec -d $NODE cline router --config /root/pilot.yaml --log-file /root/pilotlog/router.log
+  docker exec -d $NODE cline router --config $PCFG --log-file /root/pilotlog/router.log
   for _ in $(seq 1 30); do
     N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
     sleep 1
@@ -205,12 +223,12 @@ rewarm() {
   N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
   sleep 2
   N "mongosh '$HOT' --quiet --eval 'db.getSiblingDB(\"sample_mflix\").comments.drop()'" >/dev/null
-  docker exec -d $NODE cline router --config /root/pilot.yaml --log-file /root/pilotlog/router.log
+  docker exec -d $NODE cline router --config $PCFG --log-file /root/pilotlog/router.log
   for _ in $(seq 1 30); do
     N "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1})'" >/dev/null 2>&1 && break
     sleep 1
   done
-  N "cline warmer --config /root/pilot.yaml 2>&1 | grep 'warm complete'"
+  N "cline warmer --config $PCFG 2>&1 | grep 'warm complete'"
 }
 
 writes() {
@@ -249,7 +267,7 @@ cache() {
   # own router, because the cache is off by default and should stay off until it
   # has run somewhere real.
   echo "== the query cache, on =="
-  N "sed 's|^  completeness: archive|  cache:\n    enabled: true\n    max_queries: 1000\n    max_bytes: 67108864\n    max_ttl: 1m\n    measure: true\n  completeness: archive|' /root/pilot.yaml > /root/pilot_cache.yaml"
+  N "sed 's|^  completeness: archive|  cache:\n    enabled: true\n    max_queries: 1000\n    max_bytes: 67108864\n    max_ttl: 1m\n    measure: true\n  completeness: archive|' $PCFG > /root/pilot_cache.yaml"
   N "for p in \$(ss -ltnp | grep :27500 | grep -o 'pid=[0-9]*' | cut -d= -f2); do kill -9 \$p; done" >/dev/null 2>&1
   sleep 2
   docker exec -d $NODE cline router --config /root/pilot_cache.yaml --log-file /root/pilotlog/router_cache.log
@@ -301,7 +319,7 @@ churn() {
   # for the churn rather than the thing under test, and asking inside that second
   # measures how fast the feeder is rather than whether the tiers agree.
   for ns in sample_mflix.comments sample_supplies.sales sample_training.trips; do
-    N "cline watermark --config /root/pilot.yaml --ns $ns --clear" >/dev/null 2>&1
+    N "cline watermark --config $PCFG --ns $ns --clear" >/dev/null 2>&1
   done
   # Same windows as the pilot itself, and a residency of seconds.
   #
@@ -323,7 +341,7 @@ churn() {
   # straight afterwards removes nothing and the counts before and after come
   # back identical while the rounds prove nothing. That happened, which is why
   # the counts are printed.
-  N "sed -e 's|  residency: 30m|  residency: 5s|' /root/pilot.yaml > /root/pilot_churn.yaml"
+  N "sed -e 's|  residency: 30m|  residency: 5s|' $PCFG > /root/pilot_churn.yaml"
   docker cp test/pilot/churn.sh $NODE:/root/churn.sh >/dev/null
   echo "  fast tier before:"; tierCounts
   docker exec -d $NODE bash /root/churn.sh
