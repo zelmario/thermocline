@@ -336,8 +336,8 @@ chk "  the stale one is gone"              "false" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('tmp.thermocline.out.$OLDNS') >= 0)")"
 chk "  and the fresh one is left alone"    "true" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('tmp.thermocline.out.$NOWNS') >= 0)")"
-chk "  and it said so"                     "true" \
-    "$(grep -qc 'removed a scratch collection a previous router left behind' $LOGDIR/aggw_r.log && echo true || echo false)"
+chk "  and it said so, about that one"     "true" \
+    "$(grep -q "removed a scratch collection a previous router left behind.*tmp.thermocline.out.$OLDNS" $LOGDIR/aggw_r.log && echo true || echo false)"
 H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.$NOWNS').drop()" >/dev/null
 
 stopDaemons
