@@ -46,6 +46,11 @@ AS() { mongosh --port $PORT -u "$1" -p "$2" --authenticationDatabase admin --qui
 # Reduce any authorization failure to one word, so a check states what it means.
 denied() { case "$1" in *"not authorized"*) echo DENIED ;; *) echo "$1" ;; esac; }
 refused() { case "$1" in *"thermocline: refusing"*) echo REFUSED ;; *) echo "$1" ;; esac; }
+# The same command as the same user, sent straight to the fast tier. mongod is
+# the reference: anything the router allows that mongod refuses is a privilege
+# bypass. Defined here rather than halfway down the file, because a function is
+# not in scope above the line that defines it.
+HOTAS() { local uri=${HOT/dba:secret/$1:$2}; mongosh "$uri" --quiet --eval "$3" 2>&1 | tail -1; }
 
 cleanup() { pkill -9 -f "cline router --config $WDIR/" 2>/dev/null; pkill -9 -f "cline feeder --config $WDIR/" 2>/dev/null; }
 trap cleanup EXIT
@@ -112,6 +117,42 @@ chk "a readWrite user can insert"               "3"      "$(AS writer writepass 
 echo "== a command whose privilege is unknown is refused, not guessed =="
 chk "an unknown command is refused by name"     "REFUSED" "$(refused "$(AS dba secret 'print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).runCommand({thisCommandDoesNotExist:1})))')")"
 
+echo "== the diagnostic surface a driver and a shell actually send =="
+# None of this was judged, and an unjudged command is refused, so with
+# terminate_auth on the router refused all of it: measured, fourteen out of
+# fourteen. A monitoring agent got nothing, rs.status() failed, and the Go
+# driver's own connection setup sends getParameter, so every client connection
+# produced a refusal nobody asked for.
+#
+# Each action was established against mongod rather than remembered: a custom
+# role granting exactly one action makes exactly one of these allowed for a user
+# who otherwise holds read on one database. The pairs below are what that means
+# from outside, and the second half of each pair is the one that matters. A
+# mapping that is too weak is a privilege bypass, not a refusal.
+chk "a root user can read server status"        "1"      "$(AS dba secret 'print(db.adminCommand({serverStatus:1}).ok)')"
+chk "and a parameter"                           "1"      "$(AS dba secret 'print(db.adminCommand({getParameter:1,featureCompatibilityVersion:1}).ok)')"
+chk "and the startup warnings mongosh asks for" "1"      "$(AS dba secret 'print(db.adminCommand({getLog:"startupWarnings"}).ok)')"
+chk "and the replica set status"                "1"      "$(AS dba secret 'print(db.adminCommand({replSetGetStatus:1}).ok)')"
+chk "a read only user is refused server status" "DENIED" "$(denied "$(AS limited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
+chk "and mongod refuses the same user the same" "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
+chk "and it is refused the user list"           "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("admin").runCommand({usersInfo:1}).ok)')")"
+chk "and refused what is running"               "DENIED" "$(denied "$(AS limited limpass 'print(db.adminCommand({currentOp:1}).ok)')")"
+# connectionStatus reports the caller's own authentication state and mongod
+# asks no privilege for it. mongosh sends it on connect.
+chk "connectionStatus needs no privilege"       "1"      "$(AS limited limpass 'print(db.adminCommand({connectionStatus:1}).ok)')"
+# The sharpest of these: the same command, allowed on the database this user can
+# read and refused on the one it cannot. A blanket exemption would pass the
+# first and fail the second.
+chk "dbHash on the granted database"            "1"      "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1}).ok)')"
+chk "and refused on another"                    "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1}).ok)')")"
+chk "and mongod agrees about both"              "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1}).ok)')")"
+# atlasVersion is how mongosh asks whether it is talking to Atlas, and mongod
+# does not have the command. Forwarded, so the client gets mongod's own answer
+# rather than a refusal this proxy invented, and so the refusal counter is not
+# stepped twice by every shell that connects.
+chk "atlasVersion answers as mongod does"       "CommandNotFound" \
+    "$(AS dba secret 'try { db.adminCommand({atlasVersion:1}); print("ANSWERED") } catch (e) { print(e.codeName || e.message.substring(0,40)) }')"
+
 echo "== tiering still works with authentication terminated =="
 # The point of the whole system has to survive the change: a document only the
 # archive holds must still be found, by a user allowed to see it.
@@ -141,7 +182,6 @@ chk "and refused to a user without the grant"   "DENIED" "$(denied "$(AS limited
 # The reference is the same user sending the same command straight to the fast
 # tier. Anything the router allows that mongod refuses is a privilege bypass,
 # and for the writing stages it is a destructive one.
-HOTAS() { local uri=${HOT/dba:secret/$1:$2}; mongosh "$uri" --quiet --eval "$3" 2>&1 | tail -1; }
 
 echo "== the collections a command names besides its own =="
 H "db.getSiblingDB(process.env.TC_DB).tazopen.drop();
