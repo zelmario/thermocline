@@ -99,7 +99,7 @@ func runRollback(args []string) error {
 	// is the half an operator cannot fix afterwards: an application repointed at
 	// an archive without its accounts cannot log in at all, and MongoDB answers
 	// that with an ordinary authentication failure naming nothing.
-	reportArchiveGaps(ctx, cfg, log)
+	gaps := reportArchiveGaps(ctx, cfg, log)
 
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
 	if *clear && alive && !*force {
@@ -144,12 +144,26 @@ and the feeder first, let mirroring finish, then run this again.
 	}
 
 	fmt.Print("\n")
+	// Both of the reassuring endings are about delete marks alone, and they used
+	// to be printed whatever else was missing: "the archive already answers the
+	// way the router does" appeared directly under a list of collections it has
+	// never held. Marks are one of the things standing between an operator and
+	// going back, and on an adoption they are rarely the biggest.
+	ready := "The archive now answers the way the router did."
+	if gaps {
+		ready = "Delete marks are dealt with. What is listed above is not, and until it is " +
+			"the archive\nis not what the application had."
+	}
 	switch {
 	case *clear:
-		fmt.Println("The archive now answers the way the router did.")
-		fmt.Println("Point the application at it, and stop the router before anything else writes.")
-	case total == 0:
+		fmt.Println(ready)
+		if !gaps {
+			fmt.Println("Point the application at it, and stop the router before anything else writes.")
+		}
+	case total == 0 && !gaps:
 		fmt.Println("Nothing is marked deleted, so the archive already answers the way the router does.")
+	case total == 0:
+		fmt.Println("Nothing is marked deleted, but what is listed above is missing from the archive.")
 	default:
 		fmt.Printf("%d document(s) are marked deleted. A client reading this cluster directly sees\n", total)
 		fmt.Print(`them; the router does not. Clear them with --clear before pointing anything at
@@ -252,25 +266,26 @@ func archiveNamespaces(ctx context.Context, cold *mongo.Client) ([]string, error
 //
 // Best effort throughout. This runs during an incident, the fast tier may be the
 // thing that is broken, and a rollback must not depend on it being reachable.
-func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger) {
+func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger) bool {
 	hot, err := connect(ctx, cfg.Hot.URI, "hot")
 	if err != nil {
 		fmt.Printf("Could not reach the fast tier to compare it: %v\n", err)
 		fmt.Println("Nothing below is affected; this section is a courtesy.")
 		fmt.Println()
-		return
+		return false
 	}
 	defer disconnect(hot, log)
 	cold, err := connect(ctx, cfg.Cold.URI, "cold")
 	if err != nil {
-		return
+		return false
 	}
 	defer disconnect(cold, log)
 
 	users := missingAccounts(ctx, hot, cold)
 	views := missingViews(ctx, hot, cold)
-	if len(users) == 0 && len(views) == 0 {
-		return
+	colls := missingCollections(ctx, hot, cold)
+	if len(users) == 0 && len(views) == 0 && len(colls) == 0 {
+		return false
 	}
 
 	fmt.Println("The fast tier has things the archive does not:")
@@ -283,7 +298,122 @@ func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger)
 		fmt.Printf("  views     %s\n", strings.Join(views, ", "))
 		fmt.Println("            recreate them in the archive with createView")
 	}
+	if len(colls) > 0 {
+		fmt.Printf("  collections  %d the archive has never held. The feeder mirrors what\n", len(colls))
+		fmt.Println("               feeder.namespaces tiers and nothing else, so these have lived")
+		fmt.Println("               on the fast tier alone since the cutover. An application")
+		fmt.Println("               repointed at the archive will not find them.")
+		printByDatabase(colls)
+		fmt.Println("               Copy them across first:")
+		fmt.Println("                 mongodump --uri=<hot> --db=DB --collection=COLL -o /tmp/back")
+		fmt.Println("                 mongorestore --uri=<cold> /tmp/back")
+	}
 	fmt.Println()
+	return true
+}
+
+// printByDatabase lists namespaces grouped by their database, one line each.
+//
+// A hundred names joined by commas on one line is a list nobody reads, and this
+// is read during an incident. Grouped, an operator sees which applications are
+// affected before they see how many collections there are.
+func printByDatabase(nss []string) {
+	const maxDBs = 12
+	order := []string{}
+	byDB := map[string][]string{}
+	for _, ns := range nss {
+		db, coll, ok := strings.Cut(ns, ".")
+		if !ok {
+			db, coll = "", ns
+		}
+		if _, seen := byDB[db]; !seen {
+			order = append(order, db)
+		}
+		byDB[db] = append(byDB[db], coll)
+	}
+	sort.Strings(order)
+	shown := order
+	if len(order) > maxDBs {
+		shown = order[:maxDBs]
+	}
+	for _, db := range shown {
+		list := strings.Join(byDB[db], ", ")
+		if len(list) > 100 {
+			list = list[:97] + "..."
+		}
+		fmt.Printf("                 %-22s %s\n", db, list)
+	}
+	if len(order) > len(shown) {
+		fmt.Printf("                 and %d more database(s)\n", len(order)-len(shown))
+	}
+}
+
+// missingCollections names collections the fast tier has that the archive does
+// not, which is the largest thing standing between an operator and going back
+// and the one this command used to say nothing about.
+//
+// The archive is the complete copy of what is *tiered*. Everything else has
+// lived on the fast tier alone since the cutover: the adoption runbook has an
+// operator copy those collections up at the start, and nothing ever copies them
+// back down. Rolling back without them repoints an application at a cluster
+// holding its orders and not its catalogue.
+//
+// Measured on the shop harness, which is the first thing to rehearse the whole
+// procedure rather than the command: the fast tier held customers, order_events,
+// orders, products and store_marker, the archive held order_events and orders,
+// and the application would not start. The command reported the accounts and
+// said "the archive already answers the way the router does".
+//
+// Views are excluded because they are reported on their own line above, and
+// system collections because they are a node's own bookkeeping.
+func missingCollections(ctx context.Context, hot, cold *mongo.Client) []string {
+	h, err := collectionsIn(ctx, hot)
+	if err != nil {
+		return nil
+	}
+	c, err := collectionsIn(ctx, cold)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for n := range h {
+		if !c[n] {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// collectionsIn names every ordinary collection on a cluster, skipping the
+// databases that belong to a node rather than to an application.
+func collectionsIn(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+	dbs, err := client.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, db := range dbs {
+		switch db {
+		case "admin", "local", "config":
+			continue
+		}
+		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+			continue
+		}
+		names, lerr := client.Database(db).ListCollectionNames(ctx,
+			bson.D{{Key: "type", Value: "collection"}})
+		if lerr != nil {
+			return nil, lerr
+		}
+		for _, n := range names {
+			if strings.HasPrefix(n, "system.") || meta.IsScratch(n) {
+				continue
+			}
+			out[db+"."+n] = true
+		}
+	}
+	return out, nil
 }
 
 // missingAccounts names accounts the fast tier has and the archive does not.

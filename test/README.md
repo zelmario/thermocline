@@ -62,6 +62,7 @@ Or one at a time:
     bash test/testfailover.sh                      # a write across a change of primary (host side)
     bash test/testversion.sh                       # tiers that do not run the same MongoDB (host side)
     bash test/testalerts.sh                        # the README's alert rules, in a real Prometheus (host side)
+    bash test/testrollback.sh                      # going back: a shop repointed at the archive (host side)
     go run ./test/store -uri ... -skip-seed        # a shop, checking what a shop would notice (see store/README.md)
 
 `test/store` answers a different question from all of the above. Every suite here

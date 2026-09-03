@@ -2198,6 +2198,25 @@ leaves you where you started, and the command refuses while a feeder is
 publishing rather than letting you find that out afterwards. `--force` overrides
 it if you know nothing is writing.
 
+**And the marks are rarely the biggest thing in the way.** The archive is the
+complete copy of what is *tiered*. Every collection `feeder.namespaces` does not
+name has lived on the fast tier alone since the cutover, because step 4 of the
+rollout copies those up and nothing ever copies them back. Repointing without
+them hands an application its orders and not its catalogue.
+
+Measured by rehearsing the whole procedure rather than the command, which is
+what `test/testrollback.sh` now does: a shop with 3,081 orders in the archive,
+40 of them cancelled through the router, rolled back correctly to the 3,041 the
+application had been shown, and then it would not start. The fast tier held
+`customers`, `products` and `store_marker`; the archive had never heard of them.
+`cline rollback` reported the accounts and finished with "the archive already
+answers the way the router does".
+
+It names them now, grouped by database, with the `mongodump` and `mongorestore`
+to copy them across, and it no longer calls the archive ready while anything is
+listed above. Rehearsed end to end after that: the same shop runs against the
+archive with no errors and none of its five invariants broken.
+
 **13. Run more than one router by naming them all, not by hiding them.** A read
 the fast tier cannot answer is served from a cursor the router owns in its own
 memory, holding an open connection to the archive, so it cannot be shared with
