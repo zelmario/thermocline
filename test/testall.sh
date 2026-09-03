@@ -232,7 +232,7 @@ ok "--force clears anyway"                       0 "cleared 2" \
 chkrb "and the archive answers as the router did" "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RBNS.countDocuments({}))")"
 C "db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
-ok "with nothing left it says so"                0 "already answers the way the router does" \
+ok "with nothing left it says so"                0 "Nothing is marked deleted" \
     -- cline rollback --config $CFG --ns $DB.$RBNS
 C "db.getSiblingDB(process.env.TC_DB).$RBNS.drop()" >/dev/null
 
