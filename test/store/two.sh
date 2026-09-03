@@ -71,8 +71,14 @@ for _ in $(seq 1 300); do
   sleep 2
 done
 [ "$lag" -lt 5 ] 2>/dev/null || { echo "  FATAL mirroring is ${lag}s behind, so the archive cannot answer for the past"; exit 2; }
+echo "  mirroring is ${lag}s behind, which is the bar this waited for"
+# Printed as information, and the two numbers are allowed to differ. The bar
+# above is the feeder's own position, so up to that many seconds of the seed can
+# still be in flight when these are read. Sitting under a line that says
+# "waiting for mirroring to catch up", a bare pair of counts reads as a
+# discrepancy report, which is a double-take every time somebody reads this log.
 for shop in shopA shopB; do
-  echo "  $shop: fast tier $(docker exec "$NODE" mongosh "$HOT" --quiet --eval "print(db.getSiblingDB('$shop').orders.countDocuments({}))" 2>/dev/null | tail -1), archive $(docker exec "$NODE" mongosh "$COLD" --quiet --eval "print(db.getSiblingDB('$shop').orders.countDocuments({}))" 2>/dev/null | tail -1)"
+  echo "  $shop at this instant: fast tier $(docker exec "$NODE" mongosh "$HOT" --quiet --eval "print(db.getSiblingDB('$shop').orders.countDocuments({}))" 2>/dev/null | tail -1), archive $(docker exec "$NODE" mongosh "$COLD" --quiet --eval "print(db.getSiblingDB('$shop').orders.countDocuments({}))" 2>/dev/null | tail -1)"
 done
 
 echo "== the router =="
