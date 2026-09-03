@@ -72,6 +72,9 @@ feeder:
     - "shop.tidxdrop"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
+    # testevict.sh: the collection the restored-archive section mirrors, updates
+    # and then restores to an older backup underneath a live fast tier.
+    - "shop.trestore"
     # testwarm.sh: the two collections its derived configs put a warmer rule on.
     # They are listed here because a rule for a namespace the feeder does not
     # tier is refused now, and rightly: nothing would mirror it, so the router

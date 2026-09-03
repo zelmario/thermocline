@@ -2583,6 +2583,13 @@ only, so an archive holding an *older* version of a document confirms it as
 present, and the fast tier's newer copy is removed: the restore would cost you
 the writes made since the backup rather than recovering them.
 
+That is measured now rather than reasoned, in both directions, by
+`test/testevict.sh`. Five documents mirrored at one value, updated to a second,
+the archive restored to the earlier backup underneath a live fast tier: paused,
+the evictor removes nothing and the newer copies survive; unpaused, all five go
+from the fast tier and the newer value is then in neither tier. The guard works
+and the danger it guards against is real.
+
 **And the limit worth knowing before you need it.** A restored archive is a
 restored past. Documents written after the backup are still on the fast tier if
 they are recent enough to be there, and the feeder cannot fetch them: a change

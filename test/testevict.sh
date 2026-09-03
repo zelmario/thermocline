@@ -323,7 +323,60 @@ chkv "and says nothing when they are all dated"  "0" \
 H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
 
+echo "== a restored archive under a live fast tier =="
+# The reason `cline pause` exists, and the reason the backup procedure puts it
+# before the restore rather than mentioning it afterwards.
+#
+# The evictor's per document check is presence only. An archive restored to an
+# older backup still *has* the document, so the check passes and the fast tier's
+# newer copy is removed. The writes made since the backup are then in neither
+# tier: the restore costs them rather than recovering them.
+#
+# Both arms, because the guard is only worth having if the danger is real.
+# Measured: paused, the evictor removes nothing; unpaused, all five newer copies
+# go and the archive holds the older ones.
+RNS=trestore
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/ev_restore_f.log & RFP=$!
+sleep 3
+# Minted two hours ago, so the rule below reaches them.
+H "const ts=Math.floor((Date.now()-7200000)/1000).toString(16).padStart(8,'0');
+   const d=[]; for(let i=0;i<5;i++) d.push({_id:new ObjectId(ts+i.toString(16).padStart(16,'0')), v:'v1'});
+   db.getSiblingDB(process.env.TC_DB).$RNS.insertMany(d)" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({}))")" = "5" ] && break
+  sleep 1
+done
+chkv "five documents mirrored at v1"              "5"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v1'}))")"
+rm -rf $WDIR/restbak
+mongodump --uri="$COLD" --db $DB --collection $RNS -o $WDIR/restbak --quiet >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).$RNS.updateMany({},{\$set:{v:'v2'}})" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")" = "5" ] && break
+  sleep 1
+done
+chkv "then updated to v2, and that mirrored too"  "5"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+kill $RFP 2>/dev/null; wait $RFP 2>/dev/null
+mongorestore --uri="$COLD" --drop $WDIR/restbak --quiet >/dev/null 2>&1
+chkv "the restore puts the archive back to v1"    "5"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v1'}))")"
+sed "/^evictor:/,/^warmer:/ s|^  rules:|  rules:\n    - ns: \"$DB.$RNS\"\n      older_than: 40m|" $CFG > $WDIR/ev_restore.yaml
+cline watermark --config $WDIR/ev_restore.yaml --ns $DB.$RNS --complete-all >/dev/null 2>&1
+cline pause --config $WDIR/ev_restore.yaml --reason "restoring the archive" >/dev/null 2>&1
+cline evictor --config $WDIR/ev_restore.yaml --once >/dev/null 2>&1
+chkv "paused, the fast tier keeps its newer copies" "5"     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+cline resume --config $WDIR/ev_restore.yaml >/dev/null 2>&1
+cline evictor --config $WDIR/ev_restore.yaml --once >/dev/null 2>&1
+# The documented loss, pinned deliberately. If this ever stops being true
+# because the evictor learned to compare versions rather than presence, this
+# check should fail and be rewritten on purpose, not quietly pass.
+chkv "unpaused, it removes them: this is the loss" "0"     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+chkv "and the newer value is in neither tier"      "0"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
+rm -rf $WDIR/restbak
+
 echo
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
