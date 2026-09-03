@@ -8,6 +8,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -183,6 +184,14 @@ func (c *conn) archiveOnlyCollections(ctx context.Context, cmd bson.Raw, db stri
 		// setProfilingLevel(2) fails with NamespaceExists on that database from
 		// then on, and there is no way back except dropping it by hand.
 		if isSystemCollection(name) {
+			continue
+		}
+		// Nor one the router built for itself. The feeder does not mirror these
+		// any more, so a fresh deployment will not have one in the archive at
+		// all; an archive that ran before that fix can, and listing it would
+		// hand it to the indexer to be built on the fast tier, which is the
+		// same mistake as system.profile above with a different name on it.
+		if meta.IsScratch(name) {
 			continue
 		}
 		// And only what this client would have been allowed to see. The fast

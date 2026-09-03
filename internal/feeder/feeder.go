@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -501,6 +502,23 @@ func (f *Feeder) pipeline() mongo.Pipeline {
 		}}}},
 		{Key: "ns.db", Value: bson.D{{Key: "$nin", Value: bson.A{
 			"admin", "local", "config", meta.DB,
+		}}}},
+		// Not the router's own scratch collections, which live inside the
+		// application's database because a rename cannot cross databases.
+		//
+		// This matters only when Namespaces is empty, which is the supported
+		// way to say "mirror everything": the $or below would otherwise never
+		// name one. Left in, a tiered $out had every document of its temporary
+		// collection mirrored into the archive, and the rename that consumes
+		// that collection is never mirrored, so the archive kept a full copy of
+		// every such aggregation for ever and the router's startup report named
+		// it as a collection the archive holds and the fast tier does not.
+		//
+		// $not on a missing field matches, which is what keeps dropDatabase
+		// events coming through: those carry no ns.coll at all, and the feeder
+		// logs them.
+		{Key: "ns.coll", Value: bson.D{{Key: "$not", Value: bson.Regex{
+			Pattern: "^" + regexp.QuoteMeta(meta.ScratchPrefix),
 		}}}},
 	}
 

@@ -291,6 +291,9 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
 	r.warnAboutOptionDrift(ctx)
+	// And the litter a router that died mid-aggregation leaves in the
+	// application's own database. See dropLeftoverScratch.
+	r.dropLeftoverScratch(ctx)
 	// Before the listener opens: a unique index the fast tier is missing is one
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.

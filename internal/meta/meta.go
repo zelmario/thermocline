@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -60,11 +61,34 @@ func IsBookkeeping(collections []string) bool {
 // does, so every command picks it up before it opens a connection.
 var DB = DefaultDB
 
+// IsScratch reports whether a collection name is one the router made for
+// itself. See ScratchPrefix.
+func IsScratch(coll string) bool { return strings.HasPrefix(coll, ScratchPrefix) }
+
 const (
 	// DefaultDB is the bookkeeping database a deployment gets when the config
 	// does not name one. It is what every existing deployment already uses, so
 	// the name only has to be set when a second deployment shares these tiers.
 	DefaultDB = "_thermocline"
+
+	// ScratchPrefix names the collections the router builds for itself inside
+	// the application's own database, and it exists so everything else can tell
+	// them apart from the application's data.
+	//
+	// A tiered $out is assembled in one of these and renamed over its target,
+	// because the last step of an $out cannot be a rename when the target is
+	// tiered. That collection lives in the application's database, which is
+	// where it has to live for the rename to be possible, so three things have
+	// to know it is not theirs: the feeder must not mirror it, the catalog must
+	// not show it to a client, and a leftover has to be recognisable as litter.
+	//
+	// Measured by reading the feeder's own pipeline: with feeder.namespaces
+	// empty, which is the supported way to say "mirror everything", the match
+	// covered this collection. Its inserts were mirrored into the archive and
+	// the rename that consumes it never is, so the archive kept a full copy of
+	// every tiered $out for ever, and the router's own startup report then named
+	// it as a collection the archive holds and the fast tier does not.
+	ScratchPrefix = "tmp.thermocline."
 
 	// Residency tracks how long a document should stay in the fast tier. One
 	// small record per resident document, so extending a document's stay

@@ -240,7 +240,7 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		// The result is built in a temporary collection and moved in at the
 		// end, because clearing the target is part of this write and the
 		// pipeline is allowed to be reading the target. See writeSink.
-		temp := fmt.Sprintf("tmp.thermocline.out.%d", time.Now().UnixNano())
+		temp := fmt.Sprintf("%sout.%d", meta.ScratchPrefix, time.Now().UnixNano())
 		return &writeSink{
 			r: c.r, how: "replaced on both tiers, so the result is all that is left",
 			target: target, claimNS: target,
@@ -253,7 +253,7 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 
 	// Untiered, so nothing has to mirror and the switch can stay atomic the way
 	// mongod's own $out is: build it beside the target, then rename over it.
-	temp := fmt.Sprintf("tmp.thermocline.out.%d", time.Now().UnixNano())
+	temp := fmt.Sprintf("%sout.%d", meta.ScratchPrefix, time.Now().UnixNano())
 	return &writeSink{
 		r: c.r, how: "written beside the target and renamed over it",
 		target: target, outColl: c.r.hot.Database(outDB).Collection(temp),
