@@ -2731,6 +2731,26 @@ mongosh --port 28018 --eval '
   Reading a tiered collection with mapReduce is refused for a different reason,
   already: it totals whatever tier it runs on.
 
+- **`dbHash` is refused for a collection the fast tier does not hold in full,
+  and `validate` describes one tier.** Both read every document, and neither can
+  be corrected the way a count can.
+
+  `dbHash` returns one hash per collection, and there is no way to combine the
+  fast tier's with the archive's short of reading both in full, which is not
+  what a diagnostic should do. Measured on a collection with ten documents in
+  the archive and three on the fast tier: it answered a different hash with
+  nothing to say it had seen a third of the collection. That is the worst
+  possible answer for the command people use to compare two copies of a
+  dataset, so it is refused with the collections named, and allowed when the
+  claim covers everything — where it is the collection's hash and equals the
+  archive's exactly.
+
+  `validate` is not corrected, deliberately. It is a physical check of one
+  server's storage, so its `nrecords` is the fast tier's the way `storageSize`
+  is, and correcting one field would leave it inconsistent with the index key
+  counts in the same reply that mongod compares it against. Read it as a check
+  of the fast tier, and run it against the archive separately.
+
 - **A tiered `$out` is assembled in a scratch collection inside the
   application's own database.** `$out` into a tiered collection cannot
   end in a rename, so the result is built in

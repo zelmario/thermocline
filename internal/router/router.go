@@ -818,6 +818,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// dbHash reads every document and returns one hash, which cannot be
+	// corrected across two tiers. See dbhash.go.
+	if nameErr == nil && !msg.MoreToCome() && (name == "dbHash" || name == "dbhash") {
+		if out, done := c.guardDBHash(ctx, msg, db); done {
+			return c.send(out)
+		}
+	}
+
 	// count and distinct read documents the same way find does, so they need
 	// the same completeness check.
 	if nameErr == nil && (name == "count" || name == "distinct") && !msg.MoreToCome() {

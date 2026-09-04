@@ -72,6 +72,8 @@ feeder:
     - "shop.tidxdrop"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
+    # testops.sh: the collection dbHash is asked about, whole and short.
+    - "shop.tdbhash"
     # testkeys.sh: the collection a second router has to notice a new unique
     # index on, without being restarted.
     - "shop.tkddl2"

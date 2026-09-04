@@ -187,6 +187,55 @@ chk "mirrored replace" "true" "$(C "const d=db.getSiblingDB(process.env.TC_DB).$
 chk "mirrored upsert"  "900" "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:900}); print(d?d.n:'no')")"
 
 kill $RP $FP 2>/dev/null; wait $RP 2>/dev/null; wait $FP 2>/dev/null
+echo "== dbHash over a collection the fast tier is short of =="
+# Every other command that reads documents is either checked for completeness
+# and answered from the archive, or is a physical fact about one cluster and
+# right to be. dbHash is neither: it reads every document and returns one hash,
+# and a hash cannot be corrected across two tiers the way a count can.
+#
+# Found by asking eleven document-reading commands of a collection the fast tier
+# held three of ten of, with the archive as the control. Nine agreed. This
+# answered a different hash with nothing to say it had seen a third of the
+# collection, which is the worst possible answer for the command people use to
+# compare two copies of a dataset.
+DHNS=tdbhash
+# A router of this section's own: the sections above leave none running, and
+# without one every check here reads a connection error as an answer. That is
+# how the first version of this reported the product refusing nothing.
+pkill -f "cline router --config $WDIR/" 2>/dev/null; sleep 1
+cline router --config $CFG --log-file $LOGDIR/ops_dbhash_r.log & DHRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a router is up for this section"         "1" \
+    "$(R 'print(db.adminCommand({ping:1}).ok)')"
+C "db.getSiblingDB(process.env.TC_DB).$DHNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$DHNS.insertMany([{_id:1,n:1},{_id:2,n:2},{_id:3,n:3}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DHNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$DHNS.insertOne({_id:1,n:1})" >/dev/null
+cline watermark --config $CFG --ns $DB.$DHNS --clear >/dev/null 2>&1
+chk "the fast tier holds one of three"        "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$DHNS.countDocuments({}))")"
+chk "dbHash naming it is refused"             "REFUSED" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:['$DHNS']}); print(r.ok===1?'ANSWERED':'ANSWERED')" 2>&1 | grep -q 'refusing this dbHash' && echo REFUSED || echo ANSWERED)"
+chk "and the whole database form too"         "REFUSED" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1}); print('ANSWERED')" 2>&1 | grep -q 'refusing this dbHash' && echo REFUSED || echo ANSWERED)"
+# And allowed when it means what it says, which is the other half: a hash of a
+# collection the fast tier holds in full is the collection's hash, and it has to
+# equal the archive's.
+H "db.getSiblingDB(process.env.TC_DB).$DHNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$DHNS.insertMany([{_id:1,n:1},{_id:2,n:2},{_id:3,n:3}])" >/dev/null
+cline watermark --config $CFG --ns $DB.$DHNS --complete-all --force >/dev/null 2>&1
+sleep 7
+chk "with a complete claim it answers"        "$(C "print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:['$DHNS']}).collections.$DHNS)")" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:['$DHNS']}); print(r.ok===1 ? r.collections.$DHNS : 'REFUSED')")"
+H "db.getSiblingDB(process.env.TC_DB).$DHNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DHNS.drop()" >/dev/null
+cline watermark --config $CFG --ns $DB.$DHNS --clear >/dev/null 2>&1
+kill $DHRP 2>/dev/null; wait $DHRP 2>/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
