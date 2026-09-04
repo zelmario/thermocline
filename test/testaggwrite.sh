@@ -117,6 +117,44 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$grp',n:{\$
 chk "the deleted group is gone from the rollup" "2"  "$(H "print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({}))")"
 chk "and the total dropped"                     "20" "$(H "const r=db.getSiblingDB(process.env.TC_DB).rollup.aggregate([{\$group:{_id:null,t:{\$sum:'\$n'}}}]).toArray(); print(r.length?r[0].t:0)")"
 
+echo "== a stage in the reading half that reads a collection of its own =="
+# The $match that hides tombstones goes in front of the reading pipeline, and a
+# $lookup does not read that pipeline's input, it reads a collection. So the
+# join saw documents the application had deleted and $out wrote the count of
+# them into a collection, where nothing downstream can tell it was wrong.
+#
+# Its own input collection, because this deletes documents and everything below
+# counts $NS.
+H "db.getSiblingDB(process.env.TC_DB).joinsrc.drop(); db.getSiblingDB(process.env.TC_DB).joinout.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).joinsrc.drop(); db.getSiblingDB(process.env.TC_DB).joinout.drop()" >/dev/null
+R "const c=db.getSiblingDB(process.env.TC_DB).joinsrc; const d=[];
+   for(let i=0;i<20;i++) d.push({_id:i,n:i,grp:['a','b'][i%2]});
+   c.insertMany(d);" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).joinsrc.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "20" ] && break
+  sleep 0.5
+done
+# Four documents out of group a, so the group still has live documents to join
+# and tombstones to be wrong about. Deleting a whole group cannot show this: its
+# tombstones only join to a group that has nothing left in it.
+R "db.getSiblingDB(process.env.TC_DB).joinsrc.deleteMany({_id:{\$in:[0,2,4,6]}})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).joinsrc.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = "4" ] && break
+  sleep 0.5
+done
+chk "the archive holds four tombstones"     "4"  "$(C "print(db.getSiblingDB(process.env.TC_DB).joinsrc.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+# And the fast tier must not be able to answer, or the pipeline never reaches
+# the archive and the rewrite under test is never used.
+cline watermark --config $CFG --ns $DB.joinsrc --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 7
+chk "the fast tier cannot answer this input" "16" "$(R "print(db.getSiblingDB(process.env.TC_DB).joinsrc.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB).joinsrc.aggregate([{\$lookup:{from:'joinsrc',localField:'grp',foreignField:'grp',as:'sib'}},{\$group:{_id:'\$grp',s:{\$max:{\$size:'\$sib'}}}},{\$out:'joinout'}]).toArray()" >/dev/null
+chk "the join wrote both groups"            "2"  "$(H "print(db.getSiblingDB(process.env.TC_DB).joinout.countDocuments({}))")"
+chk "group a joined its six live documents" "6"  "$(H "const d=db.getSiblingDB(process.env.TC_DB).joinout.findOne({_id:'a'}); print(d?d.s:'MISSING')")"
+chk "group b joined its ten"                "10" "$(H "const d=db.getSiblingDB(process.env.TC_DB).joinout.findOne({_id:'b'}); print(d?d.s:'MISSING')")"
+# A $unionWith reads a collection too, and counts what it finds there.
+chk "a union with itself counts each document once" "32" "$(R "const r=db.getSiblingDB(process.env.TC_DB).joinsrc.aggregate([{\$unionWith:'joinsrc'},{\$count:'c'}]).toArray(); print(r.length?r[0].c:0)")"
+
 echo "== a permissive router still refuses to persist a short answer =="
 # Returning a short number is a wrong figure on a screen. Writing one with $out
 # makes it the input to everything downstream, so permissive does not cover it.

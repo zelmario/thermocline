@@ -705,6 +705,21 @@ func liveOnly(filter bson.RawValue) bson.D {
 
 // livePipeline puts a tombstone filter in front of everything else, so no stage
 // ever sees a deleted record.
+//
+// Everything includes the stages that read a collection of their own. A
+// $lookup, a $graphLookup and a $unionWith do not read the pipeline's input,
+// they read another collection, and a $match in front of the pipeline never
+// reaches them. The archive keeps a deleted document as a tombstone, so such a
+// stage joins documents the client deleted.
+//
+// Found by the differential harness and then measured directly: sixty
+// documents in three groups, five deleted through the router, then a self join
+// on the group. The untiered reference answered 19, 18 and 18 siblings and the
+// tiered collection answered 20, 20 and 20, and it stayed wrong after the
+// feeder had caught up, because the tombstones are what it was reading. Moving
+// two documents between groups then had the tiered side count each of them in
+// both groups. The outer side of the same pipeline was right throughout, which
+// is what made this look like a working feature.
 func livePipeline(pipeline bson.RawValue) bson.A {
 	out := bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}
 	arr, ok := pipeline.ArrayOK()
@@ -717,10 +732,180 @@ func livePipeline(pipeline bson.RawValue) bson.A {
 	}
 	for _, v := range vals {
 		if doc, ok := v.DocumentOK(); ok {
-			out = append(out, doc)
+			out = append(out, liveStage(doc, tombstoneRewriteDepth))
 		}
 	}
 	return out
+}
+
+// tombstoneRewriteDepth bounds the recursion below. A stage nested this deep
+// cannot reach here: one pipeline level costs several levels of BSON nesting
+// and mongod refuses a document nested past a hundred, so a command carrying
+// one was never accepted in the first place.
+const tombstoneRewriteDepth = 100
+
+// liveStage rewrites one stage so that a collection it reads of its own is read
+// without tombstones. A stage that reads no collection is returned untouched.
+func liveStage(stage bson.Raw, depth int) any {
+	if depth <= 0 {
+		return stage
+	}
+	elems, err := stage.Elements()
+	if err != nil || len(elems) != 1 {
+		return stage
+	}
+	name, val := elems[0].Key(), elems[0].Value()
+	switch name {
+	case "$lookup":
+		spec, ok := liveJoin(subDoc(val), "from", depth)
+		if !ok {
+			return stage
+		}
+		return bson.D{{Key: name, Value: spec}}
+	case "$unionWith":
+		// Two spellings. {$unionWith: "other"} names a collection and takes no
+		// pipeline, so one has to be given to it.
+		if coll, ok := val.StringValueOK(); ok {
+			return bson.D{{Key: name, Value: bson.D{
+				{Key: "coll", Value: coll},
+				{Key: "pipeline", Value: bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}},
+			}}}
+		}
+		spec, ok := liveJoin(subDoc(val), "coll", depth)
+		if !ok {
+			return stage
+		}
+		return bson.D{{Key: name, Value: spec}}
+	case "$graphLookup":
+		spec, ok := liveGraphLookup(subDoc(val))
+		if !ok {
+			return stage
+		}
+		return bson.D{{Key: name, Value: spec}}
+	case "$facet":
+		// Each field is a pipeline over the same input documents, which the
+		// $match in front of the outer pipeline has already filtered. Only the
+		// stages inside them that read a collection of their own need anything.
+		fields, ferr := subDoc(val).Elements()
+		if ferr != nil {
+			return stage
+		}
+		out := make(bson.D, 0, len(fields))
+		for _, f := range fields {
+			stages, ok := liveSubPipeline(f.Value(), depth-1, false)
+			if !ok {
+				return stage
+			}
+			out = append(out, bson.E{Key: f.Key(), Value: stages})
+		}
+		return bson.D{{Key: name, Value: out}}
+	}
+	return stage
+}
+
+// liveJoin rewrites the specification of a stage that joins another collection,
+// named by the field collKey. The tombstone filter goes at the head of the
+// stage's own pipeline, which both $lookup and $unionWith accept alongside a
+// named collection.
+//
+// A stage naming no collection reads the documents its pipeline produces, with
+// $documents at the head of it. There is nothing to filter, and a $match put in
+// front of $documents would make the pipeline invalid.
+//
+// Returns false for anything it cannot read, so the stage travels unchanged and
+// the server rejects it. Rewriting a malformed stage into a valid one would
+// answer a command MongoDB refuses, which is its own kind of disagreement.
+func liveJoin(spec bson.Raw, collKey string, depth int) (bson.D, bool) {
+	elems, err := spec.Elements()
+	if err != nil {
+		return nil, false
+	}
+	_, named := stringField(spec, collKey)
+	out := make(bson.D, 0, len(elems)+1)
+	var sub bson.RawValue
+	hasSub := false
+	for _, e := range elems {
+		if e.Key() == "pipeline" {
+			sub, hasSub = e.Value(), true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	switch {
+	case hasSub:
+		stages, ok := liveSubPipeline(sub, depth-1, named)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, bson.E{Key: "pipeline", Value: stages})
+	case named:
+		out = append(out, bson.E{Key: "pipeline",
+			Value: bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}})
+	}
+	return out, true
+}
+
+// liveGraphLookup filters what a $graphLookup traverses. It takes no pipeline,
+// so the only place to say this is restrictSearchWithMatch, which is applied to
+// every document the search considers.
+func liveGraphLookup(spec bson.Raw) (bson.D, bool) {
+	elems, err := spec.Elements()
+	if err != nil {
+		return nil, false
+	}
+	out := make(bson.D, 0, len(elems)+1)
+	// A $graphLookup always names a collection. Without one there is nothing to
+	// filter, and the stage is returned as it came.
+	if _, named := stringField(spec, "from"); !named {
+		for _, e := range elems {
+			out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+		}
+		return out, true
+	}
+	restricted := false
+	for _, e := range elems {
+		if e.Key() == "restrictSearchWithMatch" {
+			// Not a document is not something to repair: the server rejects it,
+			// and so should the rewritten stage.
+			if _, ok := e.Value().DocumentOK(); !ok {
+				return nil, false
+			}
+			out = append(out, bson.E{Key: e.Key(), Value: liveOnly(e.Value())})
+			restricted = true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	if !restricted {
+		out = append(out, bson.E{Key: "restrictSearchWithMatch", Value: bson.D{meta.NotArchivedDeleted()}})
+	}
+	return out, true
+}
+
+// liveSubPipeline rewrites a stage's own pipeline, optionally putting the
+// tombstone filter at the head of it. Anything that is not a pipeline is
+// reported rather than replaced, for the reason in liveJoin.
+func liveSubPipeline(pipeline bson.RawValue, depth int, prepend bool) (bson.A, bool) {
+	arr, ok := pipeline.ArrayOK()
+	if !ok {
+		return nil, false
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return nil, false
+	}
+	out := bson.A{}
+	if prepend {
+		out = append(out, bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}})
+	}
+	for _, v := range vals {
+		doc, ok := v.DocumentOK()
+		if !ok {
+			return nil, false
+		}
+		out = append(out, liveStage(doc, depth))
+	}
+	return out, true
 }
 
 func lookupString(doc bson.Raw, key string) (string, bool) {

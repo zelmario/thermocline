@@ -411,9 +411,15 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 	// Tombstoned documents are records the application deleted. Excluding them
 	// first means the pipeline sees the same collection the fast tier would
 	// have shown it.
+	//
+	// First is not everywhere: a $lookup or a $unionWith among these stages
+	// reads a collection of its own, which this $match never touches, so each
+	// stage is rewritten as well. Here the cost of getting it wrong is not a
+	// short answer a client can ask again, it is a short answer written into
+	// the collection $out or $merge names. See livePipeline.
 	pipeline := bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}
 	for _, st := range read {
-		pipeline = append(pipeline, st)
+		pipeline = append(pipeline, liveStage(st, tombstoneRewriteDepth))
 	}
 
 	// No budget: this is the reading half of an $out or $merge, which streams

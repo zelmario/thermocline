@@ -124,6 +124,10 @@ feeder:
     - "shop.tkeval2"
     - "shop.rollup"
     - "shop.merged"
+    # testaggwrite.sh: the input and the target of an $out whose reading half
+    # joins a collection of its own
+    - "shop.joinsrc"
+    - "shop.joinout"
     - "shop.tres"
     # testlife.sh: a collection the fast tier validates and the archive does
     # not, which is what every collection looks like after an operator adds a

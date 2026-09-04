@@ -573,6 +573,46 @@ same 'update conflicting paths'    "try{print(COLL.updateOne({_id:17},{\$set:{'a
 same 'insert duplicate _id'        "try{print(COLL.insertOne({_id:17}).acknowledged)}$E"
 same 'findAndModify bad operator'  "try{print(JSON.stringify(COLL.findAndModify({query:{_id:17},update:{\$nosuchup:{x:1}}})))}$E"
 echo
+echo "== a stage that reads a collection of its own =="
+# $lookup, $unionWith and $graphLookup do not read the pipeline's input, they
+# read another collection, so the tombstone filter in front of the pipeline
+# never reaches them. The archive keeps a deleted document as a tombstone, and
+# the difference only shows once something has been deleted: before that, both
+# tiers agree and the feature looks finished.
+#
+# Deletes go through the router so both tiers see them, then the archive is
+# polled until the tombstones are there. Comparing before that would report the
+# mirroring lag rather than the rewrite.
+reseed
+RALL "const d=db.getSiblingDB(process.env.TC_DB);
+      for (const c of [d.tcref, d.tcon]) { c.deleteMany({_id:{\$in:[3,4,17,18]}}); }" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = "4" ] && break
+  sleep 0.5
+done
+chk "the archive holds four tombstones"  "4" "$(C "print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+# print(JSON.stringify(COLL.aggregate([ ... ]).toArray())) and not one bracket
+# less. aggregate returns a cursor, and JSON.stringify of a cursor throws the
+# same circular-structure error on both sides, so `same` agrees and the check
+# passes having asked nothing. Six of these did that on the first run.
+JOINED="{\$group:{_id:'\$grp',n:{\$sum:1},sibs:{\$max:{\$size:'\$sib'}}}},{\$sort:{_id:1}}]).toArray()))"
+same 'a self join by field'        "print(JSON.stringify(COLL.aggregate([{\$lookup:{from:COLL.getName(),localField:'grp',foreignField:'grp',as:'sib'}},$JOINED"
+same 'a self join with a pipeline' "print(JSON.stringify(COLL.aggregate([{\$lookup:{from:COLL.getName(),let:{g:'\$grp'},pipeline:[{\$match:{\$expr:{\$eq:['\$grp','\$\$g']}}}],as:'sib'}},$JOINED"
+same 'a union with itself'         "print(COLL.aggregate([{\$unionWith:COLL.getName()},{\$count:'c'}]).toArray()[0].c)"
+same 'a union with a pipeline'     "print(COLL.aggregate([{\$unionWith:{coll:COLL.getName(),pipeline:[{\$match:{grp:'alpha'}}]}},{\$count:'c'}]).toArray()[0].c)"
+same 'a graph lookup'              "print(JSON.stringify(COLL.aggregate([{\$graphLookup:{from:COLL.getName(),startWith:'\$grp',connectFromField:'grp',connectToField:'grp',as:'tree'}},{\$group:{_id:'\$grp',t:{\$max:{\$size:'\$tree'}}}},{\$sort:{_id:1}}]).toArray()))"
+same 'a lookup inside a facet'     "print(JSON.stringify(COLL.aggregate([{\$facet:{j:[{\$lookup:{from:COLL.getName(),localField:'grp',foreignField:'grp',as:'sib'}},{\$group:{_id:null,s:{\$max:{\$size:'\$sib'}}}}]}}]).toArray()))"
+same 'a lookup nested in a lookup' "print(JSON.stringify(COLL.aggregate([{\$lookup:{from:COLL.getName(),localField:'grp',foreignField:'grp',as:'sib',pipeline:[{\$lookup:{from:COLL.getName(),localField:'grp',foreignField:'grp',as:'inner'}},{\$project:{i:{\$size:'\$inner'}}}]}},{\$group:{_id:'\$grp',n:{\$max:{\$size:'\$sib'}}}},{\$sort:{_id:1}}]).toArray()))"
+# And the filter must not be added where it would break the stage: $documents
+# has to be the first stage of the pipeline it is in.
+same 'a lookup over $documents'    "print(JSON.stringify(COLL.aggregate([{\$limit:1},{\$lookup:{as:'d',pipeline:[{\$documents:[{x:1},{x:2}]}]}},{\$project:{c:{\$size:'\$d'}}}]).toArray()))"
+# The guard against the failure above: two sides that both throw agree, so at
+# least one of these has to be shown answering. Hand-asserted on the untiered
+# reference, which is ordinary MongoDB, and it says the answer has the shape the
+# comparisons are comparing.
+chk "the joins were answered, not thrown" "alpha/8/8" "$(R "const r=db.getSiblingDB(process.env.TC_DB).tcref.aggregate([{\$lookup:{from:'tcref',localField:'grp',foreignField:'grp',as:'sib'}},{\$group:{_id:'\$grp',n:{\$sum:1},sibs:{\$max:{\$size:'\$sib'}}}},{\$sort:{_id:1}}]).toArray(); print(r.length?r[0]._id+'/'+r[0].n+'/'+r[0].sibs:'NOTHING')")"
+
+echo
 echo "== transactions =="
 reseed
 TXN=$(R "
