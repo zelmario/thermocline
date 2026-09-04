@@ -42,6 +42,13 @@ const SEED = Number(process.env.TC_SEED || 1);
 const d    = db.getSiblingDB(DB);
 const REF  = d.tcref;
 const TIER = d.tcfuzz;
+// A second pair, so a join can name a collection other than the one it is
+// running against. A self join is the narrowest version of the case: two tiered
+// collections carry two separate completeness claims, and the guard that judges
+// a joined collection looks at the other one's.
+const REF2  = d.tcref2;
+const TIER2 = d.tcfuzz2;
+function otherOf(c) { return c.getName() === REF.getName() ? REF2.getName() : TIER2.getName(); }
 
 // xorshift32, so a seed reproduces a run exactly. Math.random cannot: a
 // disagreement nobody can ask for again is not a bug report.
@@ -177,11 +184,15 @@ function updateSpec() {
   }
 }
 
+// Set per side before a pipeline is generated. The two sides pick the same
+// branch, because the generator is replayed from the same seed; only the name
+// it lands on differs.
 let SELF = 'tcref';
+let OTHER = 'tcref2';
 function pipeline() {
   const stages = [];
   if (maybe(0.8)) stages.push({ $match: filter(1) });
-  switch (ri(7)) {
+  switch (ri(10)) {
     case 0:
       stages.push({ $group: { _id: '$' + pick(['grp', 'opt', 'meta.active']),
                               c: { $sum: 1 }, s: { $sum: '$n' }, mx: { $max: '$f' } } });
@@ -203,11 +214,27 @@ function pipeline() {
                   { $group: { _id: '$band', c: { $sum: 1 } } });
       break;
     case 6:
-      // A self join. Both sides look up their own collection, so the tiered
-      // side has to resolve the same namespace across tiers twice in one
-      // pipeline, once as the source and once as the joined side.
-      stages.push({ $lookup: { from: SELF, localField: 'grp', foreignField: 'grp', as: 'sib' } },
+      // A join, of itself or of the other collection. Either way the tiered
+      // side has to resolve a tiered namespace across both tiers as the joined
+      // side, which is not where the pipeline's own filter reaches.
+      stages.push({ $lookup: { from: pick([SELF, OTHER]), localField: 'grp', foreignField: 'grp', as: 'sib' } },
                   { $project: { n: 1, grp: 1, sibs: { $size: '$sib' } } });
+      break;
+    case 7:
+      stages.push({ $unionWith: { coll: pick([SELF, OTHER]), pipeline: [{ $match: filter(0) }] } },
+                  { $group: { _id: '$grp', c: { $sum: 1 } } });
+      break;
+    case 8:
+      stages.push({ $graphLookup: { from: pick([SELF, OTHER]), startWith: '$grp',
+                                    connectFromField: 'grp', connectToField: 'grp', as: 'tree' } },
+                  { $project: { grp: 1, t: { $size: '$tree' } } });
+      break;
+    case 9:
+      // A lookup with its own pipeline, which is the correlated form and a
+      // different code path from the field one.
+      stages.push({ $lookup: { from: pick([SELF, OTHER]), let: { g: '$grp' },
+                               pipeline: [{ $match: { $expr: { $eq: ['$grp', '$$g'] } } }], as: 'sib' } },
+                  { $project: { grp: 1, sibs: { $size: '$sib' } } });
       break;
     default:
       stages.push({ $sortByCount: '$grp' });
@@ -239,36 +266,50 @@ function attempt(fn, c) {
 
 let agreed = 0, refused = 0, settled = 0;
 const refusals = [], bugs = [], stale = [];
+// What each shape actually did. Without this a round can report a clean
+// hundred agreements without having exercised a shape at all, or having
+// exercised it only through operations both sides rejected, which compares the
+// error message and nothing else.
+const shapes = {};
+function note(what, kind) {
+  const t = shapes[what] || (shapes[what] = { n: 0, vacuous: 0 });
+  t.n++;
+  if (kind === 'vacuous') t.vacuous++;
+}
 
 function ask(what, op, fn, how) {
   const norm = how === 'bag' ? bag : ser;
   const a = attempt(fn, REF), b = attempt(fn, TIER);
 
   if (!a.ok && !b.ok) {
-    if (a.code === b.code) { agreed++; return; }
+    if (a.code === b.code) { agreed++; note(what, 'vacuous'); return; }
     // Both failed differently. Only interesting when the tiered side is not
     // simply saying no.
-    if (/^thermocline:/.test(b.msg)) { refused++; refusals.push([what, op, b.msg]); return; }
+    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return; }
+    note(what, 'real');
     bugs.push([what, op, 'ref failed ' + a.code + ': ' + a.msg, 'tier failed ' + b.code + ': ' + b.msg]);
     return;
   }
   if (a.ok && !b.ok) {
-    if (/^thermocline:/.test(b.msg)) { refused++; refusals.push([what, op, b.msg]); return; }
+    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return; }
+    note(what, 'real');
     bugs.push([what, op, 'ref answered', 'tier failed ' + b.code + ': ' + b.msg]);
     return;
   }
   if (!a.ok && b.ok) {
+    note(what, 'real');
     bugs.push([what, op, 'ref failed ' + a.code + ': ' + a.msg, 'tier answered']);
     return;
   }
 
   let ra = norm(a.v), rb = norm(b.v);
-  if (ra === rb) { agreed++; return; }
+  if (ra === rb) { agreed++; note(what, 'real'); return; }
 
   // The archive is written by the feeder after the fact, so a difference can be
   // a stale answer that is about to settle. Ask again before calling it a bug.
   sleep(1500);
   const a2 = attempt(fn, REF), b2 = attempt(fn, TIER);
+  note(what, 'real');
   if (a2.ok && b2.ok && norm(a2.v) === norm(b2.v)) {
     settled++; stale.push([what, op, ra.slice(0, 160), rb.slice(0, 160)]);
     return;
@@ -306,8 +347,11 @@ function oneOp(i) {
   // Reads outnumber writes about two to one. Every write copies documents up
   // into the fast tier, so a write-heavy round warms the collection and the
   // comparison it is there to make gets weaker with every operation.
-  const READS = [0, 1, 2, 3, 4, 5, 0, 1, 3, 4];
-  const WRITES = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+  // Aggregate is weighted up because the join shapes live inside it, four of
+  // its ten branches, and a defect has already come out of one of them. At an
+  // even weight a round of fifty operations generated two joins.
+  const READS = [0, 1, 2, 3, 3, 3, 4, 5, 3, 4];
+  const WRITES = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16];
   const choice = RO ? pick(READS) : (maybe(0.65) ? pick(READS) : pick(WRITES));
   switch (choice) {
     case 0: {
@@ -341,11 +385,12 @@ function oneOp(i) {
     case 3: {
       // The pipeline is generated once and rendered per side, because a self
       // join names its own collection and the two sides have different names.
-      SELF = 'tcref';
+      SELF = REF.getName(); OTHER = REF2.getName();
       const shape = _s;
       const pl = pipeline();
       ask('aggregate', 'aggregate ' + ser(pl) + ' batch ' + bs, c => {
         SELF = c.getName();
+        OTHER = otherOf(c);
         _s = shape;
         const mine = pipeline();
         return c.aggregate(mine, bs ? { batchSize: bs } : {}).toArray();
@@ -439,6 +484,39 @@ function oneOp(i) {
       contentsMatch('contents after findOneAndDelete', op);
       break;
     }
+    case 16: {
+      // A transaction of reads and writes. The untiered reference runs it on
+      // one cluster and needs nothing special; the tiered collection cannot
+      // send a transaction to the other cluster without leaving the caller's
+      // snapshot behind, so the router has to move the documents it reads to
+      // the tier the transaction is on and replay. That is the promise being
+      // compared, and it is the hardest one here.
+      //
+      // withTransaction, not startTransaction, because a WriteConflict is a
+      // legitimate outcome that the driver is expected to retry: reporting it
+      // would be reporting MongoDB rather than the router. The body is
+      // rebuilt on every attempt, so nothing accumulates across a retry.
+      const f2 = { _id: { $in: someIds(known, 2) } };
+      const op = 'txn: count ' + ser(F) + ', updateMany ' + ser(f2) + ' ' + ser(U) +
+                 ', find sorted ' + ser(S);
+      ask('transaction', op, c => {
+        const s = db.getMongo().startSession();
+        let out = null;
+        try {
+          s.withTransaction(() => {
+            const tc = s.getDatabase(DB).getCollection(c.getName());
+            const acc = [];
+            acc.push(tc.countDocuments(F));
+            acc.push(tc.updateMany(f2, U).modifiedCount);
+            acc.push(tc.find(F).sort(S).limit(3).toArray().length);
+            out = acc;
+          });
+        } finally { s.endSession(); }
+        return out;
+      }, 'seq');
+      contentsMatch('contents after a transaction', op);
+      break;
+    }
     default: {
       const idA = anId, idB = pick(known.length ? known : [1]);
       const ops = [
@@ -466,6 +544,11 @@ for (let i = 0; i < OPS; i++) {
 }
 
 print('AGREED ' + agreed + '  REFUSED ' + refused + '  SETTLED ' + settled + '  DISAGREED ' + bugs.length);
+// One line naming every shape this round compared, as done/vacuous. A shape
+// missing from it was never generated; a shape whose two numbers are equal
+// compared nothing but error messages.
+print('SHAPES ' + Object.keys(shapes).sort()
+  .map(k => k.replace(/ /g, '_') + '=' + shapes[k].n + '/' + shapes[k].vacuous).join(' '));
 for (const [w, op, ref, got] of bugs) {
   print('DISAGREE\t' + w + '\t' + op + '\n\t  ref=' + ref + '\n\t  got=' + got);
 }

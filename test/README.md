@@ -99,9 +99,23 @@ documents the fast tier does not hold from the archive and requiring that the
 comparison notices, because a harness that reports agreement is worth nothing
 until it has been seen reporting a disagreement that is really there.
 
+Each round prints one `SHAPES` line naming what it actually compared, as
+`shape=done/vacuous`. A shape missing from it was never generated, and a shape
+whose two numbers are equal compared nothing but error messages: both sides
+rejected every operation of that kind. A clean tally over a grammar that never
+generated a shape is not evidence about that shape.
+
+The last section asks a different question. With `completeness: strict` and a
+fast tier holding every document, there is nothing the router cannot answer, so
+every refusal there is the guard being more cautious than the data requires.
+That is a limitation rather than a wrong answer, and it is the only
+configuration where the difference shows: the suite's own config uses
+`completeness: archive`, where nothing is ever refused.
+
 It found that a `$lookup` against a tiered collection joined documents the
-client had deleted: the tombstone filter went in front of the pipeline, which
-is not where a joined collection is read.
+client had deleted, because the tombstone filter went in front of the pipeline,
+which is not where a joined collection is read. And that a point read by `_id`
+was answered with a document that did not match the rest of the filter.
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
 them with `docker exec -e` when the topology is not the documented one.

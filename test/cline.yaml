@@ -236,6 +236,10 @@ feeder:
     - "shop.tcon"
     # testfuzz.sh: same arrangement, tcfuzz is tiered and tcref is the reference
     - "shop.tcfuzz"
+    # testfuzz.sh: the second pair, so a generated join can name a collection
+    # other than the one it runs against. tcref2 is the untiered reference and
+    # is deliberately NOT here.
+    - "shop.tcfuzz2"
     # testkeys.sh: a collated unique index whose match on the archive is created
     # after the router has already asked about it
     - "shop.tkcoll2"

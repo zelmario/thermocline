@@ -17,8 +17,14 @@
 WDIR=${WDIR:-/root}
 LOGDIR=${LOGDIR:-/var/log/cline}
 PORT=${PORT:-27100}
+# The strict router below needs a port of its own. It used to be spelled $P1
+# without anything defining it, so cline was told --listen 0.0.0.0: and mongosh
+# was told --port with nothing after it, which means its default of 27017: the
+# node's own mongod. Every check in that section then passed or failed against a
+# plain MongoDB with no router in the path at all.
 DB=${DB:-shop}
 META=${META:-_thermocline}
+P1=$((PORT+1))
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
@@ -88,6 +94,19 @@ reseed() {
     hot.tcref.insertMany(all);
     hot.tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
 
+    // The second pair, for the joins. Forty documents over the same group
+    // values, so a join on grp matches, and its own split so the joined side
+    // is short on the fast tier too.
+    const other = all.slice(0,40).map(x => Object.assign({}, x, {_id: 1000 + x._id}));
+    hot.tcref2.drop();
+    hot.tcref2.insertMany(other);
+    hot.tcfuzz2.drop();
+    cold.tcfuzz2.drop();
+    hot.tcfuzz2.insertMany(other.slice(0,20));
+    cold.tcfuzz2.bulkWrite(
+      other.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
+      {ordered:false});
+
     hot.tcfuzz.drop();
     cold.tcfuzz.drop();
     // 1 to 30 on both tiers, 31 to 60 only in the archive, which is what an
@@ -101,10 +120,48 @@ reseed() {
     hot.tcfuzz.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
     cold.tcfuzz.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
     mkIndexes(hot.tcref); mkIndexes(hot.tcfuzz); mkIndexes(cold.tcfuzz);
+    mkIndexes(hot.tcref2); mkIndexes(hot.tcfuzz2); mkIndexes(cold.tcfuzz2);
 
     // Block until the feeder has processed everything above, proved by a
     // sentinel reaching the archive. The claim below has to be written after
     // the feeder has seen the drop, or the withdrawal lands on top of it.
+    hot.tcfuzz.insertOne({_id:'__sentinel'});
+    hot.tcfuzz2.insertOne({_id:'__sentinel'});
+    let caught = false;
+    for (let i = 0; i < 120; i++) {
+      if (cold.tcfuzz.countDocuments({_id:'__sentinel'}) === 1 &&
+          cold.tcfuzz2.countDocuments({_id:'__sentinel'}) === 1) { caught = true; break; }
+      sleep(500);
+    }
+    hot.tcfuzz.deleteOne({_id:'__sentinel'});
+    cold.tcfuzz.deleteOne({_id:'__sentinel'});
+    hot.tcfuzz2.deleteOne({_id:'__sentinel'});
+    cold.tcfuzz2.deleteOne({_id:'__sentinel'});
+    print(caught ? 'RESEEDED' : 'FEEDER-NEVER-CAUGHT-UP');
+  " 2>&1 | tail -1)
+  [ "$RESEED" = "RESEEDED" ] || echo "  WARN  reseed: $RESEED"
+  # Complete from 2030 means the fast tier claims nothing here is complete, so
+  # every read has to be resolved across both tiers. That is the point.
+  cline watermark --config $CFG --ns $DB.tcfuzz  --complete-from 2030-01-01T00:00:00Z >/dev/null
+  cline watermark --config $CFG --ns $DB.tcfuzz2 --complete-from 2030-01-01T00:00:00Z >/dev/null
+}
+
+# Seeds the same documents with the fast tier holding every one of them, and a
+# claim that says so. For the strict section below, where the question is not
+# whether the answer is right but whether the router agrees to give one.
+reseedComplete() {
+  RC=$(mongosh "$HOT" --quiet --eval "
+    const hot  = db.getSiblingDB(process.env.TC_DB);
+    const cold = Mongo(process.env.TC_COLD).getDB(process.env.TC_DB);
+    const all = $DOCS;
+    const other = all.slice(0,40).map(x => Object.assign({}, x, {_id: 1000 + x._id}));
+    for (const [h, c, docs] of [[hot.tcfuzz, cold.tcfuzz, all], [hot.tcfuzz2, cold.tcfuzz2, other]]) {
+      h.drop(); c.drop();
+      h.insertMany(docs);
+      c.bulkWrite(docs.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})), {ordered:false});
+    }
+    hot.tcref.drop();  hot.tcref.insertMany(all);
+    hot.tcref2.drop(); hot.tcref2.insertMany(other);
     hot.tcfuzz.insertOne({_id:'__sentinel'});
     let caught = false;
     for (let i = 0; i < 120; i++) {
@@ -115,10 +172,9 @@ reseed() {
     cold.tcfuzz.deleteOne({_id:'__sentinel'});
     print(caught ? 'RESEEDED' : 'FEEDER-NEVER-CAUGHT-UP');
   " 2>&1 | tail -1)
-  [ "$RESEED" = "RESEEDED" ] || echo "  WARN  reseed: $RESEED"
-  # Complete from 2030 means the fast tier claims nothing here is complete, so
-  # every read has to be resolved across both tiers. That is the point.
-  cline watermark --config $CFG --ns $DB.tcfuzz --complete-from 2030-01-01T00:00:00Z >/dev/null
+  [ "$RC" = "RESEEDED" ] || echo "  WARN  reseedComplete: $RC"
+  cline watermark --config $CFG --ns $DB.tcfuzz  --complete-all >/dev/null
+  cline watermark --config $CFG --ns $DB.tcfuzz2 --complete-all >/dev/null
 }
 
 echo "== setup =="
@@ -135,6 +191,8 @@ chk "the reference holds sixty"        "60" "$(R "print(db.getSiblingDB(process.
 chk "the tiered fast tier holds thirty" "30" "$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")"
 chk "its archive holds sixty"          "60" "$(C "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 chk "and the router answers sixty"     "60" "$(R "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")"
+chk "the joined pair holds forty too"  "40" "$(R "print(db.getSiblingDB(process.env.TC_DB).tcfuzz2.countDocuments({}))")"
+chk "and its reference does"           "40" "$(R "print(db.getSiblingDB(process.env.TC_DB).tcref2.countDocuments({}))")"
 
 # The negative control, and the reason to trust everything below it. A harness
 # that compares two collections and reports agreement is worth nothing until it
@@ -162,7 +220,13 @@ for r in $(seq 1 $ROUNDS); do
   [ $r -gt 1 ] && reseed
   OUT=$(TC_SEED=$SEED mongosh --port $PORT -u dba -p secret --authenticationDatabase admin \
           --quiet --file "$HERE/fuzz.js" 2>&1)
-  echo "$OUT" | grep -E '^  HARNESS|^DISAGREE|^REFUSAL|^STALE|^\t' | head -60
+  # The continuation lines carry the two answers and start with a real tab.
+  # grep -E reads \t as a literal t, so the pattern that looked like it matched
+  # them dropped exactly the part of a disagreement worth reading.
+  echo "$OUT" | grep -E "^  HARNESS|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
+  # What the round actually compared, as shape=done/vacuous. A clean tally over
+  # a grammar that never generated a shape is not evidence about that shape.
+  echo "$OUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
   LINE=$(echo "$OUT" | grep -m1 '^AGREED ')
   if [ -z "$LINE" ]; then
     echo "  FATAL  the round produced no tally:"; echo "$OUT" | tail -20
@@ -173,6 +237,37 @@ for r in $(seq 1 $ROUNDS); do
   TA=$((TA+$2)); TR=$((TR+$4)); TS=$((TS+$6)); TD=$((TD+$8))
   chk "round $r: no disagreement" "0" "$8"
 done
+
+echo
+echo "== nothing is refused when the fast tier holds it all =="
+# Everything above asks whether the answer is right. This asks whether the
+# router agrees to give one at all. With completeness: strict it refuses
+# anything it cannot prove the fast tier can answer whole, and with a fast tier
+# that holds every document there is nothing it cannot. So a refusal here is
+# not a wrong answer, it is the guard being more cautious than the data
+# requires, and this is the only configuration where that shows.
+sed 's/completeness: archive/completeness: strict/' $CFG > $WDIR/fuzz_strict.yaml
+reseedComplete
+cline router --config $WDIR/fuzz_strict.yaml --listen 0.0.0.0:$P1 --log-file $LOGDIR/fuzz_strict.log &
+for _ in $(seq 1 30); do
+  mongosh --port $P1 -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+# isdbgrid, not ping. A ping answers on anything, and what this has to
+# establish is that the thing on that port is the strict router rather than a
+# mongod that happens to be listening.
+chk "a strict router is up"            "isdbgrid" "$(mongosh --port $P1 -u dba -p secret --authenticationDatabase admin --quiet --eval 'print(db.hello().msg)' 2>&1 | tail -1)"
+chk "and the fast tier holds them all" "60" "$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")"
+SOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=$OPS mongosh --port $P1 -u dba -p secret \
+         --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
+echo "$SOUT" | grep -E '^  HARNESS|^DISAGREE|^REFUSAL|^\t' | head -40
+echo "$SOUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
+SLINE=$(echo "$SOUT" | grep -m1 '^AGREED ')
+echo "  $SLINE"
+set -- $SLINE
+chk "strict: nothing refused"      "0" "${4:-none}"
+chk "strict: no disagreement"      "0" "${8:-none}"
 
 echo
 echo "== totals =="
