@@ -507,6 +507,19 @@ H "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_LOSTDB).notiering.insertOne({_id:1})" >/dev/null
 chk "an untiered archive collection is not listed" "false" \
     "$(R "print(db.getSiblingDB(process.env.TC_LOSTDB).getCollectionNames().indexOf('notiering') >= 0)")"
+# And the collections this router makes for itself, which are the application's
+# database's only by necessity: a tiered $out is assembled in one and renamed
+# over its target, and a rename cannot cross databases. A client that
+# enumerates collections and acts on what it finds would act on that, and after
+# a router died mid-aggregation it would go on doing so.
+H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.424242').insertOne({v:1})" >/dev/null
+chk "the fast tier does list the scratch collection" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+chk "and the router does not"                        "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
+chk "while still listing the real ones"              "true" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().length > 0)")"
+H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.424242').drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_LOSTDB).notiering.drop()" >/dev/null
 kill $CATR 2>/dev/null; wait $CATR 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null

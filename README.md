@@ -2731,19 +2731,25 @@ mongosh --port 28018 --eval '
   Reading a tiered collection with mapReduce is refused for a different reason,
   already: it totals whatever tier it runs on.
 
-- **A client listing collections while a tiered `$out` runs sees the scratch
-  collection it is being assembled in.** `$out` into a tiered collection cannot
+- **A tiered `$out` is assembled in a scratch collection inside the
+  application's own database.** `$out` into a tiered collection cannot
   end in a rename, so the result is built in
   `tmp.thermocline.out.<nanoseconds>` and renamed over the target, and that has
   to sit in the application's own database for the rename to be possible.
 
-  The feeder does not mirror those, the catalog does not merge one in from the
-  archive, and a starting router drops any a previous router left behind after
-  dying mid-aggregation. What is not filtered is the fast tier's own
-  `listCollections` reply, which is passed through: doing that means rebuilding
-  every such reply and answering the `getMore` behind it, for a collection that
-  exists for the length of one aggregation. A client that enumerates collections
-  and acts on what it finds should skip the `tmp.thermocline.` prefix.
+  Four things know they are not the application's data. The feeder does not
+  mirror them, the catalog does not merge one in from the archive, a starting
+  router drops any a previous router left behind after dying mid-aggregation,
+  and `listCollections` through the router does not show them: measured, the
+  fast tier lists one and the router lists none, with the real collections
+  untouched.
+
+  The one gap left is a long listing. The router filters the first batch and
+  appends the archive's half to it, and it does not answer the `getMore` behind
+  a cursor the fast tier opened for the rest, so a database with more
+  collections than fit one batch could show a scratch collection in a later
+  batch. Everything about that is the same limitation the archive half already
+  has, and it is written down there too.
 
 - **A pipeline the archive would answer that also reads an untiered collection is
   refused**, because answering it would be short for that half.

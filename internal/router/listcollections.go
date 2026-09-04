@@ -79,13 +79,31 @@ func (c *conn) interceptListCollections(ctx context.Context, msg *wire.Message, 
 	// normal case and the fast tier's entry is the one to keep: it is what the
 	// application writes to, and its options are what a write is validated
 	// against.
+	// The fast tier's own entries, minus the ones this router made for itself.
+	//
+	// A tiered $out is assembled in a scratch collection inside the
+	// application's own database, because the rename that finishes it cannot
+	// cross databases, so it appears in the fast tier's listing while the
+	// aggregation runs. A client that enumerates collections and acts on what
+	// it finds would act on that: a migration tool, a backup, an ORM syncing
+	// its model. The feeder already refuses to mirror them and the archive half
+	// below already skips them; this is the half a client actually sees.
+	kept := make(bson.A, 0, len(batch))
+	dropped := 0
 	seen := make(map[string]struct{}, len(batch))
 	for _, v := range batch {
 		doc, dok := v.DocumentOK()
 		if !dok {
+			kept = append(kept, v)
 			continue
 		}
-		if name, nok := stringField(doc, "name"); nok {
+		name, nok := stringField(doc, "name")
+		if nok && meta.IsScratch(name) {
+			dropped++
+			continue
+		}
+		kept = append(kept, v)
+		if nok {
 			seen[name] = struct{}{}
 		}
 	}
@@ -99,19 +117,24 @@ func (c *conn) interceptListCollections(ctx context.Context, msg *wire.Message, 
 			"db", db, "err", err,
 			"effect", "a tiered collection the fast tier does not hold is missing from this list, "+
 				"though reads of it still work")
+		// Still without this router's own scratch collections, if any were in
+		// it. The archive being unreachable is no reason to hand a client a
+		// collection that is not its data.
+		if dropped > 0 {
+			id, ns := cursorIdentity(rdoc, db+".$cmd.listCollections")
+			return cursorReply(reply.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", kept)
+		}
 		return reply, nil
 	}
-	if len(extra) == 0 {
+	if len(extra) == 0 && dropped == 0 {
 		return reply, nil
 	}
 
 	// Appended to the first batch. The fast tier may have left a cursor open
 	// for the rest of its own list, and these go in once, here, rather than
 	// into a getMore this router does not answer.
-	out := make(bson.A, 0, len(batch)+len(extra))
-	for _, v := range batch {
-		out = append(out, v)
-	}
+	out := make(bson.A, 0, len(kept)+len(extra))
+	out = append(out, kept...)
 	for _, d := range extra {
 		out = append(out, d)
 	}
