@@ -230,6 +230,8 @@ feeder:
     - "shop.tupsf"
     # testconform.sh: tcref is deliberately NOT here, it is the untiered reference
     - "shop.tcon"
+    # testfuzz.sh: same arrangement, tcfuzz is tiered and tcref is the reference
+    - "shop.tcfuzz"
     # testsingle.sh
     - "shop.tsdel"
     - "shop.tsupd"

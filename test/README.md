@@ -10,6 +10,7 @@ Keep the namespace list in it current: a collection missing from
 nothing.
 
     docker cp test/*.sh <node>:/root/
+    docker cp test/fuzz.js <node>:/root/fuzz.js
     docker cp test/cline.yaml <node>:/root/cline.yaml
     docker exec <node> bash /root/sweep.sh         # all of the below, serially, one log each
     docker exec -e WORKERS=4 <node> bash /root/psweep.sh   # the same list, four at a time
@@ -46,6 +47,7 @@ Or one at a time:
     docker exec <node> bash /root/testunack.sh     # writes that ask for no acknowledgement
     docker exec <node> bash /root/testcache.sh    # the learned cache, and the advice it gives
     docker exec <node> bash /root/testconform.sh   # differential: the same answer MongoDB would give
+    docker exec <node> bash /root/testfuzz.sh      # the same, on operations nobody wrote down
     docker exec <node> bash /root/testauthterm.sh  # the router authenticating clients itself
     docker exec <node> bash /root/testreadprefterm.sh # reads landing on the node that was asked for
     docker exec <node> bash /root/testecho.sh      # the router's promotions must not be mirrored back
@@ -81,6 +83,25 @@ answers must match. A failure is the router disagreeing with MongoDB rather than
 with somebody's expectation. It found that every promoted document came back
 with its fields reordered, which twenty-three suites of hand-written checks had
 agreed with themselves about for months.
+
+`testfuzz.sh` is the same comparison on operations nobody wrote down. It
+generates filters, sorts, projections, pipelines and writes from a grammar
+(`test/fuzz.js`), asks the same one of both collections, and reports three
+outcomes: agreed, refused (the tiered side said "thermocline:" where the
+reference answered, which is a limitation and worth counting), and disagreed. A
+disagreement is asked again a second later before it is called one, because the
+archive is written asynchronously and a stale answer that settles is a
+freshness gap rather than a wrong answer.
+
+Two things make it trustworthy. Every run is seeded, so a disagreement can be
+asked for again; the seed is printed per round. And it starts by hiding five
+documents the fast tier does not hold from the archive and requiring that the
+comparison notices, because a harness that reports agreement is worth nothing
+until it has been seen reporting a disagreement that is really there.
+
+It found that a `$lookup` against a tiered collection joined documents the
+client had deleted: the tombstone filter went in front of the pipeline, which
+is not where a joined collection is read.
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
 them with `docker exec -e` when the topology is not the documented one.
