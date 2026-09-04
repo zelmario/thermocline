@@ -190,6 +190,28 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	return err
 }
 
+// ensureTieredCollection gives the fast tier the collection the way the archive
+// has it, and builds its indexes when that created it.
+//
+// The create has to happen before the write, because a collection an insert
+// makes carries no options and a collation cannot be added afterwards. The
+// build has to happen after it and off this path, because it is a scan and the
+// client did not ask for one.
+//
+// Without the second half, an insert into a tiered collection the fast tier did
+// not hold left it with the archive's options and none of its indexes until
+// something listed the catalog or the router was restarted. Reads of it fell
+// through to the archive meanwhile, so it was slow rather than wrong, and
+// nothing said how long it would stay that way.
+func (r *Router) ensureTieredCollection(ctx context.Context, ns string) {
+	if !r.indexer.EnsureCollection(ctx, ns) {
+		return
+	}
+	r.goSafely("building the archive's indexes on a collection a write created", func() {
+		r.indexer.Ensure(context.WithoutCancel(ctx), ns)
+	})
+}
+
 // watermarkCache holds one namespace's completeness for a short while.
 type watermarkCache struct {
 	mu      sync.RWMutex

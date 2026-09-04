@@ -737,7 +737,7 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 	// archive answered countDocuments({name: "alice"}) with 3 and the fast tier's
 	// copy with 0. Memoised inside the indexer, so this is a map lookup once the
 	// fast tier has the collection. See Indexer.EnsureCollection.
-	c.r.indexer.EnsureCollection(ctx, ns)
+	c.r.ensureTieredCollection(ctx, ns)
 
 	ordered := true
 	if v, lerr := cmd.LookupErr("ordered"); lerr == nil {

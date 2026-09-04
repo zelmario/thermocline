@@ -228,7 +228,7 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		// This write may be what creates the collection on the fast tier, and a
 		// collection created by a write carries none of the archive's options.
 		// See Indexer.EnsureCollection.
-		c.r.indexer.EnsureCollection(ctx, op.ns)
+		c.r.ensureTieredCollection(ctx, op.ns)
 		idxs := c.r.uniqueIndexes(ctx, op.ns)
 		if len(idxs) == 0 {
 			continue

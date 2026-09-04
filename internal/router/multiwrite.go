@@ -271,7 +271,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// insert is what creates the collection when the fast tier does not hold
 		// it, and a collection created that way carries none of the archive's
 		// options. See Indexer.EnsureCollection.
-		r.indexer.EnsureCollection(ctx, ns)
+		r.ensureTieredCollection(ctx, ns)
 
 		// Only the inserts moved a document. The rest were refused as duplicates
 		// of a copy the fast tier already had, which is the case the old

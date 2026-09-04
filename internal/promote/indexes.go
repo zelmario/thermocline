@@ -166,19 +166,23 @@ func (ix *Indexer) Ensure(ctx context.Context, ns string) {
 // because the collection existed.
 //
 // The index build stays where it was, in the background after the write, because
-// that is a scan and this is a create.
-func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) {
+// that is a scan and this is a create. Reporting whether it created anything is
+// how the caller knows there is a build to start: an insert into a collection
+// the fast tier does not hold used to leave it there with the archive's options
+// and none of its indexes until something listed the catalog or the router was
+// restarted.
+func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) bool {
 	if ix == nil {
-		return
+		return false
 	}
 	if _, coll := splitNS(ns); strings.HasPrefix(coll, "system.") {
-		return
+		return false
 	}
 	ix.mu.Lock()
 	st := ix.state[ns]
 	if st.done || st.created || time.Since(st.lastCreated) < retryAfter {
 		ix.mu.Unlock()
-		return
+		return false
 	}
 	st.lastCreated = time.Now()
 	ix.state[ns] = st
@@ -190,13 +194,14 @@ func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) {
 			"ns", ns, "err", err,
 			"effect", "a copy-up will create it with no options, and a default collation decides "+
 				"which documents match")
-		return
+		return false
 	}
 	ix.mu.Lock()
 	st = ix.state[ns]
 	st.created = true
 	ix.state[ns] = st
 	ix.mu.Unlock()
+	return true
 }
 
 // Forget clears the record that a namespace is done, so the next Ensure builds
