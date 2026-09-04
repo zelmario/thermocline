@@ -1078,17 +1078,32 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 							"enforced everywhere at once")
 				}
 			}
-			if name == "drop" {
-				// The fast tier no longer holds any of it, so a cached claim
-				// that it holds all of it is wrong from this instant. See
-				// forgetCompleteness.
-				c.r.forgetCompleteness(db + "." + coll)
-			}
 			// drop and create are the two that change which collection lives
 			// under a name, and either half can arrive here without the other:
 			// a collection dropped out of band and created through this router
 			// leaves it remembering the one before.
 			if name == "drop" || name == "create" {
+				// The fast tier holds none of it either way: a drop removed it
+				// and a create makes it empty. A cached claim that it holds all
+				// of it is wrong from this instant, and this is the cache whose
+				// staleness decides whether a read skips the archive, so it is
+				// the one that should be cleared soonest rather than last.
+				//
+				// create was missing while its two neighbours below had it, on
+				// the reasoning written above them. The window is the claim
+				// cache TTL, five seconds, because the feeder sees the drop on
+				// the fast tier's change stream and withdraws the recorded
+				// claim whichever way the drop arrived. Five seconds of reads
+				// answered from an empty collection is still worth not having.
+				//
+				// No reproduction to point at, and that is stated rather than
+				// dressed up: the check written for it passes either way,
+				// because a create does enough work of its own, mirroring the
+				// collection and starting an index build, that the cache has
+				// expired before the next read. It is here because holding a
+				// claim that the fast tier holds everything, moments after
+				// making it empty, is wrong on its face.
+				c.r.forgetCompleteness(db + "." + coll)
 				// A drop and a recreate can put differently typed ages under
 				// the same name. See sortSafeAges.
 				c.r.forgetBrackets(db + "." + coll)

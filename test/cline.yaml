@@ -240,6 +240,9 @@ feeder:
     # other than the one it runs against. tcref2 is the untiered reference and
     # is deliberately NOT here.
     - "shop.tcfuzz2"
+    # testddl.sh: a collection created through the router after the fast tier
+    # lost it out of band
+    - "shop.tdcreate"
     # testkeys.sh: a collated unique index whose match on the archive is created
     # after the router has already asked about it
     - "shop.tkcoll2"

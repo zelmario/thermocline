@@ -108,6 +108,49 @@ sleep 7
 chk "the fast tier holds three, the archive ten"        "3" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 chk "and a normal read still answers in full"           "10" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
+echo "== a create over an archive that still holds documents =="
+# The adoption shape, arriving as DDL: the fast tier loses a collection out of
+# band, a client creates it again, and every document is still in the archive.
+# The read has to answer from there rather than from the empty collection that
+# now exists on the fast tier.
+#
+# All of it inside one mongosh, because the router caches the completeness claim
+# for five seconds and three shell round trips do not fit in that: each mongosh
+# costs about a second of startup before it does any work. That was written to
+# catch a stale claim being used, and it does not: create does enough work of
+# its own, mirroring the collection and starting an index build, that the cache
+# has expired by the time the read happens. So this passes with or without the
+# invalidation added alongside it, and is kept for the invariant it does
+# establish rather than the one it was written for.
+#
+# The recorded claim is withdrawn here rather than waited for. The feeder does
+# that on seeing the drop, which is correct and is not predictable inside the
+# window.
+export TC_COLD=$COLD TC_HOT=$HOT
+H "db.getSiblingDB(process.env.TC_DB).tdcreate.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tdcreate.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tdcreate.insertMany(Array.from({length:6},(_,i)=>({_id:i,n:i})))" >/dev/null
+waitMirrored tdcreate 6
+cline watermark --config $CFG --ns $DB.tdcreate --complete-all >/dev/null
+# Stopped so it cannot act on the out-of-band drop below, and its checkpoint
+# removed so it does not replay it when it comes back.
+stopFeeder
+CREATED=$(R "
+  const rdb  = db.getSiblingDB(process.env.TC_DB);
+  const hot  = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  const meta = Mongo(process.env.TC_COLD).getDB(process.env.TC_META);
+  // Read first, so the claim is in the router's cache when the drop happens.
+  const before = rdb.tdcreate.countDocuments({});
+  hot.tdcreate.drop();
+  meta.watermarks.deleteOne({_id: process.env.TC_DB + '.tdcreate'});
+  rdb.createCollection('tdcreate');
+  print(before + '/' + rdb.tdcreate.countDocuments({}));
+")
+chk "the read before the drop saw all six, and so does the one after" "6/6" "$CREATED"
+chk "and the archive still holds them"                 "6" "$(C "print(db.getSiblingDB(process.env.TC_DB).tdcreate.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+
 echo "== renaming a tiered collection into a name nobody tiers =="
 # The namespace list is configuration. A rename into a name it does not carry
 # stops the tiering with nothing saying so: reads of the new name answer from
