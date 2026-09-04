@@ -1,10 +1,16 @@
 // Package feeder mirrors writes from the fast tier into the cold tier.
 //
 // It tails the fast tier's change stream and applies every insert, update and
-// replace to the cold tier as an upsert. It never deletes and never drops. That
-// single restriction is what makes the cold tier a complete archive rather than
-// a second copy of whatever state the fast tier happens to be in, and it is why
-// removing a document from the fast tier does not remove it from the archive.
+// replace to the cold tier as an upsert. It never issues a delete or a drop
+// against the cold tier: an application's delete is mirrored as a mark on the
+// archived copy, _tcDeletedAt, and the router filters marked documents out of
+// every read, so the client sees the document gone while the archive keeps it.
+//
+// The restriction is on this component, not on the application. Deleting works
+// exactly as it always did. What it buys is that removing a document from the
+// fast tier does not remove it from the archive, which is what makes the cold
+// tier a complete archive rather than a second copy of whatever state the fast
+// tier happens to be in, and what stops one accident there destroying both.
 package feeder
 
 import (

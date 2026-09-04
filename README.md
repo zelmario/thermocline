@@ -41,16 +41,34 @@ One binary, `cline`, with a subcommand per component.
 
 ## The rule everything rests on
 
-**The feeder never deletes and never drops.** Inserts, updates and replaces are
-mirrored as upserts. Nothing destructive crosses into the archive.
+**Applications delete normally. The feeder never issues a delete against the
+archive.** Those are two different statements and only the second one is a
+restriction, so it is worth being exact about which.
 
-This is required so that removing a document from the fast tier does not remove
-it from the archive, which is the entire point. It has a second effect worth
-saying out loud: an accident on the fast tier cannot propagate. Run
-`deleteMany({})` and then `drop()` on the fast tier, and the archive still holds
-every document.
+Your application deletes a document and it is gone: gone from the fast tier,
+gone from every answer the router gives, immediately. Nothing about deleting
+changes. What changes is what happens *behind* the router. The feeder mirrors
+inserts, updates and replaces into the archive as upserts, and mirrors a delete
+as a **mark** on the archived copy, `_tcDeletedAt`, rather than as a removal.
+The router filters marked documents out of every read, which is why the client
+cannot tell.
 
-That is covered by a test you can run yourself, below.
+Measured, on a shop with 3,081 orders in the archive of which the application
+had deleted 40: the router answered 3,041, the number the application expected,
+while the archive still physically held all 3,081.
+
+**Why not just delete it there too.** Because then one accident on the fast tier
+destroys the only complete copy. Run `deleteMany({})` and then `drop()` on the
+fast tier and the archive still holds every document, which is the property that
+makes the fast tier disposable and the whole shape worth having. There is a test
+below you can run yourself.
+
+Two things follow, and neither is a surprise if you know about them. Storage in
+the archive grows with deletes as well as with writes, so
+`feeder.tombstone_retention` gives a marked copy an end date and mongod's TTL
+monitor erases it. And a client reading the archive **directly**, bypassing the
+router, does see the marked documents: that is what `cline rollback` counts and
+what `--clear` removes before you repoint anything at it.
 
 ## Telling an eviction from a deletion
 
