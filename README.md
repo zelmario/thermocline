@@ -2781,14 +2781,23 @@ mongosh --port 28018 --eval '
   `CursorNotFound` on a read that falls through, behind a load balanced address,
   is this and not an expiry.
 
-- **A change stream cannot be resumed across the cutover, and nothing says so.**
+- **A change stream cannot be resumed across the cutover, and the router says
+  so rather than letting it be discovered.**
   A resume token is a position in one replica set's oplog. The router serves
   change streams from the fast tier, so a token minted on the cluster being
   adopted is not a position in it. MongoDB accepts it rather than refusing it:
   measured, the same token delivered the write that followed it against the
   cluster it came from, and delivered nothing at all through the router, with
   `ok: 1`. A consumer resuming across the cutover therefore loses every event
-  the old cluster saw after its last token, silently.
+  the old cluster saw after its last token.
+
+  It is not silent any more. The router logs a warning naming the namespace and
+  the option the client used, with the effect and the remedy, every time a
+  stream is opened with `resumeAfter`, `startAfter` or `startAtOperationTime` on
+  a tiered collection. Refusing outright would mean parsing resume tokens, whose
+  encoding is undocumented and changes between releases, so this names it
+  instead: start consumers fresh after a cutover, and check the stream is
+  delivering rather than merely open. Pinned by `testchange.sh`.
 
   Refusing it would mean the router parsing resume tokens, which are an
   undocumented encoding that changes between server releases, so this is a step
