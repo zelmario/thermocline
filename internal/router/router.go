@@ -440,9 +440,10 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		}
 	}()
 	defer func() { _ = client.Close() }()
-	r.Stats.ClientsOpen.Add(1)
+	open := r.Stats.ClientsOpen.Add(1)
 	r.Stats.ClientsTotal.Add(1)
 	defer r.Stats.ClientsOpen.Add(-1)
+	r.warnAboutClientCount(open)
 
 	// One dedicated upstream per client, but only while authentication is
 	// proxied. Then the connection carries the client's identity and cannot be

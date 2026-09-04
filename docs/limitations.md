@@ -203,6 +203,13 @@ Part of [Thermocline](../README.md).
   tens of thousands of clients. With `router.terminate_auth` on the connections
   are pooled instead: measured, eight idle clients cost zero extra connections to
   the primary, against thirty two with it off.
+
+  The wall is mongod's rather than the router's, so a deployment used to meet it
+  as connection errors on the fast tier with nothing here having mentioned it.
+  The router says so once, at a thousand open clients, naming what each one costs
+  and what turns it off. A thousand is well short of the wall and well past any
+  ordinary application's pool. Nothing is said with `terminate_auth` on, where an
+  idle client holds no upstream connection at all.
 - **`$out` into a tiered collection is the one place the router removes archived
   data**, and it is deliberate rather than an oversight. Clearing the fast tier
   only reaches what the fast tier holds, so an evicted document lives in the
