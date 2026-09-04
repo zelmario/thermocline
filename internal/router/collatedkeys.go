@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -141,11 +142,15 @@ func collationFromSpec(spec bson.Raw) *options.Collation {
 func (r *Router) archiveCanAnswerCollated(ctx context.Context, ns string, idx uniqueIndex) bool {
 	key := ns + "|" + idx.name
 	r.brackets.mu.RLock()
-	usable, asked := r.brackets.collated[key]
+	ans, asked := r.brackets.collated[key]
 	r.brackets.mu.RUnlock()
-	if asked {
-		return usable
+	// Asked again once the answer is old enough. See collatedRecheckNo: an
+	// operator who creates the index the warning below asks for has to be able
+	// to see it take effect.
+	if asked && ans.good() {
+		return ans.usable
 	}
+	usable := false
 
 	db, coll := splitNS(ns)
 	cur, err := r.cold.Database(db).Collection(coll).Indexes().List(ctx)
@@ -177,12 +182,21 @@ func (r *Router) archiveCanAnswerCollated(ctx context.Context, ns string, idx un
 
 	r.brackets.mu.Lock()
 	if r.brackets.collated == nil {
-		r.brackets.collated = map[string]bool{}
+		r.brackets.collated = map[string]collatedAnswer{}
 	}
-	r.brackets.collated[key] = usable
+	if r.brackets.collatedWarned == nil {
+		r.brackets.collatedWarned = map[string]bool{}
+	}
+	r.brackets.collated[key] = collatedAnswer{usable: usable, asked: time.Now()}
+	// Once per index, not once every time the answer is asked again: a
+	// misconfiguration nobody has fixed should not fill the log.
+	warn := !usable && !r.brackets.collatedWarned[key]
+	if warn {
+		r.brackets.collatedWarned[key] = true
+	}
 	r.brackets.mu.Unlock()
 
-	if !usable {
+	if warn {
 		r.log.Warn("not enforcing a collated unique index across tiers",
 			"ns", ns, "index", idx.name,
 			"reason", "the value has to be compared in the index's own collation, which means asking the "+

@@ -403,6 +403,41 @@ waitMirrored tkcoll 3
 R 'db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:5},{$set:{email:"moved@x.com"}})' >/dev/null
 chk "the value it just moved off is free at once"    "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:6,email:"MOVES@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== the remedy for a collated index the archive cannot answer =="
+# When the archive has no index in the same collation, the router cannot compare
+# the value the way the index does, so it under-enforces and says so, with an
+# action: create the same index on the archive. This is that action, taken while
+# the router runs, which is how an operator would take it.
+#
+# The answer used to be remembered for the life of the process, so doing what
+# the log asked changed nothing until somebody restarted the router, and nothing
+# said so. See collatedRecheckNo.
+fresh tkcoll2
+H "db.getSiblingDB(process.env.TC_DB).tkcoll2.createIndex({email:1},{unique:true,collation:{locale:'en',strength:2}})" >/dev/null
+# Counted as a delta over the whole section, and taken before the first insert.
+# Two reasons: the router appends to this log across restarts, so a total also
+# counts a line an earlier run of this suite wrote; and the guard runs on every
+# insert into a collection with a unique index, so the first one is already
+# where the warning happens.
+WAS=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || echo 0)
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:1,email:"Ann@x.com"})' >/dev/null
+waitMirrored tkcoll2 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteOne({_id:1})'
+chk "with no index on the archive, another spelling lands" "ACCEPTED" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:2,email:"ann@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+NOW=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || echo 0)
+chk "and the router said so, once and not twice"            "1"        "$((NOW-WAS))"
+# The remedy, on the archive, without restarting anything.
+C "db.getSiblingDB(process.env.TC_DB).tkcoll2.createIndex({email:1},{collation:{locale:'en',strength:2}})" >/dev/null
+# The duplicate that was accepted has to go, or the fast tier's own index
+# refuses the next spelling and this passes for the wrong reason.
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteOne({_id:2})' >/dev/null
+chk "the fast tier holds no email now"                     "0"        "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkcoll2.countDocuments({email:{$exists:true}}))')"
+# Long enough for the negative answer to lapse. Fixed rather than polled,
+# because there is nothing to poll: the router asks again on the next insert.
+sleep 12
+chk "once the index is there, the third spelling is refused" "11000"   "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:3,email:"ANN@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and the archive still holds one live copy"          "1"        "$(C 'print(db.getSiblingDB(process.env.TC_DB).tkcoll2.countDocuments({email:{$exists:true},_tcDeletedAt:{$exists:false}}))')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a

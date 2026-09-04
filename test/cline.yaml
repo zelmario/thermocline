@@ -236,6 +236,9 @@ feeder:
     - "shop.tcon"
     # testfuzz.sh: same arrangement, tcfuzz is tiered and tcref is the reference
     - "shop.tcfuzz"
+    # testkeys.sh: a collated unique index whose match on the archive is created
+    # after the router has already asked about it
+    - "shop.tkcoll2"
     # testsingle.sh
     - "shop.tsdel"
     - "shop.tsupd"

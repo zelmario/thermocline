@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,7 +55,45 @@ type bracketCache struct {
 
 	// collated remembers, per namespace and index, whether the archive can
 	// answer a collated key lookup from an index. See collatedkeys.go.
-	collated map[string]bool
+	collated map[string]collatedAnswer
+	// collatedWarned keeps the warning about an index that cannot be enforced
+	// to once per namespace and index, now that the answer itself is asked
+	// again from time to time.
+	collatedWarned map[string]bool
+}
+
+// collatedAnswer is one remembered answer about the archive's indexes, with the
+// moment it was given.
+type collatedAnswer struct {
+	usable bool
+	asked  time.Time
+}
+
+// How long that answer is trusted, and it depends on which answer it is.
+//
+// It used to be remembered for the life of the router, and the answer decides
+// whether a collated unique index is enforced across tiers. When it cannot be,
+// the router says so and names the remedy: create the same index on the
+// archive, with the same collation. An operator who did exactly that changed
+// nothing, because the router never asked again, so the under-enforcement the
+// warning describes carried on until somebody restarted it. Nothing said so.
+//
+// So a no is re-asked quickly: it is the answer with a remedy, and the remedy
+// has to take effect while the operator is still watching. A yes is re-asked
+// slowly, because the only thing that can make it false is somebody dropping
+// the index off the archive, and until then re-asking buys nothing. Either way
+// it is one listIndexes, amortised over every insert in the interval.
+const (
+	collatedRecheckNo  = 10 * time.Second
+	collatedRecheckYes = 5 * time.Minute
+)
+
+// good reports how long this answer stands for.
+func (a collatedAnswer) good() bool {
+	if a.usable {
+		return time.Since(a.asked) < collatedRecheckYes
+	}
+	return time.Since(a.asked) < collatedRecheckNo
 }
 
 // sortSafeAges reports whether a sort on ns's age field can be trusted to put
@@ -142,5 +181,16 @@ func (r *Router) forgetBrackets(ns string) {
 	r.brackets.mu.Lock()
 	delete(r.brackets.byNS, ns)
 	delete(r.brackets.asked, ns)
+	// And what is remembered about its indexes, which lives in the same place
+	// and was being left behind. The key is the namespace and the index name,
+	// so a collection dropped and recreated kept an answer about an index that
+	// no longer exists, or about a different index of the same name.
+	prefix := ns + "|"
+	for key := range r.brackets.collated {
+		if strings.HasPrefix(key, prefix) {
+			delete(r.brackets.collated, key)
+			delete(r.brackets.collatedWarned, key)
+		}
+	}
 	r.brackets.mu.Unlock()
 }
