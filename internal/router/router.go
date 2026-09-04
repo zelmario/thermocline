@@ -1175,6 +1175,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		if out, filtered := c.filterChangeStream(ctx, msg, reply); filtered {
 			return c.send(out)
 		}
+		// A later batch of a listCollections cursor still carries this
+		// router's own scratch collections, because only the first batch is
+		// filtered where the archive's half is added. See listcollections.go.
+		if out, filtered := c.filterListCollectionsGetMore(msg, reply); filtered {
+			return c.send(out)
+		}
 		// A cursor neither this router nor the fast tier knows. See
 		// cursorlost.go for the two things it can be and why the id cannot say
 		// which.

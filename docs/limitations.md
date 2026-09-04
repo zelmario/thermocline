@@ -62,12 +62,17 @@ Part of [Thermocline](../README.md).
   fast tier lists one and the router lists none, with the real collections
   untouched.
 
-  The one gap left is a long listing. The router filters the first batch and
-  appends the archive's half to it, and it does not answer the `getMore` behind
-  a cursor the fast tier opened for the rest, so a database with more
-  collections than fit one batch could show a scratch collection in a later
-  batch. Everything about that is the same limitation the archive half already
-  has, and it is written down there too.
+  A long listing is filtered too, which it was not at first. The router filters
+  the first batch where it appends the archive's half, and the batches after
+  that used to come straight from the fast tier: measured with `batchSize: 1`
+  over 100 `getMore`s, one scratch collection appeared in a later batch of a
+  listing whose first batch was clean. Both are filtered now.
+
+  What is still true of a long listing is the archive's half: the collections
+  the archive holds and the fast tier does not are appended to the first batch
+  only, because the router does not answer the `getMore` behind a cursor the
+  fast tier opened. A client that pages the catalog sees them if they fit in the
+  first batch and not otherwise.
 
 - **A pipeline the archive would answer that also reads an untiered collection is
   refused**, because answering it would be short for that half.

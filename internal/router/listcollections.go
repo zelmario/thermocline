@@ -142,6 +142,58 @@ func (c *conn) interceptListCollections(ctx context.Context, msg *wire.Message, 
 	return cursorReply(reply.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", out)
 }
 
+// filterListCollectionsGetMore drops this router's scratch collections from a
+// later batch of a listCollections cursor.
+//
+// The first batch is filtered where the archive's half is added to it, and that
+// covered the ordinary listing, because listCollections returns as much as fits
+// in one reply. A client that sets a small batchSize gets a cursor instead, and
+// the batches after the first came straight from the fast tier: measured with
+// batchSize 1, a scratch collection appeared in a later batch of a listing whose
+// first batch had been filtered. Some tools do page the catalog.
+//
+// Only the listCollections cursor. A getMore over the application's own
+// documents is none of this function's business, and the cursor names which it
+// is: mongod calls it <db>.$cmd.listCollections.
+func (c *conn) filterListCollectionsGetMore(msg *wire.Message, reply *wire.Message) (*wire.Message, bool) {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return nil, false
+	}
+	coll, ok := stringField(cmd, "collection")
+	if !ok || coll != "$cmd.listCollections" {
+		return nil, false
+	}
+	rdoc, err := reply.ReplyDoc()
+	if err != nil || !replyOK(rdoc) {
+		return nil, false
+	}
+	batch, ok := nextBatch(rdoc)
+	if !ok {
+		return nil, false
+	}
+	kept := make(bson.A, 0, len(batch))
+	dropped := 0
+	for _, v := range batch {
+		if doc, dok := v.DocumentOK(); dok {
+			if name, nok := stringField(doc, "name"); nok && meta.IsScratch(name) {
+				dropped++
+				continue
+			}
+		}
+		kept = append(kept, v)
+	}
+	if dropped == 0 {
+		return nil, false
+	}
+	id, ns := cursorIdentity(rdoc, "")
+	out, nerr := cursorReply(reply.Header.RequestID, msg.Header.RequestID, id, ns, "nextBatch", kept)
+	if nerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
 // archiveOnlyCollections is the tiered collections the archive holds that are
 // not in seen.
 //

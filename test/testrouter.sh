@@ -521,14 +521,29 @@ chk "an untiered archive collection is not listed" "false" \
 # over its target, and a rename cannot cross databases. A client that
 # enumerates collections and acts on what it finds would act on that, and after
 # a router died mid-aggregation it would go on doing so.
-H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.424242').insertOne({v:1})" >/dev/null
+SCRATCHNS="tmp.thermocline.out.$(( $(date +%s) * 1000000000 ))"
+H "db.getSiblingDB(process.env.TC_DB).getCollection('$SCRATCHNS').insertOne({v:1})" >/dev/null
 chk "the fast tier does list the scratch collection" "1" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 chk "and the router does not"                        "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('tmp.thermocline')).length)")"
 chk "while still listing the real ones"              "true" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().length > 0)")"
-H "db.getSiblingDB(process.env.TC_DB).getCollection('tmp.thermocline.out.424242').drop()" >/dev/null
+# And a listing long enough to page. Only the first batch is filtered where the
+# archive's half is added to it, so the batches after it used to come straight
+# from the fast tier: measured with batchSize 1, one scratch collection appeared
+# in a later batch of a listing whose first batch was clean.
+chk "and not in a later batch of a paged listing"    "0" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB);
+          let r=d.runCommand({listCollections:1,nameOnly:true,cursor:{batchSize:1}});
+          let names=r.cursor.firstBatch.map(x=>x.name); let id=r.cursor.id, n=0;
+          while (String(id) !== '0' && n < 400) {
+            const g=d.runCommand({getMore:id, collection:'\$cmd.listCollections', batchSize:1});
+            if (g.ok !== 1) break;
+            names=names.concat(g.cursor.nextBatch.map(x=>x.name)); id=g.cursor.id; n++;
+          }
+          print(names.filter(x=>x.startsWith('tmp.thermocline')).length)")"
+H "db.getSiblingDB(process.env.TC_DB).getCollection('$SCRATCHNS').drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_LOSTDB).notiering.drop()" >/dev/null
 kill $CATR 2>/dev/null; wait $CATR 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
