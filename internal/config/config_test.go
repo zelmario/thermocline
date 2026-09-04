@@ -594,3 +594,49 @@ router:
 		}
 	}
 }
+
+// Manages is on the hot path and answers from a set built at load time, with a
+// linear scan left in for a config built in code and never loaded. Both have to
+// give the same answer, or a deployment behaves differently from a unit test.
+func TestManagesAgreesWhicheverWay(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "cline.yaml")
+	if err := os.WriteFile(p, []byte(`hot:
+  uri: "mongodb://hot1/?replicaSet=rsHot"
+cold:
+  uri: "mongodb://cold1/?replicaSet=rsCold"
+feeder:
+  id: "test"
+  namespaces: ["shop.orders", "shop.events", "wh.stock"]
+router:
+  listen: "127.0.0.1:27100"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same thing assembled by hand, which never goes through Load and so
+	// has no set to answer from.
+	built := RouterConfig{Managed: []string{"shop.orders", "shop.events", "wh.stock"}}
+
+	for _, ns := range []string{"shop.orders", "shop.events", "wh.stock", "shop.other", "", "shop", "orders"} {
+		l, b := loaded.Router.Manages(ns), built.Manages(ns)
+		if l != b {
+			t.Errorf("Manages(%q): loaded %v, built by hand %v", ns, l, b)
+		}
+	}
+	for _, ns := range []string{"shop.orders", "wh.stock"} {
+		if !loaded.Router.Manages(ns) {
+			t.Errorf("Manages(%q) is false for a namespace the feeder tiers", ns)
+		}
+	}
+	if loaded.Router.Manages("shop.untiered") {
+		t.Error("Manages is true for a namespace nothing tiers")
+	}
+	// Empty still means everything, through both paths.
+	if !(RouterConfig{}).Manages("anything.at.all") {
+		t.Error("an empty list stopped meaning every namespace")
+	}
+}

@@ -207,6 +207,9 @@ type RouterConfig struct {
 	// FeederID names the checkpoint ArchiveWait reads, copied from feeder.id at
 	// load time rather than configured twice.
 	FeederID string `yaml:"-"`
+	// managedSet is Managed as a set, built once at load time. See Manages.
+	managedSet map[string]bool `yaml:"-"`
+
 	// Managed lists the namespaces Thermocline mirrors, copied from
 	// feeder.namespaces at load time rather than configured twice.
 	//
@@ -243,10 +246,19 @@ func (r RouterConfig) AgeField(ns string) (string, bool) {
 }
 
 // Manages reports whether ns is one of the namespaces Thermocline tiers.
+//
+// A map because this is on the hot path and the list is not short. It was a
+// linear scan over Managed, and a deployment tiering a hundred namespaces paid
+// a hundred string comparisons on every call, from twenty nine call sites,
+// several of them per write. The test configuration here has 110 entries.
 func (r RouterConfig) Manages(ns string) bool {
 	if len(r.Managed) == 0 {
 		return true
 	}
+	if r.managedSet != nil {
+		return r.managedSet[ns]
+	}
+	// A config built in code rather than loaded still has to answer correctly.
 	for _, m := range r.Managed {
 		if m == ns {
 			return true
@@ -492,6 +504,10 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces
+	cfg.Router.managedSet = make(map[string]bool, len(cfg.Feeder.Namespaces))
+	for _, ns := range cfg.Feeder.Namespaces {
+		cfg.Router.managedSet[ns] = true
+	}
 	cfg.Router.FeederID = cfg.Feeder.ID
 	// evictor.feeder_id names the checkpoint the mirroring-lag gate reads, and
 	// it has to be the id of a feeder that is actually running. Taken from
