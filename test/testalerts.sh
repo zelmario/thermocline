@@ -14,7 +14,7 @@
 # selector that matches nothing. A PromQL typo. None of them shows up until the
 # night an alert should have paged somebody and did not.
 #
-# So the rules are extracted from the README itself rather than copied here.
+# So the rules are extracted from the document itself rather than copied here.
 # A copy would drift, and the copy is not what anyone deploys.
 NODE=${NODE:-thermocline-zelmar-node0}
 NET=${NET:-thermocline-zelmar-anydbver}
@@ -40,16 +40,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== the rules the README actually carries =="
-python3 - "$WORK/thermocline.rules.yml" <<'PY'
+RULEDOC=${RULEDOC:-docs/monitoring.md}
+echo "== the rules $RULEDOC actually carries =="
+python3 - "$WORK/thermocline.rules.yml" "$RULEDOC" <<'PY'
 import re, sys
-s = open("README.md").read()
+s = open(sys.argv[2]).read()
 blocks = re.findall(r"```yaml\n(groups:\n.*?)```", s, re.S)
 if len(blocks) != 1:
-    print("  FATAL  expected exactly one alert rule block in README.md, found %d" % len(blocks))
+    print("  FATAL  expected exactly one alert rule block in %s, found %d" % (sys.argv[2], len(blocks)))
     sys.exit(2)
 open(sys.argv[1], "w").write(blocks[0])
-print("  %d alerts extracted from README.md" % blocks[0].count("- alert:"))
+print("  %d alerts extracted from %s" % (blocks[0].count("- alert:"), sys.argv[2]))
 PY
 [ -s "$WORK/thermocline.rules.yml" ] || { echo "  FATAL  no rules extracted"; exit 2; }
 chmod 644 "$WORK/thermocline.rules.yml"
@@ -61,7 +62,7 @@ chk "promtool accepts every rule" "SUCCESS: $RULES rules found" "$(echo "$OUT" |
 
 echo "== every metric they name is exported =="
 # The quiet failure this catches: a counter renamed in promexport.go and not in
-# the README. The rule then evaluates against nothing and never fires.
+# the document. The rule then evaluates against nothing and never fires.
 docker exec $NODE sh -c "pkill -f 'cline router --config $CFG'" 2>/dev/null; sleep 1
 docker exec -d $NODE cline router --config $CFG --log-file /var/log/cline/alerts_r.log
 for _ in $(seq 1 30); do
