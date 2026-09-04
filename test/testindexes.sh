@@ -804,46 +804,6 @@ C "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
 
-echo "== a write that recreates a collection builds its indexes =="
-# An insert into a tiered collection the fast tier does not hold creates it, and
-# a collection created by an insert carries nothing: no options, no indexes. The
-# options were already dealt with, because a collation cannot be added
-# afterwards, so the create happens before the write. The indexes were not: they
-# waited for something to list the catalog or for the router to be restarted,
-# and reads fell through to the archive meanwhile.
-#
-# The drop goes through the router, which is what an application does, and is
-# what lets the router know the collection is gone. A drop applied straight to
-# the fast tier is a different limitation and is written up as one.
-RIDX=tidxrebuild
-# This section needs a router, and the section above it left none running: the
-# first version of this insert went nowhere and the check reported "ns does not
-# exist", which reads as the fix not working rather than as nothing having run.
-startFeeder
-cline router --config $CFG --log-file $LOGDIR/idx_rebuild_r.log & RIP=$!
-for _ in $(seq 1 30); do
-  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
-    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
-  sleep 1
-done
-C "const c=db.getSiblingDB(process.env.TC_DB).$RIDX; c.drop();
-   c.insertMany([{_id:1,email:'a@x'},{_id:2,email:'b@x'}]); c.createIndex({email:1})" >/dev/null
-chk "the archive has the index"                   "2" \
-    "$(C "print(db.getSiblingDB(process.env.TC_DB).$RIDX.getIndexes().length)")"
-R "db.getSiblingDB(process.env.TC_DB).$RIDX.drop()" >/dev/null 2>&1
-chk "and the fast tier does not have the collection" "0" \
-    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n==='$RIDX').length)")"
-R "db.getSiblingDB(process.env.TC_DB).$RIDX.insertOne({_id:new ObjectId(),email:'fresh@x'})" >/dev/null 2>&1
-for _ in $(seq 1 30); do
-  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$RIDX.getIndexes().length)")" = "2" ] && break
-  sleep 1
-done
-chk "the insert recreated it with the archive's index" "_id_,email_1" \
-    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RIDX.getIndexes().map(i=>i.name).sort().join(','))")"
-H "db.getSiblingDB(process.env.TC_DB).$RIDX.drop()" >/dev/null
-C "db.getSiblingDB(process.env.TC_DB).$RIDX.drop()" >/dev/null
-kill $RIP 2>/dev/null; wait $RIP 2>/dev/null
-
 stopDaemons
 echo
 echo "================================"

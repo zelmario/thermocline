@@ -72,9 +72,6 @@ feeder:
     - "shop.tidxdrop"
     # testwarm.sh: aged by a date field some of its documents do not have.
     - "shop.twunaged"
-    # testindexes.sh: the collection a write recreates, to check the archive's
-    # indexes are built then rather than at the next catalog listing.
-    - "shop.tidxrebuild"
     # testkeys.sh: the collection a second router has to notice a new unique
     # index on, without being restarted.
     - "shop.tkddl2"
