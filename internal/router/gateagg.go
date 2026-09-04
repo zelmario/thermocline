@@ -33,7 +33,8 @@ func aggregateNeeds(cmd bson.Raw, db string) []authz.Need {
 	}
 
 	var needs []authz.Need
-	for _, ns := range joinedCollections(stages, db, 0) {
+	joined, _ := joinedCollections(stages, db, 0)
+	for _, ns := range joined {
 		jdb, jcoll := splitNS(ns)
 		needs = append(needs, authz.Need{DB: jdb, Coll: jcoll, Actions: []string{"find"}})
 	}

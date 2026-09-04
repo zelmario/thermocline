@@ -502,6 +502,59 @@ C "db.getSiblingDB(process.env.TC_DB).$TNS.drop()" >/dev/null
 
 stopDaemons
 echo
+echo "== a tiered collection read from below the scope walk =="
+# The walk over a pipeline's sub-pipelines had a depth limit of 10 and a comment
+# saying that was beyond anything MongoDB would plan. Measured on 8.0.26: a
+# $lookup nested 14 deep runs, and 20 is where mongod says
+# MaxSubPipelineDepthExceeded. So the limit was under mongod's and reaching it
+# returned nothing, which made the collections below it invisible to the
+# completeness check and the pipeline ran on the fast tier unjudged.
+#
+# Measured before the fix: refused at depth 9, answered 3 at depth 11 where the
+# archive holds 10, with no error.
+NNS=tnesttarget
+NOUT=tnestouter
+# A router of this section's own, and a check that it is up. The sections above
+# leave none running, and without one every "REFUSED" check here passes on a
+# connection error, which is a check that cannot fail. Third time in one day.
+pkill -f "cline router --config $WDIR/" 2>/dev/null; sleep 1
+cline router --config $CFG --log-file $LOGDIR/q_nest_r.log & NRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a router is up for this section"           "1" "$(R 'print(db.adminCommand({ping:1}).ok)')"
+C "db.getSiblingDB(process.env.TC_DB).$NOUT.drop(); db.getSiblingDB(process.env.TC_DB).$NOUT.insertOne({_id:1});
+   const c=db.getSiblingDB(process.env.TC_DB).$NNS; c.drop();
+   const a=[]; for(let i=0;i<10;i++) a.push({_id:i}); c.insertMany(a)" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NOUT.drop(); db.getSiblingDB(process.env.TC_DB).$NOUT.insertOne({_id:1});
+   const c=db.getSiblingDB(process.env.TC_DB).$NNS; c.drop(); c.insertMany([{_id:0},{_id:1},{_id:2}])" >/dev/null
+cline watermark --config $CFG --ns $DB.$NNS --clear >/dev/null 2>&1
+# deep NESTING: the innermost $lookup reads the tiered collection.
+NESTJS="function deep(n){ let p=[{\$lookup:{from:'$NNS',pipeline:[{\$count:'c'}],as:'deep'}}];
+  for(let i=0;i<n;i++){ p=[{\$lookup:{from:'$NOUT',pipeline:p,as:'l'+i}}]; } return p; }"
+chk "shallow nesting is refused without a claim" "REFUSED" \
+    "$(R "$NESTJS try{ db.getSiblingDB(process.env.TC_DB).$NOUT.aggregate(deep(2)).toArray(); print('ANSWERED') }catch(e){ print('REFUSED') }")"
+chk "and so is nesting past the old limit"       "REFUSED" \
+    "$(R "$NESTJS try{ db.getSiblingDB(process.env.TC_DB).$NOUT.aggregate(deep(11)).toArray(); print('ANSWERED') }catch(e){ print('REFUSED') }")"
+# With the fast tier holding it all and saying so, the same pipelines answer,
+# which is what stops the refusal above from being an over-refusal.
+H "const c=db.getSiblingDB(process.env.TC_DB).$NNS; c.drop();
+   const a=[]; for(let i=0;i<10;i++) a.push({_id:i}); c.insertMany(a)" >/dev/null
+cline watermark --config $CFG --ns $DB.$NNS --complete-all --force >/dev/null 2>&1
+sleep 7
+chk "with a complete claim, shallow answers"     "10" \
+    "$(R "$NESTJS const r=db.getSiblingDB(process.env.TC_DB).$NOUT.aggregate(deep(2)).toArray();
+        print(r[0].l1[0].l0[0].deep[0].c)")"
+chk "and deep answers the same"                  "10" \
+    "$(R "$NESTJS const r=db.getSiblingDB(process.env.TC_DB).$NOUT.aggregate(deep(11)).toArray();
+        let n=r[0]; for(let i=10;i>=0;i--){ n=n['l'+i][0]; } print(n.deep[0].c)")"
+H "db.getSiblingDB(process.env.TC_DB).$NNS.drop(); db.getSiblingDB(process.env.TC_DB).$NOUT.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NNS.drop(); db.getSiblingDB(process.env.TC_DB).$NOUT.drop()" >/dev/null
+cline watermark --config $CFG --ns $DB.$NNS --clear >/dev/null 2>&1
+kill $NRP 2>/dev/null; wait $NRP 2>/dev/null
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

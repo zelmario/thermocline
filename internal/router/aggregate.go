@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,11 @@ type aggScope struct {
 	bound     time.Time
 	bounded   bool
 	writes    bool
+	// scopeUnknown says the walk over this pipeline's sub-pipelines stopped
+	// before the bottom, so secondary is not the whole list. Anything it
+	// contains may be tiered, so the pipeline is refused rather than judged on
+	// a list known to be short. See joinedCollections.
+	scopeUnknown bool
 	// match is the leading $match, kept so a transaction can be given the
 	// documents it selects rather than being refused.
 	match bson.Raw
@@ -149,7 +155,9 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 			s.writes = true
 		}
 	}
-	s.secondary = joinedCollections(stages, db, 0)
+	var scopeKnown bool
+	s.secondary, scopeKnown = joinedCollections(stages, db, 0)
+	s.scopeUnknown = !scopeKnown
 	return s, true
 }
 
@@ -166,18 +174,32 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 // Only the positions that MongoDB defines as sub-pipelines are followed. A
 // blind walk would pick up a user field that happens to be called coll inside a
 // $match and refuse a query over a collection nobody is tiering.
-func joinedCollections(stages []bson.RawValue, db string, depth int) []string {
-	// A pipeline nested this deep is beyond anything MongoDB will plan, and the
-	// limit stops a hand-built document from recursing without end.
-	if depth > 10 {
-		return nil
+func joinedCollections(stages []bson.RawValue, db string, depth int) ([]string, bool) {
+	// The limit exists to stop a hand-built document recursing without end, and
+	// it used to be 10 with a comment saying that was beyond anything MongoDB
+	// would plan. It is not. Measured on 8.0.26: a $lookup nested 14 deep runs,
+	// and 20 is where mongod itself says MaxSubPipelineDepthExceeded.
+	//
+	// So the limit is mongod's, and reaching it fails closed. Returning nil at
+	// the boundary meant the collections below it were invisible to the
+	// completeness check, so the aggregation ran on the fast tier unjudged.
+	// Measured before this: a tiered collection with ten documents in the
+	// archive and three on the fast tier, read by a $lookup nested 11 deep,
+	// answered 3 with no error, where the same pipeline at depth 9 was refused.
+	if depth > maxSubPipelineDepth {
+		return nil, false
 	}
 	var out []string
+	complete := true
 
 	sub := func(val bson.RawValue) {
 		if arr, ok := val.ArrayOK(); ok {
 			if vals, err := arr.Values(); err == nil {
-				out = append(out, joinedCollections(vals, db, depth+1)...)
+				nested, ok := joinedCollections(vals, db, depth+1)
+				out = append(out, nested...)
+				if !ok {
+					complete = false
+				}
 			}
 		}
 	}
@@ -226,8 +248,12 @@ func joinedCollections(stages []bson.RawValue, db string, depth int) []string {
 			}
 		}
 	}
-	return out
+	return out, complete
 }
+
+// maxSubPipelineDepth is mongod's own limit on nested sub-pipelines, which is
+// where this stops looking. See joinedCollections for what reaching it does.
+const maxSubPipelineDepth = 20
 
 // subDoc returns val as a document, or an empty one when it is not.
 func subDoc(val bson.RawValue) bson.Raw {
@@ -248,6 +274,15 @@ func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remed
 	claimOf := r.completenessForRead
 	if s.writes {
 		claimOf = r.completeness
+	}
+	// A pipeline whose collections could not all be found is refused before
+	// anything else. Judging it on the collections that were found is judging
+	// it on a list known to be incomplete.
+	if s.scopeUnknown {
+		return "this pipeline nests sub-pipelines deeper than " + itoaInt(maxSubPipelineDepth) +
+				", so the collections it reads could not all be established",
+			"flatten it, or run it against the archive directly, which holds every document " +
+				"of everything this system tiers", false
 	}
 	if r.cfg.Manages(s.primary) {
 		mark, known := claimOf(ctx, s.primary)
@@ -644,3 +679,5 @@ func (c *conn) refuseUntieredFromArchive(msg *wire.Message, s aggScope) (*wire.M
 	}
 	return out, true
 }
+
+func itoaInt(n int) string { return strconv.Itoa(n) }

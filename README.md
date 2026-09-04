@@ -2731,6 +2731,20 @@ mongosh --port 28018 --eval '
   Reading a tiered collection with mapReduce is refused for a different reason,
   already: it totals whatever tier it runs on.
 
+- **A pipeline nesting sub-pipelines deeper than mongod's own limit is
+  refused.** The collections a pipeline reads are found by walking its
+  sub-pipelines: `$lookup` and `$unionWith` each take one, and `$facet` holds
+  several. That walk had a depth limit of 10 and returned nothing at it, so
+  anything below was invisible to the completeness check and the pipeline ran on
+  the fast tier unjudged.
+
+  Measured on 8.0.26: a `$lookup` nested 14 deep runs, and 20 is where mongod
+  itself answers `MaxSubPipelineDepthExceeded`. So the limit was under mongod's,
+  and a tiered collection with ten documents in the archive and three on the
+  fast tier, read by a `$lookup` nested 11 deep, answered **3 with no error**
+  where the same pipeline at depth 9 was refused. The limit is mongod's now and
+  reaching it refuses rather than returning a list known to be short.
+
 - **`dbHash` is refused for a collection the fast tier does not hold in full,
   and `validate` describes one tier.** Both read every document, and neither can
   be corrected the way a count can.
