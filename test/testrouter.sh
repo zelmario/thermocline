@@ -116,6 +116,15 @@ WRONGNS=$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'tprobe
                   print(g.ok===1?'READ':g.code+' '+g.codeName) }
              catch(e){ print(e.code+' '+e.codeName) }")
 chk "a getMore naming another collection"  "13 Unauthorized" "$WRONGNS"
+# A cursor id nobody minted: an expired one, or one another router opened. The
+# router cannot tell those apart, because a cursor id says nothing about who
+# minted it, so it says both and how to rule one out. The limitation this
+# closes was written as "it cannot tell you more than that", and what it could
+# not tell was *which*, not *anything*.
+LOST=$(R "try{ const r=db.getSiblingDB(process.env.TC_DB).runCommand({getMore:NumberLong('1234567890123456'),collection:'tprobe'});
+             print(r.code + ' ' + ((r.errmsg||'').indexOf('another router opened') >= 0 ? 'EXPLAINED' : 'BARE')) }
+           catch(e){ print(e.code + ' ' + ((e.message||'').indexOf('another router opened') >= 0 ? 'EXPLAINED' : 'BARE')) }")
+chk "an unknown cursor id is explained"    "43 EXPLAINED" "$LOST"
 # The control: one client, one session, its own cursor, paged to the end. This is
 # the case the three checks above must not have broken.
 # Says what went wrong rather than -1. A paging failure here is worth

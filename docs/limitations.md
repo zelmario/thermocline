@@ -114,14 +114,15 @@ Part of [Thermocline](../README.md).
   its pool sends the getMore down whichever connection is free, and it lands on
   a router that never had the cursor.
 
-  What the application sees then is `CursorNotFound`, code 43, from the fast
-  tier: the router does not recognise the id, forwards the getMore, and the fast
-  tier has never heard of that cursor either. It cannot tell you more than that,
-  and it is worth knowing why. A cursor id says nothing about who minted it:
+  What the application sees then is `CursorNotFound`, code 43, and the router
+  now says what that means rather than leaving it bare. It cannot say *which* of
+  two things it is, because a cursor id says nothing about who minted it:
   measured on PSMDB 8.0, mongod's own ids cover the whole positive int64 range,
-  so an id from another router is indistinguishable from an expired one. A
-  `CursorNotFound` on a read that falls through, behind a load balanced address,
-  is this and not an expiry.
+  so an id from another router is indistinguishable from an expired one. So it
+  names both, and how to rule one out — name every router in the connection
+  string and the driver pins each cursor to the one that made it. The code stays
+  43, because a driver decides what to retry from the code rather than from the
+  words.
 
 - **A change stream cannot be resumed across the cutover, and the router says
   so rather than letting it be discovered.**

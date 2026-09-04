@@ -1174,6 +1174,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		if out, filtered := c.filterChangeStream(ctx, msg, reply); filtered {
 			return c.send(out)
 		}
+		// A cursor neither this router nor the fast tier knows. See
+		// cursorlost.go for the two things it can be and why the id cannot say
+		// which.
+		if out, said := c.explainCursorNotFound(msg, reply); said {
+			return c.send(out)
+		}
 	}
 	if name == "killCursors" {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
