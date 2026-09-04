@@ -155,6 +155,7 @@ func runFeeder(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
 		return err
@@ -213,6 +214,7 @@ func runEvictor(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
 		return err
@@ -275,6 +277,7 @@ func runWarmer(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
 		return err
@@ -328,6 +331,7 @@ func runRouter(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	warnColdShape(log)
 
 	warnIfArchiveReadPreferenceIgnored(cfg.Cold.URI, log)
 
@@ -457,6 +461,34 @@ func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {
 	// So this says no, with the reason. Supporting a sharded fast tier is a
 	// feature, and the first thing it needs is health readings that mean
 	// something there.
+	// The archive is not refused for its shape, and is told about.
+	//
+	// The supported shape is a replica set on both tiers. A sharded archive was
+	// built once and it worked, which is why it is not refused: nothing the
+	// daemons hold themselves back on is read from the archive, so the health
+	// readings a mongos cannot give are never asked of it, and it only ever
+	// receives ordinary queries and writes. A standalone archive is the same
+	// story, since nothing tails it and it needs no oplog.
+	//
+	// Neither is tested, and "not refused" was indistinguishable from
+	// "supported" from the outside. It says so once at startup now.
+	if name == "cold" {
+		if kind, herr := kindOfTier(pingCtx, client); herr == nil {
+			switch kind {
+			case tierMongos:
+				coldShapeWarning = "the archive is a mongos. The supported shape is a replica set " +
+					"on both tiers: a sharded archive is not refused, because nothing the daemons " +
+					"hold themselves back on is read from the archive, but nothing here is tested " +
+					"against one either"
+			case tierStandalone:
+				coldShapeWarning = "the archive is a standalone mongod. The supported shape is a " +
+					"replica set on both tiers: nothing tails the archive so it needs no oplog, " +
+					"which is why this is not refused, but a standalone has no majority to write " +
+					"to and nothing here is tested against one"
+			}
+		}
+	}
+
 	if name == "hot" {
 		kind, herr := kindOfTier(pingCtx, client)
 		switch {
@@ -479,6 +511,25 @@ func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {
 		}
 	}
 	return client, nil
+}
+
+// coldShapeWarning is what to say about the archive's shape, if anything, set
+// by connect. Empty when it is a replica set, which is the supported shape.
+var coldShapeWarning string
+
+// warnColdShape says so when the archive is not a replica set.
+//
+// Called after the archive is open rather than beside the other startup
+// warnings, because those run before anything has connected. The first version
+// of this sat there and reported nothing for exactly that reason, and a
+// warning that never fires is worse than no warning at all.
+func warnColdShape(log *slog.Logger) {
+	if coldShapeWarning == "" {
+		return
+	}
+	log.Warn("the archive is not a replica set",
+		"detail", coldShapeWarning,
+		"action", "use a replica set on both tiers, or accept that this shape is untested")
 }
 
 // tierKind is what a connection landed on, which decides whether this can work
@@ -529,6 +580,7 @@ func disconnect(client *mongo.Client, log *slog.Logger) {
 // component owns the contradiction. See config.WindowWarnings for what it costs
 // and why it is not refused.
 func warnAboutWindows(log *slog.Logger, cfg config.Config) {
+
 	for _, w := range cfg.FeederIDWarnings() {
 		log.Warn("the evictor is pointed at a feeder this config does not describe",
 			"detail", w,

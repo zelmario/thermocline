@@ -2854,9 +2854,13 @@ mongosh --port 28018 --eval '
   fix, and the first thing it needs is health readings that mean something
   there.
 
-- **A sharded archive is not supported either, and it is not refused.** Both
-  tiers are replica sets: that is the supported shape, and it is the only one
-  anything here is tested against.
+- **A sharded archive is not supported either, and it is not refused. Every
+  daemon says so at startup.** Both tiers are replica sets: that is the
+  supported shape, and it is the only one anything here is tested against. A
+  standalone archive gets the same warning, for the same reason: nothing tails
+  the archive so it needs no oplog, which is why neither is refused, and neither
+  is tested. "Not refused" used to be indistinguishable from "supported" from
+  the outside.
 
   The distinction matters, so it is stated rather than left to be discovered. A
   mongos archive is *not* obviously broken. Nothing the daemons hold themselves
