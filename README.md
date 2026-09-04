@@ -2892,11 +2892,19 @@ mongosh --port 28018 --eval '
   than failing, because replaying a drop is exactly how one accident on the fast
   tier would destroy the archive. Removing archived documents is deliberately a
   separate act.
-- **`terminate_auth` has never met traffic that was not a test.** Everything it
-  lifts is lifted in principle only while it is off by default, and the
-  security-critical half of it is an authorization gate. That gate is the only
-  thing between a client and somebody else's data in that mode, it denies by
-  default, and it has thirty three checks behind it in `testauthterm.sh`,
+- **`terminate_auth` has never met a real workload.** It has now met harness
+  traffic, which it had not before: a three hour soak of 490 rounds through
+  mongosh, two shops writing at once for 19,253 commands, and the pilot's write,
+  stream and transaction batteries. That run is what found the gate refusing
+  fourteen out of fourteen ordinary diagnostic commands, because the
+  authorisation table only ever judged commands that touch data while drivers
+  and shells spend most of their commands elsewhere. What it has still not met
+  is an application nobody wrote for this.
+
+  Everything it lifts is lifted in principle only while it is off by default,
+  and the security-critical half of it is an authorization gate. That gate is
+  the only thing between a client and somebody else's data in that mode, it
+  denies by default, and it has fifty six checks behind it in `testauthterm.sh`,
   including the ones that caught it allowing a `$lookup`, a `$merge` and an
   unacknowledged write it should have refused. It is still a judgement call
   rather than a finished feature.
