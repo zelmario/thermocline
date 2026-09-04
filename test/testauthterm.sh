@@ -143,9 +143,20 @@ chk "connectionStatus needs no privilege"       "1"      "$(AS limited limpass '
 # The sharpest of these: the same command, allowed on the database this user can
 # read and refused on the one it cannot. A blanket exemption would pass the
 # first and fail the second.
-chk "dbHash on the granted database"            "1"      "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1}).ok)')"
-chk "and refused on another"                    "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1}).ok)')")"
-chk "and mongod agrees about both"              "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1}).ok)')")"
+#
+# Named collections rather than the whole database, and untiered ones, because
+# dbHash over a tiered collection the fast tier holds part of is refused for a
+# reason that has nothing to do with authorisation: it would answer a hash of
+# that part. The first version of this asked for the whole database and started
+# failing the day that refusal was added, on tiering grounds, which says nothing
+# about the privilege being tested here.
+H "db.getSiblingDB(process.env.TC_DB).tazhash.drop();
+   db.getSiblingDB(process.env.TC_DB).tazhash.insertOne({_id:1,v:'x'});
+   db.getSiblingDB('payroll').tazhash.drop();
+   db.getSiblingDB('payroll').tazhash.insertOne({_id:1,v:'x'})" >/dev/null
+chk "dbHash on the granted database"            "1"      "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:["tazhash"]}).ok)')"
+chk "and refused on another"                    "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
+chk "and mongod agrees about both"              "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
 # atlasVersion is how mongosh asks whether it is talking to Atlas, and mongod
 # does not have the command. Forwarded, so the client gets mongod's own answer
 # rather than a refusal this proxy invented, and so the refusal counter is not
