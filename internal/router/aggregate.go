@@ -508,7 +508,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 				return out, true
 			}
 		} else {
-			out, err := c.answerFromArchive(ctx, msg, db, coll)
+			out, err := c.answerFromArchive(ctx, msg, db, coll, true)
 			if err == nil {
 				c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
 				return out, true

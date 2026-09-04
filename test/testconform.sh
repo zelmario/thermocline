@@ -573,6 +573,34 @@ same 'update conflicting paths'    "try{print(COLL.updateOne({_id:17},{\$set:{'a
 same 'insert duplicate _id'        "try{print(COLL.insertOne({_id:17}).acknowledged)}$E"
 same 'findAndModify bad operator'  "try{print(JSON.stringify(COLL.findAndModify({query:{_id:17},update:{\$nosuchup:{x:1}}})))}$E"
 echo
+echo "== a point read is still the whole query =="
+# An _id equality names at most one document, which is why a point read is
+# exempt from the completeness guard: no claim about how much history the fast
+# tier holds is needed to answer it. The exemption never covered answering a
+# different question, and that is what happened, because the miss was resolved
+# by reading the document by its _id and handing it back.
+#
+# _id 17 lives only in the archive here, so every one of these takes that path.
+# samew rather than same: answering one of them promotes the document to the
+# fast tier, and the next check would then never reach the archive at all.
+samew 'a predicate that excludes the document' "print(JSON.stringify(COLL.find({_id:17,n:{\$gt:100}}).toArray()))"
+samew 'a predicate that includes it'           "print(JSON.stringify(COLL.find({_id:17,n:{\$gte:17}}).toArray()))"
+samew 'an \$eq on _id with a predicate'        "print(JSON.stringify(COLL.find({_id:{\$eq:17},grp:'nosuchgroup'}).toArray()))"
+samew 'a projection'                           "print(JSON.stringify(COLL.find({_id:17},{name:1,_id:0}).toArray()))"
+samew 'an excluding projection'                "print(JSON.stringify(COLL.find({_id:17},{items:0,loc:0,words:0,when:0}).toArray()))"
+samew 'skipped past'                            "print(JSON.stringify(COLL.find({_id:17}).skip(1).toArray()))"
+samew 'a limit of one'                          "print(JSON.stringify(COLL.find({_id:17}).limit(1).toArray()))"
+samew 'findOne with a predicate that excludes'  "print(JSON.stringify(COLL.findOne({_id:17,opt:'nosuchvalue'})))"
+samew 'the plain point read still answers'      "print(JSON.stringify(COLL.findOne({_id:17})))"
+# The write paths were never wrong here, because they copy the document up and
+# run the client's own statement against the fast tier, which applies the whole
+# filter. Locked in rather than assumed.
+samew 'an update by _id a predicate excludes'   "print(COLL.updateOne({_id:17,n:{\$gt:100}},{\$set:{touched:1}}).matchedCount)"
+samew 'and it changed nothing'                  "COLL.updateOne({_id:17,n:{\$gt:100}},{\$set:{touched:1}}); print(COLL.countDocuments({touched:1}))"
+samew 'a delete by _id a predicate excludes'    "print(COLL.deleteOne({_id:17,n:{\$gt:100}}).deletedCount)"
+samew 'findAndModify a predicate excludes'      "print(JSON.stringify(COLL.findAndModify({query:{_id:17,n:{\$gt:100}},update:{\$set:{touched:1}}})))"
+
+echo
 echo "== a stage that reads a collection of its own =="
 # $lookup, $unionWith and $graphLookup do not read the pipeline's input, they
 # read another collection, so the tombstone filter in front of the pipeline

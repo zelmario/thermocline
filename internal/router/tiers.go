@@ -1175,27 +1175,6 @@ func collectionsIn(ctx context.Context, client *mongo.Client, db string) (map[st
 	return out, cur.Err()
 }
 
-// singleDocReply builds a find reply carrying one document fetched from the
-// archive, shaped exactly as the fast tier would have shaped it.
-func (r *Router) singleDocReply(msg, reply *wire.Message, ns string, doc bson.Raw) (*wire.Message, error) {
-	var v bson.D
-	if err := bson.Unmarshal(doc, &v); err != nil {
-		return nil, fmt.Errorf("decode archived document: %w", err)
-	}
-
-	out := bson.D{
-		{Key: "cursor", Value: bson.D{
-			// Cursor id zero means the results are exhausted, so the driver
-			// never issues a getMore that this proxy could not answer.
-			{Key: "id", Value: int64(0)},
-			{Key: "ns", Value: ns},
-			{Key: "firstBatch", Value: bson.A{v}},
-		}},
-		{Key: "ok", Value: 1.0},
-	}
-	return wire.NewMsg(reply.Header.RequestID, msg.Header.RequestID, out)
-}
-
 // errorReply builds a command failure the driver will surface to the caller.
 func (r *Router) errorReply(msg, reply *wire.Message, errmsg string) (*wire.Message, error) {
 	return r.commandError(reply.Header.RequestID, msg.Header.RequestID, errmsg)

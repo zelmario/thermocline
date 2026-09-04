@@ -64,6 +64,31 @@ chk "point lookup finds an archived doc" "archived-only" "$(R 'const d=db.getSib
 sleep 2
 chk "and it was copied up"          "archived-only" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:9}); print(d?d.v:"MISSING")')"
 
+echo "== a point read is the whole query, not just the _id =="
+# An _id equality names at most one document, which is why a point lookup skips
+# the completeness guard. It never justified answering a different question, and
+# the miss used to be resolved by reading the document by its _id and handing it
+# back: the rest of the filter, the projection and the skip all went missing.
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:11,v:"untouched"})' >/dev/null
+chk "a predicate the document fails returns nothing" "null" "$(R 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:11,v:"nosuchvalue"}); print(d?d.v:null)')"
+sleep 2
+# And nothing was promoted. The copy-up exists because the client just read the
+# document, so it is hot; a read that returned no rows leaves nothing hot, and
+# copying up anyway writes into the fast tier for nobody and announces it on
+# every change stream watching the collection.
+chk "and the fast tier was left alone"               "MISSING" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:11}); print(d?d.v:"MISSING")')"
+chk "a projection is applied to it"                  "1"       "$(R 'const d=db.getSiblingDB(process.env.TC_DB).tprobe.findOne({_id:11},{_id:0,v:1}); print(d?Object.keys(d).length:"MISSING")')"
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:12,v:"skipme"})' >/dev/null
+chk "a skip past the only match returns nothing"     "0"       "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({_id:12}).skip(1).toArray().length)')"
+# batchSize zero asks for a cursor and no documents yet, which drivers do. The
+# hand-built reply put the document in the first batch regardless.
+C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:13,v:"cursored"})' >/dev/null
+chk "a cursor asked for with no first batch"         "0/cursored" "$(R 'const d=db.getSiblingDB(process.env.TC_DB);
+  const c=d.runCommand({find:"tprobe",filter:{_id:13},batchSize:0});
+  const n=c.cursor.firstBatch.length;
+  const m=d.runCommand({getMore:c.cursor.id,collection:"tprobe"});
+  print(n+"/"+((m.cursor&&m.cursor.nextBatch.length)?m.cursor.nextBatch[0].v:"NOTHING"))')"
+
 echo "== write miss and copy-up =="
 C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:10,v:"old"})' >/dev/null
 chk "update on an archived doc matches 1" "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tprobe.updateOne({_id:10},{$set:{v:"new"}}).matchedCount)')"

@@ -259,7 +259,7 @@ func (c *conn) interceptAggNewest(ctx context.Context, msg *wire.Message, db str
 	// The fast tier ran this and may be holding the rest of it. Nothing will
 	// ever ask for that rest. See superseded.go.
 	c.dropSupersededCursor(ctx, rdoc, db)
-	out, aerr := c.answerFromArchive(ctx, msg, db, coll)
+	out, aerr := c.answerFromArchive(ctx, msg, db, coll, true)
 	if aerr == nil {
 		c.log.Debug("aggregation answered from the archive", "ns", ns,
 			"because", "the fast tier's own answer did not prove it holds the newest of them")

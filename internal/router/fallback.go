@@ -259,7 +259,12 @@ func (reg *cursorRegistry) closeAll(ctx context.Context) {
 
 // answerFromArchive runs a find or aggregate against the archive and returns the
 // reply the client would have got from a single complete cluster.
-func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, coll string) (*wire.Message, error) {
+//
+// count says whether to record this as an archive read. A point lookup passes
+// false and records its own outcome instead: whether it was a miss that will be
+// promoted or an ordinary archive read is not known until the answer is in
+// hand, and the two are different numbers an operator watches. See Class.
+func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, coll string, count bool) (*wire.Message, error) {
 	cmd, err := msg.CommandDoc()
 	if err != nil {
 		return nil, err
@@ -311,8 +316,10 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 		_ = cur.Close(ctx)
 	}
 
-	c.r.Stats.Archived.Add(1)
-	c.cls = ClassArchive
+	if count {
+		c.r.Stats.Archived.Add(1)
+		c.cls = ClassArchive
+	}
 	return cursorReply(msg.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", batch)
 }
 

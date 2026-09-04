@@ -107,7 +107,9 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// Linearizable cannot be honoured by another cluster, and downgrading the
 	// strongest guarantee in the system without saying so is the one thing this
 	// must not do.
-	level, honourable := archiveLevel(cmd)
+	// The level itself is carried across by rewriteForArchive along with the
+	// rest of the command, so only the refusal is decided here.
+	_, honourable := archiveLevel(cmd)
 	if !honourable {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
@@ -118,27 +120,20 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 				"document. Warm this range, or read it with majority.")
 	}
 
-	c.r.Stats.ReadMisses.Add(1)
-	c.cls = ClassMiss
-	// A document deleted a moment ago is still live in the archive until the
-	// tombstone is mirrored, so a miss has to wait for mirroring before it can
-	// treat the archive's copy as the truth.
-	c.archiveReadIsFresh(ctx, ns, time.Now(), maxTimeBudget(cmd))
-	doc, found, err := c.r.readArchived(ctx, ns, id, level)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		// Genuinely absent from both tiers. The empty answer was correct.
-		return reply, nil
-	}
-
 	// Inside a transaction, answering from the archive would mix two clusters
 	// into one snapshot. Copy the document up and replay instead, so the whole
 	// transaction reads a fast tier that holds it.
+	//
+	// copyUp reports whether the document was there at all, which is the same
+	// question the read below has to answer, so it is asked once.
 	if inTransaction(cmd) {
-		if _, cerr := c.r.copyUp(ctx, ns, id); cerr != nil {
+		copied, cerr := c.r.copyUp(ctx, ns, id)
+		if cerr != nil {
 			return nil, cerr
+		}
+		if !copied {
+			// Genuinely absent from both tiers. The empty answer was correct.
+			return reply, nil
 		}
 		c.r.Stats.TxnReplays.Add(1)
 		c.cls = ClassTxnWarm
@@ -147,15 +142,68 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 			"this transaction read a document that had been archived, and it has now been restored to the fast tier")
 	}
 
-	// Reply first, copy up afterwards. The caller already has what it asked
-	// for, and making it wait on a write it did not request would turn a 30 ms
-	// miss into a slower one for no benefit.
-	out, err := c.r.singleDocReply(msg, reply, ns, doc)
+	// The archive answers the command the client sent, not a lookup by _id.
+	//
+	// This used to read the document by its _id and hand it back, and an _id is
+	// not the whole of a filter. Measured by the differential harness:
+	// find({_id: 33, f: {$gt: 13.75}}) where document 33 holds f: 8.25 and
+	// lives only in the archive. MongoDB returns nothing and the router
+	// returned the document, so a query was answered with a record that does
+	// not match it. A projection and a skip went the same way, both ignored by
+	// a reply built here from the document alone.
+	//
+	// The point read keeps its exemption from the completeness guard, which is
+	// what it is for: at most one document can match an _id equality, so no
+	// claim about how much of history the fast tier holds is needed to answer
+	// it. What the exemption never justified was answering a different
+	// question. rewriteForArchive carries the filter, projection, skip, limit,
+	// collation, hint and read concern across, and the freshness wait a miss
+	// needs before it can treat the archive's copy as the truth happens inside
+	// answerFromArchive with every other archive read.
+	out, err := c.answerFromArchive(ctx, msg, db, coll, false)
 	if err != nil {
 		return nil, err
 	}
-	c.r.copyUpAsync(ns, id)
+
+	// Promoted only if the client actually got it. A filter that matched
+	// nothing leaves nothing hot to promote, and copying up regardless would
+	// write a document into the fast tier that nobody read and announce it on
+	// every change stream watching the collection.
+	//
+	// After the reply is built, not before: the caller already has what it
+	// asked for, and making it wait on a write it did not request would turn a
+	// 30 ms miss into a slower one for no benefit.
+	//
+	// Which of the two this was is also settled here, and it follows the same
+	// line: promoted makes it a miss, and not promoted makes it an ordinary
+	// archive read, which is exactly how Class defines them.
+	if replyCarriesDocuments(out) {
+		c.r.Stats.ReadMisses.Add(1)
+		c.cls = ClassMiss
+		c.r.copyUpAsync(ns, id)
+	} else {
+		// Nothing to promote, so this was an ordinary archive read and is
+		// counted as one. It used to be counted as a read miss whatever came
+		// back, including when the document was in neither tier, which the
+		// counter's own description says it is not: "point lookups that found
+		// the document only in the archive".
+		c.r.Stats.Archived.Add(1)
+		c.cls = ClassArchive
+	}
 	return out, nil
+}
+
+// replyCarriesDocuments reports whether a reply's first batch holds anything.
+func replyCarriesDocuments(reply *wire.Message) bool {
+	if reply == nil {
+		return false
+	}
+	rdoc, err := reply.ReplyDoc()
+	if err != nil {
+		return false
+	}
+	batch, ok := firstBatch(rdoc)
+	return ok && len(batch) > 0
 }
 
 // interceptWrite handles a write that matched nothing.
@@ -438,7 +486,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		if fdoc, ferr := reply.ReplyDoc(); ferr == nil {
 			c.dropSupersededCursor(ctx, fdoc, db)
 		}
-		out, aerr := c.answerFromArchive(ctx, msg, db, coll)
+		out, aerr := c.answerFromArchive(ctx, msg, db, coll, true)
 		if aerr == nil {
 			c.log.Debug("read answered from the archive", "ns", ns, "because", because)
 			return out, nil
