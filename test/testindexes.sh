@@ -530,6 +530,13 @@ echo "== the same options going the other way, into the archive =="
 # additionalProperties false on purpose: it is the shape that refuses a
 # tombstone, which is the document with a mark added, and the archive did not
 # have a validator to refuse one with until this carried it down.
+#
+# The feeder's log is appended to, never truncated, so the check below counts
+# what this section caused rather than how many lines the file holds: measured,
+# a refusal logged on 2026-08-22 by a run of another suite failed this check on
+# 2026-09-05, on a binary that refused nothing. Same shape as the baseline
+# testkeys.sh takes around its own log count.
+REFUSED_WAS=$({ grep -c 'the archive refuses a document the fast tier accepted' $LOGDIR/idx_f.log 2>/dev/null || true; } | head -1)
 R "db.getSiblingDB(process.env.TC_DB).createCollection('$ONS',{collation:{locale:'en',strength:2},
      validator:{\$jsonSchema:{bsonType:'object',required:['email'],additionalProperties:false,
                 properties:{_id:{},name:{},email:{bsonType:'string'}}}}})" >/dev/null
@@ -575,8 +582,9 @@ for _ in $(seq 1 40); do
 done
 chk "a delete still becomes a tombstone there"    "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$ONS.countDocuments({_id:9,_tcDeletedAt:{\$exists:true}}))")"
+REFUSED_NOW=$({ grep -c 'the archive refuses a document the fast tier accepted' $LOGDIR/idx_f.log 2>/dev/null || true; } | head -1)
 chk "and mirroring refused nothing"               "0" \
-    "$({ grep -c 'the archive refuses a document the fast tier accepted' $LOGDIR/idx_f.log 2>/dev/null || true; } | head -1)"
+    "$((REFUSED_NOW - REFUSED_WAS))"
 
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
