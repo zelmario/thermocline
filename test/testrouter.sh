@@ -450,6 +450,57 @@ chk "the fast tier ends up with the collection"    "true" \
 chk "so stats answers, and for the whole thing"    "3" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CATNS.stats().count)")"
 
+echo "== the commands that describe a collection, not the ones that read it =="
+# Reads of a tiered collection the fast tier has never held work, because they
+# fall through to the archive. The commands that ask *about* the collection go to
+# the fast tier alone, and it answers that the collection does not exist.
+#
+# Measured before this, with the router running throughout and nothing having
+# listed the catalog: countDocuments 6, find 6, distinct 6, and then
+# db.coll.stats() "Unable to retrieve storageStats in $collStats",
+# getIndexes() "ns does not exist", validate() "does not exist to validate",
+# collMod "ns does not exist". The collStats *command* answered, because mongod
+# is lenient about that one form and replies with a count of nought, which this
+# router then corrects. So two spellings of one question and the one an operator
+# types by hand was the one that failed.
+#
+# Its own collection, because a catalog listing is what used to repair this and
+# the section above has just done one.
+CAT2=tcatalog2
+H "db.getSiblingDB(process.env.TC_DB).$CAT2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CAT2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$CAT2',{collation:{locale:'en',strength:2}});
+   db.getSiblingDB(process.env.TC_DB).$CAT2.createIndex({n:1});
+   db.getSiblingDB(process.env.TC_DB).$CAT2.insertMany([{_id:1,n:'a'},{_id:2,n:'b'},{_id:3,n:'c'}])" >/dev/null
+chk "the fast tier does not have it"               "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CAT2') >= 0)")"
+# The control again: a check that it describes the collection says nothing if the
+# router cannot read it either.
+chk "the router reads it"                          "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CAT2.countDocuments({}))")"
+chk "getIndexes answers rather than denying it"    "_id_" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$CAT2.getIndexes().map(function (i) { return i.name })[0])}catch(e){print('ERROR '+e.message.substring(0,40))}")"
+chk "db.coll.stats() answers, for the whole thing" "3" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$CAT2.stats().count)}catch(e){print('ERROR '+e.message.substring(0,40))}")"
+chk "validate runs"                                "true" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$CAT2.validate().ok === 1)}catch(e){print('ERROR '+e.message.substring(0,40))}")"
+chk "collMod runs"                                 "1" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$CAT2',validationLevel:'off'}).ok)}catch(e){print('ERROR '+e.message.substring(0,40))}")"
+# Asking is what repairs it, and the repair is the archive's collection rather
+# than a bare one: the collation decides which documents match and cannot be
+# added afterwards, and the indexes are what the application's queries use.
+chk "the fast tier has the archive's collation"    "en/2" \
+    "$(H "const o=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$CAT2'})[0];
+          print(o&&o.options&&o.options.collation?o.options.collation.locale+'/'+o.options.collation.strength:'NONE')")"
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$CAT2.getIndexes().length)")" = "2" ] && break
+  sleep 1
+done
+chk "and the archive's indexes, once built"        "_id_,n_1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$CAT2.getIndexes().map(function (i) { return i.name }).sort().join(','))")"
+H "db.getSiblingDB(process.env.TC_DB).$CAT2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CAT2.drop()" >/dev/null
+
 echo "== and a database the fast tier has no trace of =="
 # The same gap one level up, and it reads worse. A database whose tiered
 # collections are all in the archive is not in listDatabases at all, so it does

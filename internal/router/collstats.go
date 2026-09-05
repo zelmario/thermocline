@@ -111,7 +111,7 @@ func (c *conn) interceptAggCollStats(ctx context.Context, msg *wire.Message, db 
 		return reply, nil
 	}
 	coll, ok := stringField(cmd, "aggregate")
-	if !ok || !leadsWithCollStats(cmd) {
+	if !ok || !leadsWith(cmd, collStatsStage) {
 		return reply, nil
 	}
 	rdoc, err := reply.ReplyDoc()
@@ -156,26 +156,9 @@ func (c *conn) interceptAggCollStats(ctx context.Context, msg *wire.Message, db 
 	return cursorReply(reply.Header.RequestID, msg.Header.RequestID, id, ns, "firstBatch", out)
 }
 
-// leadsWithCollStats reports whether a pipeline's first stage is $collStats.
-func leadsWithCollStats(cmd bson.Raw) bool {
-	v, err := cmd.LookupErr("pipeline")
-	if err != nil {
-		return false
-	}
-	vals, err := v.Array().Values()
-	if err != nil || len(vals) == 0 {
-		return false
-	}
-	stage, ok := vals[0].DocumentOK()
-	if !ok {
-		return false
-	}
-	elems, err := stage.Elements()
-	if err != nil || len(elems) == 0 {
-		return false
-	}
-	return elems[0].Key() == "$collStats"
-}
+// collStatsStage is the one stage whose reply this file knows how to correct.
+// See leadsWith in describe.go.
+var collStatsStage = map[string]bool{"$collStats": true}
 
 // withCount replaces the document counts in a stats document and reports
 // whether it found any.

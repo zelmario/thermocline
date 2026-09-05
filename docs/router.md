@@ -424,6 +424,36 @@ Range queries are governed by the watermark below.
   repairs it: the router creates the collection on the fast tier with the
   archive's options and indexes, which is what lets it be asked for its stats.
 
+  **The commands that describe a collection get the same repair, and four of
+  them used not to.** A read of a tiered collection the fast tier has never held
+  falls through to the archive; a command that asks *about* the collection goes
+  to the fast tier alone and is told it does not exist. Measured on one the
+  archive holds six documents of, with nothing having listed the catalog:
+  `countDocuments`, `find` and `distinct` all answered 6, and then
+
+  ```
+  db.coll.stats()   Unable to retrieve storageStats in $collStats
+  getIndexes()      ns does not exist
+  validate()        Collection 'catdb.tdbstats' does not exist to validate
+  collMod           ns does not exist
+  ```
+
+  The `collStats` *command* answered, because mongod is lenient about that one
+  form and replies `ok: 1` with a count of nought, which this router then
+  corrects to 6. The `$collStats` *stage* errors, and that is what `mongosh`
+  sends for `db.coll.stats()`. So two spellings of one question, and the one an
+  operator types by hand was the one that failed.
+
+  `listIndexes`, `collStats`, `validate` and `collMod`, and an aggregation led by
+  `$collStats` or `$indexStats`, now give the fast tier the collection before
+  they run, exactly as a write into an unheld collection already did. It cannot
+  invent one: the create reads the archive's options and does nothing when the
+  archive does not hold the collection either, so a name that exists nowhere
+  still gets mongod's own answer. The first `getIndexes` after the repair reports
+  `_id_` and the archive's indexes arrive with the build that follows, because
+  the fast tier's indexes are the fast tier's and that is what `listIndexes` is
+  asked for. `cline indexes` is what reports both.
+
   `dbStats`'s `collections` counts what the fast tier has rather than what the
   catalog now lists, and in practice those agree: the router creates the fast
   tier's copy of every namespace it manages as it starts, so a database the fast

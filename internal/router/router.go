@@ -827,6 +827,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// A command that asks about a tiered collection rather than for its
+	// documents is answered by the fast tier alone, and a fast tier that has
+	// never held the collection says it does not exist. Give it one first. See
+	// describe.go for the four that were told so while every read worked.
+	if nameErr == nil && !msg.MoreToCome() {
+		c.ensureDescribable(ctx, msg, name, db)
+	}
+
 	// count and distinct read documents the same way find does, so they need
 	// the same completeness check.
 	if nameErr == nil && (name == "count" || name == "distinct") && !msg.MoreToCome() {

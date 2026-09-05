@@ -39,6 +39,11 @@ feeder:
     # testrouter.sh: a tiered collection deliberately left off the fast tier, to
     # check the router still names it in the catalog and reads it.
     - "shop.tcatalog"
+    # testrouter.sh: the same shape again, for the commands that describe a
+    # collection rather than read it. Its own collection because nothing may
+    # have listed it: a listing repairs the fast tier and would answer the
+    # question before it is asked.
+    - "shop.tcatalog2"
     # testindexes.sh: an adopted collection whose indexes carry options the copy
     # has to bring across whole, a text index and a wildcard one.
     - "shop.tidxtext"
