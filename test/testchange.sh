@@ -240,6 +240,175 @@ echo "  the watcher saw: ${LOOKUP:-nothing}"
 chk "a lookup is answered from the archive"            "HAS looked up" "$LOOKUP"
 startFeeder
 
+echo "== the same two events, read by a consumer that is behind =="
+# Both suppressions are decided when the events are handed over, not when they
+# happened. An application that stores its resume token and comes back to it,
+# or that simply batches, reads events long after the fact. Storing the token
+# and resuming is the correct thing for an application to do, so this is the
+# ordinary case rather than an exotic one.
+#
+# The watcher opens its stream, waits out the window without reading, and only
+# then asks. The events are already sitting on the server; what changes is when
+# the router is asked to hand them over.
+OID4=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 774)
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID4'), v:'late'})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')}); print(d?d.v:'')")" = "late" ] && break
+  sleep 0.5
+done
+
+rm -f /tmp/cs_events5.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  sleep(40000);
+  let ops=[];
+  for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events5.txt 2>&1 &
+WATCHER5=$!
+sleep 3
+# The eviction is made by hand rather than by running the evictor, so that it
+# happens whatever the evictor's eligibility rules say at this point in the
+# suite: the run before this one left the feeder restarted, and an evictor that
+# refuses because mirroring looks behind evicts nothing, which makes a check
+# that looks for no delete pass by seeing no events at all.
+#
+# This is exactly what the evictor does: announce the removal, then make it.
+# The notice id is the namespace and the document id encoded the way meta.DocID
+# encodes it, which for an ObjectId is the type byte 07 and its twelve bytes.
+C "db.getSiblingDB(process.env.TC_META).evicting.updateOne(
+     {_id:'$DB.$NS|07$OID4'},
+     {\$inc:{pending:1}, \$set:{at:new Date()}},
+     {upsert:true})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID4')})" >/dev/null
+LATE=$(awaitWatcher /tmp/cs_events5.txt $WATCHER5)
+echo "  the late watcher saw: ${LATE:-nothing}"
+# Seeing no delete proves nothing if no eviction happened. Both of these
+# sections say "none" either way, so the thing they are about has to be shown
+# to have taken place.
+chk "the eviction actually happened"                   "MISSING" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')}); print(d?d.v:'MISSING')")"
+chk "the late watcher was actually watching"           "true" \
+    "$(echo "${LATE:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+# Keyed to this document, not to the word delete. A stream on a collection this
+# suite has been writing to all along can carry an event from something else,
+# and a check that greps for the operation alone reports that as the defect.
+chk "an eviction read late is not a delete"            "true" \
+    "$(echo "${LATE:-none}" | grep -q "delete:\"$OID4\"" && echo false || echo true)"
+
+# And the copy-up half of it, on the document that was just evicted.
+rm -f /tmp/cs_events6.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  sleep(40000);
+  let ops=[];
+  for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events6.txt 2>&1 &
+WATCHER6=$!
+sleep 3
+R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')})" >/dev/null
+LATE2=$(awaitWatcher /tmp/cs_events6.txt $WATCHER6)
+echo "  the late watcher saw: ${LATE2:-nothing}"
+chk "the copy-up actually happened"                    "late" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')}); print(d?d.v:'MISSING')")"
+chk "the second late watcher was actually watching"    "true" \
+    "$(echo "${LATE2:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+chk "a copy-up read late is not an insert"             "true" \
+    "$(echo "${LATE2:-none}" | grep -q "insert:\"$OID4\"" && echo false || echo true)"
+
+echo "== a change stream on the whole database =="
+# db.watch() sends aggregate: 1 rather than a collection name, so it carried no
+# namespace to match against the configuration, was never registered for
+# filtering, and nothing it delivered was ever sieved. An application following
+# several collections with one stream saw every copy-up as an insert and every
+# eviction as a delete. Measured: the collection stream hid a copy-up and the
+# database stream reported it.
+OID5=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 775)
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID5'), v:'wide'})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID5')}); print(d?d.v:'')")" = "wide" ] && break
+  sleep 0.5
+done
+
+# The eviction, made by hand for the reason given above.
+rm -f /tmp/cs_events7.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).watch();
+  let ops=[];
+  for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+(e.ns?e.ns.coll:'?')); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events7.txt 2>&1 &
+WATCHER7=$!
+sleep 3
+C "db.getSiblingDB(process.env.TC_META).evicting.updateOne(
+     {_id:'$DB.$NS|07$OID5'},
+     {\$inc:{pending:1}, \$set:{at:new Date()}},
+     {upsert:true})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID5')})" >/dev/null
+WIDE1=$(awaitWatcher /tmp/cs_events7.txt $WATCHER7)
+echo "  the database watcher saw: ${WIDE1:-nothing}"
+chk "the eviction actually happened"                   "MISSING" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID5')}); print(d?d.v:'MISSING')")"
+chk "the database watcher was actually watching"       "true" \
+    "$(echo "${WIDE1:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+chk "an eviction is not a delete on a database stream" "true" \
+    "$(echo "${WIDE1:-none}" | grep -q delete && echo false || echo true)"
+# The database watcher records the collection rather than the id, and this
+# suite writes to only one collection, so the operation alone is specific
+# enough there.
+
+# The copy-up half, and with it the control that matters most: filtering a
+# stream must not silence it. A write the application really made has to arrive.
+rm -f /tmp/cs_events8.txt
+# Every event over a fixed window, keyed by document, rather than the first one
+# that arrives. Grepping for "insert" was satisfied by the copy-up's own insert,
+# so the control passed while reporting the very event it was meant to rule out.
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).watch();
+  let ops=[];
+  for (let i=0;i<60;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events8.txt 2>&1 &
+WATCHER8=$!
+sleep 3
+R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID5')})" >/dev/null
+sleep 2
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'wide-real', v:'real'})" >/dev/null
+WIDE2=$(awaitWatcher /tmp/cs_events8.txt $WATCHER8)
+echo "  the database watcher saw: ${WIDE2:-nothing}"
+chk "the copy-up actually happened"                    "wide" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID5')}); print(d?d.v:'MISSING')")"
+# Exactly one event, and it is the application's. Filtering a stream must not
+# silence it, and must not leave the copy-up in it either.
+chk "the application's insert arrives, and only it"    'insert:"wide-real"' "$WIDE2"
+chk "and the document really is there"                 "true" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:'wide-real'}); print(!!d)")"
+
+# The whole deployment is a third shape again: client.watch() sends aggregate: 1
+# against admin. And a tiered $out assembles its result in a scratch collection
+# inside the application's own database, which a client watching the database
+# would see appear, fill and vanish. The catalog listing already hides those.
+rm -f /tmp/cs_events9.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getMongo().watch();
+  let ops=[];
+  for (let i=0;i<60;i++) { const e=cs.tryNext(); if (e && e.ns && e.ns.db===process.env.TC_DB) ops.push(e.operationType+':'+e.ns.coll); else if (!e) sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events9.txt 2>&1 &
+WATCHER9=$!
+sleep 3
+R "db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$v',n:{\$sum:1}}},{\$out:'$NS_rollup'}]).toArray()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'deployment-real', v:'real'})" >/dev/null
+WIDE3=$(awaitWatcher /tmp/cs_events9.txt $WATCHER9)
+echo "  the deployment watcher saw: ${WIDE3:-nothing}"
+chk "the deployment watcher was actually watching"     "true" \
+    "$(echo "${WIDE3:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+chk "no scratch collection is reported"                "true" \
+    "$(echo "${WIDE3:-none}" | grep -q "tmp.thermocline" && echo false || echo true)"
+chk "the application's own insert still arrives"       "true" \
+    "$(echo "${WIDE3:-none}" | grep -q "insert:$NS" && echo true || echo false)"
+
 stopDaemons
 echo
 echo "================================"

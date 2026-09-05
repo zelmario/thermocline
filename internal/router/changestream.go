@@ -41,6 +41,14 @@ import (
 // document is meant to stay hot, so presence alone would suppress a genuine
 // insert of a document that had been copied up and later deleted by the
 // application. The event's own time has to be close to the promotion.
+//
+// The event's own time, and it was not: this was measured against the clock at
+// the moment the events were handed over, which is a different instant whenever
+// the client is not keeping up. An application that stores its resume token and
+// comes back to it gets a backlog, and every promotion in that backlog is older
+// than the window. Measured: one promotion, read at once, invisible; the same
+// promotion read thirty-five seconds later arrived as an insert. Storing the
+// token and resuming is the correct thing for an application to do.
 const promotionWindow = 30 * time.Second
 
 // changeStreamRegistry remembers which cursors are change streams that need
@@ -82,8 +90,34 @@ func (reg *changeStreamRegistry) drop(id int64) {
 // its later batches can be filtered.
 func (c *conn) noteChangeStream(cmd bson.Raw, db string, reply *wire.Message) {
 	ns, isCS := changeStreamCollection(cmd, db)
-	if !isCS || ns == "" || !c.r.cfg.Manages(ns) {
+	if !isCS {
 		return
+	}
+	// A change stream on a whole database or the whole deployment sends
+	// aggregate: 1 rather than a collection name, so it had no namespace to
+	// match against the configuration and was never registered, and nothing it
+	// delivered was ever filtered. db.watch() is ordinary: an application
+	// follows several collections with one stream. Measured: the collection
+	// stream hid a copy-up and the database stream reported it as an insert.
+	//
+	// Every event carries its own namespace, so the wider kinds are filtered
+	// per event instead, and this only has to decide whether any event could
+	// be about a collection this system tiers.
+	watching := ns
+	switch {
+	case ns != "":
+		if !c.r.cfg.Manages(ns) {
+			return
+		}
+	case db == "admin":
+		// The whole deployment. Which databases it will carry events for is
+		// not knowable here.
+		watching = "the whole deployment"
+	default:
+		if !c.r.managesAnythingIn(db) {
+			return
+		}
+		watching = db + ", the whole database"
 	}
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
@@ -93,8 +127,8 @@ func (c *conn) noteChangeStream(cmd bson.Raw, db string, reply *wire.Message) {
 	if !ok || id == 0 {
 		return
 	}
-	c.r.changeStreams.add(id, ns)
-	c.log.Info("filtering tiering events out of a change stream", "ns", ns, "cursor", id)
+	c.r.changeStreams.add(id, watching)
+	c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
 }
 
 // filterChangeStream removes this system's own housekeeping from a change
@@ -112,11 +146,11 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	if !ok {
 		return nil, false
 	}
-	ns, watched := c.r.changeStreams.get(id)
+	watching, watched := c.r.changeStreams.get(id)
 	if !watched {
 		return nil, false
 	}
-	c.log.Debug("filtering a change stream batch", "ns", ns, "cursor", id)
+	c.log.Debug("filtering a change stream batch", "watching", watching, "cursor", id)
 
 	rdoc, derr := reply.ReplyDoc()
 	if derr != nil || !replyOK(rdoc) {
@@ -127,20 +161,20 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 		return nil, false
 	}
 
-	keep, dropped := c.r.sieveEvents(ctx, ns, events)
+	keep, dropped := c.r.sieveEvents(ctx, events)
 	// A lookup the fast tier could not answer is asked of the archive, because
 	// null means deleted and this document is not. See fillLookups.
-	keep, filled := c.r.fillLookups(ctx, ns, keep)
+	keep, filled := c.r.fillLookups(ctx, keep)
 	if dropped == 0 && filled == 0 {
 		return nil, false
 	}
 	if dropped > 0 {
 		c.r.Stats.EventsHidden.Add(int64(dropped))
-		c.log.Info("hid tiering events from a change stream", "ns", ns, "hidden", dropped)
+		c.log.Info("hid tiering events from a change stream", "watching", watching, "hidden", dropped)
 	}
 	if filled > 0 {
 		c.log.Debug("answered a change stream's document lookups from the archive",
-			"ns", ns, "filled", filled)
+			"watching", watching, "filled", filled)
 	}
 
 	out, berr := replaceNextBatch(rdoc, keep, msg.Header.RequestID)
@@ -152,11 +186,21 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 
 // sieveEvents returns the events an application should see, and how many were
 // this system's own work.
-func (r *Router) sieveEvents(ctx context.Context, ns string, events []bson.RawValue) (bson.A, int) {
+func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.A, int) {
 	// Gather the ids to ask about, so one lookup covers the whole batch.
 	var deleteIDs, insertIDs []string
 	kinds := make([]string, len(events))
 	docIDs := make([]string, len(events))
+
+	// Namespaces this router made for itself, which a client watching a whole
+	// database would otherwise see appear, fill and vanish. A tiered $out is
+	// assembled in a scratch collection inside the application's own database,
+	// because the rename that finishes it cannot cross databases. The catalog
+	// listing already hides them for the same reason: a client that acts on
+	// what it finds would act on that. Every kind of event, not just inserts
+	// and deletes, because a scratch collection is created, written, renamed
+	// and dropped.
+	scratch := make([]bool, len(events))
 
 	for i, ev := range events {
 		doc, ok := ev.DocumentOK()
@@ -165,7 +209,18 @@ func (r *Router) sieveEvents(ctx context.Context, ns string, events []bson.RawVa
 		}
 		op, _ := lookupString(doc, "operationType")
 		kinds[i] = op
+		if evns, nsok := eventNS(doc); nsok {
+			_, coll := splitNS(evns)
+			scratch[i] = meta.IsScratch(coll)
+		}
 		if op != "delete" && op != "insert" {
+			continue
+		}
+		// The event's own namespace, not the cursor's: a stream on a whole
+		// database carries a different one on each event, and an event about a
+		// collection nothing tiers has no housekeeping behind it to hide.
+		ns, nsok := eventNS(doc)
+		if !nsok || !r.cfg.Manages(ns) {
 			continue
 		}
 		key, kerr := doc.LookupErr("documentKey")
@@ -188,16 +243,25 @@ func (r *Router) sieveEvents(ctx context.Context, ns string, events []bson.RawVa
 		}
 	}
 
-	evicted := r.announcedIn(ctx, meta.Evicting, deleteIDs, time.Time{})
-	promoted := r.announcedIn(ctx, meta.Residency, insertIDs, time.Now().Add(-promotionWindow))
+	evicted := r.evictionNotices(ctx, deleteIDs)
+	promoted := r.promotionTimes(ctx, insertIDs)
+	// The old rule, kept as a floor. Whatever the events say about their own
+	// time, a promotion recorded within the window still counts, so this can
+	// only ever suppress more than it did and never less. That also settles the
+	// clock question: promotedAt is written by a router and an event's time
+	// comes from the fast tier's primary, two clocks, and skew between them can
+	// only fail to widen the window, never narrow it.
+	recent := time.Now().Add(-promotionWindow)
 
 	keep := make(bson.A, 0, len(events))
 	dropped := 0
 	for i, ev := range events {
 		switch {
-		case kinds[i] == "delete" && evicted[docIDs[i]]:
+		case scratch[i]:
 			dropped++
-		case kinds[i] == "insert" && promoted[docIDs[i]]:
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev)):
+			dropped++
+		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), recent):
 			dropped++
 		default:
 			keep = append(keep, ev)
@@ -206,37 +270,157 @@ func (r *Router) sieveEvents(ctx context.Context, ns string, events []bson.RawVa
 	return keep, dropped
 }
 
-// announcedIn reports which of these document ids appear in one of the
-// bookkeeping collections.
+// eventNS is the namespace one change stream event happened in.
+func eventNS(doc bson.Raw) (string, bool) {
+	nsv, err := doc.LookupErr("ns")
+	if err != nil {
+		return "", false
+	}
+	nd, ok := nsv.DocumentOK()
+	if !ok {
+		return "", false
+	}
+	db, dok := stringField(nd, "db")
+	coll, cok := stringField(nd, "coll")
+	if !dok || !cok {
+		return "", false
+	}
+	return db + "." + coll, true
+}
+
+// evictionWindow is how close a delete has to be to the announcement for it to
+// be read as an eviction rather than as the application deleting the document.
 //
-// since, when set, requires the record to be newer than it, which is what
-// separates a document promoted a moment ago from one that has merely been
-// resident for a month.
-func (r *Router) announcedIn(ctx context.Context, coll string, ids []string, since time.Time) map[string]bool {
-	out := map[string]bool{}
+// It did not need one: the notice was removed the moment the feeder applied the
+// eviction, so a notice that still existed meant an eviction that had just
+// happened, and presence alone answered the question. A notice now lives out
+// its TTL, because a client reading its events late needs it to, and presence
+// alone would then hide a genuine delete of a document that had been evicted
+// and warmed back up within the hour.
+const evictionWindow = 30 * time.Second
+
+// evictionNote is what the sieve needs to know about one announcement.
+type evictionNote struct {
+	left int
+	at   time.Time
+}
+
+// isEviction reports whether this delete is the evictor making room rather than
+// the application removing a document.
+func isEviction(notes map[string]evictionNote, id string, at time.Time) bool {
+	note, ok := notes[id]
+	if !ok {
+		return false
+	}
+	// Unclaimed, which is what presence alone used to mean: announced, and the
+	// feeder has not applied it yet. Kept exactly so this can only suppress
+	// more than it did.
+	if note.left > 0 {
+		return true
+	}
+	if at.IsZero() || note.at.IsZero() {
+		return false
+	}
+	d := at.Sub(note.at)
+	if d < 0 {
+		d = -d
+	}
+	return d <= evictionWindow
+}
+
+// evictionNotices reads the announcements for these documents.
+func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]evictionNote {
+	out := map[string]evictionNote{}
 	if len(ids) == 0 {
 		return out
 	}
-	filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}
-	if !since.IsZero() {
-		filter = append(filter, bson.E{Key: "promotedAt", Value: bson.D{{Key: "$gte", Value: since}}})
-	}
-	cur, err := r.cold.Database(meta.DB).Collection(coll).Find(ctx, filter)
+	cur, err := r.cold.Database(meta.DB).Collection(meta.Evicting).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
 	if err != nil {
 		// Nothing is hidden when the answer cannot be had. An application
 		// seeing an eviction is bad; an application missing a real delete
 		// because a lookup failed would be worse.
-		r.log.Warn("could not read tiering announcements, letting the events through",
-			"collection", coll, "err", err)
+		r.log.Warn("could not read eviction announcements, letting the events through", "err", err)
+		return out
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	for cur.Next(ctx) {
+		var rec meta.EvictionNotice
+		if cur.Decode(&rec) == nil {
+			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC()}
+		}
+	}
+	return out
+}
+
+// isPromotion reports whether this insert is a copy-up rather than the
+// application creating a document.
+func isPromotion(promoted map[string]time.Time, id string, at time.Time, recent time.Time) bool {
+	when, ok := promoted[id]
+	if !ok {
+		return false
+	}
+	if when.After(recent) {
+		return true
+	}
+	// The event carries no time to judge it by on a server old enough not to
+	// send one, and there is nothing left to say.
+	if at.IsZero() {
+		return false
+	}
+	d := at.Sub(when)
+	if d < 0 {
+		d = -d
+	}
+	return d <= promotionWindow
+}
+
+// eventTime is when a change stream event happened, as the cluster that
+// produced it saw it. wallTime is what a comparison against a wall clock needs
+// and MongoDB has sent it since 6.0; clusterTime is the fallback, to one
+// second, and is always there.
+func eventTime(ev bson.RawValue) time.Time {
+	doc, ok := ev.DocumentOK()
+	if !ok {
+		return time.Time{}
+	}
+	if v, err := doc.LookupErr("wallTime"); err == nil {
+		if t, tok := v.TimeOK(); tok {
+			return t.UTC()
+		}
+	}
+	if v, err := doc.LookupErr("clusterTime"); err == nil {
+		if secs, _, tok := v.TimestampOK(); tok {
+			return time.Unix(int64(secs), 0).UTC()
+		}
+	}
+	return time.Time{}
+}
+
+// promotionTimes reports, for each of these document ids that has a residency
+// record, when it was promoted.
+func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]time.Time {
+	out := map[string]time.Time{}
+	if len(ids) == 0 {
+		return out
+	}
+	cur, err := r.cold.Database(meta.DB).Collection(meta.Residency).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	if err != nil {
+		// Nothing is hidden when the answer cannot be had: an application
+		// seeing a promotion is bad, and one missing a real insert because a
+		// lookup failed would be worse.
+		r.log.Warn("could not read promotion records, letting the events through", "err", err)
 		return out
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	for cur.Next(ctx) {
 		var rec struct {
-			ID string `bson:"_id"`
+			ID string    `bson:"_id"`
+			At time.Time `bson:"promotedAt"`
 		}
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = true
+			out[rec.ID] = rec.At.UTC()
 		}
 	}
 	return out
@@ -385,10 +569,11 @@ func cursorIDsOf(cmd bson.Raw) []int64 {
 //
 // The second result counts how many were filled, for the log line that says the
 // stream was answered across both tiers.
-func (r *Router) fillLookups(ctx context.Context, ns string, events bson.A) (bson.A, int) {
+func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
 	type pending struct {
 		index int
 		id    bson.RawValue
+		ns    string
 	}
 	var want []pending
 	for i, ev := range events {
@@ -422,41 +607,48 @@ func (r *Router) fillLookups(ctx context.Context, ns string, events bson.A) (bso
 		if ierr != nil {
 			continue
 		}
-		want = append(want, pending{index: i, id: idv})
+		// Per event, because a stream on a whole database carries events from
+		// several collections and two of them can hold the same _id.
+		evns, nsok := eventNS(doc)
+		if !nsok {
+			continue
+		}
+		want = append(want, pending{index: i, id: idv, ns: evns})
 	}
 	if len(want) == 0 {
 		return events, 0
 	}
 
-	ids := make(bson.A, 0, len(want))
+	byNS := map[string]bson.A{}
 	for _, w := range want {
-		ids = append(ids, w.id)
+		byNS[w.ns] = append(byNS[w.ns], w.id)
 	}
-	db, coll := splitNS(ns)
-	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, bson.D{
-		{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
-		meta.NotArchivedDeleted(),
-	})
-	if err != nil {
-		r.log.Warn("could not ask the archive for a change stream's documents; they stay null",
-			"ns", ns, "err", err)
-		return events, 0
-	}
-	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-
 	found := make(map[string]bson.Raw, len(want))
-	for cur.Next(ctx) {
-		doc := bson.Raw(append([]byte(nil), cur.Current...))
-		if idv, ierr := doc.LookupErr("_id"); ierr == nil {
-			found[string(idv.Value)+string(rune(idv.Type))] = doc
+	for evns, ids := range byNS {
+		db, coll := splitNS(evns)
+		cur, err := r.cold.Database(db).Collection(coll).Find(ctx, bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
+			meta.NotArchivedDeleted(),
+		})
+		if err != nil {
+			r.log.Warn("could not ask the archive for a change stream's documents; they stay null",
+				"ns", evns, "err", err)
+			continue
 		}
+		for cur.Next(ctx) {
+			doc := bson.Raw(append([]byte(nil), cur.Current...))
+			if idv, ierr := doc.LookupErr("_id"); ierr == nil {
+				found[evns+"|"+string(idv.Value)+string(rune(idv.Type))] = doc
+			}
+		}
+		_ = cur.Close(context.WithoutCancel(ctx))
 	}
 
 	filled := 0
 	out := make(bson.A, len(events))
 	copy(out, events)
 	for _, w := range want {
-		doc, ok := found[string(w.id.Value)+string(rune(w.id.Type))]
+		doc, ok := found[w.ns+"|"+string(w.id.Value)+string(rune(w.id.Type))]
 		if !ok {
 			continue
 		}
