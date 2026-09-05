@@ -188,7 +188,7 @@ reseed() {
     // reseed writes the claim moments later and the withdrawal can land after it.
     hot.tcon.insertOne({_id:'__sentinel'});
     let caught = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 240; i++) {
       if (cold.tcon.countDocuments({_id:'__sentinel'}) === 1) { caught = true; break; }
       sleep(500);
     }

@@ -128,7 +128,11 @@ reseed() {
     hot.tcfuzz.insertOne({_id:'__sentinel'});
     hot.tcfuzz2.insertOne({_id:'__sentinel'});
     let caught = false;
-    for (let i = 0; i < 120; i++) {
+    // Two minutes, not one. This is a wait rather than an assertion, and on a
+    // machine sharing itself with another cluster a minute was not enough: the
+    // reseed gave up, every round after it reported no tally, and the suite
+    // failed for want of patience rather than for anything it tests.
+    for (let i = 0; i < 240; i++) {
       if (cold.tcfuzz.countDocuments({_id:'__sentinel'}) === 1 &&
           cold.tcfuzz2.countDocuments({_id:'__sentinel'}) === 1) { caught = true; break; }
       sleep(500);
@@ -164,7 +168,7 @@ reseedComplete() {
     hot.tcref2.drop(); hot.tcref2.insertMany(other);
     hot.tcfuzz.insertOne({_id:'__sentinel'});
     let caught = false;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 240; i++) {
       if (cold.tcfuzz.countDocuments({_id:'__sentinel'}) === 1) { caught = true; break; }
       sleep(500);
     }
