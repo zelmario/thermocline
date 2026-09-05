@@ -346,8 +346,8 @@ func (r *Router) Listen(ctx context.Context) error {
 		defer close(adviceDone)
 		r.safely("reporting what the cache learned", func() { r.reportAdvice(ctx) })
 	}()
-	r.goSafely("watching the fast tier for changes the cache must hear about",
-		func() { r.watchForInvalidation(ctx) })
+	r.goSafely("watching the fast tier for changes this router did not make",
+		func() { r.watchFastTier(ctx) })
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),

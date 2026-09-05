@@ -243,6 +243,10 @@ feeder:
     # testddl.sh: a collection created through the router after the fast tier
     # lost it out of band
     - "shop.tdcreate"
+    # testddl.sh: a collection the fast tier loses out of band, carrying a
+    # default collation and a unique index the archive has and the recreated
+    # copy would not.
+    - "shop.tidxoob"
     # testkeys.sh: a collated unique index whose match on the archive is created
     # after the router has already asked about it
     - "shop.tkcoll2"

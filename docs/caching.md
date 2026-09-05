@@ -84,13 +84,20 @@ rather than merely fast: the ordinary pattern of writing and then reading the
 same collection is right immediately.
 
 **And a write by anybody else drops it too.** The fast tier publishes every
-change it makes and this system is built on reading that, so with the cache on
-the router follows the same change stream and drops the answers a write made
-stale, whoever made it: another application, a migration script, a person in a
-shell. Measured: a client's cached answer of 31 became 32 within a second of
-another connection inserting a document straight into the fast tier, without
-waiting out the TTL. That is the difference between a cache that expires and one
-that is kept honest, and it costs one change stream while the cache is on.
+change it makes and this system is built on reading that, so the router follows
+the same change stream and drops the answers a write made stale, whoever made
+it: another application, a migration script, a person in a shell. Measured: a
+client's cached answer of 31 became 32 within a second of another connection
+inserting a document straight into the fast tier, without waiting out the TTL.
+That is the difference between a cache that expires and one that is kept honest.
+
+That stream is no longer the cache's own. The router follows the fast tier
+whether or not the cache is on, because it is also how it hears that a collection
+was dropped out of band, and the cache is one of two things it corrects. With the
+cache off the stream asks the server for the DDL events alone, so it costs
+nothing per write; with it on every event is wanted and none are filtered. Either
+way it is one change stream per router, and the dashboard's `watching` says
+whether it is open.
 
 The learned TTL is what remains: a backstop for the moments before the stream
 catches up, bounded again by `max_ttl`.

@@ -152,18 +152,34 @@ Range queries are governed by the watermark below.
   after the drop answered **0 where the archive holds 3**, with no error.
 
   A drop the router forwarded is one it knows about at once, so it forgets the
-  claim there and then. A drop applied straight to the fast tier, out of band, is
-  not: that window remains, and the answer corrects itself once the feeder has
-  withdrawn the claim and the cache has expired.
+  claim there and then. A drop applied straight to the fast tier, out of band,
+  reaches it a moment later: the router follows the fast tier's change stream and
+  forgets the same things when it sees the drop there, so the window is the
+  stream's own latency rather than the claim cache's.
 
-  **It also leaves the indexer remembering a collection that has gone**, and that
-  one does not correct itself. The router creates the fast tier's copy the way the
-  archive has it before any write that would otherwise create it bare, and
-  remembers having done so; a drop it forwarded clears that memory, and a drop it
-  never saw does not. The next write then recreates the collection with no
-  collation and no validator, and a query the application has always run answers
-  differently. So drop a tiered collection **through the router**, which is where
-  every other consequence of a drop is handled too.
+  **That also covers the indexer's memory, which used not to correct itself at
+  all.** The router creates the fast tier's copy the way the archive has it
+  before any write that would otherwise create it bare, and remembers having done
+  so. A drop it never saw left that memory standing, and the next write recreated
+  the collection implicitly: no collation, no validator, no index but `_id_`.
+  Measured on an adopted collection with a case-insensitive collation and a
+  unique index on `name`: after the out-of-band drop the fast tier's copy came
+  back with neither, and a minute later, once the router had re-read its index
+  listing from a collection that no longer had one, an insert of a second `alice`
+  was **accepted** against a constraint the application had relied on since
+  before the adoption. Nothing in either tier's log mentioned it, and it
+  corrected itself only when something listed the catalog or the router was
+  restarted.
+
+  It costs one change stream per router, on the fast tier. That stream used to be
+  opened only when the query cache was on; it is now always open, so the router's
+  own account needs the privilege to open one. Without it the router still runs
+  and says so at ERROR, and a collection dropped out of band goes back to being
+  noticed at the next catalog listing or router start.
+
+  Dropping a tiered collection **through the router** is still the right thing to
+  do, because that is where every consequence of a drop is handled at once rather
+  than a moment later.
 - **An eviction sweep waits before it removes what it has just stopped
   claiming.** The evictor raises the completeness watermark first, so an
   interrupted sweep never leaves a claim wider than the truth. That protects a

@@ -651,9 +651,11 @@ R "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
 # create is where there is something to build.
 #
 # An implicit create, which is what an insert into a dropped collection is,
-# sends no create command and is not covered by this. It is repaired at the next
-# catalog listing or router start, and until then reads fall through to the
-# archive, which still holds both the documents and the indexes.
+# sends no create command and so never reaches the branch this section is about.
+# It is covered all the same, by the write path: every write into a tiered
+# collection creates it the way the archive has it before the insert that would
+# otherwise create it bare. The section below is the case that used not to be
+# covered, where the drop itself never reached this router either.
 R "db.getSiblingDB(process.env.TC_DB).createCollection('$DNS')" >/dev/null 2>&1
 R "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:2, code:'b'})" >/dev/null
 for _ in $(seq 1 30); do [ "$(hasIdx)" = "true" ] && break; sleep 1; done
@@ -661,6 +663,85 @@ chk "and builds it again after a drop and create"   "true" "$(hasIdx)"
 kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+
+echo "== a collection the fast tier loses without the router hearing about it =="
+# The twin of the section above, and the half that used not to correct itself.
+#
+# A drop this router forwards is one it knows about at once. A drop applied
+# straight to the fast tier is not, and the memory that this namespace already
+# has its collection and its indexes stands: the next write recreates the
+# collection implicitly, with no collation, no validator and no index but _id_.
+#
+# Measured before the router followed the fast tier for DDL, on this exact
+# collection: after the out-of-band drop the fast tier's copy came back with no
+# collation and no unique index, and a minute later, once the router's own index
+# listing had expired and been read again from a collection that no longer had
+# one, an insert of a second alice was **accepted** against a unique constraint
+# the application had relied on since before the adoption. Nothing in either
+# tier's log mentioned it. It corrected itself only when something listed the
+# catalog or the router was restarted, and neither is a thing an application
+# does.
+#
+# The same router throughout, for the same reason as above: a restart repairs
+# this and hides it.
+ONS2=tidxoob
+C "db.getSiblingDB(process.env.TC_DB).$ONS2.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$ONS2.drop()" >/dev/null
+# The adoption shape: the archive carries the application's own collation and
+# unique index, and the fast tier has never held the collection.
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$ONS2', {collation:{locale:'en',strength:2}});
+   db.getSiblingDB(process.env.TC_DB).$ONS2.createIndex({name:1},{unique:true});
+   db.getSiblingDB(process.env.TC_DB).$ONS2.insertMany([{_id:1,name:'alice'},{_id:2,name:'bob'}])" >/dev/null
+# A feeder as well as a router, which the section above does not need. The read
+# at the end of this one is answered from the archive, and the archive is only
+# the whole answer while something is mirroring into it: without a feeder the
+# documents this section writes never reach it, and the check would report a
+# correct router as a broken one.
+rm -f $LOGDIR/idxoob.log
+stopDaemons
+# The checkpoint goes with the daemons. Everything this section does to the fast
+# tier out of band is in the oplog, and a feeder resuming from an old position
+# replays it: measured, the archive held four documents where the section had
+# written three, which turned a check about the indexer into a check about
+# whichever run had gone before.
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder
+cline router --config $CFG --log-file $LOGDIR/idxoob.log >/dev/null 2>&1 & ORP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+oobShape() {
+  H "const o=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS2'})[0];
+     const c=o&&o.options&&o.options.collation?o.options.collation.locale+'/'+o.options.collation.strength:'NONE';
+     const u=db.getSiblingDB(process.env.TC_DB).$ONS2.getIndexes().filter(i=>i.unique).map(i=>i.name).join(',')||'NONE';
+     print(c+' '+u)"
+}
+oobMirrored() { C "print(db.getSiblingDB(process.env.TC_DB).$ONS2.countDocuments({_tcDeletedAt:{\$exists:false}}))"; }
+R "db.getSiblingDB(process.env.TC_DB).$ONS2.insertOne({_id:3,name:'carol'})" >/dev/null
+for _ in $(seq 1 30); do [ "$(oobShape)" = "en/2 name_1" ] && break; sleep 1; done
+chk "the first write builds it the way the archive has it" "en/2 name_1" "$(oobShape)"
+# Mirrored before the drop, or the drop destroys the only copy of carol and the
+# read at the end is short for a reason that has nothing to do with this.
+for _ in $(seq 1 60); do [ "$(oobMirrored)" = "3" ] && break; sleep 0.5; done
+chk "carol reached the archive before the drop"            "3" "$(oobMirrored)"
+
+# Out of band, so no command reaches the router and no create follows: the write
+# below is an implicit create, which is the shape an application produces and
+# the one nothing used to cover.
+H "db.getSiblingDB(process.env.TC_DB).$ONS2.drop()" >/dev/null
+for _ in $(seq 1 20); do [ "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS2'}).length)")" = "0" ] && break; sleep 0.5; done
+sleep 2   # the router's own change stream carries the drop, in milliseconds
+R "db.getSiblingDB(process.env.TC_DB).$ONS2.insertOne({_id:4,name:'dave'})" >/dev/null
+for _ in $(seq 1 30); do [ "$(oobShape)" = "en/2 name_1" ] && break; sleep 1; done
+chk "and so does the write after a drop it never saw"      "en/2 name_1" "$(oobShape)"
+# The claim half of the same event: the archive still holds every document the
+# fast tier lost, so the read has to answer in full rather than from a
+# collection that was empty a moment ago.
+for _ in $(seq 1 60); do [ "$(oobMirrored)" = "4" ] && break; sleep 0.5; done
+chk "a read still answers from the archive in full"        "alice,bob,carol,dave" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$ONS2.find({},{name:1}).sort({_id:1}).toArray().map(d=>d.name).join(','))")"
+kill $ORP 2>/dev/null; wait $ORP 2>/dev/null
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ONS2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ONS2.drop()" >/dev/null
 
 echo "== dropping a unique index has to reach both tiers =="
 # DDL is not mirrored, so the drop used to reach the fast tier alone. From then

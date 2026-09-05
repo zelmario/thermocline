@@ -49,8 +49,14 @@ type Snapshot struct {
 // hoping.
 type CacheSnapshot struct {
 	Enabled bool `json:"enabled"`
-	// Watching is whether the change stream that drops answers other writers
-	// made stale is open. Without it the learned TTL is the only bound.
+	// Watching is whether the change stream this router follows on the fast
+	// tier is open. It drops answers another writer made stale, and it is also
+	// how this router hears that a collection was dropped out of band, so
+	// false means both are weaker: the learned TTL is the cache's only bound,
+	// and a collection that has gone is noticed at the next catalog listing.
+	// It is reported under the cache because the cache is what it was built
+	// for; it is not the cache's any more, and Enabled is what says whether
+	// the cache is on.
 	Watching bool          `json:"watching"`
 	Shapes   int           `json:"shapes"`
 	Hits     uint64        `json:"hits"`

@@ -20,7 +20,6 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -372,7 +371,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 
 	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
 	if err != nil {
-		if len(token) > 0 && resumePointGone(err) {
+		if len(token) > 0 && checkpoint.ResumePointGone(err) {
 			// The instant the checkpoint marks, so the log says how much is
 			// missing rather than only that something is.
 			at, _, _ := f.cp.EventAt(ctx, f.cfg.ID)
@@ -611,31 +610,4 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		wasInsert: ev.OperationType == "insert",
 	})
 	return nil
-}
-
-// resumePointGone reports whether MongoDB refused the resume token, so
-// mirroring cannot carry on from where it stopped.
-//
-// Two codes and several wordings. ChangeStreamHistoryLost is the specific one.
-// ChangeStreamFatalError is what a server says when the token is simply not
-// there any more: measured against PSMDB 8.0, "cannot resume stream; the resume
-// token was not found". So the code narrows it to a fatal change stream error
-// and the word resume in the message decides, rather than matching one phrasing
-// that a release can change.
-//
-// A token from another cluster lands here too, and belongs here: it names a
-// position this oplog has never had, mirroring cannot resume from it, and the
-// operator has the same hole to think about either way.
-func resumePointGone(err error) bool {
-	var ce mongo.CommandError
-	if !errors.As(err, &ce) {
-		return false
-	}
-	if ce.Code == 286 || ce.Name == "ChangeStreamHistoryLost" {
-		return true
-	}
-	if ce.Code == 280 || ce.Name == "ChangeStreamFatalError" {
-		return strings.Contains(strings.ToLower(ce.Message), "resume")
-	}
-	return false
 }
