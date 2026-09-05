@@ -15,11 +15,12 @@ LOGDIR=${LOGDIR:-/var/log/cline}
 PORT=${PORT:-27100}
 DB=${DB:-shop}
 DB2=${DB2:-wh}
+DB3=${DB3:-catdb}
 META=${META:-_thermocline}
 # mongosh is node, so the suites reach these through process.env rather than
 # shell expansion. Half the eval strings are single-quoted at the shell, where a
 # $VAR would not expand and would silently query the wrong database.
-export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
+export TC_DB=$DB TC_DB2=$DB2 TC_DB3=$DB3 TC_META=$META
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
@@ -179,6 +180,59 @@ chk "collStats"        "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS
 chk "dbStats"          "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).stats().db == '$DB')")"
 chk "ping"             "1"    "$(R "print(db.adminCommand({ping:1}).ok)")"
 chk "buildInfo"        "true" "$(R "print(!!db.adminCommand({buildInfo:1}).version)")"
+
+echo "== dbStats over a database the fast tier holds part of =="
+# collStats counts the collection and dbStats counts the database, and only one
+# of them was corrected. The principle behind the first is that a count is a
+# logical fact about the data while bytes on disk are a per-tier one; objects is
+# the same field one level up and it was the fast tier's.
+#
+# Measured before this, on a database whose one tiered collection the archive
+# holds seven documents of and the fast tier had just been created empty for:
+# collStats answered 7, countDocuments answered 7, and db.stats().objects
+# answered **0**. A database holding seven documents reported none. That is the
+# adoption's ordinary state rather than a corner, because the fast tier starts
+# empty and fills.
+#
+# In its own database, because dbStats totals all of one and the check is only
+# deterministic where nothing else writes. catdb is that database here, and the
+# suites that use it are the ones that drop it whole.
+SDB=$DB3
+H "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+# tdbstats: ten in the archive and three on the fast tier, which is a warmed
+# window. tdbstats2: five in the archive and none copied up, which is a
+# collection entirely outside it.
+C "db.getSiblingDB(process.env.TC_DB3).tdbstats.insertMany(Array.from({length:10},(_,i)=>({_id:i,n:i})));
+   db.getSiblingDB(process.env.TC_DB3).tdbstats2.insertMany(Array.from({length:5},(_,i)=>({_id:i,n:i})))" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB3).tdbstats.insertMany(Array.from({length:3},(_,i)=>({_id:i,n:i})))" >/dev/null
+# The router is restarted onto the seeded archive, which is the adoption arriving
+# in the right order: the archive is prepared and then this is pointed at it. It
+# creates the fast tier's copy of every namespace the archive holds as it starts,
+# so tdbstats2 exists there and holds nothing, which is the state being measured.
+# Without that a collection the fast tier has never heard of makes collStats
+# error rather than answer, which is a different subject.
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+cline router --config $CFG --log-file $LOGDIR/ops_r.log & RP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+# Number() because mongod answers dbStats with an int64 and mongosh prints one
+# as Long('15'). The count is what this compares, not how the shell renders it.
+chk "the fast tier's own dbStats counts what it holds" "3" \
+    "$(H "print(Number(db.getSiblingDB(process.env.TC_DB3).stats().objects))")"
+chk "dbStats through the router counts the database"   "15" \
+    "$(R "print(Number(db.getSiblingDB(process.env.TC_DB3).stats().objects))")"
+chk "and agrees with collStats on the same collection" "10" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB3).tdbstats.stats().count)")"
+chk "and with the one nothing was copied up for"       "5" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB3).tdbstats2.stats().count)")"
+# The other half, and the reason only one field moves: bytes on disk are a
+# per-tier fact. The router's storage figures must still be the fast tier's, so
+# an operator sizing one reads its own number and not two clusters added up.
+DBSZ_R=$(R "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
+DBSZ_H=$(H "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
+chk "storageSize is the fast tier's, unchanged"        "$DBSZ_H" "$DBSZ_R"
+H "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
 
 echo "== writes reached the archive =="
 sleep 6

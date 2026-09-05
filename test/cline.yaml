@@ -102,6 +102,12 @@ feeder:
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.
     - "catdb.tcatdb"
+    # testops.sh: what dbStats says about a database whose tiered collections
+    # the fast tier holds part of, and one it holds none of. In catdb for the
+    # same reason: dbStats totals a whole database, so the check is only
+    # deterministic in one nothing else writes to.
+    - "catdb.tdbstats"
+    - "catdb.tdbstats2"
     # testkeys.sh, one collection per section: the router caches a namespace's
     # unique indexes for a minute, so a name reused with a different index is
     # still enforced under the old one.

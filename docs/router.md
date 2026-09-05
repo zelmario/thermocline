@@ -110,16 +110,32 @@ Range queries are governed by the watermark below.
   `totalIndexSize`, `avgObjSize` and the WiredTiger figures describe the fast
   tier, because they are per-cluster facts and adding two clusters' compressed
   sizes together would produce a number describing nothing. That is also what
-  you want when sizing a fast tier. `dbStats` is the fast tier's throughout,
-  including its `objects`.
+  you want when sizing a fast tier.
 
-  **That inconsistency is deliberate, and it is a decision rather than an
-  oversight.** `collStats` corrects its count and `dbStats` does not. Correcting
-  `dbStats` means a per-collection count against the archive on a command
-  monitoring agents poll every few seconds, and the number it would replace is
-  the one thing in that reply an operator sizing a fast tier actually wants.
-  Read `dbStats` as a physical fact about the fast tier, and ask
-  `countDocuments` or `collStats` for a logical one.
+  **`dbStats` follows the same rule**: its `objects` is the database's document
+  count and everything else in the reply is the fast tier's. It was the fast
+  tier's throughout until 2026-09-05, which made the two ways of asking the same
+  question disagree. Measured on a database whose one tiered collection the
+  archive holds seven documents of and the fast tier had just been created empty
+  for: `collStats` answered 7, `countDocuments` answered 7, and
+  `db.stats().objects` answered **0**. A database holding seven documents
+  reported none, and that is the adoption's ordinary state rather than a corner,
+  because the fast tier starts empty and fills.
+
+  It is not free, and the price is worth knowing before you poll it. The
+  correction costs one count against the archive per tiered collection in the
+  database that is not already claimed complete: measured, 135 to 173ms per
+  million documents, against 6ms for the metadata count the fast tier answers
+  with. On a test database of 92 small collections the whole call went from 2-8ms
+  to 64-92ms, which is round trips rather than counting. Warming a collection
+  removes its share of the cost entirely, because a claim covering everything
+  makes the fast tier's own count the right one. If the counts cannot all be
+  taken inside ten seconds the reply is left as the fast tier's and the router
+  says so, because a total corrected half way through describes neither tier.
+
+  `avgObjSize` stays with the bytes it is derived from rather than being
+  recomputed against the corrected count, for the same reason the bytes
+  themselves are not corrected.
 
   The count used to be the fast tier's too, which was wrong rather than
   partial. Measured on MongoDB's sample datasets adopted as an archive:
@@ -408,8 +424,12 @@ Range queries are governed by the watermark below.
   repairs it: the router creates the collection on the fast tier with the
   archive's options and indexes, which is what lets it be asked for its stats.
 
-  `dbStats` is still the fast tier's throughout, so its `collections` counts
-  what the fast tier has rather than what the catalog now lists.
+  `dbStats`'s `collections` counts what the fast tier has rather than what the
+  catalog now lists, and in practice those agree: the router creates the fast
+  tier's copy of every namespace it manages as it starts, so a database the fast
+  tier had never held still reported 1 collection where the archive holds one.
+  What it will not show is a collection that appeared in the archive after this
+  router started and that nothing has listed or written to since.
 - **TLS is handled, in both directions.** `router.tls.cert` and `key` make the
   listener speak it, `ca` checks client certificates, and
   `require_client_cert` insists on one. Whether the fast tier needs TLS is read

@@ -28,6 +28,8 @@ func (c *conn) intercept(ctx context.Context, msg *wire.Message, name, db string
 		return c.interceptListCollections(ctx, msg, db, reply)
 	case "collStats":
 		return c.interceptCollStats(ctx, msg, db, reply)
+	case "dbStats":
+		return c.interceptDBStats(ctx, msg, db, reply)
 	case "aggregate":
 		// A read-only newest-N pipeline is the one an aggregation defers to
 		// here, because judging it early cannot use its own answer. See

@@ -279,7 +279,10 @@ nothing, including the reads the fast tier could have served alone. Plan
 restarts accordingly, and remember that on day one almost every read needs the
 archive anyway.
 
-**That one stays as it is, deliberately.** A router that has never read a claim
+**That one stays as it is, and it is now a decision rather than an open
+question.** Asked and answered on 2026-09-05: the router goes on refusing, and
+this is the runbook entry for it — do not restart a router during an archive
+outage, and bring the archive back first. A router that has never read a claim
 knows which namespaces are tiered and nothing about what the fast tier holds of
 them, so anything it served would be a guess dressed as an answer. Starting and
 refusing every tiered namespace by name was considered and is not obviously

@@ -199,6 +199,32 @@ Part of [Thermocline](../README.md).
   nothing runs that way, and a defect there would be found by whoever is running
   it in production rather than here. If that shape is wanted, the work is a suite
   that keeps it honest, not a change to the code.
+- **A claim declared by hand past the counting budget is recorded unchecked.**
+  `cline watermark --complete-all` says the fast tier holds every document there
+  is, and recording one it does not have makes every unbounded read answer short
+  with no error. So both tiers are counted first and a claim the numbers
+  contradict is refused. Counting is not free on a large collection, so it is
+  bounded by `--count-for`, a minute by default, and past that bound the claim is
+  recorded **unchecked** rather than refused: blocking a rollout on a count is
+  the worse failure, and the operator is left exactly where they were before the
+  check existed.
+
+  That leaves one outcome nobody asked for, and it is the collection big enough
+  to need the check that reaches it. Raise `--count-for` on those, and read
+  "recorded unchecked" as a claim nothing has stood behind.
+
+- **The router will not start while the archive is unreachable**, so a restart
+  during an archive outage leaves the application with nothing, including the
+  reads the fast tier could have served alone. Decided on 2026-09-05 to stay that
+  way: a router that has never read a claim knows which namespaces are tiered and
+  nothing about what the fast tier holds of them, so anything it served would be
+  a guess dressed as an answer, and starting-and-refusing gives the application
+  errors either way while looking healthy to monitoring. The runbook entry is in
+  [adoption.md](adoption.md): bring the archive back before restarting a router.
+
+  A router that is already **running** is a different case and has a knob:
+  `router.claim_grace` keeps tiered reads alive through an outage.
+
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server
