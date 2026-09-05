@@ -12,7 +12,7 @@ configurable as `meta.db`:
 |---|---|
 | `checkpoints` | One change stream resume token per feeder, for recovery |
 | `positions` | How far each feeder has mirrored, published far more often than the checkpoint because fallback reads wait on it |
-| `evicting` | Eviction announcements, expiring on a TTL index |
+| `evicting` | Eviction announcements, kept for an hour on a TTL index, not removed when applied |
 | `residency` | How long a document should stay in the fast tier (used by the evictor and router) |
 | `warming` | Warming announcements, expiring on a TTL index |
 | `watermarks` | How far back the fast tier is complete, one per namespace |

@@ -38,7 +38,13 @@ chkv() {
 }
 H() { mongosh "$HOT"  --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
-notices() { C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:'$1'}))"; }
+# Unclaimed announcements, not rows. A notice the feeder has spent stays in the
+# collection until its TTL, because the router needs it to recognise the delete
+# when a change stream reads that event, which can be long afterwards. Every
+# check here is about whether the feeder still has one to claim.
+notices() { C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:'$1', \$or:[{pending:{\$gt:0}},{pending:{\$exists:false}}]}))"; }
+# The row itself, spent or not, which is what the change stream sieve reads.
+noticeRows() { C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:'$1'}))"; }
 
 echo "== setup: the feeder stopped, so nothing races the checks =="
 pkill -f "cline feeder --config $WDIR/" 2>/dev/null
@@ -131,6 +137,11 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 chkv "the announcements are spent once it catches up" "0" "$(notices "$NOTICE")"
+# And the record stays, spent, for the router to recognise the delete by when a
+# change stream reads that event. It used to be removed here, and a client
+# reading its events late was then handed a delete for a document the archive
+# still holds.
+chkv "but the record stays for the change stream"     "1" "$(noticeRows "$NOTICE")"
 chkv "and the archive still holds the document live"  "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$EVID'),_tcDeletedAt:{\$exists:false}}))")"
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
@@ -253,7 +264,7 @@ chkv "the archive still has all ten"             "10" \
 chkv "none of the evicted five was tombstoned"   "0" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({n:'short',_tcDeletedAt:{\$exists:true}}))")"
 chkv "no announcement is left for the five it never saw" "0" \
-    "$(C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:{\$in:[$(printf "'$DB.orders|07%s'," "${GONE[@]}" | sed 's/,$//')]}}))")"
+    "$(C "print(db.getSiblingDB(process.env.TC_META).evicting.countDocuments({_id:{\$in:[$(printf "'$DB.orders|07%s'," "${GONE[@]}" | sed 's/,$//')]}, \$or:[{pending:{\$gt:0}},{pending:{\$exists:false}}]}))")"
 chkv "the five it evicted are live in the archive" "5" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:{\$in:[$(printf "ObjectId('%s')," "${KEPT[@]}" | sed 's/,$//')]}, _tcDeletedAt:{\$exists:false}}))")"
 

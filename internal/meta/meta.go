@@ -233,7 +233,22 @@ type EvictionNotice struct {
 	// not seen the delete for yet. A count and not a flag, because a document
 	// can be evicted, warmed back up and evicted again while the feeder is
 	// still behind, and one flag cannot answer for two deletes.
-	Pending int `bson:"pending"`
+	//
+	// A pointer, so a notice written before this field existed can be told from
+	// one the feeder has spent. Both read as zero otherwise, and they mean
+	// opposite things: the first is one unclaimed eviction, the second is none
+	// left. That distinction is what lets a spent notice stay until its TTL,
+	// which is what a change stream read late needs. See SpendEvictionNotices.
+	Pending *int `bson:"pending"`
+}
+
+// Left reports how many announced evictions of this document are still
+// unclaimed. A notice from before the field existed counts as one.
+func (n EvictionNotice) Left() int {
+	if n.Pending == nil {
+		return 1
+	}
+	return *n.Pending
 }
 
 // AnnounceEviction records that these documents are about to leave the fast
@@ -300,11 +315,14 @@ func ConsumeEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []st
 		if derr := cur.Decode(&rec); derr != nil {
 			return nil, fmt.Errorf("decode eviction notice: %w", derr)
 		}
-		// A notice written before this field existed counts as one.
-		if rec.Pending <= 0 {
-			rec.Pending = 1
+		// A spent notice is not an announcement. It stays in the collection
+		// until its TTL now, for the change stream sieve to read, and the
+		// feeder must not claim it: doing so would treat an application's own
+		// delete as an eviction and leave the archive holding a live copy of a
+		// document that was removed.
+		if left := rec.Left(); left > 0 {
+			have[rec.ID] = left
 		}
-		have[rec.ID] = rec.Pending
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return nil, fmt.Errorf("read eviction notices: %w", cerr)
@@ -323,9 +341,7 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 	}
 	coll := cold.Database(DB).Collection(Evicting)
 	models := make([]mongo.WriteModel, 0, len(spent))
-	ids := make([]string, 0, len(spent))
 	for id, n := range spent {
-		ids = append(ids, id)
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
 			SetUpdate(bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: -n}}}}))
@@ -333,12 +349,13 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
 		return fmt.Errorf("spend eviction notices: %w", err)
 	}
-	if _, err := coll.DeleteMany(ctx, bson.D{
-		{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
-		{Key: "pending", Value: bson.D{{Key: "$lte", Value: 0}}},
-	}); err != nil {
-		return fmt.Errorf("spend eviction notices: %w", err)
-	}
+	// Spent, not removed. It used to be deleted here, which left the router
+	// with nothing to recognise the eviction by, and the router is asked when
+	// it hands the delete event to a client rather than when the delete
+	// happened. A client that is behind, which is what any client resuming from
+	// a stored token is, then saw a delete for a document the archive still
+	// holds. The notice now lives out its TTL and the feeder ignores it once
+	// spent; see ConsumeEvictionNotices and the sieve in the router.
 	return nil
 }
 
