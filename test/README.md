@@ -117,6 +117,25 @@ client had deleted, because the tombstone filter went in front of the pipeline,
 which is not where a joined collection is read. And that a point read by `_id`
 was answered with a document that did not match the rest of the filter.
 
+**The grammar generates index DDL as well as reads and writes**, one draw in
+ten, because the shape every defect found on 2026-09-05 lived in is this
+router's memory of a namespace going stale. It caches the fast tier's unique
+indexes for a minute, whether a hint is answerable on the archive for the same,
+the collation, and the type brackets of the field a collection ages by, and no
+read-only grammar can make any of those wrong because nothing in one ever
+changes an index. So it creates indexes, sometimes unique, sparse, partial,
+collated or expiring; drops ones it made; and inserts straight after a create,
+which is the moment a listing read before the DDL is enforced after it. Both
+sides get the same command, so a refusal the tiered side alone makes is counted
+as a refusal and everything else still has to agree.
+
+That extension caught one thing immediately, and it was the harness: a
+`dropIndex` reply carries `$clusterTime` and `operationTime`, which differ
+between any two commands by construction, so comparing whole replies reported a
+disagreement on every drop. It compares `nIndexesWas` now. Read that as the
+standing warning about this file: a generator is only as good as what it decides
+counts as the same answer.
+
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
 them with `docker exec -e` when the topology is not the documented one.
 

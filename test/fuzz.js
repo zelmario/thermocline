@@ -39,6 +39,7 @@ const OPS  = Number(process.env.TC_OPS || 60);
 // paper over it by copying documents up.
 const RO   = process.env.TC_READONLY === '1';
 const SEED = Number(process.env.TC_SEED || 1);
+const TRACE = process.env.TC_TRACE === '1';
 const d    = db.getSiblingDB(DB);
 const REF  = d.tcref;
 const TIER = d.tcfuzz;
@@ -277,49 +278,213 @@ function note(what, kind) {
   if (kind === 'vacuous') t.vacuous++;
 }
 
+// Returns true when both sides answered, which is the only case where comparing
+// what they left behind means anything. See contentsMatch.
 function ask(what, op, fn, how) {
+  // TC_TRACE prints every operation as it runs, in order. The seed makes a round
+  // reproducible and the report names the operation that disagreed, but not what
+  // ran before it, and a disagreement is usually about state something earlier
+  // left behind. Off by default because it is one line per comparison.
+  if (TRACE) print('  op\t' + what + '\t' + op);
   const norm = how === 'bag' ? bag : ser;
   const a = attempt(fn, REF), b = attempt(fn, TIER);
 
   if (!a.ok && !b.ok) {
-    if (a.code === b.code) { agreed++; note(what, 'vacuous'); return; }
+    if (a.code === b.code) { agreed++; note(what, 'vacuous'); return false; }
     // Both failed differently. Only interesting when the tiered side is not
     // simply saying no.
-    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return; }
+    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return false; }
     note(what, 'real');
     bugs.push([what, op, 'ref failed ' + a.code + ': ' + a.msg, 'tier failed ' + b.code + ': ' + b.msg]);
-    return;
+    return false;
   }
   if (a.ok && !b.ok) {
-    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return; }
+    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return false; }
     note(what, 'real');
     bugs.push([what, op, 'ref answered', 'tier failed ' + b.code + ': ' + b.msg]);
-    return;
+    return false;
   }
   if (!a.ok && b.ok) {
     note(what, 'real');
     bugs.push([what, op, 'ref failed ' + a.code + ': ' + a.msg, 'tier answered']);
-    return;
+    return false;
   }
 
   let ra = norm(a.v), rb = norm(b.v);
-  if (ra === rb) { agreed++; note(what, 'real'); return; }
+  if (ra === rb) { agreed++; note(what, 'real'); return true; }
 
   // The archive is written by the feeder after the fact, so a difference can be
-  // a stale answer that is about to settle. Ask again before calling it a bug.
-  sleep(1500);
+  // a stale answer that is about to settle. Ask again before calling it a bug,
+  // and wait for mirroring rather than for a guess.
+  waitForMirroring();
   const a2 = attempt(fn, REF), b2 = attempt(fn, TIER);
   note(what, 'real');
   if (a2.ok && b2.ok && norm(a2.v) === norm(b2.v)) {
     settled++; stale.push([what, op, ra.slice(0, 160), rb.slice(0, 160)]);
-    return;
+    return true;
   }
+  const d = describeDiff(a.v, b.v);
+  if (d) { bugs.push([what, op, d.ref, d.got]); return true; }
   bugs.push([what, op, ra.slice(0, 400), rb.slice(0, 400)]);
+  return true;
+}
+
+// describeDiff narrows a disagreement between two arrays of documents to the
+// first place they differ.
+//
+// Without it a contents comparison reports the first 400 characters of two
+// dumps that are identical for the first several documents, so every one of them
+// looks the same and none of them says anything. Measured: 98 disagreements in
+// one run, every report opening with the same _id 2, and the difference
+// somewhere past the truncation.
+//
+// Returns null when the values are not both arrays, which leaves the plain
+// report in place.
+function describeDiff(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return null;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = i < a.length ? ser(a[i]) : '(missing)';
+    const y = i < b.length ? ser(b[i]) : '(missing)';
+    if (x === y) continue;
+    const id = (i < b.length && b[i] && b[i]._id !== undefined) ? b[i]._id
+             : (i < a.length && a[i] && a[i]._id !== undefined) ? a[i]._id : null;
+    return {
+      ref: a.length + ' documents, first difference at ' + i + ': ' + x.slice(0, 700),
+      got: b.length + ' documents, first difference at ' + i + ': ' + y.slice(0, 700)
+           + eachTier(id),
+    };
+  }
+  return null;
+}
+
+// eachTier says which tier the tiered side's answer came from, by asking both of
+// them for the same document.
+//
+// A disagreement about a document is one of three things and they need different
+// fixes: the archive holds the old value, which is mirroring; the fast tier holds
+// the old value, which is a write that did not land; or both hold the new value
+// and the router answered with neither, which is the router. Reporting only the
+// router's answer leaves all three looking identical, and a whole evening went
+// into guessing between them.
+//
+// Only the archive is reachable from here, because TC_COLD is what the runner
+// passes. That is still the one that decides: the tiered read fell through to
+// it, so if the archive agrees with the reference the answer did not come from
+// where it should have.
+function eachTier(id) {
+  if (id === null || id === undefined) return '';
+  let out = '';
+  for (const [name, conn] of [['fast tier', HOT], ['archive', COLD]]) {
+    if (!conn) continue;
+    try {
+      const d = conn.getDB(DB).getCollection(TIER.getName()).findOne({ _id: id });
+      // A tombstone is not a document the archive holds, it is the archive
+      // remembering one the application deleted. Reporting it as held sent a
+      // reader looking for a lost write where there was a correct delete.
+      const mark = d && d._tcDeletedAt ? ' (TOMBSTONED, deleted at ' + d._tcDeletedAt + ')' : '';
+      out += '\n\t  ' + name + ' holds: ' + (d ? mark + ser(d).slice(0, 700) : '(nothing)');
+    } catch (e) { /* a tier that cannot be read says nothing rather than lying */ }
+  }
+  return out;
+}
+
+// The archive this run's tiered collection falls through to, when the runner
+// gave us its address. Read only, and only for the feeder's own checkpoint.
+const COLD = process.env.TC_COLD ? new Mongo(process.env.TC_COLD) : null;
+const HOT = process.env.TC_HOT ? new Mongo(process.env.TC_HOT) : null;
+const META = process.env.TC_META || '_thermocline';
+
+// waitForMirroring holds until mirroring has reached the instant this round has
+// written up to, so a second look at a disagreement is a second look and not a
+// coin toss.
+//
+// It used to be sleep(1500), which is a guess, and the guess was wrong under
+// load. Measured on one round of 150 operations: 53 disagreements reported, and
+// every one of them gone when the same two collections were compared 15 seconds
+// later with the daemons still up. 58 documents each, nought differing
+// positions. The router had logged "answering from the archive before mirroring
+// caught up" eleven times in that round, which is the bounded behaviour working
+// and saying so.
+//
+// A harness that reports 53 wrong answers where there are none is worse than no
+// harness: the one real disagreement would be somewhere in the list and nobody
+// would look.
+//
+// Two records could be waited on and only one of them is sound. The checkpoint
+// answers "where does the feeder resume", and its instant is the *seconds* half
+// of a cluster time, so everything inside one second reads as simultaneous:
+// waiting on it returned "caught up" after 500ms while the archive still did not
+// hold the write, and the round still reported 53 disagreements. The position
+// record answers "how far has mirroring got", carries the cluster time whole,
+// and is written after the batch lands. That is the one the router's own barrier
+// compares against, and it is the one to compare against here.
+//
+// The target is a cluster time and not a clock reading, for the reason the
+// position record itself gives: it is the replica set's own logical clock, so
+// both sides read it from the same place and neither machine's clock comes into
+// it. ping through the router carries one back from the fast tier, which is
+// where the writes just went.
+//
+// Bounded, and it falls back to the old sleep when the runner did not pass an
+// archive address, because a comparison that hangs is its own kind of useless.
+function waitForMirroring() {
+  if (!COLD) { if (TRACE) print('  wait\tno TC_COLD, sleeping 1500ms'); sleep(1500); return; }
+
+  const target = clusterTimeNow();
+  if (!target) { sleep(1500); return; }
+  const pos = COLD.getDB(META).getCollection('positions');
+  for (let i = 0; i < 60; i++) {
+    sleep(500);
+    let p = null;
+    try { p = pos.findOne({ _id: 'test' }); } catch (e) {
+      if (TRACE) print('  wait\tcould not read the position: ' + String(e.message).slice(0, 80));
+      break;
+    }
+    if (p && p.ts && cmpTS(p.ts, target) >= 0) {
+      if (TRACE) print('  wait\tmirroring reached this cluster time after ' + ((i + 1) * 500) + 'ms');
+      return;
+    }
+  }
+  print('  HARNESS  mirroring did not reach this round\'s cluster time within 30s, so the ' +
+        'disagreements below may be the feeder rather than the router');
+}
+
+// clusterTimeNow is the fast tier's own logical clock, taken through the router
+// so it is the clock the writes above were stamped with.
+function clusterTimeNow() {
+  try {
+    const r = db.getSiblingDB('admin').runCommand({ ping: 1 });
+    return r.operationTime || (r.$clusterTime && r.$clusterTime.clusterTime) || null;
+  } catch (e) { return null; }
+}
+
+// cmpTS orders two BSON timestamps, seconds first and increment second, which is
+// how a cluster time orders. Comparing the seconds alone would treat everything
+// inside one second as simultaneous, which is the mistake the checkpoint's own
+// instant made here.
+function cmpTS(a, b) {
+  const at = Number(a.t !== undefined ? a.t : a.getTime()), bt = Number(b.t !== undefined ? b.t : b.getTime());
+  if (at !== bt) return at < bt ? -1 : 1;
+  const ai = Number(a.i !== undefined ? a.i : a.getInc()), bi = Number(b.i !== undefined ? b.i : b.getInc());
+  if (ai !== bi) return ai < bi ? -1 : 1;
+  return 0;
 }
 
 // After a write the two collections have to hold the same documents, which is a
 // stronger statement than the write's own reported counts and catches a write
 // that landed on one document too many.
+//
+// Only after a write that succeeded on both sides, which is why every caller
+// guards it on what ask returned. An updateMany is not atomic across documents:
+// it applies them one at a time and stops at the first error, so a write that
+// failed part way leaves a partial result whose extent depends on the order the
+// documents were visited, and two collections need not visit them in the same
+// order. Measured: {$pull: {tags: "common"}} over a collection where one
+// document's tags had been $set to a string failed on both sides with "Cannot
+// apply $pull to a non-array value", was correctly counted as agreed, and then
+// the contents comparison after it reported 45 disagreements across the rest of
+// the round. None of them was the router.
 function contentsMatch(after, op) {
   ask(after, op, c => c.find({}).sort({ _id: 1 }).toArray(), 'seq');
 }
@@ -334,6 +499,96 @@ function someIds(known, n) {
   }
   return out.length ? out : [1];
 }
+
+// Index DDL, generated the same way everything else here is.
+//
+// The shape the hand-written suites cannot reach, and the one every defect found
+// on 2026-09-05 lived in: this router remembers things about a namespace that
+// only stay true while its indexes and its collection do. It caches the fast
+// tier's unique indexes for a minute, whether a hint is answerable on the
+// archive for the same, the collation, and the type brackets of the field a
+// collection ages by. A read taken while one of those is stale is a wrong
+// answer that no read-only grammar can produce, because nothing in it ever
+// changes an index.
+//
+// Both sides get the same command, so the comparison is unchanged: the
+// reference is untiered and mongod answers it, and the tiered side goes through
+// the router's DDL guards first. Where a guard refuses, that is a REFUSAL and
+// the census is worth having; where it does not, the answers to every read after
+// it have to agree as before.
+//
+// Deterministic names, because the two sides are two collections and a drop has
+// to be able to name the index the create made on both of them.
+const IDX_SPECS = [
+  { spec: { n: 1 },                     name: 'fz_n' },
+  { spec: { grp: 1, n: -1 },            name: 'fz_grp_n' },
+  { spec: { 'meta.score': 1 },          name: 'fz_score' },
+  { spec: { tags: 1 },                  name: 'fz_tags' },
+  { spec: { 'items.sku': 1, n: 1 },     name: 'fz_sku_n' },
+  { spec: { when: -1 },                 name: 'fz_when' },
+  { spec: { name: 1 },                  name: 'fz_name' },
+];
+
+// What is put on top of a spec, and each option is here because something in
+// the router reads it.
+//
+//   unique     the registry claims keys across the tiers for one of these
+//   sparse     narrows which documents an index covers, which is what decides
+//              whether a key is claimed for a document at all
+//   partial    the same, by predicate, and the fields the predicate reads are
+//              what makes a write move a document into the index
+//   collation  two spellings are one key and their bytes are not
+//   ttl        refused on a tiered collection, because it is the archive
+//              deleting history nobody asked it to
+// The longest retention a TTL index can express, which is int32 seconds, about
+// 68 years. It has to be a retention that expires nothing.
+//
+// A day was the first value here and it cost an evening. The tiered side refuses
+// a TTL index, because that is the archive deleting history nobody asked it to;
+// the reference is untiered, so mongod accepts it and starts expiring. The
+// documents are dated 2024, so within a minute the reference had emptied itself
+// and every contents comparison after that disagreed: 112 disagreements in ten
+// rounds, none of them about the router. Measured on a throwaway collection of
+// twenty documents with the same index: 20 before, 0 after.
+//
+// This is the harness lying about the router, which is the one failure this file
+// cannot afford, and the second time this grammar has done it in a day. A
+// generated operation is only safe when it means the same thing on both sides.
+const TTL_NEVER = 2147483647;
+
+function indexOptions() {
+  const o = {};
+  if (maybe(0.25)) o.unique = true;
+  switch (ri(6)) {
+    case 0: o.sparse = true; break;
+    case 1: o.partialFilterExpression = { n: { $gt: 10 } }; break;
+    case 2: o.partialFilterExpression = { grp: 'alpha' }; break;
+    case 3: o.collation = { locale: 'en', strength: 2 }; break;
+    case 4: if (!o.unique) o.expireAfterSeconds = TTL_NEVER; break;
+    default: break;
+  }
+  return o;
+}
+
+// legalOptions is indexOptions with the combinations mongod itself rejects taken
+// out, so a refusal in a round is this router's and not the server's.
+//
+// A TTL index is only legal on a single date field and never together with
+// unique, and this collection's one date field is `when`. Generating an illegal
+// pair would have both sides fail identically for ever, which counts as agreed
+// and proves nothing.
+function legalOptions(entry) {
+  const o = indexOptions();
+  if (o.expireAfterSeconds !== undefined && entry.name !== 'fz_when') {
+    delete o.expireAfterSeconds;
+  }
+  return o;
+}
+
+// Every index this run has created, by name, so a drop names one that exists.
+// Shared between the two sides on purpose: they are given the same commands, so
+// a name created on one was created on the other.
+const madeIndexes = [];
 
 function oneOp(i) {
   const F = filter(1 + ri(2));
@@ -352,7 +607,14 @@ function oneOp(i) {
   // even weight a round of fifty operations generated two joins.
   const READS = [0, 1, 2, 3, 3, 3, 4, 5, 3, 4];
   const WRITES = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16];
-  const choice = RO ? pick(READS) : (maybe(0.65) ? pick(READS) : pick(WRITES));
+  // DDL is its own draw rather than a member of WRITES, because it is rare in
+  // an application and every one of these changes what the router has cached
+  // about the namespace for the operations that follow. Too many and a round
+  // spends itself building indexes instead of comparing answers.
+  const DDL = [17, 17, 18, 19, 19];
+  const choice = RO ? pick(READS)
+                    : maybe(0.10) ? pick(DDL)
+                    : maybe(0.60) ? pick(READS) : pick(WRITES);
   switch (choice) {
     case 0: {
       const sk = ri(3), lm = maybe(0.5) ? 1 + ri(25) : 0;
@@ -406,8 +668,7 @@ function oneOp(i) {
       break;
     case 6: {
       const op = 'updateMany ' + ser(F) + ' ' + ser(U);
-      ask('updateMany', op, c => { const r = c.updateMany(F, U); return [r.matchedCount, r.modifiedCount]; }, 'seq');
-      contentsMatch('contents after updateMany', op);
+      if (ask('updateMany', op, c => { const r = c.updateMany(F, U); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateMany', op);
       break;
     }
     case 7: {
@@ -419,8 +680,7 @@ function oneOp(i) {
       // deleting a document the fast tier does not have is still reached.
       const f = { $and: [ { _id: { $in: someIds(known, 3) } }, F ] };
       const op = 'deleteMany ' + ser(f);
-      ask('deleteMany', op, c => c.deleteMany(f).deletedCount, 'seq');
-      contentsMatch('contents after deleteMany', op);
+      if (ask('deleteMany', op, c => c.deleteMany(f).deletedCount, 'seq')) contentsMatch('contents after deleteMany', op);
       break;
     }
     case 8: {
@@ -430,23 +690,20 @@ function oneOp(i) {
       // itself.
       const f = { _id: anId };
       const op = 'updateOne ' + ser(f) + ' ' + ser(U);
-      ask('updateOne', op, c => { const r = c.updateOne(f, U); return [r.matchedCount, r.modifiedCount]; }, 'seq');
-      contentsMatch('contents after updateOne', op);
+      if (ask('updateOne', op, c => { const r = c.updateOne(f, U); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateOne', op);
       break;
     }
     case 9: {
       const f = { _id: anId };
       const op = 'deleteOne ' + ser(f);
-      ask('deleteOne', op, c => c.deleteOne(f).deletedCount, 'seq');
-      contentsMatch('contents after deleteOne', op);
+      if (ask('deleteOne', op, c => c.deleteOne(f).deletedCount, 'seq')) contentsMatch('contents after deleteOne', op);
       break;
     }
     case 10: {
       const doc = { _id: anId, n: ri(70), grp: pick(['alpha', 'beta']), tags: ['r' + ri(3)],
                     meta: { score: ri(13), active: maybe(0.5) }, when: new Date(Date.UTC(2024, ri(12), 1 + ri(27))) };
       const op = 'replaceOne ' + ser(doc);
-      ask('replaceOne', op, c => { const r = c.replaceOne({ _id: anId }, doc); return [r.matchedCount, r.modifiedCount]; }, 'seq');
-      contentsMatch('contents after replaceOne', op);
+      if (ask('replaceOne', op, c => { const r = c.replaceOne({ _id: anId }, doc); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after replaceOne', op);
       break;
     }
     case 11: {
@@ -456,8 +713,7 @@ function oneOp(i) {
                     meta: { score: ri(13), active: maybe(0.5) },
                     when: new Date(Date.UTC(2024, ri(12), 1 + ri(27))) };
       const op = 'insertOne ' + ser(doc);
-      ask('insertOne', op, c => c.insertOne(doc).insertedId, 'seq');
-      contentsMatch('contents after insertOne', op);
+      if (ask('insertOne', op, c => c.insertOne(doc).insertedId, 'seq')) contentsMatch('contents after insertOne', op);
       break;
     }
     case 12: {
@@ -466,22 +722,21 @@ function oneOp(i) {
       // side invents its own ObjectId.
       const f = { _id: 2000 + ri(8), grp: pick(['alpha', 'beta']) };
       const op = 'upsert ' + ser(f) + ' ' + ser(U);
-      ask('upsert', op, c => { const r = c.updateOne(f, U, { upsert: true }); return [r.matchedCount, r.modifiedCount, ser(r.upsertedId)]; }, 'seq');
-      contentsMatch('contents after upsert', op);
+      if (ask('upsert', op, c => { const r = c.updateOne(f, U, { upsert: true }); return [r.matchedCount, r.modifiedCount, ser(r.upsertedId)]; }, 'seq')) contentsMatch('contents after upsert', op);
       break;
     }
     case 13: {
       const newDoc = maybe(0.5);
       const op = 'findOneAndUpdate ' + ser(F) + ' ' + ser(U) + ' by ' + ser(S) + (newDoc ? ' returning new' : '');
-      ask('findOneAndUpdate', op,
-          c => c.findOneAndUpdate(F, U, { sort: S, returnNewDocument: newDoc }), 'seq');
-      contentsMatch('contents after findOneAndUpdate', op);
+      if (ask('findOneAndUpdate', op,
+              c => c.findOneAndUpdate(F, U, { sort: S, returnNewDocument: newDoc }), 'seq')) {
+        contentsMatch('contents after findOneAndUpdate', op);
+      }
       break;
     }
     case 14: {
       const op = 'findOneAndDelete ' + ser(F) + ' by ' + ser(S);
-      ask('findOneAndDelete', op, c => c.findOneAndDelete(F, { sort: S }), 'seq');
-      contentsMatch('contents after findOneAndDelete', op);
+      if (ask('findOneAndDelete', op, c => c.findOneAndDelete(F, { sort: S }), 'seq')) contentsMatch('contents after findOneAndDelete', op);
       break;
     }
     case 16: {
@@ -499,11 +754,20 @@ function oneOp(i) {
       const f2 = { _id: { $in: someIds(known, 2) } };
       const op = 'txn: count ' + ser(F) + ', updateMany ' + ser(f2) + ' ' + ser(U) +
                  ', find sorted ' + ser(S);
-      ask('transaction', op, c => {
+      // attempts is counted and reported, not compared. A transaction the router
+      // asked to be replayed runs its body more than once, by design, and the
+      // reference never does; comparing the number would report the design as a
+      // defect. It is in the op line because a transaction that gave up is a
+      // transaction that ran its body many times first, and that is invisible
+      // otherwise.
+      const tries = { ref: 0, tier: 0 };
+      const txnOK = ask('transaction', op, c => {
         const s = db.getMongo().startSession();
         let out = null;
+        const side = c.getName() === REF.getName() ? 'ref' : 'tier';
         try {
           s.withTransaction(() => {
+            tries[side]++;
             const tc = s.getDatabase(DB).getCollection(c.getName());
             const acc = [];
             acc.push(tc.countDocuments(F));
@@ -514,7 +778,59 @@ function oneOp(i) {
         } finally { s.endSession(); }
         return out;
       }, 'seq');
-      contentsMatch('contents after a transaction', op);
+      if (TRACE || tries.tier > 1) {
+        print('  txn\tbody ran ' + tries.ref + ' times on the reference and ' +
+              tries.tier + ' on the tiered collection');
+      }
+      if (txnOK) contentsMatch('contents after a transaction', op);
+      break;
+    }
+    case 17: {
+      const entry = pick(IDX_SPECS);
+      const opts = legalOptions(entry);
+      const full = Object.assign({ name: entry.name }, opts);
+      const op = 'createIndex ' + ser(entry.spec) + ' ' + ser(opts);
+      // No try/catch of its own: ask compares how the two sides failed as
+      // carefully as it compares what they answered, and swallowing the error
+      // here would throw away the half of the comparison that matters. A build
+      // both sides refuse the same way is vacuous, one refused only on the
+      // tiered side is a refusal, and one that fails on the tiered side alone
+      // for another reason is a finding.
+      const madeOK = ask('createIndex', op, c => c.createIndex(entry.spec, full), 'seq');
+      if (madeIndexes.indexOf(entry.name) < 0) madeIndexes.push(entry.name);
+      // The documents cannot have changed, and this is where a stale cache
+      // shows: the read below runs against a collection whose indexes have just
+      // moved under a router that had listed them.
+      if (madeOK) contentsMatch('contents after createIndex', op);
+      break;
+    }
+    case 18: {
+      if (!madeIndexes.length) { break; }
+      const name = pick(madeIndexes);
+      const op = 'dropIndex ' + name;
+      // nIndexesWas alone, because the whole reply carries $clusterTime and
+      // operationTime and those differ between any two commands by
+      // construction. Comparing them reported a disagreement on every single
+      // dropIndex: the harness lying about the router, which is the failure
+      // this file is least able to afford.
+      if (ask('dropIndex', op, c => String(c.dropIndex(name).nIndexesWas), 'seq')) contentsMatch('contents after dropIndex', op);
+      break;
+    }
+    case 19: {
+      // The index listing this router keeps is per namespace and a minute long,
+      // so what it enforces after a create is what it read before one. A write
+      // straight after the DDL is where that shows, and an insert is the write
+      // that has to claim a key for every unique index there is.
+      //
+      // name is drawn from a small set on purpose, so a unique index on it has
+      // duplicates to refuse rather than never firing.
+      const doc = { _id: 4000 + i, n: ri(70), grp: pick(['alpha', 'beta']),
+                    name: 'ddl' + ri(6), tags: ['t' + ri(3)],
+                    items: [{ sku: 's' + ri(4), qty: ri(70) }],
+                    meta: { score: ri(13), active: maybe(0.5) },
+                    when: new Date(Date.UTC(2024, ri(12), 1 + ri(27))) };
+      const op = 'insert straight after DDL ' + ser(doc);
+      if (ask('insertAfterDDL', op, c => String(c.insertOne(doc).insertedId), 'seq')) contentsMatch('contents after an insert following DDL', op);
       break;
     }
     default: {
@@ -525,11 +841,11 @@ function oneOp(i) {
         { insertOne: { document: { _id: 3000 + i, n: ri(70), grp: 'alpha', tags: ['b'] } } },
       ];
       const op = 'bulkWrite ' + ser(ops);
-      ask('bulkWrite', op, c => {
+      const bulkOK = ask('bulkWrite', op, c => {
         const r = c.bulkWrite(ops, { ordered: false });
         return [r.matchedCount, r.modifiedCount, r.deletedCount, r.insertedCount];
       }, 'seq');
-      contentsMatch('contents after bulkWrite', op);
+      if (bulkOK) contentsMatch('contents after bulkWrite', op);
     }
   }
 }

@@ -251,6 +251,10 @@ feeder:
     # other than the one it runs against. tcref2 is the untiered reference and
     # is deliberately NOT here.
     - "shop.tcfuzz2"
+    # testtxn.sh: a transaction updating one document the fast tier holds and one
+    # only the archive has, read back the instant it commits. ttxref is the
+    # untiered reference and is deliberately NOT here.
+    - "shop.ttxmul"
     # testddl.sh: a collection created through the router after the fast tier
     # lost it out of band
     - "shop.tdcreate"

@@ -31,7 +31,7 @@ COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:
 ROUNDS=${TC_ROUNDS:-4}
 OPS=${TC_OPS:-40}
 SEED0=${TC_SEED:-1}
-export TC_DB=$DB TC_META=$META TC_COLD=$COLD TC_OPS=$OPS
+export TC_DB=$DB TC_META=$META TC_COLD=$COLD TC_HOT=$HOT TC_OPS=$OPS
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 PASS=0; FAIL=0; declare -a FAILED
@@ -227,7 +227,11 @@ for r in $(seq 1 $ROUNDS); do
   # The continuation lines carry the two answers and start with a real tab.
   # grep -E reads \t as a literal t, so the pattern that looked like it matched
   # them dropped exactly the part of a disagreement worth reading.
-  echo "$OUT" | grep -E "^  HARNESS|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
+  # TC_TRACE prints every operation the round ran, in order, before the report.
+  # A disagreement is usually about state something earlier left behind, and the
+  # report names only the operation that noticed.
+  [ "${TC_TRACE:-0}" = "1" ] && echo "$OUT" | grep -E "^  (op|wait)$(printf '\t')"
+  echo "$OUT" | grep -E "^  HARNESS|^  txn$(printf '\t')|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
   # What the round actually compared, as shape=done/vacuous. A clean tally over
   # a grammar that never generated a shape is not evidence about that shape.
   echo "$OUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
