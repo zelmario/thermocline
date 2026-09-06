@@ -318,19 +318,33 @@ Part of [Thermocline](../README.md).
   than failing, because replaying a drop is exactly how one accident on the fast
   tier would destroy the archive. Removing archived documents is deliberately a
   separate act.
-- **`terminate_auth` has never met a real workload.** It has now met harness
-  traffic, which it had not before: a three hour soak of 490 rounds through
-  mongosh, two shops writing at once for 19,253 commands, and the pilot's write,
-  stream and transaction batteries. That run is what found the gate refusing
-  fourteen out of fourteen ordinary diagnostic commands, because the
-  authorisation table only ever judged commands that touch data while drivers
-  and shells spend most of their commands elsewhere. What it has still not met
-  is an application nobody wrote for this.
+- **`terminate_auth` is a judgement call rather than a finished feature**, and it
+  is off by default.
 
-  Everything it lifts is lifted in principle only while it is off by default,
-  and the security-critical half of it is an authorization gate. That gate is
-  the only thing between a client and somebody else's data in that mode, it
-  denies by default, and it has fifty six checks behind it in `testauthterm.sh`,
-  including the ones that caught it allowing a `$lookup`, a `$merge` and an
-  unacknowledged write it should have refused. It is still a judgement call
-  rather than a finished feature.
+  What it has met, in order. Harness traffic first: a three hour soak of 490
+  rounds through mongosh, and two shops writing at once for 19,253 commands.
+  That run is what found the gate refusing fourteen out of fourteen ordinary
+  diagnostic commands, because the authorisation table only ever judged commands
+  that touch data while drivers and shells spend most of their commands
+  elsewhere.
+
+  And on 2026-09-06, **data nobody here wrote**: the whole pilot with it on, over
+  MongoDB's published sample datasets adopted as an archive. 199 comparison
+  questions with no disagreement, the nineteen cross-collection aggregations with
+  the two documented refusals and no disagreement, and the write, change stream
+  and transaction batteries clean. That closes the gap this entry used to name,
+  which was that it had never met an application nobody wrote for this.
+
+  The write battery reports one fewer section than the run beside it with
+  proxied auth, and the reason is in the run rather than in the mode: the
+  straddling-range section skips itself when no year has documents on both sides
+  of the boundary, and the run before it had moved the boundary. Three checks,
+  and they are reported as skipped rather than quietly absent.
+
+  The security-critical half of it is an authorization gate. That gate is the
+  only thing between a client and somebody else's data in that mode, it denies by
+  default, and it has fifty six checks behind it in `testauthterm.sh`, including
+  the ones that caught it allowing a `$lookup`, a `$merge` and an unacknowledged
+  write it should have refused. A clean pilot says the mode serves an
+  application correctly; it does not say the gate cannot be got round, and those
+  are different claims.
