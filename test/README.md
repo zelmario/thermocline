@@ -132,9 +132,29 @@ as a refusal and everything else still has to agree.
 That extension caught one thing immediately, and it was the harness: a
 `dropIndex` reply carries `$clusterTime` and `operationTime`, which differ
 between any two commands by construction, so comparing whole replies reported a
-disagreement on every drop. It compares `nIndexesWas` now. Read that as the
-standing warning about this file: a generator is only as good as what it decides
-counts as the same answer.
+disagreement on every drop. It compares whether the index is gone now, which is
+what a drop is for. Read that as the standing warning about this file: a
+generator is only as good as what it decides counts as the same answer.
+
+**The last section runs the same operations with an evictor draining the fast
+tier underneath them**, `TC_CHURN_ROUNDS` rounds of it, two by default. Every
+other round moves documents one way only: a read or a write that needs an
+archived document copies it up, and nothing takes one back. That is half of what
+this system does, and the other half is the shape behind the worst defect this
+project has had, where a sweep narrowed a claim and acted on it in the same
+breath and the router answered 1,095 of 2,000.
+
+The comparison is unchanged and still sound: the archive holds every document
+whatever the evictor does, and the untiered reference is not touched by it. What
+moves is only which tier has to answer.
+
+Two things had to be true before that section meant anything. `residency` holds
+a copied-up document against the next sweep for five minutes and the setup
+copies every one of them up, so the derived config sets it to a second: without
+that the sweep reported `scanned=32 evicted=0 held=30` every five seconds and
+nothing moved at all. And the section proves it swept, from the evictor's own
+log, because a document count taken before and after says nothing when a reseed
+puts them straight back.
 
 The suites take their endpoints from `HOT`, `COLD`, `HOTU` and `COLDU`, so pass
 them with `docker exec -e` when the topology is not the documented one.
