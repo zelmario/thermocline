@@ -40,6 +40,14 @@ const OPS  = Number(process.env.TC_OPS || 60);
 const RO   = process.env.TC_READONLY === '1';
 const SEED = Number(process.env.TC_SEED || 1);
 const TRACE = process.env.TC_TRACE === '1';
+// The strict section asks a different question: with a fast tier holding every
+// document there is nothing the router cannot answer, so every refusal there is
+// the completeness guard being more cautious than the data requires. A TTL index
+// on a tiered collection is refused by a different guard, for a reason that has
+// nothing to do with completeness: it would delete the newest documents and keep
+// the oldest. Generating one there would make that section fail for the guard
+// working.
+const NO_TTL = process.env.TC_NO_TTL === '1';
 const d    = db.getSiblingDB(DB);
 const REF  = d.tcref;
 const TIER = d.tcfuzz;
@@ -589,7 +597,7 @@ function indexOptions() {
     case 1: o.partialFilterExpression = { n: { $gt: 10 } }; break;
     case 2: o.partialFilterExpression = { grp: 'alpha' }; break;
     case 3: o.collation = { locale: 'en', strength: 2 }; break;
-    case 4: if (!o.unique) o.expireAfterSeconds = TTL_NEVER; break;
+    case 4: if (!o.unique && !NO_TTL) o.expireAfterSeconds = TTL_NEVER; break;
     default: break;
   }
   return o;
@@ -876,12 +884,22 @@ function oneOp(i) {
       if (!madeIndexes.length) { break; }
       const name = pick(madeIndexes);
       const op = 'dropIndex ' + name;
-      // nIndexesWas alone, because the whole reply carries $clusterTime and
-      // operationTime and those differ between any two commands by
-      // construction. Comparing them reported a disagreement on every single
-      // dropIndex: the harness lying about the router, which is the failure
-      // this file is least able to afford.
-      if (ask('dropIndex', op, c => String(c.dropIndex(name).nIndexesWas), 'seq')) contentsMatch('contents after dropIndex', op);
+      // Whether the index is gone, which is what a drop is for.
+      //
+      // Not the whole reply, which carries $clusterTime and operationTime and
+      // those differ between any two commands by construction: comparing them
+      // reported a disagreement on every single drop. And not nIndexesWas
+      // either, which was the first answer to that and is an index *count*
+      // across two collections whose index sets legitimately differ. The router
+      // builds the archive's indexes on the fast tier as documents arrive
+      // there, so with an evictor running the counts move on one side and not
+      // the other: measured, one disagreement in twelve churn rounds, and it
+      // was this.
+      const dropped = ask('dropIndex', op, c => {
+        c.dropIndex(name);
+        return c.getIndexes().some(i => i.name === name) ? 'still there' : 'gone';
+      }, 'seq');
+      if (dropped) contentsMatch('contents after dropIndex', op);
       break;
     }
     case 19: {

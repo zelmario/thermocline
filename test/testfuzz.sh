@@ -217,11 +217,15 @@ chk "five documents hidden from the archive are noticed" "yes" "$([ "${8:-0}" -g
 reseed
 
 TA=0; TR=0; TS=0; TD=0
-for r in $(seq 1 $ROUNDS); do
-  SEED=$((SEED0 + r*7919))
+# oneRound runs the generator once and reports what it found. Named because the
+# churn section below runs the same thing with the tiers moving underneath it,
+# and a second copy of this loop would drift from the first.
+#   $1  the label for the round
+#   $2  the seed
+oneRound() {
+  local label="$1" SEED="$2"
   echo
-  echo "== round $r of $ROUNDS, seed $SEED, $OPS operations =="
-  [ $r -gt 1 ] && reseed
+  echo "== $label, seed $SEED, $OPS operations =="
   OUT=$(TC_SEED=$SEED mongosh --port $PORT -u dba -p secret --authenticationDatabase admin \
           --quiet --file "$HERE/fuzz.js" 2>&1)
   # The continuation lines carry the two answers and start with a real tab.
@@ -243,8 +247,90 @@ for r in $(seq 1 $ROUNDS); do
   set -- $LINE
   echo "  $LINE"
   TA=$((TA+$2)); TR=$((TR+$4)); TS=$((TS+$6)); TD=$((TD+$8))
-  chk "round $r: no disagreement" "0" "$8"
+  chk "$label: no disagreement" "0" "$8"
+}
+
+for r in $(seq 1 $ROUNDS); do
+  [ $r -gt 1 ] && reseed
+  oneRound "round $r of $ROUNDS" $((SEED0 + r*7919))
 done
+
+echo
+echo "== the same operations with the tiers moving underneath them =="
+# Every round above ran with documents moving one way only: a read or a write
+# that needs an archived document copies it up, and nothing ever takes one back.
+# That is half of what this system does. The other half is the evictor, and it
+# removes documents from the fast tier while clients are reading and writing
+# them.
+#
+# It is the shape behind the worst defect this project has had, where an
+# eviction sweep narrowed a claim and acted on it in the same breath and the
+# router answered 1,095 of 2,000 for five seconds. The hand-written suite for
+# that asks the questions somebody thought of; this asks the ones nobody did,
+# against a collection that is being drained as it is asked.
+#
+# The comparison is unchanged and still sound: the archive holds every document
+# whatever the evictor does, the untiered reference is not touched by it at all,
+# and both sides must still answer the same. What moves is only which tier the
+# answer has to come from, which is the thing being tested.
+CHURN_ROUNDS=${TC_CHURN_ROUNDS:-2}
+if [ "$CHURN_ROUNDS" -gt 0 ]; then
+  # An eviction rule for the tiered collection alone, appended to the evictor's
+  # own rules. Aged by `when`, because these documents carry integer _ids and a
+  # rule with no date_field reads the age out of an ObjectId timestamp, which
+  # they do not have. Every document is dated 2024, so every one of them is
+  # older than the window and the sweep drains what the copy-ups put back.
+  # residency goes with the rule. A document the router copied up is held
+  # against the next sweep for router.residency, five minutes in this config,
+  # and the setup copies every one of them up: measured, the sweep reported
+  # `scanned=32 evicted=0 held=30` every five seconds and the section ran with
+  # nothing moving at all. One second still exercises the hold, and lets the
+  # sweep reach the documents inside a round.
+  awk '
+    /^evictor:/ { inev = 1 }
+    /^warmer:/  { inev = 0 }
+    { sub(/residency: 5m/, "residency: 1s"); print }
+    inev && /^  rules:/ && !done {
+      print "    - ns: \"'"$DB"'.tcfuzz\""
+      print "      older_than: 40m"
+      print "      date_field: \"when\""
+      done = 1
+    }
+  ' $CFG > $WDIR/fuzz_churn.yaml
+  grep -q "$DB.tcfuzz" $WDIR/fuzz_churn.yaml || {
+    echo "  FATAL  the churn config does not carry an eviction rule"; exit 2; }
+  # Proving the rule is live before the rounds run, or a clean tally would mean
+  # the evictor never did anything and the section would be the section above
+  # under another name.
+  reseed
+  rm -f $LOGDIR/fuzz_ev.log
+  cline evictor --config $WDIR/fuzz_churn.yaml --every 5s --log-file $LOGDIR/fuzz_ev.log &
+  EVP=$!
+  for r in $(seq 1 $CHURN_ROUNDS); do
+    reseed
+    oneRound "churn round $r of $CHURN_ROUNDS" $((SEED0 + 555 + r*7919))
+  done
+  kill $EVP 2>/dev/null; wait $EVP 2>/dev/null
+  # What the evictor actually did, from its own log, rather than a count taken
+  # before and after. A before-and-after says nothing here, because a reseed
+  # puts the documents straight back: measured, it read 30 to 30 across a
+  # section in which the evictor had removed nothing at all, and read 30 to 29
+  # across another, and neither number was about the rounds.
+  #
+  # Without this the section is the section above under another name, and a
+  # clean tally from it would be evidence of nothing.
+  SWEPT=$({ grep -c 'msg="sweep complete"' $LOGDIR/fuzz_ev.log 2>/dev/null || true; } | head -1)
+  MOVED=$({ grep -c 'evicted=[1-9]' $LOGDIR/fuzz_ev.log 2>/dev/null || true; } | head -1)
+  chk "the evictor swept while the rounds ran"        "true" \
+      "$([ "${SWEPT:-0}" -gt 0 ] && echo true || echo false)"
+  chk "and took documents out from under them"        "true" \
+      "$([ "${MOVED:-0}" -gt 0 ] && echo true || echo false)"
+  echo "  $SWEPT sweeps, $MOVED of which removed something"
+  # The evictor writes the watermark itself, so the claim it leaves is its own
+  # rather than the one the rounds above were set up with. Put it back before
+  # anything else runs.
+  reseed
+fi
 
 echo
 echo "== nothing is refused when the fast tier holds it all =="
@@ -267,7 +353,7 @@ done
 # mongod that happens to be listening.
 chk "a strict router is up"            "isdbgrid" "$(mongosh --port $P1 -u dba -p secret --authenticationDatabase admin --quiet --eval 'print(db.hello().msg)' 2>&1 | tail -1)"
 chk "and the fast tier holds them all" "60" "$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")"
-SOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=$OPS mongosh --port $P1 -u dba -p secret \
+SOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=$OPS TC_NO_TTL=1 mongosh --port $P1 -u dba -p secret \
          --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
 echo "$SOUT" | grep -E '^  HARNESS|^DISAGREE|^REFUSAL|^\t' | head -40
 echo "$SOUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
