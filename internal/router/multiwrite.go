@@ -72,9 +72,18 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 			continue
 		}
 
-		// A filter pinned to one _id cannot reach beyond a single document, and
-		// that case is already resolved on the reply.
-		if _, hasID := idFromFilter(fdoc); hasID {
+		// A filter that is nothing but an _id cannot reach beyond a single
+		// document, and that case is already resolved on the reply.
+		//
+		// Nothing but an _id, not merely carrying one. A filter of an _id and
+		// something else is resolved on the reply against the whole of itself,
+		// and the reply path leaves a multi statement alone because this guard
+		// is supposed to have brought its documents up first. Skipping here on
+		// the _id alone left {_id: X, other: ...} with neither: no copy-up
+		// before the write and no resolution after it, so an archived document
+		// the statement matched was never touched and the write reported
+		// success. See filterIsOnlyID.
+		if _, hasID := idFromFilter(fdoc); hasID && filterIsOnlyID(fdoc) {
 			continue
 		}
 

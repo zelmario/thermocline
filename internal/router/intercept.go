@@ -129,6 +129,27 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// copyUp reports whether the document was there at all, which is the same
 	// question the read below has to answer, so it is asked once.
 	if inTransaction(cmd) {
+		// The whole filter decides, not the _id in it. Asking the archive for
+		// the _id alone copies up a document this find does not match, the
+		// replay finds nothing again, and the two go round until the driver
+		// gives up. See filterIsOnlyID for what that was measured to cost.
+		//
+		// resolveMissByFilter rather than a second answerFromArchive: it asks
+		// the same question in one round trip with an _id projection, it is
+		// what the two write paths below already use, and it costs nothing at
+		// all on a namespace whose claim covers the read.
+		if !filterIsOnlyID(fdoc) {
+			resolved, ok, rerr := c.resolveMissByFilter(ctx, ns, fdoc, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if !ok {
+				// The archive does not match it either, so the empty answer
+				// was correct.
+				return reply, nil
+			}
+			id = resolved
+		}
 		copied, cerr := c.r.copyUp(ctx, ns, id)
 		if cerr != nil {
 			return nil, cerr
@@ -250,6 +271,12 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 	}
 	fdoc, _ := fval.DocumentOK()
 	id, hasID := idFromFilter(fdoc)
+	if hasID && !filterIsOnlyID(fdoc) {
+		// An _id and something else. The something else decides whether the
+		// document that _id names is one this statement matches, so the miss is
+		// resolved against the whole filter like any other. See filterIsOnlyID.
+		hasID = false
+	}
 	if !hasID {
 		// A filter on any other field names one document without saying which,
 		// and until now it was in neither resolving path. See singlewrite.go.
@@ -324,6 +351,11 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 	}
 	fdoc, _ := qval.DocumentOK()
 	id, hasID := idFromFilter(fdoc)
+	if hasID && !filterIsOnlyID(fdoc) {
+		// The same as the write path above, and for the same reason. See
+		// filterIsOnlyID.
+		hasID = false
+	}
 	if !hasID {
 		// findAndModify carries its own sort, which is how the caller says
 		// which of several matches it means. The archive has to be asked in

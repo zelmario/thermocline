@@ -46,6 +46,22 @@ import (
 //
 // aggregate is not here because an aggregation is usually a read; it is handled
 // separately, for the two stages that describe the collection they run on.
+//
+// Two neighbours are deliberately left out, and both were measured.
+//
+// dropIndexes answers "ns not found" and leaves the archive's index exactly as
+// it was, so it fails cleanly rather than half applying. Repairing first would
+// make it worse: the create starts an index build in the background, and a drop
+// racing that build would remove an index the build then puts back, which is a
+// unique constraint silently resurrected after somebody dropped it. An error
+// naming the namespace is the better of the two, and any read or listing of the
+// collection makes the drop possible.
+//
+// explain is left out because an explain must not do anything mongod would not.
+// The router already refuses to copy documents up for one, on that reasoning,
+// and creating a collection is the same kind of side effect. So
+// db.coll.stats() repairs and an explain of the same pipeline does not, which
+// is the difference between running a command and planning it.
 var describesCollection = map[string]bool{
 	"listIndexes": true,
 	"validate":    true,

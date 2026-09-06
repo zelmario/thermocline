@@ -14,6 +14,35 @@ import (
 // which is the work the fast tier exists to avoid.
 //
 // Both spellings count: {_id: x} and {_id: {$eq: x}}.
+// filterIsOnlyID reports whether a filter says nothing but which _id it wants.
+//
+// An _id equality names at most one document, which is why a point read is
+// exempt from the completeness guard. It does not say that document matches the
+// statement: a filter is its _id and everything else in it, and resolving a miss
+// from the _id alone finds a document the statement would never have touched.
+//
+// Outside a transaction that produced a wrong answer, fixed once already by
+// answering a point read with the query the client sent. Inside one it produces
+// something worse than a wrong answer. The router copies the document up and
+// asks the driver to replay the transaction so it can see it; the replay runs,
+// the statement still matches nothing, the same _id resolves to the same
+// unmatching document, and round it goes. Measured by the differential harness:
+// the transaction body ran 446 times and then the driver gave up after its two
+// minute budget, so a transaction MongoDB would have committed failed, and the
+// application was told the write did not happen. Which was true, and it was the
+// router that made it true.
+//
+// Only the top level. An _id inside $and or $or is not found by idFromFilter
+// either, so such a filter already goes down the path that judges the whole of
+// it.
+func filterIsOnlyID(filter bson.Raw) bool {
+	elems, err := filter.Elements()
+	if err != nil || len(elems) != 1 {
+		return false
+	}
+	return elems[0].Key() == "_id"
+}
+
 func idFromFilter(filter bson.Raw) (bson.RawValue, bool) {
 	if len(filter) == 0 {
 		return bson.RawValue{}, false
