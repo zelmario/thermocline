@@ -196,6 +196,31 @@ Range queries are governed by the watermark below.
   Dropping a tiered collection **through the router** is still the right thing to
   do, because that is where every consequence of a drop is handled at once rather
   than a moment later.
+
+  **Both drops clear the same list**, because the forwarded path and the change
+  stream path were written separately and had already drifted. Writing it once
+  added the remembered **hint** and the remembered **view**, which neither
+  cleared: the hint is a sparse or partial index's own filter, which the router
+  reproduces against the archive so that a fall-through read is narrowed the way
+  the hint narrows it, and whether a name is a view decides whose completeness
+  claim judges a read of it. Both are untrue after a drop.
+
+  Neither has a reproduction behind it, and that is worth saying. The hint one
+  was measured for a dropped *index*, which is why it is cleared there; for a
+  dropped *collection* the check written for it answered 20 of 20 with and
+  without the change, because putting the index back goes through
+  `createIndexes` and that path already clears the same cache. The check was
+  removed rather than kept green for nothing. What the shared list buys is that
+  the two paths cannot drift again.
+
+  One thing is deliberately not on the list: the fast tier's **unique index
+  listing**. A collection that has just gone lists none, so re-reading it would
+  replace a listing that is merely old with one that is empty, and empty is the
+  direction that lets a duplicate of an archived document through. The archive
+  still holds every document that constraint covered, because a drop is never
+  replayed there, so the collection still logically contains them. That listing
+  is refreshed by the index build the next write starts, which is when there is
+  something true to read.
 - **An eviction sweep waits before it removes what it has just stopped
   claiming.** The evictor raises the completeness watermark first, so an
   interrupted sweep never leaves a claim wider than the truth. That protects a

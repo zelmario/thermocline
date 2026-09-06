@@ -67,7 +67,7 @@ func TestLivePipelineFiltersJoinedCollections(t *testing.T) {
 				{Key: "as", Value: "d"},
 				{Key: "pipeline", Value: bson.A{bson.D{{Key: "$documents", Value: bson.A{}}}}},
 			}}}},
-			want:   []string{`"$lookup": {"as": "d","pipeline": [{"$documents": []}]}`},
+			want: []string{`"$lookup": {"as": "d","pipeline": [{"$documents": []}]}`},
 		},
 		{
 			name:   "unionWith named as a string becomes the document form",

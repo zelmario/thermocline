@@ -251,14 +251,20 @@ func (r *Router) noteFastTierDDL(ns, op string) {
 // forgetDropped drops what this router remembers about a namespace the fast tier
 // no longer holds.
 //
-// The same set a drop forwarded through this router clears, and deliberately not
-// one item more: forgetIndexes is not here. The router reads the fast tier's
-// unique indexes to know which keys it has to protect across the tiers, and a
-// collection that has just gone lists none, so re-reading now would replace a
-// listing that is merely old with one that is empty. Empty is the direction that
-// lets a duplicate of an archived document through. That listing is refreshed by
-// the index build the next write starts, which is when there is something true
-// to read.
+// One list for both drops: the one this router forwards and the one it hears
+// about on the fast tier's change stream. They were written separately and had
+// already drifted, which is the argument for a single list rather than two that
+// agree today.
+//
+// Every memory here is one whose staleness is a wrong answer. forgetIndexes is
+// the one that is not, and it is deliberately absent: the router reads the fast
+// tier's unique indexes to know which keys it has to protect across the tiers,
+// and a collection that has just gone lists none, so re-reading now would
+// replace a listing that is merely old with one that is empty. Empty is the
+// direction that lets a duplicate of an archived document through, and the
+// archive still holds every document the constraint covered, because a drop is
+// never replayed there. That listing is refreshed by the index build the next
+// write starts, which is when there is something true to read.
 func (r *Router) forgetDropped(ns string) {
 	r.forgetCompleteness(ns)
 	// A drop and a recreate can put differently typed ages under the same name.
@@ -267,6 +273,24 @@ func (r *Router) forgetDropped(ns string) {
 	// A collection's collation is fixed at creation, so a drop is the only way
 	// it changes.
 	r.forgetCollation(ns)
+	// These two are here because a drop makes them untrue, and not because a
+	// reproduction was found. That is stated rather than dressed up.
+	//
+	// The hint is a sparse or partial index's own filter, which this router
+	// reproduces against the archive so a fall-through read is narrowed the way
+	// the hint narrows it, and reproducing the filter of an index that is gone
+	// asks the archive a narrower question than the client asked. That has been
+	// measured for a dropped *index*, which is why forgetHint exists at all. For
+	// a dropped *collection* it could not be: the check written for it answered
+	// 20 of 20 either way, because putting the index back goes through
+	// createIndexes and that path already clears this cache. The check was
+	// removed rather than kept green for nothing.
+	r.forgetHint(ns)
+	// Whether this name is a view, and what it is a view on, decides whose
+	// completeness claim judges a read of it. A drop can put a view where a
+	// collection was or the other way round, and either way what is remembered
+	// is about the collection before. No reproduction here either.
+	r.forgetView(ns)
 	// The one that does not correct itself on its own. See the top of this file
 	// for what it costs.
 	r.indexer.Forget(ns)

@@ -1111,20 +1111,24 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// expired before the next read. It is here because holding a
 				// claim that the fast tier holds everything, moments after
 				// making it empty, is wrong on its face.
-				c.r.forgetCompleteness(db + "." + coll)
-				// A drop and a recreate can put differently typed ages under
-				// the same name. See sortSafeAges.
-				c.r.forgetBrackets(db + "." + coll)
-				// The indexer records a namespace as done once the fast tier
-				// has the collection and its indexes, and never asks again. A
-				// drop makes that untrue and a create is where it becomes
-				// worth asking: without this the collection comes back with
-				// nothing but _id_, every query on it scans, and a unique
-				// index the archive still carries is not enforced on the fast
-				// tier at all. It noticed only when a catalog listing happened
-				// to find the collection missing, which is a later and much
-				// weaker signal than the DDL itself.
-				c.r.indexer.Forget(db + "." + coll)
+				//
+				// One list, shared with the drop this router hears about on
+				// the fast tier's change stream rather than performs. They
+				// were written separately and had already drifted: this one
+				// left the remembered hint and the remembered view standing,
+				// so a collection dropped and recreated here went on having a
+				// dropped partial index's filter reproduced against the
+				// archive for up to a minute, which asks a narrower question
+				// than the client asked and answers short.
+				//
+				// The indexer's half of that list is the one worth naming
+				// here: it records a namespace as done once the fast tier has
+				// the collection and its indexes, and never asks again. A drop
+				// makes that untrue, and without clearing it the collection
+				// comes back with nothing but _id_, every query on it scans,
+				// and a unique index the archive still carries is not enforced
+				// on the fast tier at all.
+				c.r.forgetDropped(db + "." + coll)
 			}
 			if name == "create" {
 				ns := db + "." + coll
