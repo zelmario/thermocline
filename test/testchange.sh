@@ -203,6 +203,68 @@ chk "the archive still holds the evicted document"     "true" \
 chk "a read through the router still finds it"         "old" \
     "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'MISSING')")"
 
+echo "== and the application's own insert of a document it just deleted =="
+# The twin of the section above, and the direction it gets wrong. A copy-up must
+# not look like an insert; an insert must not look like a copy-up.
+#
+# The router decides that an insert on the fast tier is one of its own by looking
+# for a residency record for that _id and comparing the times. The record says
+# the document was copied up and should stay hot, and nothing ended it when the
+# application deleted the document, so it went on standing over a name the
+# application was free to use again.
+#
+# Measured: a document copied up from the archive, deleted through the router,
+# and inserted again two seconds later under the same _id. The stream delivered
+# the delete and then nothing at all. The insert landed, the document was there,
+# and the application's own write was missing from its own change stream.
+#
+# The record's own comment already said what should happen, that only the one
+# insert the promotion causes is suppressed and a later genuine one is not.
+# Its own document, and its own copy-up moments before the delete. The section
+# above copied one up too, but by the time its checks had finished that
+# promotion was well over thirty seconds old and outside the window that decides
+# this, so a check written on top of it passed against the binary that had the
+# defect. The three writes here happen within a few seconds of each other, which
+# is what an application doing it looks like.
+OID2=6a9da091b2018df81a140b02
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID2')});
+   db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID2'), v:'archived', at:new Date(Date.now()-7200000)})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID2')})" >/dev/null
+rm -f /tmp/cs_events2b.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  let ops=[];
+  for (let i=0;i<80 && ops.length<2;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events2b.txt 2>&1 &
+WATCHER2B=$!
+sleep 3
+# All three inside one mongosh, because a shell round trip between them is about
+# a second and a half and the window this turns on is thirty. Split across three
+# invocations the same section passed against the binary that had the defect.
+# The fast tier, read from inside the one mongosh below rather than through a
+# shell round trip. Exported here because HOT is defined further up than the
+# other TC_ variables are exported.
+export TC_HOT="$HOT"
+HOTAFTER=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  c.findOne({_id:ObjectId('$OID2')});
+  const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  const held = hot.$NS.countDocuments({_id:ObjectId('$OID2')});
+  c.deleteOne({_id:ObjectId('$OID2')});
+  sleep(2000);
+  c.insertOne({_id:ObjectId('$OID2'), v:'the application put it back'});
+  print(held);")
+chk "the copy-up put it on the fast tier"              "1" "$HOTAFTER"
+EVENTS2B=$(awaitWatcher /tmp/cs_events2b.txt $WATCHER2B)
+echo "  the watcher saw: ${EVENTS2B:-nothing}"
+chk "the delete is reported"                           "true" \
+    "$(echo "${EVENTS2B:-none}" | grep -q delete && echo true || echo false)"
+chk "and so is the insert that followed it"            "true" \
+    "$(echo "${EVENTS2B:-none}" | grep -q insert && echo true || echo false)"
+chk "the document is what the application put there"   "the application put it back" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID2')}); print(d?d.v:'MISSING')")"
+
 echo "== a lookup the fast tier cannot answer =="
 # fullDocument: "updateLookup" fetches the document as it stands when the event
 # is read, and that lookup happens on the fast tier, which is the one place that

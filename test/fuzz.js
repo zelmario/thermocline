@@ -48,6 +48,9 @@ const TRACE = process.env.TC_TRACE === '1';
 // the oldest. Generating one there would make that section fail for the guard
 // working.
 const NO_TTL = process.env.TC_NO_TTL === '1';
+// Compare what a change stream on each collection delivered for the round's own
+// writes. Off by default because it holds two cursors open for the whole round.
+const STREAM = process.env.TC_STREAM === '1';
 const d    = db.getSiblingDB(DB);
 const REF  = d.tcref;
 const TIER = d.tcfuzz;
@@ -936,6 +939,41 @@ function oneOp(i) {
   }
 }
 
+// Change streams, when asked for. See STREAM.
+//
+// Opened before the operations and drained after them, on both collections at
+// once, so the two sequences describe the same work. The reference is untiered
+// and its stream is MongoDB's own; the tiered one is served by the router from
+// the fast tier, and it has to hide this system's own writes from it: a copy-up
+// is an insert on the fast tier that the application did not make, and an
+// eviction is a delete of a document that still exists. Both would otherwise
+// arrive as ordinary events, which is a change stream telling an application
+// its data changed when it did not.
+//
+// That is where the three defects of 2026-09-05 were, and all of them were
+// about *when* an event is judged rather than whether. This asks the question
+// the other way round: run the same writes against both and compare what the
+// two streams delivered.
+let csRef = null, csTier = null, csDb = null;
+if (STREAM) {
+  csRef  = REF.watch([]);
+  csTier = TIER.watch([]);
+  // The same collection watched a second way. A change stream opened on the
+  // database, or on the whole deployment, carries the tiered collection's
+  // events too, and the router has to filter those exactly as it filters the
+  // collection's own stream. It did not filter them at all until 2026-09-05,
+  // and nothing compared the two ways of asking.
+  csDb = d.watch([]);
+  // Primed, because watch() does not necessarily open the cursor: the driver can
+  // wait until the first read, and then the stream starts at that instant rather
+  // than at this one. Measured before this, with the operations running between
+  // the two: the reference delivered 14 events and the tiered collection 9, and
+  // the five missing ones were the *earliest*, which is a stream that started
+  // late rather than a router that suppressed anything. A comparison of two
+  // streams that began at different moments is not a comparison.
+  csRef.tryNext(); csTier.tryNext(); csDb.tryNext();
+}
+
 for (let i = 0; i < OPS; i++) {
   try { oneOp(i); }
   catch (e) {
@@ -943,6 +981,71 @@ for (let i = 0; i < OPS; i++) {
     // harness fault, not a finding, and it must not be silent.
     print('  HARNESS  op ' + i + ': ' + String(e.message || e).slice(0, 160));
   }
+}
+
+if (STREAM) {
+  // Held past the promotion window before anything is read.
+  //
+  // The router decides whether an insert on the fast tier is one of its own
+  // copy-ups by how close the event is to the promotion it recorded, and that
+  // window is thirty seconds. Judging it at hand-over time rather than at event
+  // time is what made a promotion read thirty-five seconds later arrive as an
+  // ordinary insert, which is the correct thing for an application to see never.
+  // An application that stores its resume token and comes back to it gets a
+  // backlog, and every promotion in that backlog is older than the window.
+  //
+  // So this waits. A stream drained the instant the writes finish cannot see
+  // that class at all: measured, this section passed against the binary from
+  // before the fix until the wait was put in.
+  sleep(Number(process.env.TC_STREAM_DELAY || 35000));
+
+  // Drain them, giving each a while to catch up. The router's stream is behind
+  // the reference's by whatever the fast tier's own change stream costs, so a
+  // fixed sleep before draining would compare a full sequence against a partial
+  // one and call it a disagreement.
+  // onlyColl keeps a database-level stream to one collection, so its sequence is
+  // comparable with that collection's own.
+  const drain = (cs, onlyColl) => {
+    const out = [];
+    for (let round = 0; round < 40; round++) {
+      let got = false;
+      for (;;) {
+        const ev = cs.tryNext();
+        if (!ev) break;
+        got = true;
+        if (onlyColl && !(ev.ns && ev.ns.coll === onlyColl)) continue;
+        // The operation and which document, and nothing else. A resume token is
+        // a position in one cluster's oplog and a cluster time is that cluster's
+        // clock, so neither can be compared across two of them.
+        out.push(ev.operationType + ':' + ser(ev.documentKey ? ev.documentKey._id : null));
+      }
+      if (!got && round > 3) break;
+      sleep(250);
+    }
+    return out;
+  };
+  const evRef = drain(csRef), evTier = drain(csTier), evDb = drain(csDb, TIER.getName());
+  try { csRef.close(); csTier.close(); csDb.close(); } catch (e) { /* nothing to do */ }
+
+  const compare = (what, a, b) => {
+    note(what, a.length || b.length ? 'real' : 'vacuous');
+    if (ser(a) === ser(b)) { agreed++; return; }
+    const diff = describeDiff(a, b);
+    if (diff) bugs.push([what, 'the events the two streams delivered', diff.ref, diff.got]);
+    else bugs.push([what, 'the events the two streams delivered',
+                    a.length + ' events: ' + ser(a).slice(0, 400),
+                    b.length + ' events: ' + ser(b).slice(0, 400)]);
+  };
+  print('  stream\tthe reference delivered ' + evRef.length + ' events, the tiered collection ' +
+        evTier.length + ', the database-level stream ' + evDb.length + ' for that collection');
+  if (TRACE || ser(evRef) !== ser(evTier)) {
+    print('  stream\tref  ' + evRef.join(' '));
+    print('  stream\ttier ' + evTier.join(' '));
+  }
+  compare('change stream', evRef, evTier);
+  // Not against the reference, against the same collection's own stream: these
+  // are two ways of asking one question and the router answers both.
+  compare('change stream on the database', evTier, evDb);
 }
 
 print('AGREED ' + agreed + '  REFUSED ' + refused + '  SETTLED ' + settled + '  DISAGREED ' + bugs.length);

@@ -202,6 +202,15 @@ func (f *Feeder) flush(ctx context.Context) error {
 		opsByNS[op.ns] = append(opsByNS[op.ns], op)
 	}
 
+	// The documents the application deleted, so their residency records can go
+	// with them. See dropResidency.
+	var deleted []string
+	for _, op := range f.pending {
+		if op.kind == actionTombstone {
+			deleted = append(deleted, meta.DocID(op.ns, op.id))
+		}
+	}
+
 	bulkFrom := time.Now()
 	defer func() { f.pace.bulk += time.Since(bulkFrom) }()
 	for _, ns := range order {
@@ -229,8 +238,59 @@ func (f *Feeder) flush(ctx context.Context) error {
 		f.claimedInBatch = nil
 	}
 
+	f.dropResidency(ctx, deleted)
+
 	f.pending = f.pending[:0]
 	return nil
+}
+
+// dropResidency removes the holds for documents the application has deleted.
+//
+// A residency record says a document was copied up and should stay on the fast
+// tier for a while. When the application deletes the document the record
+// describes nothing, and what it still does is worse than nothing: the router
+// reads these records to decide whether an insert it sees on the fast tier is
+// one of its own copy-ups, and a record left behind makes it hide the
+// application's next insert of that _id.
+//
+// Measured. A document is copied up from the archive, the application deletes it
+// and the client's change stream delivers the delete, and the application
+// inserts it again two seconds later. The insert lands, the document is there,
+// and the stream delivers **nothing at all**: an application's own write missing
+// from its own change stream. The record's own comment already says what should
+// happen, that only the one insert the promotion causes is suppressed and a
+// later genuine one is not.
+//
+// Here rather than in the router, because the feeder sees every delete whichever
+// way it arrived, including one applied straight to the fast tier. Only the
+// application's: an eviction removes the document too, and the evictor spends
+// those holds itself as it goes.
+//
+// What is left is a race the width of one flush. An application that deletes and
+// re-inserts faster than the feeder gets through a batch can still have the
+// insert hidden, which is the same window the eviction side accepts, and it is
+// bounded by checkpoint_every rather than by the thirty second window it
+// replaces.
+//
+// Best effort. Failing to remove a hold must not stop mirroring: the cost is one
+// suppressed insert, and stopping the feeder costs every namespace behind it.
+func (f *Feeder) dropResidency(ctx context.Context, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	res, err := f.cold.Database(meta.DB).Collection(meta.Residency).
+		DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	if err != nil {
+		f.log.Warn("could not release the residency holds for documents the application deleted",
+			"documents", len(ids), "err", err,
+			"effect", "a client's change stream may not be shown its own insert if one of these "+
+				"_ids is written again within thirty seconds",
+			"note", "the holds expire on their own TTL, so this corrects itself")
+		return
+	}
+	if res.DeletedCount > 0 {
+		f.log.Debug("released residency holds for deleted documents", "count", res.DeletedCount)
+	}
 }
 
 // resolveDeletes decides, in one round trip, which buffered deletes were

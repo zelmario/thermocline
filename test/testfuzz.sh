@@ -333,6 +333,71 @@ if [ "$CHURN_ROUNDS" -gt 0 ]; then
 fi
 
 echo
+echo "== what a change stream on each collection delivered =="
+# Off by default, and that is a statement about this section rather than about
+# the router. Set TC_STREAM_SECTION=1 to run it.
+#
+# It works: against the binary from before the promotion suppression was fixed it
+# reported thirty extra inserts on the tiered side, which is that defect exactly.
+# What it also reports, against a binary with every known fix in, is five inserts
+# missing from the tiered stream that nothing explains yet. They are the
+# application's own inserts of new _ids; there is no residency record for any of
+# them, so the promotion filter is not what dropped them, and the later inserts
+# in the same round arrive. That is either a defect nobody has found yet or a
+# fault in this section, and until it is one or the other this cannot be a check
+# the sweep depends on.
+#
+# It is left here rather than deleted because it is the only thing that compares
+# what two change streams delivered, and because the question it raises is worth
+# somebody's afternoon. See the pinned case in testchange.sh for the half of this
+# that is understood and fixed.
+if [ "${TC_STREAM_SECTION:-0}" = "1" ]; then
+# The router serves a change stream from the fast tier and has to hide this
+# system's own writes from it. A copy-up is an insert on the fast tier that the
+# application did not make; an eviction is a delete of a document that still
+# exists. Either one arriving as an ordinary event is a change stream telling an
+# application its data changed when it did not, which is the shape of all three
+# defects found on 2026-09-05.
+#
+# So the same generated writes run against both collections with a stream open on
+# each, and the two sequences have to match. The reference is untiered and its
+# stream is MongoDB's own.
+#
+# Writes only, and fewer of them: a stream round holds two cursors open for its
+# whole length, and reads contribute nothing to what a stream delivers except
+# the copy-ups they cause, which is the point and which the writes cause too.
+# The fast tier's own count before and after, because a round in which nothing
+# was copied up has nothing for the router to suppress and would agree for the
+# wrong reason. Measured: the same section passed against the binary from before
+# the fix at thirty operations and failed at forty, and the difference was
+# whether a write happened to touch a document the fast tier did not hold.
+STREAM_HOT_BEFORE=$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")
+SOUT=$(TC_SEED=$((SEED0+31337)) TC_OPS=$((OPS/2+20)) TC_STREAM=1 mongosh --port $PORT -u dba -p secret \
+         --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
+STREAM_HOT_AFTER=$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")
+echo "$SOUT" | grep -E "^  HARNESS|^  stream$(printf '\t')|^DISAGREE|^REFUSAL|^$(printf '\t')" | head -30
+SLINE=$(echo "$SOUT" | grep -m1 '^AGREED ')
+echo "  $SLINE"
+set -- $SLINE
+chk "streams: no disagreement"     "0" "${8:-none}"
+# Two shapes, not one: the tiered collection against the untiered reference, and
+# the same collection's own stream against a database-level one. The second
+# needs no reference at all, and it is the one that catches a filter that was
+# never applied rather than one applied at the wrong moment.
+# A round in which neither stream delivered anything would agree trivially, and
+# the SHAPES line is what says whether it did.
+echo "$SOUT" | grep -m1 '^SHAPES ' | tr ' ' '\n' | grep -m1 'change_stream' | sed 's/^/  shape /'
+chk "streams: the shape ran"       "true" \
+    "$(echo "$SOUT" | grep -m1 '^SHAPES ' | grep -qE 'change_stream=[0-9]+/0' && echo true || echo false)"
+chk "streams: the database shape ran too" "true" \
+    "$(echo "$SOUT" | grep -m1 '^SHAPES ' | grep -qE 'change_stream_on_the_database=[0-9]+/0' && echo true || echo false)"
+chk "streams: something was copied up to suppress" "true" \
+    "$([ "${STREAM_HOT_AFTER:-0}" -gt "${STREAM_HOT_BEFORE:-99999}" ] 2>/dev/null && echo true || echo false)"
+echo "  the fast tier went from $STREAM_HOT_BEFORE to $STREAM_HOT_AFTER during the stream round"
+
+fi
+
+echo
 echo "== nothing is refused when the fast tier holds it all =="
 # Everything above asks whether the answer is right. This asks whether the
 # router agrees to give one at all. With completeness: strict it refuses
