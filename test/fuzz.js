@@ -169,10 +169,35 @@ function applyMods(q, m) {
   return q;
 }
 
+// setValue is what $set writes for a field, which is the field's own generated
+// value except for tags.
+//
+// tags is the field the array operators work on, and $set writing a bare string
+// to it turns a later $push, $pull or $addToSet into an error for that document
+// alone. An updateMany is not atomic across documents: it applies them one at a
+// time and stops at the first error, so such a write leaves a partial result
+// whose extent depends on the order the documents were visited, and the two
+// collections need not visit them in the same order.
+//
+// Measured: a $pull over a collection where one document's tags had been $set to
+// a string threw on both sides, was correctly counted as agreed, and left the
+// reference with the pull applied to a document the tiered side had not reached.
+// The two collections then differed for the rest of the round, 38 disagreements,
+// none of them the router. Guarding the contents comparison on the write having
+// succeeded stops it being reported at the write; it does not put the
+// collections back.
+//
+// So the type of tags is left alone. Every other field is still $set to whatever
+// its generator produces, types and all, which is where the type coverage was.
+function setValue(f) {
+  if (f.p !== 'tags') return f.v();
+  return [f.v(), f.v()];
+}
+
 function updateSpec() {
   const f = pick(FIELDS.filter(x => x.p !== '_id'));
   switch (ri(10)) {
-    case 0: return { $set:   { [f.p]: f.v() } };
+    case 0: return { $set:   { [f.p]: setValue(f) } };
     case 1: return { $unset: { [f.p]: '' } };
     case 2: return { $inc:   { n: 1 + ri(5) } };
     case 3: return { $mul:   { f: 2 } };
@@ -181,7 +206,7 @@ function updateSpec() {
     case 6: return { $push:  { tags: 'p' + ri(4) } };
     case 7: return { $pull:  { tags: pick(['t1', 't2', 'common']) } };
     case 8: return { $addToSet: { tags: 'a' + ri(3) } };
-    default: return { $set: { [f.p]: f.v() }, $inc: { n: 1 } };
+    default: return { $set: { [f.p]: setValue(f) }, $inc: { n: 1 } };
   }
 }
 
@@ -570,6 +595,17 @@ function indexOptions() {
   return o;
 }
 
+// optionSuffix names an option shape, so one key can carry several indexes.
+function optionSuffix(o) {
+  let out = '';
+  if (o.unique) out += '_u';
+  if (o.sparse) out += '_s';
+  if (o.partialFilterExpression) out += '_p' + Object.keys(o.partialFilterExpression).join('');
+  if (o.collation) out += '_c';
+  if (o.expireAfterSeconds !== undefined) out += '_ttl';
+  return out;
+}
+
 // legalOptions is indexOptions with the combinations mongod itself rejects taken
 // out, so a refusal in a round is this router's and not the server's.
 //
@@ -788,8 +824,20 @@ function oneOp(i) {
     case 17: {
       const entry = pick(IDX_SPECS);
       const opts = legalOptions(entry);
-      const full = Object.assign({ name: entry.name }, opts);
-      const op = 'createIndex ' + ser(entry.spec) + ' ' + ser(opts);
+      // The name carries the option shape, so two indexes on one key never
+      // collide under one name.
+      //
+      // They did, and it cost the last disagreement in a clean round. A TTL
+      // index is refused on a tiered collection and accepted on the untiered
+      // reference, which is the refusal working; it leaves fz_when existing on
+      // one side and not the other. The next createIndex on the same key with
+      // different options was then an IndexOptionsConflict on the reference,
+      // code 86, and a real build on the tiered side that failed 11000 on the
+      // fast tier's own duplicates. Two failures with different codes is a
+      // disagreement, and it was about the generator reusing a name.
+      const name = entry.name + optionSuffix(opts);
+      const full = Object.assign({ name: name }, opts);
+      const op = 'createIndex ' + ser(entry.spec) + ' ' + ser(opts) + ' as ' + name;
       // No try/catch of its own: ask compares how the two sides failed as
       // carefully as it compares what they answered, and swallowing the error
       // here would throw away the half of the comparison that matters. A build
@@ -797,7 +845,7 @@ function oneOp(i) {
       // tiered side is a refusal, and one that fails on the tiered side alone
       // for another reason is a finding.
       const madeOK = ask('createIndex', op, c => c.createIndex(entry.spec, full), 'seq');
-      if (madeIndexes.indexOf(entry.name) < 0) madeIndexes.push(entry.name);
+      if (madeIndexes.indexOf(name) < 0) madeIndexes.push(name);
       // The documents cannot have changed, and this is where a stale cache
       // shows: the read below runs against a collection whose indexes have just
       // moved under a router that had listed them.
