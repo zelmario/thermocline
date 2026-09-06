@@ -199,6 +199,47 @@ Part of [Thermocline](../README.md).
   nothing runs that way, and a defect there would be found by whoever is running
   it in production rather than here. If that shape is wanted, the work is a suite
   that keeps it honest, not a change to the code.
+- **`distinct` over a field some documents do not carry can omit the `null`
+  MongoDB would report.** This is the one command whose answer depends on the
+  query plan, and the router has to change the plan.
+
+  MongoDB reports a missing field as `null` only when it can answer from a
+  non-sparse index, because an index stores a missing field as a null key.
+  Measured on PSMDB 8.0 over three documents, one of which has no `meta.score`:
+
+  ```
+  no index at all       distinct("meta.score", {"meta.score":{$ne:11}})  ->  [5,7]
+  a plain index         ->  ["NULL",5,7]   plan DISTINCT_SCAN
+  a sparse index        ->  [5,7]
+  ```
+
+  Every archive read carries a predicate excluding the copies of documents the
+  application deleted, because returning one would resurrect it. That predicate
+  is what costs the covered scan:
+
+  ```
+  the client's filter alone             ["NULL",5,7]   plan DISTINCT_SCAN
+  with the tombstone predicate added    [5,7]          plan IXSCAN
+  ```
+
+  So a `distinct` that falls through to the archive answers without the `null`,
+  where a single MongoDB carrying the same index answers with it. Found by the
+  differential harness, on a generated `distinct` after a round of generated
+  index DDL.
+
+  It is not corrected, and the reason is that a partial correction would be
+  worse. Answering from the fast tier as well and merging the two value sets
+  closes the case where the fast tier holds one of the documents missing the
+  field, and leaves the case where they are all in the archive, so the rule
+  would become "sometimes". Reproducing the behaviour outright means the router
+  deciding, from the fast tier's own indexes, whether mongod would have used a
+  covered scan, which is reproducing a plan choice rather than an answer.
+
+  What to rely on instead: `null` in a `distinct` result means "some document
+  has no value here" only when an index makes it visible, in MongoDB as much as
+  here. Ask `countDocuments({field: {$exists: false}})` for that, which is a
+  logical fact and is correct through the router.
+
 - **A claim declared by hand past the counting budget is recorded unchecked.**
   `cline watermark --complete-all` says the fast tier holds every document there
   is, and recording one it does not have makes every unbounded read answer short

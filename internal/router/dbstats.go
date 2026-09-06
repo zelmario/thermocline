@@ -87,6 +87,15 @@ func (c *conn) interceptDBStats(ctx context.Context, msg *wire.Message, db strin
 // tieredObjectDelta is what has to be added to the fast tier's object count for
 // it to describe the database, and whether every collection could be counted.
 //
+// A namespace whose fast tier copy is a view needs no special case, which was
+// worth finding out rather than assuming. EstimatedDocumentCount sends `count`,
+// and mongod answers that on a view, so the count comes back as the number of
+// documents the view yields. Measured on a database holding an untiered
+// collection of one document, a tiered name turned into a view over it, and a
+// second tiered collection of ten the fast tier held none of: the fast tier's
+// own dbStats said 2 and the router said 15, which is the truth. Skipping the
+// view instead would have said 12.
+//
 // Per namespace it is the collection's logical count less what the fast tier
 // holds of it. The logical count comes from correctedCount, which is the same
 // function collStats uses, so the two commands agree by construction rather
