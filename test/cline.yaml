@@ -103,6 +103,9 @@ feeder:
     - "shop.tfstopped"
     # testevict.sh: a claim narrowed and acted on in the same sweep.
     - "shop.tevclaim"
+    # testevict.sh: a cursor held open while a sweep takes its documents off the
+    # fast tier. Aged by `when`, so a rule can address it.
+    - "shop.tevcursor"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.
@@ -306,6 +309,11 @@ evictor:
       older_than: 40m
     - ns: "shop.tcs"
       older_than: 40m
+    # testevict.sh: the collection a cursor is held open over while a sweep
+    # takes its documents off the fast tier.
+    - ns: "shop.tevcursor"
+      older_than: 40m
+      date_field: "when"
     # testquery.sh: aged by a date field rather than by the _id, so a bound on
     # some other date is a bound in a different dimension.
     - ns: "shop.tqbound"

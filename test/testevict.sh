@@ -258,6 +258,79 @@ kill $CRP 2>/dev/null; wait $CRP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 
+echo "== a cursor held open while a sweep empties the fast tier =="
+# The completeness claim is read once, when the query arrives. A cursor outlives
+# that: every getMore after the first batch is forwarded to the fast tier, and
+# the evictor may have taken the documents off it in between. Nothing checked
+# whether the decision still held.
+#
+# Measured before this, on forty documents held by both tiers with a claim over
+# all of history: a client took a first batch of three, a sweep took the fast
+# tier from forty documents to nought, and the cursor delivered **3 of 40**.
+# Nothing had been deleted. The archive held all forty throughout and a query
+# issued after the sweep answered forty. Only the cursor was short, and it was
+# short in silence.
+#
+# It is refused rather than corrected, which is this project's rule: a refusal is
+# a limitation and a wrong answer is a bug. Correcting it would mean continuing
+# the read from the archive at the point the fast tier's cursor reached, which
+# the router cannot know without tracking the sort key of everything it has
+# handed over, and which is not defined at all for an unsorted query.
+# Its own daemons. The section before this one leaves none running, and a
+# refusal check against a router that is not there passes on a connection
+# error, which is a green check that proves nothing.
+pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
+sleep 2
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/ev_cursor_f.log & CFP=$!
+sleep 3
+cline router --config $CFG --log-file $LOGDIR/ev_cursor_r.log & CRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chkv "a router is up for this section"             "1" \
+    "$(R 'print(db.adminCommand({ping:1}).ok)')"
+CNS=tevcursor
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+CMK='Array.from({length:40},(_,i)=>({_id:i+1, n:i+1, when:new Date(Date.UTC(2024,i%12,1+i%27))}))'
+C "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+cline watermark --config $CFG --ns $DB.$CNS --complete-all --force >/dev/null 2>&1
+sleep 2
+chkv "both tiers hold all forty"                    "40" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+chkv "and the router answers forty"                 "40" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+# The evictor runs from here rather than from inside mongosh, which cannot start
+# a process. The cursor below waits on the fast tier's own count instead of
+# sleeping for a guess.
+cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_cursor.log & CEVP=$!
+export TC_HOT="$HOT"
+CUROUT=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$CNS;
+  const cur = c.find({}).sort({_id:1}).batchSize(3);
+  let first = 0;
+  for (let i=0;i<3 && cur.hasNext();i++) { cur.next(); first++; }
+  const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  for (let i=0;i<60 && hot.$CNS.countDocuments({}) > 10; i++) sleep(500);
+  const left = hot.$CNS.countDocuments({});
+  let got = first, refused = false;
+  try { while (cur.hasNext()) { cur.next(); got++; } }
+  catch (e) { refused = /^thermocline:/.test(String(e.message)); }
+  print(left + '/' + got + '/' + refused);")
+kill $CEVP 2>/dev/null; wait $CEVP 2>/dev/null
+echo "  the fast tier was left with $(echo "$CUROUT" | cut -d/ -f1), the cursor delivered $(echo "$CUROUT" | cut -d/ -f2)"
+chkv "the sweep did empty the fast tier"            "true" \
+    "$([ "$(echo "$CUROUT" | cut -d/ -f1)" -lt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "the getMore is refused, not answered short"   "true" "$(echo "$CUROUT" | cut -d/ -f3)"
+# And the remedy the refusal names has to work.
+chkv "re-running the query answers in full"         "40" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.find({}).sort({_id:1}).batchSize(3).itcount())")"
+chkv "the archive kept every one of them"           "40" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+kill $CRP $CFP 2>/dev/null; wait $CRP 2>/dev/null; wait $CFP 2>/dev/null
+
 echo "== documents the rule can never remove =="
 # The whole-namespace version of this is already refused: a rule with no
 # date_field against non-ObjectId _ids matches nothing at all. The partial

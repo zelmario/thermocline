@@ -125,6 +125,10 @@ type Router struct {
 	// housekeeping filtered out of them.
 	changeStreams changeStreamRegistry
 	cursors       cursorRegistry
+	// tiered are the client cursors the fast tier was allowed to answer because
+	// a completeness claim covered them, remembered with the claim itself so a
+	// getMore can be refused once it no longer does. See tieredcursor.go.
+	tiered tieredCursors
 
 	// cache holds answers for as long as each query has been observed to keep
 	// giving the same one. Nil unless router.cache.enabled. See querycache.go.
@@ -400,6 +404,11 @@ func (r *Router) reapCursors(ctx context.Context) {
 			return
 		case <-t.C:
 			r.cursors.reapIdle(ctx, cursorIdle)
+			// The same sweep, for the registrations that remember which claim
+			// authorised a fast tier cursor. A client that walks away from one
+			// leaves an entry behind, and mongod reaps its own cursors on a
+			// timer too.
+			r.tiered.reapIdle(cursorIdle)
 		}
 	}
 }
@@ -833,6 +842,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// describe.go for the four that were told so while every read worked.
 	if nameErr == nil && !msg.MoreToCome() {
 		c.ensureDescribable(ctx, msg, name, db)
+	}
+
+	// A cursor the fast tier was allowed to answer because a claim covered it,
+	// asked for its next batch after that claim has narrowed. See
+	// tieredcursor.go for what the alternative was measured to be.
+	if nameErr == nil && name == "getMore" && !msg.MoreToCome() {
+		if out, done := c.guardTieredGetMore(ctx, msg); done {
+			return c.send(out)
+		}
 	}
 
 	// count and distinct read documents the same way find does, so they need

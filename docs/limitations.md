@@ -199,6 +199,32 @@ Part of [Thermocline](../README.md).
   nothing runs that way, and a defect there would be found by whoever is running
   it in production rather than here. If that shape is wanted, the work is a suite
   that keeps it honest, not a change to the code.
+- **A cursor whose completeness claim narrows under it is refused, not answered
+  short.** The claim is read once, when the query arrives. A cursor outlives
+  that: the first batch comes from the fast tier because the claim covered the
+  read, and every `getMore` after it is forwarded to the fast tier, which by then
+  may hold none of it.
+
+  Measured on forty documents held by both tiers with a claim over all of
+  history. A client took a first batch of three, an eviction sweep took the fast
+  tier from forty documents to nought, and the cursor delivered **3 of 40**.
+  Nothing had been deleted: the archive held all forty throughout, and a query
+  issued after the sweep answered forty. Only the cursor was short, and it was
+  short in silence.
+
+  It is refused now, with the namespace named and the remedy in the message:
+  re-run the query, and it is answered across both tiers and is whole. That
+  costs an application one error on a read it can repeat, which is the trade this
+  project makes on purpose — a refusal is a limitation and a wrong answer is a
+  bug.
+
+  It is not corrected, and the reason is worth stating. Continuing the read from
+  the archive would mean knowing where the fast tier's cursor had got to, which
+  needs the sort key of every document already handed over, and which is not
+  defined at all for a query with no sort. An application paging a large tiered
+  collection through a long-running sweep should expect this and retry; a
+  `batchSize` large enough to finish the read in one batch avoids it entirely.
+
 - **`distinct` over a field some documents do not carry can omit the `null`
   MongoDB would report.** This is the one command whose answer depends on the
   query plan, and the router has to change the plan.
