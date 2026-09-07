@@ -136,19 +136,47 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 	until := time.Now().UTC().Add(r.cfg.Residency.D())
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: docID}},
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "ns", Value: ns},
-			{Key: "doc", Value: id},
-			{Key: "hotUntil", Value: until},
-			{Key: "promotedAt", Value: time.Now().UTC()},
-			// The insert this record precedes is about to appear on the feeder's
-			// change stream, and mirroring it would write the archive's own
-			// document back into the archive. This says one is expected, and the
-			// feeder clears it as it suppresses, so only that one insert is
-			// suppressed and a later genuine one is not. See promotion echoes in
-			// the feeder.
-			{Key: "echoPending", Value: true},
-		}}},
+		bson.D{
+			{Key: "$set", Value: bson.D{
+				{Key: "ns", Value: ns},
+				{Key: "doc", Value: id},
+				// Refreshed on every read, because that is what the hold is
+				// for: a document read again should stay hot longer.
+				{Key: "hotUntil", Value: until},
+			}},
+			// These two describe one promotion, so they are written when the
+			// record is created and never moved afterwards.
+			//
+			// A record exists exactly while the document is on the fast tier:
+			// the evictor deletes it when it removes the document, on the
+			// stated grounds that residency is meaningless once the document
+			// has left, and the feeder deletes it when the application deletes
+			// the document. So its creation *is* the promotion, and one
+			// promotion is what these two fields describe.
+			//
+			// $set moved them, and that was a defect. A multi-document write
+			// records residency for every document it matches, most of which
+			// the fast tier already holds, so a fresh promotedAt landed on
+			// documents nobody had promoted. Measured by the differential
+			// harness: five of the application's own inserts missing from its
+			// own change stream, and the router's log said why. For _id 4002
+			// the promotion was recorded at 00:30:27.134 and the insert had
+			// happened at 00:30:24.72, two and a half seconds *before* it.
+			//
+			// The echo is the same story. It says one insert is expected, and
+			// no insert is coming for a document already there, so announcing
+			// one again is announcing something that will not happen.
+			{Key: "$setOnInsert", Value: bson.D{
+				{Key: "promotedAt", Value: time.Now().UTC()},
+				// The insert this record precedes is about to appear on the
+				// feeder's change stream, and mirroring it would write the
+				// archive's own document back into the archive. This says one
+				// is expected, and the feeder clears it as it suppresses, so
+				// only that one insert is suppressed and a later genuine one is
+				// not. See promotion echoes in the feeder.
+				{Key: "echoPending", Value: true},
+			}},
+		},
 		options.UpdateOne().SetUpsert(true))
 	return err
 }
@@ -172,15 +200,18 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	for _, id := range ids {
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(bson.D{{Key: "$set", Value: bson.D{
-				{Key: "ns", Value: ns},
-				{Key: "doc", Value: id},
-				{Key: "hotUntil", Value: until},
-				{Key: "promotedAt", Value: now},
-				// One echo expected per document, the same as the single
-				// version records. See promotion echoes in the feeder.
-				{Key: "echoPending", Value: true},
-			}}}).
+			SetUpdate(bson.D{
+				{Key: "$set", Value: bson.D{
+					{Key: "ns", Value: ns},
+					{Key: "doc", Value: id},
+					{Key: "hotUntil", Value: until},
+				}},
+				// On creation only. See recordResidency for why.
+				{Key: "$setOnInsert", Value: bson.D{
+					{Key: "promotedAt", Value: now},
+					{Key: "echoPending", Value: true},
+				}},
+			}).
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written
@@ -1247,6 +1278,11 @@ func (r *Router) withdrawEcho(ctx context.Context, docIDs []string) {
 	if len(docIDs) == 0 {
 		return
 	}
+	// Only the echo. promotedAt stays, and clearing it was tried and was wrong:
+	// the record may describe a genuine promotion by another path, and taking
+	// its timestamp away let every promotion through as an ordinary insert.
+	// Measured, in the same round that found the defect this comment is about:
+	// 44 events delivered where 9 were right, and nothing hidden at all.
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
 		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})

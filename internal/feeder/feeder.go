@@ -570,6 +570,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// router must go there for them instead of answering from nothing.
 		if ev.OperationType == "drop" {
 			f.withdrawCompleteness(ctx, ns)
+			f.clearResidency(ctx, ns)
 		}
 		// And the same one level up. dropDatabase names no collection, so the
 		// line above never fired for it and every claim in that database stayed
@@ -579,6 +580,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// silent short answer it exists to prevent.
 		if ev.OperationType == "dropDatabase" {
 			f.withdrawDatabase(ctx, ev.NS.DB)
+			f.clearResidencyIn(ctx, ev.NS.DB)
 		}
 		return nil
 	}

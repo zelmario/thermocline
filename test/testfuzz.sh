@@ -334,24 +334,12 @@ fi
 
 echo
 echo "== what a change stream on each collection delivered =="
-# Off by default, and that is a statement about this section rather than about
-# the router. Set TC_STREAM_SECTION=1 to run it.
-#
-# It works: against the binary from before the promotion suppression was fixed it
-# reported thirty extra inserts on the tiered side, which is that defect exactly.
-# What it also reports, against a binary with every known fix in, is five inserts
-# missing from the tiered stream that nothing explains yet. They are the
-# application's own inserts of new _ids; there is no residency record for any of
-# them, so the promotion filter is not what dropped them, and the later inserts
-# in the same round arrive. That is either a defect nobody has found yet or a
-# fault in this section, and until it is one or the other this cannot be a check
-# the sweep depends on.
-#
-# It is left here rather than deleted because it is the only thing that compares
-# what two change streams delivered, and because the question it raises is worth
-# somebody's afternoon. See the pinned case in testchange.sh for the half of this
-# that is understood and fixed.
-if [ "${TC_STREAM_SECTION:-0}" = "1" ]; then
+# This section has found two defects and both of them are fixed. Against the
+# binary from before the promotion suppression was judged by event time it
+# reports thirty extra inserts, and against the binary from before promotedAt was
+# written once per promotion it reports five of the application's own inserts
+# missing. Neither is subtle once the sequences are printed side by side, and
+# neither was reachable by any hand-written check in this repository.
 # The router serves a change stream from the fast tier and has to hide this
 # system's own writes from it. A copy-up is an insert on the fast tier that the
 # application did not make; an eviction is a delete of a document that still
@@ -394,8 +382,6 @@ chk "streams: the database shape ran too" "true" \
 chk "streams: something was copied up to suppress" "true" \
     "$([ "${STREAM_HOT_AFTER:-0}" -gt "${STREAM_HOT_BEFORE:-99999}" ] 2>/dev/null && echo true || echo false)"
 echo "  the fast tier went from $STREAM_HOT_BEFORE to $STREAM_HOT_AFTER during the stream round"
-
-fi
 
 echo
 echo "== nothing is refused when the fast tier holds it all =="

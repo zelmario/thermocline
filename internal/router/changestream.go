@@ -262,6 +262,14 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev)):
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), recent):
+			// Which one, and how the window judged it. An insert hidden from an
+			// application's own change stream is the most expensive thing this
+			// function can get wrong, and the count alone cannot be worked back
+			// to a document.
+			r.log.Debug("hiding an insert as a promotion",
+				"doc", docIDs[i], "promotedAt", promoted[docIDs[i]].at.Format(time.RFC3339Nano),
+				"echoPending", promoted[docIDs[i]].pending,
+				"eventAt", eventTime(ev).Format(time.RFC3339Nano))
 			dropped++
 		default:
 			keep = append(keep, ev)
@@ -355,12 +363,19 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 
 // isPromotion reports whether this insert is a copy-up rather than the
 // application creating a document.
-func isPromotion(promoted map[string]time.Time, id string, at time.Time, recent time.Time) bool {
-	when, ok := promoted[id]
+func isPromotion(promoted map[string]promotion, id string, at time.Time, recent time.Time) bool {
+	p, ok := promoted[id]
 	if !ok {
 		return false
 	}
-	if when.After(recent) {
+	// Announced and not yet spent, which means the insert this record was
+	// written to precede has not been seen. Unconditional, the way an
+	// unclaimed eviction announcement is, and for the same reason: it can only
+	// suppress more than the window would and never less.
+	if p.pending {
+		return true
+	}
+	if p.at.After(recent) {
 		return true
 	}
 	// The event carries no time to judge it by on a server old enough not to
@@ -368,9 +383,29 @@ func isPromotion(promoted map[string]time.Time, id string, at time.Time, recent 
 	if at.IsZero() {
 		return false
 	}
-	d := at.Sub(when)
+	// One-sided, and this is the half that was wrong.
+	//
+	// Residency is recorded *before* the copy-up, deliberately, so that a
+	// consumer can tell a promotion from an insert the moment the event
+	// arrives. A promotion's own insert therefore always happens at or after
+	// the record was written. An insert that happened *before* it is somebody
+	// else's, and comparing the two by absolute difference reached back and
+	// hid it: measured, five of the application's own inserts missing from its
+	// own change stream, one of them two and a half seconds older than the
+	// record that suppressed it.
+	//
+	// What this gives up is stated rather than hidden. promotedAt is a router's
+	// clock and an event's time is the fast tier primary's, so a router running
+	// ahead of the primary makes a genuine promotion look earlier than its own
+	// record, and this would let it through. The two branches above are what
+	// cover that: while the echo is outstanding nothing gets through, and a
+	// promotion recorded inside the window is suppressed whatever the event
+	// says. What is left is a promotion whose echo has been spent, older than
+	// thirty seconds, on a router whose clock leads the primary's by more than
+	// the promotion took, and that is a narrower case than the one this fixes.
+	d := at.Sub(p.at)
 	if d < 0 {
-		d = -d
+		return false
 	}
 	return d <= promotionWindow
 }
@@ -397,10 +432,17 @@ func eventTime(ev bson.RawValue) time.Time {
 	return time.Time{}
 }
 
+// promotion is what a residency record says about one document: when it was
+// promoted, and whether the insert that promotion causes has been accounted for.
+type promotion struct {
+	at      time.Time
+	pending bool
+}
+
 // promotionTimes reports, for each of these document ids that has a residency
-// record, when it was promoted.
-func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]time.Time {
-	out := map[string]time.Time{}
+// record, when it was promoted and whether its echo is still outstanding.
+func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]promotion {
+	out := map[string]promotion{}
 	if len(ids) == 0 {
 		return out
 	}
@@ -416,11 +458,12 @@ func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]ti
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	for cur.Next(ctx) {
 		var rec struct {
-			ID string    `bson:"_id"`
-			At time.Time `bson:"promotedAt"`
+			ID      string    `bson:"_id"`
+			At      time.Time `bson:"promotedAt"`
+			Pending bool      `bson:"echoPending"`
 		}
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = rec.At.UTC()
+			out[rec.ID] = promotion{at: rec.At.UTC(), pending: rec.Pending}
 		}
 	}
 	return out
