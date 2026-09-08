@@ -296,9 +296,26 @@ vjoinVerdict() {
     *)                     echo "false (got $1)" ;;
   esac
 }
-VJF=$(vjoinRead "find({})")
+# Both reads are waited for rather than asked once. The insert that set tqvb up
+# went through the router, which read tqvb's claim to do it and remembers the
+# answer it got then, which was that nothing claimed it. A claim recorded a
+# moment ago is not a claim the router has seen: measured, the aggregation was
+# refused for the *base* for about a second after the watermark was written, and
+# that is a refusal which proves nothing and never reaches the code this section
+# is about. The verdict function is what makes the wait honest, because it will
+# not accept that refusal as a pass.
+vjoinSettled() {
+  local out=""
+  for _ in $(seq 1 20); do
+    out=$(vjoinRead "$1")
+    [ "$(vjoinVerdict "$out")" = "true" ] && break
+    sleep 1
+  done
+  printf '%s' "$out"
+}
+VJF=$(vjoinSettled "find({})")
 chk "a find through it is refused for the join"         "true" "$(vjoinVerdict "$VJF")"
-VJA=$(vjoinRead "aggregate([])")
+VJA=$(vjoinSettled "aggregate([])")
 chk "an aggregate through it too"                       "true" "$(vjoinVerdict "$VJA")"
 # And the guard has to stop guarding once the joined collection is whole, or it
 # is a refusal nobody can clear.

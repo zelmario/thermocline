@@ -39,6 +39,15 @@ type viewCache struct {
 	// on maps a view's namespace to the collection it reads. Empty means the
 	// namespace is not a view.
 	on map[string]string
+	// joins is the collections one view's own pipeline reads besides the one it
+	// is defined on, and unreadable says its pipeline could not be walked.
+	//
+	// Cached here rather than read where it is wanted, because every read of a
+	// view asks this and viewOn has the definition in its hand already. Read
+	// separately it was a listCollections per query on the hot path, against a
+	// namespace tieredBase had just looked up.
+	joins      map[string][]string
+	unreadable map[string]bool
 }
 
 // viewBase resolves a namespace to the collection its documents actually come
@@ -81,6 +90,8 @@ func (r *Router) viewOn(ctx context.Context, ns string) (string, bool) {
 
 	db, coll := splitNS(ns)
 	found := ""
+	var joins []string
+	unreadable := false
 
 	cur, err := r.hot.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
 	if err == nil {
@@ -104,6 +115,32 @@ func (r *Router) viewOn(ctx context.Context, ns string) (string, bool) {
 			if base, bok := lookupString(odoc, "viewOn"); bok && base != "" {
 				found = db + "." + base
 			}
+			// What this view reads besides the collection it is on. See
+			// viewJoins for why it has to be judged, and viewCache.joins for
+			// why it is read here.
+			pv, perr := odoc.LookupErr("pipeline")
+			if perr != nil {
+				// mongod always stores one, empty or not. A view without it is
+				// a catalog this code does not understand, and not
+				// understanding it is not the same as knowing it joins nothing.
+				unreadable = true
+				continue
+			}
+			arr, aok := pv.ArrayOK()
+			if !aok {
+				unreadable = true
+				continue
+			}
+			vals, verr := arr.Values()
+			if verr != nil {
+				unreadable = true
+				continue
+			}
+			names, complete := joinedCollections(vals, db, 0)
+			joins = append(joins, names...)
+			if !complete {
+				unreadable = true
+			}
 		}
 	}
 
@@ -111,12 +148,26 @@ func (r *Router) viewOn(ctx context.Context, ns string) (string, bool) {
 	if r.viewCache.fetched == nil {
 		r.viewCache.fetched = map[string]time.Time{}
 		r.viewCache.on = map[string]string{}
+		r.viewCache.joins = map[string][]string{}
+		r.viewCache.unreadable = map[string]bool{}
 	}
 	r.viewCache.fetched[ns] = time.Now()
 	r.viewCache.on[ns] = found
+	r.viewCache.joins[ns] = joins
+	r.viewCache.unreadable[ns] = unreadable
 	r.viewCache.mu.Unlock()
 
 	return found, found != ""
+}
+
+// viewJoinsOf is what one view's own pipeline reads besides the collection it is
+// defined on, from the cache viewOn fills.
+func (r *Router) viewJoinsOf(ctx context.Context, ns string) (joins []string, readable bool) {
+	// Fills the cache when it is cold, and its own answer is not wanted here.
+	_, _ = r.viewOn(ctx, ns)
+	r.viewCache.mu.RLock()
+	defer r.viewCache.mu.RUnlock()
+	return r.viewCache.joins[ns], !r.viewCache.unreadable[ns]
 }
 
 // forgetView drops a remembered view definition.
@@ -124,6 +175,8 @@ func (r *Router) forgetView(ns string) {
 	r.viewCache.mu.Lock()
 	delete(r.viewCache.fetched, ns)
 	delete(r.viewCache.on, ns)
+	delete(r.viewCache.joins, ns)
+	delete(r.viewCache.unreadable, ns)
 	r.viewCache.mu.Unlock()
 }
 
@@ -207,30 +260,28 @@ func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
 // answer as a scope walk that did not reach the bottom: the caller refuses
 // rather than judging the read against a list known to be short.
 func (r *Router) viewJoins(ctx context.Context, ns string) (joined []string, ok bool) {
-	db, _ := splitNS(ns)
 	at := ns
+	seen := map[string]bool{}
 	for hop := 0; hop < maxViewHops; hop++ {
-		spec, isView := viewDefinition(ctx, r.hot, at)
+		if seen[at] {
+			// A cycle mongod would not have allowed, so nothing can be said
+			// about what is at the bottom of this chain.
+			return joined, false
+		}
+		seen[at] = true
+		on, isView := r.viewOn(ctx, at)
 		if !isView {
 			// The chain has reached a collection.
 			return joined, true
 		}
-		vals, verr := bson.Raw(spec.pipeline).Values()
-		if verr != nil {
-			return joined, false
-		}
-		// The view's own database, not the query's: a view reads a collection
-		// in the database it lives in.
-		vdb, _ := splitNS(at)
-		names, complete := joinedCollections(vals, vdb, 0)
+		names, readable := r.viewJoinsOf(ctx, at)
 		joined = append(joined, names...)
-		if !complete {
+		if !readable {
 			return joined, false
 		}
-		at = db + "." + spec.on
+		at = on
 	}
-	// A chain longer than mongod itself resolves. Nothing can be said about
-	// what is at the bottom of it.
+	// A chain longer than mongod itself resolves.
 	return joined, false
 }
 
