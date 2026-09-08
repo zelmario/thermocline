@@ -982,6 +982,13 @@ the namespace, and every insert after it was refused as a duplicate of a documen
 it has nothing in common with. A wrong answer and a false refusal from one
 missing idea.
 
+What this costs is proportionate and worth knowing: a document with a thousand
+elements in an indexed array claims a thousand registry rows, because mongod puts
+a thousand entries in the index. The registry lives in the archive, so those are
+round trips to the other cluster, batched into as few as the driver will take. A
+unique index on a large array is expensive to write through this router, and it
+is expensive in mongod too.
+
 The rules are mongod's and they are pinned by unit tests: one entry per element,
 duplicates within a document collapse to one key, an empty array indexes as
 `undefined` and two of them collide, an array inside an array is a value rather
