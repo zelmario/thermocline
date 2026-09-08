@@ -246,6 +246,66 @@ H "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$N2.drop()" >/dev/null
 startRouter
 
+echo "== an odd age written after the router has already asked =="
+# sortSafeAges asks the archive once whether every document ages the same way,
+# and the answer it can get wrong is yes. Yes means a sort on the age field puts
+# everything the claim ignores below what it covers, so the fast tier's own
+# newest-first answer is a proof. A document written afterwards whose age field
+# holds a Timestamp sorts above every date there is, and the proof then misses
+# it. Nothing asked again: the answer was kept for the life of the router, while
+# the collated answer in the same file has always had a recheck.
+#
+# Measured before this, on six dated documents and one Timestamp added after the
+# first query: the archive answered 99,6,5 and the router answered 6,5,4, missing
+# the newest document there is. A router started a moment later answered
+# correctly, which is what says the difference was the cache and not the code
+# that reads it.
+#
+# The window is deliberate and is what this checks: within bracketRecheckSafe the
+# router has to ask again and catch up. A minute, which is what this codebase
+# already pays per namespace for a unique index created on another router.
+N3=tmenag2
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$N3.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$N3.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$N3'})" >/dev/null
+MK3="Array.from({length:6},(_,i)=>({_id:i+1, createdAt:new Date(Date.UTC(2024,7+i,1))}))"
+H "db.getSiblingDB(process.env.TC_DB).$N3.insertMany($MK3)" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$N3.insertMany($MK3)" >/dev/null
+# Claimed, but not for all of history, so a query with no lower bound has to be
+# proved by its own answer rather than covered outright.
+cline watermark --config $CFG --ns $DB.$N3 --complete-from 2024-06-01T00:00:00Z >/dev/null 2>&1
+startRouter
+# No projection anywhere below. The proof reads the age field off the last
+# document of the batch, so projecting it away makes the proof fail and the
+# archive answer, which is correct and tests nothing: measured, newest_first
+# stayed at 0 and every check passed for the wrong reason.
+Q3="print(db.getSiblingDB(process.env.TC_DB).$N3.find({}).sort({createdAt:-1}).limit(3).toArray().map(d=>d._id).join(','))"
+Q3C="print(db.getSiblingDB(process.env.TC_DB).$N3.find({_tcDeletedAt:{\$exists:false}}).sort({createdAt:-1}).limit(3).toArray().map(d=>d._id).join(','))"
+chk "the newest three agree while every age is a date"  "$(C "$Q3C")" "$(R "$Q3")"
+# The proof has to have been used, or the check above passed on a fall-through
+# and nothing was cached to go stale.
+chk "  and the fast tier proved that answer"           "true" \
+    "$(curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -qE '"newest_first"[: ]*[1-9]' && echo true || echo false)"
+# A Timestamp sorts above every Date, so this is now the newest document there
+# is. Only the archive has it, which is the adoption shape.
+C "db.getSiblingDB(process.env.TC_DB).$N3.insertOne({_id:99, createdAt:new Timestamp({t:2000000000,i:1})})" >/dev/null
+TRUTH3=$(C "$Q3C")
+chk "the archive puts it first"                        "true" \
+    "$([ "${TRUTH3%%,*}" = "99" ] && echo true || echo "false (got $TRUTH3)")"
+WAITED3=""
+for _ in $(seq 1 90); do
+  WAITED3=$(R "$Q3")
+  [ "$WAITED3" = "$TRUTH3" ] && break
+  sleep 1
+done
+chk "the router asks again and catches up"             "$TRUTH3" "$WAITED3"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$N3.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$N3.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$N3'})" >/dev/null
+startRouter
+
 echo "== the directions and orders the proof does not cover =="
 # Oldest first proves nothing: everything not returned is newer, not older.
 for L in 1 3 10; do

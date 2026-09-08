@@ -52,6 +52,9 @@ type bracketCache struct {
 	mu    sync.RWMutex
 	byNS  map[string]bool
 	asked map[string]bool
+	// at is when each answer was given, which decides whether a yes still
+	// stands. See bracketRecheckSafe.
+	at map[string]time.Time
 
 	// collated remembers, per namespace and index, whether the archive can
 	// answer a collated key lookup from an index. See collatedkeys.go.
@@ -96,6 +99,38 @@ func (a collatedAnswer) good() bool {
 	return time.Since(a.asked) < collatedRecheckNo
 }
 
+// bracketRecheckSafe is how long a yes stands for.
+//
+// Only a yes. The two answers are not the same kind of thing and they do not go
+// stale the same way.
+//
+// Yes means the archive holds nothing whose age field sorts above a date, so the
+// fast tier's own newest-first answer is a proof. The next write can make that
+// untrue: one document with a string where a date belongs sorts above every date
+// there is, and the proof then misses it. Measured on six dated documents and one
+// string: the archive answers with the string document first, the router that had
+// already asked answered without it, and a router started a moment later
+// answered correctly. Stale in the direction of a wrong answer, and it never
+// expired, because the answer was remembered for the life of the process.
+//
+// No is the conservative direction: the optimisation does not apply and the
+// query takes the ordinary path through the archive, which is always right. It
+// is kept, and so is the timeout that produces one, because re-asking costs the
+// collection scan the timeout exists to stop paying. The remedy for a no is to
+// fix the data or index the field, and the action the warning names is to
+// restart the router.
+//
+// A minute, which is what this codebase already pays per namespace for the
+// other question of this shape: a unique index created on one router is not
+// enforced by the others for up to indexRefresh. The probe is bounded at
+// bracketProbeTimeout and only a namespace that answered yes inside it is asked
+// again, so the ones this costs anything on are the ones where it is cheap.
+//
+// The window is real and is written down: for up to a minute after the first
+// document of an odd type reaches the archive, a newest-first query on that
+// namespace can still be answered from the fast tier alone.
+const bracketRecheckSafe = time.Minute
+
 // sortSafeAges reports whether a sort on ns's age field can be trusted to put
 // every document the claim ignores below the ones it covers.
 //
@@ -104,9 +139,9 @@ func (a collatedAnswer) good() bool {
 // ordinary path through the archive, which is where it went before.
 func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	r.brackets.mu.RLock()
-	safe, asked := r.brackets.byNS[ns], r.brackets.asked[ns]
+	safe, asked, at := r.brackets.byNS[ns], r.brackets.asked[ns], r.brackets.at[ns]
 	r.brackets.mu.RUnlock()
-	if asked {
+	if asked && (!safe || time.Since(at) < bracketRecheckSafe) {
 		return safe
 	}
 
@@ -160,9 +195,11 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	if r.brackets.byNS == nil {
 		r.brackets.byNS = map[string]bool{}
 		r.brackets.asked = map[string]bool{}
+		r.brackets.at = map[string]time.Time{}
 	}
 	r.brackets.byNS[ns] = safe
 	r.brackets.asked[ns] = true
+	r.brackets.at[ns] = time.Now()
 	r.brackets.mu.Unlock()
 
 	if found {
@@ -181,6 +218,7 @@ func (r *Router) forgetBrackets(ns string) {
 	r.brackets.mu.Lock()
 	delete(r.brackets.byNS, ns)
 	delete(r.brackets.asked, ns)
+	delete(r.brackets.at, ns)
 	// And what is remembered about its indexes, which lives in the same place
 	// and was being left behind. The key is the namespace and the index name,
 	// so a collection dropped and recreated kept an answer about an index that
