@@ -471,6 +471,48 @@ chk "no scratch collection is reported"                "true" \
 chk "the application's own insert still arrives"       "true" \
     "$(echo "${WIDE3:-none}" | grep -q "insert:$NS" && echo true || echo false)"
 
+echo "== a promotion read after the application deleted the document =="
+# The residency record is two things at once: a hold saying the document should
+# stay on the fast tier, and the only evidence that the insert a copy-up causes
+# was a promotion rather than somebody writing a document. Ending it when the
+# application deletes the document is what stops the *next* insert of that _id
+# being suppressed, and the section above checks that half.
+#
+# This is the other half. A consumer that has not caught up has yet to read the
+# promotion's own insert, and the router decides whether to hide it when it hands
+# it over. Deleting the record took the evidence away before that: measured on a
+# document only the archive held, read once through the router so it was copied
+# up and deleted two seconds later, the client was shown **insert then delete**
+# for a document it never inserted.
+#
+# Found by the fuzzer first, as four extra inserts in eighty operations, and it
+# needed a hundred and twenty operations a round to reach: the sweep's forty had
+# not.
+PNS=tcs2
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$PNS.insertOne({_id:1,v:'archived'})" >/dev/null
+startFeeder; startRouter
+PROMO=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$PNS;
+  const cs = c.watch([]);
+  cs.tryNext();
+  c.findOne({_id:1});
+  sleep(2000);
+  c.deleteOne({_id:1});
+  sleep(8000);
+  const got = [];
+  for (let r = 0; r < 20; r++) {
+    for (;;) { const e = cs.tryNext(); if (!e) break; got.push(e.operationType + ':' + e.documentKey._id); }
+    sleep(250);
+  }
+  try { cs.close(); } catch (e) {}
+  print(got.join(' '));")
+echo "  the consumer that was behind saw: ${PROMO:-nothing}"
+chk "only the delete, not the copy-up's insert"        "delete:1" "$PROMO"
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
+
 stopDaemons
 echo
 echo "================================"

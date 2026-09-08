@@ -368,6 +368,19 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, recent 
 	if !ok {
 		return false
 	}
+	// The application has deleted the document since, and this insert happened
+	// after that, so it is the application writing the _id again and not this
+	// promotion. Checked before everything below, including the echo: a record
+	// that has ended describes a promotion that is over.
+	//
+	// Ending the record rather than deleting it is what makes the other half of
+	// this work. Deleting it took away the only evidence that the copy-up's own
+	// insert was a promotion, and a consumer that had not caught up was then
+	// shown an insert of a document it never inserted: measured as exactly that,
+	// insert then delete, for a document only the archive held.
+	if !p.ended.IsZero() && !at.IsZero() && at.After(p.ended) {
+		return false
+	}
 	// Announced and not yet spent, which means the insert this record was
 	// written to precede has not been seen. Unconditional, the way an
 	// unclaimed eviction announcement is, and for the same reason: it can only
@@ -437,6 +450,10 @@ func eventTime(ev bson.RawValue) time.Time {
 type promotion struct {
 	at      time.Time
 	pending bool
+	// ended is when the application deleted the document, zero while it is still
+	// there. An insert after it is the application writing that _id again rather
+	// than this promotion's own. See the feeder's dropResidency.
+	ended time.Time
 }
 
 // promotionTimes reports, for each of these document ids that has a residency
@@ -461,9 +478,14 @@ func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]pr
 			ID      string    `bson:"_id"`
 			At      time.Time `bson:"promotedAt"`
 			Pending bool      `bson:"echoPending"`
+			Ended   time.Time `bson:"endedAt"`
 		}
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = promotion{at: rec.At.UTC(), pending: rec.Pending}
+			p := promotion{at: rec.At.UTC(), pending: rec.Pending}
+			if !rec.Ended.IsZero() {
+				p.ended = rec.Ended.UTC()
+			}
+			out[rec.ID] = p
 		}
 	}
 	return out

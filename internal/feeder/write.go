@@ -278,18 +278,42 @@ func (f *Feeder) dropResidency(ctx context.Context, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	res, err := f.cold.Database(meta.DB).Collection(meta.Residency).
-		DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	// Ended, not deleted, and the difference is a wrong answer.
+	//
+	// The record is two things at once: a hold saying the document should stay
+	// on the fast tier, and the only evidence that the insert the copy-up caused
+	// was a promotion rather than somebody writing a document. Deleting it takes
+	// the hold away, which is right, and the evidence with it, which is not: a
+	// consumer that has not caught up has yet to read that insert, and the
+	// router decides whether to hide it when it hands it over.
+	//
+	// Measured. A document only the archive held, read once through the router
+	// so it was copied up, deleted by the application two seconds later, and the
+	// stream drained after that: the client was shown **insert then delete** for
+	// a document it never inserted. The fuzzer found it first, as four extra
+	// inserts in eighty operations.
+	//
+	// So the end is recorded and the hold released. An insert event at or before
+	// that instant is the promotion's own; one after it is the application
+	// writing that _id again, which is what deleting the record was for. The row
+	// goes on its own TTL as it always did.
+	now := time.Now().UTC()
+	res, err := f.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "endedAt", Value: now},
+			{Key: "hotUntil", Value: now},
+		}}})
 	if err != nil {
-		f.log.Warn("could not release the residency holds for documents the application deleted",
+		f.log.Warn("could not end the residency holds for documents the application deleted",
 			"documents", len(ids), "err", err,
 			"effect", "a client's change stream may not be shown its own insert if one of these "+
 				"_ids is written again within thirty seconds",
 			"note", "the holds expire on their own TTL, so this corrects itself")
 		return
 	}
-	if res.DeletedCount > 0 {
-		f.log.Debug("released residency holds for deleted documents", "count", res.DeletedCount)
+	if res.ModifiedCount > 0 {
+		f.log.Debug("ended residency holds for deleted documents", "count", res.ModifiedCount)
 	}
 }
 

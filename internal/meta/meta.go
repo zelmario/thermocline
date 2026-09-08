@@ -209,6 +209,11 @@ type ResidencyRecord struct {
 	Doc        bson.RawValue `bson:"doc"`
 	HotUntil   time.Time     `bson:"hotUntil"`
 	PromotedAt time.Time     `bson:"promotedAt,omitempty"`
+	// EndedAt is when the application deleted the document this record is
+	// about. The hold is over from then, and so is the promotion: an insert of
+	// this _id at or before it is the copy-up's own, and one after it is the
+	// application writing the _id again. See the feeder's dropResidency.
+	EndedAt time.Time `bson:"endedAt,omitempty"`
 }
 
 // NoticeTTL is how long an eviction or warming announcement is kept.

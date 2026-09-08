@@ -304,6 +304,10 @@ feeder:
     - "shop.tbwm"
     # testchange.sh
     - "shop.tcs"
+    # testchange.sh: a promotion read after the application deleted the
+    # document. Its own collection, because the section drops it and the one
+    # above watches the whole database.
+    - "shop.tcs2"
     # testcache.sh
     - "shop.tcache"
     # testcache.sh again, for the cache across an adoption: the archive holds
