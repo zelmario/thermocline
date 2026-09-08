@@ -63,6 +63,18 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 	if !ok {
 		return nil, false
 	}
+	if inTransaction(cmd) {
+		// mongod refuses $merge in a transaction, the same way it refuses $out,
+		// so there is nothing here to protect. Measured rather than assumed: the
+		// command comes back "$merge cannot be used in a transaction".
+		//
+		// Worth returning for rather than letting it fall through. Everything
+		// below reads the input once to work out what the merge would match and
+		// copies the archived documents carrying those values up, and paying
+		// that for a command that is about to be refused is a read of the
+		// archive and a write to the fast tier that nothing asked for.
+		return nil, false
+	}
 	if !c.r.cfg.Manages(target) {
 		// Untiered, so the fast tier is the whole of it and it can see
 		// everything the merge might match.

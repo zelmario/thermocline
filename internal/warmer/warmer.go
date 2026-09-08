@@ -248,6 +248,18 @@ func (w *Warmer) countBothInWindow(ctx context.Context, rule config.WarmRule, fr
 // Refusing to strengthen the claim leaves whatever the evictor last narrowed it
 // to, which is the honest description of a tier being emptied. The next warm
 // makes the claim again if it is true by then.
+//
+// What is left is the gap between this answer and the write that follows it, and
+// it is worth saying why that is not closed with a compare and set on the
+// watermark. The evictor narrows the claim, then waits settleClaim, then
+// deletes: the window here would have to span that wait, which is
+// watermark.ClaimCacheTTL and a second, for the fast tier to lose a document
+// between this check passing and the claim being written. A compare and set
+// would have to read the watermark immediately before writing it to be any
+// tighter than that, and getting the expected value from the start of the run
+// instead would refuse to claim on any namespace whose evictor sweeps during a
+// warm, which is all of them. A warmer that never records a claim sends every
+// read to the archive, so that cure is worse than this disease.
 func (w *Warmer) stillHolds(ctx context.Context, rule config.WarmRule, from time.Time) bool {
 	if w.dryRun {
 		return true
