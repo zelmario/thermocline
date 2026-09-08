@@ -214,3 +214,65 @@ func TestAnOversizedAnswerIsLearnedFromButNotHeld(t *testing.T) {
 		t.Error("the rejection was not counted, so an idle-looking cache says nothing about why")
 	}
 }
+
+// The collections an answer depends on are not always known the first time it
+// is seen.
+//
+// cacheDeps works them out by reading the catalog: the view chain the query
+// runs through, what those views join, what the pipeline joins. Every one of
+// those reads can come back short. A listCollections that fails leaves a view
+// looking like an ordinary collection, and the answer is then hung from the
+// namespace the command named and nothing else.
+//
+// The router asks again on the next read of the same query and gets the fuller
+// set, and until this it made no difference: the index was written once, when
+// the key was new, and never revisited. A write to the collection discovered
+// second did not drop the entry, so the cache went on serving an answer the
+// data behind it had moved out from under.
+func TestADependencyLearnedLaterStillInvalidates(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+
+	// First look: only the collection the command named, which is what a
+	// catalog read that came back short leaves behind.
+	c.ObserveResultOn("q", []string{"shop.v"}, []byte("a"), 1)
+	k.add(10 * time.Minute)
+	// Second look: the view's base is known this time.
+	c.ObserveResultOn("q", []string{"shop.v", "shop.orders"}, []byte("a"), 1)
+
+	if _, ok := c.Get("q"); !ok {
+		t.Fatal("the answer was not cached, so this test proves nothing")
+	}
+	if n := c.Invalidate("shop.orders"); n != 1 {
+		t.Fatalf("a write to shop.orders dropped %d entries, want 1", n)
+	}
+	if _, ok := c.Get("q"); ok {
+		t.Error("the cache still answered a query whose data had just been written")
+	}
+}
+
+// byKey is bounded by max_queries and byNS was bounded by nothing.
+//
+// Invalidate deletes the entry itself, and leaving the reference behind is safe
+// because a reference that finds nothing does nothing. Safe is not free: the
+// key stays in the set of every other namespace it was hung from, for a query
+// that may never be asked again, and those sets are the one thing here that no
+// setting bounds. A router answering many distinct queries against a collection
+// that is written to accumulates them for as long as it runs.
+func TestInvalidateLeavesNoDeadReferences(t *testing.T) {
+	c, k := newTestCache(1000, time.Hour)
+
+	for i := 0; i < 100; i++ {
+		key := string(rune('a'+i%26)) + string(rune('a'+i/26))
+		c.ObserveResultOn(key, []string{"shop.v", "shop.orders"}, []byte("a"), 1)
+		k.add(time.Minute)
+		c.ObserveResultOn(key, []string{"shop.v", "shop.orders"}, []byte("a"), 1)
+	}
+	c.Invalidate("shop.orders")
+
+	if n := c.Len(); n != 0 {
+		t.Fatalf("%d queries still watched after the write, want 0", n)
+	}
+	if n := c.refs(); n != 0 {
+		t.Errorf("%d dead references left behind, want 0", n)
+	}
+}

@@ -51,6 +51,15 @@ type history struct {
 	stable    []time.Duration
 	ttl       time.Duration
 
+	// nss is every namespace this key is indexed under in byNS.
+	//
+	// Kept here rather than worked out again, because the two places that stop
+	// watching a query have to unhook it from all of them and neither one is
+	// given the list. Invalidate is handed one namespace and eviction is handed
+	// none, so without this the first cleaned up nothing but the namespace it
+	// was called with and the second swept every namespace there is.
+	nss []string
+
 	entry *Entry
 }
 
@@ -171,17 +180,10 @@ func (c *Cache) ObserveResultOn(key string, nss []string, reply []byte, h uint64
 		c.evictIfFull()
 		e = &history{lastHash: h, lastSeen: now, changedAt: now}
 		c.byKey[key] = e
-		for _, ns := range nss {
-			if ns == "" {
-				continue
-			}
-			if c.byNS[ns] == nil {
-				c.byNS[ns] = make(map[string]struct{})
-			}
-			c.byNS[ns][key] = struct{}{}
-		}
+		c.indexOn(key, e, nss)
 		return
 	}
+	c.indexOn(key, e, nss)
 
 	if h != e.lastHash {
 		// How long that answer was being given: from the moment it first
@@ -242,6 +244,79 @@ func (c *Cache) ObserveResultOn(key string, nss []string, reply []byte, h uint64
 	c.evictForBytes()
 }
 
+// indexOn hangs a key from every collection its answer depends on.
+//
+// Additive, and called on every observation rather than only the first.
+//
+// The set is not always known the first time a query is seen. The router works
+// it out by reading the catalog, and a catalog read that comes back short
+// leaves a view looking like an ordinary collection: the answer is then hung
+// from the namespace the command named and from nothing else. The next read of
+// the same query asks again and gets the fuller set, and until this that made
+// no difference, because the index was written once when the key was new. A
+// write to the collection discovered second did not drop the entry, and the
+// cache went on serving an answer whose data had moved.
+//
+// Additive in the other direction too: a set that comes back short later does
+// not remove anything. An extra reference costs an invalidation that was not
+// needed, and a missing one costs a stale answer.
+func (c *Cache) indexOn(key string, e *history, nss []string) {
+	for _, ns := range nss {
+		if ns == "" {
+			continue
+		}
+		if c.byNS[ns] == nil {
+			c.byNS[ns] = make(map[string]struct{})
+		}
+		if _, already := c.byNS[ns][key]; already {
+			continue
+		}
+		c.byNS[ns][key] = struct{}{}
+		e.nss = append(e.nss, ns)
+	}
+}
+
+// unhook removes a key from every namespace it was hung from.
+//
+// byKey is bounded by max_queries and byNS was bounded by nothing. Deleting the
+// entry and leaving the references behind is safe, because a reference that
+// finds nothing does nothing, and safe is not free: the key stayed in the set
+// of every other namespace it was hung from, for a query that may never be
+// asked again, and nothing ever removed it. A router answering many distinct
+// queries against a collection that is written to accumulated them for as long
+// as it ran.
+func (c *Cache) unhook(key string, e *history) {
+	if e == nil {
+		return
+	}
+	for _, ns := range e.nss {
+		keys := c.byNS[ns]
+		if keys == nil {
+			continue
+		}
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(c.byNS, ns)
+		}
+	}
+	e.nss = nil
+}
+
+// forget stops watching a query and gives back the memory its answer held.
+func (c *Cache) forget(key string) bool {
+	e, ok := c.byKey[key]
+	if !ok {
+		return false
+	}
+	held := e.entry != nil
+	if held {
+		c.bytes -= len(e.entry.Reply)
+	}
+	c.unhook(key, e)
+	delete(c.byKey, key)
+	return held
+}
+
 // TTLOf reports what has been learned for a query, for the dashboard and for
 // tests.
 func (c *Cache) TTLOf(key string) time.Duration {
@@ -262,17 +337,46 @@ func (c *Cache) TTLOf(key string) time.Duration {
 func (c *Cache) Invalidate(ns string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	keys := c.byNS[ns]
+	// Copied first: forget deletes from byNS, including from this very set.
+	keys := make([]string, 0, len(c.byNS[ns]))
+	for k := range c.byNS[ns] {
+		keys = append(keys, k)
+	}
 	n := 0
-	for k := range keys {
-		if h, ok := c.byKey[k]; ok && h.entry != nil {
+	for _, k := range keys {
+		if c.forget(k) {
 			n++
-			c.bytes -= len(h.entry.Reply)
 		}
-		delete(c.byKey, k)
 	}
 	delete(c.byNS, ns)
 	return n
+}
+
+// Stats is everything worth publishing about a running cache, read in one pass
+// under the lock.
+//
+// One call rather than five, because Learned and Rejected are plain fields and
+// reading them beside a locked Counters() from a scrape goroutine is a race on
+// two of them. It is also the only way the five numbers describe the same
+// moment.
+type Stats struct {
+	Hits, Misses, Learned, Rejected uint64
+	Entries                         int
+	Bytes                           int
+}
+
+// Stats reports what this cache has done and what it is holding.
+func (c *Cache) Stats() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Stats{
+		Hits:     c.Hits,
+		Misses:   c.Misses,
+		Learned:  c.Learned,
+		Rejected: c.Rejected,
+		Entries:  len(c.byKey),
+		Bytes:    c.bytes,
+	}
 }
 
 // Counters reports hits and misses, for the report and the dashboard.
@@ -289,19 +393,22 @@ func (c *Cache) InvalidateDatabase(db string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	prefix := db + "."
-	n := 0
-	for ns, keys := range c.byNS {
+	// Gathered first, for the same reason Invalidate gathers: forget deletes
+	// from byNS while this walks it.
+	var keys []string
+	for ns, ks := range c.byNS {
 		if len(ns) <= len(prefix) || ns[:len(prefix)] != prefix {
 			continue
 		}
-		for k := range keys {
-			if h, ok := c.byKey[k]; ok && h.entry != nil {
-				n++
-				c.bytes -= len(h.entry.Reply)
-			}
-			delete(c.byKey, k)
+		for k := range ks {
+			keys = append(keys, k)
 		}
-		delete(c.byNS, ns)
+	}
+	n := 0
+	for _, k := range keys {
+		if c.forget(k) {
+			n++
+		}
 	}
 	return n
 }
@@ -374,13 +481,10 @@ func (c *Cache) evictIfFull() {
 		}
 	}
 	if oldestKey != "" {
-		if h := c.byKey[oldestKey]; h != nil && h.entry != nil {
-			c.bytes -= len(h.entry.Reply)
-		}
-		delete(c.byKey, oldestKey)
-		for _, keys := range c.byNS {
-			delete(keys, oldestKey)
-		}
+		// Its own list, rather than a sweep of every namespace there is: the
+		// key is hung from the handful its answer depends on and from no
+		// others, and the sweep was the whole of byNS on every eviction.
+		c.forget(oldestKey)
 	}
 }
 
@@ -392,4 +496,16 @@ func hashOf(b []byte) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write(b)
 	return h.Sum64()
+}
+
+// refs is how many namespace references are held in total, for the test that
+// pins them to the entries they belong to.
+func (c *Cache) refs() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, keys := range c.byNS {
+		n += len(keys)
+	}
+	return n
 }
