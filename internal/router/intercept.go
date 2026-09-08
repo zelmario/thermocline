@@ -96,12 +96,11 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// Before the untiered check too. A view over an untiered reference
 	// collection joining the tiered history is the same defect with the tiers
 	// the other way up, and it is the shape reporting most often takes.
-	{
-		_, viaView, tiered := c.r.tieredBase(ctx, ns)
-		if c.r.isViewNS(ctx, ns, viaView, tiered) {
-			if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, reply); done {
-				return out, nil
-			}
+	nsBase, nsViaView, nsTiered := c.r.tieredBase(ctx, ns)
+	readingAView := c.r.isViewNS(ctx, ns, nsViaView, nsTiered)
+	if readingAView {
+		if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, reply); done {
+			return out, nil
 		}
 	}
 
@@ -196,6 +195,28 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 			"this transaction read a document that had been archived, and it has now been restored to the fast tier")
 	}
 
+	// A view the archive has never heard of cannot be asked, and asking anyway
+	// is the quietest way to be wrong: a find on a namespace mongod does not
+	// have is an empty result set, not an error. Measured, on a view created
+	// straight on the fast tier over a tiered collection: findOne by _id
+	// returned nothing for a document the archive holds, with no error on it.
+	//
+	// The range path has refused this since views were understood at all. The
+	// point read skips that guard on purpose, because a lookup by exact id has
+	// no completeness question to answer, and it took this with it. The question
+	// here is not about completeness: it is whether the archive can be asked this
+	// query at all.
+	if readingAView && !c.r.archiveCanAnswerView(ctx, ns) {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a point read through a view the archive does not have",
+			"view", ns, "reads", nsBase,
+			"why", "the document is in the archive and the archive has no such view, and a find on "+
+				"a namespace it does not have answers nothing rather than failing")
+		return c.r.refuseView(reply.Header.RequestID, msg.Header.RequestID, ns, nsBase,
+			"this document is in the archive and the archive does not hold this view")
+	}
+
 	// The archive answers the command the client sent, not a lookup by _id.
 	//
 	// This used to read the document by its _id and hand it back, and an _id is
@@ -234,7 +255,24 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	if replyCarriesDocuments(out) {
 		c.r.Stats.ReadMisses.Add(1)
 		c.cls = ClassMiss
-		c.r.copyUpAsync(ns, id)
+		// Not through a view. A promotion writes the document into the namespace
+		// the client named, and a view is not a namespace anything can be
+		// written to: mongod answers "Namespace ... is a view, not a
+		// collection". The read above is already answered from the archive and
+		// is right, so what this cost was an error in the log on every such
+		// read and a promotion that never happened.
+		//
+		// It is skipped rather than redirected to the collection underneath. The
+		// _id here is the one the view's own pipeline produced, and a view that
+		// groups or projects makes that a value the base collection has never
+		// heard of. Promoting by it would copy up an unrelated document, or none.
+		if readingAView {
+			c.log.Debug("not promoting a document read through a view",
+				"view", ns, "why", "a view is not a namespace a document can be written to, and "+
+					"the _id a view produces need not be one the collection underneath has")
+		} else {
+			c.r.copyUpAsync(ns, id)
+		}
 	} else {
 		// Nothing to promote, so this was an ordinary archive read and is
 		// counted as one. It used to be counted as a read miss whatever came

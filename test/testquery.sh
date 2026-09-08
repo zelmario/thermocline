@@ -214,6 +214,18 @@ chk "and a find through it returns every document"     "10" \
 # back short, and short and full both read as answered.
 chk "while the fast-tier-only view is still refused"   "REFUSED" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview.countDocuments({}))}catch(e){print('REFUSED')}")"
+# And by _id, which takes a different road to the same place. A point read is
+# exempt from the completeness guard on purpose, because a lookup by exact id
+# matches at most one document and needs no claim about how much of history the
+# fast tier holds. It took the view question with it, and that question is not
+# about completeness: it is whether the archive can be asked this query at all.
+#
+# Measured before this: findOne by _id through a view only the fast tier has
+# returned *nothing* for a document the archive holds, with no error on it,
+# because a find on a namespace mongod does not have is an empty result set
+# rather than a failure. The quietest way to be wrong there is.
+chk "  and a point read by _id through it as well"    "REFUSED" \
+    "$(R "try{const d=db.getSiblingDB(process.env.TC_DB).vqview.findOne({_id:1}); print(d?('found '+d._id):'NOTHING')}catch(e){print('REFUSED')}")"
 
 # A view whose own pipeline reads another collection stays refused, and the
 # reason is what the archive holds rather than what the view is. The feeder

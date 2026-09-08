@@ -608,10 +608,6 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 			c.r.resolveJoinedViews(ctx, &scope)
 			pbase, pViaView, pTiered := c.r.tieredBase(ctx, scope.primary)
 			primaryIsView := c.r.isViewNS(ctx, scope.primary, pViaView, pTiered)
-			// Kept, because scope.primary is about to become the collection the
-			// view reads and the refusal below has to name the view the client
-			// asked for. Without this both halves of the message were the base,
-			// which reads as a collection refusing to be a view of itself.
 			primaryName := scope.primary
 			if primaryIsView {
 				// The same question the three read paths ask of a view they are
@@ -621,12 +617,17 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 					return out, true
 				}
 			}
+			// A view names itself, not the collection it reads, so the
+			// completeness of the one underneath is what decides. Judged on a
+			// copy, because everything after this reports what the client asked
+			// for: the refusal has to name the view, and so does the line the
+			// write logs. Rewriting scope itself made both of them say the base,
+			// which reads as a collection refusing to be a view of itself.
+			judged := scope
 			if pViaView && pTiered {
-				// A view names itself, not the collection it reads, so the
-				// completeness of the one underneath is what decides.
-				scope.primary = pbase
+				judged.primary = pbase
 			}
-			if _, _, _, fine := c.r.checkAggregate(ctx, scope); !fine {
+			if _, _, _, fine := c.r.checkAggregate(ctx, judged); !fine {
 				if primaryIsView {
 					// The archive cannot be asked this one. Reading it there
 					// means running the view's own pipeline against the

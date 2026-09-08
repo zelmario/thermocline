@@ -189,7 +189,7 @@ func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) bool {
 	ix.mu.Unlock()
 
 	db, coll := splitNS(ns)
-	if err := ix.createWithOptions(ctx, db, coll); err != nil {
+	if _, err := ix.createWithOptions(ctx, db, coll); err != nil {
 		ix.log.Warn("could not create the collection on the fast tier the way the archive has it",
 			"ns", ns, "err", err,
 			"effect", "a copy-up will create it with no options, and a default collation decides "+
@@ -256,8 +256,19 @@ func (ix *Indexer) build(ctx context.Context, ns string) error {
 
 	// The collection before the indexes, because two of its options decide
 	// answers and cannot be added afterwards.
-	if err := ix.createWithOptions(ctx, db, coll); err != nil {
+	//
+	// A view holds no documents of its own, so there is nothing to index either.
+	// Asked anyway, mongod answers listIndexes with CommandNotSupportedOnView,
+	// and the warning that produced said the fast tier would scan for these
+	// reads until the indexes exist, and that a unique index which will not
+	// build means the values are already duplicated there. Neither is true of a
+	// view, and both were logged every time one was created through the router.
+	isView, err := ix.createWithOptions(ctx, db, coll)
+	if err != nil {
 		return err
+	}
+	if isView {
+		return nil
 	}
 
 	want, expiring, err := archiveIndexes(ctx, ix.cold, db, coll)
@@ -453,31 +464,31 @@ func rejectsCommitQuorum(err error) bool {
 // application deleting them, and the archive would tombstone the history it
 // exists to keep. Those are refused rather than copied; see the feeder's
 // collection kind check.
-func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error {
-	exists, opts, err := archiveCollectionOptions(ctx, ix.cold, db, coll)
-	if err != nil || !exists {
-		return err
+func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) (isView bool, err error) {
+	exists, isView, opts, err := archiveCollectionOptions(ctx, ix.cold, db, coll)
+	if err != nil || !exists || isView {
+		return isView, err
 	}
 
 	names, err := ix.hot.Database(db).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
 	if err != nil {
-		return fmt.Errorf("list %s.%s on the fast tier: %w", db, coll, err)
+		return false, fmt.Errorf("list %s.%s on the fast tier: %w", db, coll, err)
 	}
 	if len(names) > 0 {
 		// Already there. Adding a collation now would not apply to what it
 		// already holds, and MongoDB does not allow it either.
-		return nil
+		return false, nil
 	}
 
 	cmd := bson.D{{Key: "create", Value: coll}}
 	cmd = append(cmd, opts...)
-	if err := ix.hot.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
+	if cerr := ix.hot.Database(db).RunCommand(ctx, cmd).Err(); cerr != nil {
 		// A racing insert is the expected way to lose here, and it is not
 		// worth failing the index build over.
-		if isNamespaceExists(err) {
-			return nil
+		if isNamespaceExists(cerr) {
+			return false, nil
 		}
-		return fmt.Errorf("create %s.%s on the fast tier: %w", db, coll, err)
+		return false, fmt.Errorf("create %s.%s on the fast tier: %w", db, coll, cerr)
 	}
 	carried := make([]string, 0, len(opts))
 	for _, e := range opts {
@@ -488,7 +499,7 @@ func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) error
 		"why", "a collation decides which documents match and a validator which writes are refused, "+
 			"and neither arrives with the documents; and a collection that does not exist is not "+
 			"listed by listCollections and cannot be asked for its stats, however well its reads work")
-	return nil
+	return false, nil
 }
 
 // MirrorCollection gives the archive the collection the way the fast tier has
@@ -625,28 +636,34 @@ func carryableOptions(ctx context.Context, from *mongo.Client, db, coll string) 
 // the same collection is answered correctly from the archive. Measured on an
 // adoption of a hundred documents: countDocuments answered 100, show
 // collections was empty, and stats() errored.
-func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll string) (bool, bson.D, error) {
+func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll string) (exists, isView bool, opts bson.D, err error) {
 	cur, err := cold.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
 	if err != nil {
-		return false, nil, fmt.Errorf("list %s.%s in the archive: %w", db, coll, err)
+		return false, false, nil, fmt.Errorf("list %s.%s in the archive: %w", db, coll, err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	if !cur.Next(ctx) {
-		return false, nil, cur.Err()
+		return false, false, nil, cur.Err()
 	}
 	var raw bson.Raw
-	if err := cur.Decode(&raw); err != nil {
-		return false, nil, err
+	if derr := cur.Decode(&raw); derr != nil {
+		return false, false, nil, derr
+	}
+	// A view is reported here rather than left to fail further down. It holds no
+	// documents of its own, so there is nothing to index and nothing to create,
+	// and asking mongod for its indexes is an error rather than an empty list.
+	if t, tok := raw.Lookup("type").StringValueOK(); tok && t == "view" {
+		return true, true, nil, nil
 	}
 	odoc, ok := raw.Lookup("options").DocumentOK()
 	if !ok {
-		return true, nil, nil
+		return true, false, nil, nil
 	}
 
-	elems, err := odoc.Elements()
-	if err != nil {
-		return true, nil, nil
+	elems, eerr := odoc.Elements()
+	if eerr != nil {
+		return true, false, nil, nil
 	}
 	var out bson.D
 	for _, e := range elems {
@@ -655,7 +672,7 @@ func archiveCollectionOptions(ctx context.Context, cold *mongo.Client, db, coll 
 		}
 		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
 	}
-	return true, out, nil
+	return true, false, out, nil
 }
 
 // notCarried is the collection options the fast tier's copy must not be given.
