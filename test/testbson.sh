@@ -328,6 +328,73 @@ stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 
+echo "== an age that is an array, which the sort ranks by its largest element =="
+# The section above asks about a type above the claim's own bracket. This is the
+# other thing a sort cannot be trusted about, and it is not above anything.
+# MongoDB sorts an array field by its extreme element, its largest for a
+# descending sort, so a document holding [2020, 2030] sorts above every date the
+# fast tier has while being, to every predicate the evictor and the warmer write,
+# an old document.
+#
+# It matches $type "date" through its elements, which is exactly why the probe
+# that asks for types above a date never saw it, and $type "array" is the one
+# spelling that matches the array itself.
+#
+# Measured before the array was asked about: the archive answered 99,6,5 and the
+# router answered 6,5,4. Unlike the Timestamp above, this depended on nothing
+# remembered, so a router started afterwards answered the same way.
+#
+# Last in the file, with its own daemons, because it drops and reseeds a
+# collection the sections above read. Put in the middle it left them with no
+# router at all: measured, three checks that had nothing to do with it failed on
+# a connection refused.
+NA=tmenag2
+H "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$NA'})" >/dev/null
+MKA="Array.from({length:6},(_,i)=>({_id:i+1, createdAt:new Date(Date.UTC(2024,7+i,1))}))"
+H "db.getSiblingDB(process.env.TC_DB).$NA.insertMany($MKA)" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NA.insertMany($MKA)" >/dev/null
+# The claim first, and the array document after it. That order is the whole
+# fixture, not a detail: `cline watermark --complete-from` counts both tiers and
+# refuses a claim they contradict, so a fixture that seeds the odd document first
+# never gets a claim at all and every read falls through to the archive. Measured
+# doing it the other way round: the command printed "return 6 documents where
+# there are 7" and refused, and the section then passed against every binary
+# because nothing was ever proved from the fast tier.
+#
+# Claim first is also the only shape this can take in life. The document appears
+# on a tier the router did not write it to, which is the adoption shape and the
+# out-of-band one.
+WMOUT=$(cline watermark --config $CFG --ns $DB.$NA --complete-from 2024-06-01T00:00:00Z 2>&1)
+chk "the claim is recorded"                            "true" \
+    "$(echo "$WMOUT" | grep -qi "declared complete" && echo true || echo "false ($(echo "$WMOUT" | tail -1 | cut -c1-60))")"
+C "db.getSiblingDB(process.env.TC_DB).$NA.insertOne({_id:99, createdAt:[new Date(Date.UTC(2020,0,1)), new Date(Date.UTC(2030,0,1))]})" >/dev/null
+startRouter
+QA="print(db.getSiblingDB(process.env.TC_DB).$NA.find({}).sort({createdAt:-1}).limit(3).toArray().map(d=>d._id).join(','))"
+QAC="print(db.getSiblingDB(process.env.TC_DB).$NA.find({_tcDeletedAt:{\$exists:false}}).sort({createdAt:-1}).limit(3).toArray().map(d=>d._id).join(','))"
+TRUTHA=$(C "$QAC")
+chk "the archive puts the array document first"        "true" \
+    "$([ "${TRUTHA%%,*}" = "99" ] && echo true || echo "false (got $TRUTHA)")"
+GOTA=$(R "$QA")
+chk "and the router agrees, asking for the first time" "$TRUTHA" "$GOTA"
+# The control, and this section is worth nothing without it: the answer the
+# router must not give is the fast tier's own, and the fast tier's own is what a
+# binary that accepts the proof here returns. Comparing against the archive alone
+# says nothing, because a read the fast tier cannot prove falls through and the
+# archive answers correctly either way.
+#
+# The counter on the dashboard was the first control this had and it is not one:
+# it says the proof was used somewhere, not that it was used for this, and a
+# bounded query put in to move it is covered by the claim outright and never
+# reaches the proof at all.
+chk "  which is not what the fast tier would say"      "true" \
+    "$([ "$GOTA" != "$(H "$QA")" ] && echo true || echo "false (both $GOTA)")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$NA'})" >/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

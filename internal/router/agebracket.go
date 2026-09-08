@@ -146,7 +146,8 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	}
 
 	field, types := ageField, aboveDate
-	if field == "" {
+	byID := field == ""
+	if byID {
 		field, types = "_id", aboveObjectID
 	}
 	db, coll := splitNS(ns)
@@ -158,10 +159,36 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	// is answered the same way an error is: the optimisation does not apply.
 	probeCtx, cancel := context.WithTimeout(ctx, bracketProbeTimeout)
 	defer cancel()
-	err := r.cold.Database(db).Collection(coll).FindOne(probeCtx, bson.D{
-		{Key: field, Value: bson.D{{Key: "$type", Value: types}}},
-		meta.NotArchivedDeleted(),
-	}).Err()
+	// Two things make a sort untrustworthy here, and only the first was asked
+	// about.
+	//
+	// A type above the claim's own bracket, which is what the rest of this file
+	// is about. And an array, which is not above anything: MongoDB sorts an
+	// array field by its extreme element, its largest for a descending sort, and
+	// the claim reasoned about the document rather than about one of its values.
+	// So a document holding [2020, 2030] sorts above every date the fast tier
+	// has while being, to every predicate the evictor and the warmer write, an
+	// old document.
+	//
+	// Measured on six dated documents and one holding those two dates, in the
+	// archive alone: the archive answers 99,6,5 and the router answered 6,5,4,
+	// missing the document the sort puts first. Unlike the type case it did not
+	// depend on anything remembered, so a router started afterwards answered the
+	// same way.
+	//
+	// An array matches $type "date" through its elements, which is exactly why
+	// the first clause never saw it, and $type "array" is the one spelling that
+	// matches the array itself. Not asked when the age is the _id timestamp:
+	// mongod does not allow an array _id.
+	probe := bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: types}}}}
+	if !byID {
+		probe = bson.D{{Key: "$or", Value: bson.A{
+			bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: types}}}},
+			bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: "array"}}}},
+		}}}
+	}
+	probe = append(probe, meta.NotArchivedDeleted())
+	err := r.cold.Database(db).Collection(coll).FindOne(probeCtx, probe).Err()
 
 	found := false
 	switch {
