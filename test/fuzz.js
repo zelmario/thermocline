@@ -970,11 +970,21 @@ function viewsSection() {
     ['tcrefvj',  REF.getName(),  REF2.getName()],
     ['tcfuzzvj', TIER.getName(), TIER2.getName()],
   ];
+  const dropAll = () => {
+    for (const [name] of defs) { try { d.getCollection(name).drop(); } catch (e) { /* gone */ } }
+  };
   for (const [name, on, from] of defs) {
     try { d.getCollection(name).drop(); } catch (e) { /* not there */ }
     const pipe = from ? [{ $lookup: { from, localField: 'grp', foreignField: 'grp', as: 'j' } }] : [];
     try { d.createView(name, on, pipe); }
-    catch (e) { print('  HARNESS  could not create ' + name + ': ' + String(e.message).slice(0, 120)); return; }
+    catch (e) {
+      // Whatever was made before the one that failed goes too. A view left in a
+      // worker's database is a collection the next suite's catalog checks find
+      // and nobody put there.
+      print('  HARNESS  could not create ' + name + ': ' + String(e.message).slice(0, 120));
+      dropAll();
+      return;
+    }
   }
   // Created through the router, which mirrors a view down as it makes one. The
   // archive needs its copy or a read the fast tier cannot answer is refused for
@@ -1008,7 +1018,7 @@ function viewsSection() {
         c => { const x = joinedOf(c).findOne({ _id: one }); return x ? [x._id, x.j.length] : []; }, 'seq');
   }
 
-  for (const [name] of defs) { try { d.getCollection(name).drop(); } catch (e) { /* gone */ } }
+  dropAll();
 }
 if (VIEWS) viewsSection();
 
