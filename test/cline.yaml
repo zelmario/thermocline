@@ -281,6 +281,11 @@ feeder:
     - "shop.tqcoll"
     - "shop.tqtext"
     - "shop.tqview"
+    # testquery.sh: a view whose own pipeline joins a second tiered collection.
+    # tqvb is the collection the view is defined on and is claimed complete;
+    # tqvj is the one it joins, and the fast tier deliberately holds part of it.
+    - "shop.tqvb"
+    - "shop.tqvj"
     # testbulk.sh
     - "shop.tbwu"
     - "shop.tbwm"

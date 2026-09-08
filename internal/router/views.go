@@ -170,7 +170,92 @@ func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
 		}
 		s.secondary[i] = base
 		s.named[base] = " (joined as the view " + ns + ")"
+		// And whatever that view joins in turn, for the same reason a view
+		// queried directly has its own joins folded in: the join is in the
+		// definition and the completeness check reads the query. See viewJoins.
+		deeper, readable := r.viewJoins(ctx, ns)
+		if !readable {
+			s.scopeUnknown = true
+			continue
+		}
+		for _, d := range deeper {
+			s.secondary = append(s.secondary, d)
+			s.named[d] = " (joined by the view " + ns + ", itself joined here)"
+		}
 	}
+}
+
+// viewJoins is every collection the chain of views under ns reads besides the
+// one it is defined on.
+//
+// A view's own $lookup is invisible to the completeness check, because that
+// check reads the client's pipeline and the join is in the definition. The
+// consequence was measured and it is a wrong answer, not a short one: a view on
+// a tiered collection the fast tier holds in full, joining a second tiered
+// collection it does not, was answered from the fast tier alone and the rows
+// whose partner had been evicted came back with an empty join array. Two rows
+// where the archive joins both, one joined and one not, with ok: 1.
+//
+// joins() on viewSpec already knew this. It is what makes a joining view refuse
+// to be answered from the archive, and the comment there says exactly why the
+// completeness machinery cannot see the join. What nobody had asked is the same
+// question of the *fast tier* path, which is reached whenever the collection the
+// view is defined on is complete, and that is the ordinary case for a reporting
+// view over recent history.
+//
+// ok is false when a definition or a stage could not be read, which is the same
+// answer as a scope walk that did not reach the bottom: the caller refuses
+// rather than judging the read against a list known to be short.
+func (r *Router) viewJoins(ctx context.Context, ns string) (joined []string, ok bool) {
+	db, _ := splitNS(ns)
+	at := ns
+	for hop := 0; hop < maxViewHops; hop++ {
+		spec, isView := viewDefinition(ctx, r.hot, at)
+		if !isView {
+			// The chain has reached a collection.
+			return joined, true
+		}
+		vals, verr := bson.Raw(spec.pipeline).Values()
+		if verr != nil {
+			return joined, false
+		}
+		// The view's own database, not the query's: a view reads a collection
+		// in the database it lives in.
+		vdb, _ := splitNS(at)
+		names, complete := joinedCollections(vals, vdb, 0)
+		joined = append(joined, names...)
+		if !complete {
+			return joined, false
+		}
+		at = db + "." + spec.on
+	}
+	// A chain longer than mongod itself resolves. Nothing can be said about
+	// what is at the bottom of it.
+	return joined, false
+}
+
+// incompleteViewJoin names a tiered collection a view joins that the fast tier
+// does not hold in full, or empty when there is no such thing.
+//
+// A join reads by key rather than by time, so nothing less than the whole
+// collection makes it whole: the same rule checkAggregate applies to a $lookup
+// the client wrote, applied to one the view was defined with.
+func (r *Router) incompleteViewJoin(ctx context.Context, view string) (string, bool) {
+	joined, ok := r.viewJoins(ctx, view)
+	if !ok {
+		return "a collection it joins, which could not be established", true
+	}
+	for _, ns := range joined {
+		if !r.cfg.Manages(ns) {
+			// Untiered, so the fast tier is the whole of it.
+			continue
+		}
+		mark, known := r.completenessForRead(ctx, ns)
+		if !known || !mark.CoversAll() {
+			return ns, true
+		}
+	}
+	return "", false
 }
 
 // refuseView turns down a read through a view that the fast tier cannot answer

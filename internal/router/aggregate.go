@@ -403,6 +403,34 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
 		view := scope.primary
 		scope.primary = base
+		// What the view itself reads besides the collection it is defined on.
+		// checkAggregate judges these the way it judges a $lookup the client
+		// wrote, which is what makes the difference between a refusal and the
+		// wrong answer measured in viewJoins.
+		joined, readable := c.r.viewJoins(ctx, view)
+		if !readable {
+			// Not scopeUnknown, which says something specific and wrong about
+			// nesting depth. A definition that cannot be read is its own reason.
+			c.r.Stats.Incomplete.Add(1)
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			why := "the collections this view reads could not all be established, so it cannot be " +
+				"shown that the fast tier holds them"
+			c.log.Warn("refused a read through a view whose own pipeline could not be read",
+				"view", view, "reads", base)
+			out, rerr := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, view, base, why)
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
+		}
+		for _, ns := range joined {
+			scope.secondary = append(scope.secondary, ns)
+			if scope.named == nil {
+				scope.named = map[string]string{}
+			}
+			scope.named[ns] = " (joined by the view " + view + ")"
+		}
 		because, _, authorised, fine := c.r.checkAggregate(ctx, scope)
 		if fine {
 			// Same as the collection case below: the cursor this leaves open

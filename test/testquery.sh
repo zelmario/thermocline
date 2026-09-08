@@ -238,6 +238,86 @@ R "db.getSiblingDB(process.env.TC_DB).createView('vqchainbad','vqview',[])" >/de
 chk "a chain whose second link is missing is refused"  "REFUSED" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}))}catch(e){print('REFUSED')}")"
 
+echo "== a view whose own pipeline joins a tiered collection the fast tier is short of =="
+# The section above checks a joining view while the collection under it is
+# *incomplete*, which is the path that reaches the archive and refuses because
+# the archive cannot be asked. That left the other path open, and it is the
+# ordinary one: when the collection the view is defined on is complete, the fast
+# tier answers, and nothing ever looks at the collection the view joins.
+#
+# viewSpec.joins() already said why this is invisible: the completeness check
+# reads the client's pipeline and the join is in the definition. Nobody had asked
+# the same question of the fast tier path.
+#
+# Measured before the fix, on two rows whose partners the archive holds both of
+# and the fast tier one: the archive joins both, the router answered one joined
+# and one with an empty array, ok: 1. That is a reporting view over history
+# quietly losing the rows whose partner has aged out, which is every row the
+# system exists to keep.
+#
+# A refusal is the answer rather than the archive's own, and that is not
+# laziness. The archive's copies carry tombstones, and a $lookup reads a
+# collection of its own, so the tombstone filter the router puts in front of a
+# pipeline never reaches inside the view's definition, which the router cannot
+# rewrite. Answering it there would join deleted documents.
+for c in tqvb tqvj; do
+  H "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null
+done
+R "db.getSiblingDB(process.env.TC_DB).vqvjoin.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({_id:{\$in:['$DB.tqvb','$DB.tqvj']}})" >/dev/null
+# The collection the view is defined on: both tiers hold all of it.
+R "db.getSiblingDB(process.env.TC_DB).tqvb.insertMany([{_id:1,k:'a'},{_id:2,k:'b'}])" >/dev/null
+waitMirrored tqvb 2
+# The collection it joins, in the adoption shape: the archive holds both and the
+# fast tier has never held the second. Written to each tier directly, so the
+# feeder has nothing to mirror and no tombstone is involved.
+C "db.getSiblingDB(process.env.TC_DB).tqvj.insertMany([{_id:1,k:'a',label:'ay'},{_id:2,k:'b',label:'bee'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tqvj.insertOne({_id:1,k:'a',label:'ay'})" >/dev/null
+cline watermark --config $CFG --ns $DB.tqvb --complete-all --force >/dev/null 2>&1
+chk "the fast tier holds one of the joined collection" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tqvj.countDocuments({}))")"
+chk "and the archive holds both"                       "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tqvj.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+R "db.getSiblingDB(process.env.TC_DB).createView('vqvjoin','tqvb',[{\$lookup:{from:'tqvj',localField:'k',foreignField:'k',as:'j'}}])" >/dev/null
+# Both ways of reading a view, because they are judged by different code: a find
+# on the way back, an aggregate before it runs.
+# The refusal has to name the joined collection, not merely happen. A read
+# through a view is also refused when the collection the view is *on* is
+# incomplete, and that would pass this check while proving nothing about the
+# join: the whole point is that tqvb is complete and tqvj is what is short.
+vjoinRead() {
+  R "try{print(db.getSiblingDB(process.env.TC_DB).vqvjoin.$1.toArray().map(d=>d._id+':'+d.j.length).join(','))}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}"
+}
+vjoinVerdict() {
+  case "$1" in
+    "1:1,2:1")             echo true ;;
+    "REFUSED "*"$DB.tqvj"*) echo true ;;
+    *)                     echo "false (got $1)" ;;
+  esac
+}
+VJF=$(vjoinRead "find({})")
+chk "a find through it is refused for the join"         "true" "$(vjoinVerdict "$VJF")"
+VJA=$(vjoinRead "aggregate([])")
+chk "an aggregate through it too"                       "true" "$(vjoinVerdict "$VJA")"
+# And the guard has to stop guarding once the joined collection is whole, or it
+# is a refusal nobody can clear.
+#
+# Waited for rather than asked once. The router caches a completeness claim for
+# watermark.ClaimCacheTTL, so the "no" it read a moment ago is still the answer
+# it has: measured at five seconds here. Asking once fails and looks exactly
+# like a guard that never lets go.
+H "db.getSiblingDB(process.env.TC_DB).tqvj.insertOne({_id:2,k:'b',label:'bee'})" >/dev/null
+cline watermark --config $CFG --ns $DB.tqvj --complete-all --force >/dev/null 2>&1
+VJW=""
+for _ in $(seq 1 20); do
+  VJW=$(vjoinRead "find({})")
+  [ "$VJW" = "1:1,2:1" ] && break
+  sleep 1
+done
+chk "with the join whole, the view answers"             "1:1,2:1" "$VJW"
+R "db.getSiblingDB(process.env.TC_DB).vqvjoin.drop()" >/dev/null 2>&1
+
 echo "== a pipeline that joins a view over a tiered collection =="
 # The same blindness, reached from the other side. $lookup, $graphLookup and
 # $unionWith all accept a view, and the joined namespace is checked by asking

@@ -110,6 +110,36 @@ Part of [Thermocline](../README.md).
   all nineteen aggregations agree with the archive: `bash test/pilot/setup.sh
   join`.
 
+- **A view whose own pipeline joins a tiered collection is refused unless the
+  fast tier holds that collection in full.** A view's `$lookup` is in the view's
+  definition, not in the query, so nothing about the query says the join is
+  there. The completeness check reads the client's pipeline.
+
+  The reading was already half-right: a joining view has always been refused
+  when the collection it is *defined on* is incomplete, because the archive
+  cannot be asked. What nobody had asked is the same question of the other path,
+  the ordinary one. When the collection the view is defined on **is** complete,
+  the fast tier answers, and the collection the view joins was never looked at.
+
+  Measured on two rows whose partners the archive holds both of and the fast
+  tier one: the archive joins both, and the router answered one row joined and
+  one with an empty join array, with `ok: 1`. That is a reporting view over
+  history quietly dropping the rows whose partner has aged out, which is every
+  row the tiering exists to keep.
+
+  Both collections are judged now, and the joined one has to be whole, for the
+  reason a `$lookup` written in the query does: a join reads by key rather than
+  by time, so no partial window makes it whole. The remedy is in the message and
+  it is the usual one: warm the joined collection, or aggregate against the
+  archive.
+
+  It is a refusal rather than an archive answer, and that is not laziness. The
+  archive's copies carry tombstones, and a `$lookup` reads a collection of its
+  own, so the tombstone predicate the router puts in front of a pipeline never
+  reaches inside a view's definition — which the router cannot rewrite.
+  Answering it there would join deleted documents, which is the defect in
+  *Joined collections are read elsewhere* with the sign flipped.
+
 - **Cursors are not shared between routers.** A read answered from the archive
   is served from a cursor this router holds open against the archive, in its own
   memory, so another router cannot continue it. This is what a mongos does too,
