@@ -452,6 +452,20 @@ echo "== the same, when a copy-up is what recreates the collection =="
 # copy-up, and an insert carries no options at all. Measured before this: the
 # collation carried at startup was gone from the recreated copy, and the query
 # the application has always run answered 1 where its own cluster answers 2.
+#
+# **These three checks caught a second defect on 2026-09-08, in a sweep, and it
+# would have been dismissed as a flake.** The reads below are sequential and the
+# promotions they cause are not: a point read that misses answers from the
+# archive and promotes in the background. A second promotion arriving while the
+# first was still creating the collection used to give up waiting and insert, and
+# an insert creates it bare. So all three failed together, once, on a loaded
+# machine, and passed alone.
+#
+# It does not fail reliably, and that is worth knowing rather than fixing here:
+# the window is however long one create takes, measured at one round in six under
+# load and none in twelve on an idle box. If this section fails again, run it
+# alone before believing it, and if it passes alone, look at what else was
+# running rather than closing the tab. See EnsureCollection.
 R "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 chk "the fast tier no longer holds it"            "false" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('$ONS'))")"

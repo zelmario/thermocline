@@ -49,6 +49,10 @@ type Indexer struct {
 
 	mu    sync.Mutex
 	state map[string]indexState
+	// creating is the namespaces a create is running for now, one channel each,
+	// closed when it finishes. A second caller waits on it rather than going
+	// ahead: see EnsureCollection for what going ahead cost.
+	creating map[string]chan struct{}
 }
 
 type indexState struct {
@@ -180,13 +184,58 @@ func (ix *Indexer) EnsureCollection(ctx context.Context, ns string) bool {
 	}
 	ix.mu.Lock()
 	st := ix.state[ns]
-	if st.done || st.created || time.Since(st.lastCreated) < retryAfter {
+	if st.done || st.created {
+		ix.mu.Unlock()
+		return false
+	}
+	// Somebody else is creating it. Wait for them, rather than returning and
+	// letting this caller's write create it bare.
+	//
+	// Returning at once is what the rate limit below used to do to a second
+	// caller, and the two are not the same thing at all. The rate limit is there
+	// so a create that fails is not retried on every copy-up; this is two
+	// copy-ups into a namespace the fast tier does not hold, which is the
+	// ordinary way an adopted collection comes back. The reads are sequential
+	// and the promotions are not: a point read that misses answers from the
+	// archive and promotes in the background.
+	//
+	// Measured, on an archive collection with a collation and a validator whose
+	// fast tier copy had been dropped: six point reads in a row, and in one run
+	// of six the collection came back with neither. The first copy-up was still
+	// talking to the two clusters when the second gave up waiting and inserted.
+	// A collection's options cannot be added afterwards, so what is left is a
+	// fast tier copy that matches different documents from the archive's, for
+	// as long as it exists.
+	if ch, inflight := ix.creating[ns]; inflight {
+		ix.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+		}
+		return false
+	}
+	if time.Since(st.lastCreated) < retryAfter {
 		ix.mu.Unlock()
 		return false
 	}
 	st.lastCreated = time.Now()
 	ix.state[ns] = st
+	ch := make(chan struct{})
+	if ix.creating == nil {
+		ix.creating = map[string]chan struct{}{}
+	}
+	ix.creating[ns] = ch
 	ix.mu.Unlock()
+
+	// Whatever happens below, the waiters are released and the namespace stops
+	// being in flight. A create that failed leaves lastCreated set, so the rate
+	// limit still holds and the next copy-up does not repeat it immediately.
+	defer func() {
+		ix.mu.Lock()
+		delete(ix.creating, ns)
+		ix.mu.Unlock()
+		close(ch)
+	}()
 
 	db, coll := splitNS(ns)
 	if _, err := ix.createWithOptions(ctx, db, coll); err != nil {

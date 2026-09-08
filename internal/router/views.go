@@ -646,10 +646,18 @@ func (r *Router) refuseView(requestID, responseTo int32, view, base, because str
 // eventually confusing; failing the client's drop over it would be worse, and
 // the fast tier has already done the part that matters.
 func (r *Router) dropArchiveView(ctx context.Context, ns string) {
+	// The same reach as the mirroring half, and no more. mirrorViewsToArchive
+	// carries every view in a database that holds something this router
+	// manages, so those are the views the archive has because of us and those
+	// are the ones to take back. A database this router manages nothing in is
+	// the adopted cluster's own, and nothing else here touches one.
+	db, coll := splitNS(ns)
+	if !r.managesDatabase(db) {
+		return
+	}
 	if _, isView := viewDefinition(ctx, r.cold, ns); !isView {
 		return
 	}
-	db, coll := splitNS(ns)
 	if derr := r.cold.Database(db).Collection(coll).Drop(ctx); derr != nil {
 		r.log.Warn("could not drop the archive's copy of a view the fast tier no longer has",
 			"ns", ns, "err", derr,
@@ -661,6 +669,21 @@ func (r *Router) dropArchiveView(ctx context.Context, ns string) {
 	r.log.Info("dropped the archive's copy of a view", "ns", ns,
 		"why", "a view holds no documents, so the rule that a drop is never replayed does not "+
 			"reach it, and a stale one is named by every startup report and found by a rollback")
+}
+
+// managesDatabase reports whether this router manages any namespace in db,
+// which is the reach mirrorViewsToArchive has through viewDatabases. An empty
+// managed list means every namespace, and so every database.
+func (r *Router) managesDatabase(db string) bool {
+	if len(r.cfg.Managed) == 0 {
+		return true
+	}
+	for _, ns := range r.cfg.Managed {
+		if d, _ := splitNS(ns); d == db {
+			return true
+		}
+	}
+	return false
 }
 
 // mirrorViewsToArchive gives the archive every view the fast tier has that it
