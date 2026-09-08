@@ -384,6 +384,40 @@ chk "streams: something was copied up to suppress" "true" \
 echo "  the fast tier went from $STREAM_HOT_BEFORE to $STREAM_HOT_AFTER during the stream round"
 
 echo
+echo "== the same collections read through views =="
+# Every operation the sections above generate names a collection. A view is the
+# other way to name one, and what a view adds is a pipeline stored on the server
+# that the query does not carry, so every judgement the router makes about a read
+# of one is made without it.
+#
+# That is where four wrong answers came from on 2026-09-08, and none of them was
+# reachable from anything this file generated. Two of the four were found by hand
+# and the other two by asking what the first fix did not cover, which is a way of
+# finding defects that does not scale. This is the shape put into the grammar so
+# it does not have to be remembered.
+#
+# Two views on each side. A plain one, where the two answers have to match
+# exactly. And one joining the second pair, where the tiered side's joined
+# collection is short on the fast tier: there the tiered side has to match or
+# refuse, and a short join answered is the defect.
+VOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=1 TC_READONLY=1 TC_VIEWS=1 mongosh --port $PORT -u dba -p secret \
+         --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
+echo "$VOUT" | grep -E "^  HARNESS|^DISAGREE|^$(printf '\t')" | head -20
+VLINE=$(echo "$VOUT" | grep -m1 '^AGREED ')
+echo "  $VLINE"
+set -- $VLINE
+chk "views: no disagreement"       "0" "${8:-none}"
+# And the shapes have to have run. A view that could not be created leaves every
+# comparison ungenerated and the line above says 0 disagreements, which is what
+# a section proving nothing looks like.
+echo "$VOUT" | grep -m1 '^SHAPES ' | tr ' ' '\n' | grep -E 'view' | sed 's/^/  shape /'
+for shape in view_read joining_view joining_view_distinct joining_view_point_read; do
+  chk "views: the shape $shape ran" "true" \
+      "$(echo "$VOUT" | grep -m1 '^SHAPES ' | grep -qE "(^| )$shape=[0-9]+/0" && echo true || echo false)"
+done
+reseed
+
+echo
 echo "== nothing is refused when the fast tier holds it all =="
 # Everything above asks whether the answer is right. This asks whether the
 # router agrees to give one at all. With completeness: strict it refuses

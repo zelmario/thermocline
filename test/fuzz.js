@@ -51,6 +51,11 @@ const NO_TTL = process.env.TC_NO_TTL === '1';
 // Compare what a change stream on each collection delivered for the round's own
 // writes. Off by default because it holds two cursors open for the whole round.
 const STREAM = process.env.TC_STREAM === '1';
+// Read the same collections through views. Off by default because it creates
+// four of them and drops them again, which is DDL the other sections would
+// otherwise have to work around.
+const VIEWS = process.env.TC_VIEWS === '1';
+const VIEW_OPS = Number(process.env.TC_VIEW_OPS || 12);
 const d    = db.getSiblingDB(DB);
 const REF  = d.tcref;
 const TIER = d.tcfuzz;
@@ -938,6 +943,74 @@ function oneOp(i) {
     }
   }
 }
+
+// Views, when asked for. See VIEWS.
+//
+// A view's own pipeline is stored on the server and not sent with the query, so
+// every judgement the router makes about a read of one is made without it. Four
+// wrong answers on 2026-09-08 were exactly that, and not one of them was
+// reachable from anything else this file generates: every operation above names
+// a collection.
+//
+// Two views on each side. A plain one, where the two answers have to match
+// exactly, which is what tests that a read through a view is resolved to the
+// collection underneath it and judged there. And one that joins the second pair,
+// where the tiered side's join is short on the fast tier: there the tiered side
+// has to either match or refuse, and answering a short join is the defect.
+//
+// Each side's view joins its own second collection, so the reference's view
+// joins the untiered one and is whole by construction. The reference is the
+// oracle here as everywhere else in this file.
+function viewsSection() {
+  const plainOf  = c => d.getCollection(c.getName() === REF.getName() ? 'tcrefv'  : 'tcfuzzv');
+  const joinedOf = c => d.getCollection(c.getName() === REF.getName() ? 'tcrefvj' : 'tcfuzzvj');
+  const defs = [
+    ['tcrefv',   REF.getName(),  null],
+    ['tcfuzzv',  TIER.getName(), null],
+    ['tcrefvj',  REF.getName(),  REF2.getName()],
+    ['tcfuzzvj', TIER.getName(), TIER2.getName()],
+  ];
+  for (const [name, on, from] of defs) {
+    try { d.getCollection(name).drop(); } catch (e) { /* not there */ }
+    const pipe = from ? [{ $lookup: { from, localField: 'grp', foreignField: 'grp', as: 'j' } }] : [];
+    try { d.createView(name, on, pipe); }
+    catch (e) { print('  HARNESS  could not create ' + name + ': ' + String(e.message).slice(0, 120)); return; }
+  }
+  // Created through the router, which mirrors a view down as it makes one. The
+  // archive needs its copy or a read the fast tier cannot answer is refused for
+  // the view being missing rather than for anything this section is about.
+  sleep(1500);
+
+  for (let i = 0; i < VIEW_OPS; i++) {
+    const F = filter();
+    const S = sortSpec();
+    // The plain view: two answers that have to be the same.
+    ask('view read', 'view find ' + ser(F) + ' sort ' + ser(S),
+        c => plainOf(c).find(F).sort(S).limit(8).toArray(), 'seq');
+    ask('view count', 'view count ' + ser(F), c => plainOf(c).countDocuments(F), 'seq');
+    // The joining view. Only how many rows each document joined, because the
+    // joined documents themselves are the second collection over again and the
+    // number is what the defect changes.
+    ask('joining view', 'joining view find ' + ser(F),
+        c => joinedOf(c).find(F).sort({ _id: 1 }).limit(8).toArray()
+              .map(x => x._id + ':' + (x.j ? x.j.length : 'none')), 'seq');
+    ask('joining view aggregate', 'joining view aggregate ' + ser(F),
+        c => joinedOf(c).aggregate([{ $match: F }, { $sort: { _id: 1 } }, { $limit: 8 },
+                                    { $project: { _id: 1, jn: { $size: '$j' } } }]).toArray(), 'seq');
+    // distinct over the joined half, which is the one read shape a $lookup can
+    // shorten without changing how many rows come back.
+    ask('joining view distinct', 'joining view distinct j.name ' + ser(F),
+        c => joinedOf(c).distinct('j.name', F).filter(v => v !== null).map(ser).sort(), 'seq');
+    // And a point read by _id, which skips the completeness guard on purpose and
+    // has a join all the same.
+    const one = 1 + ri(60);
+    ask('joining view point read', 'joining view findOne _id ' + one,
+        c => { const x = joinedOf(c).findOne({ _id: one }); return x ? [x._id, x.j.length] : []; }, 'seq');
+  }
+
+  for (const [name] of defs) { try { d.getCollection(name).drop(); } catch (e) { /* gone */ } }
+}
+if (VIEWS) viewsSection();
 
 // Change streams, when asked for. See STREAM.
 //

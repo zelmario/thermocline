@@ -105,6 +105,17 @@ whose two numbers are equal compared nothing but error messages: both sides
 rejected every operation of that kind. A clean tally over a grammar that never
 generated a shape is not evidence about that shape.
 
+`TC_VIEWS=1` reads the same collections through views instead, and it is there
+because a view is the one way of naming a collection that nothing else in the
+grammar reaches. What a view adds is a pipeline stored on the server and not sent
+with the query, so every judgement the router makes about a read of one is made
+without it: four wrong answers on 2026-09-08 were that, and two of the four were
+found only by asking what the fix for the first two did not cover. Two views on
+each side. A plain one, where the two answers have to match exactly. And one
+joining the second pair, where the tiered side's joined collection is short on
+the fast tier, so the tiered side has to match or refuse and a short join
+answered is the defect.
+
 The last section asks a different question. With `completeness: strict` and a
 fast tier holding every document, there is nothing the router cannot answer, so
 every refusal there is the guard being more cautious than the data requires.
