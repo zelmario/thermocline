@@ -153,16 +153,25 @@ func docKeys(ns string, idx uniqueIndex, doc bson.Raw) ([]string, [][]any) {
 	return keysFromTuples(ns, idx, keyTuples(idx, doc))
 }
 
-// valueKeys is docKeys for values worked out some other way, which is what the
-// update path has to do: the document that will hold the key does not exist yet.
-func valueKeys(ns string, idx uniqueIndex, vals []any) ([]string, [][]any) {
-	if len(vals) != len(idx.fields) {
+// keysFromFieldValues is docKeys for values worked out some other way, which is
+// what the update path has to do: the document that will hold the key does not
+// exist yet, so its values come from the update, from the document being changed
+// and from the filter.
+//
+// It takes the values per field rather than one each, for the same reason
+// fieldValues returns a list: a field holding an array contributes one of them
+// per element. The update path used to hand over one value per field and it was
+// the null key for anything behind an array, which stopped agreeing with the
+// insert path the moment that one learned to walk them.
+func keysFromFieldValues(ns string, idx uniqueIndex, per [][]any) ([]string, [][]any) {
+	if len(per) != len(idx.fields) {
 		return nil, nil
 	}
-	per := make([][]any, len(vals))
 	arrays := 0
-	for i, v := range vals {
-		per[i] = openValue(v)
+	for i := range per {
+		if len(per[i]) == 0 {
+			per[i] = []any{nil}
+		}
 		if len(per[i]) > 1 {
 			arrays++
 		}

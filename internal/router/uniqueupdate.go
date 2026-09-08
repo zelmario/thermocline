@@ -209,36 +209,51 @@ func (sh updateShape) determinable(idx uniqueIndex) bool {
 // newKeyValues works out what idx's fields will hold after the statement runs.
 // existing is the document being updated, or nil for a document an upsert is
 // about to create.
-func (sh updateShape) newKeyValues(idx uniqueIndex, existing bson.Raw, filter bson.Raw) []any {
-	vals := make([]any, len(idx.fields))
+// Values, plural, per field. A field that holds an array puts one entry per
+// element into the index, so what a document contributes to one field is a list
+// and not a value.
+//
+// It used to be one value read with lookupPath, and lookupPath cannot cross an
+// array: it answers "element not found" for items.sku over an array of
+// subdocuments, so every such document was keyed as null here. That agreed with
+// the insert path while the insert path was wrong in the same way, and stopped
+// agreeing the moment the insert path learned to walk arrays. The two then
+// computed different keys for the same document, and an update to one whose
+// items.sku the archive has nothing to do with was refused as a duplicate.
+//
+// Found by the fuzzer at ten rounds of a hundred and twenty operations, on a
+// compound partial unique index over items.sku and n. The reference accepted the
+// update and the tiered side answered E11000, and every comparison after it
+// disagreed because the two collections had parted company.
+func (sh updateShape) newKeyValues(idx uniqueIndex, existing bson.Raw, filter bson.Raw) [][]any {
+	per := make([][]any, len(idx.fields))
 	for i, f := range idx.fields {
 		switch {
 		case sh.isReplace:
-			if v, ok := lookupPath(sh.replacement, f); ok {
-				vals[i] = v
-			}
+			per[i] = fieldValues(sh.replacement, f)
 		default:
 			if v, ok := sh.set[f]; ok {
-				vals[i] = v
+				per[i] = openValue(v)
 				continue
 			}
 			if sh.unset[f] {
+				per[i] = []any{nil}
 				continue
 			}
 			if existing != nil {
-				if v, ok := lookupPath(existing, f); ok {
-					vals[i] = v
-				}
+				per[i] = fieldValues(existing, f)
 				continue
 			}
 			// An upsert with nothing matched: the document mongod is about to
 			// create also inherits the filter's equality fields.
 			if v, ok := equalityInFilter(filter, f); ok {
-				vals[i] = v
+				per[i] = openValue(v)
+				continue
 			}
+			per[i] = []any{nil}
 		}
 	}
-	return vals
+	return per
 }
 
 // prospective builds the document the statement will leave behind, so a sparse
@@ -449,9 +464,8 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		if !c.constrainsAfter(ctx, ns, idx, sh, doc, st.filter) {
 			continue
 		}
-		nvals := sh.newKeyValues(idx, doc, st.filter)
 		// Every key the post-image takes. See multikey.go.
-		kids, tuples := valueKeys(ns, idx, nvals)
+		kids, tuples := keysFromFieldValues(ns, idx, sh.newKeyValues(idx, doc, st.filter))
 		for k, kid := range kids {
 			got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, tuples[k])
 			if terr != nil {
@@ -470,8 +484,7 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		if !c.constrainsAfter(ctx, ns, idx, sh, nil, st.filter) {
 			return false, claimed, nil
 		}
-		nvals := sh.newKeyValues(idx, nil, st.filter)
-		kids, tuples := valueKeys(ns, idx, nvals)
+		kids, tuples := keysFromFieldValues(ns, idx, sh.newKeyValues(idx, nil, st.filter))
 		owner, _ := lookupPath(st.filter, "_id")
 		for k, kid := range kids {
 			got, terr := c.r.tryClaim(ctx, ns, idx, kid, owner, tuples[k])

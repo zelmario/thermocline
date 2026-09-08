@@ -173,24 +173,54 @@ func TestMultikeyParallelArraysClaimNothing(t *testing.T) {
 	}
 }
 
-// The values worked out by the update path expand the same way, or an update
-// that sets an array would be judged on one key while the insert of the same
-// document is judged on all of them.
-func TestMultikeyValueKeysMatchDocKeys(t *testing.T) {
-	idx := uniqueIndex{name: "tags_1", fields: []string{"tags"}}
-	d := mkRaw(t, bson.D{{Key: "tags", Value: bson.A{"x", "y"}}})
-	fromDoc, _ := docKeys("shop.k", idx, d)
-	v, err := d.LookupErr("tags")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fromVals, _ := valueKeys("shop.k", idx, []any{v})
-	if len(fromDoc) != len(fromVals) {
-		t.Fatalf("document gave %d keys and values gave %d", len(fromDoc), len(fromVals))
-	}
-	for i := range fromDoc {
-		if fromDoc[i] != fromVals[i] {
-			t.Errorf("key %d differs: %s and %s", i, fromDoc[i], fromVals[i])
-		}
+// The update path has to reach the same keys as the insert path for the same
+// document, or an update to a document is judged against keys the insert of it
+// never claimed.
+//
+// This is the one that broke. The update path read a field with a plain lookup,
+// which cannot cross an array, so items.sku was the null key there and the real
+// elements here. They agreed while both were wrong and stopped agreeing the
+// moment this side learned to walk arrays: the fuzzer found it as an update
+// refused for a duplicate the reference had no trouble with.
+func TestMultikeyUpdatePathMatchesDocKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		idx  uniqueIndex
+		doc  bson.D
+	}{
+		{"an array field", uniqueIndex{name: "tags_1", fields: []string{"tags"}},
+			bson.D{{Key: "tags", Value: bson.A{"x", "y"}}}},
+		{"a path through an array", uniqueIndex{name: "items.sku_1", fields: []string{"items.sku"}},
+			bson.D{{Key: "items", Value: bson.A{
+				bson.D{{Key: "sku", Value: "a"}},
+				bson.D{{Key: "sku", Value: "b"}},
+			}}}},
+		{"compound, one of them behind an array",
+			uniqueIndex{name: "items.sku_1_n_1", fields: []string{"items.sku", "n"}},
+			bson.D{
+				{Key: "items", Value: bson.A{bson.D{{Key: "sku", Value: "a"}}, bson.D{{Key: "sku", Value: "b"}}}},
+				{Key: "n", Value: 7},
+			}},
+		{"a scalar, which must not change", uniqueIndex{name: "email_1", fields: []string{"email"}},
+			bson.D{{Key: "email", Value: "a@x"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := mkRaw(t, tc.doc)
+			fromDoc, _ := docKeys("shop.k", tc.idx, d)
+			// What an update that touches none of the indexed fields computes.
+			var sh updateShape
+			fromUpdate, _ := keysFromFieldValues("shop.k", tc.idx, sh.newKeyValues(tc.idx, d, nil))
+			if len(fromDoc) == 0 {
+				t.Fatalf("the document gave no keys at all")
+			}
+			if len(fromDoc) != len(fromUpdate) {
+				t.Fatalf("the document gave %d keys and the update path %d", len(fromDoc), len(fromUpdate))
+			}
+			for i := range fromDoc {
+				if fromDoc[i] != fromUpdate[i] {
+					t.Errorf("key %d differs: document %s, update path %s", i, fromDoc[i], fromUpdate[i])
+				}
+			}
+		})
 	}
 }
