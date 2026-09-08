@@ -329,6 +329,72 @@ chkv "the archive kept every one of them"           "40" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+
+echo "== the same, for an aggregation, which is judged before it runs =="
+# The twin of the section above, and it was open. A find is inspected on the way
+# back, so the claim that authorised it was to hand and could be remembered
+# beside the cursor. An aggregation is judged before it runs, because it can end
+# in $out, and the claim it was judged against was read in a different function
+# and thrown away. Nothing registered the cursor, so nothing could refuse its
+# getMore.
+#
+# It is the same wrong answer and it is easier to reach: mongod puts 101
+# documents in an aggregation's first batch and a cursor holds the rest, so any
+# pipeline over a collection larger than that leaves one, without the client
+# asking for a batchSize at all. That is the shape a BI tool sends.
+#
+# Measured before the fix on the fixture below: the fast tier went to nought
+# under an open cursor and the aggregation delivered 3 of 40, with ok: 1.
+CNS=tevaggcur
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+cline watermark --config $CFG --ns $DB.$CNS --complete-all --force >/dev/null 2>&1
+# A router of its own, started after the claim is recorded. The one the section
+# above left running has already read this namespace and cached the answer it
+# got then, which was that nothing claimed it: the router caches a claim for
+# watermark.ClaimCacheTTL and re-asks a "no" after ten seconds. Measured with
+# the section sharing that router: the aggregation was judged incomplete, went
+# to the archive, and delivered all forty from a cursor the router owns. Forty
+# is the right number and it proves nothing at all about the fast tier's cursor,
+# which is what this section is here to test.
+kill $CRP 2>/dev/null; wait $CRP 2>/dev/null
+cline router --config $CFG --log-file $LOGDIR/ev_aggcursor_r.log & CRP=$!
+for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+chkv "both tiers hold all forty"                    "40" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+# And the fast tier is what answers it, which is the precondition the whole
+# section rests on. An aggregation the router sends to the archive is answered
+# in full from a cursor of its own, and it would pass every check below for the
+# wrong reason: forty documents and no refusal, from a cursor eviction cannot
+# touch. Asked of explain, because that is where the router already publishes
+# this verdict: a plan it leaves untouched is one the fast tier can answer
+# whole, and a thermocline field on it says the opposite.
+chkv "and the fast tier is what will answer it"     "false" \
+    "$(R "print(!!db.getSiblingDB(process.env.TC_DB).$CNS.explain().aggregate([{\$sort:{_id:1}}]).thermocline)")"
+cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_aggcursor.log & AEVP=$!
+AGGOUT=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$CNS;
+  const cur = c.aggregate([{\$sort:{_id:1}}], {cursor:{batchSize:3}});
+  let first = 0;
+  for (let i=0;i<3 && cur.hasNext();i++) { cur.next(); first++; }
+  const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  for (let i=0;i<60 && hot.$CNS.countDocuments({}) > 10; i++) sleep(500);
+  const left = hot.$CNS.countDocuments({});
+  let got = first, refused = false;
+  try { while (cur.hasNext()) { cur.next(); got++; } }
+  catch (e) { refused = /^thermocline:/.test(String(e.message)); }
+  print(left + '/' + got + '/' + refused);")
+kill $AEVP 2>/dev/null; wait $AEVP 2>/dev/null
+echo "  the fast tier was left with $(echo "$AGGOUT" | cut -d/ -f1), the aggregation delivered $(echo "$AGGOUT" | cut -d/ -f2)"
+chkv "the sweep did empty the fast tier"            "true" \
+    "$([ "$(echo "$AGGOUT" | cut -d/ -f1)" -lt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "the aggregation getMore is refused too"       "true" "$(echo "$AGGOUT" | cut -d/ -f3)"
+chkv "re-running the aggregation answers in full"   "40" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.aggregate([{\$sort:{_id:1}}],{cursor:{batchSize:3}}).itcount())")"
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 kill $CRP $CFP 2>/dev/null; wait $CRP 2>/dev/null; wait $CFP 2>/dev/null
 
 echo "== documents the rule can never remove =="

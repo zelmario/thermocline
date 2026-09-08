@@ -205,6 +205,15 @@ Part of [Thermocline](../README.md).
   read, and every `getMore` after it is forwarded to the fast tier, which by then
   may hold none of it.
 
+  Both kinds of cursor. A `find` and an `aggregate` are judged at opposite ends
+  of the command — one on the way back, one before it runs, because a pipeline
+  can end in `$out` — and the aggregation is the easier of the two to reach:
+  mongod puts 101 documents in an aggregation's first batch and a cursor holds
+  the rest, so a pipeline over a collection larger than that leaves one without
+  the client asking for a `batchSize` at all. An aggregation is also refused for
+  a joined collection whose claim has narrowed, because `$lookup` needs that one
+  whole.
+
   Measured on forty documents held by both tiers with a claim over all of
   history. A client took a first batch of three, an eviction sweep took the fast
   tier from forty documents to nought, and the cursor delivered **3 of 40**.
@@ -224,6 +233,18 @@ Part of [Thermocline](../README.md).
   defined at all for a query with no sort. An application paging a large tiered
   collection through a long-running sweep should expect this and retry; a
   `batchSize` large enough to finish the read in one batch avoids it entirely.
+
+  **The guard is one router's, and a `getMore` that reaches a different router
+  is not guarded.** What a cursor was authorised by is held in the memory of the
+  router that opened it. A fast tier cursor works from any router, because they
+  all speak to the same fast tier, so nothing fails: the second router forwards
+  the `getMore` and the answer comes back short, which is the behaviour this
+  entry exists to remove. The remedy is the one already required for cursors the
+  router owns against the archive, a few entries above: **name every router in
+  the connection string** rather than putting one load balanced address in front
+  of them, and the driver pins each cursor to the router that made it. Recording
+  the authorisation in the shared bookkeeping database instead would cost a round
+  trip on every tiered query that leaves a cursor, which is most of them.
 
 - **`distinct` over a field some documents do not carry can omit the `null`
   MongoDB would report.** This is the one command whose answer depends on the

@@ -103,7 +103,7 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 		if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
 			scope.primary = base
 		}
-		why, _, fine := c.r.checkAggregate(ctx, scope)
+		why, _, _, fine := c.r.checkAggregate(ctx, scope)
 		if fine {
 			return "", false
 		}

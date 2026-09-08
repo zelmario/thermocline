@@ -527,6 +527,12 @@ type conn struct {
 	// until the reply says whether it did. See finishIndexDrop.
 	indexDrop *pendingIndexDrop
 
+	// aggAuth are the completeness claims that let the fast tier run the
+	// aggregation now in flight, held until the reply says whether it left a
+	// cursor open. An aggregation is judged before it runs, unlike a find, so
+	// there is nowhere else to carry them. See tieredcursor.go.
+	aggAuth []nsClaim
+
 	// observedUser is who the fast tier accepted on this connection while
 	// authentication is proxied, and observedPending is who is mid-handshake.
 	// See observeauth.go.
@@ -759,6 +765,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
 	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
+		// Cleared here rather than beside the guard that sets it, so that an
+		// aggregation which never reaches that guard cannot have its reply
+		// registered against the claims of the one before it. See
+		// tieredcursor.go.
+		c.aggAuth = nil
+
 		// An aggregation can carry explain: true instead of being wrapped in an
 		// explain command, and then it plans rather than runs. Every guard below
 		// exists to make a pipeline that runs come out right, and each of them
@@ -1217,6 +1229,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 	if name == "getMore" {
+		// A cursor that has just been drained has no more getMores to guard, so
+		// the claim it was authorised by is forgotten here rather than left for
+		// the idle reaper. Without this every tiered cursor a BI tool opens sits
+		// in that map for the ten minutes mongod would keep the cursor itself.
+		c.forgetExhaustedTieredCursor(msg, reply)
 		if out, filtered := c.filterChangeStream(ctx, msg, reply); filtered {
 			return c.send(out)
 		}

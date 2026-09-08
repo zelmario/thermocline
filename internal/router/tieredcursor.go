@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zelmario/thermocline/internal/watermark"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -33,16 +34,27 @@ import (
 // unsorted query. Refusing costs the application one error on a read it can
 // re-run, and the re-run is answered from the archive and is whole.
 
-// tieredRead is the claim a cursor was authorised by.
+// nsClaim is one namespace's completeness claim as it stood at that moment.
 //
 // The claim itself, not the query's bound. The rule is the same whichever branch
 // let the query through, including the newest-N proof that needs no bound at
 // all: the claim must not have narrowed since.
-type tieredRead struct {
+type nsClaim struct {
 	ns      string
 	from    time.Time
 	claimed bool
-	at      time.Time
+}
+
+// tieredRead is the set of claims a cursor was authorised by.
+//
+// A set rather than one claim, because an aggregation rests on more than the
+// collection it names. A $lookup, $unionWith or $graphLookup reads a second
+// collection, and checkAggregate requires that one to be held in full, because a
+// join reads by key rather than by time. Any of them narrowing under an open
+// cursor shortens the rest of it exactly as the primary's does.
+type tieredRead struct {
+	on []nsClaim
+	at time.Time
 }
 
 // tieredCursors remembers them, per router.
@@ -83,24 +95,19 @@ func (reg *tieredCursors) drop(id int64) {
 // when that query left a cursor open.
 //
 // A reply with cursor id nought is the whole answer and has nothing to outlive.
-func (c *conn) noteTieredCursor(ns string, reply *wire.Message, mark markState) {
+func (c *conn) noteTieredCursor(on []nsClaim, reply *wire.Message) {
+	if len(on) == 0 {
+		return
+	}
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
 		return
 	}
-	id, _ := cursorIdentity(rdoc, ns)
+	id, _ := cursorIdentity(rdoc, on[0].ns)
 	if id == 0 {
 		return
 	}
-	c.r.tiered.add(id, tieredRead{
-		ns: ns, from: mark.from, claimed: mark.claimed, at: time.Now(),
-	})
-}
-
-// markState is the part of a completeness claim this has to remember.
-type markState struct {
-	from    time.Time
-	claimed bool
+	c.r.tiered.add(id, tieredRead{on: on, at: time.Now()})
 }
 
 // guardTieredGetMore refuses a getMore whose claim has narrowed under it.
@@ -122,25 +129,38 @@ func (c *conn) guardTieredGetMore(ctx context.Context, msg *wire.Message) (*wire
 		return nil, false
 	}
 
-	// The claim as it stands. A read, so a claim held under router.claim_grace
+	// The claims as they stand. A read, so one held under router.claim_grace
 	// answers here too: an archive that cannot be reached has not narrowed
 	// anything, because narrowing one is a write to it.
-	now, ok := c.r.completenessForRead(ctx, was.ns)
-	if ok && now.Claimed && !now.From.After(was.from) {
-		// Unchanged, or wider than it was. Nothing to say.
+	//
+	// Every namespace the cursor rests on, not only the one it names. The first
+	// that has moved is the one reported, because one reason is enough to
+	// re-run the query and naming them all would say no more.
+	var narrowed nsClaim
+	var now watermark.Mark
+	for _, prev := range was.on {
+		now, ok = c.r.completenessForRead(ctx, prev.ns)
+		if ok && now.Claimed && !now.From.After(prev.from) {
+			// Unchanged, or wider than it was. Nothing to say.
+			continue
+		}
+		narrowed = prev
+		break
+	}
+	if narrowed.ns == "" {
 		return nil, false
 	}
 
 	c.r.tiered.drop(id)
 	c.r.Stats.Refused.Add(1)
 	c.cls = ClassRefused
-	because := "the completeness claim for " + was.ns + " has been narrowed since this cursor was opened"
+	because := "the completeness claim for " + narrowed.ns + " has been narrowed since this cursor was opened"
 	if !ok || !now.Claimed {
-		because = "the completeness claim for " + was.ns + " has been withdrawn since this cursor was opened"
+		because = "the completeness claim for " + narrowed.ns + " has been withdrawn since this cursor was opened"
 	}
 	c.log.Warn("refused a getMore whose claim narrowed under it",
-		"ns", was.ns, "cursor", id,
-		"was", was.from.Format(time.RFC3339), "now", now.From.Format(time.RFC3339),
+		"ns", narrowed.ns, "cursor", id,
+		"was", narrowed.from.Format(time.RFC3339), "now", now.From.Format(time.RFC3339),
 		"opened", was.at.Format(time.RFC3339),
 		"why", "the fast tier answered the first batch because it was complete for this range, "+
 			"and it no longer is, so the rest of this cursor would be short with no error on it",
@@ -169,4 +189,33 @@ func (reg *tieredCursors) reapIdle(idle time.Duration) {
 		}
 	}
 	reg.mu.Unlock()
+}
+
+// forgetExhaustedTieredCursor drops the registration for a cursor the fast tier
+// has just drained.
+//
+// A getMore whose reply carries cursor id nought is the end of that cursor:
+// there will be no further getMore to refuse, and nothing else reads the
+// registration. reapIdle would get to it eventually, and eventually is a map
+// entry per cursor for as long as mongod would have kept the cursor itself.
+func (c *conn) forgetExhaustedTieredCursor(msg *wire.Message, reply *wire.Message) {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return
+	}
+	asked, ok := intOf64(cmd.Lookup("getMore"))
+	if !ok || asked == 0 {
+		return
+	}
+	rdoc, rerr := reply.ReplyDoc()
+	if rerr != nil || !replyOK(rdoc) {
+		return
+	}
+	// Only a reply that succeeded, checked above: an error carries no cursor
+	// document at all, and that is not proof the cursor is gone, because a
+	// getMore can fail for a reason the next one would not.
+	if id, _ := cursorIdentity(rdoc, ""); id != 0 {
+		return
+	}
+	c.r.tiered.drop(asked)
 }

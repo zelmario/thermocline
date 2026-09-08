@@ -266,7 +266,13 @@ func subDoc(val bson.RawValue) bson.Raw {
 
 // checkAggregate reports why an aggregation cannot be trusted, or ok when it
 // can.
-func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remedy string, ok bool) {
+//
+// on is every claim the answer rests on, in the state this call read them.
+// Read here rather than looked up again by the caller, because a claim narrows
+// between two reads and the later value is the one that would fail to notice:
+// what a cursor has to be judged against is what authorised it, not what stood
+// a moment afterwards. See tieredcursor.go.
+func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remedy string, on []nsClaim, ok bool) {
 	// An aggregation that writes is judged strictly, however it reads. Its
 	// input feeds $out or $merge, so a claim that has become false does not
 	// shorten an answer a client can retry, it writes a short answer into a
@@ -282,26 +288,27 @@ func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remed
 		return "this pipeline nests sub-pipelines deeper than " + itoaInt(maxSubPipelineDepth) +
 				", so the collections it reads could not all be established",
 			"flatten it, or run it against the archive directly, which holds every document " +
-				"of everything this system tiers", false
+				"of everything this system tiers", nil, false
 	}
 	if r.cfg.Manages(s.primary) {
 		mark, known := claimOf(ctx, s.primary)
 		switch {
 		case !known:
 			return "the completeness watermark could not be read",
-				"the archive is unreachable, so completeness cannot be established; retry once it is back", false
+				"the archive is unreachable, so completeness cannot be established; retry once it is back", nil, false
 		case !mark.Claimed:
 			return "nothing has recorded that the fast tier is complete for " + s.primary,
-				"run the warmer, or if the fast tier holds all of history run: cline watermark --ns " + s.primary + " --complete-all", false
+				"run the warmer, or if the fast tier holds all of history run: cline watermark --ns " + s.primary + " --complete-all", nil, false
 		case s.bounded && !mark.Complete(s.bound):
 			return "this aggregation reaches earlier than " + mark.From.Format(time.RFC3339) +
 					", which the fast tier does not hold completely for " + s.primary,
-				"bound the pipeline with a leading $match inside that range, or aggregate against the archive directly", false
+				"bound the pipeline with a leading $match inside that range, or aggregate against the archive directly", nil, false
 		case !s.bounded && !mark.CoversAll():
 			return "this aggregation has no leading $match bounding how far back it reads, so it scans all of " + s.primary,
 				"start the pipeline with a $match inside " + mark.From.Format(time.RFC3339) +
-					", or aggregate against the archive directly", false
+					", or aggregate against the archive directly", nil, false
 		}
+		on = append(on, nsClaim{ns: s.primary, from: mark.From, claimed: mark.Claimed})
 	}
 
 	// A joined collection is read by key, not by time, so nothing less than the
@@ -313,15 +320,16 @@ func (r *Router) checkAggregate(ctx context.Context, s aggScope) (because, remed
 		mark, known := claimOf(ctx, ns)
 		if !known {
 			return "the completeness watermark for the joined collection " + ns + " could not be read",
-				"the archive is unreachable; retry once it is back", false
+				"the archive is unreachable; retry once it is back", nil, false
 		}
 		if !mark.CoversAll() {
 			return "this pipeline joins " + ns + s.named[ns] + ", which is tiered and not held in full by the fast tier",
 				"a join reads by key rather than by time, so the joined collection has to be whole: warm all of " +
-					ns + ", or run the aggregation against the archive", false
+					ns + ", or run the aggregation against the archive", nil, false
 		}
+		on = append(on, nsClaim{ns: ns, from: mark.From, claimed: mark.Claimed})
 	}
-	return "", "", true
+	return "", "", on, true
 }
 
 // guardAggregate refuses an aggregation the fast tier cannot answer in full,
@@ -395,8 +403,12 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
 		view := scope.primary
 		scope.primary = base
-		because, _, fine := c.r.checkAggregate(ctx, scope)
+		because, _, authorised, fine := c.r.checkAggregate(ctx, scope)
 		if fine {
+			// Same as the collection case below: the cursor this leaves open
+			// outlives the claims that authorised it. Set here too, because a
+			// view returns from this branch and never reaches that one.
+			c.aggAuth = authorised
 			return nil, false
 		}
 		// The archive can be asked the same question when it holds the view
@@ -419,8 +431,14 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		}
 	}
 
-	because, remedy, fine := c.r.checkAggregate(ctx, scope)
+	because, remedy, authorised, fine := c.r.checkAggregate(ctx, scope)
 	if fine {
+		// The fast tier is about to run this, and the answer may not fit in one
+		// batch: an aggregation returns 101 documents and a cursor for the rest.
+		// That cursor outlives the claims above exactly as a find's does, so
+		// they are carried to the reply and registered there. See
+		// tieredcursor.go for what the find twin of this was measured to cost.
+		c.aggAuth = authorised
 		return nil, false
 	}
 

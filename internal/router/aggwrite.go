@@ -600,7 +600,7 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 	if named {
 		if sc, sok := scopeOfAggregate(cmd, db, c.r.ageFieldOf); sok {
 			scope = sc
-			if _, _, fine := c.r.checkAggregate(ctx, scope); !fine {
+			if _, _, _, fine := c.r.checkAggregate(ctx, scope); !fine {
 				if c.r.cfg.Completeness != config.Archive {
 					// Reading the input from the archive is exactly what strict
 					// and permissive decline, so this stays out of the way and

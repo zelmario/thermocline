@@ -37,6 +37,12 @@ func (c *conn) intercept(ctx context.Context, msg *wire.Message, name, db string
 		if out, done := c.interceptAggNewest(ctx, msg, db, reply); done {
 			return out, nil
 		}
+		// The fast tier ran this because a claim said it could, and an
+		// aggregation returns 101 documents and a cursor for the rest. The
+		// claims are registered against that cursor so a getMore can be refused
+		// once they no longer hold. Nil for anything the guard did not
+		// authorise, which registers nothing.
+		c.noteTieredCursor(c.aggAuth, reply)
 		// Otherwise only a pipeline led by $collStats, which is what
 		// db.coll.stats() sends. Everything else an aggregate can be is
 		// decided before it runs.
@@ -434,18 +440,18 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		// long as the cursor this query leaves behind. A cursor outlives the
 		// decision and nothing used to check whether the decision still held:
 		// see tieredcursor.go for what that was measured to cost.
-		authorised := markState{from: mark.From, claimed: mark.Claimed}
+		authorised := []nsClaim{{ns: judged, from: mark.From, claimed: mark.Claimed}}
 
 		af, aok := c.r.ageFieldOf(judged)
 		bound, bounded := lowerTimeBound(filter, af, aok)
 		switch {
 		case bounded && mark.Complete(bound):
-			c.noteTieredCursor(judged, reply, authorised)
+			c.noteTieredCursor(authorised, reply)
 			return reply, nil
 		case !bounded && mark.CoversAll():
 			// No lower bound, so the query may reach arbitrarily far back. Only
 			// a tier claiming all of history can answer that on its own.
-			c.noteTieredCursor(judged, reply, authorised)
+			c.noteTieredCursor(authorised, reply)
 			return reply, nil
 		}
 
@@ -460,7 +466,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 				c.r.Stats.NewestFirst.Add(1)
 				// The proof needs no bound, and the rule is the same: it rests
 				// on this claim, so it lasts as long as this claim does.
-				c.noteTieredCursor(judged, reply, authorised)
+				c.noteTieredCursor(authorised, reply)
 				return reply, nil
 			}
 		}

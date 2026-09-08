@@ -106,6 +106,11 @@ feeder:
     # testevict.sh: a cursor held open while a sweep takes its documents off the
     # fast tier. Aged by `when`, so a rule can address it.
     - "shop.tevcursor"
+    # testevict.sh: the same question asked of an aggregation, which is judged
+    # before it runs rather than on the way back. Its own collection, so the
+    # claim and the residency the section before it leaves behind decide
+    # nothing here.
+    - "shop.tevaggcur"
     # And the same one level up. catdb holds nothing else, so the section can
     # drop the whole database on the fast tier without reaching a collection
     # another suite is using.
@@ -312,6 +317,10 @@ evictor:
     # testevict.sh: the collection a cursor is held open over while a sweep
     # takes its documents off the fast tier.
     - ns: "shop.tevcursor"
+      older_than: 40m
+      date_field: "when"
+    # testevict.sh: the aggregation half of the same section.
+    - ns: "shop.tevaggcur"
       older_than: 40m
       date_field: "when"
     # testquery.sh: aged by a date field rather than by the _id, so a bound on
