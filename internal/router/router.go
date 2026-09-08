@@ -1556,7 +1556,7 @@ func isClosed(err error) bool {
 // For dropDatabase, which removes them all at once and names none of them. The
 // per collection path is driven by indexDDL, and a command naming no collection
 // never reaches it, so a database dropped through the router left every cached
-// claim, index listing and collation in it standing.
+// claim and collation in it standing.
 //
 // The claim recorded in the archive is a separate matter and outlives this: the
 // warmer notices a fast tier that has lost its contents and withdraws it. This
@@ -1567,13 +1567,22 @@ func (r *Router) forgetEverythingIn(db string) {
 		if !strings.HasPrefix(ns, prefix) {
 			continue
 		}
-		r.forgetCompleteness(ns)
-		r.forgetIndexes(ns)
-		r.forgetHint(ns)
-		r.forgetBrackets(ns)
-		r.forgetCollation(ns)
-		r.forgetView(ns)
-		r.indexer.Forget(ns)
+		// Deliberately the same list as forgetDropped, which is what a drop of
+		// one collection runs, and deliberately without forgetIndexes for the
+		// reason written there: the unique index listing is the one memory whose
+		// staleness is a refusal rather than a wrong answer, and re-reading it
+		// now would replace a listing that is merely old with an empty one, off
+		// a database that has just gone. Empty is the direction that lets a
+		// duplicate of an archived document through, and the archive still holds
+		// every document the constraint covered, because a drop is never
+		// replayed there.
+		//
+		// This list had it and forgetDropped did not, which is the drift a
+		// single list exists to stop. No reproduction: the listing expires on
+		// indexRefresh anyway, so the window is a minute rather than for ever.
+		// It is here because two lists disagreeing about which way a cache is
+		// allowed to be stale is how the next reader gets it wrong.
+		r.forgetDropped(ns)
 	}
 }
 
