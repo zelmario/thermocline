@@ -494,6 +494,19 @@ chk "a document sharing no element is allowed" "ok" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarr.insertOne({_id:3,tags:["p","q"]});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and it reaches the archive"             "1" \
     "$(waitMirrored tkarr 2 >/dev/null; C 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({_id:3,_tcDeletedAt:{$exists:false}}))')"
+# One document repeating a value is one index entry to mongod, so it is one
+# claim here. Claiming it twice would have the second look like somebody else
+# holding it and the document would refuse itself.
+chk "a document repeating an element is allowed" "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarr.insertOne({_id:4,tags:["w","w","w"]});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# And two documents in one batch sharing an element, which mongod refuses and
+# which nothing archived is needed for.
+chk "two in one batch sharing an element rejected" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarr.insertMany([{_id:5,tags:["m"]},{_id:6,tags:["m"]}]);print("ACCEPTED")}catch(e){print(e.code||(e.writeErrors&&e.writeErrors[0]&&e.writeErrors[0].code)||e.message.substring(0,40))}')"
+chk "  and the first of the two is there"        "1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({_id:5}))')"
+chk "  and the second is not"                    "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({_id:6}))')"
 
 echo "== a unique index on a path that crosses an array =="
 # The quieter half of the same mistake, and it points the other way. The driver

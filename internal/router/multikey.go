@@ -34,7 +34,11 @@ import (
 // A missing field is nil, which is the null key MongoDB indexes it as, and which
 // keyIDFromValues already encodes. An empty array is undefined, which is what
 // MongoDB indexes it as, and two documents holding one are duplicates of each
-// other.
+// other while neither is a duplicate of a document missing the field.
+//
+// Those are measured against mongod rather than read out of the manual, and so
+// is every other corner here. See the head of multikey_test.go for the six
+// answers and what was asked to get them.
 func fieldValues(doc bson.Raw, field string) []any {
 	parts := strings.Split(field, ".")
 	v, err := doc.LookupErr(parts[0])
@@ -68,6 +72,9 @@ func descend(v bson.RawValue, rest []string) []any {
 			out = append(out, descend(e, rest)...)
 		}
 		if len(out) == 0 {
+			// An empty array part way along a path. Measured: for items.sku,
+			// {items: []} and a document with no items at all are duplicates of
+			// each other, so both are the null key.
 			return []any{nil}
 		}
 		return out

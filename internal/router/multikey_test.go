@@ -6,6 +6,14 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
+// Every rule below was checked against PSMDB 8.0 by putting the documents into a
+// collection with the unique index on it and seeing which pairs it called
+// duplicates, rather than read out of the manual. The six answers were: two
+// empty arrays collide; an empty array and a missing field do not; two missing
+// fields collide; for a dotted path an empty array at the prefix and a missing
+// field *do* collide; two documents holding [[1,2]] collide, so the inner array
+// is a value; and parallel arrays are error 171 rather than an index entry.
+
 func mkRaw(t *testing.T, d bson.D) bson.Raw {
 	t.Helper()
 	b, err := bson.Marshal(d)
@@ -56,7 +64,7 @@ func TestMultikeyDeduplicates(t *testing.T) {
 
 // An empty array indexes as undefined, so two documents holding one are
 // duplicates of each other, and neither is a duplicate of a document missing
-// the field.
+// the field. Measured on mongod: [] then [] is 11000, [] then missing is ok.
 func TestMultikeyEmptyArrayIsOneKey(t *testing.T) {
 	idx := uniqueIndex{name: "tags_1", fields: []string{"tags"}}
 	a := keysOf(t, idx, bson.D{{Key: "tags", Value: bson.A{}}})
@@ -77,7 +85,7 @@ func TestMultikeyEmptyArrayIsOneKey(t *testing.T) {
 }
 
 // A missing field is null, and two documents missing it are duplicates. That
-// was true before arrays were understood and has to stay true.
+// was true before arrays were understood and has to stay true. Measured.
 func TestMultikeyMissingFieldIsOneNullKey(t *testing.T) {
 	idx := uniqueIndex{name: "tags_1", fields: []string{"tags"}}
 	a := keysOf(t, idx, bson.D{{Key: "other", Value: 1}})
@@ -88,7 +96,7 @@ func TestMultikeyMissingFieldIsOneNullKey(t *testing.T) {
 }
 
 // One level. MongoDB indexes an array inside an array as a value rather than
-// opening it again.
+// opening it again: measured, two documents holding [[1,2]] are 11000.
 func TestMultikeyOpensOneLevel(t *testing.T) {
 	idx := uniqueIndex{name: "tags_1", fields: []string{"tags"}}
 	got := keysOf(t, idx, bson.D{{Key: "tags", Value: bson.A{bson.A{1, 2}, "z"}}})
@@ -152,7 +160,8 @@ func TestMultikeyCompoundWithOneArray(t *testing.T) {
 }
 
 // MongoDB refuses to index parallel arrays, so the write fails on the fast tier
-// before anything here matters and there is nothing to protect.
+// before anything here matters and there is nothing to protect. Measured: the
+// insert is error 171, CannotIndexParallelArrays.
 func TestMultikeyParallelArraysClaimNothing(t *testing.T) {
 	idx := uniqueIndex{name: "a_1_b_1", fields: []string{"a", "b"}}
 	got := keysOf(t, idx, bson.D{
