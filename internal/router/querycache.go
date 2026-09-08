@@ -163,19 +163,23 @@ func (c *conn) cacheLookup(ctx context.Context, msg *wire.Message, name, db stri
 	if !ok {
 		return nil, false
 	}
-	key := c.cacheKey(name, ns, cmd)
-	if key == "" {
-		return nil, false
-	}
 	// The shape and its parameters are recorded whether or not anything is
 	// cached, because the point of the advisor is to say what caching would be
 	// worth before anybody turns it on. See package cache.
 	shape, params := cache.Shape(name, ns, cmd)
-	c.cacheOf = cachePending{key: key, ns: ns, shape: shape, params: params}
+	c.cacheOf = cachePending{live: true, ns: ns, shape: shape, params: params}
 
 	if c.r.cache == nil {
 		return nil, false
 	}
+	// Below the check above, not before it. Nothing looks a key up when there
+	// is nothing to look it up in, and this is a SHA-256 over the whole command
+	// on every read of the hot path.
+	key := c.cacheKey(name, ns, cmd)
+	if key == "" {
+		return nil, false
+	}
+	c.cacheOf.key = key
 	// Worked out here rather than where the answer is stored, because that is
 	// the last place with a context to ask the catalog with. Only with the cache
 	// on: with the advisor alone nothing is stored, so nothing has to be dropped
@@ -215,7 +219,7 @@ func (c *conn) cacheLookup(ctx context.Context, msg *wire.Message, name, db stri
 func (c *conn) cacheStore(reply *wire.Message) {
 	pending := c.cacheOf
 	c.cacheOf = cachePending{}
-	if pending.key == "" || reply == nil {
+	if !pending.live || reply == nil {
 		return
 	}
 	rdoc, err := reply.ReplyDoc()
@@ -231,7 +235,7 @@ func (c *conn) cacheStore(reply *wire.Message) {
 	if c.r.advisor != nil {
 		c.r.advisor.Observe(pending.shape, pending.ns, pending.params, rhash)
 	}
-	if c.r.cache != nil {
+	if c.r.cache != nil && pending.key != "" {
 		// The stored bytes are the whole reply, because that is what goes back
 		// to the client; the hash is of the answer inside it, because that is
 		// what stability means.
@@ -376,6 +380,14 @@ func (c *conn) send(out *wire.Message) error {
 
 // cachePending is the key an in-flight read will be learned under.
 type cachePending struct {
+	// live says a read is in flight that the reply should be learned from.
+	//
+	// Its own field rather than a non-empty key, which is what it used to be.
+	// The key is only worth computing when there is a cache to look it up in,
+	// and the advisor runs whether or not there is one: with a key standing in
+	// for this, every deployment that had not turned the cache on was paying a
+	// SHA-256 of every read for a string nothing went on to use.
+	live   bool
 	key    string
 	ns     string
 	shape  string
