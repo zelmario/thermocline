@@ -600,7 +600,55 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 	if named {
 		if sc, sok := scopeOfAggregate(cmd, db, c.r.ageFieldOf); sok {
 			scope = sc
+			// A view is invisible to checkAggregate unless somebody resolves
+			// it, and the read paths do that before judging anything. This one
+			// runs before the read guard and never did, so a pipeline reading
+			// through a view was judged with the view not there. It is the
+			// worse place for it: this path writes what it reads.
+			c.r.resolveJoinedViews(ctx, &scope)
+			pbase, pViaView, pTiered := c.r.tieredBase(ctx, scope.primary)
+			primaryIsView := c.r.isViewNS(ctx, scope.primary, pViaView, pTiered)
+			// Kept, because scope.primary is about to become the collection the
+			// view reads and the refusal below has to name the view the client
+			// asked for. Without this both halves of the message were the base,
+			// which reads as a collection refusing to be a view of itself.
+			primaryName := scope.primary
+			if primaryIsView {
+				// The same question the three read paths ask of a view they are
+				// asked to read: its own pipeline can join a tiered collection
+				// and nothing in this command names it.
+				if out, done := c.refuseViewJoinIfShort(ctx, scope.primary, msg, nil); done {
+					return out, true
+				}
+			}
+			if pViaView && pTiered {
+				// A view names itself, not the collection it reads, so the
+				// completeness of the one underneath is what decides.
+				scope.primary = pbase
+			}
 			if _, _, _, fine := c.r.checkAggregate(ctx, scope); !fine {
+				if primaryIsView {
+					// The archive cannot be asked this one. Reading it there
+					// means running the view's own pipeline against the
+					// archive's copies, and those carry tombstones: the
+					// predicate that filters them goes in front of a pipeline
+					// and cannot reach inside a definition this cannot rewrite.
+					// So the deleted documents would be aggregated and the
+					// result written into the target.
+					c.r.Stats.Incomplete.Add(1)
+					c.r.Stats.Refused.Add(1)
+					c.cls = ClassRefused
+					c.log.Warn("refused a $out reading through a view the fast tier cannot answer",
+						"view", primaryName, "reads", pbase, "target", coll)
+					out, rerr := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID,
+						primaryName, pbase,
+						"the collection it reads is not held in full by the fast tier, and a $out "+
+							"through a view cannot be read from the archive either")
+					if rerr != nil {
+						return nil, false
+					}
+					return out, true
+				}
 				if c.r.cfg.Completeness != config.Archive {
 					// Reading the input from the archive is exactly what strict
 					// and permissive decline, so this stays out of the way and

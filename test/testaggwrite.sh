@@ -155,6 +155,72 @@ chk "group b joined its ten"                "10" "$(H "const d=db.getSiblingDB(p
 # A $unionWith reads a collection too, and counts what it finds there.
 chk "a union with itself counts each document once" "32" "$(R "const r=db.getSiblingDB(process.env.TC_DB).joinsrc.aggregate([{\$unionWith:'joinsrc'},{\$count:'c'}]).toArray(); print(r.length?r[0].c:0)")"
 
+echo "== the reading half reaches a tiered collection through a view =="
+# The section above is the same question asked of a collection named directly.
+# A view is the other way to name one, and this path could not see it: the read
+# guards call resolveJoinedViews before judging anything, and guardTieredOut
+# builds its own scope, runs before them, and never did. So a $lookup naming a
+# view was judged with the collection underneath it invisible, and this is the
+# path that writes what it reads.
+#
+# Measured before the fix, on a joined collection the archive holds two of and
+# the fast tier one: the target was written with one row joined and one holding
+# an empty array. Not an answer somebody reads and re-runs, an answer on disk.
+#
+# And the other half of it, which is the pipeline reading *from* a view. That one
+# is refused rather than read from the archive: the archive's copies carry
+# tombstones, and the predicate that filters them goes in front of a pipeline and
+# cannot reach inside a view's definition, which the router cannot rewrite.
+stopDaemons; startFeeder; startRouter
+for c in tovsrc tovjoin joinout; do
+  H "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null 2>&1
+  C "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null 2>&1
+done
+R "db.getSiblingDB(process.env.TC_DB).vovjoin.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({_id:{\$in:['$DB.tovsrc','$DB.tovjoin']}})" >/dev/null
+# The collection the pipeline runs against: whole on both tiers and claimed, so
+# nothing about it can refuse the pipeline and only the join can.
+R "db.getSiblingDB(process.env.TC_DB).tovsrc.insertMany([{_id:1,k:'a'},{_id:2,k:'b'}])" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tovsrc.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "2" ] && break
+  sleep 1
+done
+cline watermark --config $CFG --ns $DB.tovsrc --complete-all --force >/dev/null 2>&1
+# The collection the view reads, in the adoption shape: the archive holds both
+# and the fast tier has never held the second. Written to each tier directly, so
+# no tombstone is involved and the difference is only what each holds.
+C "db.getSiblingDB(process.env.TC_DB).tovjoin.insertMany([{_id:1,k:'a',label:'ay'},{_id:2,k:'b',label:'bee'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tovjoin.insertOne({_id:1,k:'a',label:'ay'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).createView('vovjoin','tovjoin',[])" >/dev/null
+chk "the fast tier holds one of the joined collection" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tovjoin.countDocuments({}))")"
+chk "and the archive holds both"                       "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tovjoin.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+# Waited for: the inserts above went through the router, which read these claims
+# to do it and remembers the answers it got then. See testquery.sh for the same
+# wait and what asking once was measured to report.
+OUTJ=""
+for _ in $(seq 1 20); do
+  R "db.getSiblingDB(process.env.TC_DB).joinout.drop()" >/dev/null 2>&1
+  R "try{db.getSiblingDB(process.env.TC_DB).tovsrc.aggregate([{\$lookup:{from:'vovjoin',localField:'k',foreignField:'k',as:'j'}},{\$out:'joinout'}]).toArray()}catch(e){}" >/dev/null 2>&1
+  OUTJ=$(R "try{print(db.getSiblingDB(process.env.TC_DB).joinout.find({}).sort({_id:1}).toArray().map(d=>d._id+':'+d.j.length).join(','))}catch(e){print('ERR')}")
+  [ "$OUTJ" = "1:1,2:1" ] && break
+  sleep 1
+done
+chk "the target is written whole, not short"           "1:1,2:1" "$OUTJ"
+# And reading from the view itself, which cannot be answered from either tier.
+R "db.getSiblingDB(process.env.TC_DB).joinout.drop()" >/dev/null 2>&1
+OUTV=$(R "try{db.getSiblingDB(process.env.TC_DB).vovjoin.aggregate([{\$out:'joinout'}]).toArray();print('WROTE')}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}")
+chk "a \$out reading from the view is refused"          "true" \
+    "$(case "$OUTV" in "REFUSED "*"$DB.vovjoin"*) echo true;; *) echo "false (got $(echo "$OUTV"|cut -c1-70))";; esac)"
+chk "  and it wrote nothing to the fast tier"          "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).joinout.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB).vovjoin.drop()" >/dev/null 2>&1
+for c in tovsrc tovjoin joinout; do
+  H "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null 2>&1
+  C "db.getSiblingDB(process.env.TC_DB).$c.drop()" >/dev/null 2>&1
+done
+
 echo "== a permissive router still refuses to persist a short answer =="
 # Returning a short number is a wrong figure on a screen. Writing one with $out
 # makes it the input to everything downstream, so permissive does not cover it.

@@ -147,6 +147,11 @@ feeder:
     # joins a collection of its own
     - "shop.joinsrc"
     - "shop.joinout"
+    # testaggwrite.sh: the same reading half, reaching the joined collection
+    # through a view. tovsrc is whole and claimed, so nothing about it can
+    # refuse the pipeline, and tovjoin is what the fast tier is short of.
+    - "shop.tovsrc"
+    - "shop.tovjoin"
     - "shop.tres"
     # testlife.sh: a collection the fast tier validates and the archive does
     # not, which is what every collection looks like after an operator adds a

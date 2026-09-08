@@ -344,6 +344,13 @@ chk "  and so is an aggregate through it"               "true" "$(vjoinVerdict "
 # distinct is the third read path and the only one this shows. A $lookup adds
 # fields rather than rows, so a count through the view is the same number either
 # way, and only a value taken from the joined half can be missing.
+# A point read by _id, which the completeness guard skips on purpose: a lookup by
+# exact id matches at most one document, so there is no question about how far
+# back the query reaches. The join is a different question and the row comes back
+# with the same short array.
+VUP=$(R "try{const d=db.getSiblingDB(process.env.TC_DB).vqvjoin2.findOne({_id:2}); print(d?('2:'+d.j.length):'none')}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}")
+chk "  and a point read by _id through it"               "true" \
+    "$(case "$VUP" in "2:1") echo true;; "REFUSED "*"$DB.tqvj"*) echo true;; *) echo "false (got $VUP)";; esac)"
 VUD=$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqvjoin2.distinct('j.label').sort().join(','))}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}")
 chk "  and distinct through it"                         "true" \
     "$(case "$VUD" in "ay,bee") echo true;; "REFUSED "*"$DB.tqvj"*) echo true;; *) echo "false (got $VUD)";; esac)"

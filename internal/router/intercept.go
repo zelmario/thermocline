@@ -80,6 +80,31 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	filter, _ := cmd.LookupErr("filter")
 	fdoc, _ := filter.DocumentOK()
 
+	// A view's own pipeline can read a second collection, and that join is
+	// invisible to everything below: what gets checked is the collection the
+	// view is defined on. Measured, and it is a wrong answer rather than a short
+	// one. See viewJoins.
+	//
+	// Here rather than inside guardCompleteness, which is the only caller of
+	// this and skips a point read by _id. The completeness question a point read
+	// skips is about how far back a query reaches, and it is right to skip it: a
+	// lookup by exact id matches at most one document. This question is a
+	// different one. It is about a collection the query never names, and a row
+	// found by its _id comes back with the same short join array as one found by
+	// anything else.
+	//
+	// Before the untiered check too. A view over an untiered reference
+	// collection joining the tiered history is the same defect with the tiers
+	// the other way up, and it is the shape reporting most often takes.
+	{
+		_, viaView, tiered := c.r.tieredBase(ctx, ns)
+		if c.r.isViewNS(ctx, ns, viaView, tiered) {
+			if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, reply); done {
+				return out, nil
+			}
+		}
+	}
+
 	// A lookup by exact id matches at most one document, so it has no
 	// completeness question to answer. Either the fast tier holds that document
 	// or the archive does, and both cases are resolved below. Running the
@@ -424,21 +449,6 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// completeness claim it will never have would send the read to an archive
 	// that has never held a single one of its documents.
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
-
-	// A view's own pipeline can read a second collection, and that join is
-	// invisible to everything below: what gets checked is the collection the
-	// view is defined on. Measured, and it is a wrong answer rather than a short
-	// one. See viewJoins.
-	//
-	// Before the untiered return, not after. A view over an untiered reference
-	// collection joining the tiered history is the same defect with the tiers
-	// the other way up, and it is the shape reporting most often takes.
-	if c.r.isViewNS(ctx, ns, viaView, tiered) {
-		if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, reply); done {
-			return out, nil
-		}
-	}
-
 	if !tiered {
 		return reply, nil
 	}

@@ -140,6 +140,15 @@ Part of [Thermocline](../README.md).
   Answering it there would join deleted documents, which is the defect in
   *Joined collections are read elsewhere* with the sign flipped.
 
+  **A `$out` into a tiered collection that reads through a view is refused for
+  the same reason**, and that refusal is the sharper end of it: the reading half
+  of a tiered `$out` is performed by the router rather than forwarded, so a short
+  answer there is not something a client reads and re-runs, it is something on
+  disk. Measured before it was refused: a pipeline reading a view over a tiered
+  collection the fast tier was short of wrote one document where the archive
+  holds two. A `$lookup` *naming* a view is not refused — that one resolves to
+  the collection underneath and is read from the archive, whole.
+
 - **Cursors are not shared between routers.** A read answered from the archive
   is served from a cursor this router holds open against the archive, in its own
   memory, so another router cannot continue it. This is what a mongos does too,
