@@ -197,8 +197,14 @@ Range queries are governed by the watermark below.
   do, because that is where every consequence of a drop is handled at once rather
   than a moment later.
 
-  **Both drops clear the same list**, because the forwarded path and the change
-  stream path were written separately and had already drifted. Writing it once
+  **All three drops clear the same list.** The forwarded path and the change
+  stream path were written separately and had already drifted; `dropDatabase`
+  was a third list nobody had compared against either, and it had drifted the
+  other way, clearing the unique index listing. That listing is the one memory
+  whose staleness is a refusal rather than a wrong answer, and re-reading it off
+  a database that has just gone replaces an old listing with an empty one, which
+  is the direction that lets a duplicate of an archived document through and
+  stops all mirroring when the archive's own index refuses it. Writing it once
   added the remembered **hint** and the remembered **view**, which neither
   cleared: the hint is a sparse or partial index's own filter, which the router
   reproduces against the archive so that a fall-through read is narrowed the way
@@ -669,6 +675,49 @@ refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
 `$out` and `$merge` are refused even under `completeness: permissive`. Returning
 a short answer is a wrong number on somebody's screen; writing one makes it the
 input to everything downstream.
+
+### A view is a query somebody else wrote down
+
+A view is a saved pipeline over another collection. What makes it different from
+every other way of naming a collection is that the pipeline is **stored on the
+server and not sent with the query**, so every judgement the router makes about a
+read of one is made without it.
+
+Three things follow, and all three were wrong answers before they were rules.
+
+**Which collection's claim decides.** A view names itself, and a view is never in
+`feeder.namespaces` because it holds no documents of its own. So completeness is
+judged against the collection at the end of the view chain, and a read the fast
+tier cannot answer goes to the archive only when the archive holds the same view,
+defined the same way. Anything else is refused: running a different pipeline
+against the archive would answer a different question, which is worse than an
+error.
+
+**What the view itself joins.** A `$lookup` in a view's definition reads a second
+collection that the query names nowhere. It is judged the way a `$lookup` the
+client wrote is judged, and the rule is not the primary's: a join reads by key
+rather than by time, so nothing less than the whole collection makes it whole.
+This is asked of any view, not only one over a tiered collection — a small
+reference collection nobody tiers, with the tiered history joined to it, is the
+shape reporting most often takes, and it is a view whose base is untiered.
+
+It stays a refusal rather than an archive answer. The archive's copies carry
+tombstones, and the predicate that filters them goes in front of a pipeline: it
+cannot reach inside a definition the router has no way to rewrite. Answering it
+there would join deleted documents.
+
+**Every path that reads.** A `find` is judged on the way back, an `aggregate`
+before it runs because it can end in `$out`, `count` and `distinct` in a third
+place, and a point read by `_id` skips the completeness guard on purpose because
+a lookup by exact id matches at most one document. That exemption is about how
+far back a query reaches and nothing else: a row found by its `_id` comes back
+with the same short join array as one found by anything else, so the view
+question is asked there too. `explain` publishes the same verdict, because a plan
+it leaves untouched says the fast tier can answer the query whole.
+
+A view is not a collection, either. Nothing is promoted into one, the indexer
+builds no indexes on one, and a tiered `$out` reading through one is refused
+rather than performed against a short input.
 
 ### Writes that name many documents
 
