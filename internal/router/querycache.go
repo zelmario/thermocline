@@ -151,7 +151,7 @@ func (c *conn) identity() string {
 // cacheLookup answers from the cache when it can, before any guard runs: a
 // stored answer is the whole answer, and re-deciding completeness for it would
 // be deciding about a read that is not happening.
-func (c *conn) cacheLookup(msg *wire.Message, name, db string) (*wire.Message, bool) {
+func (c *conn) cacheLookup(ctx context.Context, msg *wire.Message, name, db string) (*wire.Message, bool) {
 	if c.r.cache == nil && c.r.advisor == nil {
 		return nil, false
 	}
@@ -176,6 +176,11 @@ func (c *conn) cacheLookup(msg *wire.Message, name, db string) (*wire.Message, b
 	if c.r.cache == nil {
 		return nil, false
 	}
+	// Worked out here rather than where the answer is stored, because that is
+	// the last place with a context to ask the catalog with. Only with the cache
+	// on: with the advisor alone nothing is stored, so nothing has to be dropped
+	// and this would be a listCollections per read for a number nobody uses.
+	c.cacheOf.deps = c.r.cacheDeps(ctx, name, cmd, db, ns)
 	stored, hit := c.r.cache.Get(key)
 	if !hit {
 		return nil, false
@@ -230,7 +235,11 @@ func (c *conn) cacheStore(reply *wire.Message) {
 		// The stored bytes are the whole reply, because that is what goes back
 		// to the client; the hash is of the answer inside it, because that is
 		// what stability means.
-		c.r.cache.ObserveResult(pending.key, pending.ns, reply.Raw, rhash)
+		deps := pending.deps
+		if len(deps) == 0 {
+			deps = []string{pending.ns}
+		}
+		c.r.cache.ObserveResultOn(pending.key, deps, reply.Raw, rhash)
 	}
 }
 
@@ -371,6 +380,9 @@ type cachePending struct {
 	ns     string
 	shape  string
 	params uint64
+	// deps is every collection this answer depends on, which an entry is hung
+	// from so that a change to any of them drops it. See cacheDeps.
+	deps []string
 }
 
 // publishAdvice records what has been learned, so it can be read long after the
@@ -448,4 +460,68 @@ func (r *Router) addrOrConfigured() string {
 		return a
 	}
 	return r.cfg.Listen
+}
+
+// cacheDeps is every collection an answer depends on, so an entry can be hung
+// from all of them and dropped when any one changes.
+//
+// The namespace a command names is not the whole of what it read. A read of a
+// view names the view, and its answer comes from the collection underneath and
+// from whatever the view's own pipeline joins. An aggregation names the
+// collection it runs against, and a $lookup in it reads another. Every
+// invalidation this cache gets arrives under a collection: the router's own
+// write path names it, and so does the fast tier's change stream. So an entry
+// hung only from the name in the command was never dropped by a write to the
+// data it was actually made of, and stood until its learned TTL ran out.
+//
+// That is the one thing this cache is documented not to do. See the top of this
+// file: a write followed by a read of the same collection is correct
+// immediately, and what the router cannot see is another writer.
+func (r *Router) cacheDeps(ctx context.Context, name string, cmd bson.Raw, db, ns string) []string {
+	deps := []string{ns}
+	add := func(more ...string) {
+		for _, m := range more {
+			if m == "" || m == ns {
+				continue
+			}
+			deps = append(deps, m)
+		}
+	}
+	// Through a view: every hop of the chain, not only the collection at the
+	// end of it. A view in the middle is dropped and recreated by its own name,
+	// and an entry not hung from that name would survive its definition
+	// changing. And whatever the views along the way join. An unreadable
+	// definition needs nothing here, because a read of one is refused before it
+	// can be answered at all.
+	at := ns
+	for hop := 0; hop < maxViewHops; hop++ {
+		on, isView := r.viewOn(ctx, at)
+		if !isView {
+			break
+		}
+		add(on)
+		at = on
+	}
+	if joined, ok := r.viewJoins(ctx, ns); ok {
+		for _, j := range joined {
+			add(j)
+			if jb, jIsView := r.viewBase(ctx, j); jIsView {
+				add(jb)
+			}
+		}
+	}
+	if name == "aggregate" {
+		if stages, sok := pipelineStages(cmd); sok {
+			joined, _ := joinedCollections(stages, db, 0)
+			for _, j := range joined {
+				add(j)
+				// A join may name a view too, and then the documents are one
+				// more hop away.
+				if jb, jIsView := r.viewBase(ctx, j); jIsView {
+					add(jb)
+				}
+			}
+		}
+	}
+	return deps
 }

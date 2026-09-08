@@ -132,6 +132,35 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:5001})" >/dev/null
 BACK=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({country:'UY'}))")
 chk "and falls again on the delete"                "$BEFORE" "$BACK"
 
+echo "== a write drops what a view over the same collection learned =="
+# The cache hangs an answer from the namespace the command named, and a read of
+# a view names the view. Everything that invalidates arrives under the
+# collection: the router's own write path names it, and so does the fast tier's
+# change stream. The two never meet, so a cached read of a view outlived every
+# write to the collection it reads, until its learned TTL ran out.
+#
+# That is the one thing this cache's design says it does not do. The comment at
+# the top of querycache.go is that a write followed by a read of the same
+# collection is correct immediately rather than a TTL later, and what the router
+# cannot see is another writer.
+R "db.getSiblingDB(process.env.TC_DB).vcache.drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).createView('vcache','$NS',[])" >/dev/null
+# Read it several times first. An entry is not served until it has been observed
+# often enough to have a learned TTL, and with only two reads the write below was
+# answered from the tiers and the check passed against a binary that never
+# dropped anything: measured, the first check passed and only the second failed.
+for _ in 1 2 3 4; do
+  R "print(db.getSiblingDB(process.env.TC_DB).vcache.countDocuments({country:'UY'}))" >/dev/null
+done
+VBEFORE=$(R "print(db.getSiblingDB(process.env.TC_DB).vcache.countDocuments({country:'UY'}))")
+VAFTER=$(R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:5002,country:'UY',n:5002});
+            print(db.getSiblingDB(process.env.TC_DB).vcache.countDocuments({country:'UY'}))")
+chk "the view's count rises the moment the write lands" "$((VBEFORE+1))" "$VAFTER"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:5002})" >/dev/null
+VBACK=$(R "print(db.getSiblingDB(process.env.TC_DB).vcache.countDocuments({country:'UY'}))")
+chk "  and falls again on the delete"                  "$VBEFORE" "$VBACK"
+R "db.getSiblingDB(process.env.TC_DB).vcache.drop()" >/dev/null 2>&1
+
 echo "== a cached answer still expires =="
 # The reply goes back through the same funnel every answer does, and that funnel
 # learns from what it sends. Left alone, every hit was recorded as a fresh

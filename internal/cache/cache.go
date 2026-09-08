@@ -144,6 +144,23 @@ func (c *Cache) Observe(key, ns string, reply []byte) {
 // has already worked out which part of the reply is the answer and which part
 // is the envelope it arrived in. See ResultHash.
 func (c *Cache) ObserveResult(key, ns string, reply []byte, h uint64) {
+	c.ObserveResultOn(key, []string{ns}, reply, h)
+}
+
+// ObserveResultOn is ObserveResult for an answer that depends on more than one
+// collection.
+//
+// An entry is dropped when any collection it was hung from changes, and until
+// this it could only be hung from one: the namespace the command named. A read
+// of a view names the view, and every invalidation arrives under the collection
+// the view reads, so the two never met and a cached read of a view outlived
+// every write to its own data. The same is true of a $lookup, whose joined
+// collection the command names nowhere the invalidation can see.
+//
+// Registering an entry under several namespaces is enough because Invalidate
+// deletes the entry itself and not merely the reference: a leftover reference
+// under another namespace finds nothing and does nothing.
+func (c *Cache) ObserveResultOn(key string, nss []string, reply []byte, h uint64) {
 	now := c.now()
 
 	c.mu.Lock()
@@ -154,10 +171,15 @@ func (c *Cache) ObserveResult(key, ns string, reply []byte, h uint64) {
 		c.evictIfFull()
 		e = &history{lastHash: h, lastSeen: now, changedAt: now}
 		c.byKey[key] = e
-		if c.byNS[ns] == nil {
-			c.byNS[ns] = make(map[string]struct{})
+		for _, ns := range nss {
+			if ns == "" {
+				continue
+			}
+			if c.byNS[ns] == nil {
+				c.byNS[ns] = make(map[string]struct{})
+			}
+			c.byNS[ns][key] = struct{}{}
 		}
-		c.byNS[ns][key] = struct{}{}
 		return
 	}
 

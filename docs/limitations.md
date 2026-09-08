@@ -440,6 +440,29 @@ Part of [Thermocline](../README.md).
   moment the versions are legitimately unequal. **Upgrade both tiers, then
   restart the daemons**, and they will tell you at once if the pair is wrong.
 
+- **The query cache drops an answer when a collection it depends on changes, and
+  working out what it depends on is a best effort.** An entry is hung from every
+  collection the answer was made of: the one the command named, every hop of a
+  view chain under it, whatever those views join, and the collections a
+  `$lookup`, `$unionWith` or `$graphLookup` in the pipeline reads.
+
+  It used to be hung from the name in the command alone, which is not what a
+  read is made of. Every invalidation this cache gets arrives under a
+  collection: the router's own write path names it, and so does the fast tier's
+  change stream. A read of a view names the view, so the two never met, and a
+  cached read of a view outlived every write to the collection it reads.
+  Measured with the cache on: a count through a view stayed at its old value
+  after an insert into the collection underneath, until the learned TTL ran out.
+  A `$lookup` was the same, hung from the collection the pipeline ran against
+  and not from the one it joined.
+
+  What is still best effort is a pipeline whose sub-pipelines nest past mongod's
+  own depth limit, where the walk stops. That direction is the same one the
+  completeness guard takes there, and the learned TTL is the bound on it. The
+  older and larger exposure has not changed and is stated at the top of
+  `querycache.go`: a writer this router cannot see is not seen at all, and the
+  TTL is the whole of that.
+
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection
