@@ -100,7 +100,11 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 			return "", false
 		}
 		c.r.resolveJoinedViews(ctx, &scope)
-		if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
+		base, viaView, tiered := c.r.tieredBase(ctx, scope.primary)
+		if why, said := c.viewJoinVerdict(ctx, scope.primary, viaView, tiered); said {
+			return why, true
+		}
+		if viaView && tiered {
 			scope.primary = base
 		}
 		why, _, _, fine := c.r.checkAggregate(ctx, scope)
@@ -125,6 +129,9 @@ func (c *conn) explainVerdict(ctx context.Context, inner bson.Raw, db string) (b
 
 	ns := db + "." + coll
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
+	if why, said := c.viewJoinVerdict(ctx, ns, viaView, tiered); said {
+		return why, true
+	}
 	if !tiered {
 		return "", false
 	}
@@ -201,4 +208,25 @@ func inlineExplainOf(msg *wire.Message) bool {
 		return false
 	}
 	return inlineExplain(cmd)
+}
+
+// viewJoinVerdict is what an explain has to say about a view whose own pipeline
+// joins a tiered collection the fast tier does not hold in full.
+//
+// Here because explain exists to publish this verdict, and a plan it leaves
+// untouched says the fast tier can answer the query whole. Without this it said
+// exactly that about a query the router refuses, which is worse than saying
+// nothing: it was used as a proxy for "the router sees this as complete" while
+// writing the check for the defect below, and it lied.
+func (c *conn) viewJoinVerdict(ctx context.Context, ns string, viaView, tiered bool) (string, bool) {
+	if !c.r.isViewNS(ctx, ns, viaView, tiered) {
+		return "", false
+	}
+	which, bad := c.r.incompleteViewJoin(ctx, ns)
+	if !bad {
+		return "", false
+	}
+	return "this view's own pipeline joins " + which + ", which is tiered and the fast tier does " +
+		"not hold in full; a join reads by key rather than by time, and this join is in the view's " +
+		"definition where nothing in the query can bound it", true
 }

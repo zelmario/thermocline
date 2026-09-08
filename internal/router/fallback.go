@@ -964,6 +964,19 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	}
 	ns := db + "." + coll
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
+
+	// The third read path, and the same question as the other two: a view's own
+	// pipeline can join a tiered collection, and nothing in this command names
+	// it. distinct is the one that shows it, because a $lookup adds fields
+	// rather than rows and a count of rows is the same either way.
+	//
+	// Before the untiered return, for the reason in isViewNS.
+	if c.r.isViewNS(ctx, ns, viaView, tiered) {
+		if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, nil); done {
+			return out, true
+		}
+	}
+
 	if !tiered {
 		return nil, false
 	}

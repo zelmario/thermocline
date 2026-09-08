@@ -210,33 +210,61 @@ func (r *Router) tieredBase(ctx context.Context, ns string) (base string, viaVie
 // returns a short answer as success. And inside a transaction the scope is
 // warmed rather than refused, which would try to copy documents into a view.
 func (r *Router) resolveJoinedViews(ctx context.Context, s *aggScope) {
-	for i, ns := range s.secondary {
-		if r.cfg.Manages(ns) {
-			continue
+	if s.named == nil {
+		s.named = map[string]string{}
+	}
+	// A worklist rather than one pass, because resolving a view adds names and
+	// those names can be views too. A view joined by a joined view is two hops
+	// from the query, and one pass appended it and never looked at it: the
+	// collection *it* joins was then judged by nobody, which is the same wrong
+	// answer one level further out.
+	//
+	// seen makes a cycle terminate, which the catalog should not contain and a
+	// stale cache could still describe, and maxJoinedViewHops bounds the rest.
+	seen := map[string]bool{}
+	for hop := 0; hop < maxJoinedViewHops; hop++ {
+		grew := false
+		for i, ns := range s.secondary {
+			if r.cfg.Manages(ns) || seen[ns] {
+				continue
+			}
+			base, isView := r.viewBase(ctx, ns)
+			if !isView || base == ns {
+				seen[ns] = true
+				continue
+			}
+			seen[ns] = true
+			s.secondary[i] = base
+			s.named[base] = " (joined as the view " + ns + ")"
+			// And whatever that view joins in turn, for the same reason a view
+			// queried directly has its own joins folded in: the join is in the
+			// definition and the completeness check reads the query. See
+			// viewJoins.
+			deeper, readable := r.viewJoins(ctx, ns)
+			if !readable {
+				s.scopeUnknown = true
+				continue
+			}
+			for _, d := range deeper {
+				s.secondary = append(s.secondary, d)
+				s.named[d] = " (joined by the view " + ns + ", itself joined here)"
+				grew = true
+			}
 		}
-		base, isView := r.viewBase(ctx, ns)
-		if !isView || base == ns {
-			continue
-		}
-		if s.named == nil {
-			s.named = map[string]string{}
-		}
-		s.secondary[i] = base
-		s.named[base] = " (joined as the view " + ns + ")"
-		// And whatever that view joins in turn, for the same reason a view
-		// queried directly has its own joins folded in: the join is in the
-		// definition and the completeness check reads the query. See viewJoins.
-		deeper, readable := r.viewJoins(ctx, ns)
-		if !readable {
-			s.scopeUnknown = true
-			continue
-		}
-		for _, d := range deeper {
-			s.secondary = append(s.secondary, d)
-			s.named[d] = " (joined by the view " + ns + ", itself joined here)"
+		if !grew {
+			return
 		}
 	}
+	// Deeper than this is a shape nothing can be said about, and saying nothing
+	// is what scopeUnknown means.
+	s.scopeUnknown = true
 }
+
+// maxJoinedViewHops bounds how far resolveJoinedViews follows views that join
+// views. mongod resolves a view chain a handful deep and refuses a cycle, so
+// this is a guard against a catalog that says otherwise rather than a real
+// depth.
+const maxJoinedViewHops = 10
 
 // viewJoins is every collection the chain of views under ns reads besides the
 // one it is defined on.
@@ -307,6 +335,77 @@ func (r *Router) incompleteViewJoin(ctx context.Context, view string) (string, b
 		}
 	}
 	return "", false
+}
+
+// isViewNS reports whether ns is a view, for the callers that have already asked
+// tieredBase and cannot use its answer.
+//
+// tieredBase reports viaView only when the collection the view reads is itself
+// tiered, because that is the only thing the rest of it is about. A view over an
+// untiered reference collection is not a view as far as that answer goes, and it
+// can still join the tiered history: the same query with the tiers the other way
+// up, and the shape reporting most often takes. No extra round trip either way:
+// tieredBase has already filled the view cache for anything it said no to.
+func (r *Router) isViewNS(ctx context.Context, ns string, viaView, tiered bool) bool {
+	if viaView {
+		return true
+	}
+	if tiered {
+		// tieredBase returns before asking, because a managed namespace judges
+		// itself. Asking here would put a listCollections on the hot path of
+		// every read of every tiered collection.
+		return false
+	}
+	_, isView := r.viewBase(ctx, ns)
+	return isView
+}
+
+// refuseViewJoin turns down a read through a view whose own pipeline joins a
+// tiered collection the fast tier does not hold in full.
+//
+// Its own message rather than refuseView's, which says the collection the view
+// reads is the incomplete one. Here that collection may be complete, or untiered
+// and complete by definition, and the trouble is somewhere the query cannot see.
+func (r *Router) refuseViewJoin(requestID, responseTo int32, view, which string) (*wire.Message, error) {
+	return r.commandError(requestID, responseTo,
+		"thermocline: refusing this query on the view "+view+" because the view's own pipeline joins "+
+			which+", which is tiered and the fast tier does not hold in full. A join reads by key "+
+			"rather than by time, so nothing less than the whole collection makes it whole, and this "+
+			"join is in the view's definition where nothing in the query can bound it. Warm "+which+
+			", or run the pipeline against the archive directly.")
+}
+
+// refuseViewJoinIfShort refuses a read through view when the view's own pipeline
+// joins a tiered collection the fast tier does not hold in full.
+//
+// One place for both read paths. They are judged at opposite ends of the command
+// and this question is the same at either end.
+func (c *conn) refuseViewJoinIfShort(ctx context.Context, view string,
+	msg *wire.Message, reply *wire.Message) (*wire.Message, bool) {
+	which, bad := c.r.incompleteViewJoin(ctx, view)
+	if !bad {
+		return nil, false
+	}
+	c.r.Stats.Incomplete.Add(1)
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a read through a view that joins an incomplete collection",
+		"view", view, "joins", which,
+		"why", "the completeness check reads the client's pipeline, and this join is in the "+
+			"view's definition, so the rows whose partner is only in the archive would come "+
+			"back with an empty join array and no error on them")
+	// A reply is in hand on the find path and not on the aggregation's, which is
+	// judged before it runs. The response id is the request's either way.
+	responseTo := msg.Header.RequestID
+	requestID := responseTo
+	if reply != nil {
+		requestID = reply.Header.RequestID
+	}
+	out, err := c.r.refuseViewJoin(requestID, responseTo, view, which)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // refuseView turns down a read through a view that the fast tier cannot answer

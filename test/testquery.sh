@@ -317,6 +317,39 @@ VJF=$(vjoinSettled "find({})")
 chk "a find through it is refused for the join"         "true" "$(vjoinVerdict "$VJF")"
 VJA=$(vjoinSettled "aggregate([])")
 chk "an aggregate through it too"                       "true" "$(vjoinVerdict "$VJA")"
+# The same view over a collection nobody tiers, which is the shape reporting most
+# often takes: a small reference collection on the fast tier alone, with the
+# large tiered history joined to it and the pair packaged as a view.
+#
+# It is a separate check because it reaches the guard by a different road. The
+# router asks tieredBase whether a namespace is a view, and that answer is only
+# yes when the collection the view reads is itself tiered, so this view was not a
+# view as far as every judgement below it went. Measured: 1:1,2:0 again, from a
+# binary that already refused the case above.
+H "db.getSiblingDB(process.env.TC_DB).tqvu.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).vqvjoin2.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).tqvu.insertMany([{_id:1,k:'a'},{_id:2,k:'b'}])" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).createView('vqvjoin2','tqvu',[{\$lookup:{from:'tqvj',localField:'k',foreignField:'k',as:'j'}}])" >/dev/null
+vjoin2Read() {
+  R "try{print(db.getSiblingDB(process.env.TC_DB).vqvjoin2.$1.toArray().map(d=>d._id+':'+d.j.length).join(','))}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}"
+}
+VU=""
+for _ in $(seq 1 20); do
+  VU=$(vjoin2Read "find({})")
+  [ "$(vjoinVerdict "$VU")" = "true" ] && break
+  sleep 1
+done
+chk "a view over an untiered collection is judged too"  "true" "$(vjoinVerdict "$VU")"
+chk "  and so is an aggregate through it"               "true" "$(vjoinVerdict "$(vjoin2Read "aggregate([])")")"
+# distinct is the third read path and the only one this shows. A $lookup adds
+# fields rather than rows, so a count through the view is the same number either
+# way, and only a value taken from the joined half can be missing.
+VUD=$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqvjoin2.distinct('j.label').sort().join(','))}catch(e){print('REFUSED '+String(e.message).replace(/\s+/g,' '))}")
+chk "  and distinct through it"                         "true" \
+    "$(case "$VUD" in "ay,bee") echo true;; "REFUSED "*"$DB.tqvj"*) echo true;; *) echo "false (got $VUD)";; esac)"
+R "db.getSiblingDB(process.env.TC_DB).vqvjoin2.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).tqvu.drop()" >/dev/null
+
 # And the guard has to stop guarding once the joined collection is whole, or it
 # is a refusal nobody can clear.
 #

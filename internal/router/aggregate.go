@@ -411,39 +411,30 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	// and it is reached by the same kind of name.
 	c.r.resolveJoinedViews(ctx, &scope)
 
-	// A view names itself, not the collection it reads, so completeness has to
-	// be judged against the collection underneath it.
-	if base, viaView, tiered := c.r.tieredBase(ctx, scope.primary); viaView && tiered {
-		view := scope.primary
-		scope.primary = base
-		// What the view itself reads besides the collection it is defined on.
-		// checkAggregate judges these the way it judges a $lookup the client
-		// wrote, which is what makes the difference between a refusal and the
-		// wrong answer measured in viewJoins.
-		joined, readable := c.r.viewJoins(ctx, view)
-		if !readable {
-			// Not scopeUnknown, which says something specific and wrong about
-			// nesting depth. A definition that cannot be read is its own reason.
-			c.r.Stats.Incomplete.Add(1)
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			why := "the collections this view reads could not all be established, so it cannot be " +
-				"shown that the fast tier holds them"
-			c.log.Warn("refused a read through a view whose own pipeline could not be read",
-				"view", view, "reads", base)
-			out, rerr := c.r.refuseView(msg.Header.RequestID, msg.Header.RequestID, view, base, why)
-			if rerr != nil {
-				return nil, false
-			}
+	// What the view this runs against reads besides the collection it is defined
+	// on. Asked before anything is decided about the scope, and for any view
+	// rather than only one over a tiered collection: see isViewNS. A view's own
+	// $lookup is in its definition and nothing in the query names it, so every
+	// judgement below is made without it.
+	//
+	// Refused rather than folded into the scope and sent to the archive. The
+	// archive's copies carry tombstones, and the tombstone predicate the router
+	// puts in front of a pipeline never reaches inside a view's definition,
+	// which the router cannot rewrite: answering it there would join deleted
+	// documents.
+	primaryBase, primaryViaView, primaryTiered := c.r.tieredBase(ctx, scope.primary)
+	if c.r.isViewNS(ctx, scope.primary, primaryViaView, primaryTiered) {
+		if out, done := c.refuseViewJoinIfShort(ctx, scope.primary, msg, nil); done {
 			return out, true
 		}
-		for _, ns := range joined {
-			scope.secondary = append(scope.secondary, ns)
-			if scope.named == nil {
-				scope.named = map[string]string{}
-			}
-			scope.named[ns] = " (joined by the view " + view + ")"
-		}
+	}
+
+	// A view names itself, not the collection it reads, so completeness has to
+	// be judged against the collection underneath it.
+	if primaryViaView && primaryTiered {
+		view := scope.primary
+		base := primaryBase
+		scope.primary = base
 		because, _, authorised, fine := c.r.checkAggregate(ctx, scope)
 		if fine {
 			// Same as the collection case below: the cursor this leaves open

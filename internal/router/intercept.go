@@ -424,6 +424,21 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// completeness claim it will never have would send the read to an archive
 	// that has never held a single one of its documents.
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
+
+	// A view's own pipeline can read a second collection, and that join is
+	// invisible to everything below: what gets checked is the collection the
+	// view is defined on. Measured, and it is a wrong answer rather than a short
+	// one. See viewJoins.
+	//
+	// Before the untiered return, not after. A view over an untiered reference
+	// collection joining the tiered history is the same defect with the tiers
+	// the other way up, and it is the shape reporting most often takes.
+	if c.r.isViewNS(ctx, ns, viaView, tiered) {
+		if out, done := c.refuseViewJoinIfShort(ctx, ns, msg, reply); done {
+			return out, nil
+		}
+	}
+
 	if !tiered {
 		return reply, nil
 	}
@@ -434,26 +449,6 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 
 	// A read, so a claim held under router.claim_grace is allowed to answer it.
 	mark, known := c.r.completenessForRead(ctx, judged)
-
-	// A view's own pipeline can read a second collection, and that join is
-	// invisible to everything below: the claim being checked is the one for the
-	// collection the view is defined on. Measured, and it is a wrong answer
-	// rather than a short one. See viewJoins.
-	if viaView {
-		if which, bad := c.r.incompleteViewJoin(ctx, ns); bad {
-			c.r.Stats.Incomplete.Add(1)
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			because := "the view joins " + which + ", which is tiered and not held in full by the " +
-				"fast tier, and a join reads by key rather than by time"
-			c.log.Warn("refused a read through a view that joins an incomplete collection",
-				"view", ns, "reads", base, "joins", which,
-				"why", "the completeness check reads the client's pipeline, and this join is in the "+
-					"view's definition, so the rows whose partner is only in the archive would come "+
-					"back with an empty join array and no error on them")
-			return c.r.refuseView(reply.Header.RequestID, msg.Header.RequestID, ns, base, because)
-		}
-	}
 
 	if known && mark.Claimed {
 		// The claim that is about to authorise the fast tier is remembered for
