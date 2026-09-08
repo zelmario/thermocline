@@ -57,11 +57,17 @@ type CacheSnapshot struct {
 	// It is reported under the cache because the cache is what it was built
 	// for; it is not the cache's any more, and Enabled is what says whether
 	// the cache is on.
-	Watching bool          `json:"watching"`
-	Shapes   int           `json:"shapes"`
-	Hits     uint64        `json:"hits"`
-	Misses   uint64        `json:"misses"`
-	HitRate  float64       `json:"hit_rate"`
+	Watching bool    `json:"watching"`
+	Shapes   int     `json:"shapes"`
+	Hits     uint64  `json:"hits"`
+	Misses   uint64  `json:"misses"`
+	HitRate  float64 `json:"hit_rate"`
+	// Entries and Bytes are what the hit rate cannot explain: a cache at its
+	// max_bytes is evicting answers it learned, and one whose entries sit at
+	// max_queries is forgetting a query on every new one.
+	Entries  int           `json:"entries"`
+	Bytes    int           `json:"bytes"`
+	Rejected uint64        `json:"rejected"`
 	Advice   []CacheAdvice `json:"advice"`
 }
 
@@ -80,7 +86,9 @@ type CacheAdvice struct {
 func (r *Router) cacheSnapshot() CacheSnapshot {
 	out := CacheSnapshot{Enabled: r.cache != nil, Watching: r.watching.Load()}
 	if r.cache != nil {
-		out.Hits, out.Misses = r.cache.Counters()
+		cs := r.cache.Stats()
+		out.Hits, out.Misses = cs.Hits, cs.Misses
+		out.Entries, out.Bytes, out.Rejected = cs.Entries, cs.Bytes, cs.Rejected
 		if total := out.Hits + out.Misses; total > 0 {
 			out.HitRate = float64(out.Hits) / float64(total)
 		}

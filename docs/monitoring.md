@@ -26,6 +26,33 @@ scrape_configs:
       - targets: ["router-1.internal:27101"]
 ```
 
+#### The query cache
+
+Six series appear only when `router.cache.enabled` is true, because a hit rate
+of zero published for a cache nobody turned on reads as a cache that is not
+working:
+
+    thermocline_cache_hits_total
+    thermocline_cache_misses_total
+    thermocline_cache_learned_total
+    thermocline_cache_rejected_total
+    thermocline_cache_entries
+    thermocline_cache_bytes
+
+The hit rate over the first two is what says whether enabling it was worth it.
+The other four are for the case that rate cannot explain. `cache_bytes` against
+your `max_bytes` says whether the cache is evicting to stay inside its budget;
+`cache_entries` against `max_queries` says the same for the table of watched
+queries. `cache_rejected_total` is the one that catches the surprise: a cache
+handed replies over 256KB learns from them and holds none of them, so it looks
+idle from the hit rate alone and the reason is visible nowhere else.
+
+There is no alert on any of them, on purpose. A cache that is not paying is a
+tuning question, not a page, and the two things it could get wrong that *are*
+worth paging on are already covered: a stale answer would show as a wrong
+answer, and the memory is bounded by configuration rather than by an alert.
+
+
 ### What to alert on
 
 Nine signals, and the reason each one is worth waking somebody for. Everything

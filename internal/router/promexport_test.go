@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zelmario/thermocline/internal/cache"
 	"github.com/zelmario/thermocline/internal/config"
 )
 
@@ -133,5 +134,65 @@ func TestMetricsExportsWhatIsWorthPagingOn(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("the exporter does not carry %q", want)
 		}
+	}
+}
+
+// The cache is the one thing here that can answer without asking, and nothing
+// in the export said anything about it.
+//
+// Its hit rate is what says whether turning it on was worth it, and its size is
+// what says whether max_bytes is about to start throwing answers away. Both
+// were readable only from the dashboard, which is a page somebody has to open,
+// and an alert cannot be written against that. Worse for the memory: an
+// operator who set max_bytes too low got a cache that quietly held nothing,
+// with the counter that would have shown it visible nowhere.
+func TestMetricsExportsTheCache(t *testing.T) {
+	r := &Router{
+		cfg:     config.RouterConfig{Completeness: config.Archive},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: NewMetrics(metricsWindow),
+		started: time.Now(),
+		cache:   cache.NewWithBytes(100, 1<<20, time.Minute),
+	}
+	// Two looks at a query that has held still, so there is a hit, a miss and
+	// an entry to report.
+	r.cache.Observe("q", "shop.orders", []byte("an answer"))
+	r.cache.Observe("q", "shop.orders", []byte("an answer"))
+	if _, ok := r.cache.Get("q"); !ok {
+		t.Fatal("nothing was cached, so this test proves nothing")
+	}
+	r.cache.Get("absent")
+
+	var b strings.Builder
+	r.writeMetrics(context.Background(), &b)
+	out := b.String()
+
+	for _, want := range []string{
+		"thermocline_cache_hits_total 1",
+		"thermocline_cache_misses_total 1",
+		"thermocline_cache_entries 1",
+		"thermocline_cache_bytes ",
+		"thermocline_cache_rejected_total 0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the exporter does not carry %q", want)
+		}
+	}
+}
+
+// And says nothing about a cache that is off, rather than publishing a hit rate
+// of zero for one that is not running. A zero there reads as "the cache is not
+// working" and the truth is that nobody turned it on.
+func TestMetricsIsSilentAboutACacheThatIsOff(t *testing.T) {
+	r := &Router{
+		cfg:     config.RouterConfig{Completeness: config.Archive},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: NewMetrics(metricsWindow),
+		started: time.Now(),
+	}
+	var b strings.Builder
+	r.writeMetrics(context.Background(), &b)
+	if strings.Contains(b.String(), "thermocline_cache_") {
+		t.Error("the exporter published cache metrics for a cache that is off")
 	}
 }

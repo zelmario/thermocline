@@ -71,6 +71,27 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	gauge("clients_open", "Client connections open now.", float64(snap.Counters["clients_open"]))
 	gauge("uptime_seconds", "How long this router has been running.", float64(snap.UptimeS))
 
+	// The query cache, and only when it is on.
+	//
+	// Nothing here for a cache nobody enabled: a hit rate of zero published for
+	// a cache that is not running reads as "the cache is not working", and the
+	// truth is that nobody turned it on. Absent says that and a zero does not.
+	//
+	// The hit rate is what says whether enabling it was worth it. The bytes are
+	// what say whether max_bytes is about to start throwing answers away, and
+	// rejected is the other half of that: a cache handed replies larger than
+	// MaxEntryBytes looks idle from the hit rate alone, and the reason is
+	// visible only here.
+	if r.cache != nil {
+		cs := r.cache.Stats()
+		counter("cache_hits_total", "Reads answered from the query cache without asking either tier.", int64(cs.Hits))
+		counter("cache_misses_total", "Cacheable reads the cache could not answer. With hits, this is the hit rate.", int64(cs.Misses))
+		counter("cache_learned_total", "Times a watched query was seen to return something new, which is what the TTL is learned from.", int64(cs.Learned))
+		counter("cache_rejected_total", "Answers too large to hold. A cache with a low hit rate and a rising count here is being handed replies over 256KB, not failing to learn.", int64(cs.Rejected))
+		gauge("cache_entries", "Queries being watched. At max_queries the least recently seen is forgotten on every new one.", float64(cs.Entries))
+		gauge("cache_bytes", "Memory the held answers occupy. Against max_bytes, this says how close the cache is to evicting to stay inside its budget.", float64(cs.Bytes))
+	}
+
 	// Commands and latency, per way of being served.
 	fmt.Fprintf(b, "# HELP thermocline_command_duration_seconds Command latency by how the command was served.\n")
 	fmt.Fprintf(b, "# TYPE thermocline_command_duration_seconds histogram\n")
