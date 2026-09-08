@@ -188,11 +188,11 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 		case ev.NS.Coll != "":
 			ns := ev.NS.DB + "." + ev.NS.Coll
 			r.invalidateFor(ns, ev.OperationType)
-			r.noteFastTierDDL(ns, ev.OperationType)
+			r.noteFastTierDDL(ctx, ns, ev.OperationType)
 			if ev.To.Coll != "" {
 				// A rename leaves a different collection under the new name
 				// too, and this router may well remember the old one.
-				r.noteFastTierDDL(ev.To.DB+"."+ev.To.Coll, ev.OperationType)
+				r.noteFastTierDDL(ctx, ev.To.DB+"."+ev.To.Coll, ev.OperationType)
 			}
 		case ev.NS.DB != "":
 			// dropDatabase and the invalidate that follows it name no
@@ -225,7 +225,7 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 // undo the memory it had just written and the next write would create the
 // collection again. The sequence that matters is a drop followed by a write, and
 // the drop is the half worth hearing.
-func (r *Router) noteFastTierDDL(ns, op string) {
+func (r *Router) noteFastTierDDL(ctx context.Context, ns, op string) {
 	if op != "drop" && op != "rename" {
 		return
 	}
@@ -246,6 +246,9 @@ func (r *Router) noteFastTierDDL(ns, op string) {
 		"note", "the archive keeps its documents, so reads answer from it until something "+
 			"writes to this namespace again")
 	r.forgetDropped(ns)
+	// A view dropped out of band on the fast tier, which this stream is the only
+	// way to hear about. Same rule as the forwarded drop above it.
+	r.dropArchiveView(ctx, ns)
 }
 
 // forgetDropped drops what this router remembers about a namespace the fast tier

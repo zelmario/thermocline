@@ -296,6 +296,9 @@ feeder:
     # tqvj is the one it joins, and the fast tier deliberately holds part of it.
     - "shop.tqvb"
     - "shop.tqvj"
+    # testquery.sh: dropped through the router, to check the archive keeps its
+    # documents while a dropped view does not survive there.
+    - "shop.tqdroplife"
     # testbulk.sh
     - "shop.tbwu"
     - "shop.tbwm"

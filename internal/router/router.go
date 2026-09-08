@@ -1159,6 +1159,10 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// and a unique index the archive still carries is not enforced
 				// on the fast tier at all.
 				c.r.forgetDropped(db + "." + coll)
+				// And the archive's copy, when what it holds under that name is
+				// a view. A view has no documents, so the rule that a drop is
+				// never replayed does not reach it. See dropArchiveView.
+				c.r.dropArchiveView(ctx, db+"."+coll)
 			}
 			if name == "create" {
 				ns := db + "." + coll

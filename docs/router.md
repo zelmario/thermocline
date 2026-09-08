@@ -719,6 +719,20 @@ A view is not a collection, either. Nothing is promoted into one, the indexer
 builds no indexes on one, and a tiered `$out` reading through one is refused
 rather than performed against a short input.
 
+**And a dropped view is dropped in the archive too.** Collection DDL other than
+rename is logged and never replayed, and that rule is about documents: replaying
+a drop would destroy the history the archive exists to keep. A view has none.
+Leaving it cost three things, and the first is the one that shows: the startup
+report names it for ever, and that report is what step 1 of the runbook tells an
+operator to read. A rollback repoints the application at the archive and finds a
+view it dropped. And recreating the view with a different pipeline leaves the
+archive holding the old one, so a read the fast tier cannot answer is refused
+where it could have been answered.
+
+The guard is the whole of it and it is one line: the archive's copy is dropped
+only when what the archive holds under that name **is a view**. A collection is
+never touched, whatever the fast tier had.
+
 ### Writes that name many documents
 
 `updateMany` and `deleteMany` only ever reached the documents the fast tier

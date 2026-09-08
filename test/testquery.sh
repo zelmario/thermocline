@@ -250,6 +250,45 @@ R "db.getSiblingDB(process.env.TC_DB).createView('vqchainbad','vqview',[])" >/de
 chk "a chain whose second link is missing is refused"  "REFUSED" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}))}catch(e){print('REFUSED')}")"
 
+echo "== a view dropped through the router is dropped in the archive too =="
+# A view created through the router is mirrored down, so the archive can answer
+# a read the fast tier cannot and so a rollback finds it. A drop was not
+# replayed, because collection DDL other than rename never is, and that rule is
+# about documents: replaying a drop would destroy the history the archive exists
+# to keep. A view has no documents.
+#
+# Leaving it costs three things, and the first is the one that shows. The startup
+# report names it for ever, and that report is what step 1 of the runbook tells
+# an operator to read: measured, a day of running the suites left eight stale
+# views in one database and the report named all of them. A rollback repoints the
+# application at the archive and finds a view it dropped. And recreating the view
+# with a different pipeline leaves the archive holding the old one, so a read the
+# fast tier cannot answer is refused where it could have been answered.
+#
+# Only when what the archive holds under that name is a view. That is the whole
+# guard, and it is what makes this safe: a collection is never touched by it.
+R "db.getSiblingDB(process.env.TC_DB).vqdroplife.drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).createView('vqdroplife','tqview',[])" >/dev/null
+sleep 1
+chk "the archive was given the view"                   "true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vqdroplife'}).length === 1)")"
+R "db.getSiblingDB(process.env.TC_DB).vqdroplife.drop()" >/dev/null
+sleep 2
+chk "  and the drop reached it"                        "false" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vqdroplife'}).length === 1)")"
+# And the guard: a tiered collection dropped through the router keeps its
+# documents in the archive, which is the whole point of the rule this steps
+# around. Its own collection, because it is about to be dropped.
+R "db.getSiblingDB(process.env.TC_DB).tqdroplife.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).tqdroplife.drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).tqdroplife.insertOne({_id:1,n:1})" >/dev/null
+waitMirrored tqdroplife 1
+R "db.getSiblingDB(process.env.TC_DB).tqdroplife.drop()" >/dev/null
+sleep 2
+chk "a dropped collection keeps its archived documents" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tqdroplife.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+C "db.getSiblingDB(process.env.TC_DB).tqdroplife.drop()" >/dev/null 2>&1
+
 echo "== a view whose own pipeline joins a tiered collection the fast tier is short of =="
 # The section above checks a joining view while the collection under it is
 # *incomplete*, which is the path that reaches the archive and refuses because

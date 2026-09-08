@@ -625,6 +625,44 @@ func (r *Router) refuseView(requestID, responseTo int32, view, base, because str
 			"archive answers in full.")
 }
 
+// dropArchiveView removes the archive's copy of a view the fast tier no longer
+// has.
+//
+// Collection DDL other than rename is logged and never replayed, and that rule
+// is about documents: replaying a drop into the archive would destroy the
+// history it exists to keep. A view has no documents, so none of that applies to
+// one, and leaving it costs three things. The startup report names it for ever,
+// and that report is what step 1 of the runbook tells an operator to read. A
+// rollback repoints the application at the archive and finds a view it dropped.
+// And recreating the view with a different pipeline leaves the archive holding
+// the old one, so archiveCanAnswerView says no and every read the fast tier
+// cannot answer is refused where it could have been answered.
+//
+// Only when the archive's own copy is a view. That is the whole guard, and it is
+// what makes this safe: a collection is never touched by it, whatever the fast
+// tier had under that name.
+//
+// Best effort, and said out loud when it fails. A view left behind is untidy and
+// eventually confusing; failing the client's drop over it would be worse, and
+// the fast tier has already done the part that matters.
+func (r *Router) dropArchiveView(ctx context.Context, ns string) {
+	if _, isView := viewDefinition(ctx, r.cold, ns); !isView {
+		return
+	}
+	db, coll := splitNS(ns)
+	if derr := r.cold.Database(db).Collection(coll).Drop(ctx); derr != nil {
+		r.log.Warn("could not drop the archive's copy of a view the fast tier no longer has",
+			"ns", ns, "err", derr,
+			"effect", "the startup report will go on naming it, and a rollback would find a view "+
+				"the application dropped",
+			"action", "drop "+ns+" on the archive by hand")
+		return
+	}
+	r.log.Info("dropped the archive's copy of a view", "ns", ns,
+		"why", "a view holds no documents, so the rule that a drop is never replayed does not "+
+			"reach it, and a stale one is named by every startup report and found by a rollback")
+}
+
 // mirrorViewsToArchive gives the archive every view the fast tier has that it
 // does not, once, at startup.
 //
