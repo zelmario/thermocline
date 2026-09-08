@@ -103,6 +103,78 @@ func (c *conn) interceptCollStats(ctx context.Context, msg *wire.Message, db str
 	return wire.NewMsg(reply.Header.RequestID, msg.Header.RequestID, out)
 }
 
+// interceptDataSize corrects the object count in a dataSize reply.
+//
+// The third command of this family and the one that was left. collStats.count
+// and dbStats.objects are corrected because a count is a logical fact about the
+// data rather than a physical one about the tier, and dataSize returns
+// numObjects beside its bytes. Measured on an archive holding ten documents and
+// a fast tier holding three: countDocuments, collStats.count and dbStats.objects
+// all answered ten, and dataSize answered three.
+//
+// The bytes are left alone, exactly as collStats leaves its size alone. Those
+// describe the tier that answered and the fast tier really does hold that many
+// of them; the count describes the collection.
+//
+// Not corrected for a key range. dataSize with min and max is a question about
+// where documents sit in one collection's index, which is what the balancer
+// asks and which means nothing across two clusters: the answer would be the
+// archive's count for a range read out of the fast tier's index. Left as the
+// fast tier's, and said so, because a number that means something else is worse
+// than one that is short.
+func (c *conn) interceptDataSize(ctx context.Context, msg *wire.Message, db string, reply *wire.Message) (*wire.Message, error) {
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return reply, nil
+	}
+	ns, ok := stringField(cmd, "dataSize")
+	if !ok {
+		return reply, nil
+	}
+	// dataSize names its collection in full, as db.collection, unlike every
+	// other command in this file.
+	if ndb, _ := splitNS(ns); ndb != db {
+		// Run against another database, which mongod refuses, so there is
+		// nothing here to correct.
+		return reply, nil
+	}
+	if _, hasMin := cmd.Lookup("min").DocumentOK(); hasMin {
+		c.log.Debug("not correcting the object count of a dataSize over a key range",
+			"ns", ns, "why", "a key range is a position in one collection's index, and the "+
+				"archive's count for it would be a different question answered")
+		return reply, nil
+	}
+	if _, hasMax := cmd.Lookup("max").DocumentOK(); hasMax {
+		return reply, nil
+	}
+	rdoc, err := reply.ReplyDoc()
+	if err != nil || !replyOK(rdoc) {
+		return reply, nil
+	}
+	n, ok := c.correctedCount(ctx, ns)
+	if !ok {
+		return reply, nil
+	}
+	var doc bson.D
+	if uerr := bson.Unmarshal(rdoc, &doc); uerr != nil {
+		return reply, nil
+	}
+	out := make(bson.D, 0, len(doc))
+	changed := false
+	for _, e := range doc {
+		if e.Key == "numObjects" {
+			out = append(out, bson.E{Key: "numObjects", Value: sameNumberKind(e.Value, n)})
+			changed = true
+			continue
+		}
+		out = append(out, e)
+	}
+	if !changed {
+		return reply, nil
+	}
+	return wire.NewMsg(reply.Header.RequestID, msg.Header.RequestID, out)
+}
+
 // interceptAggCollStats corrects the count in the reply to an aggregate whose
 // pipeline begins with $collStats, which is what db.coll.stats() sends.
 func (c *conn) interceptAggCollStats(ctx context.Context, msg *wire.Message, db string, reply *wire.Message) (*wire.Message, error) {

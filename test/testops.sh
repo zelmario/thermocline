@@ -123,6 +123,21 @@ chk "collStats count"           "$TRUTH" "$(R "print(db.getSiblingDB(process.env
 chk "\$collStats count"         "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$collStats:{count:{}}}]).toArray()[0].count)")"
 chk "\$collStats storageStats"  "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$collStats:{storageStats:{}}}]).toArray()[0].storageStats.count)")"
 chk "stats().count"             "$TRUTH" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.stats().count)")"
+# The third command of that family, and it was the one left. dataSize returns
+# numObjects beside its bytes, and it names its collection in full rather than
+# where every other command puts it, which is how it was missed. Measured on ten
+# documents in the archive and three on the fast tier: countDocuments,
+# collStats.count and dbStats.objects all answered ten and this answered three.
+chk "dataSize numObjects"       "$TRUTH" \
+    "$(R "print(Number(db.getSiblingDB(process.env.TC_DB).runCommand({dataSize:process.env.TC_DB + '.$NS'}).numObjects))")"
+# And not for a key range, which is a question about where documents sit in one
+# collection's index. That is what the balancer asks and it means nothing across
+# two clusters, so it stays the fast tier's: a number that means something else
+# would be worse than one that is short.
+chk "  but not over a key range" "true" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({dataSize:process.env.TC_DB + '.$NS',
+          keyPattern:{_id:1}, min:{_id:MinKey()}, max:{_id:MaxKey()}});
+          print(r.ok === 1 && r.numObjects <= $TRUTH)")"
 # And the other half: bytes on disk are a per-tier fact, so they must still be
 # the fast tier's. Adding two clusters' compressed sizes together would produce
 # a number describing nothing, and an operator sizing a fast tier reads this one.
