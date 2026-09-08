@@ -463,6 +463,32 @@ Part of [Thermocline](../README.md).
   `querycache.go`: a writer this router cannot see is not seen at all, and the
   TTL is the whole of that.
 
+- **A document whose age field holds an array is never evicted, and the fast
+  tier grows by that much.** Everything about ageing a document assumes there is
+  one date to read. MongoDB does not promise that: a range predicate on an array
+  field matches when *any* element matches, so a document holding
+  `[old, new]` is older than the eviction cutoff and newer than it at the same
+  time.
+
+  Measured before it was excluded, on four documents with one holding
+  `[four hours ago, thirty seconds ago]`: the evictor removed it for the old
+  element, and a read bounded at the completeness claim still matched it for the
+  new one. The archive answered `1,2,3,9` and the router answered `1,2,3` — a
+  short answer inside the range the claim promises, with no error on it.
+
+  So the eviction filter excludes an array outright, which leaves those
+  documents on the fast tier for ever. That is the same answer this rule already
+  gives every other shape it cannot address: type bracketing means a cutoff on a
+  date selects only documents whose field holds a date, so a missing, null or
+  string age is invisible to every sweep already. An array of dates is the one
+  thing bracketing lets through, because `$type` matches an element. The evictor
+  counts them and says so at startup, separately from the others, because the
+  reason is the opposite one: those cannot be selected at all, and these could be
+  and must not be.
+
+  The remedy is in the message and it is the application's: give each document
+  one date in that field, or age the namespace by a field that holds one.
+
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection

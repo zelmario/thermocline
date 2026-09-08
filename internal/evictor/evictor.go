@@ -676,18 +676,43 @@ func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule,
 	n, err := hotColl.CountDocuments(ctx, bson.D{{Key: rule.DateField, Value: bson.D{
 		{Key: "$not", Value: bson.D{{Key: "$type", Value: "date"}}},
 	}}})
-	if err != nil || n == 0 {
+	if err == nil && n > 0 {
+		e.log.Warn("the fast tier holds documents this rule can never remove",
+			"ns", rule.NS, "not_dated_by_"+rule.DateField, n,
+			"reason", "a cutoff on a date selects only documents whose field holds a date, because "+
+				"MongoDB brackets a range predicate by type; one whose "+rule.DateField+" is missing, "+
+				"null or a string is invisible to every sweep",
+			"effect", "these stay on the fast tier however old they are, so it grows by that much and "+
+				"every sweep goes on reporting success",
+			"action", "give them a date in "+rule.DateField+", or remove them by hand once the archive "+
+				"is confirmed to hold them")
+	}
+
+	// And the ones bracketing lets through, which are excluded on purpose. See
+	// candidateFilter: a document whose age field is an array is older than the
+	// cutoff and newer than it at once, because a range predicate on an array
+	// matches when any element does. Removing one leaves a short answer inside
+	// the range the claim promises.
+	//
+	// Reported separately from the count above, because the reason and the
+	// action are different: those cannot be selected at all, and these could be
+	// and must not be.
+	na, aerr := hotColl.CountDocuments(ctx, bson.D{{Key: rule.DateField, Value: bson.D{
+		{Key: "$type", Value: "array"},
+	}}})
+	if aerr != nil || na == 0 {
 		return
 	}
-	e.log.Warn("the fast tier holds documents this rule can never remove",
-		"ns", rule.NS, "not_dated_by_"+rule.DateField, n,
-		"reason", "a cutoff on a date selects only documents whose field holds a date, because "+
-			"MongoDB brackets a range predicate by type; one whose "+rule.DateField+" is missing, "+
-			"null or a string is invisible to every sweep",
-		"effect", "these stay on the fast tier however old they are, so it grows by that much and "+
-			"every sweep goes on reporting success",
-		"action", "give them a date in "+rule.DateField+", or remove them by hand once the archive "+
-			"is confirmed to hold them")
+	e.log.Warn("the fast tier holds documents this rule will not remove, because their age is an array",
+		"ns", rule.NS, "array_"+rule.DateField, na,
+		"reason", "a range predicate on an array matches when any element matches, so a document "+
+			"holding [old, new] in "+rule.DateField+" is older than the cutoff and newer than it "+
+			"at the same time",
+		"effect", "removing one would leave a read bounded inside the completeness claim short by "+
+			"that document, with no error on it, so these stay where they are and the fast tier "+
+			"grows by that much",
+		"action", "give each document one date in "+rule.DateField+", or age this namespace by a "+
+			"field that holds one")
 }
 
 // settleClaim waits long enough for every reader holding the previous claim to

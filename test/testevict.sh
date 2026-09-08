@@ -452,6 +452,36 @@ chkv "counting them by the field they lack a date in" "true" \
     "$(grep -q 'not_dated_by_at=2' $LOGDIR/ev_unaged.log && echo true || echo false)"
 chkv "and says the fast tier grows by that much" "true" \
     "$(grep -q 'grows by that much' $LOGDIR/ev_unaged.log && echo true || echo false)"
+# And the one type bracketing does not keep out. A range predicate on an array
+# matches when *any* element matches, so a document whose age field holds
+# [old, new] is older than the cutoff and newer than it at the same time. The
+# claim says the fast tier holds every live document newer than the cutoff, and
+# removing this one makes that false.
+#
+# Measured before it was excluded, on four documents with one holding
+# [four hours ago, thirty seconds ago]: the archive answered 1,2,3,9 for a read
+# bounded at the claim and the router answered 1,2,3. A short answer inside the
+# range the claim promises, with no error on it.
+#
+# It is left where it is, which is what this rule already does for every other
+# shape it cannot address, and it is counted separately because the reason is
+# the opposite one: those cannot be selected at all, and this one could be.
+NOWD=$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$ENS.insertOne(
+    {_id:9, at:[new Date('$OLDDATE'), new Date('$NOWD')], n:'old and new at once'})" >/dev/null
+done
+rm -f $LOGDIR/ev_unagedarr.log
+cline evictor --config $WDIR/evunaged.yaml --once --log-file $LOGDIR/ev_unagedarr.log >/dev/null 2>&1
+chkv "an array age is not removed for its old half"  "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ENS.countDocuments({_id:9}) === 1)")"
+chkv "and the sweep says why, counting it"           "true" \
+    "$(grep -q 'array_at=1' $LOGDIR/ev_unagedarr.log && echo true || echo false)"
+chkv "  naming what removing it would cost"          "true" \
+    "$(grep -q 'bounded inside the completeness claim short' $LOGDIR/ev_unagedarr.log && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.deleteOne({_id:9})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.deleteOne({_id:9})" >/dev/null
+
 # The control: a namespace whose documents are all properly dated must stay
 # quiet, or the warning is noise on every start and nobody reads it.
 H "db.getSiblingDB(process.env.TC_DB).$ENS.deleteMany({at:{\$not:{\$type:'date'}}})" >/dev/null
