@@ -489,6 +489,34 @@ Part of [Thermocline](../README.md).
   The remedy is in the message and it is the application's: give each document
   one date in that field, or age the namespace by a field that holds one.
 
+- **A unique index on an array field is not enforced across the tiers.** Such an
+  index is *multikey*: mongod makes one index entry per element, so no two
+  documents may share **any** element. The registry that protects archived keys
+  computes one key from one document's value of the field, and an array is one
+  value to it, so two documents sharing an element have different keys as far as
+  it is concerned.
+
+  While both documents are on the fast tier mongod catches the duplicate itself.
+  Once one has been evicted, nothing does: the fast tier's index no longer holds
+  the entry and the registry is comparing the wrong key.
+
+  Measured. A document holding `tags: ["x","y"]` is mirrored and then taken off
+  the fast tier. A second holding `tags: ["y","z"]` is accepted by the router and
+  by the fast tier, and the archive refuses the mirrored insert with
+  `E11000 ... index: tags_1 dup key: { tags: "y" }`. The router says so at ERROR
+  level and names the action, so it is not silent and mirroring does not hang —
+  the feeder writes the document off rather than retrying a write that can never
+  succeed. What is left is worse in a quieter way: **the document is on the fast
+  tier and not in the archive, and the evictor will not remove it**, so the two
+  tiers disagree about it until somebody resolves the duplicate by hand.
+
+  Enforcing it properly means one claim per array element rather than one per
+  document, through every path that claims a key: the insert batch, the update
+  post-image, `$merge` and `$out`. That is the most dangerous code here to change
+  and it has not been done. Until it is, **do not put a unique index on a field
+  that holds arrays in a tiered collection**. `cline keys --rebuild` has the same
+  blind spot, so it will not tell you either.
+
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection
