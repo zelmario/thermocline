@@ -36,6 +36,10 @@ import (
 // that the evictor did not announce.
 var ErrUnannouncedDelete = errors.New("unannounced delete on the fast tier")
 
+// ErrUnmirrorableKind is returned when a collection this feeder is mirroring
+// turns out to be a kind that mirroring damages. See checkNamespaceKind.
+var ErrUnmirrorableKind = errors.New("a namespace this feeder mirrors cannot be mirrored")
+
 // ErrResumePointLost is returned when the fast tier's oplog no longer reaches
 // back to where mirroring got to.
 //
@@ -62,6 +66,11 @@ type Feeder struct {
 
 	// buffered work, flushed together
 	pending []pendingOp
+
+	// kindSeen is the namespaces whose collection kind has been checked at
+	// least once since this feeder started. Read and written only from the
+	// stream goroutine. See checkNamespaceKind.
+	kindSeen map[string]bool
 	// Where mirroring's time goes, since the rate it sustains is a ceiling on
 	// how fast the fast tier can take writes before every fall-through read
 	// waits. End-to-end timing on a loaded machine varied by 70% between runs
@@ -282,7 +291,8 @@ func (f *Feeder) Run(ctx context.Context) error {
 		switch {
 		case err == nil, errors.Is(err, context.Canceled):
 			return nil
-		case errors.Is(err, ErrUnannouncedDelete), errors.Is(err, ErrResumePointLost):
+		case errors.Is(err, ErrUnannouncedDelete), errors.Is(err, ErrResumePointLost),
+			errors.Is(err, ErrUnmirrorableKind):
 			return err
 		}
 
@@ -571,6 +581,9 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		if ev.OperationType == "drop" {
 			f.withdrawCompleteness(ctx, ns)
 			f.clearResidency(ctx, ns)
+			// The next collection under this name may be a different kind of
+			// thing entirely.
+			f.forgetNamespaceKind(ns)
 		}
 		// And the same one level up. dropDatabase names no collection, so the
 		// line above never fired for it and every claim in that database stayed
@@ -581,8 +594,17 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		if ev.OperationType == "dropDatabase" {
 			f.withdrawDatabase(ctx, ev.NS.DB)
 			f.clearResidencyIn(ctx, ev.NS.DB)
+			f.forgetNamespaceKindsIn(ev.NS.DB)
 		}
 		return nil
+	}
+
+	// What kind of collection this is, asked once per namespace. The startup
+	// check cannot see a collection created after it ran, and mirroring a capped
+	// one destroys the archive's history rather than merely failing. See
+	// checkNamespaceKind.
+	if kerr := f.checkNamespaceKind(ctx, ns); kerr != nil {
+		return kerr
 	}
 
 	id, err := ev.DocumentKey.LookupErr("_id")

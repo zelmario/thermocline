@@ -456,22 +456,21 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	}
 
 	if known && mark.Claimed {
-		// The claim that is about to authorise the fast tier, remembered for as
-		// long as the cursor this query leaves behind. A cursor outlives the
+		// The claim that is about to authorise the fast tier is remembered for
+		// as long as the cursor this query leaves behind. A cursor outlives the
 		// decision and nothing used to check whether the decision still held:
 		// see tieredcursor.go for what that was measured to cost.
-		authorised := []nsClaim{{ns: judged, from: mark.From, claimed: mark.Claimed}}
 
 		af, aok := c.r.ageFieldOf(judged)
 		bound, bounded := lowerTimeBound(filter, af, aok)
 		switch {
 		case bounded && mark.Complete(bound):
-			c.noteTieredCursor(authorised, reply)
+			c.noteTieredCursorOn(judged, mark, reply)
 			return reply, nil
 		case !bounded && mark.CoversAll():
 			// No lower bound, so the query may reach arbitrarily far back. Only
 			// a tier claiming all of history can answer that on its own.
-			c.noteTieredCursor(authorised, reply)
+			c.noteTieredCursorOn(judged, mark, reply)
 			return reply, nil
 		}
 
@@ -486,7 +485,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 				c.r.Stats.NewestFirst.Add(1)
 				// The proof needs no bound, and the rule is the same: it rests
 				// on this claim, so it lasts as long as this claim does.
-				c.noteTieredCursor(authorised, reply)
+				c.noteTieredCursorOn(judged, mark, reply)
 				return reply, nil
 			}
 		}

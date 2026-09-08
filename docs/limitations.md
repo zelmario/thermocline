@@ -388,6 +388,49 @@ Part of [Thermocline](../README.md).
   moves the result in with ordinary inserts, which is the only difference from
   mongod, and claims its unique keys so the registry still holds them once those
   documents are evicted.
+- **A collection of a kind that cannot be mirrored stops the feeder, whenever it
+  appears.** Capped, time series and queryable-encryption collections are
+  refused at startup, and the reasons are in `internal/feeder/collkind.go`: a
+  capped one removes its own oldest documents with nothing to announce them, so
+  the archive tombstones its copies and discards the history it exists to keep.
+
+  That check could only ever see collections that already existed. One created
+  afterwards — which is every collection, in a deployment that leaves
+  `feeder.namespaces` empty to mirror everything — was mirrored. Measured on a
+  4KB capped collection filled with 400 documents: the fast tier kept the 18 it
+  had room for and the archive held tombstones over the rest, marked deleted by
+  a collection doing exactly what capped means.
+
+  So the kind is checked again the first time an event for a namespace arrives,
+  and the feeder stops the same way it would have refused to start, with the
+  namespace named and the action in the log. **It stops rather than skipping the
+  namespace**, and that is the same choice the startup check makes: a feeder that
+  carried on would be mirroring less than its configuration says, and the router
+  would answer reads of that namespace from an archive holding none of it. The
+  cost is that one such collection, created anywhere a mirror-everything
+  deployment can see, takes mirroring down until it is removed from scope.
+
+  Views and time series collections do not reach this, and do not need to: what
+  a change stream carries for a time series collection is its bucket collection,
+  which nothing here mirrors, and a view has no documents of its own.
+
+- **Neither tier's version is looked at again after the daemons start.** Both
+  tiers must run the same MongoDB release and the same feature compatibility
+  version, and every daemon refuses to start otherwise. That check runs once.
+
+  So an upgrade of one tier while the daemons are running is not noticed. The
+  pair they refused to start against is the pair they will happily go on serving
+  until something restarts them. The exposure is the one that made the rule:
+  everything the router needs of a tier goes to the fast one, and the archive
+  only ever runs the client's own pipeline, so what breaks is a stage or operator
+  newer than the archive, and it breaks with the archive's own error naming a
+  stage the application has always used.
+
+  It is deliberate rather than missed. Re-checking on a timer and halting would
+  take the system down in the middle of a rolling upgrade, which is the one
+  moment the versions are legitimately unequal. **Upgrade both tiers, then
+  restart the daemons**, and they will tell you at once if the pair is wrong.
+
 - **Collection DDL other than rename** is logged and ignored, never replayed.
   A drop is the one worth knowing: the fast tier's copy goes, the archive keeps
   its documents, and the completeness claim is withdrawn, so the collection

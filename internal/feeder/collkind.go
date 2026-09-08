@@ -248,3 +248,96 @@ func (f *Feeder) checkCollectionKinds(ctx context.Context) error {
 		"archive with something the application cannot use, or empties it as the collection rolls",
 		strings.Join(bad, "\n  "), action)
 }
+
+// checkNamespaceKind refuses a namespace whose kind cannot be mirrored, the
+// first time an event for it arrives.
+//
+// The startup check cannot see a collection that does not exist yet, and that
+// is the whole gap: name a namespace nothing has created, or leave
+// feeder.namespaces empty so every namespace is named, start the feeder, and
+// then create the collection capped. Measured, and it is what the comment at the
+// top of this file describes happening: the collection rolls over as it was
+// designed to, mongod removes its oldest documents with nothing to announce
+// them, and the archive tombstones its copies. The history the archive exists to
+// keep, discarded by a check that ran before there was anything to check.
+//
+// Only the kinds that are mirrored and do damage stop the feeder. That is the
+// same distinction unmirrorableKind already draws with namedOnly: a view or a
+// time series collection is never mirrored at all, because what the change
+// stream carries is the bucket collection rather than the one the application
+// writes to, so nothing of theirs reaches here to be stopped.
+//
+// Stopping is what the startup check does and it is what this does, for the
+// reason written above: a feeder that started and skipped a namespace would be
+// mirroring less than its configuration says, and the router would answer reads
+// of that namespace from an archive holding none of it.
+//
+// One listCollections per namespace, once, and the fast tier only. That is
+// where a collection appears while this runs: the application writes through the
+// router to the fast tier, and the archive's side of the same question is what
+// the startup check covers, both tiers of it.
+//
+// A namespace dropped is forgotten, so a collection recreated under the same
+// name as a capped one is checked again.
+func (f *Feeder) checkNamespaceKind(ctx context.Context, ns string) error {
+	if f.hot == nil {
+		// Nothing to ask. A feeder with no fast tier client cannot mirror
+		// anything either, so there is nothing here to protect.
+		return nil
+	}
+	if f.kindSeen == nil {
+		f.kindSeen = map[string]bool{}
+	}
+	if f.kindSeen[ns] {
+		return nil
+	}
+	db, coll := splitNS(ns)
+	cur, err := f.hot.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		// Not being able to look is not a reason to stop, the same as the
+		// startup check, which warns and carries on. Nothing is remembered, so
+		// the next event for this namespace asks again.
+		f.log.Warn("could not check what kind of collection this is before mirroring it",
+			"ns", ns, "err", err)
+		return nil
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	var kind, why string
+	var namedOnly bool
+	for cur.Next(ctx) {
+		var info bson.Raw
+		if cur.Decode(&info) != nil {
+			continue
+		}
+		kind, why, namedOnly = unmirrorableKind(info)
+	}
+	f.kindSeen[ns] = true
+	if kind == "" || namedOnly {
+		return nil
+	}
+	// Said here as well as returned, because the error goes up to the daemon
+	// and out, and an operator reading the log file is the one who has to act.
+	f.log.Error("stopping: a collection this feeder mirrors cannot be mirrored",
+		"ns", ns, "kind", kind, "why", why,
+		"when", "it was created after this feeder started, so the check at startup could not see it",
+		"action", "remove "+ns+" from feeder.namespaces, or do not create it this way; then restart "+
+			"the feeder. Its documents are on the fast tier and the archive holds whatever was "+
+			"mirrored before this")
+	return fmt.Errorf("%w: %s is %s, which %s", ErrUnmirrorableKind, ns, kind, why)
+}
+
+// forgetNamespaceKind drops what is remembered about ns, so a collection
+// recreated under the same name is checked again.
+func (f *Feeder) forgetNamespaceKind(ns string) { delete(f.kindSeen, ns) }
+
+// forgetNamespaceKindsIn does the same for every namespace in one database,
+// which is what a dropDatabase removes.
+func (f *Feeder) forgetNamespaceKindsIn(db string) {
+	prefix := db + "."
+	for ns := range f.kindSeen {
+		if strings.HasPrefix(ns, prefix) {
+			delete(f.kindSeen, ns)
+		}
+	}
+}

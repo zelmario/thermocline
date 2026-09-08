@@ -99,15 +99,38 @@ func (c *conn) noteTieredCursor(on []nsClaim, reply *wire.Message) {
 	if len(on) == 0 {
 		return
 	}
+	if id, live := liveCursorOf(reply, on[0].ns); live {
+		c.r.tiered.add(id, tieredRead{on: on, at: time.Now()})
+	}
+}
+
+// noteTieredCursorOn is the one-claim case, which is every find.
+//
+// Separate so the slice is built only for a reply that left a cursor open.
+// Most replies do not, and a find on a tiered collection is the hot path this
+// whole system is for: one allocation per read, thrown away unread, is not
+// something to add to it.
+func (c *conn) noteTieredCursorOn(ns string, mark watermark.Mark, reply *wire.Message) {
+	id, live := liveCursorOf(reply, ns)
+	if !live {
+		return
+	}
+	c.r.tiered.add(id, tieredRead{
+		on: []nsClaim{{ns: ns, from: mark.From, claimed: mark.Claimed}},
+		at: time.Now(),
+	})
+}
+
+// liveCursorOf is the cursor a successful reply left open, if it left one.
+//
+// A reply with cursor id nought is the whole answer and has nothing to outlive.
+func liveCursorOf(reply *wire.Message, fallbackNS string) (int64, bool) {
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
-		return
+		return 0, false
 	}
-	id, _ := cursorIdentity(rdoc, on[0].ns)
-	if id == 0 {
-		return
-	}
-	c.r.tiered.add(id, tieredRead{on: on, at: time.Now()})
+	id, _ := cursorIdentity(rdoc, fallbackNS)
+	return id, id != 0
 }
 
 // guardTieredGetMore refuses a getMore whose claim has narrowed under it.

@@ -187,6 +187,65 @@ chk "the feeder refuses to mirror a view"               "true" \
 chk "and it did not stay running"                       "0"    "$STARTEDV"
 H "db.getSiblingDB(process.env.TC_DB).tview.drop()" >/dev/null 2>&1
 
+echo "== a capped collection created after the feeder started =="
+# Every check above asks the question at startup, which is the only time it was
+# ever asked. A collection that does not exist yet cannot be looked at, and
+# nothing looked again: name a namespace nothing has created, or leave
+# feeder.namespaces empty so every namespace is named, and the collection can be
+# created capped afterwards with the feeder already running.
+#
+# Measured before this, on a capped collection of 4KB filled with 400 documents:
+# the fast tier kept the 18 it had room for, and the archive held tombstones over
+# the rest. Documents nobody deleted, marked deleted in the tier that exists to
+# keep them, by a collection doing exactly what capped means.
+#
+# The remedy is the one the startup check already chose, for the reason written
+# at the top of collkind.go: the feeder stops, with the namespace named. A feeder
+# that carried on and skipped the namespace would mirror less than its
+# configuration says, and the router would answer reads of it from an archive
+# holding none of it.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+chk "neither tier holds it, so the feeder can start"    "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('tcap'))")"
+# Truncated first. A log file is appended to, so a previous run's refusal is
+# still in it, and both checks below then pass against a binary that never
+# refused anything: measured, exactly that, against the binary from before this.
+: > $LOGDIR/t_types_late.log
+cline feeder --config $CFG --log-file $LOGDIR/t_types_late.log &
+LATEFP=$!
+for _ in $(seq 1 40); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+chk "the feeder is running"                             "1" \
+    "$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)"
+# Created out of band, straight at the fast tier, which is how a tool or an
+# operator makes one. Through the router it is refused, and that refusal is
+# testddl.sh's.
+H "db.getSiblingDB(process.env.TC_DB).createCollection('tcap',{capped:true,size:4096})" >/dev/null
+H "for(let i=0;i<400;i++){db.getSiblingDB(process.env.TC_DB).tcap.insertOne({_id:i,pad:'x'.repeat(200)})}" >/dev/null
+sleep 8
+LATEHOT=$(H "print(db.getSiblingDB(process.env.TC_DB).tcap.countDocuments({}))")
+LATEDEAD=$(C "print(db.getSiblingDB(process.env.TC_DB).tcap.countDocuments({_tcDeletedAt:{\$exists:true}}))")
+echo "  the fast tier kept $LATEHOT of 400, the archive tombstoned $LATEDEAD"
+chk "the archive tombstoned none of them"               "0" "$LATEDEAD"
+# The refusal message, not the word "capped": the log names the namespace it is
+# mirroring at startup, and this collection is called tcap, so a grep for the
+# word passes whatever happens. A check that cannot fail is worse than no check.
+chk "the feeder stopped, saying why"                    "true" \
+    "$(grep -q "cannot be mirrored" $LOGDIR/t_types_late.log && echo true || echo false)"
+chk "and it named the collection and the kind"          "true" \
+    "$(grep -q "kind=\"a capped collection\"" $LOGDIR/t_types_late.log && echo true || echo false)"
+chk "and it is not still mirroring"                     "0" \
+    "$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+wait $LATEFP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
+
 echo "== the same collection, capped on the archive instead =="
 # Which tier holds the collection depends on where the deployment is in its
 # life. Ordinarily the application's collections are on the fast tier and the

@@ -218,8 +218,17 @@ func joinedCollections(stages []bson.RawValue, db string, depth int) ([]string, 
 		switch name {
 		case "$lookup", "$graphLookup":
 			d := subDoc(val)
-			if from, ok := stringField(d, "from"); ok {
-				out = append(out, db+"."+from)
+			// A $lookup may legitimately carry no from at all: the form whose
+			// pipeline begins with $documents reads nothing. One that carries a
+			// from this cannot read is the other case, and it is the dangerous
+			// one, so it is reported as a scope that did not reach the bottom
+			// rather than as a stage that joins nothing.
+			if fv, ferr := d.LookupErr("from"); ferr == nil {
+				if from, ok := fv.StringValueOK(); ok {
+					out = append(out, db+"."+from)
+				} else {
+					complete = false
+				}
 			}
 			if pv, perr := d.LookupErr("pipeline"); perr == nil {
 				sub(pv)
@@ -231,8 +240,12 @@ func joinedCollections(stages []bson.RawValue, db string, depth int) ([]string, 
 				break
 			}
 			d := subDoc(val)
-			if from, ok := stringField(d, "coll"); ok {
-				out = append(out, db+"."+from)
+			if cv, cerr := d.LookupErr("coll"); cerr == nil {
+				if from, ok := cv.StringValueOK(); ok {
+					out = append(out, db+"."+from)
+				} else {
+					complete = false
+				}
 			}
 			if pv, perr := d.LookupErr("pipeline"); perr == nil {
 				sub(pv)
