@@ -450,18 +450,18 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 			continue
 		}
 		nvals := sh.newKeyValues(idx, doc, st.filter)
-		kid, kok := keyIDFromValues(ns, idx, nvals)
-		if !kok {
-			continue
+		// Every key the post-image takes. See multikey.go.
+		kids, tuples := valueKeys(ns, idx, nvals)
+		for k, kid := range kids {
+			got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, tuples[k])
+			if terr != nil {
+				return false, claimed, terr
+			}
+			if !got {
+				return true, claimed, nil
+			}
+			claimed = append(claimed, kid)
 		}
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, nvals)
-		if terr != nil {
-			return false, claimed, terr
-		}
-		if !got {
-			return true, claimed, nil
-		}
-		claimed = append(claimed, kid)
 	}
 
 	// Nothing matched. An upsert is still about to create a document, and that
@@ -471,19 +471,18 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 			return false, claimed, nil
 		}
 		nvals := sh.newKeyValues(idx, nil, st.filter)
-		kid, kok := keyIDFromValues(ns, idx, nvals)
-		if !kok {
-			return false, claimed, nil
-		}
+		kids, tuples := valueKeys(ns, idx, nvals)
 		owner, _ := lookupPath(st.filter, "_id")
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, owner, nvals)
-		if terr != nil {
-			return false, claimed, terr
+		for k, kid := range kids {
+			got, terr := c.r.tryClaim(ctx, ns, idx, kid, owner, tuples[k])
+			if terr != nil {
+				return false, claimed, terr
+			}
+			if !got {
+				return true, claimed, nil
+			}
+			claimed = append(claimed, kid)
 		}
-		if !got {
-			return true, claimed, nil
-		}
-		claimed = append(claimed, kid)
 	}
 	return false, claimed, nil
 }
@@ -637,19 +636,18 @@ func (c *conn) claimEvaluated(ctx context.Context, ns string, idx uniqueIndex, d
 		if !c.r.constrains(ctx, dbName, idx, doc) {
 			continue
 		}
-		kid, ok := keyID(ns, idx, doc)
-		if !ok {
-			continue
-		}
 		id, _ := doc.LookupErr("_id")
-		got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, keyValues(idx, doc))
-		if terr != nil {
-			return false, claimed, terr
+		kids, tuples := docKeys(ns, idx, doc)
+		for k, kid := range kids {
+			got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, tuples[k])
+			if terr != nil {
+				return false, claimed, terr
+			}
+			if !got {
+				return true, claimed, nil
+			}
+			claimed = append(claimed, kid)
 		}
-		if !got {
-			return true, claimed, nil
-		}
-		claimed = append(claimed, kid)
 	}
 	return false, claimed, nil
 }

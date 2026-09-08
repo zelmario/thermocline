@@ -463,6 +463,55 @@ chk "a pipeline update onto an evicted key rejected" "11000" "$(R 'try{db.getSib
 chk "a pipeline update to a free value works" "ok"  "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkeval2.updateOne({_id:3},[{$set:{email:"fresh@x.com"}}]);print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and the dry run left nothing behind"  "1"    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkeval2.countDocuments({email:"fresh@x.com"}))')"
 
+echo "== a unique index on a field that holds an array =="
+# Such an index is multikey: mongod makes one entry per element, so no two
+# documents may share *any* element. The registry computed one key from one
+# document's value of the field, and an array is one value to it, so two
+# documents sharing an element had different keys as far as it was concerned.
+#
+# While both are on the fast tier mongod catches the duplicate itself. Once one
+# has been evicted, nothing does. Measured before this: the router accepted the
+# second document, the fast tier accepted it, and the archive refused the
+# mirrored insert with E11000 dup key { tags: "y" }. The feeder writes such a
+# document off rather than retrying a write that can never succeed, so what is
+# left is a document on the fast tier that is not in the archive and that the
+# evictor will not remove, because the archive cannot confirm it.
+fresh tkarr '{tags:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkarr.insertOne({_id:1,tags:["x","y"]})' >/dev/null
+waitMirrored tkarr 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkarr.deleteOne({_id:1})'
+chk "the archive holds the evicted document"   "true" \
+    "$(C 'const d=db.getSiblingDB(process.env.TC_DB).tkarr.findOne({_id:1}); print(!!d && !d._tcDeletedAt)')"
+chk "and the fast tier does not"               "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({}))')"
+chk "a document sharing one element rejected"  "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarr.insertOne({_id:2,tags:["y","z"]});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and the fast tier did not take it"      "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({_id:2}))')"
+# The other half, or this is a guard that refuses everything: a document whose
+# elements are all free has to be allowed.
+chk "a document sharing no element is allowed" "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarr.insertOne({_id:3,tags:["p","q"]});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and it reaches the archive"             "1" \
+    "$(waitMirrored tkarr 2 >/dev/null; C 'print(db.getSiblingDB(process.env.TC_DB).tkarr.countDocuments({_id:3,_tcDeletedAt:{$exists:false}}))')"
+
+echo "== a unique index on a path that crosses an array =="
+# The quieter half of the same mistake, and it points the other way. The driver
+# answers "element not found" for a path that crosses an array, so every such
+# document was keyed as null and the first one to arrive claimed that key for
+# the whole namespace. Every insert after it was refused as a duplicate of a
+# document it has nothing in common with.
+#
+# Nothing has to be archived to show it, which is why it went unnoticed: it is a
+# refusal rather than a wrong answer, and a refusal reads as the guard working.
+fresh tkarrp '{"items.sku":1}'
+chk "the first document is allowed"            "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarrp.insertOne({_id:1,items:[{sku:"a"}]});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and a second with a different sku too"    "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarrp.insertOne({_id:2,items:[{sku:"b"}]});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "while one that shares a sku is refused"   "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkarrp.insertOne({_id:3,items:[{sku:"a"}]});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== a unique index created on a running router is enforced at once =="
 # The cache that remembers a namespace's unique indexes has to be dropped when
 # the indexes change, or the constraint goes unenforced across tiers until it

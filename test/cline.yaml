@@ -141,6 +141,11 @@ feeder:
     - "shop.tkddl"
     - "shop.tkeval"
     - "shop.tkeval2"
+    # testkeys.sh: a unique index on a field that holds an array, which is
+    # multikey, and one on a path that crosses an array. Their own collections
+    # because the router caches a namespace's unique indexes.
+    - "shop.tkarr"
+    - "shop.tkarrp"
     - "shop.rollup"
     - "shop.merged"
     # testaggwrite.sh: the input and the target of an $out whose reading half

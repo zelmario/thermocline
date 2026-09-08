@@ -68,19 +68,25 @@ func (c *conn) guardMergeKeys(ctx context.Context, msg *wire.Message, ns, db str
 			if !c.r.constrains(ctx, db, idxs[i], result) {
 				continue
 			}
-			kid, ok := keyID(ns, idxs[i], result)
-			if !ok {
-				continue
-			}
-			got, terr := c.r.tryClaim(ctx, ns, idxs[i], kid, owner, keyValues(idxs[i], result))
-			if terr != nil {
-				c.r.releaseKeys(ctx, claimed)
-				c.log.Warn("could not check a $merge against the key registry, letting it through",
-					"ns", ns, "err", terr)
-				return nil, false
-			}
-			if got {
+			// Every key the result takes, not one. A field holding an array
+			// puts one entry per element into the index. See multikey.go.
+			kids, tuples := docKeys(ns, idxs[i], result)
+			taken := true
+			for k, kid := range kids {
+				got, terr := c.r.tryClaim(ctx, ns, idxs[i], kid, owner, tuples[k])
+				if terr != nil {
+					c.r.releaseKeys(ctx, claimed)
+					c.log.Warn("could not check a $merge against the key registry, letting it through",
+						"ns", ns, "err", terr)
+					return nil, false
+				}
+				if !got {
+					taken = false
+					break
+				}
 				claimed = append(claimed, kid)
+			}
+			if taken {
 				continue
 			}
 			c.r.releaseKeys(ctx, claimed)

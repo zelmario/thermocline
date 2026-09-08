@@ -964,6 +964,33 @@ Refusals use mongod's code 13, so a driver sees the error it already handles.
 
 ### Unique indexes
 
+**A field that holds an array is indexed once per element**, which is what
+multikey means, so no two documents may share *any* element. The registry claims
+one key per element for exactly that reason, and every path that claims a key
+claims all of them: the insert batch, the update post-image, `$merge`, `$out` and
+`cline keys --rebuild`.
+
+Reading one value per document was wrong in both directions and neither showed
+up as the other. A document holding `["x","y"]` mirrored and then evicted, and a
+second holding `["y","z"]`: the router accepted it, the fast tier accepted it,
+and the archive refused the mirrored insert with `E11000 dup key { tags: "y" }`,
+leaving a document on the fast tier that the archive does not have and the
+evictor will not remove. And a unique index on a path that crosses an array,
+`items.sku`, could not be looked up at all — the driver answers "element not
+found" — so every such document keyed as null, the first one claimed that key for
+the namespace, and every insert after it was refused as a duplicate of a document
+it has nothing in common with. A wrong answer and a false refusal from one
+missing idea.
+
+The rules are mongod's and they are pinned by unit tests: one entry per element,
+duplicates within a document collapse to one key, an empty array indexes as
+`undefined` and two of them collide, an array inside an array is a value rather
+than another level, an element missing the path indexes as null, and a compound
+index takes the array from one field and the scalar from the other. Two array
+fields in one compound index is what mongod calls parallel arrays and refuses, so
+nothing is claimed for it: the write fails on the fast tier before any of this
+matters.
+
 A unique index only constrains the documents it can see. Evicting a document
 takes its index entry with it, so the fast tier stops knowing that value was
 ever used and a later insert of the same key succeeds. Nothing errors, and the

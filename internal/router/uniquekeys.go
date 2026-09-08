@@ -289,28 +289,11 @@ func indexDDL(cmd bson.Raw, name string) (string, bool) {
 	return "", false
 }
 
-// keyID builds the registry id for one document's value of one index.
-//
-// A missing field is indexed as null by MongoDB, so it is encoded as null here
-// too, or two documents both missing the field would look like different keys
-// and both be allowed.
-func keyID(ns string, idx uniqueIndex, doc bson.Raw) (string, bool) {
-	return keyIDFromValues(ns, idx, keyValues(idx, doc))
-}
-
-// keyValues reads one document's value of each of an index's fields, in order.
-// A nil entry means the field is absent, which MongoDB indexes as null.
-func keyValues(idx uniqueIndex, doc bson.Raw) []any {
-	vals := make([]any, len(idx.fields))
-	for i, f := range idx.fields {
-		val, err := doc.LookupErr(strings.Split(f, ".")...)
-		if err != nil {
-			continue // absent, which is a null key
-		}
-		vals[i] = val
-	}
-	return vals
-}
+// A document's registry ids are docKeys, in multikey.go. There is no
+// single-key form here on purpose: a field holding an array puts one entry per
+// element into the index, and every path that claims a key has to claim all of
+// them. The one that read a single value per document let a duplicate of an
+// archived document through, and the archive then refused the mirrored insert.
 
 // keyIDFromValues builds the same id from field values worked out some other
 // way, which is what the update path has to do: the document that will hold the
@@ -418,13 +401,14 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 			if !covered[i][d] {
 				continue
 			}
-			kid, ok := keyID(ns, idxs[i], doc)
-			if !ok {
-				continue
+			// One candidate per key, not per document. A field holding an
+			// array puts one entry per element into the index. See multikey.go.
+			kids, tuples := docKeys(ns, idxs[i], doc)
+			for k, kid := range kids {
+				cands = append(cands, claimCandidate{
+					doc: d, idx: i, kid: kid, owner: id, vals: tuples[k],
+				})
 			}
-			cands = append(cands, claimCandidate{
-				doc: d, idx: i, kid: kid, owner: id, vals: keyValues(idxs[i], doc),
-			})
 		}
 	}
 	if len(cands) == 0 {
@@ -684,11 +668,18 @@ func (r *Router) stillHoldsKey(ctx context.Context, ns string, idx uniqueIndex, 
 	if !r.constrains(ctx, dbName, idx, doc) {
 		return false
 	}
-	got, ok := keyID(ns, idx, doc)
-	if !ok {
+	kids, _ := docKeys(ns, idx, doc)
+	if len(kids) == 0 {
 		return true
 	}
-	return got == kid
+	// Among, not equal to. A document with an array holds one key per element,
+	// and it still holds this one while that element is in it.
+	for _, got := range kids {
+		if got == kid {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseKeys undoes claims after an insert that did not land.
@@ -1059,28 +1050,33 @@ func (r *Router) RebuildKeys(ctx context.Context, namespaces []string) (map[stri
 					if !r.constrains(ctx, db, idxs[i], doc) {
 						continue
 					}
-					kid, ok := keyID(ns, idxs[i], doc)
-					if !ok {
-						continue
-					}
-					_, ierr := r.keys().InsertOne(ctx, keyClaim{
-						ID: kid, NS: ns, Index: idxs[i].name, Doc: id, At: time.Now().UTC(),
-					})
-					switch {
-					case ierr == nil:
-						claimed[ns]++
-					case mongo.IsDuplicateKeyError(ierr):
-						// Already claimed. Only a different owner is a conflict;
-						// the same document seen in both tiers is expected.
-						var existing keyClaim
-						if derr := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&existing); derr == nil {
-							if !existing.Doc.Equal(id) {
-								conflicts[ns]++
+					// One row per key, because a field holding an array puts
+					// one entry per element into the index. A rebuild that
+					// claimed one of them left the rest of that document's
+					// values unprotected, which is what --rebuild exists to
+					// stop. See multikey.go.
+					kids, _ := docKeys(ns, idxs[i], doc)
+					for _, kid := range kids {
+						_, ierr := r.keys().InsertOne(ctx, keyClaim{
+							ID: kid, NS: ns, Index: idxs[i].name, Doc: id, At: time.Now().UTC(),
+						})
+						switch {
+						case ierr == nil:
+							claimed[ns]++
+						case mongo.IsDuplicateKeyError(ierr):
+							// Already claimed. Only a different owner is a
+							// conflict; the same document seen in both tiers is
+							// expected.
+							var existing keyClaim
+							if derr := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&existing); derr == nil {
+								if !existing.Doc.Equal(id) {
+									conflicts[ns]++
+								}
 							}
+						default:
+							_ = cur.Close(context.WithoutCancel(ctx))
+							return claimed, conflicts, ierr
 						}
-					default:
-						_ = cur.Close(context.WithoutCancel(ctx))
-						return claimed, conflicts, ierr
 					}
 				}
 			}
@@ -1405,7 +1401,8 @@ func (r *Router) pruneClaims(ctx context.Context, ns string, idx uniqueIndex, cl
 			if !r.constrains(ctx, db, idx, doc) {
 				continue
 			}
-			if kid, ok := keyID(ns, idx, doc); ok {
+			kids, _ := docKeys(ns, idx, doc)
+			for _, kid := range kids {
 				held[kid] = true
 			}
 		}

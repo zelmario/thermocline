@@ -6,6 +6,17 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
+// onlyKeyID is the single key a document with no arrays takes, which is what
+// every case in this file is about. Production code uses docKeys, because a
+// document with an array takes one key per element: see multikey.go.
+func onlyKeyID(ns string, idx uniqueIndex, doc bson.Raw) (string, bool) {
+	kids, _ := docKeys(ns, idx, doc)
+	if len(kids) != 1 {
+		return "", false
+	}
+	return kids[0], true
+}
+
 // The same whole number written four ways is one key, because that is what
 // mongod's unique index makes of it.
 func TestKeyIDIsOneKeyPerWholeNumber(t *testing.T) {
@@ -20,7 +31,7 @@ func TestKeyIDIsOneKeyPerWholeNumber(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, ok := keyID("shop.tknum", idx, bson.Raw(raw))
+		got, ok := onlyKeyID("shop.tknum", idx, bson.Raw(raw))
 		if !ok {
 			t.Fatalf("%T: no key", v)
 		}
@@ -42,7 +53,7 @@ func TestKeyIDKeepsDifferentNumbersApart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, ok := keyID("shop.tknum", idx, bson.Raw(raw))
+		got, ok := onlyKeyID("shop.tknum", idx, bson.Raw(raw))
 		if !ok {
 			t.Fatalf("%v: no key", v)
 		}
@@ -63,7 +74,7 @@ func TestKeyIDLeavesStringsAlone(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, _ := keyID("shop.tknum", idx, bson.Raw(raw))
+		got, _ := onlyKeyID("shop.tknum", idx, bson.Raw(raw))
 		ids = append(ids, got)
 	}
 	if ids[0] == ids[1] {
