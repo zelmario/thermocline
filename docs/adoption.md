@@ -108,6 +108,10 @@ already in it starts with none of them claimed. It reads the constraint from the
 fast tier's unique indexes, which the router builds there at startup, so run it
 after the router has been up once.
 
+This step is about the indexes the adoption brought with it, which no router was
+running when they were created. A unique index created *later*, through a
+router, claims the existing documents' keys itself.
+
 Run it again after upgrading past 0.1.0-dev if any of your unique keys are
 numbers. A key is derived from the value, and whole numbers are now derived the
 way mongod compares them, so int, long, double and decimal 7 arrive at one key

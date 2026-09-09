@@ -100,6 +100,9 @@ type Router struct {
 
 	wmCache  watermarkCache
 	idxCache indexCache
+	// backfill is which namespaces are having the keys of their existing
+	// documents claimed after a new unique index. See newuniqueindex.go.
+	backfill keyBackfill
 	brackets bracketCache
 
 	// warnedKillCursor keeps the privilege warning in superseded.go to one per
@@ -1097,7 +1100,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// a field unique.
 	if cmd, cerr := msg.CommandDoc(); cerr == nil {
 		if coll, ok := indexDDL(cmd, name); ok {
-			c.r.forgetIndexes(db + "." + coll)
+			// Stale rather than forgotten, and then read again on purpose.
+			// Forgetting leaves nothing for the next listing to be compared
+			// against, and that comparison is what notices a unique index has
+			// gone: it is what says so in the log and what releases the claims
+			// the index made. Reading it here rather than leaving it to the
+			// next write, because a dropIndexes is often the last thing an
+			// operator does to a collection for a while.
+			c.r.staleIndexes(db + "." + coll)
+			c.r.refreshIndexes(db + "." + coll)
 			c.r.forgetHint(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
 			// And tell the other routers, which have no other way to hear it:
@@ -1115,6 +1126,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 						"action", "run cline keys --rebuild, or restart the routers to have it "+
 							"enforced everywhere at once")
 				}
+			}
+			// A unique index the fast tier has just built covers nothing in the
+			// archive, and the archive is where the documents this constraint
+			// needs help with are. See newuniqueindex.go.
+			if name == "createIndexes" {
+				c.backfillNewUniqueKeys(ctx, db+"."+coll, msg, reply)
 			}
 			// drop and create are the two that change which collection lives
 			// under a name, and either half can arrive here without the other:

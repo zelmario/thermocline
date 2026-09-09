@@ -266,6 +266,7 @@ func (r *Router) noteFastTierIndexDDL(ns, op string) {
 		return
 	}
 	r.staleIndexes(ns)
+	r.refreshIndexes(ns)
 	r.forgetHint(ns)
 	r.log.Debug("the indexes changed on the fast tier, re-reading them on the next write",
 		"ns", ns, "op", op)

@@ -627,6 +627,83 @@ sleep 3
 chk "a collection rebuilt without the index does not keep it" "ok" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:4,email:"held@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,60))}')"
 
+echo
+echo "== a new unique index has to cover what is already in the archive =="
+#
+# The documents in the archive are the only ones the constraint needs help with:
+# the fast tier's own index enforces itself over what the fast tier holds. None
+# of them was ever written through a router that knew about this index, so until
+# now none of their keys was claimed, and the rollout list saying to run
+# cline keys --rebuild afterwards was the whole of the protection.
+#
+# The index is created after the document is archived, which is the order that
+# matters. The other way round is the ordinary write path and was never in doubt.
+fresh tkgone ''
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+waitMirrored tkgone 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkgone.deleteOne({_id:1})'
+chk "the document is in the archive and not on the fast tier" "0/1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkgone.countDocuments({}))')/$(C 'print(db.getSiblingDB(process.env.TC_DB).tkgone.countDocuments({_tcDeletedAt:{$exists:false}}))')"
+# Emptied by hand rather than waited for. A document archived before the index
+# existed has no claim, and that is the state this section is about; leaving it
+# to the previous section'"'"'s leftovers and to whether a change stream event has
+# landed yet would make the precondition a race rather than a statement.
+H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+".tkgone"})' >/dev/null
+chk "  and nothing has claimed its key"                  "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')"
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({email:1},{unique:true,name:"u_email"})' >/dev/null
+# The walk is in the background: the client'"'"'s createIndexes is answered first,
+# because waiting for it would turn a command that returns in a second into one
+# that returns in minutes.
+for _ in $(seq 1 60); do
+  [ "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')" != "0" ] && break
+  sleep 0.5
+done
+chk "creating the unique index claims its key"           "1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')"
+chk "  so a duplicate of the archived document is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:2,email:"held@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and nothing of it reached the fast tier"          "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkgone.countDocuments({_id:2}))')"
+
+# An ordinary index build must not walk the archive. A driver that re-declares
+# its indexes on every start would otherwise scan the whole collection on every
+# start, for a constraint it is not creating.
+WALKWAS=$(grep -c 'claiming the keys of the documents already there' $LOGDIR/keys_r.log 2>/dev/null || true)
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({grp:1},{name:"plain_grp"})' >/dev/null
+sleep 2
+WALKNOW=$(grep -c 'claiming the keys of the documents already there' $LOGDIR/keys_r.log 2>/dev/null || true)
+chk "an index that is not unique starts no walk"         "0" "$((WALKNOW-WALKWAS))"
+
+echo
+echo "== dropping a unique index releases the claims it made =="
+#
+# Claims are permanent on purpose, and that reasoning is about documents: a
+# deleted document leaves its row behind and the row is resolved when something
+# collides with it. For an index that has been dropped the row is a claim about
+# a constraint that no longer exists.
+#
+# Leaving them is worse than useless because index names are reused. Create the
+# same index again and the rows are already there, so the walk that follows can
+# insert none of them and the documents that really hold those keys never get a
+# row. Their keys then read as free. The fuzzer needed nine rounds of a hundred
+# and twenty operations to build that state.
+fresh tkgone '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+waitMirrored tkgone 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkgone.deleteOne({_id:1})'
+claimsFor() { H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone",idx:"email_1"}))'; }
+chk "the archived document holds a claim"                "1" "$(claimsFor)"
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.dropIndex("email_1")' >/dev/null
+# The release is in the background, off the path of the command that caused it.
+for _ in $(seq 1 40); do [ "$(claimsFor)" = "0" ] && break; sleep 0.5; done
+chk "  dropping the index releases them"                 "0" "$(claimsFor)"
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({email:1},{unique:true,name:"email_1"})' >/dev/null
+for _ in $(seq 1 60); do [ "$(claimsFor)" != "0" ] && break; sleep 0.5; done
+chk "  and creating it again claims the key afresh"      "1" "$(claimsFor)"
+chk "  so a duplicate of the archived document is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:2,email:"held@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"

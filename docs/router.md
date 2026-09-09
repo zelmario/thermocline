@@ -984,6 +984,45 @@ one key per element for exactly that reason, and every path that claims a key
 claims all of them: the insert batch, the update post-image, `$merge`, `$out` and
 `cline keys --rebuild`.
 
+**Creating the index claims the keys of the documents already there.** The
+documents in the archive are the only ones the constraint needs help with -- the
+fast tier's own index enforces itself over what the fast tier holds -- and none
+of them was ever written through a router that knew about this index. Until the
+router did this itself, the whole of the protection was a line in the rollout
+list saying to run `cline keys --rebuild` afterwards. Measured with the index
+created after the document was archived: the archive holds `held@x.com`, and an
+insert of a second `held@x.com` was **accepted**. It is a walk of both tiers, so
+it runs in the background and the createIndexes is answered first; the log says
+when it starts, how many keys it claimed and how long it took. While it runs the
+constraint is enforced over what it has reached and not yet over the rest, which
+is a bounded window where there was none.
+
+It runs only on the router that took the command, only for a `createIndexes`
+that asks for `unique: true`, and only when the reply says an index was actually
+built. `cline keys --rebuild` is still the answer for an index created out of
+band, for a fast tier rebuilt from nothing, and for a cluster adopted with data
+already in it.
+
+**Dropping the index releases the claims it made.** Claims are permanent on
+purpose -- a deleted document leaves its row behind, and the row is resolved
+when something collides with it -- and that reasoning is about documents. For an
+index that has been dropped the row is a claim about a constraint that no longer
+exists.
+
+Leaving them is not merely untidy, because index names are derived from the key
+and the options and are therefore reused. Create the same index again and its
+rows are already there, so the walk that follows can insert none of them, and
+the documents that really hold those keys never get a row. Their keys then read
+as free: an update moved onto `{ items.sku: "s9", n: 34 }`, the row for it named
+a document that had long since moved off that value, the claim was judged stale
+and taken over, and the archived document that really held it was never asked
+about. mongod refused the same write on an untiered copy. The fuzzer needed nine
+rounds of a hundred and twenty operations to build that state.
+
+The release is driven by the listing rather than by parsing a `dropIndexes`, so
+an index dropped out of band releases its claims too, and it is the same
+comparison that reports a constraint has gone.
+
 Reading one value per document was wrong in both directions and neither showed
 up as the other. A document holding `["x","y"]` mirrored and then evicted, and a
 second holding `["y","z"]`: the router accepted it, the fast tier accepted it,

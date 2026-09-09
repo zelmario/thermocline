@@ -283,6 +283,7 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 				"fast tier's own index cannot see and so cannot refuse",
 			"action", "if this was not deliberate, recreate the index; the archive's copies of "+
 				"the documents are still there and cline keys --rebuild will find any duplicates")
+		r.releaseIndexClaims(ns, gone)
 	}
 
 	r.idxCache.mu.Lock()
@@ -295,6 +296,79 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	r.idxCache.mu.Unlock()
 	return found
 }
+
+// refreshIndexes reads a namespace's unique indexes again, off the path of
+// whatever caused them to change.
+//
+// The reading is the point rather than the answer: uniqueIndexes is where a
+// listing is compared with the one before it, and that comparison is what
+// notices an index has gone. Left to the next write, a collection nobody writes
+// to keeps rows for a constraint that no longer exists, and keeps them exactly
+// until somebody creates an index of the same name again -- which is the state
+// that produced the wrong answer below.
+func (r *Router) refreshIndexes(ns string) {
+	if !r.cfg.Manages(ns) {
+		return
+	}
+	r.goSafely("re-reading the unique indexes after a change to them", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), releaseClaimsLimit)
+		defer cancel()
+		r.uniqueIndexes(ctx, ns)
+	})
+}
+
+// releaseIndexClaims deletes the registry rows for indexes that no longer exist.
+//
+// Claims are permanent on purpose: a deleted document leaves its row behind, and
+// the row is resolved lazily when something collides with it. That reasoning is
+// about documents. For an index that has been dropped the row is not a claim any
+// more, it is a claim about a constraint that no longer exists, and leaving it
+// is worse than useless.
+//
+// The fuzzer showed why, and it took nine rounds. Index names here are derived
+// from the key and the options, so dropping fz_sku_n_u_pgrp and creating it
+// again produces the same name and the same key ids. The rows from the first
+// incarnation were still there, so the rebuild that follows the new index could
+// insert none of them -- every one a duplicate -- and the documents that
+// actually held those keys never got a row. Their keys then read as free: an
+// update moved onto { items.sku: "s9", n: 34 }, the row for it named a document
+// that had long since moved off that value, the claim was judged stale and
+// taken over, and the archived document that really holds it was never asked
+// about. mongod refused the same write on an untiered copy.
+//
+// Driven by the listing rather than by parsing a dropIndexes, because the same
+// thing has to happen for an index dropped out of band, and the listing is the
+// one place that learns about both.
+//
+// In the background: it is a write to the registry, it happens when an index is
+// dropped rather than on the write path, and the caller is a read that a client
+// is waiting on.
+func (r *Router) releaseIndexClaims(ns string, indexes []string) {
+	r.goSafely("releasing the claims of a dropped unique index", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), releaseClaimsLimit)
+		defer cancel()
+		res, err := r.keys().DeleteMany(ctx, bson.D{
+			{Key: "ns", Value: ns},
+			{Key: "idx", Value: bson.D{{Key: "$in", Value: indexes}}},
+		})
+		if err != nil {
+			r.log.Warn("could not release the claims of a unique index that no longer exists",
+				"ns", ns, "indexes", indexes, "err", err,
+				"effect", "if an index of the same name is created again, its rows are already "+
+					"there and name documents that may no longer hold those keys",
+				"action", "run cline keys --prune, or cline keys --rebuild after recreating it")
+			return
+		}
+		if res.DeletedCount > 0 {
+			r.log.Info("released the claims of a unique index that no longer exists",
+				"ns", ns, "indexes", indexes, "rows", res.DeletedCount)
+		}
+	})
+}
+
+// releaseClaimsLimit bounds that delete. A registry this cannot clear in a
+// minute is one for cline keys --prune to deal with deliberately.
+const releaseClaimsLimit = time.Minute
 
 // missingFrom names the unique indexes in was that are not in now.
 func missingFrom(was, now []uniqueIndex) []string {
