@@ -419,12 +419,12 @@ H "db.getSiblingDB(process.env.TC_DB).tkcoll2.createIndex({email:1},{unique:true
 # counts a line an earlier run of this suite wrote; and the guard runs on every
 # insert into a collection with a unique index, so the first one is already
 # where the warning happens.
-WAS=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || echo 0)
+WAS=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || true)
 R 'db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:1,email:"Ann@x.com"})' >/dev/null
 waitMirrored tkcoll2 1
 evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteOne({_id:1})'
 chk "with no index on the archive, another spelling lands" "ACCEPTED" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:2,email:"ann@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
-NOW=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || echo 0)
+NOW=$(grep -c 'not enforcing a collated unique index' $LOGDIR/keys_r.log 2>/dev/null || true)
 chk "and the router said so, once and not twice"            "1"        "$((NOW-WAS))"
 # The remedy, on the archive, without restarting anything.
 C "db.getSiblingDB(process.env.TC_DB).tkcoll2.createIndex({email:1},{collation:{locale:'en',strength:2}})" >/dev/null
@@ -587,6 +587,45 @@ chk "  while a free value still goes through"    "ok" \
 chk "  and it said why it re-read them"          "true" \
     "$(grep -q 'another router changed the unique indexes here' $LOGDIR/keys_r2.log && echo true || echo false)"
 kill $RP2 2>/dev/null; wait $RP2 2>/dev/null
+
+echo
+echo "== a unique index that no longer exists must not still be enforced =="
+#
+# The router reads the fast tier's unique indexes and remembers the listing for
+# a minute. Two ways it goes stale without the router being told, and both used
+# to end in a duplicate key error naming an index that exists on neither tier:
+# an insert plain mongod accepts, refused with 11000.
+#
+# Out of band on purpose. A dropIndex or a drop forwarded through the router is
+# already handled where it is forwarded; the ones worth testing are the ones
+# nothing forwards, which is what an operator on the mongod does and what
+# resetting an environment does.
+fresh tkgone '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+chk "with the index there, a duplicate is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:2,email:"held@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# Counted rather than grepped: the router appends to this log across restarts,
+# so a total also counts a line an earlier run of this suite wrote, and the
+# check would then pass against a binary that says nothing.
+GONEWAS=$(grep -c 'is gone from the fast tier, so it is no longer enforced' $LOGDIR/keys_r.log 2>/dev/null || true)
+H 'db.getSiblingDB(process.env.TC_DB).tkgone.dropIndex("email_1")' >/dev/null
+sleep 3
+chk "  the index is gone from the fast tier"      "_id_" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkgone.getIndexes().map(i=>i.name).join(","))')"
+chk "  so the same insert is accepted, as mongod would" "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:3,email:"held@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,60))}')"
+GONENOW=$(grep -c 'is gone from the fast tier, so it is no longer enforced' $LOGDIR/keys_r.log 2>/dev/null || true)
+chk "  and it said the constraint had gone"       "1" "$((GONENOW-GONEWAS))"
+
+# The other half: the whole collection dropped and rebuilt without the index,
+# which is what the fuzzer's own reseed does and what found this.
+fresh tkgone '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+H 'const c=db.getSiblingDB(process.env.TC_DB).tkgone; c.drop(); c.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+C 'const c=db.getSiblingDB(process.env.TC_DB).tkgone; c.drop(); c.insertOne({_id:1,email:"held@x.com"})' >/dev/null
+sleep 3
+chk "a collection rebuilt without the index does not keep it" "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:4,email:"held@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,60))}')"
 
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo

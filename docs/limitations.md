@@ -397,6 +397,28 @@ Part of [Thermocline](../README.md).
   moves the result in with ordinary inserts, which is the only difference from
   mongod, and claims its unique keys so the registry still holds them once those
   documents are evicted.
+- **Dropping a tiered collection on the fast tier ends its unique constraints,
+  and the router says so rather than pretending.** The router enforces a unique
+  index across the tiers by reading the fast tier's listing, so a collection
+  dropped out of band takes the index with it: the next write recreates the
+  collection bare, and neither tier carries the constraint any more. The archive
+  still holds every document it covered, and nothing stops a write duplicating
+  one of their keys.
+
+  It used to hold on to the listing for a minute after a drop, which read like
+  protection and was not: the listing expires on its own, so the constraint was
+  going to be lost a minute later either way. What that minute did produce was a
+  false refusal. A collection dropped and rebuilt out of band — resetting an
+  environment, restoring a fixture — does not have the old collection's unique
+  index, and the router refused writes on its behalf with a duplicate key error
+  naming an index that exists on neither tier. The fuzzer found it after four
+  rounds, because its own reseed is that shape.
+
+  So the constraint is dropped as soon as the fast tier says it is gone, and the
+  router logs which index it stopped enforcing, what that allows and what to do
+  about it. If the drop was not deliberate, recreate the index and run
+  `cline keys --rebuild`, which reports any duplicates that got in.
+
 - **A collection of a kind that cannot be mirrored stops the feeder, whenever it
   appears.** Capped, time series and queryable-encryption collections are
   refused at startup, and the reasons are in `internal/feeder/collkind.go`: a

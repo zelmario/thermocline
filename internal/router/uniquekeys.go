@@ -200,10 +200,16 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 
 	db, coll := splitNS(ns)
 	found := []uniqueIndex{}
+	// listed counts every index, _id_ included, and is how this tells an
+	// absent collection from one that simply has no unique index. Every
+	// collection has _id_, so a listing that names nothing at all is a
+	// collection that is not there.
+	listed := 0
 	cur, err := r.hot.Database(db).Collection(coll).Indexes().List(ctx)
 	if err == nil {
 		defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 		for cur.Next(ctx) {
+			listed++
 			var spec struct {
 				Name                    string   `bson:"name"`
 				Unique                  bool     `bson:"unique"`
@@ -234,6 +240,49 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 			}
 			found = append(found, ui)
 		}
+		err = cur.Err()
+	}
+
+	// A listing nobody managed to read must not replace what is remembered.
+	//
+	// It used to. The error branch stored an empty slice and stamped it as
+	// fresh, so one unreachable moment on the fast tier -- an election, a
+	// dropped connection -- turned into a full minute of believing this
+	// collection has no unique index, and for that minute nothing stopped a
+	// write duplicating a key an archived document holds. Silently: an empty
+	// listing produces no refusals and no log line, and the router looks like
+	// it is working.
+	//
+	// listed counts _id_ as well, so nothing at all means the collection is not
+	// there rather than there with no unique index, and that is not an answer
+	// either. fetched is left alone in both cases, so the next write tries again
+	// rather than waiting out the refresh interval on an answer nobody got.
+	if err != nil || listed == 0 {
+		if err != nil {
+			r.log.Warn("could not list the unique indexes, keeping the previous listing",
+				"ns", ns, "err", err, "remembered", len(cached),
+				"effect", "uniqueness is enforced across the tiers from what was last read, "+
+					"which is right if the indexes have not changed and stale if they have")
+		}
+		return cached
+	}
+
+	// A unique index this router was enforcing is gone from the fast tier.
+	//
+	// Said out loud, because it is the end of a guarantee and nothing else
+	// would mention it. The usual cause is the collection being dropped: the
+	// next write recreates it bare, and the constraint the application declared
+	// is not on either tier any more. The router stops enforcing it, which is
+	// the honest thing to do -- it would refuse writes mongod accepts otherwise
+	// -- and this is the only trace.
+	if gone := missingFrom(cached, found); len(gone) > 0 {
+		r.log.Warn("a unique index this router was enforcing across the tiers is gone from the "+
+			"fast tier, so it is no longer enforced",
+			"ns", ns, "indexes", gone,
+			"effect", "a write may now duplicate a key an archived document holds, which the "+
+				"fast tier's own index cannot see and so cannot refuse",
+			"action", "if this was not deliberate, recreate the index; the archive's copies of "+
+				"the documents are still there and cline keys --rebuild will find any duplicates")
 	}
 
 	r.idxCache.mu.Lock()
@@ -245,6 +294,24 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	r.idxCache.fetched[ns] = time.Now()
 	r.idxCache.mu.Unlock()
 	return found
+}
+
+// missingFrom names the unique indexes in was that are not in now.
+func missingFrom(was, now []uniqueIndex) []string {
+	if len(was) == 0 {
+		return nil
+	}
+	have := make(map[string]struct{}, len(now))
+	for _, i := range now {
+		have[i.name] = struct{}{}
+	}
+	var gone []string
+	for _, i := range was {
+		if _, ok := have[i.name]; !ok {
+			gone = append(gone, i.name)
+		}
+	}
+	return gone
 }
 
 // noticeIndexChanges reads the completeness claim so that a unique index
@@ -272,6 +339,38 @@ func (r *Router) forgetIndexes(ns string) {
 	r.idxCache.mu.Lock()
 	delete(r.idxCache.byNS, ns)
 	delete(r.idxCache.fetched, ns)
+	r.idxCache.mu.Unlock()
+}
+
+// staleIndexes makes the next write re-read ns's unique indexes without
+// throwing away what is remembered until it has something truthful to replace
+// it with.
+//
+// For a collection whose indexes have changed underneath this router: dropped
+// with the collection, or dropped on their own straight on the fast tier.
+// Leaving the listing alone is what used to happen for the first, and it goes
+// wrong. A collection dropped and rebuilt out
+// of band -- which is what resetting an environment looks like -- does not have
+// the old collection's unique index, and the router went on refusing writes on
+// its behalf, with a duplicate key error naming an index that exists on neither
+// tier. Measured: an insert plain mongod accepts, refused with 11000. The
+// fuzzer found it after four rounds, because its own reseed is that shape.
+//
+// What this gives up is a minute of enforcing the old constraint after a drop
+// the collection does not come back from the same way. That was never a
+// guarantee: the listing expires on its own after indexRefresh, so the
+// constraint was going to be lost a minute later regardless, and losing it
+// quietly is what made it look like one. uniqueIndexes says so in a log line
+// now, which is the honest version of the same outcome.
+//
+// It is not forgetIndexes, because there is one case where the old listing is
+// still the best answer available: a listing nobody could read. Keeping the
+// entry and only marking it old is what lets uniqueIndexes fall back to it.
+func (r *Router) staleIndexes(ns string) {
+	r.idxCache.mu.Lock()
+	if _, known := r.idxCache.byNS[ns]; known {
+		r.idxCache.fetched[ns] = time.Time{}
+	}
 	r.idxCache.mu.Unlock()
 }
 

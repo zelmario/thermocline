@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
+	"github.com/zelmario/thermocline/internal/tierver"
 )
 
 // This router remembers things about the fast tier that only stay true while
@@ -139,7 +140,7 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 	if r.cache == nil {
 		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.D{
 			{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
-				"drop", "rename", "dropDatabase",
+				"drop", "rename", "dropDatabase", "createIndexes", "dropIndexes",
 			}}}},
 		}}})
 	}
@@ -157,6 +158,21 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 	opts := options.ChangeStream()
 	if after != nil {
 		opts.SetStartAfter(after)
+	}
+	// Index DDL is the one change to a collection that an ordinary change
+	// stream does not carry, and it is the one this router most needs to hear:
+	// a unique index dropped straight on the fast tier leaves it enforcing a
+	// constraint that no longer exists, refusing writes mongod accepts, until
+	// the listing expires a minute later. Measured, with a duplicate key error
+	// naming an index neither tier has.
+	//
+	// Asked for rather than assumed. showExpandedEvents arrived in MongoDB 6.0
+	// and this supports 4.2, where passing it makes the whole stream fail to
+	// open -- and that stream is also what drops cached answers and notices a
+	// collection dropped out of band, so losing it to gain this would be a poor
+	// trade. Below 6.0 the minute stands, which is what it has always been.
+	if r.expandedEventsSupported(ctx) {
+		opts.SetShowExpandedEvents(true)
 	}
 	cs, err := r.hot.Watch(ctx, pipeline, opts)
 	if err != nil {
@@ -188,6 +204,7 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 		case ev.NS.Coll != "":
 			ns := ev.NS.DB + "." + ev.NS.Coll
 			r.invalidateFor(ns, ev.OperationType)
+			r.noteFastTierIndexDDL(ns, ev.OperationType)
 			r.noteFastTierDDL(ctx, ns, ev.OperationType)
 			if ev.To.Coll != "" {
 				// A rename leaves a different collection under the new name
@@ -214,6 +231,44 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 		}
 	}
 	return after, cs.Err()
+}
+
+// expandedEventsSupported reports whether the fast tier will accept
+// showExpandedEvents, which is MongoDB 6.0 and up.
+//
+// Read per connection attempt rather than once at startup, because the stream
+// reconnects and a cluster can be upgraded under it. It is a hello, and it is
+// paid once per stream rather than once per event.
+func (r *Router) expandedEventsSupported(ctx context.Context) bool {
+	v, ok := tierver.Read(ctx, r.hot)
+	if !ok || len(v.Parts) == 0 {
+		return false
+	}
+	return v.Parts[0] >= 6
+}
+
+// noteFastTierIndexDDL forgets a collection's unique index listing when its
+// indexes change on the fast tier.
+//
+// Unlike a drop, the collection is still there, so the next listing reads the
+// truth. It is still staleIndexes rather than forgetIndexes, for two reasons:
+// a listing that cannot be read should leave the old one standing rather than
+// nothing, and uniqueIndexes can only say which constraint it has stopped
+// enforcing if it still has the previous listing to compare against. The hint
+// goes with it, being the same index's own filter reproduced against the
+// archive.
+//
+// This fires for index builds the router starts itself, on a copy-up or a warm.
+// Those change the listing too, and re-reading a listing that has not changed
+// costs one listIndexes on the next write.
+func (r *Router) noteFastTierIndexDDL(ns, op string) {
+	if op != "createIndexes" && op != "dropIndexes" {
+		return
+	}
+	r.staleIndexes(ns)
+	r.forgetHint(ns)
+	r.log.Debug("the indexes changed on the fast tier, re-reading them on the next write",
+		"ns", ns, "op", op)
 }
 
 // noteFastTierDDL corrects what this router remembers about a namespace whose
@@ -259,15 +314,26 @@ func (r *Router) noteFastTierDDL(ctx context.Context, ns, op string) {
 // already drifted, which is the argument for a single list rather than two that
 // agree today.
 //
-// Every memory here is one whose staleness is a wrong answer. forgetIndexes is
-// the one that is not, and it is deliberately absent: the router reads the fast
-// tier's unique indexes to know which keys it has to protect across the tiers,
-// and a collection that has just gone lists none, so re-reading now would
-// replace a listing that is merely old with one that is empty. Empty is the
-// direction that lets a duplicate of an archived document through, and the
-// archive still holds every document the constraint covered, because a drop is
-// never replayed there. That listing is refreshed by the index build the next
-// write starts, which is when there is something true to read.
+// Every memory here is one whose staleness is a wrong answer. The unique index
+// listing is the awkward one, and it is neither forgotten nor left alone.
+//
+// Forgetting it is wrong: the router reads the fast tier's unique indexes to
+// know which keys it has to protect across the tiers, and a collection that has
+// just gone lists none, so re-reading now would replace a listing that is merely
+// old with one that is empty. Empty lets a duplicate of an archived document
+// through, and the archive still holds every document the constraint covered,
+// because a drop is never replayed there.
+//
+// Leaving it alone was wrong too, which is what used to happen here. A drop
+// followed by a rebuild out of band -- resetting an environment -- puts a
+// collection under the name that does not have the old one's unique index, and
+// the router went on refusing writes on its behalf for a minute, with a
+// duplicate key error naming an index that exists on neither tier. The fuzzer
+// found it after four rounds, because its own reseed is exactly that shape.
+//
+// staleIndexes is neither: the old listing stands until the fast tier has
+// something truthful to replace it with, and the first write after the
+// collection is back reads it.
 func (r *Router) forgetDropped(ns string) {
 	r.forgetCompleteness(ns)
 	// A drop and a recreate can put differently typed ages under the same name.
@@ -288,6 +354,7 @@ func (r *Router) forgetDropped(ns string) {
 	// 20 of 20 either way, because putting the index back goes through
 	// createIndexes and that path already clears this cache. The check was
 	// removed rather than kept green for nothing.
+	r.staleIndexes(ns)
 	r.forgetHint(ns)
 	// Whether this name is a view, and what it is a view on, decides whose
 	// completeness claim judges a read of it. A drop can put a view where a

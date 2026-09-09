@@ -85,6 +85,10 @@ feeder:
     # testkeys.sh: the collection a second router has to notice a new unique
     # index on, without being restarted.
     - "shop.tkddl2"
+    # testkeys.sh: the collection whose unique index goes away underneath the
+    # router, once by dropping the index and once by dropping the whole
+    # collection, both out of band so nothing forwards the DDL.
+    - "shop.tkgone"
     # testevict.sh: the collection the restored-archive section mirrors, updates
     # and then restores to an older backup underneath a live fast tier.
     - "shop.trestore"
