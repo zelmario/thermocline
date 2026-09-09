@@ -266,7 +266,13 @@ func (r *Router) noteFastTierIndexDDL(ns, op string) {
 		return
 	}
 	r.staleIndexes(ns)
-	r.refreshIndexes(ns)
+	// In the background here, unlike the forwarded path: this is the event loop
+	// and a listIndexes on it holds up every other change behind this one.
+	// Nothing bumps the index generation on this path, so there is no race to
+	// lose.
+	r.goSafely("re-reading the unique indexes after a change on the fast tier", func() {
+		r.refreshIndexes(context.Background(), ns)
+	})
 	r.forgetHint(ns)
 	r.log.Debug("the indexes changed on the fast tier, re-reading them on the next write",
 		"ns", ns, "op", op)

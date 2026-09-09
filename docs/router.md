@@ -984,24 +984,44 @@ one key per element for exactly that reason, and every path that claims a key
 claims all of them: the insert batch, the update post-image, `$merge`, `$out` and
 `cline keys --rebuild`.
 
-**Creating the index claims the keys of the documents already there.** The
-documents in the archive are the only ones the constraint needs help with -- the
-fast tier's own index enforces itself over what the fast tier holds -- and none
-of them was ever written through a router that knew about this index. Until the
-router did this itself, the whole of the protection was a line in the rollout
-list saying to run `cline keys --rebuild` afterwards. Measured with the index
-created after the document was archived: the archive holds `held@x.com`, and an
-insert of a second `held@x.com` was **accepted**. It is a walk of both tiers, so
-it runs in the background and the createIndexes is answered first; the log says
-when it starts, how many keys it claimed and how long it took. While it runs the
-constraint is enforced over what it has reached and not yet over the rest, which
-is a bounded window where there was none.
+**Creating a unique index is checked and claimed before it is built.** Two
+things were wrong with a unique index on a tiered collection, and one walk of
+both tiers answers both.
 
-It runs only on the router that took the command, only for a `createIndexes`
-that asks for `unique: true`, and only when the reply says an index was actually
-built. `cline keys --rebuild` is still the answer for an index created out of
-band, for a fast tier rebuilt from nothing, and for a cluster adopted with data
-already in it.
+The documents in the archive were never claimed. They are the only ones the
+constraint needs help with -- the fast tier's own index enforces itself over what
+the fast tier holds -- and none of them was ever written through a router that
+knew about this index. Measured with the index created after the document was
+archived: the archive holds `held@x.com`, the index is created through the
+router, and an insert of a second `held@x.com` was **accepted**. It was written
+down, in the rollout list saying to run `cline keys --rebuild` afterwards, and a
+documented step is not a guarantee.
+
+And the build itself was allowed over data that already violated it. mongod
+refuses `createIndex` with `unique` when two live documents share a key; split
+the pair across the tiers and the fast tier's build sees only one of each, so it
+succeeded. Measured with two documents holding `sku: "x"`, one on each tier:
+mongod refuses the same pair in one collection with 11000 and the router
+answered ok. The application is then told a constraint holds that does not.
+
+So the walk runs **before** the build, not after it, and that is the only order
+in which the answer can be a refusal: an index already built cannot be un-built
+without taking away something the client was told it had. Duplicates come back
+as 11000 with the key named, which is what mongod returns for the same command
+over the same documents -- this is the one refusal here that is not announcing a
+limitation but giving the server's own answer, so a driver that handles a failed
+unique build handles it unchanged. Otherwise the keys are claimed and the build
+goes ahead already covered, and the claims go back if the fast tier turns the
+build down for its own reasons.
+
+The cost is that `createIndexes` waits for a walk of both tiers, next to a build
+that scans the fast tier anyway. It runs only on the router that took the
+command, only for a spec that asks for `unique: true`, and only on a tiered
+namespace. If the walk cannot be done at all the build is let through with a
+warning, because refusing a command over a bookkeeping collection that could not
+answer is a worse failure than the one being prevented. `cline keys --rebuild`
+is still the answer for an index created out of band, for a fast tier rebuilt
+from nothing, and for a cluster adopted with data already in it.
 
 **Dropping the index releases the claims it made.** Claims are permanent on
 purpose -- a deleted document leaves its row behind, and the row is resolved

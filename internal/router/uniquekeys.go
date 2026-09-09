@@ -297,24 +297,31 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	return found
 }
 
-// refreshIndexes reads a namespace's unique indexes again, off the path of
-// whatever caused them to change.
+// refreshIndexes reads a namespace's unique indexes again, right after
+// something changed them.
 //
 // The reading is the point rather than the answer: uniqueIndexes is where a
 // listing is compared with the one before it, and that comparison is what
 // notices an index has gone. Left to the next write, a collection nobody writes
 // to keeps rows for a constraint that no longer exists, and keeps them exactly
 // until somebody creates an index of the same name again -- which is the state
-// that produced the wrong answer below.
-func (r *Router) refreshIndexes(ns string) {
+// that produced the wrong answer releaseIndexClaims describes.
+//
+// **Synchronous, and it has to be.** The first version did this in a goroutine
+// and lost a race to BumpIndexGen, which is called a few lines later on the
+// same DDL: bumping the generation makes the next completeness read drop the
+// cached listing, and a dropped listing is nothing to compare against, so the
+// comparison found no change, said nothing and released nothing. It passed on a
+// quiet machine and failed in a loaded sweep, which is what a scheduling race
+// looks like. One listIndexes on a command that changes indexes is not a cost
+// worth a race.
+func (r *Router) refreshIndexes(ctx context.Context, ns string) {
 	if !r.cfg.Manages(ns) {
 		return
 	}
-	r.goSafely("re-reading the unique indexes after a change to them", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), releaseClaimsLimit)
-		defer cancel()
-		r.uniqueIndexes(ctx, ns)
-	})
+	rc, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseClaimsLimit)
+	defer cancel()
+	r.uniqueIndexes(rc, ns)
 }
 
 // releaseIndexClaims deletes the registry rows for indexes that no longer exist.
@@ -714,21 +721,33 @@ func (r *Router) bulkClaim(ctx context.Context, ns string, idxs []uniqueIndex, c
 // Both the insert and the update path go through here, so a value is reserved
 // the same way whichever command is about to write it.
 func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid string, owner bson.RawValue, vals []any) (bool, error) {
+	got, _, err := r.tryClaimFresh(ctx, ns, idx, kid, owner, vals)
+	return got, err
+}
+
+// tryClaimFresh is tryClaim, also reporting whether the row is new.
+//
+// Only the rebuild walk needs the second answer, and it needs it because the
+// number it prints is "keys claimed": counting a row that was already this
+// document's would make a second rebuild of an unchanged collection report work
+// it did not do, which is how an operator tells a rebuild that found something
+// from one that found nothing.
+func (r *Router) tryClaimFresh(ctx context.Context, ns string, idx uniqueIndex, kid string, owner bson.RawValue, vals []any) (got, fresh bool, err error) {
 	// An index with a collation calls strings equal that the id derived above
 	// keeps apart, so the archive is asked in the comparison the index itself
 	// uses. See collatedkeys.go. This costs one indexed lookup, and only on an
 	// index that carries a collation.
 	if r.collatedArchiveClash(ctx, ns, idx, vals, owner) {
-		return false, nil
+		return false, false, nil
 	}
 
 	now := time.Now().UTC()
-	_, err := r.keys().InsertOne(ctx, claimRow(kid, ns, idx.name, owner, now))
+	_, err = r.keys().InsertOne(ctx, claimRow(kid, ns, idx.name, owner, now))
 	if err == nil {
-		return true, nil
+		return true, true, nil
 	}
 	if !mongo.IsDuplicateKeyError(err) {
-		return false, err
+		return false, false, err
 	}
 
 	// Somebody holds this key. Whether that is a real duplicate depends on
@@ -739,28 +758,28 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 		// Released between the failed insert and this read. Try once more.
 		_, ierr := r.keys().InsertOne(ctx, claimRow(kid, ns, idx.name, owner, now))
 		if ierr == nil {
-			return true, nil
+			return true, true, nil
 		}
 		if mongo.IsDuplicateKeyError(ierr) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, ierr
+		return false, false, ierr
 	}
 	if derr != nil {
-		return false, derr
+		return false, false, derr
 	}
 	// Already ours. An update that rewrites a field to the value it already has
 	// must not be rejected by the claim the same document made.
 	if !owner.IsZero() && claim.Doc.Equal(owner) {
-		return true, nil
+		return true, false, nil
 	}
 
 	live, lerr := r.claimIsLive(ctx, ns, idx, kid, claim, vals, owner)
 	if lerr != nil {
-		return false, lerr
+		return false, false, lerr
 	}
 	if live {
-		return false, nil
+		return false, false, nil
 	}
 
 	// Stale. Take it over, unless somebody else just did.
@@ -779,9 +798,11 @@ func (r *Router) tryClaim(ctx context.Context, ns string, idx uniqueIndex, kid s
 	}
 	res, uerr := r.keys().UpdateOne(ctx, filter, update)
 	if uerr != nil {
-		return false, uerr
+		return false, false, uerr
 	}
-	return res.MatchedCount > 0, nil
+	// Taken over rather than inserted, and it counts as fresh: the row now
+	// stands for a different document than it did, which is work the walk did.
+	return res.MatchedCount > 0, res.MatchedCount > 0, nil
 }
 
 // claimIsLive reports whether a claim still stands: its owning document must
@@ -1201,66 +1222,151 @@ func (r *Router) RebuildKeys(ctx context.Context, namespaces []string) (map[stri
 		if len(idxs) == 0 {
 			continue
 		}
-		db, coll := splitNS(ns)
-
-		// The archive holds every document, so it is the authoritative walk. The
-		// fast tier is walked too, for anything written since the last mirror.
-		for _, src := range []struct {
-			client *mongo.Client
-			filter bson.D
-		}{
-			{r.cold, bson.D{meta.NotArchivedDeleted()}},
-			{r.hot, bson.D{}},
-		} {
-			cur, err := src.client.Database(db).Collection(coll).Find(ctx, src.filter)
-			if err != nil {
-				return claimed, conflicts, err
-			}
-			for cur.Next(ctx) {
-				doc := bson.Raw(cur.Current)
-				id, _ := doc.LookupErr("_id")
-				for i := range idxs {
-					if !r.constrains(ctx, db, idxs[i], doc) {
-						continue
-					}
-					// One row per key, because a field holding an array puts
-					// one entry per element into the index. A rebuild that
-					// claimed one of them left the rest of that document's
-					// values unprotected, which is what --rebuild exists to
-					// stop. See multikey.go.
-					kids, _ := docKeys(ns, idxs[i], doc)
-					for _, kid := range kids {
-						_, ierr := r.keys().InsertOne(ctx, keyClaim{
-							ID: kid, NS: ns, Index: idxs[i].name, Doc: id, At: time.Now().UTC(),
-						})
-						switch {
-						case ierr == nil:
-							claimed[ns]++
-						case mongo.IsDuplicateKeyError(ierr):
-							// Already claimed. Only a different owner is a
-							// conflict; the same document seen in both tiers is
-							// expected.
-							var existing keyClaim
-							if derr := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&existing); derr == nil {
-								if !existing.Doc.Equal(id) {
-									conflicts[ns]++
-								}
-							}
-						default:
-							_ = cur.Close(context.WithoutCancel(ctx))
-							return claimed, conflicts, ierr
-						}
-					}
-				}
-			}
-			cerr := cur.Err()
-			_ = cur.Close(context.WithoutCancel(ctx))
-			if cerr != nil {
-				return claimed, conflicts, cerr
-			}
+		got, clash, _, err := r.claimExistingKeys(ctx, ns, idxs)
+		claimed[ns] = got
+		conflicts[ns] = clash
+		if err != nil {
+			return claimed, conflicts, err
 		}
 	}
 	return claimed, conflicts, nil
+}
+
+// claimExistingKeys claims a key for every document ns already holds, under the
+// indexes it is given rather than the ones the listing reports.
+//
+// Given the indexes, because the caller that matters most is asking about one
+// that does not exist yet: a createIndexes deciding whether the two tiers
+// together already break the constraint it is about to declare. See
+// newuniqueindex.go.
+//
+// firstClash names a key two live documents share, for the error message. The
+// walk does not stop there: the count is worth having, and mongod's own build
+// reports one key and finds them all the same way.
+func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []uniqueIndex) (claimed, conflicts int, firstClash string, err error) {
+	db, coll := splitNS(ns)
+
+	// The archive holds every document, so it is the authoritative walk. The
+	// fast tier is walked too, for anything written since the last mirror.
+	for _, src := range []struct {
+		client      *mongo.Client
+		filter      bson.D
+		fromArchive bool
+	}{
+		{r.cold, bson.D{meta.NotArchivedDeleted()}, true},
+		{r.hot, bson.D{}, false},
+	} {
+		fromArchive := src.fromArchive
+		cur, ferr := src.client.Database(db).Collection(coll).Find(ctx, src.filter)
+		if ferr != nil {
+			return claimed, conflicts, firstClash, ferr
+		}
+		for cur.Next(ctx) {
+			doc := bson.Raw(cur.Current)
+			id, _ := doc.LookupErr("_id")
+			for i := range idxs {
+				if !r.constrains(ctx, db, idxs[i], doc) {
+					continue
+				}
+				// One row per key, because a field holding an array puts
+				// one entry per element into the index. A rebuild that
+				// claimed one of them left the rest of that document's
+				// values unprotected, which is what --rebuild exists to
+				// stop. See multikey.go.
+				kids, tuples := docKeys(ns, idxs[i], doc)
+				for k, kid := range kids {
+					// tryClaim rather than a bare insert, so this walk reaches
+					// the same verdict the write paths do. A row whose owner
+					// has moved off the value is stale and is taken over; only
+					// an owner that still holds the key is a conflict. Doing
+					// that here by hand was the difference between reporting a
+					// duplicate and reporting a claim nobody had cleaned up.
+					got, fresh, terr := r.tryClaimFresh(ctx, ns, idxs[i], kid, id, tuples[k])
+					if terr != nil {
+						_ = cur.Close(context.WithoutCancel(ctx))
+						return claimed, conflicts, firstClash, terr
+					}
+					if got {
+						// Only a row that was not already this document's. A
+						// second rebuild of an unchanged collection has to
+						// report nothing, which is how an operator tells one
+						// that found something from one that did not.
+						if fresh {
+							claimed++
+						}
+						continue
+					}
+					// One document seen twice is not two documents.
+					//
+					// This walk reads both tiers, and during mirroring lag the
+					// archive's copy of a document can carry a value the
+					// document no longer has. Claiming from it reports a
+					// duplicate against whichever live document really holds
+					// that value. The fast tier is authoritative where it holds
+					// the document, which is the same rule claimIsLive follows,
+					// so an archive copy the fast tier has a newer version of
+					// is skipped and the fast tier's own pass covers it.
+					//
+					// On the conflict path only. It is a read per conflict, and
+					// a walk with no conflicts pays nothing for it.
+					if fromArchive && r.staleArchiveCopy(ctx, ns, idxs[i], kid, id) {
+						continue
+					}
+					conflicts++
+					if firstClash == "" {
+						firstClash = describeKey(idxs[i], doc)
+					}
+				}
+			}
+		}
+		cerr := cur.Err()
+		_ = cur.Close(context.WithoutCancel(ctx))
+		if cerr != nil {
+			return claimed, conflicts, firstClash, cerr
+		}
+	}
+	return claimed, conflicts, firstClash, nil
+}
+
+// staleArchiveCopy reports whether the archive's copy of a document is behind
+// the fast tier's, for this key.
+//
+// The fast tier is authoritative where it holds the document: the archive trails
+// it by the feeder's mirroring lag and may still show the value the document had
+// before its last write. A copy like that is not a second document and must not
+// be counted as one.
+func (r *Router) staleArchiveCopy(ctx context.Context, ns string, idx uniqueIndex, kid string, id bson.RawValue) bool {
+	db, coll := splitNS(ns)
+	var current bson.Raw
+	if err := r.hot.Database(db).Collection(coll).
+		FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&current); err != nil {
+		// Not on the fast tier, or unreadable. Either way the archive's copy is
+		// the only one there is, so it stands and the conflict is real.
+		return false
+	}
+	return !r.stillHoldsKey(ctx, ns, idx, kid, current)
+}
+
+// describeKey renders a document's value for an index the way mongod renders a
+// duplicate key in its own error, so the message an application sees says the
+// same thing whichever side refused.
+func describeKey(idx uniqueIndex, doc bson.Raw) string {
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, f := range idx.fields {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(f)
+		b.WriteString(": ")
+		if v, ok := lookupPath(doc, f); ok {
+			b.WriteString(v.String())
+		} else {
+			b.WriteString("null")
+		}
+	}
+	b.WriteString(" }")
+	return b.String()
 }
 
 // UniqueNamespaces returns the managed namespaces that have unique indexes the

@@ -100,9 +100,6 @@ type Router struct {
 
 	wmCache  watermarkCache
 	idxCache indexCache
-	// backfill is which namespaces are having the keys of their existing
-	// documents claimed after a new unique index. See newuniqueindex.go.
-	backfill keyBackfill
 	brackets bracketCache
 
 	// warnedKillCursor keeps the privilege warning in superseded.go to one per
@@ -577,6 +574,12 @@ type conn struct {
 	// held across an open transaction. Nil when authentication is proxied,
 	// where this connection owns its upstream outright.
 	lease *pooled
+
+	// pendingIndexKeys are the unique indexes whose existing keys were claimed
+	// for a createIndexes that has not been answered yet, on pendingIndexNS.
+	// They go back if the fast tier turns the build down.
+	pendingIndexKeys []string
+	pendingIndexNS   string
 
 	// warnedReadPref remembers which non-primary read preferences this client
 	// has already been warned about, so a reporting client sending the same one
@@ -1086,6 +1089,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		return c.send(reply)
 	}
 
+	// A unique index the fast tier turned down never happened either, and the
+	// keys for it were claimed before the command was forwarded. See
+	// newuniqueindex.go for why that order.
+	c.releaseIndexKeysIfBuildFailed(ctx, reply)
+
 	// An insert the fast tier rejected never happened, so its key claims have
 	// to go back, or that value is blocked until something else collides.
 	if len(c.pendingKeys) > 0 {
@@ -1108,7 +1116,10 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// next write, because a dropIndexes is often the last thing an
 			// operator does to a collection for a while.
 			c.r.staleIndexes(db + "." + coll)
-			c.r.refreshIndexes(db + "." + coll)
+			// Before BumpIndexGen below, which is not a detail: bumping the
+			// generation makes the next completeness read drop the cached
+			// listing, and this comparison needs it.
+			c.r.refreshIndexes(ctx, db+"."+coll)
 			c.r.forgetHint(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
 			// And tell the other routers, which have no other way to hear it:
@@ -1126,12 +1137,6 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 						"action", "run cline keys --rebuild, or restart the routers to have it "+
 							"enforced everywhere at once")
 				}
-			}
-			// A unique index the fast tier has just built covers nothing in the
-			// archive, and the archive is where the documents this constraint
-			// needs help with are. See newuniqueindex.go.
-			if name == "createIndexes" {
-				c.backfillNewUniqueKeys(ctx, db+"."+coll, msg, reply)
 			}
 			// drop and create are the two that change which collection lives
 			// under a name, and either half can arrive here without the other:

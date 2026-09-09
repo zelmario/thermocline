@@ -50,7 +50,16 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 		return c.guardRename(ctx, msg, cmd)
 
 	case "createIndexes", "collMod":
-		return c.guardTTL(ctx, msg, cmd, db, name)
+		if out, done := c.guardTTL(ctx, msg, cmd, db, name); done {
+			return out, true
+		}
+		if name != "createIndexes" {
+			return nil, false
+		}
+		// After the TTL refusal, because a TTL index is turned down whatever
+		// else it is and walking both tiers first would be a scan for a command
+		// that is not going to run.
+		return c.guardNewUniqueIndex(ctx, msg, cmd, db)
 
 	case "convertToCapped", "cloneCollectionAsCapped", "create":
 		return c.guardUnmirrorable(ctx, msg, cmd, db, name)

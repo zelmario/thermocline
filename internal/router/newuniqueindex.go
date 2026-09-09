@@ -2,193 +2,241 @@ package router
 
 import (
 	"context"
-	"sync"
+	"strconv"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
-// A unique index created on a tiered collection did not cover the documents
-// already in the archive.
+// A unique index on a tiered collection is declared over documents the fast
+// tier does not have, and neither half of that was handled.
 //
-// Those are the only documents the constraint actually needs help with. The
-// fast tier's own index enforces itself over what the fast tier holds; the
-// registry exists for the rest, and it is filled in by whatever writes a
-// document. A collection that has been running for a year has most of its
-// documents in the archive, and none of them had ever been written through a
-// router that knew about this index, so none of their keys were claimed.
+// **The documents already in the archive were never claimed.** They are the only
+// ones the constraint needs help with: the fast tier's own index enforces itself
+// over what the fast tier holds, and the registry exists for the rest. A
+// collection that has been running for a year has most of its documents in the
+// archive, and none of them had ever been written through a router that knew
+// about this index. Measured with the index created after the document was
+// archived: the archive holds held@x.com, the index is created through the
+// router, and an insert of a second held@x.com is accepted. It was written down
+// -- the rollout list says to run `cline keys --rebuild` afterwards -- and a
+// documented step is not a guarantee.
 //
-// Measured on an evicted document and a fresh unique index: the archive holds
-// held@x.com, the index is created through the router, and an insert of a
-// second held@x.com is **accepted**. The same probe with `cline keys --rebuild`
-// in between refuses it with 11000. So the constraint was enforced against
-// everything except the half it was needed for.
+// **And the build itself was allowed over data that already violated it.**
+// mongod refuses createIndex with unique when two live documents share a key.
+// Split the pair across the tiers and the fast tier's build sees only one of
+// each, so it succeeds. Measured: two documents with sku "x", one on each tier,
+// and mongod refuses the same pair in one collection with 11000 while the router
+// answers ok. The application is then told a constraint holds that does not, and
+// nothing will ever tell it otherwise.
 //
-// It was written down -- the rollout list says to run `cline keys --rebuild`
-// after creating a unique index -- and a documented step is not a guarantee.
-// Nothing refused, nothing warned, and the duplicate that got in is permanent:
-// the archive's copy and the new one both exist, and the fast tier's index
-// cannot see the pair.
-//
-// So the router does it itself, from the one place that knows all three facts
-// at once: the createIndexes succeeded, it made a unique index, and the
-// namespace is tiered.
+// Both are answered by the same walk, and it runs **before** the build rather
+// than after it. Before, because that is the only order in which the answer can
+// be a refusal: an index already built cannot be un-built without taking away
+// something the client was told it had. The cost is that createIndexes waits for
+// a walk of both tiers, which is the honest price of the guarantee and is next
+// to a build that scans the fast tier anyway.
 
-// keyBackfill remembers which namespaces are being walked, so two index builds
-// in a row do not start two walks of the same collection.
-type keyBackfill struct {
-	mu sync.Mutex
-	on map[string]bool
-}
-
-func (b *keyBackfill) start(ns string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.on == nil {
-		b.on = map[string]bool{}
+// guardNewUniqueIndex claims the keys of the documents ns already holds, and
+// refuses the build if two of them share one.
+//
+// It reports true when it has answered the client itself.
+func (c *conn) guardNewUniqueIndex(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	coll, ok := stringField(cmd, "createIndexes")
+	if !ok {
+		return nil, false
 	}
-	if b.on[ns] {
-		return false
-	}
-	b.on[ns] = true
-	return true
-}
-
-func (b *keyBackfill) done(ns string) {
-	b.mu.Lock()
-	delete(b.on, ns)
-	b.mu.Unlock()
-}
-
-// backfillNewUniqueKeys claims the keys of documents that already exist, after a
-// createIndexes that made a unique index on a tiered collection.
-//
-// In the background and on a context of its own, because it is a walk of the
-// archive and the client's createIndexes has already been answered. Waiting for
-// it would turn a command that returns in a second into one that returns in
-// minutes, and the operator did not ask for that.
-//
-// The window while it runs is the honest cost: the constraint is enforced over
-// the documents already reached and not yet over the rest. It is bounded, it is
-// announced at both ends, and it is strictly less than the window it replaces,
-// which was for ever.
-func (c *conn) backfillNewUniqueKeys(ctx context.Context, ns string, msg, reply *wire.Message) {
+	ns := db + "." + coll
 	if !c.r.cfg.Manages(ns) {
-		return
+		return nil, false
 	}
-	// The command, before anything else, because the other two questions cost a
-	// round trip each and this one is a parse. An ordinary index build on a
-	// collection that happens to have a unique index elsewhere is not a reason
-	// to walk the archive, and re-declaring indexes on start-up is something
-	// drivers do.
-	if !asksForUniqueIndex(msg) {
-		return
-	}
-	if !indexWasBuilt(reply) {
-		return
-	}
-	// After staleIndexes and a re-read, so this is the listing including whatever
-	// was just built. Nothing to claim if it did not end up unique after all.
-	if len(c.r.uniqueIndexes(ctx, ns)) == 0 {
-		return
-	}
-	if !c.r.backfill.start(ns) {
-		c.log.Debug("a key backfill for this collection is already running", "ns", ns)
-		return
+	idxs := proposedUniqueIndexes(msg)
+	if len(idxs) == 0 {
+		return nil, false
 	}
 
-	log := c.log
-	r := c.r
-	r.goSafely("claiming existing keys for a new unique index", func() {
-		defer r.backfill.done(ns)
-		// Its own timeout rather than the client's context, which is gone the
-		// moment the reply is sent.
-		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), backfillLimit)
-		defer cancel()
+	// Its own deadline. The client's context lasts as long as the client is
+	// willing to wait, and abandoning the walk halfway leaves the registry
+	// holding rows for an index that is about to be built anyway.
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), backfillLimit)
+	defer cancel()
 
-		log.Info("a unique index was created on a tiered collection, claiming the keys of the "+
-			"documents already there",
-			"ns", ns,
-			"why", "the fast tier's own index covers what the fast tier holds; the documents in "+
-				"the archive are the ones it cannot see, and until their keys are claimed a "+
-				"write may duplicate one of them",
-			"note", "this walks both tiers and may take a while on a large collection; the "+
-				"constraint is enforced over what it has reached and not yet over the rest")
-		started := time.Now()
-		claimed, conflicts, err := r.RebuildKeys(bg, []string{ns})
-		if err != nil {
-			log.Warn("could not claim the existing keys for a new unique index",
-				"ns", ns, "err", err, "claimed", claimed[ns], "after", time.Since(started).String(),
-				"effect", "a write may duplicate a key held by a document whose key was not "+
-					"reached, which the fast tier's own index cannot see",
-				"action", "run cline keys --rebuild")
-			return
-		}
-		if conflicts[ns] > 0 {
-			// Reported, never resolved. Two live documents already sharing a
-			// key means the constraint was broken before the index existed, and
-			// picking a winner here would hide it. mongod would have refused
-			// the build outright; it did not, which means the duplicates are
-			// split across the tiers where its own index cannot see them.
-			log.Warn("a new unique index has keys held by more than one live document",
-				"ns", ns, "conflicts", conflicts[ns], "claimed", claimed[ns],
-				"why", "the fast tier built this index because the duplicates are split across "+
-					"the tiers, so its own index saw only one of each pair",
-				"effect", "the constraint is already broken and this router will not pick a "+
-					"winner; the duplicates stay",
-				"action", "run cline keys --rebuild to list them, and resolve them before the "+
-					"evictor makes the split permanent")
-			return
-		}
-		log.Info("claimed the existing keys for a new unique index",
-			"ns", ns, "claimed", claimed[ns], "took", time.Since(started).String())
-	})
+	started := time.Now()
+	c.log.Info("a unique index is being created on a tiered collection, checking the documents "+
+		"already there and claiming their keys",
+		"ns", ns, "indexes", indexNames(idxs),
+		"why", "the fast tier's own build sees only the documents the fast tier holds, so a "+
+			"duplicate whose other half is in the archive would not stop it, and the archive's "+
+			"documents have no claim on their keys until something makes one",
+		"note", "this walks both tiers, so the command waits for it")
+
+	claimed, conflicts, clash, err := c.r.claimExistingKeys(bg, ns, idxs)
+	if err != nil {
+		// The same stance the write paths take when the registry cannot be
+		// reached: refusing a command because a bookkeeping collection could
+		// not answer is a worse failure than the one being prevented.
+		c.log.Warn("could not check a new unique index against the documents already there, "+
+			"letting it through",
+			"ns", ns, "err", err, "claimed", claimed,
+			"effect", "the index is built over the fast tier alone, and a duplicate whose other "+
+				"half is in the archive is neither refused now nor refused later",
+			"action", "run cline keys --rebuild, which reports any duplicates it finds")
+		return nil, false
+	}
+	if conflicts == 0 {
+		c.log.Info("claimed the existing keys for a new unique index",
+			"ns", ns, "claimed", claimed, "took", time.Since(started).String())
+		// Held so a build the fast tier rejects gives them back, the same way an
+		// insert's keys are.
+		c.pendingIndexKeys = append(c.pendingIndexKeys, indexNames(idxs)...)
+		c.pendingIndexNS = ns
+		return nil, false
+	}
+
+	// Refused, and the rows this walk wrote go back: the index is not going to
+	// exist, so a claim under its name would sit there until something created
+	// an index of that name again and found its keys already taken.
+	c.r.releaseIndexClaims(ns, indexNames(idxs))
+	c.r.Stats.DuplicateKeys.Add(1)
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused a unique index over documents that already break it",
+		"ns", ns, "indexes", indexNames(idxs), "conflicts", conflicts, "key", clash,
+		"why", "the fast tier would have built it, because the duplicates are split across the "+
+			"tiers and its own build sees only the half that is here",
+		"action", "resolve the duplicates and create the index again; cline keys --rebuild "+
+			"reports them")
+	// 11000 rather than the generic refusal code the rest of this router uses.
+	// This is the one refusal that is not a limitation being announced: it is
+	// the answer mongod itself gives to the same command over the same
+	// documents, and an application that handles a failed unique index build
+	// already handles it. Sending CommandFailed here would make the tiered pair
+	// behave differently from the collection it is pretending to be, which is
+	// the whole thing this router exists not to do.
+	out, rerr := c.r.duplicateKeyError(msg.Header.RequestID, msg.Header.RequestID,
+		"E11000 duplicate key error collection: "+ns+" index: "+indexNames(idxs)[0]+
+			" dup key: "+clash+" :: thermocline: refusing to build this unique index, because "+
+			ns+" already holds "+strconv.Itoa(conflicts)+" key(s) held by more than one live "+
+			"document. "+
+			"The fast tier would have built it: the duplicates are split across the tiers and "+
+			"its own build sees only the half that is here, so the index would exist and the "+
+			"constraint would not. Resolve the duplicates and create it again; cline keys "+
+			"--rebuild reports them.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
 }
 
-// backfillLimit bounds the walk. A collection this does not finish in an hour
-// is one whose operator should be running cline keys --rebuild deliberately,
-// with the output in front of them, rather than having a router do it quietly.
-const backfillLimit = time.Hour
+// releaseIndexKeysIfBuildFailed gives the claims back when the build the walk
+// ran for did not happen.
+//
+// The keys were claimed before the command was forwarded, which is the only
+// order that lets a duplicate be refused rather than discovered afterwards. A
+// build the fast tier then turns down for its own reasons -- a name already
+// used, a key pattern it will not accept -- would otherwise leave the registry
+// enforcing an index nobody has.
+func (c *conn) releaseIndexKeysIfBuildFailed(ctx context.Context, reply *wire.Message) {
+	names, ns := c.pendingIndexKeys, c.pendingIndexNS
+	c.pendingIndexKeys, c.pendingIndexNS = nil, ""
+	if len(names) == 0 {
+		return
+	}
+	if reply != nil {
+		if rdoc, err := reply.ReplyDoc(); err == nil && replyOK(rdoc) {
+			return
+		}
+	}
+	c.log.Info("a unique index build was refused by the fast tier, giving its claims back",
+		"ns", ns, "indexes", names)
+	c.r.releaseIndexClaims(ns, names)
+}
 
-// asksForUniqueIndex reports whether a createIndexes asks for a unique one.
+// proposedUniqueIndexes reads the unique indexes a createIndexes asks for.
 //
 // Through AllOf rather than the command document, because a driver may send the
-// index specifications in a payload section rather than inline and both are
-// ordinary.
-func asksForUniqueIndex(msg *wire.Message) bool {
+// specifications in a payload section rather than inline and both are ordinary.
+func proposedUniqueIndexes(msg *wire.Message) []uniqueIndex {
 	if msg == nil {
-		return false
+		return nil
 	}
+	var out []uniqueIndex
 	for _, spec := range msg.AllOf("indexes") {
-		if u, err := spec.LookupErr("unique"); err == nil {
-			if b, ok := u.BooleanOK(); ok && b {
-				return true
+		u, uerr := spec.LookupErr("unique")
+		if uerr != nil {
+			continue
+		}
+		if b, ok := u.BooleanOK(); !ok || !b {
+			continue
+		}
+		key, kok := spec.Lookup("key").DocumentOK()
+		if !kok {
+			continue
+		}
+		elems, eerr := key.Elements()
+		if eerr != nil || len(elems) == 0 {
+			continue
+		}
+		name, _ := lookupString(spec, "name")
+		if name == "" {
+			// mongod derives one from the key when the client sends none, and
+			// so does this: the name is what the registry rows are filed under
+			// and what the refusal has to name.
+			name = derivedIndexName(elems)
+		}
+		idx := uniqueIndex{name: name}
+		for _, e := range elems {
+			idx.fields = append(idx.fields, e.Key())
+		}
+		if v, err := spec.LookupErr("sparse"); err == nil {
+			idx.sparse, _ = v.BooleanOK()
+		}
+		if v, err := spec.LookupErr("partialFilterExpression"); err == nil {
+			if d, ok := v.DocumentOK(); ok {
+				idx.partial = d
+				idx.partialFields = partialFieldNames(d)
 			}
 		}
+		if v, err := spec.LookupErr("collation"); err == nil {
+			if d, ok := v.DocumentOK(); ok {
+				idx.collation = d
+			}
+		}
+		out = append(out, idx)
 	}
-	return false
+	return out
 }
 
-// indexWasBuilt reports whether a createIndexes reply says it made one.
-//
-// mongod answers an already-existing index with numIndexesBefore equal to
-// numIndexesAfter and note: "all indexes already exist". Walking the archive for
-// that would be a scan of the whole collection for nothing, and a driver that
-// re-declares its indexes on every start would do it on every start.
-func indexWasBuilt(reply *wire.Message) bool {
-	if reply == nil {
-		return false
+// derivedIndexName is mongod's own default: every field and its direction,
+// joined by underscores.
+func derivedIndexName(elems []bson.RawElement) string {
+	name := ""
+	for i, e := range elems {
+		if i > 0 {
+			name += "_"
+		}
+		dir := "1"
+		if n, ok := intOf64(e.Value()); ok {
+			dir = strconv.FormatInt(n, 10)
+		} else if s, ok := e.Value().StringValueOK(); ok {
+			dir = s
+		}
+		name += e.Key() + "_" + dir
 	}
-	rdoc, err := reply.ReplyDoc()
-	if err != nil || !replyOK(rdoc) {
-		return false
-	}
-	before, bok := intOf64(rdoc.Lookup("numIndexesBefore"))
-	after, aok := intOf64(rdoc.Lookup("numIndexesAfter"))
-	if !bok || !aok {
-		// Said nothing either way. A walk that was not needed costs a scan; one
-		// that was needed and skipped costs a duplicate nothing can see.
-		return true
-	}
-	return after > before
+	return name
 }
+
+func indexNames(idxs []uniqueIndex) []string {
+	out := make([]string, 0, len(idxs))
+	for _, i := range idxs {
+		out = append(out, i.name)
+	}
+	return out
+}
+
+// backfillLimit bounds the walk. A collection this does not finish in an hour is
+// one whose operator should be running cline keys --rebuild deliberately, with
+// the output in front of them, rather than having a command do it quietly.
+const backfillLimit = time.Hour

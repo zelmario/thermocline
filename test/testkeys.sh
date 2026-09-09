@@ -651,14 +651,11 @@ chk "the document is in the archive and not on the fast tier" "0/1" \
 H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+".tkgone"})' >/dev/null
 chk "  and nothing has claimed its key"                  "0" \
     "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')"
+# The walk runs before the build, not after it, so the key is claimed by the
+# time the command has been answered. Before is the only order in which the
+# answer can be a refusal, which is the other half of this: see the duplicate
+# section below.
 R 'db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({email:1},{unique:true,name:"u_email"})' >/dev/null
-# The walk is in the background: the client'"'"'s createIndexes is answered first,
-# because waiting for it would turn a command that returns in a second into one
-# that returns in minutes.
-for _ in $(seq 1 60); do
-  [ "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')" != "0" ] && break
-  sleep 0.5
-done
 chk "creating the unique index claims its key"           "1" \
     "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone"}))')"
 chk "  so a duplicate of the archived document is refused" "11000" \
@@ -669,10 +666,9 @@ chk "  and nothing of it reached the fast tier"          "0" \
 # An ordinary index build must not walk the archive. A driver that re-declares
 # its indexes on every start would otherwise scan the whole collection on every
 # start, for a constraint it is not creating.
-WALKWAS=$(grep -c 'claiming the keys of the documents already there' $LOGDIR/keys_r.log 2>/dev/null || true)
+WALKWAS=$(grep -c 'checking the documents already there and claiming their keys' $LOGDIR/keys_r.log 2>/dev/null || true)
 R 'db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({grp:1},{name:"plain_grp"})' >/dev/null
-sleep 2
-WALKNOW=$(grep -c 'claiming the keys of the documents already there' $LOGDIR/keys_r.log 2>/dev/null || true)
+WALKNOW=$(grep -c 'checking the documents already there and claiming their keys' $LOGDIR/keys_r.log 2>/dev/null || true)
 chk "an index that is not unique starts no walk"         "0" "$((WALKNOW-WALKWAS))"
 
 echo
@@ -703,6 +699,43 @@ for _ in $(seq 1 60); do [ "$(claimsFor)" != "0" ] && break; sleep 0.5; done
 chk "  and creating it again claims the key afresh"      "1" "$(claimsFor)"
 chk "  so a duplicate of the archived document is refused" "11000" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:2,email:"held@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
+echo
+echo "== a unique index over documents that already break it is refused =="
+#
+# mongod refuses createIndex with unique when two live documents share a key.
+# Split the pair across the tiers and the fast tier'"'"'s build sees only one of
+# each, so it succeeded: the application was told a constraint holds that does
+# not, and nothing would ever tell it otherwise.
+#
+# The control is the same two documents in one untiered collection, so the
+# comparison is against what mongod itself says rather than against what this
+# suite believes mongod says.
+fresh tkgone ''
+H 'db.getSiblingDB(process.env.TC_DB).tkgone.insertOne({_id:1,sku:"x"})' >/dev/null
+# Upserts, not insertMany: the feeder may have mirrored _id 1 already, and an
+# ordered insert then abandons the rest on the first duplicate, leaving the
+# archive with one document and this section testing nothing. The fuzzer'"'"'s
+# reseed learned the same thing.
+C 'db.getSiblingDB(process.env.TC_DB).tkgone.bulkWrite(
+     [{_id:1,sku:"x"},{_id:2,sku:"x"}].map(d=>({replaceOne:{filter:{_id:d._id},replacement:d,upsert:true}})),
+     {ordered:false})' >/dev/null
+chk "one on the fast tier, both in the archive"          "1/2" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkgone.countDocuments({}))')/$(C 'print(db.getSiblingDB(process.env.TC_DB).tkgone.countDocuments({}))')"
+chk "mongod refuses the same pair in one collection"     "11000" \
+    "$(H 'const c=db.getSiblingDB(process.env.TC_DB).tkgone_ref; c.drop(); c.insertMany([{_id:1,sku:"x"},{_id:2,sku:"x"}]);
+         try{c.createIndex({sku:1},{unique:true,name:"u_sku"});print("ACCEPTED")}catch(e){print(e.code)}')"
+chk "  and so does the router"                           "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({sku:1},{unique:true,name:"u_sku"});print("ACCEPTED")}catch(e){print(e.code)}')"
+chk "  leaving no index behind"                          "_id_" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkgone.getIndexes().map(i=>i.name).join(","))')"
+chk "  and no claims for an index that was not built"    "0" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+".tkgone",idx:"u_sku"}))')"
+# The same index with the duplicate removed goes through, so the refusal is
+# about the data and not about the shape of the command.
+C 'db.getSiblingDB(process.env.TC_DB).tkgone.deleteOne({_id:2})' >/dev/null
+chk "  with the duplicate gone it is built"              "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({sku:1},{unique:true,name:"u_sku"});print("ok")}catch(e){print(e.code||e.message.substring(0,60))}')"
 
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo

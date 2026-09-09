@@ -1227,6 +1227,21 @@ func (r *Router) commandError(requestID, responseTo int32, errmsg string) (*wire
 	return wire.NewMsg(requestID, responseTo, out)
 }
 
+// duplicateKeyError is commandError with mongod's own duplicate key code.
+//
+// For the refusals that are not this router announcing a limitation but this
+// router giving the answer the server would have given. A driver that handles a
+// duplicate key from mongod handles this one unchanged, which a generic
+// CommandFailed would not.
+func (r *Router) duplicateKeyError(requestID, responseTo int32, errmsg string) (*wire.Message, error) {
+	return wire.NewMsg(requestID, responseTo, bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: errmsg},
+		{Key: "code", Value: int32(11000)},
+		{Key: "codeName", Value: "DuplicateKey"},
+	})
+}
+
 func splitNS(ns string) (db, coll string) {
 	db, coll, _ = strings.Cut(ns, ".")
 	return db, coll

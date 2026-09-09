@@ -397,6 +397,15 @@ Part of [Thermocline](../README.md).
   moves the result in with ordinary inserts, which is the only difference from
   mongod, and claims its unique keys so the registry still holds them once those
   documents are evicted.
+- **A unique index build waits for a walk of both tiers.** mongod refuses
+  `createIndex` with `unique` when two live documents already share a key, and
+  the fast tier's own build cannot see the half of a duplicate that is in the
+  archive. The router walks both tiers before forwarding the command, so the
+  refusal is the same 11000 mongod would have given, and the keys of the
+  documents already there are claimed on the way. On a large collection that
+  walk is the dominant cost of creating the index. It happens only for a spec
+  asking for `unique: true` on a tiered collection.
+
 - **Dropping a tiered collection on the fast tier ends its unique constraints,
   and the router says so rather than pretending.** The router enforces a unique
   index across the tiers by reading the fast tier's listing, so a collection
