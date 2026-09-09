@@ -87,11 +87,15 @@ func (reg *changeStreamRegistry) drop(id int64) {
 }
 
 // noteChangeStream remembers the cursor an opened change stream returned, so
-// its later batches can be filtered.
-func (c *conn) noteChangeStream(cmd bson.Raw, db string, reply *wire.Message) {
+// its later batches can be filtered, and filters the batch this reply
+// carries.
+//
+// It reports whether it rewrote the reply, the same way filterChangeStream
+// does, and a batch it cannot read leaves the reply exactly as it came back.
+func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, reply *wire.Message) (*wire.Message, bool) {
 	ns, isCS := changeStreamCollection(cmd, db)
 	if !isCS {
-		return
+		return nil, false
 	}
 	// A change stream on a whole database or the whole deployment sends
 	// aggregate: 1 rather than a collection name, so it had no namespace to
@@ -107,7 +111,7 @@ func (c *conn) noteChangeStream(cmd bson.Raw, db string, reply *wire.Message) {
 	switch {
 	case ns != "":
 		if !c.r.cfg.Manages(ns) {
-			return
+			return nil, false
 		}
 	case db == "admin":
 		// The whole deployment. Which databases it will carry events for is
@@ -115,20 +119,60 @@ func (c *conn) noteChangeStream(cmd bson.Raw, db string, reply *wire.Message) {
 		watching = "the whole deployment"
 	default:
 		if !c.r.managesAnythingIn(db) {
-			return
+			return nil, false
 		}
 		watching = db + ", the whole database"
 	}
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
-		return
+		return nil, false
 	}
 	id, ok := cursorIDOf(rdoc)
 	if !ok || id == 0 {
-		return
+		return nil, false
 	}
 	c.r.changeStreams.add(id, watching)
 	c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
+
+	// And this reply's own batch, which was passed through untouched.
+	//
+	// A stream opened on a live collection comes back with an empty
+	// firstBatch, because nothing has happened yet, and everything it ever
+	// delivers arrives in a getMore. That is why registering the cursor here
+	// and filtering only getMore looked complete, and passed every test that
+	// opened a stream and then wrote.
+	//
+	// A consumer that stores its resume token and comes back to it is the
+	// case that breaks it. resumeAfter, startAfter and startAtOperationTime
+	// all name a position in the past, so the aggregate returns events
+	// immediately and the first of them never reached the sieve at all.
+	// Measured: three documents copied up by one multi-document write, read
+	// back from a startAtOperationTime just before it, and all three arrived
+	// as inserts the application never made -- with the residency records
+	// right there, naming those exact oplog positions.
+	//
+	// Storing a token and resuming from it is the correct thing for a
+	// consumer to do, and it is precisely the consumer this was failing.
+	events, eok := firstBatch(rdoc)
+	if !eok || len(events) == 0 {
+		return nil, false
+	}
+	keep, dropped := c.r.sieveEvents(ctx, events)
+	keep, filled := c.r.fillLookups(ctx, keep)
+	if dropped == 0 && filled == 0 {
+		return nil, false
+	}
+	if dropped > 0 {
+		c.r.Stats.EventsHidden.Add(int64(dropped))
+		c.log.Info("hid tiering events from a change stream's first batch",
+			"watching", watching, "hidden", dropped,
+			"note", "this batch is what a consumer resuming from a stored token reads")
+	}
+	out, berr := replaceBatch(rdoc, "firstBatch", keep, reply.Header.RequestID)
+	if berr != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // filterChangeStream removes this system's own housekeeping from a change
@@ -177,7 +221,7 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 			"watching", watching, "filled", filled)
 	}
 
-	out, berr := replaceNextBatch(rdoc, keep, msg.Header.RequestID)
+	out, berr := replaceBatch(rdoc, "nextBatch", keep, msg.Header.RequestID)
 	if berr != nil {
 		return nil, false
 	}
@@ -591,13 +635,16 @@ func nextBatch(reply bson.Raw) ([]bson.RawValue, bool) {
 	return vals, true
 }
 
-// replaceNextBatch rebuilds a getMore reply with a different set of events.
+// replaceBatch rebuilds a cursor reply with a different set of events. The
+// field names which batch: "firstBatch" for the aggregate that opened the
+// stream, "nextBatch" for a getMore. Both carry events and both are filtered,
+// because a consumer resuming from a stored token reads the first one.
 //
 // Everything else is copied through untouched, and postBatchResumeToken above
 // all: it is how a client resumes, and inventing one would be worse than any
 // event this filters. Dropping events from a batch is what a $match in the
 // pipeline would have done, so the token stays correct for what remains.
-func replaceNextBatch(reply bson.Raw, keep bson.A, requestID int32) (*wire.Message, error) {
+func replaceBatch(reply bson.Raw, field string, keep bson.A, requestID int32) (*wire.Message, error) {
 	elems, err := reply.Elements()
 	if err != nil {
 		return nil, err
@@ -619,8 +666,8 @@ func replaceNextBatch(reply bson.Raw, keep bson.A, requestID int32) (*wire.Messa
 		}
 		cursor := make(bson.D, 0, len(celems))
 		for _, ce := range celems {
-			if ce.Key() == "nextBatch" {
-				cursor = append(cursor, bson.E{Key: "nextBatch", Value: keep})
+			if ce.Key() == field {
+				cursor = append(cursor, bson.E{Key: field, Value: keep})
 				continue
 			}
 			cursor = append(cursor, bson.E{Key: ce.Key(), Value: ce.Value()})

@@ -513,6 +513,53 @@ chk "only the delete, not the copy-up's insert"        "delete:1" "$PROMO"
 H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null 2>&1
 
+echo "== a consumer resuming from a stored position reads the first batch =="
+# Every section above opens a stream and then writes, so the aggregate that
+# opens it comes back empty and every event arrives in a getMore. That is one
+# way to read a change stream and it was the only one filtered: the aggregate
+# reply was read for its cursor id and its own batch was passed through whole.
+#
+# A consumer that stores its resume token and comes back to it is the other way,
+# and it is the correct thing for a consumer to do. resumeAfter, startAfter and
+# startAtOperationTime all name a position in the past, so the events are there
+# in the first batch, and none of them had ever been through the sieve.
+#
+# Measured before the fix: three documents copied up by one multi-document
+# write, read back from a startAtOperationTime just before it, and all three
+# arrived as inserts the application never made -- identical, event for event,
+# to what the fast tier's own unfiltered stream delivered.
+#
+# The control matters more than usual here. A first batch that is empty for any
+# other reason would pass this check while proving nothing, so the same question
+# is put to the fast tier directly, where nothing is hidden and the insert has
+# to be there.
+RNS=tcs3
+H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
+# Created here rather than by the copy-up, so no drop or create lands inside the
+# window. A drop delivers an invalidate, which closes the cursor and would end
+# the batch before the events being asked about.
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$RNS')" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:1,v:'archived'})" >/dev/null
+startFeeder; startRouter
+sleep 3
+RTS=$(( $(date +%s) - 1 ))
+# One read through the router, which copies the document up.
+R "db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:1})" >/dev/null
+sleep 6
+DRAINFIRST="const r = db.getSiblingDB(process.env.TC_DB).runCommand({
+     aggregate: '$RNS',
+     pipeline: [{\$changeStream: {startAtOperationTime: Timestamp({t: $RTS, i: 1})}}],
+     cursor: {}});
+   print(r.ok ? r.cursor.firstBatch.filter(e => e.operationType === 'insert').length : 'aggregate failed');"
+RFIRST=$(R "$DRAINFIRST")
+RCTRL=$(H "$DRAINFIRST")
+echo "  the resumed stream's first batch carried $RFIRST inserts, the fast tier's own $RCTRL"
+chk "the copy-up is hidden from a resumed stream"      "0" "$RFIRST"
+chk "and the fast tier's own stream did carry it"      "1" "$RCTRL"
+H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
+
 stopDaemons
 echo
 echo "================================"

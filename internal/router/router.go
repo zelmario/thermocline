@@ -1251,7 +1251,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// neither happened as far as the application is concerned.
 	if name == "aggregate" {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
-			c.noteChangeStream(cmd, db, reply)
+			// The reply is rewritten when this batch carried tiering events,
+			// which is what a consumer resuming from a stored token reads.
+			//
+			// Carried on rather than sent from here, so that everything an
+			// aggregate reply is still put through -- registering the claims a
+			// getMore will be judged against, above all -- sees exactly what the
+			// client will. Returning early skipped all of it.
+			if out, filtered := c.noteChangeStream(ctx, cmd, db, reply); filtered {
+				reply = out
+			}
 		}
 	}
 	if name == "getMore" {

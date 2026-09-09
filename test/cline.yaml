@@ -312,6 +312,11 @@ feeder:
     # document. Its own collection, because the section drops it and the one
     # above watches the whole database.
     - "shop.tcs2"
+    # testchange.sh: a stream resumed from a stored position, whose events
+    # arrive in the aggregate's own first batch rather than in a getMore. Its
+    # own collection so that no other section's copy-up lands in the window it
+    # reads.
+    - "shop.tcs3"
     # testcache.sh
     - "shop.tcache"
     # testcache.sh again, for the cache across an adoption: the archive holds
