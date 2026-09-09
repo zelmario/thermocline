@@ -1119,15 +1119,73 @@ if (STREAM) {
                     a.length + ' events: ' + ser(a).slice(0, 400),
                     b.length + ' events: ' + ser(b).slice(0, 400)]);
   };
+  // The events each document got, in the order it got them. The key is the
+  // document, so the operation alone is what is compared.
+  const byDoc = (evs) => {
+    const m = new Map();
+    evs.forEach((e) => {
+      const cut = e.indexOf(':');
+      const doc = e.slice(cut + 1);
+      if (!m.has(doc)) m.set(doc, []);
+      m.get(doc).push(e.slice(0, cut));
+    });
+    return m;
+  };
+  const compareUnordered = (what, a, b) => {
+    note(what, a.length || b.length ? 'real' : 'vacuous');
+    const sa = a.slice().sort(), sb = b.slice().sort();
+    if (ser(sa) !== ser(sb)) {
+      const diff = describeDiff(sa, sb);
+      if (diff) bugs.push([what, 'the events the two streams delivered, as a set', diff.ref, diff.got]);
+      else bugs.push([what, 'the events the two streams delivered, as a set',
+                      a.length + ' events: ' + ser(sa).slice(0, 400),
+                      b.length + ' events: ' + ser(sb).slice(0, 400)]);
+      return;
+    }
+    const ma = byDoc(a), mb = byDoc(b);
+    for (const doc of ma.keys()) {
+      const seqA = ma.get(doc), seqB = mb.get(doc) || [];
+      if (ser(seqA) !== ser(seqB)) {
+        bugs.push([what, 'the events one document got, in order',
+                   doc + ' ' + ser(seqA), doc + ' ' + ser(seqB)]);
+        return;
+      }
+    }
+    agreed++;
+  };
   print('  stream\tthe reference delivered ' + evRef.length + ' events, the tiered collection ' +
         evTier.length + ', the database-level stream ' + evDb.length + ' for that collection');
   if (TRACE || ser(evRef) !== ser(evTier)) {
     print('  stream\tref  ' + evRef.join(' '));
     print('  stream\ttier ' + evTier.join(' '));
   }
-  compare('change stream', evRef, evTier);
+  // Two different collections, so their global interleaving is not comparable
+  // and comparing it was reporting a disagreement MongoDB never promised.
+  //
+  // A multi-document write makes one oplog entry per document, in the order the
+  // write reached them, which is collection scan order. The tiered collection's
+  // documents arrived by copy-up, in the order reads asked for them, so it is
+  // laid out differently from the reference and one updateMany walks the two in
+  // different orders. Measured at seed 90801 once the copy-up leak was fixed:
+  // the same 105 events on both sides, with update:4001 two places earlier on
+  // the tiered side and update:32 and update:45 swapped. Five positions, and no
+  // event added, missing or duplicated.
+  //
+  // The router cannot be the cause either: the sieve only ever drops events
+  // from a batch, in place, and nothing reorders one.
+  //
+  // So what is compared is what MongoDB does promise, and it is not weaker
+  // where it matters: the same events with the same counts, which is a *set*
+  // difference and is exactly what a copy-up delivered as an insert shows up
+  // as -- four of them, which is what this check caught -- and then each
+  // document's own events in order, which is the guarantee an application
+  // reading one document's history actually depends on.
+  compareUnordered('change stream', evRef, evTier);
   // Not against the reference, against the same collection's own stream: these
-  // are two ways of asking one question and the router answers both.
+  // are two ways of asking one question and the router answers both. One
+  // collection, one oplog, so here the order is promised and is compared
+  // strictly. This is the half that catches a filter applied at the wrong
+  // moment rather than not at all.
   compare('change stream on the database', evTier, evDb);
 }
 
