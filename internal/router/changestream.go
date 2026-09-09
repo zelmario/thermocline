@@ -259,7 +259,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 		switch {
 		case scratch[i]:
 			dropped++
-		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev)):
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev)):
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
@@ -305,27 +305,53 @@ func eventNS(doc bson.Raw) (string, bool) {
 // its TTL, because a client reading its events late needs it to, and presence
 // alone would then hide a genuine delete of a document that had been evicted
 // and warmed back up within the hour.
+//
+// It is a fallback now rather than the rule. A notice the feeder has spent
+// records which delete it was spent on, and that is exact; the window is what
+// answers for a notice written by a feeder from before that field existed, so a
+// rolling upgrade does not stop suppressing evictions for an hour.
 const evictionWindow = 30 * time.Second
 
 // evictionNote is what the sieve needs to know about one announcement.
 type evictionNote struct {
-	left int
-	at   time.Time
+	left  int
+	at    time.Time
+	spent []bson.Timestamp
 }
 
 // isEviction reports whether this delete is the evictor making room rather than
 // the application removing a document.
-func isEviction(notes map[string]evictionNote, id string, at time.Time) bool {
+//
+// The window used to answer this on its own, and it swallowed the application's
+// own deletes. An eviction and an application delete of the same document look
+// identical in the oplog, and the only thing that tells them apart is which one
+// the feeder counted the announcement against: the evictor announces, the
+// feeder applies that one delete and spends the notice, and every delete after
+// it is somebody else's. Measured on a fuzzer round where the evictor removed
+// nine documents, the feeder applied them, and the application deleted the same
+// nine twenty-two seconds later: all nine deletes were dropped from the stream,
+// so a client watching the collection was never told records it had deleted
+// were gone.
+//
+// pos is the delete's own position in the fast tier's oplog, which is the same
+// value the feeder wrote down, because both read it off the same event.
+func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp) bool {
 	note, ok := notes[id]
 	if !ok {
 		return false
 	}
-	// Unclaimed, which is what presence alone used to mean: announced, and the
-	// feeder has not applied it yet. Kept exactly so this can only suppress
-	// more than it did.
+	// Unclaimed: announced, and the feeder has not applied it yet, so this
+	// delete may well be the one. Genuinely ambiguous until the feeder catches
+	// up, and suppressing is the side that does not tell an application its
+	// data changed when it did not.
 	if note.left > 0 {
 		return true
 	}
+	// Spent, and it says which delete it was spent on.
+	if known, yes := (meta.EvictionNotice{Spent: note.spent}).SpentOn(pos); known {
+		return yes
+	}
+	// A notice from a feeder that did not record positions. The old rule.
 	if at.IsZero() || note.at.IsZero() {
 		return false
 	}
@@ -334,6 +360,27 @@ func isEviction(notes map[string]evictionNote, id string, at time.Time) bool {
 		d = -d
 	}
 	return d <= evictionWindow
+}
+
+// eventPosition is where an event sits in the fast tier's oplog.
+//
+// Its cluster time, which is exact: no two oplog entries share one, and the
+// feeder reads the same field off the same event. wallTime would have done from
+// MongoDB 6.0 and this supports 4.2.
+func eventPosition(ev bson.RawValue) bson.Timestamp {
+	doc, ok := ev.DocumentOK()
+	if !ok {
+		return bson.Timestamp{}
+	}
+	v, err := doc.LookupErr("clusterTime")
+	if err != nil {
+		return bson.Timestamp{}
+	}
+	t, i, tok := v.TimestampOK()
+	if !tok {
+		return bson.Timestamp{}
+	}
+	return bson.Timestamp{T: t, I: i}
 }
 
 // evictionNotices reads the announcements for these documents.
@@ -355,7 +402,7 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 	for cur.Next(ctx) {
 		var rec meta.EvictionNotice
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC()}
+			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent}
 		}
 	}
 	return out

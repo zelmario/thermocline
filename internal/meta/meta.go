@@ -245,7 +245,47 @@ type EvictionNotice struct {
 	// left. That distinction is what lets a spent notice stay until its TTL,
 	// which is what a change stream read late needs. See SpendEvictionNotices.
 	Pending *int `bson:"pending"`
+	// Spent is the oplog position of each delete this notice has been spent on,
+	// newest last and capped.
+	//
+	// Without it a spent notice went on answering for every delete of the same
+	// document for the next thirty seconds, including the application's own.
+	// Measured: the evictor removed a document, the feeder applied it, and the
+	// application deleted the same document twenty-two seconds later; the
+	// change stream dropped that delete, so a client watching the collection
+	// was never told a record it had deleted was gone. Nine of them in one
+	// fuzzer round.
+	//
+	// A cluster time and not a wall clock, because it has to be the same value
+	// on both sides: the feeder and the router read the same oplog entry from
+	// the same change stream, so its position identifies it exactly, and no two
+	// entries share one. wallTime would have done as well from 6.0 and this
+	// supports 4.2.
+	Spent []bson.Timestamp `bson:"spent,omitempty"`
 }
+
+// SpentOn reports whether this notice has already been spent on the delete at
+// this oplog position.
+//
+// A notice with no Spent list at all was written by a feeder from before the
+// field existed, and there is no way to tell: the caller falls back to the
+// window it used to use rather than stop suppressing during an upgrade.
+func (n EvictionNotice) SpentOn(at bson.Timestamp) (known, yes bool) {
+	if len(n.Spent) == 0 {
+		return false, false
+	}
+	for _, t := range n.Spent {
+		if t.T == at.T && t.I == at.I {
+			return true, true
+		}
+	}
+	return true, false
+}
+
+// MaxSpentRecorded is how many spent positions a notice keeps. A document can
+// be evicted, warmed and evicted again, so one is not enough; a notice lives an
+// hour, so a handful is plenty.
+const MaxSpentRecorded = 8
 
 // Left reports how many announced evictions of this document are still
 // unclaimed. A notice from before the field existed counts as one.
@@ -335,21 +375,38 @@ func ConsumeEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []st
 	return have, nil
 }
 
-// SpendEvictionNotices writes down the announcements a batch actually used.
+// SpendEvictionNotices writes down the announcements a batch actually used, and
+// which delete each one answered for.
 //
 // Separate from reading them so the caller can decide, in event order, which
 // deletes each notice answers for, and so nothing is spent if the batch cannot
 // be applied.
-func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[string]int) error {
+//
+// The positions are what let the router's sieve be exact rather than
+// approximate. A spent notice stays until its TTL so a change stream read late
+// can still recognise the eviction, and until these were recorded the only way
+// to use it was "any delete of this document in the next thirty seconds", which
+// swallowed the application's own. See EvictionNotice.Spent.
+func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[string][]bson.Timestamp) error {
 	if len(spent) == 0 {
 		return nil
 	}
 	coll := cold.Database(DB).Collection(Evicting)
 	models := make([]mongo.WriteModel, 0, len(spent))
-	for id, n := range spent {
+	for id, at := range spent {
+		n := len(at)
+		if n == 0 {
+			continue
+		}
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: -n}}}}))
+			SetUpdate(bson.D{
+				{Key: "$inc", Value: bson.D{{Key: "pending", Value: -n}}},
+				{Key: "$push", Value: bson.D{{Key: "spent", Value: bson.D{
+					{Key: "$each", Value: at},
+					{Key: "$slice", Value: -MaxSpentRecorded},
+				}}}},
+			}))
 	}
 	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
 		return fmt.Errorf("spend eviction notices: %w", err)

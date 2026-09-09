@@ -230,10 +230,10 @@ func (f *Feeder) flush(ctx context.Context) error {
 	// checkpoint covering these events. See flushAndCheckpoint.
 	if len(f.claimedInBatch) > 0 {
 		if f.spentNotices == nil {
-			f.spentNotices = map[string]int{}
+			f.spentNotices = map[string][]bson.Timestamp{}
 		}
-		for id, n := range f.claimedInBatch {
-			f.spentNotices[id] += n
+		for id, at := range f.claimedInBatch {
+			f.spentNotices[id] = append(f.spentNotices[id], at...)
 		}
 		f.claimedInBatch = nil
 	}
@@ -359,10 +359,10 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// applied, so an attempt that fails part way leaves nothing behind. The
 	// halt policy returns from the middle of the loop below, and a write can
 	// fail after it.
-	f.claimedInBatch = map[string]int{}
+	f.claimedInBatch = map[string][]bson.Timestamp{}
 	avail := make(map[string]int, len(announced))
 	for id, n := range announced {
-		avail[id] = n - f.spentNotices[id]
+		avail[id] = n - len(f.spentNotices[id])
 	}
 
 	var unannounced int
@@ -370,7 +370,10 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		ok := avail[ids[n]] > 0
 		if ok {
 			avail[ids[n]]--
-			f.claimedInBatch[ids[n]]++
+			// The position of the delete this announcement answers for, so the
+			// router can recognise that one delete and not every later delete
+			// of the same document.
+			f.claimedInBatch[ids[n]] = append(f.claimedInBatch[ids[n]], f.pending[slot].at)
 		}
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)
 		if !ok {

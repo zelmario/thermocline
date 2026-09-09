@@ -154,7 +154,9 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	if have[noticeID] != 1 {
 		t.Fatalf("announced once, the feeder sees %d", have[noticeID])
 	}
-	if err := SpendEvictionNotices(ctx, c, map[string]int{noticeID: 1}); err != nil {
+	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{
+		noticeID: {{T: 100, I: 1}},
+	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
 	have, _ = ConsumeEvictionNotices(ctx, c, []string{noticeID})
@@ -181,7 +183,9 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 	if have[noticeID] != 2 {
 		t.Fatalf("announced twice, the feeder sees %d", have[noticeID])
 	}
-	if err := SpendEvictionNotices(ctx, c, map[string]int{noticeID: 1}); err != nil {
+	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{
+		noticeID: {{T: 100, I: 1}},
+	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
 	have, _ = ConsumeEvictionNotices(ctx, c, []string{noticeID})

@@ -87,12 +87,12 @@ type Feeder struct {
 	// Held here, they also stop two deletes of one document inside a single
 	// window both spending the same announcement, which is what the archive's
 	// own count cannot see. See flushAndCheckpoint.
-	spentNotices map[string]int
+	spentNotices map[string][]bson.Timestamp
 	// claimedInBatch are the announcements the batch being assembled has taken.
 	// They join spentNotices only once that batch is in the archive, so an
 	// attempt that failed leaves nothing behind for a retry to under-count
 	// against.
-	claimedInBatch map[string]int
+	claimedInBatch map[string][]bson.Timestamp
 	// lag of the most recent event applied
 	lastEventAt time.Time
 	// lastEventTS is the same position as a cluster time, kept whole.
@@ -190,6 +190,12 @@ type pendingOp struct {
 	// mirrored, but only an insert can be the router copying a document up, and
 	// only inserts may be suppressed as promotion echoes.
 	wasInsert bool
+
+	// at is where this event sits in the fast tier's oplog. Carried for deletes,
+	// so that an eviction announcement spent on one can say which one: the
+	// router reads the same position off the same event and can then tell the
+	// evictor's delete from the application's delete of the same document.
+	at bson.Timestamp
 }
 
 // changeEvent is the subset of a change stream document the feeder reads.
@@ -619,6 +625,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// evictor is running.
 		f.pending = append(f.pending, pendingOp{
 			ns: ns, key: ev.DocumentKey, id: id, kind: actionDeletePending,
+			at: ev.ClusterTime,
 		})
 		return nil
 	}
