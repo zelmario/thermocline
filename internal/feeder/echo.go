@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -232,9 +233,18 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 	// left behind by a copy-up that inserted nothing to swallow an ordinary
 	// update's mirror instead.
 	var ids []string
+	// Where each promotion's insert sits in the fast tier's oplog, so the record
+	// can say afterwards which insert it accounted for. The first upsert for a
+	// document is the one the flag is spent on, so the first position is the one
+	// to keep; see the loop at the end of this function.
+	posOf := map[string]bson.Timestamp{}
 	for _, op := range f.pending {
 		if op.kind == actionUpsert && op.wasInsert {
-			ids = append(ids, meta.DocID(op.ns, op.id))
+			id := meta.DocID(op.ns, op.id)
+			ids = append(ids, id)
+			if _, seen := posOf[id]; !seen {
+				posOf[id] = op.at
+			}
 		}
 	}
 	if len(ids) == 0 {
@@ -283,11 +293,36 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 	// on a later genuine insert of the same document, which is the one outcome
 	// worth avoiding: the archive would keep an older version and nothing would
 	// say so. Failing the other way costs a redundant write.
-	res, err := coll.UpdateMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: pending}}}},
-		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})
-	if err != nil || res == nil {
-		f.log.Warn("could not clear promotion notices, mirroring them anyway", "err", err)
+	//
+	// The position of the insert goes down in the same write as the flag comes
+	// off, because the two are one fact: this promotion caused that insert. A
+	// router handing the event over later reads it back and answers exactly,
+	// rather than comparing the event's time against a promotedAt that may
+	// describe a different promotion of the same document, which is what let
+	// four copy-ups reach an application as inserts it never made. See
+	// meta.ResidencyRecord.Echoed.
+	models := make([]mongo.WriteModel, 0, len(pending))
+	for _, id := range pending {
+		update := bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}}
+		// A server old enough not to send a cluster time leaves nothing exact to
+		// record. The flag still comes off, and the router falls back to the
+		// window as it did before.
+		if pos, ok := posOf[id]; ok && (pos.T != 0 || pos.I != 0) {
+			update = append(update, bson.E{Key: "$push", Value: bson.D{
+				{Key: "echoed", Value: bson.D{
+					{Key: "$each", Value: []bson.Timestamp{pos}},
+					{Key: "$slice", Value: -meta.MaxEchoRecorded},
+				}},
+			}})
+		}
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: id}}).
+			SetUpdate(update))
+	}
+	// Unordered: these are independent records, and one that cannot be written
+	// must not hold up the rest.
+	if _, uerr := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); uerr != nil {
+		f.log.Warn("could not clear promotion notices, mirroring them anyway", "err", uerr)
 		return 0, nil
 	}
 

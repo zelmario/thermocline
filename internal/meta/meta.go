@@ -209,11 +209,82 @@ type ResidencyRecord struct {
 	Doc        bson.RawValue `bson:"doc"`
 	HotUntil   time.Time     `bson:"hotUntil"`
 	PromotedAt time.Time     `bson:"promotedAt,omitempty"`
-	// EndedAt is when the application deleted the document this record is
-	// about. The hold is over from then, and so is the promotion: an insert of
-	// this _id at or before it is the copy-up's own, and one after it is the
-	// application writing the _id again. See the feeder's dropResidency.
+	// EndedAt is when the document this record is about left the fast tier,
+	// whether the application deleted it or the evictor removed it. The hold is
+	// over from then, and so is the promotion: an insert of this _id at or
+	// before it is the copy-up's own, and one after it is the application
+	// writing the _id again. See the feeder's dropResidency.
 	EndedAt time.Time `bson:"endedAt,omitempty"`
+	// ExpiresAt is when this row may be removed, and it is deliberately not
+	// HotUntil.
+	//
+	// The two used to be one field, and a row was destroyed as soon as its hold
+	// was over. That is the third thing this row is for: the hold, the
+	// promotion, and the evidence that the copy-up's insert was a promotion at
+	// all. A change stream consumer is judged when it reads, and it reads when
+	// it likes, so the evidence has to outlive the hold by more than the
+	// consumer's lag.
+	//
+	// Measured, with the hold and the expiry sharing a field: three documents
+	// copied up and then deleted by the application, the rows ended and gone
+	// within one TTL pass, and the stream read eighty seconds later delivered
+	// all three copy-ups as inserts -- byte for byte what the fast tier's own
+	// unfiltered stream delivered. Everything else about the suppression was
+	// correct; there was simply nothing left to consult.
+	//
+	// NoticeTTL past the hold, which is what an eviction announcement gets and
+	// for the same reason. The bound is stated rather than hidden: a consumer
+	// further behind than that reads a copy-up as an insert, exactly as one
+	// further behind than NoticeTTL reads an eviction as a delete.
+	ExpiresAt time.Time `bson:"expiresAt,omitempty"`
+	// Echoed is the oplog position of each copy-up insert this record's
+	// promotions have caused, newest last and capped.
+	//
+	// promotedAt cannot answer for more than one promotion, and a record
+	// describes as many as the document has had. A document copied up, evicted
+	// and copied up again leaves one record whose promotedAt is the *later*
+	// promotion's, so the earlier copy-up's insert is older than the record
+	// that should account for it and reads as somebody else's write. Measured
+	// with the sieve instrumented: haveRecord=true, promotedAt 06:57:18.386,
+	// eventAt 06:57:16.169, and four copy-ups delivered to an application as
+	// inserts it never made.
+	//
+	// A cluster time and not a wall clock, for the reason EvictionNotice.Spent
+	// gives: the feeder and the router read the same field off the same event,
+	// so the values compare by construction and no two entries share one.
+	Echoed []bson.Timestamp `bson:"echoed,omitempty"`
+}
+
+// ResidencyExpiry is when a residency row whose hold runs to hotUntil may be
+// removed. Every writer of a hold goes through this, so the gap between the two
+// is stated in one place.
+func ResidencyExpiry(hotUntil time.Time) time.Time {
+	return hotUntil.Add(NoticeTTL)
+}
+
+// MaxEchoRecorded is how many promotion positions a residency record keeps. A
+// document can be copied up, evicted and copied up again, so one is not enough;
+// the record is cleared shortly after the document leaves, so a handful covers
+// every promotion it can still be asked about.
+const MaxEchoRecorded = 8
+
+// EchoedAt reports whether one of this record's promotions caused the insert at
+// this oplog position.
+//
+// A record with no Echoed list at all was written by a feeder from before the
+// field existed, and there is no way to tell: the caller falls back to the
+// window it used to use rather than stop suppressing during an upgrade. The
+// same shape as EvictionNotice.SpentOn, and for the same reason.
+func (r ResidencyRecord) EchoedAt(at bson.Timestamp) (known, yes bool) {
+	if len(r.Echoed) == 0 {
+		return false, false
+	}
+	for _, t := range r.Echoed {
+		if t.T == at.T && t.I == at.I {
+			return true, true
+		}
+	}
+	return true, false
 }
 
 // NoticeTTL is how long an eviction or warming announcement is kept.

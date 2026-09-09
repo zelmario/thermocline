@@ -497,11 +497,40 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 				"because taking back the wrong one loses a document")
 	}
 
-	// Residency is meaningless once the document has left the fast tier.
+	// The hold is over once the document has left the fast tier, and the record
+	// is ended rather than deleted. That is the whole difference between a
+	// change stream that is right and one that is not.
+	//
+	// Deleting it took away the evidence that this document's copy-up inserts
+	// were promotions. A consumer reading its stream later still has those
+	// inserts ahead of it, and the router decides what to hide when it hands
+	// them over: with the record gone, or recreated by a later copy-up whose
+	// promotedAt is newer than the insert being read, the copy-up arrives as an
+	// application insert. Measured with the fuzzer, seed 90801: four of them in
+	// one round, every promotedAt one to two seconds after the event it was
+	// judging.
+	//
+	// Ending it releases the hold exactly as deleting did -- residencyHolds
+	// wants hotUntil in the future, and this puts it in the past -- and the TTL
+	// index on hotUntil clears the row within the minute. The same thing the
+	// feeder's dropResidency does for a document the application deleted, and
+	// the third and last instance of one pattern: the evidence a change stream
+	// reader needs was being destroyed the moment nothing else needed it.
+	//
+	// What is left is a bound rather than a guarantee: a consumer more than a
+	// TTL pass behind reads the insert with no record to recognise it by. That
+	// is the bound the row already had once the application deleted a document,
+	// and it is a minute where it used to be nothing at all.
+	//
 	// Failing here is untidy rather than dangerous, so it only warns.
-	if _, err := e.cold.Database(meta.DB).Collection(meta.Residency).
-		DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}}); err != nil {
-		e.log.Warn("could not clear residency records", "ns", ns, "err", err)
+	now := time.Now().UTC()
+	if _, err := e.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "endedAt", Value: now},
+			{Key: "hotUntil", Value: now},
+		}}}); err != nil {
+		e.log.Warn("could not end the residency records of evicted documents", "ns", ns, "err", err)
 	}
 	return nil
 }

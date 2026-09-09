@@ -261,7 +261,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 			dropped++
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev)):
 			dropped++
-		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), recent):
+		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), eventPosition(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
 			// application's own change stream is the most expensive thing this
 			// function can get wrong, and the count alone cannot be worked back
@@ -410,7 +410,7 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 
 // isPromotion reports whether this insert is a copy-up rather than the
 // application creating a document.
-func isPromotion(promoted map[string]promotion, id string, at time.Time, recent time.Time) bool {
+func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bson.Timestamp, recent time.Time) bool {
 	p, ok := promoted[id]
 	if !ok {
 		return false
@@ -437,6 +437,30 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, recent 
 	}
 	if p.at.After(recent) {
 		return true
+	}
+	// Exact, and it answers the question the window cannot.
+	//
+	// promotedAt describes one promotion and a record outlives several. A
+	// document copied up, evicted and copied up again keeps one record whose
+	// promotedAt is the later promotion's, so the earlier copy-up's insert is
+	// older than the record accounting for it and the comparison below reads it
+	// as somebody else's write. Measured at seed 90801: four copy-ups delivered
+	// to an application as inserts it never made, promotedAt one to two seconds
+	// after the event every time.
+	//
+	// The feeder writes down which insert it spent each echo on, so this is a
+	// lookup rather than a judgement.
+	//
+	// Below both branches above on purpose, and that ordering is the fix rather
+	// than a detail. A promotion whose echo is still outstanding has not been
+	// written down yet, so a miss there would mean "not yet" and not "not
+	// ours". And the window stays a floor: a record cleared by its TTL between
+	// two promotions comes back knowing only the later one, and answering
+	// exactly from an incomplete list would let the earlier insert through
+	// where the floor had been catching it. So this can still only ever
+	// suppress more than the old rule did, never less.
+	if known, yes := (meta.ResidencyRecord{Echoed: p.echoed}).EchoedAt(pos); known {
+		return yes
 	}
 	// The event carries no time to judge it by on a server old enough not to
 	// send one, and there is nothing left to say.
@@ -497,10 +521,13 @@ func eventTime(ev bson.RawValue) time.Time {
 type promotion struct {
 	at      time.Time
 	pending bool
-	// ended is when the application deleted the document, zero while it is still
+	// ended is when the document left the fast tier, zero while it is still
 	// there. An insert after it is the application writing that _id again rather
 	// than this promotion's own. See the feeder's dropResidency.
 	ended time.Time
+	// echoed is where each of this document's copy-up inserts sits in the fast
+	// tier's oplog, as the feeder wrote it down. See meta.ResidencyRecord.Echoed.
+	echoed []bson.Timestamp
 }
 
 // promotionTimes reports, for each of these document ids that has a residency
@@ -522,13 +549,14 @@ func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]pr
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	for cur.Next(ctx) {
 		var rec struct {
-			ID      string    `bson:"_id"`
-			At      time.Time `bson:"promotedAt"`
-			Pending bool      `bson:"echoPending"`
-			Ended   time.Time `bson:"endedAt"`
+			ID      string           `bson:"_id"`
+			At      time.Time        `bson:"promotedAt"`
+			Pending bool             `bson:"echoPending"`
+			Ended   time.Time        `bson:"endedAt"`
+			Echoed  []bson.Timestamp `bson:"echoed"`
 		}
 		if cur.Decode(&rec) == nil {
-			p := promotion{at: rec.At.UTC(), pending: rec.Pending}
+			p := promotion{at: rec.At.UTC(), pending: rec.Pending, echoed: rec.Echoed}
 			if !rec.Ended.IsZero() {
 				p.ended = rec.Ended.UTC()
 			}

@@ -90,3 +90,117 @@ func TestSpentPositionsAreCapped(t *testing.T) {
 		t.Error("a position older than the cap was still answered for")
 	}
 }
+
+// A copy-up read late arrived as an ordinary insert, because promotedAt
+// describes one promotion and a record outlives several.
+//
+// The document is copied up, evicted, and copied up again. One residency record
+// survives all of it, and its promotedAt is the *later* promotion's, so the
+// earlier copy-up's insert is older than the record accounting for it. The
+// window read that as somebody else's write and let it through: an application
+// shown an insert it never made, four of them in one fuzzer round at seed
+// 90801, every promotedAt one to two seconds after the event it was judging.
+//
+// The feeder writes down which insert it spent each echo on, so both copy-ups
+// are recognised however late they are read.
+func TestAnEarlierCopyUpIsStillRecognisedAfterAnotherPromotion(t *testing.T) {
+	first := bson.Timestamp{T: 1000, I: 1}
+	second := bson.Timestamp{T: 1002, I: 3}
+	// The record as it stands after the second copy-up. promotedAt moved with
+	// it and is now the later promotion's, which is the whole difficulty: the
+	// earlier insert is older than the record that has to account for it. The
+	// measured gap, from the sieve instrumented at seed 90801, was promotedAt
+	// 06:57:18.386 against an event at 06:57:16.169.
+	promotedAt := time.Now().Add(-60 * time.Second)
+	firstAt := promotedAt.Add(-2200 * time.Millisecond)
+	promoted := map[string]promotion{
+		"shop.orders|x": {
+			at:     promotedAt,
+			echoed: []bson.Timestamp{first, second},
+		},
+	}
+	// Drained well after the promotion, which is what a consumer that stores a
+	// resume token and comes back to it does.
+	recent := time.Now().Add(-promotionWindow)
+
+	if !isPromotion(promoted, "shop.orders|x", firstAt, first, recent) {
+		t.Error("the earlier copy-up was delivered as an insert the application never made")
+	}
+	if !isPromotion(promoted, "shop.orders|x", promotedAt, second, recent) {
+		t.Error("the later copy-up was delivered as an insert the application never made")
+	}
+	// And neither of them hides the application's own insert of that same _id.
+	own := bson.Timestamp{T: 1120, I: 7}
+	if isPromotion(promoted, "shop.orders|x", time.Now(), own, recent) {
+		t.Error("an application's own insert was hidden as a promotion")
+	}
+}
+
+// While an echo is outstanding the feeder has not written that insert down yet,
+// so a miss means "not yet", not "not ours". Unconditional the way an unclaimed
+// eviction announcement is, and for the same reason.
+func TestAnOutstandingEchoStillSuppresses(t *testing.T) {
+	promoted := map[string]promotion{
+		"shop.orders|x": {
+			at:      time.Now(),
+			pending: true,
+			echoed:  []bson.Timestamp{{T: 1000, I: 1}},
+		},
+	}
+	if !isPromotion(promoted, "shop.orders|x", time.Now(), bson.Timestamp{T: 1090, I: 2},
+		time.Now().Add(-promotionWindow)) {
+		t.Error("a promotion whose echo the feeder has not spent yet was let through")
+	}
+}
+
+// A record written by a feeder from before the positions existed has to go on
+// answering through a rolling upgrade, so the window still decides for it.
+func TestARecordWithoutPositionsFallsBackToTheWindow(t *testing.T) {
+	recent := time.Now().Add(-promotionWindow)
+	promoted := map[string]promotion{
+		"shop.orders|x": {at: time.Now().Add(-2 * time.Second)},
+	}
+	if !isPromotion(promoted, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, recent) {
+		t.Error("a record from before the upgrade stopped recognising its own promotion")
+	}
+}
+
+// An insert after the record ended is the application writing that _id again,
+// whatever the record's history says.
+func TestAnInsertAfterTheRecordEndedIsTheApplicationsOwn(t *testing.T) {
+	ended := time.Now().Add(-30 * time.Second)
+	promoted := map[string]promotion{
+		"shop.orders|x": {
+			at:     time.Now().Add(-90 * time.Second),
+			ended:  ended,
+			echoed: []bson.Timestamp{{T: 1000, I: 1}},
+		},
+	}
+	if isPromotion(promoted, "shop.orders|x", ended.Add(time.Second), bson.Timestamp{T: 1100, I: 1},
+		time.Now().Add(-promotionWindow)) {
+		t.Error("an insert after the document left the fast tier was hidden as a promotion")
+	}
+}
+
+// The list is capped, because a document can be copied up and evicted all day.
+func TestEchoedPositionsAreCapped(t *testing.T) {
+	rec := meta.ResidencyRecord{}
+	for i := range meta.MaxEchoRecorded + 4 {
+		rec.Echoed = append(rec.Echoed, bson.Timestamp{T: uint32(1000 + i), I: 1})
+	}
+	if len(rec.Echoed) <= meta.MaxEchoRecorded {
+		t.Fatal("this test is not exercising the cap")
+	}
+	// What the $slice keeps is the newest, so the oldest is the one to lose.
+	kept := rec.Echoed[len(rec.Echoed)-meta.MaxEchoRecorded:]
+	capped := meta.ResidencyRecord{Echoed: kept}
+	if known, yes := capped.EchoedAt(kept[0]); !known || !yes {
+		t.Error("a position inside the cap was not recognised")
+	}
+	if known, yes := capped.EchoedAt(bson.Timestamp{T: 999, I: 1}); !known || yes {
+		t.Error("a position that was never recorded was recognised")
+	}
+	if known, _ := (meta.ResidencyRecord{}).EchoedAt(bson.Timestamp{T: 1, I: 1}); known {
+		t.Error("a record with no positions claimed to know the answer")
+	}
+}

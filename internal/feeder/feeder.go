@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -191,10 +192,15 @@ type pendingOp struct {
 	// only inserts may be suppressed as promotion echoes.
 	wasInsert bool
 
-	// at is where this event sits in the fast tier's oplog. Carried for deletes,
-	// so that an eviction announcement spent on one can say which one: the
-	// router reads the same position off the same event and can then tell the
-	// evictor's delete from the application's delete of the same document.
+	// at is where this event sits in the fast tier's oplog.
+	//
+	// Carried for deletes, so that an eviction announcement spent on one can say
+	// which one: the router reads the same position off the same event and can
+	// then tell the evictor's delete from the application's delete of the same
+	// document. And for inserts, for the mirror image of that: a residency
+	// record says which inserts were its own copy-ups, so a promotion read late
+	// is still recognised after the document has been evicted and promoted
+	// again. See meta.ResidencyRecord.Echoed.
 	at bson.Timestamp
 }
 
@@ -250,33 +256,60 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 		return fmt.Errorf("create warming ttl index: %w", err)
 	}
 
-	// Residency holds expire at an instant they carry themselves, so the TTL is
-	// zero seconds past that instant rather than a duration of its own. Once
-	// hotUntil is in the past the hold is over: the evictor reads an expired one
-	// as no hold at all, so the record is dead weight from that moment.
+	// Residency rows expire at an instant they carry themselves, so the TTL is
+	// zero seconds past that instant rather than a duration of its own.
 	//
-	// The evictor deletes the records of the documents it evicts, which is most
-	// of them. What it cannot delete is a hold whose document the application
-	// removed instead, and those accumulated for ever in a collection nothing
-	// else cleans. One row per copy-up is not large, and "for ever" is the part
-	// that matters on a deployment that runs for years.
+	// On expiresAt and not on hotUntil, and that is a fix rather than a
+	// rename. hotUntil is when the hold is over; expiresAt is when the row may
+	// go, an hour later. While they were one field the row was destroyed as
+	// soon as the hold ended, which took with it the only evidence that a
+	// copy-up's insert was a promotion, and a change stream consumer reading
+	// after that was shown inserts its application never made. See
+	// meta.ResidencyRecord.ExpiresAt for the measurement.
 	//
+	// Rows written before the field existed carry no expiresAt and the new
+	// index would never remove them, so they are given one first, derived from
+	// the hold they already carry. Done before the index is created and before
+	// the old one is dropped, so there is no moment at which a row is immortal.
+	if _, err := f.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
+		bson.D{{Key: "expiresAt", Value: bson.D{{Key: "$exists", Value: false}}}},
+		mongo.Pipeline{bson.D{{Key: "$set", Value: bson.D{
+			{Key: "expiresAt", Value: bson.D{{Key: "$add", Value: bson.A{
+				"$hotUntil", meta.NoticeTTL.Milliseconds(),
+			}}}},
+		}}}}); err != nil {
+		f.log.Warn("could not carry residency rows onto the new expiry field",
+			"err", err,
+			"note", "rows written before this version keep expiring on hotUntil until the "+
+				"old index is gone, and are removed by hand or by the next start")
+	}
+
+	if _, err := f.cold.Database(meta.DB).Collection(meta.Residency).Indexes().
+		CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "expiresAt", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).SetName("tc_residency_expiry"),
+		}); err != nil {
+		f.log.Warn("could not create the residency expiry index",
+			"err", err,
+			"note", "residency rows are never cleared, so "+meta.DB+"."+meta.Residency+
+				" grows slowly; mirroring is unaffected")
+	} else if err := f.cold.Database(meta.DB).Collection(meta.Residency).Indexes().
+		DropOne(ctx, "tc_residency_ttl"); err != nil {
+		// Absent on every deployment that never ran the older version, which is
+		// not a problem and must not be reported as one.
+		if !isIndexNotFound(err) {
+			f.log.Warn("could not drop the old residency expiry index",
+				"err", err,
+				"note", "it expires rows on hotUntil, which is when the hold ends rather than "+
+					"when the row may go, so a change stream read late may see a copy-up as an insert")
+		}
+	}
+
 	// This one warns instead of refusing to start. The notice TTLs above are
 	// load-bearing: an announcement that outlives its expiry is read as an
 	// application delete and the archive tombstones a live record, so a feeder
 	// that cannot create them should not run. Housekeeping is not worth a
-	// stopped feeder, and an index somebody already made on hotUntil under
-	// another name would be exactly that.
-	if _, err := f.cold.Database(meta.DB).Collection(meta.Residency).Indexes().
-		CreateOne(ctx, mongo.IndexModel{
-			Keys:    bson.D{{Key: "hotUntil", Value: 1}},
-			Options: options.Index().SetExpireAfterSeconds(0).SetName("tc_residency_ttl"),
-		}); err != nil {
-		f.log.Warn("could not create the residency expiry index",
-			"err", err,
-			"note", "residency records of documents the application deleted are never cleared, "+
-				"so "+meta.DB+"."+meta.Residency+" grows slowly; mirroring is unaffected")
-	}
+	// stopped feeder.
 	return nil
 }
 
@@ -639,6 +672,18 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 	f.pending = append(f.pending, pendingOp{
 		ns: ns, key: ev.DocumentKey, id: id, doc: ev.FullDocument, kind: actionUpsert,
 		wasInsert: ev.OperationType == "insert",
+		at:        ev.ClusterTime,
 	})
 	return nil
+}
+
+// isIndexNotFound reports whether dropping an index failed because it was not
+// there. A deployment that never ran the version which created it is the
+// ordinary case, not a fault.
+func isIndexNotFound(err error) bool {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return ce.Code == 27 || ce.Name == "IndexNotFound"
+	}
+	return strings.Contains(err.Error(), "index not found")
 }

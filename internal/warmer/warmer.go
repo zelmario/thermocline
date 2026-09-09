@@ -669,6 +669,10 @@ func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDo
 				{Key: "ns", Value: ns},
 				{Key: "doc", Value: d.id},
 				{Key: "hotUntil", Value: until},
+				// The row outlives the hold, so a change stream consumer that is
+				// behind can still tell this warm from an application insert. See
+				// meta.ResidencyRecord.ExpiresAt.
+				{Key: "expiresAt", Value: meta.ResidencyExpiry(until)},
 			}}}).
 			SetUpsert(true)
 	}
