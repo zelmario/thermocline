@@ -1399,6 +1399,41 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 		// The document being written is allowed to hold its own value.
 		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
 	}
+	// Narrowed to the documents the index actually indexes, because holding the
+	// value and holding the key are not the same thing.
+	//
+	// A sparse or partial unique index constrains only some documents, and one
+	// outside it does not hold the key however plainly it holds the value.
+	// Matching on the values alone therefore refused writes mongod accepts:
+	// measured on a unique index over sku with partialFilterExpression
+	// {active: true}, one document {sku: "K", active: false} and an ownerless
+	// claim row for that key, an insert of {sku: "K", active: true} came back
+	// E11000 from the router and was accepted by mongod on an untiered
+	// collection carrying the same index.
+	//
+	// In the query rather than per document, unlike pruneClaims, which reads
+	// each candidate and asks constrains. Both answer the same question and
+	// agree on the rules; this one is on the write path, where the point is to
+	// let the partial index serve the lookup instead of fetching what it would
+	// have excluded. Every operator MongoDB allows in a
+	// partialFilterExpression is one a find filter takes.
+	var scope bson.A
+	if len(idx.partial) > 0 {
+		scope = append(scope, idx.partial)
+	}
+	if idx.sparse {
+		// A compound sparse index still indexes a document that has any one of
+		// its fields, so only one missing all of them is exempt. The same rule
+		// constrains applies, in the same polarity.
+		var present bson.A
+		for _, f := range idx.fields {
+			present = append(present, bson.D{{Key: f, Value: bson.D{{Key: "$exists", Value: true}}}})
+		}
+		scope = append(scope, bson.D{{Key: "$or", Value: present}})
+	}
+	if len(scope) > 0 {
+		filter = append(filter, bson.E{Key: "$and", Value: scope})
+	}
 
 	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
 	if len(idx.collation) > 0 {

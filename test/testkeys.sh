@@ -347,6 +347,55 @@ chk "the same value outside the filter is fine" "ok"    "$(R 'try{db.getSiblingD
 chk "an update moving it into the filter rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkpart.updateOne({_id:3},{$set:{active:true}});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and the document was not changed"           "false" "$(H 'const d=db.getSiblingDB(process.env.TC_DB).tkpart.findOne({_id:3}); print(d?d.active:"MISSING")')"
 
+# Every row above names its owner, so the question "is this key still held" was
+# always answered by re-reading that document. A row that names nobody is
+# answered a different way -- by asking the tiers whether any live document
+# holds the value -- and that path did not know the index was partial.
+#
+# A row with no owner is a real state: a key claimed for a write whose document
+# id was not knowable yet leaves one. It is made here by taking the owner off a
+# row, because the alternative is computing a key id, which nothing outside the
+# router can do.
+#
+# The value below is held by a document outside the filter, so mongod indexes
+# nothing for it and accepts a second, indexed holder. The router refused it:
+# E11000 naming an index whose filter the other document does not match. An
+# untiered copy of the same collection with the same index is what says so.
+echo "== a claim row with no owner still knows the filter =="
+H 'db.getSiblingDB(process.env.TC_DB).tkplain.drop(); db.getSiblingDB(process.env.TC_DB).tkplain.createIndex({email:1},{unique:true,partialFilterExpression:{active:true}})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkpart.insertOne({_id:10,email:"q@x.com",active:true})' >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkpart.deleteOne({_id:10})' >/dev/null
+# A deleted document leaves its row behind on purpose, which is what makes the
+# rest of this possible. Asserted rather than assumed.
+QROW=$(H "const r=db.getSiblingDB(process.env.TC_META).keys.findOne({ns:'$DB.tkpart',doc:10}); print(r?r._id:'NONE')")
+chk "  the row outlived the document it was for" "true" \
+    "$([ "$QROW" != "NONE" ] && echo true || echo false)"
+[ "$QROW" != "NONE" ] && H "db.getSiblingDB(process.env.TC_META).keys.updateOne({_id:'$QROW'},{\$unset:{doc:''}})" >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkpart.insertOne({_id:11,email:"q@x.com",active:false})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_DB).tkplain.insertOne({_id:11,email:"q@x.com",active:false})' >/dev/null
+chk "  mongod accepts an indexed holder beside it" "ok" \
+    "$(H 'try{db.getSiblingDB(process.env.TC_DB).tkplain.insertOne({_id:12,email:"q@x.com",active:true});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and so does the router"                     "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkpart.insertOne({_id:12,email:"q@x.com",active:true});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# And the enforcement that narrowing could have thrown away. The only holder is
+# in the archive, where the fast tier's index cannot see it, and it is inside
+# the filter, so it does hold the key: refusing is right here even though a lone
+# mongod would accept. Its row loses its owner too, so the same ownerless path
+# is the one answering.
+# Waited for by name rather than by count. waitMirrored counts the whole
+# collection, which makes the number depend on every section above this one.
+for _ in $(seq 1 60); do
+  [ "$(C 'print(db.getSiblingDB(process.env.TC_DB).tkpart.countDocuments({_id:12,_tcDeletedAt:{$exists:false}}))')" = "1" ] && break
+  sleep 0.5
+done
+chk "  the archive has the document to be evicted" "1" \
+    "$(C 'print(db.getSiblingDB(process.env.TC_DB).tkpart.countDocuments({_id:12,_tcDeletedAt:{$exists:false}}))')"
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkpart.deleteOne({_id:12})'
+EROW=$(H "const r=db.getSiblingDB(process.env.TC_META).keys.findOne({ns:'$DB.tkpart',doc:12}); print(r?r._id:'NONE')")
+[ "$EROW" != "NONE" ] && H "db.getSiblingDB(process.env.TC_META).keys.updateOne({_id:'$EROW'},{\$unset:{doc:''}})" >/dev/null
+chk "  an archived indexed holder is still enforced" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkpart.insertOne({_id:13,email:"q@x.com",active:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== the same number written two ways is one key =="
 # A unique index makes one key out of int, long, double and decimal: a
 # collection holding NumberLong(7) rejects an insert of 7. The registry encodes
