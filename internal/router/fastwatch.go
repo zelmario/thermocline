@@ -84,13 +84,22 @@ func (r *Router) watchFastTier(ctx context.Context) {
 	// because a drop is followed by an invalidate and ResumeAfter refuses to
 	// carry on past one.
 	var after bson.Raw
+	// Whether a stream has ever been open, which is what separates "cannot" from
+	// "ended".
+	everOpened := false
 	for ctx.Err() == nil {
 		next, err := r.followChanges(ctx, after)
 		if ctx.Err() != nil {
 			return
 		}
 		after = next
-		r.watching.Store(false)
+		// Whether this attempt ever had a stream, read before it is cleared.
+		// An attempt that opened one and then ended is a failover or a stepdown;
+		// one that never opened is the shape a privilege problem takes, and the
+		// two want opposite things said about them. See below.
+		if r.watching.Swap(false) {
+			everOpened = true
+		}
 		if after != nil && checkpoint.ResumePointGone(err) {
 			// The token names a position the fast tier's oplog no longer has,
 			// which means this router was away for longer than the oplog is
@@ -105,16 +114,42 @@ func (r *Router) watchFastTier(ctx context.Context) {
 				"action", "cline indexes reports what each tier is missing")
 			after = nil
 		}
-		if first {
-			r.log.Error("this router cannot watch the fast tier, so it will not hear about a "+
-				"collection dropped out of band until something lists the catalog or it is "+
-				"restarted, and the cache is back to its learned TTL alone",
-				"err", err,
-				"remedy", "this router's own account needs to open a change stream on the fast "+
-					"tier, which is the privilege the feeder already holds")
-			first = false
-		} else {
+		switch {
+		case everOpened:
+			// It has watched, so it can watch. A stream ends on every fast tier
+			// failover and on every stepdown, and the next attempt carries on
+			// from `after`.
 			r.log.Warn("the fast tier's change stream ended, reopening", "err", err)
+		case first:
+			// Never once established, which is what the ERROR was written for:
+			// a privilege this router's account does not hold leaves the whole
+			// thing silently weaker, so it has to be loud.
+			//
+			// It used to fire on the *first end* rather than the first failure
+			// to open, and those are not the same event. Measured under
+			// testchaos, which shuts the fast tier's primary down beneath a
+			// running router: the error was "(ShutdownInProgress) The server is
+			// in quiesce mode and will shut down" and this line asserted the
+			// account was missing a privilege and that nothing would be heard
+			// "until something lists the catalog or it is restarted". Both
+			// wrong, on an ordinary election, at ERROR. An operator following
+			// that remedy would go and audit roles that are fine.
+			//
+			// So the remedy is a hypothesis about the error rather than a claim
+			// about the cause, and the consequence says what is true while it
+			// retries.
+			r.log.Error("this router has not been able to watch the fast tier once",
+				"err", err,
+				"effect", "while this is failing the cache is back to its learned TTL alone, and a "+
+					"collection dropped out of band is noticed at the next catalog listing rather "+
+					"than at once",
+				"retrying", invalidationBackoff.String(),
+				"remedy", "if the error above is an authorization failure, this router's own "+
+					"account needs to open a change stream on the fast tier, which is the "+
+					"privilege the feeder already holds")
+			first = false
+		default:
+			r.log.Warn("still cannot watch the fast tier, retrying", "err", err)
 		}
 		select {
 		case <-ctx.Done():
