@@ -58,6 +58,9 @@ stopDaemons() {
 }
 startRouter() { # config
   cline router --config "$1" --log-file $LOGDIR/pool_r.log &
+  # conns() counts this pid's sockets, so it has to be captured here. Backgrounded
+  # directly rather than through a subshell, so $! is the router itself.
+  RPID=$!
   for _ in $(seq 1 30); do
     mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
@@ -66,13 +69,35 @@ startRouter() { # config
   echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
-# Every connection the primary currently holds.
+# Every connection this worker's router holds to the fast tier.
 #
-# Counted in total rather than by name, and measured as a delta around holding
-# the clients. Counting by appName would only see the pooled router, since a
-# proxied connection carries the client's own handshake, and a measurement that
-# can only see one of the two things being compared is not a comparison.
-conns() { H 'print(db.serverStatus().connections.current)'; }
+# This was the primary's own connections.current, which counts every client it
+# has, and it is read as a delta around holding eight clients open. Under a
+# parallel sweep the other three workers' routers, feeders and mongosh
+# invocations land in that delta: measured, the pooled arm read 0 and 8 on
+# different runs and the proxied arm 50, 32 and 17, so this suite failed most
+# sweeps and passed on its own. An absolute threshold fails on the first kind
+# of noise and subtracting a separately measured drift fails on the second.
+#
+# The router's own sockets are the thing the claim is about, and no other
+# worker's process owns any of them, so there is no noise to subtract. Read by
+# pid, which ss gives, rather than by appName: a proxied connection carries the
+# client's own handshake, so a measurement by name can only see the pooled arm,
+# and a comparison that can only see one of its arms is not a comparison.
+#
+# Filtered to the fast tier's addresses, because this process also holds
+# sockets to the archive and one to each of the clients it is being measured
+# with, and counting those would make every arm look like it gained eight.
+HOTADDRS=$(echo "$HOT" | sed -e 's|^mongodb://[^@]*@||' -e 's|/?.*$||' | tr ',' ' ')
+conns() {
+  [ -n "$RPID" ] || { echo 0; return; }
+  ss -tnp 2>/dev/null | awk -v pid="pid=$RPID," -v addrs="$HOTADDRS" '
+    BEGIN { n = split(addrs, a, " ") }
+    /ESTAB/ && index($0, pid) {
+      for (i = 1; i <= n; i++) if ($5 == a[i]) { c++; break }
+    }
+    END { print c+0 }'
+}
 
 # Hold CLIENTS connections open, each doing nothing at all.
 holdClients() {
@@ -100,16 +125,10 @@ POOLED=$(( $(conns) - BEFORE ))
 dropClients
 stopDaemons
 echo "      $CLIENTS idle clients cost $POOLED extra connections to the primary"
-# Judged below, against the proxied arm, because that is the claim and because
-# both arms carry the same noise.
-#
-# conns() is the primary's total across every client it has, which is what makes
-# the two arms comparable and also means other work on the cluster lands in the
-# delta. Measured under a parallel sweep: the pooled arm read 0 and 8 on
-# different runs, and the proxied arm 50, 32 and 17. An absolute threshold fails
-# on the first kind of noise; subtracting a separately measured drift, which was
-# the first attempt at this, fails on the second: a drift sample of 15 turned a
-# proxied reading of 17 into 2 and the control failed instead.
+# Judged below, against the proxied arm, because that is the claim: the number
+# that matters is the ratio between the two arms, not either reading on its own.
+# Both are counted the same way, on the same router, at the same two moments.
+# See conns() for why it is counted by pid.
 
 echo "== with authentication proxied, they do not =="
 # The control. Without this the numbers above could mean the clients never
@@ -128,8 +147,14 @@ chk "proxied clients each hold one"                    "true" \
     "$(awk -v p="$PROXIED" -v c="$CLIENTS" 'BEGIN{print (p+0 >= c+0-1) ? "true" : "false"}')"
 # The claim, stated as the comparison it is: pooled costs a fraction of proxied,
 # not merely one connection less.
+#
+# The parenthesis is the point. This read `n+0 * 2 < p+0`, and awk binds `*`
+# tighter than `+`, so it was `n + (0*2) < p`: the check asked only that pooled
+# was lower by anything at all, while its own name claimed a factor of two. A
+# check whose arithmetic is weaker than its name is the one kind of failure a
+# green suite cannot show you.
 chk "and pooled clients cost a fraction of that"       "true" \
-    "$(awk -v p="$PROXIED" -v n="$POOLED" 'BEGIN{print (n+0 * 2 < p+0) ? "true" : "false"}')"
+    "$(awk -v p="$PROXIED" -v n="$POOLED" 'BEGIN{print ((n+0) * 2 < (p+0)) ? "true" : "false"}')"
 
 echo "== and a transaction keeps the connection it started on =="
 startRouter $POOLCFG
