@@ -335,6 +335,22 @@ Things this encodes, each of which cost a wrong result first:
   ninety after. A suite cannot own a four percent per round failure, so it lives
   beside the suites as something to run by hand, with the numbers written down.
 
+- **Never read the exit status of `R`, `H` or `C`.** They end in `| tail -1`, and
+  a pipeline's status is the last command's, so they return zero however badly
+  mongosh failed. Thirteen wait loops across five suites were written
+  `do R 'ping' && break` and therefore broke on their first iteration and waited
+  for nothing: the router was given no time to start and whatever ran next met a
+  closed port. On an idle box the router wins that race and nothing shows; under
+  a parallel sweep it does not, and what you see is a write that failed into
+  `/dev/null` and some later check reporting a mirroring defect. Use `routerUp`,
+  which is the same ping without the pipe, or call mongosh directly.
+
+- **A section that starts its own router has to check that it started.**
+  `startRouter` ends in a FATAL for a reason, and a section that starts a router
+  inline skips it. Print the last line of the router's own log with it: the time
+  this mattered, that line was an ordinary startup INFO rather than an error,
+  which is what proved the router was fine and nothing had waited for it.
+
 Things these encode that are easy to get wrong when testing by hand:
 
 - **The evictor's precondition is a feeder that has caught up.** Killing the
