@@ -619,6 +619,89 @@ chk "and the fast tier's own stream did carry it"      "1" "$RCTRL"
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null 2>&1
 
+echo "== the catalog repair behind a copy-up is not the application's DDL =="
+# The fast tier is repaired, not merely filled. Before the first copy-up into a
+# namespace the router creates the collection there with the archive's options,
+# because a collation decides which documents match and cannot be added
+# afterwards, and then builds the archive's indexes on it. Both happen on the
+# application's own namespace, so neither the scratch prefix nor the bookkeeping
+# database hides them.
+#
+# An ordinary change stream carries neither, which is why this went unseen: it
+# takes showExpandedEvents, MongoDB 6.0 and up, and then one point read of one
+# archived document delivered **create then createIndexes** for a collection the
+# archive had held all along. Measured on both the collection and the database
+# shapes of the stream.
+#
+# Asked as the same question of both tiers, which is what makes the zero below
+# mean anything: the fast tier's own stream has to carry those events, because a
+# fixture where the router never repaired anything would pass this while
+# proving nothing.
+DNS=tcs5
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C "const d = db.getSiblingDB(process.env.TC_DB).$DNS;
+   d.insertOne({_id:1,v:'archived'}); d.createIndex({v:1}); print('seeded')" >/dev/null
+# The window starts before the daemons and strictly after that drop, and both
+# halves of that were learned by measurement.
+#
+# Before the daemons, because the router repairs the catalogs of the namespaces
+# it serves as it starts: a window opened after startRouter misses the very
+# events this section is about, and the check below then passes for the wrong
+# reason. Measured, the create landed two seconds after startRouter and the
+# copy-up's insert seven seconds after that.
+#
+# Strictly after the drop, because the drop is in the fast tier's oplog too and
+# a drop delivers an invalidate, which closes a resumed cursor. A window that
+# reaches back into the same second read "drop, invalidate" and ended there,
+# carrying none of what follows: one run in three, which is the worst kind of
+# check. The same trap the resumed-stream section above avoids by creating its
+# collection beforehand, which this one cannot do, because a fast tier that
+# already holds the collection has nothing to repair.
+sleep 2
+DTS=$(date +%s)
+startFeeder; startRouter
+sleep 3
+# And a point read, so the copy-up path is covered whichever of the two did it.
+R "db.getSiblingDB(process.env.TC_DB).$DNS.findOne({_id:1})" >/dev/null
+# The index build is detached from the read's own path, so wait for it rather
+# than racing it. _id_ plus the archive's v_1.
+for _ in $(seq 1 40); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$DNS.getIndexes().length)" 2>/dev/null)" = "2" ] && break
+  sleep 0.5
+done
+echo "  the fast tier now holds $(H "print(db.getSiblingDB(process.env.TC_DB).$DNS.getIndexes().length)") indexes and $(H "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({}))") document"
+# Read out of the aggregate's own first batch rather than from a getMore, so the
+# section also covers the path a consumer resuming from a stored token takes.
+DDLDRAIN="const r = db.getSiblingDB(process.env.TC_DB).runCommand({
+     aggregate: '$DNS',
+     pipeline: [{\$changeStream: {startAtOperationTime: Timestamp({t: $DTS, i: 1}),
+                                 showExpandedEvents: true}}],
+     cursor: {}});
+   print(r.ok ? r.cursor.firstBatch.filter(e =>
+     e.operationType === 'create' || e.operationType === 'createIndexes').length : 'aggregate failed');"
+DROUTED=$(R "$DDLDRAIN")
+DCTRL=$(H "$DDLDRAIN")
+echo "  the routed stream carried $DROUTED catalog events, the fast tier's own $DCTRL"
+chk "the fast tier's own stream did carry the repair"  "2" "$DCTRL"
+chk "and the routed stream carried none of it"         "0" "$DROUTED"
+# The other half, and the half the two checks above cannot tell apart from a
+# router that hides every create and createIndexes it sees. Hiding the
+# application's own DDL from its own stream is worse than the defect this fixes.
+DMTS=$(( $(date +%s) - 1 ))
+R "db.getSiblingDB(process.env.TC_DB).$DNS.createIndex({mine:1})" >/dev/null 2>&1
+sleep 2
+DMINE=$(R "const r = db.getSiblingDB(process.env.TC_DB).runCommand({
+     aggregate: '$DNS',
+     pipeline: [{\$changeStream: {startAtOperationTime: Timestamp({t: $DMTS, i: 1}),
+                                 showExpandedEvents: true}}],
+     cursor: {}});
+   print(r.ok ? r.cursor.firstBatch.filter(e => e.operationType === 'createIndexes').length : 'aggregate failed');")
+echo "  after the application built its own index the routed stream carried $DMINE"
+chk "the application's own index build still arrives"  "1" "$DMINE"
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+
 stopDaemons
 echo
 echo "================================"

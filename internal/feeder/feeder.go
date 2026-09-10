@@ -256,6 +256,19 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 		return fmt.Errorf("create warming ttl index: %w", err)
 	}
 
+	// And the record of this system's own DDL on the fast tier, which a
+	// client's change stream is judged against. The same hour, because it
+	// answers the same question for the same late reader: a consumer resuming
+	// from a stored token needs the row to still be there. See meta.OwnDDL.
+	_, err = f.cold.Database(meta.DB).Collection(meta.OwnDDL).Indexes().
+		CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(ttl).SetName("tc_ownddl_ttl"),
+		})
+	if err != nil {
+		return fmt.Errorf("create own ddl ttl index: %w", err)
+	}
+
 	// Residency rows expire at an instant they carry themselves, so the TTL is
 	// zero seconds past that instant rather than a duration of its own.
 	//

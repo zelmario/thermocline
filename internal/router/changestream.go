@@ -267,6 +267,24 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 	// written and deleted continuously.
 	ours := make([]bool, len(events))
 
+	// The namespaces of DDL events on collections this system tiers, and the
+	// distinct list to ask about. This system repairs the fast tier's catalog:
+	// before the first copy-up into a namespace it creates the collection there
+	// with the archive's options and builds the archive's indexes on it, both
+	// on the application's own namespace. An ordinary change stream does not
+	// carry either, so this is only reachable with showExpandedEvents, and with
+	// it a client was told its collection had just been created and its indexes
+	// with it. Measured on both the collection and the database shapes of the
+	// stream, from a single point read of one archived document.
+	//
+	// Not suppressed by kind alone, which would have been a line rather than a
+	// lookup: the application creates indexes on these same collections through
+	// this router, and hiding its own DDL from its own stream is worse than
+	// showing an extra create. See meta.OwnDDLRecord.
+	ddlNS := make([]string, len(events))
+	var ddlAsk []string
+	seenNS := map[string]bool{}
+
 	for i, ev := range events {
 		doc, ok := ev.DocumentOK()
 		if !ok {
@@ -289,6 +307,15 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 			// collection with a unique index, and a client.watch() delivered ten
 			// events, five of them the registry's.
 			ours[i] = meta.IsScratch(coll) || edb == meta.DB
+		}
+		if isCatalogDDL(op) && !ours[i] {
+			if evns, nsok := eventNS(doc); nsok && r.cfg.Manages(evns) {
+				ddlNS[i] = evns
+				if !seenNS[evns] {
+					seenNS[evns] = true
+					ddlAsk = append(ddlAsk, evns)
+				}
+			}
 		}
 		if op != "delete" && op != "insert" {
 			continue
@@ -322,6 +349,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 
 	evicted := r.evictionNotices(ctx, deleteIDs)
 	promoted := r.promotionTimes(ctx, insertIDs)
+	ownDDL := r.ownCatalogDDL(ctx, ddlAsk)
 	// The old rule, kept as a floor. Whatever the events say about their own
 	// time, a promotion recorded within the window still counts, so this can
 	// only ever suppress more than it did and never less. That also settles the
@@ -335,6 +363,14 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 	for i, ev := range events {
 		switch {
 		case ours[i]:
+			dropped++
+		case ddlNS[i] != "" && ownDDL[ddlNS[i]].Covers(eventPosition(ev)):
+			// This system's own catalog repair. The event's position falls
+			// inside a bracket the Indexer opened before the command and
+			// closed after it, read from the fast tier's own lastWrite. See
+			// meta.OwnDDLSpan for why the command's own reply cannot say.
+			r.log.Debug("hiding this system's own catalog repair from a change stream",
+				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev)):
 			dropped++
@@ -353,6 +389,41 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 		}
 	}
 	return keep, dropped
+}
+
+// isCatalogDDL reports whether an event is one this system performs on the fast
+// tier to repair its catalog.
+//
+// create and createIndexes, and nothing else, because those are the two this
+// system does: Indexer.EnsureCollection creates the collection with the
+// archive's options before the first copy-up, and Indexer.Ensure builds the
+// archive's indexes on it. Nothing here drops a collection or an index on the
+// fast tier for its own reasons, so a drop or a dropIndexes reaching a client
+// is the application's own or somebody else's, and either way it is news.
+//
+// Named as a list rather than "any DDL" for that reason. A kind added here
+// without something recording it would hide an event nothing accounts for.
+func isCatalogDDL(op string) bool {
+	return op == "create" || op == "createIndexes"
+}
+
+// ownCatalogDDL reads what this system recorded doing to these namespaces.
+//
+// A miss is not an error: it means nothing recorded that DDL, so the event is
+// the application's and goes through. That is also what happens when the
+// bookkeeping cannot be read at all, which is the same direction every other
+// judgement here errs in.
+func (r *Router) ownCatalogDDL(ctx context.Context, nss []string) map[string]meta.OwnDDLRecord {
+	if len(nss) == 0 {
+		return nil
+	}
+	rows, err := meta.ReadOwnDDL(ctx, r.cold, nss)
+	if err != nil {
+		r.log.Warn("could not read which catalog changes this system made, so a client watching "+
+			"with showExpandedEvents may see them", "err", err)
+		return nil
+	}
+	return rows
 }
 
 // eventNS is the namespace one change stream event happened in.

@@ -11,7 +11,79 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
+
+// beginOwnDDL opens a bracket around DDL this system is about to do on the fast
+// tier, so a client's change stream can tell it from the application's own. It
+// returns the closer, which must be called once the command has finished.
+//
+// A client's change stream watches the fast tier, which is where all of this
+// happens, and with showExpandedEvents it carries create and createIndexes.
+// Measured before this existed: one point read of one archived document, and a
+// client watching was delivered create then createIndexes for a collection the
+// archive had held all along, on both the collection and the database shapes of
+// the stream.
+//
+// Opened before the command rather than recorded after it, because the event
+// reaches the client as soon as the write is visible and the record has to be
+// there already. A closer that is never called leaves the span open, which
+// meta.OwnDDLRecord.Covers bounds rather than trusting.
+func (ix *Indexer) beginOwnDDL(ctx context.Context, ns string) func() {
+	from, ok := ix.hotPosition(ctx)
+	if !ok {
+		// Nothing to bracket with. The events go through, which is the
+		// direction everything here errs in: see meta.MaxOwnDDLRecorded.
+		ix.log.Debug("could not read the fast tier's write position, so a client watching with "+
+			"showExpandedEvents will see this system's catalog repair", "ns", ns)
+		return func() {}
+	}
+	// Detached, because the span has to outlive a cancelled request: the DDL
+	// below happens either way and a client is watching for it.
+	bctx := context.WithoutCancel(ctx)
+	if err := meta.AnnounceOwnDDL(bctx, ix.cold, ns, from); err != nil {
+		ix.log.Warn("could not record that this system is about to change the fast tier's catalog",
+			"ns", ns, "err", err,
+			"effect", "a client watching with showExpandedEvents is told its collection or its "+
+				"indexes were just created")
+		return func() {}
+	}
+	return func() {
+		to, ok := ix.hotPosition(bctx)
+		if !ok {
+			// The span stays open and Covers bounds it. Better than closing it
+			// at a position that may be before the write.
+			return
+		}
+		if err := meta.CloseOwnDDL(bctx, ix.cold, ns, from, to); err != nil {
+			ix.log.Warn("could not close the record of this system's own catalog change",
+				"ns", ns, "err", err)
+		}
+	}
+}
+
+// hotPosition is the fast tier's own latest write position.
+//
+// hello reports it as lastWrite.opTime.ts, which is an oplog position and not a
+// logical clock reading: the entry a command writes next comes strictly after
+// it. The command reply's operationTime looks like the same thing and is not,
+// which is the mistake this replaced. See meta.OwnDDLSpan.
+func (ix *Indexer) hotPosition(ctx context.Context) (bson.Timestamp, bool) {
+	raw, err := ix.hot.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Raw()
+	if err != nil {
+		return bson.Timestamp{}, false
+	}
+	v, lerr := raw.LookupErr("lastWrite", "opTime", "ts")
+	if lerr != nil {
+		return bson.Timestamp{}, false
+	}
+	t, i, ok := v.TimestampOK()
+	if !ok {
+		return bson.Timestamp{}, false
+	}
+	return bson.Timestamp{T: t, I: i}, true
+}
 
 // The fast tier is filled by copying documents, and an index is not a document,
 // so a tier that has just been built holds every document the application asks
@@ -460,8 +532,17 @@ func (ix *Indexer) createIndexes(ctx context.Context, db, coll string, specs []b
 		// catches up, the same as it applies everything else.
 		{Key: "commitQuorum", Value: "majority"},
 	}
+	// Bracketed on both attempts, and not only the first: a fast tier that
+	// refuses the commit quorum builds its indexes down the path below, and an
+	// unbracketed build there would be delivered to every application on such a
+	// cluster. Same defect, second door.
+	done := ix.beginOwnDDL(ctx, db+"."+coll)
 	err := ix.hot.Database(db).RunCommand(ctx, cmd).Err()
-	if err == nil || !rejectsCommitQuorum(err) {
+	done()
+	if err == nil {
+		return nil
+	}
+	if !rejectsCommitQuorum(err) {
 		return err
 	}
 	// A server that will not take the option at all. Nothing here should stop
@@ -472,7 +553,10 @@ func (ix *Indexer) createIndexes(ctx context.Context, db, coll string, specs []b
 		"ns", db+"."+coll, "err", err,
 		"note", "the build then waits for every voting member, so one away for maintenance "+
 			"means it does not finish")
-	return ix.hot.Database(db).RunCommand(ctx, cmd[:len(cmd)-1]).Err()
+	done = ix.beginOwnDDL(ctx, db+"."+coll)
+	err = ix.hot.Database(db).RunCommand(ctx, cmd[:len(cmd)-1]).Err()
+	done()
+	return err
 }
 
 // rejectsCommitQuorum reports a server refusing the option rather than the
@@ -531,7 +615,12 @@ func (ix *Indexer) createWithOptions(ctx context.Context, db, coll string) (isVi
 
 	cmd := bson.D{{Key: "create", Value: coll}}
 	cmd = append(cmd, opts...)
-	if cerr := ix.hot.Database(db).RunCommand(ctx, cmd).Err(); cerr != nil {
+	// Bracketed, so a client watching this collection with showExpandedEvents
+	// is not told its collection was just created. See beginOwnDDL.
+	done := ix.beginOwnDDL(ctx, db+"."+coll)
+	cerr := ix.hot.Database(db).RunCommand(ctx, cmd).Err()
+	done()
+	if cerr != nil {
 		// A racing insert is the expected way to lose here, and it is not
 		// worth failing the index build over.
 		if isNamespaceExists(cerr) {

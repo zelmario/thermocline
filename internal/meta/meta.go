@@ -22,7 +22,7 @@ import (
 var bookkeepingCollections = map[string]bool{
 	Residency: true, Evicting: true, Checkpoints: true, PositionsColl: true,
 	Warming: true, Markers: true, DaemonStats: true, CacheAdvice: true,
-	Watermarks: true, "keys": true,
+	Watermarks: true, OwnDDL: true, "keys": true,
 }
 
 // IsBookkeeping reports whether a database holding exactly these collections is
@@ -112,6 +112,24 @@ const (
 	// fast tier produces an insert that the feeder would otherwise mirror
 	// straight back down, into the archive it was just read from.
 	Warming = "warming"
+
+	// OwnDDL records the collection creations and index builds this system
+	// performs on the fast tier for itself, so a client's change stream can
+	// tell them from the application's own.
+	//
+	// The fast tier is repaired rather than merely filled: before the first
+	// copy-up into a namespace the collection is created there with the
+	// archive's options, and the archive's indexes are built on it. Both happen
+	// on the application's own namespace, so neither the scratch prefix nor the
+	// bookkeeping database hides them, and with showExpandedEvents a client is
+	// told its collection was just created and its indexes with it.
+	//
+	// One row per namespace, holding the oplog positions of that DDL. A
+	// namespace and not a document id, because DDL has no document; positions
+	// and not a window, because the application builds indexes on these same
+	// collections and hiding its own DDL would be worse than showing an extra
+	// create. See OwnDDLRecord.
+	OwnDDL = "ownddl"
 
 	// Markers holds small singleton documents, currently the warmer's
 	// heartbeat. It lets the feeder skip echo suppression entirely when no
@@ -591,6 +609,158 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 	// holds. The notice now lives out its TTL and the feeder ignores it once
 	// spent; see ConsumeEvictionNotices and the sieve in the router.
 	return nil
+}
+
+// OwnDDLSpan brackets one piece of DDL this system did on the fast tier: the
+// oplog position before it started and the position once it had finished.
+//
+// A bracket rather than the position itself, because the position itself is not
+// obtainable. The obvious source is the command reply's operationTime, and it
+// is the wrong value: it is the node's latest logical time when it answered,
+// not the oplog position of the write it just did. Measured on PSMDB 8.0, a
+// single copy-up into an empty namespace: the create arrived at clusterTime
+// (T,1), the createIndexes at (T,7), and operationTime came back (T,8), which
+// matches neither event. A fix built on it suppressed nothing at all while
+// passing its own unit tests.
+//
+// From is read before the command and To after it, both from the fast tier's
+// own lastWrite position, so the entry the command writes falls strictly
+// inside. That is exact enough to be safe in the only direction that matters:
+// the application's own DDL on this namespace is outside every span unless it
+// happens while this system is building on the same collection.
+type OwnDDLSpan struct {
+	From bson.Timestamp `bson:"from"`
+	// To is unset while the DDL is still running. See OwnDDLRecord.Covers for
+	// how far an unfinished span reaches.
+	To bson.Timestamp `bson:"to,omitempty"`
+}
+
+// OwnDDLRecord is one namespace's row in OwnDDL.
+type OwnDDLRecord struct {
+	// ID is the namespace, db.coll.
+	ID    string       `bson:"_id"`
+	At    time.Time    `bson:"at"`
+	Spans []OwnDDLSpan `bson:"spans,omitempty"`
+}
+
+// OpenSpanSeconds is how far an unfinished span reaches, in cluster time.
+//
+// A span is opened before the DDL and closed after it, so an open one means
+// either that the DDL is still running or that whatever was running it went
+// away. The first wants covering and the second must not last: a namespace
+// whose row said "still building" for ever would hide the application's own
+// index builds on that collection until the row's TTL took it.
+//
+// Five minutes covers an index build on a fast tier of any size this system is
+// meant for, and a build slower than that has its event delivered, which is the
+// direction everything here errs in.
+const OpenSpanSeconds = 300
+
+// Covers reports whether this system was doing DDL on this namespace at this
+// oplog position.
+func (d OwnDDLRecord) Covers(pos bson.Timestamp) bool {
+	if pos.T == 0 && pos.I == 0 {
+		return false
+	}
+	for _, s := range d.Spans {
+		if before(pos, s.From) {
+			continue
+		}
+		if s.To.T == 0 && s.To.I == 0 {
+			if pos.T <= s.From.T+OpenSpanSeconds {
+				return true
+			}
+			continue
+		}
+		if !before(s.To, pos) {
+			return true
+		}
+	}
+	return false
+}
+
+// before reports whether a comes strictly before b in the oplog.
+func before(a, b bson.Timestamp) bool {
+	if a.T != b.T {
+		return a.T < b.T
+	}
+	return a.I < b.I
+}
+
+// MaxOwnDDLRecorded is how many spans one namespace's row keeps.
+//
+// A namespace ordinarily contributes two, the create and the one createIndexes
+// that carries every index, and the Indexer does that once per namespace per
+// process. Retries and a fast tier collection dropped and repaired again add
+// more, so a handful of room is right; a row lives an hour.
+//
+// Overflowing drops the oldest, which shows an extra create rather than hiding
+// one of the application's own index builds. That is the safe direction, and it
+// is the same choice the sieve makes everywhere else: passing an event through
+// is recoverable and hiding one is silent.
+const MaxOwnDDLRecorded = 16
+
+// AnnounceOwnDDL opens a span for DDL this system is about to do on ns.
+//
+// Before the command, and that ordering is the point. Recording afterwards
+// leaves a window in which the event has been delivered and nothing yet says it
+// was ours, which is the same window recordResidency is written first to avoid:
+// the client's next getMore can arrive inside one round trip to the archive.
+func AnnounceOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from bson.Timestamp) error {
+	_, err := cold.Database(DB).Collection(OwnDDL).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: ns}},
+		bson.D{
+			{Key: "$set", Value: bson.D{{Key: "at", Value: time.Now().UTC()}}},
+			{Key: "$push", Value: bson.D{{Key: "spans", Value: bson.D{
+				{Key: "$each", Value: bson.A{OwnDDLSpan{From: from}}},
+				{Key: "$slice", Value: -MaxOwnDDLRecorded},
+			}}}},
+		},
+		options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("announce own ddl for %s: %w", ns, err)
+	}
+	return nil
+}
+
+// CloseOwnDDL closes the span this system opened at from.
+//
+// Matched on the position it was opened with rather than on the last element,
+// because two callers can be repairing two namespaces at once and a retry can
+// leave more than one span on a row.
+func CloseOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from, to bson.Timestamp) error {
+	_, err := cold.Database(DB).Collection(OwnDDL).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: ns}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "spans.$[s].to", Value: to}}}},
+		options.UpdateOne().SetArrayFilters([]interface{}{
+			bson.D{{Key: "s.from", Value: from}},
+		}))
+	if err != nil {
+		return fmt.Errorf("close own ddl for %s: %w", ns, err)
+	}
+	return nil
+}
+
+// ReadOwnDDL reads the rows for these namespaces, one query for the batch.
+func ReadOwnDDL(ctx context.Context, cold *mongo.Client, nss []string) (map[string]OwnDDLRecord, error) {
+	if len(nss) == 0 {
+		return nil, nil
+	}
+	cur, err := cold.Database(DB).Collection(OwnDDL).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: nss}}}})
+	if err != nil {
+		return nil, fmt.Errorf("read own ddl: %w", err)
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	out := make(map[string]OwnDDLRecord, len(nss))
+	for cur.Next(ctx) {
+		var r OwnDDLRecord
+		if err := cur.Decode(&r); err != nil {
+			continue
+		}
+		out[r.ID] = r
+	}
+	return out, cur.Err()
 }
 
 // Tombstone is the update applied to a cold document when the application

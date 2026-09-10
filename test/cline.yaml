@@ -325,6 +325,12 @@ feeder:
     # router claim keys in its own registry on the fast tier. Its own
     # collection because that registry is what the section is watching for.
     - "shop.tcs4"
+    # testchange.sh: the archive holds it with its indexes and the fast tier
+    # holds none of it, so the first copy-up makes the router create the
+    # collection there and build the archive's indexes on it. Its own
+    # collection because the section needs a namespace no other section has
+    # already had the router repair.
+    - "shop.tcs5"
     # testcache.sh
     - "shop.tcache"
     # testcache.sh again, for the cache across an adoption: the archive holds
