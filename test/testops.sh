@@ -32,6 +32,20 @@ chk() {
   else FAIL=$((FAIL+1)); FAILED+=("$MODE/$1"); printf '  FAIL  %-44s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+
+# routerUp is the same ping R makes, without the pipe, and it exists because a
+# wait loop has to test the command's own status.
+#
+# R ends in `| tail -1`, so a pipeline's status is tail's and is zero however
+# badly mongosh failed. Every `do R 'ping' && break` loop in this file therefore
+# broke on its first iteration and waited for nothing at all: the router was
+# given no time to come up, and whatever ran next met a closed port. On an idle
+# box the router wins that race and nothing shows; under a parallel sweep it
+# does not, and the result is a write failing into /dev/null and a later check
+# reporting something else entirely. Measured: testindexes reported "carol
+# reached the archive got=2 want=3" for a router that was still starting.
+routerUp() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+  --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
@@ -229,7 +243,7 @@ H "db.getSiblingDB(process.env.TC_DB3).tdbstats.insertMany(Array.from({length:3}
 # error rather than answer, which is a different subject.
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 cline router --config $CFG --log-file $LOGDIR/ops_r.log & RP=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 # Number() because mongod answers dbStats with an int64 and mongosh prints one
 # as Long('15'). The count is what this compares, not how the shell renders it.
 chk "the fast tier's own dbStats counts what it holds" "3" \

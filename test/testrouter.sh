@@ -31,6 +31,20 @@ chk() { # chk NAME EXPECTED ACTUAL
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-46s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+
+# routerUp is the same ping R makes, without the pipe, and it exists because a
+# wait loop has to test the command's own status.
+#
+# R ends in `| tail -1`, so a pipeline's status is tail's and is zero however
+# badly mongosh failed. Every `do R 'ping' && break` loop in this file therefore
+# broke on its first iteration and waited for nothing at all: the router was
+# given no time to come up, and whatever ran next met a closed port. On an idle
+# box the router wins that race and nothing shows; under a parallel sweep it
+# does not, and the result is a write failing into /dev/null and a later check
+# reporting something else entirely. Measured: testindexes reported "carol
+# reached the archive got=2 want=3" for a router that was still starting.
+routerUp() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+  --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
@@ -429,7 +443,7 @@ CATNS=tcatalog
 H "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 cline router --config $CFG >/dev/null 2>&1 & CATR=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 # In the archive only, which is where an unwarmed tiered collection lives.
 C "db.getSiblingDB(process.env.TC_DB).$CATNS.insertMany([{_id:1,n:'a'},{_id:2,n:'b'},{_id:3,n:'c'}])" >/dev/null
 chk "the fast tier does not have it"               "false" \
@@ -580,7 +594,7 @@ chk "the derived config tiers everything"          "0" \
     "$(grep -c '^  namespaces:' $WDIR/router_all.yaml)"
 kill $CATR 2>/dev/null; wait $CATR 2>/dev/null
 cline router --config $WDIR/router_all.yaml >/dev/null 2>&1 & CATR2=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 chk "the collection is still named"                "true" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('$CATNS') >= 0)")"
 chk "and the view is still not"                    "false" \
@@ -589,7 +603,7 @@ chk "and nothing built the view as a collection"   "false" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${CATNS}_view') >= 0)")"
 kill $CATR2 2>/dev/null; wait $CATR2 2>/dev/null
 cline router --config $CFG >/dev/null 2>&1 & CATR=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 C "db.getSiblingDB(process.env.TC_DB).${CATNS}_view.drop()" >/dev/null 2>&1
 # On the fast tier too. A binary without the guard builds the view there as a
 # real collection, and left behind it fails this section on the next run for a

@@ -40,6 +40,20 @@ chk() {
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-52s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 R() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
+
+# routerUp is the same ping R makes, without the pipe, and it exists because a
+# wait loop has to test the command's own status.
+#
+# R ends in `| tail -1`, so a pipeline's status is tail's and is zero however
+# badly mongosh failed. Every `do R 'ping' && break` loop in this file therefore
+# broke on its first iteration and waited for nothing at all: the router was
+# given no time to come up, and whatever ran next met a closed port. On an idle
+# box the router wins that race and nothing shows; under a parallel sweep it
+# does not, and the result is a write failing into /dev/null and a later check
+# reporting something else entirely. Measured: testindexes reported "carol
+# reached the archive got=2 want=3" for a router that was still starting.
+routerUp() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+  --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
@@ -625,7 +639,7 @@ chk "cline indexes calls it worse than slow"       "true" \
     "$(cline indexes --config $CFG --ns $DB.$LNS 2>&1 | grep -q 'worse than slow' && echo true || echo false)"
 rm -f $LOGDIR/lost.log
 cline router --config $CFG --log-file $LOGDIR/lost.log >/dev/null 2>&1 & LRP=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 chk "the router names it and the namespace"        "true" \
     "$(grep -qE "unique index the fast tier does not.*ns=$DB.$LNS" $LOGDIR/lost.log && echo true || echo false)"
 chk "and says the document stays on the fast tier" "true" \
@@ -658,7 +672,7 @@ C "db.getSiblingDB(process.env.TC_DB).$DNS.createIndex({code:1},{unique:true,nam
 C "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:1, code:'a'})" >/dev/null
 rm -f $LOGDIR/idxdrop.log
 cline router --config $CFG --log-file $LOGDIR/idxdrop.log >/dev/null 2>&1 & DRP=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 hasIdx() {
   H "print(db.getSiblingDB(process.env.TC_DB).$DNS.getIndexes().some(function (i) { return i.name === 'dropcode_u' }))"
 }
@@ -729,7 +743,7 @@ stopDaemons
 C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
 startFeeder
 cline router --config $CFG --log-file $LOGDIR/idxoob.log >/dev/null 2>&1 & ORP=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 # Say so when it did not come up, rather than letting the checks below describe
 # it as something else.
 #
@@ -860,7 +874,7 @@ chk "the two tiers answer the same query differently" "2/1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({name:'alice'}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({name:'alice'}))")"
 rm -f $LOGDIR/drift.log
 cline router --config $CFG --log-file $LOGDIR/drift.log >/dev/null 2>&1 & DRP=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 chk "the router names the collection and the option" "true" \
     "$(grep -qE "ns=$DB.$DNS option=collation" $LOGDIR/drift.log && echo true || echo false)"
 chk "and says which tier has what"                 "true" \
@@ -872,7 +886,7 @@ H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).createCollection('$DNS', {collation:{locale:'en',strength:2}})" >/dev/null
 rm -f $LOGDIR/drift2.log
 cline router --config $CFG --log-file $LOGDIR/drift2.log >/dev/null 2>&1 & DRQ=$!
-for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 chk "and says nothing once they match"             "0" \
     "$(grep -c "ns=$DB.$DNS" $LOGDIR/drift2.log || true)"
 kill $DRQ 2>/dev/null; wait $DRQ 2>/dev/null
