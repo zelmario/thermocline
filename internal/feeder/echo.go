@@ -85,9 +85,18 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 	}
 
 	var ids []string
+	// Where each warm's insert sits in the fast tier's oplog, so the residency
+	// record can say afterwards which insert it accounted for. The first upsert
+	// for a document is the one the notice is spent on, so the first position is
+	// the one to keep; see the loop at the end of this function.
+	posOf := map[string]bson.Timestamp{}
 	for _, op := range f.pending {
 		if op.kind == actionUpsert && op.wasInsert {
-			ids = append(ids, meta.DocID(op.ns, op.id))
+			id := meta.DocID(op.ns, op.id)
+			ids = append(ids, id)
+			if _, seen := posOf[id]; !seen {
+				posOf[id] = op.at
+			}
 		}
 	}
 	if len(ids) == 0 {
@@ -134,6 +143,17 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: announced}}}}); derr != nil {
 		f.log.Warn("could not clear warming notices, mirroring them anyway", "err", derr)
 		return 0, nil
+	}
+
+	// The warm is now accounted for on the residency record as well, which is
+	// where the router looks when it decides whether an insert it is handing to
+	// a client was this system's own work. Spending the notice alone left the
+	// record saying an echo was still expected, so a warm read late fell back
+	// to a window instead of being answered exactly.
+	if rerr := f.spendResidencyEchoes(ctx, announced, posOf); rerr != nil {
+		f.log.Warn("could not record the warmed documents on their residency records",
+			"err", rerr,
+			"effect", "a client reading its change stream late may see these warms as inserts")
 	}
 
 	claimed := make(map[string]struct{}, len(announced))
@@ -298,31 +318,10 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 	// off, because the two are one fact: this promotion caused that insert. A
 	// router handing the event over later reads it back and answers exactly,
 	// rather than comparing the event's time against a promotedAt that may
-	// describe a different promotion of the same document, which is what let
-	// four copy-ups reach an application as inserts it never made. See
+	// describe a different promotion of the same document. See
 	// meta.ResidencyRecord.Echoed.
-	models := make([]mongo.WriteModel, 0, len(pending))
-	for _, id := range pending {
-		update := bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}}
-		// A server old enough not to send a cluster time leaves nothing exact to
-		// record. The flag still comes off, and the router falls back to the
-		// window as it did before.
-		if pos, ok := posOf[id]; ok && (pos.T != 0 || pos.I != 0) {
-			update = append(update, bson.E{Key: "$push", Value: bson.D{
-				{Key: "echoed", Value: bson.D{
-					{Key: "$each", Value: []bson.Timestamp{pos}},
-					{Key: "$slice", Value: -meta.MaxEchoRecorded},
-				}},
-			}})
-		}
-		models = append(models, mongo.NewUpdateOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(update))
-	}
-	// Unordered: these are independent records, and one that cannot be written
-	// must not hold up the rest.
-	if _, uerr := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); uerr != nil {
-		f.log.Warn("could not clear promotion notices, mirroring them anyway", "err", uerr)
+	if err := f.spendResidencyEchoes(ctx, pending, posOf); err != nil {
+		f.log.Warn("could not clear promotion notices, mirroring them anyway", "err", err)
 		return 0, nil
 	}
 
@@ -359,4 +358,44 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 	}
 	f.pending = kept
 	return dropped, nil
+}
+
+// spendResidencyEchoes takes the echo off these residency records and writes
+// down which insert each one was spent on.
+//
+// Shared by both suppressors, because a warm and a copy-up are the same event to
+// anybody reading a change stream: this system putting a document on the fast
+// tier that the archive already held. The router has one rule for recognising
+// them and therefore needs one place to read.
+//
+// The position rather than a clock, for the reason the eviction notice's spent
+// list gives: the feeder and the router read the same field off the same event,
+// so the values compare by construction.
+func (f *Feeder) spendResidencyEchoes(ctx context.Context, ids []string, posOf map[string]bson.Timestamp) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	coll := f.cold.Database(meta.DB).Collection(meta.Residency)
+	models := make([]mongo.WriteModel, 0, len(ids))
+	for _, id := range ids {
+		update := bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}}
+		// A server old enough not to send a cluster time leaves nothing exact to
+		// record. The flag still comes off, and the router falls back to the
+		// window as it did before.
+		if pos, ok := posOf[id]; ok && (pos.T != 0 || pos.I != 0) {
+			update = append(update, bson.E{Key: "$push", Value: bson.D{
+				{Key: "echoed", Value: bson.D{
+					{Key: "$each", Value: []bson.Timestamp{pos}},
+					{Key: "$slice", Value: -meta.MaxEchoRecorded},
+				}},
+			}})
+		}
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: id}}).
+			SetUpdate(update))
+	}
+	// Unordered: these are independent records, and one that cannot be written
+	// must not hold up the rest.
+	_, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	return err
 }

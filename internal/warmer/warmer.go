@@ -633,11 +633,35 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return 0, err
 	}
 
-	// The skipped positions matter only to callers that announced an echo per
-	// document; the warmer announces through _thermocline.warming instead.
-	inserted, _, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
+	inserted, skipped, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
 	if err != nil {
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
+	}
+
+	// The documents the fast tier already held produce no insert, so the echo
+	// announced for each of them has to be taken back.
+	//
+	// The skipped positions used to be discarded here, on the grounds that they
+	// matter only to callers that announce an echo per document and the warmer
+	// announced through _thermocline.warming instead. That stopped being true
+	// the moment the residency record started carrying an echo so that a warm
+	// could be told from an application's insert. A notice left standing is
+	// spent on whatever write reaches that document next and that mirror is
+	// dropped, so the archive keeps the older version with nothing saying so --
+	// which is the one outcome this system exists to prevent, arrived at by
+	// fixing something else.
+	if len(skipped) > 0 {
+		stale := make([]string, 0, len(skipped))
+		for _, i := range skipped {
+			if i >= 0 && i < len(docs) {
+				stale = append(stale, meta.DocID(ns, docs[i].id))
+			}
+		}
+		if werr := meta.WithdrawEchoes(ctx, w.cold, stale); werr != nil {
+			w.log.Warn("could not withdraw the echoes for documents the fast tier already held",
+				"ns", ns, "count", len(stale), "err", werr,
+				"effect", "one later write to each of these may not reach the archive")
+		}
 	}
 
 	// The eviction notices for these documents are deliberately left alone.
@@ -656,24 +680,27 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	return inserted, nil
 }
 
-// recordResidency protects warmed documents from the evictor for a while.
-// Without it, a warm followed by an eviction sweep undoes itself.
+// recordResidency protects warmed documents from the evictor for a while, and
+// records that this system put them there.
+//
+// Without the hold, a warm followed by an eviction sweep undoes itself.
+//
+// Without the rest of the row, a warmed document reached the application's
+// change stream as an insert. The router recognises a copy-up by the residency
+// record the copy-up wrote, and this wrote a hold and nothing else -- no
+// promotedAt, no echo -- so there was nothing to recognise. Every document the
+// warmer moved was announced to any client watching as a brand new insert of a
+// record the archive may have held for years, and the warmer's whole job is
+// moving documents in bulk. meta.ResidencyUpdate writes what the router's own
+// copy-up writes, so both are recognised the same way.
 func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDoc) error {
-	until := time.Now().UTC().Add(w.cfg.Residency.D())
+	now := time.Now().UTC()
+	until := now.Add(w.cfg.Residency.D())
 	models := make([]mongo.WriteModel, len(docs))
 	for i, d := range docs {
-		docID := meta.DocID(ns, d.id)
 		models[i] = mongo.NewUpdateOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: docID}}).
-			SetUpdate(bson.D{{Key: "$set", Value: bson.D{
-				{Key: "ns", Value: ns},
-				{Key: "doc", Value: d.id},
-				{Key: "hotUntil", Value: until},
-				// The row outlives the hold, so a change stream consumer that is
-				// behind can still tell this warm from an application insert. See
-				// meta.ResidencyRecord.ExpiresAt.
-				{Key: "expiresAt", Value: meta.ResidencyExpiry(until)},
-			}}}).
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, d.id)}}).
+			SetUpdate(meta.ResidencyUpdate(ns, d.id, now, until)).
 			SetUpsert(true)
 	}
 	_, err := w.cold.Database(meta.DB).Collection(meta.Residency).

@@ -135,76 +135,9 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 	now := time.Now().UTC()
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: meta.DocID(ns, id)}},
-		residencyUpdate(ns, id, now, now.Add(r.cfg.Residency.D())),
+		meta.ResidencyUpdate(ns, id, now, now.Add(r.cfg.Residency.D())),
 		options.UpdateOne().SetUpsert(true))
 	return err
-}
-
-// residencyUpdate is the write a copy-up makes to the residency record, as an
-// aggregation pipeline so that one write can both refresh a live hold and
-// reopen an ended one.
-//
-// $setOnInsert used to carry promotedAt and echoPending, on the reasoning that
-// a record exists exactly while the document is on the fast tier, so creating
-// one *is* the promotion. That reasoning was true when the evictor deleted the
-// record; it stopped being true when the evictor started ending it instead, so
-// that a change stream consumer reading late can still recognise the copy-up's
-// insert. An ended record is now the ordinary state of a document that has been
-// evicted, and a copy-up that found one left promotedAt describing the previous
-// promotion and echoPending unset, so the new promotion announced no echo and
-// was never suppressed at all.
-//
-// Reopening is the same decision $setOnInsert was making, stated properly: a
-// record with no promotedAt has never described one, and a record that has
-// ended describes one that is over. Either way the promotion beginning now is
-// this record's, and neither its history nor anything the previous promotion
-// wrote down is disturbed -- echoed in particular, which is the evidence the
-// whole change belongs to.
-//
-// A hold on a document the fast tier already holds is refreshed and nothing
-// more. That is the defect the $setOnInsert was written for: a multi-document
-// write records residency for every document it matches, most of them already
-// there, and moving promotedAt onto those hid five of an application's own
-// inserts from its own change stream. Announcing an echo for them would be
-// worse still, and a copy-up that turns out to insert nothing takes its echo
-// back; see withdrawEcho.
-//
-// A pipeline update, which needs MongoDB 4.2, the floor this project already
-// supports.
-func residencyUpdate(ns string, id bson.RawValue, now, until time.Time) mongo.Pipeline {
-	// Missing promotedAt: never promoted, so this is the first. Present
-	// endedAt: the last promotion is over, so this is a new one.
-	reopening := bson.D{{Key: "$or", Value: bson.A{
-		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$promotedAt"}}, "missing"}}},
-		bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
-	}}}
-	return mongo.Pipeline{
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "ns", Value: ns},
-			// $literal, because a document's _id is the application's and a
-			// string one beginning with $ would otherwise be read as a field
-			// path rather than as the value it is.
-			{Key: "doc", Value: bson.D{{Key: "$literal", Value: id}}},
-			// Refreshed on every read, because that is what the hold is for: a
-			// document read again should stay hot longer.
-			{Key: "hotUntil", Value: until},
-			// When the row goes, which is later than when the hold does. See
-			// meta.ResidencyRecord.ExpiresAt.
-			{Key: "expiresAt", Value: meta.ResidencyExpiry(until)},
-			{Key: "promotedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, now, "$promotedAt"}}}},
-			// The insert this record precedes is about to appear on the
-			// feeder's change stream, and mirroring it would write the
-			// archive's own document back into the archive. This says one is
-			// expected, and the feeder clears it as it suppresses, so only that
-			// one insert is suppressed and a later genuine one is not. See
-			// promotion echoes in the feeder.
-			{Key: "echoPending", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, true, "$echoPending"}}}},
-			// The document is back, so the record is no longer ended. Left
-			// standing it would answer "the application wrote this _id again"
-			// for the copy-up's own insert.
-			{Key: "endedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, "$$REMOVE", "$endedAt"}}}},
-		}}},
-	}
 }
 
 // recordResidencyMany does the same for a batch, in one round trip.
@@ -226,7 +159,7 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	for _, id := range ids {
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(residencyUpdate(ns, id, now, until)).
+			SetUpdate(meta.ResidencyUpdate(ns, id, now, until)).
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written
@@ -1313,10 +1246,7 @@ func (r *Router) withdrawEcho(ctx context.Context, docIDs []string) {
 	// its timestamp away let every promotion through as an ordinary insert.
 	// Measured, in the same round that found the defect this comment is about:
 	// 44 events delivered where 9 were right, and nothing hidden at all.
-	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})
-	if err != nil {
+	if err := meta.WithdrawEchoes(ctx, r.cold, docIDs); err != nil {
 		r.log.Warn("could not withdraw a promotion notice", "err", err)
 	}
 }

@@ -256,6 +256,10 @@ feeder:
     # what a rule reading a document's age from the _id timestamp cannot
     # address at all.
     - "shop.tintid"
+    # testwarm.sh: the collection a client watches while the warmer moves it,
+    # to check a warm is not delivered as an application insert. Its own
+    # collection so no other section's copy-up lands in the window it reads.
+    - "shop.twstream"
     # testexplain.sh
     - "shop.texpl"
     # testunack.sh, the writes that ask for no acknowledgement

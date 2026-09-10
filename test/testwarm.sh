@@ -440,6 +440,85 @@ stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 
+echo "== a warmed document is not an application's insert =="
+# The warmer's whole job is moving documents the archive already holds onto the
+# fast tier, in bulk. Every one of those is an insert on the fast tier, and a
+# client watching the collection sees it.
+#
+# The router recognises this system's own copy-ups by the residency record the
+# copy-up writes. The warmer wrote a hold and nothing else -- no promotedAt, no
+# echo -- so there was nothing to recognise, and nothing in the router ever read
+# the warming announcements either. Measured before the fix: five documents
+# warmed, five inserts delivered, identical to what the fast tier's own
+# unfiltered stream delivered. An application would have been told five records
+# the archive may have held for years had just been created.
+#
+# Read from a position before the warm, because that is the consumer this is
+# about: one that stores its resume token and comes back to it. The control is
+# the same question put to the fast tier directly, where nothing is hidden, so
+# an empty answer cannot pass for a correct one.
+WSNS=twstream
+sed '/^warmer:/,/^router:/ s|^  rules:|  rules:\n    - ns: "'"$DB.$WSNS"'"\n      back: 40m|' $CFG > $WDIR/warm_stream.yaml
+H "db.getSiblingDB(process.env.TC_DB).$WSNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$WSNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({});
+   db.getSiblingDB(process.env.TC_META).warming.deleteMany({})" >/dev/null
+startFeeder; startRouter
+# Created here rather than by the warm, so no drop or create lands in the window:
+# a drop delivers an invalidate, which closes the cursor before the events being
+# asked about.
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$WSNS')" >/dev/null 2>&1
+# Archive only, with recent ObjectIds so a rule reaching back 40m addresses them.
+C "db.getSiblingDB(process.env.TC_DB).$WSNS.insertMany([1,2,3,4,5].map(i=>({_id:new ObjectId(), n:i, v:'archived'})))" >/dev/null
+sleep 3
+WSTS=$(( $(date +%s) - 1 ))
+sleep 1
+cline warmer --config $WDIR/warm_stream.yaml --log-file $LOGDIR/warm_stream.log >/dev/null 2>&1
+sleep 8
+chk "the warmer moved them onto the fast tier"    "5"     "$(H "print(db.getSiblingDB(process.env.TC_DB).$WSNS.countDocuments({}))")"
+chk "and each one is recorded as a promotion"     "5"     "$(C "print(db.getSiblingDB(process.env.TC_META).residency.countDocuments({ns:process.env.TC_DB+'.$WSNS', promotedAt:{\$exists:true}}))")"
+WSDRAIN="const r = db.getSiblingDB(process.env.TC_DB).runCommand({
+     aggregate: '$WSNS',
+     pipeline: [{\$changeStream: {startAtOperationTime: Timestamp({t: $WSTS, i: 1})}}],
+     cursor: {}});
+   print(r.ok ? r.cursor.firstBatch.filter(e => e.operationType === 'insert').length : 'aggregate failed');"
+WSGOT=$(R "$WSDRAIN")
+WSCTRL=$(H "$WSDRAIN")
+echo "  the client saw $WSGOT inserts, the fast tier's own stream $WSCTRL"
+chk "the warm is hidden from the application"     "0" "$WSGOT"
+chk "and the fast tier's own stream did carry it" "5" "$WSCTRL"
+
+# And a second pass over documents the fast tier already holds, with their
+# residency rows gone.
+#
+# Residency is recorded before the documents are moved, and a row that is new or
+# has ended announces an echo. The documents produce no insert, because the fast
+# tier already has them, and an announcement left standing is spent on whatever
+# write reaches that document next -- dropping that mirror, so the archive keeps
+# the older version with nothing saying so.
+#
+# The rows are removed here rather than waited out, which is what makes this the
+# ordinary case rather than a contrived one: rows expire an hour after their
+# hold, a warmer rule reaching back 40m keeps selecting the same documents, and
+# a long-running warmer therefore meets its own warmed documents with no row
+# beside them all the time. Warming twice in quick succession proves nothing,
+# because the row is still there and still says the promotion is live, so no
+# echo is announced and the check passes without exercising anything.
+# The claim goes with them, or the warmer looks at its own watermark, sees the
+# window is filled and selects nothing at all -- which is a second way for this
+# check to pass while exercising nothing.
+C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({ns:process.env.TC_DB+'.$WSNS'});
+   db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({_id:process.env.TC_DB+'.$WSNS'})" >/dev/null
+cline warmer --config $WDIR/warm_stream.yaml --log-file $LOGDIR/warm_stream2.log >/dev/null 2>&1
+sleep 6
+chk "the second pass moved nothing"                   "5" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$WSNS.countDocuments({}))")"
+chk "a warm that moved nothing leaves no echo behind" "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).residency.countDocuments({ns:process.env.TC_DB+'.$WSNS', echoPending:true}))")"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$WSNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$WSNS.drop()" >/dev/null 2>&1
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

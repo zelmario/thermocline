@@ -255,6 +255,107 @@ type ResidencyRecord struct {
 	Echoed []bson.Timestamp `bson:"echoed,omitempty"`
 }
 
+// ResidencyUpdate is the write a copy-up makes to the residency record, as an
+// aggregation pipeline so that one write can both refresh a live hold and
+// reopen an ended one.
+//
+// $setOnInsert used to carry promotedAt and echoPending, on the reasoning that
+// a record exists exactly while the document is on the fast tier, so creating
+// one *is* the promotion. That reasoning was true when the evictor deleted the
+// record; it stopped being true when the evictor started ending it instead, so
+// that a change stream consumer reading late can still recognise the copy-up's
+// insert. An ended record is now the ordinary state of a document that has been
+// evicted, and a copy-up that found one left promotedAt describing the previous
+// promotion and echoPending unset, so the new promotion announced no echo and
+// was never suppressed at all.
+//
+// Reopening is the same decision $setOnInsert was making, stated properly: a
+// record with no promotedAt has never described one, and a record that has
+// ended describes one that is over. Either way the promotion beginning now is
+// this record's, and neither its history nor anything the previous promotion
+// wrote down is disturbed -- echoed in particular, which is the evidence the
+// whole change belongs to.
+//
+// A hold on a document the fast tier already holds is refreshed and nothing
+// more. That is the defect the $setOnInsert was written for: a multi-document
+// write records residency for every document it matches, most of them already
+// there, and moving promotedAt onto those hid five of an application's own
+// inserts from its own change stream. Announcing an echo for them would be
+// worse still, and a copy-up that turns out to insert nothing takes its echo
+// back; see withdrawEcho.
+//
+// The warmer writes the same row through here. A warm and a copy-up are the
+// same thing to a change stream reader -- this system putting a document on the
+// fast tier that the archive already held -- and the reader has one place to
+// look. The warmer used to write a hold and nothing else, so isPromotion had
+// nothing to recognise and every warmed document reached the application as an
+// insert of a record that could be years old.
+//
+// A pipeline update, which needs MongoDB 4.2, the floor this project already
+// supports.
+func ResidencyUpdate(ns string, id bson.RawValue, now, until time.Time) mongo.Pipeline {
+	// Missing promotedAt: never promoted, so this is the first. Present
+	// endedAt: the last promotion is over, so this is a new one.
+	reopening := bson.D{{Key: "$or", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$promotedAt"}}, "missing"}}},
+		bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
+	}}}
+	return mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "ns", Value: ns},
+			// $literal, because a document's _id is the application's and a
+			// string one beginning with $ would otherwise be read as a field
+			// path rather than as the value it is.
+			{Key: "doc", Value: bson.D{{Key: "$literal", Value: id}}},
+			// Refreshed on every read, because that is what the hold is for: a
+			// document read again should stay hot longer.
+			{Key: "hotUntil", Value: until},
+			// When the row goes, which is later than when the hold does. See
+			// ResidencyRecord.ExpiresAt.
+			{Key: "expiresAt", Value: ResidencyExpiry(until)},
+			{Key: "promotedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, now, "$promotedAt"}}}},
+			// The insert this record precedes is about to appear on the
+			// feeder's change stream, and mirroring it would write the
+			// archive's own document back into the archive. This says one is
+			// expected, and the feeder clears it as it suppresses, so only that
+			// one insert is suppressed and a later genuine one is not. See
+			// promotion echoes in the feeder.
+			{Key: "echoPending", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, true, "$echoPending"}}}},
+			// The document is back, so the record is no longer ended. Left
+			// standing it would answer "the application wrote this _id again"
+			// for the copy-up's own insert.
+			{Key: "endedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, "$$REMOVE", "$endedAt"}}}},
+		}}},
+	}
+}
+
+// WithdrawEchoes removes the promise that a copy-up is coming.
+//
+// Residency is recorded before the documents are moved, which is what lets a
+// change stream consumer tell a copy-up from an insert the moment the event
+// arrives, and it announces an echo at the same time. A document the fast tier
+// turned out to already hold produces no insert and therefore no echo, so the
+// announcement has to be taken back. Left standing it is spent on whatever
+// write reaches that document next, and that mirror is dropped: the archive
+// keeps the older version and nothing says so.
+//
+// Both promoters need this and for the same reason, so it lives here rather
+// than in either of them. The warmer went without it for as long as it
+// announced no echoes, and gained the need for it the moment it started.
+//
+// Only the echo. promotedAt stays, because the record may describe a genuine
+// promotion by the other path, and taking its timestamp away lets every
+// promotion through as an ordinary insert.
+func WithdrawEchoes(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	_, err := cold.Database(DB).Collection(Residency).UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})
+	return err
+}
+
 // ResidencyExpiry is when a residency row whose hold runs to hotUntil may be
 // removed. Every writer of a hold goes through this, so the gap between the two
 // is stated in one place.
