@@ -83,11 +83,21 @@ chk "a skip past the only match returns nothing"     "0"       "$(R 'print(db.ge
 # batchSize zero asks for a cursor and no documents yet, which drivers do. The
 # hand-built reply put the document in the first batch regardless.
 C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:13,v:"cursored"})' >/dev/null
-chk "a cursor asked for with no first batch"         "0/cursored" "$(R 'const d=db.getSiblingDB(process.env.TC_DB);
+# Both commands go through one explicit session, and that is not tidiness. Two
+# separate runCommand calls each take an implicit session from the driver's
+# pool, and a getMore from a different session than the one that opened the
+# cursor is refused -- by mongod and by the router alike. The pool usually hands
+# back the same session, so this passed for months and then failed under a
+# parallel sweep with "cursor id ... was not created by the authenticated user
+# or was created in another session", which reads exactly like a router defect
+# and is the driver doing what it says it does.
+chk "a cursor asked for with no first batch"         "0/cursored" "$(R 'const s=db.getMongo().startSession();
+  const d=s.getDatabase(process.env.TC_DB);
   const c=d.runCommand({find:"tprobe",filter:{_id:13},batchSize:0});
   const n=c.cursor.firstBatch.length;
   const m=d.runCommand({getMore:c.cursor.id,collection:"tprobe"});
-  print(n+"/"+((m.cursor&&m.cursor.nextBatch.length)?m.cursor.nextBatch[0].v:"NOTHING"))')"
+  print(n+"/"+((m.cursor&&m.cursor.nextBatch.length)?m.cursor.nextBatch[0].v:"NOTHING"));
+  s.endSession()')"
 
 echo "== write miss and copy-up =="
 C 'db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:10,v:"old"})' >/dev/null

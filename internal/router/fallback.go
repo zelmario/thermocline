@@ -82,6 +82,29 @@ type cursorOwner struct {
 	conn *conn
 }
 
+// differsFrom names the scope that does not match, for the log.
+//
+// The refusal is word for word mongod's, and the commonest cause of it is not a
+// client reading somebody else's cursor at all: two runCommand calls each take
+// an implicit session from the driver's pool, so a find and its getMore can
+// legitimately arrive in different sessions. The pool usually hands back the
+// same one, which is why it surfaces as something that passes for months and
+// then fails under load. Saying which scope differed is the difference between
+// that being a minute's work and an afternoon's.
+func (o cursorOwner) differsFrom(other cursorOwner) string {
+	switch {
+	case o.user != other.user:
+		return "a different authenticated user"
+	case o.lsid != "" || other.lsid != "":
+		return "a different session, which is also what two runCommand calls " +
+			"taking their own implicit session from the driver's pool look like"
+	case o.user != "":
+		return "nothing: same user, no session"
+	default:
+		return "a different connection, and neither side named a session or a user"
+	}
+}
+
 // sameAs reports whether a request may read a cursor this owner opened.
 func (o cursorOwner) sameAs(other cursorOwner) bool {
 	if o.user != other.user {
@@ -401,7 +424,10 @@ func (c *conn) archiveGetMore(ctx context.Context, msg *wire.Message, cmd bson.R
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a getMore for a cursor this client did not open",
-			"ns", ac.ns, "cursor", id)
+			"ns", ac.ns, "cursor", id,
+			"differs_by", ac.owner.differsFrom(c.owner(cmd)),
+			"note", "mongod refuses the same getMore for the same reason; a client that means to "+
+				"continue its own cursor should run the find and the getMore in one explicit session")
 		out, cerr := c.notYourCursor(msg, id)
 		return out, true, cerr
 	}
