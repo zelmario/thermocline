@@ -13,7 +13,7 @@ configurable as `meta.db`:
 | `checkpoints` | One change stream resume token per feeder, for recovery |
 | `positions` | How far each feeder has mirrored, published far more often than the checkpoint because fallback reads wait on it |
 | `evicting` | Eviction announcements, kept for an hour on a TTL index, not removed when applied |
-| `residency` | How long a document should stay in the fast tier (used by the evictor and router) |
+| `residency` | How long a document should stay in the fast tier, and the record that this system put it there. Kept for an hour past the hold on a TTL index |
 | `warming` | Warming announcements, expiring on a TTL index |
 | `watermarks` | How far back the fast tier is complete, one per namespace |
 | `markers` | Daemon heartbeats, currently just the warmer's |
@@ -36,6 +36,29 @@ saying so.
 
 Residency is a sidecar rather than a field on the document on purpose.
 Extending a document's stay rewrites 60 bytes instead of a 5 KB document.
+
+**A residency row is two things, and the second one is why it outlives the
+first.** The hold says a document should stay in the fast tier, and `hotUntil`
+is when that ends. The rest of the row -- `promotedAt`, and the oplog position
+of each copy-up insert it caused -- is the only evidence that those inserts were
+this system moving a document rather than an application creating one, and a
+change stream consumer is judged when it reads, which it does when it likes. So
+the row expires on `expiresAt`, an hour after the hold, which is the same hour
+an eviction announcement gets and for the same reason.
+
+The cost is stated rather than hidden. Rows alive at any moment are roughly the
+copy-up rate times `router.residency` plus that hour, so a deployment promoting
+a thousand documents a second with a five minute residency holds about four
+million rows rather than three hundred thousand. They are small -- an id, a
+namespace, two dates and a short array -- and they expire on their own. If that
+is the wrong trade for a deployment, the thing to change is the hour, and the
+consequence of shortening it is that a consumer further behind than the new
+value is shown copy-ups as inserts.
+
+The bound is worth saying plainly: a consumer more than an hour behind reads a
+copy-up as an insert, exactly as one more than an hour behind reads an eviction
+as a delete. Neither is silent -- both are the same limitation of keeping
+evidence for a bounded time.
 
 `positions` and `checkpoints` look redundant and are not. A checkpoint is
 durable, majority-acknowledged and written every few seconds, because a stale

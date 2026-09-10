@@ -38,6 +38,14 @@ Range queries are governed by the watermark below.
   run on the fast tier or refused. See below.
 - **`getMore` on a fast tier cursor is passed through.** Cursors the router
   creates for archive reads are served here instead, and tracked per connection.
+- **A change stream does not show this system's own work.** Tiering moves
+  documents between the tiers, and every one of those moves is an event on the
+  fast tier: a copy-up and a warm are inserts, an eviction is a delete. An
+  application watching a tiered collection would be told a document it never
+  wrote had appeared, or that one it still has was deleted. Those are hidden.
+  What remains is the application's own writes, and nothing else is added or
+  reordered. See below for how far behind a consumer may be before this stops
+  holding.
 - **Bulk writes are only miss-resolved one statement at a time.** A batch that
   matched nothing is left as the fast tier answered it. Unique keys and
   multi-document writes are handled across the whole batch.
@@ -160,6 +168,33 @@ Range queries are governed by the watermark below.
   not find role", so an application with its own role is one whose every account
   fails the first adoption step. Create the roles, then the accounts that hold
   them.
+- **What a change stream is filtered against, and how far behind it may be.**
+  Three things move documents without an application asking: a copy-up, when a
+  read or a write reaches a document only the archive holds; a warm, which does
+  the same in bulk ahead of time; and an eviction. The first two are inserts on
+  the fast tier and the third is a delete, and all three are hidden from a
+  client's stream. So are events for the router's own scratch collections, which
+  a `$out` or `$merge` creates and drops.
+
+  **An event is judged when the client reads it, not when it happened**, and the
+  client decides when that is. A consumer that stores its resume token and comes
+  back to it an hour later is doing the correct thing, and it gets a backlog in
+  which every tiering event is older than any window. So the decision is made
+  against a record written when the document was moved, and against the event's
+  own position in the oplog rather than a clock: the router and the feeder read
+  the same field off the same event, so the two agree by construction rather
+  than by being in sync.
+
+  **The bound is the hour those records are kept.** A consumer further behind
+  than that is shown a copy-up as an insert and an eviction as a delete, because
+  the evidence has expired. It is the same hour, and the same trade, for both.
+
+  This applies to `db.watch()` and to a deployment-wide stream as well as to one
+  on a collection: those carry events for collections nothing tiers, so each
+  event is matched against the configuration on its own. And it applies to the
+  batch the stream is opened with, not only to the batches that follow it,
+  which is what a consumer resuming from a stored position actually reads.
+
 - **A drop through the router stops the claim at once.** Dropping a tiered
   collection empties the fast tier immediately, and the claim that it holds
   everything outlives it: the feeder withdraws the claim when it sees the event,
