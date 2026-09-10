@@ -730,6 +730,29 @@ C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/d
 startFeeder
 cline router --config $CFG --log-file $LOGDIR/idxoob.log >/dev/null 2>&1 & ORP=$!
 for _ in $(seq 1 30); do R 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break; sleep 1; done
+# Say so when it did not come up, rather than letting the checks below describe
+# it as something else.
+#
+# This section starts its own router instead of calling startRouter, and so
+# skipped that function's FATAL. A router that never bound sent every write
+# below to a closed port: the insert failed with ECONNREFUSED into /dev/null,
+# and the section reported "carol reached the archive got=2 want=3" -- a
+# mirroring failure, in a section about the indexer, with a feeder that was
+# working perfectly. Measured once in a sweep and once by hand, and it cost an
+# investigation into the feeder each time. The cause was 27100 still held by a
+# router somebody else had left, which the log says plainly and no check read.
+#
+# Asked of mongosh directly rather than through R, and that is the difference
+# between this guard working and not. R ends in `| tail -1`, so the pipeline's
+# status is tail's and is zero however badly mongosh failed: written as
+# `if ! R ...` this guard never fired once, and the section went on to report
+# the same three misleading failures it was added to prevent.
+if ! mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+     --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+  echo "  FATAL  the router for this section never came up on $PORT"
+  echo "         $(tail -1 $LOGDIR/idxoob.log 2>/dev/null | cut -c1-160)"
+  exit 2
+fi
 oobShape() {
   H "const o=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$ONS2'})[0];
      const c=o&&o.options&&o.options.collation?o.options.collation.locale+'/'+o.options.collation.strength:'NONE';
