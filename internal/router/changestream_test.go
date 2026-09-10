@@ -204,3 +204,33 @@ func TestEchoedPositionsAreCapped(t *testing.T) {
 		t.Error("a record with no positions claimed to know the answer")
 	}
 }
+
+// An echo nothing ever spent must not hide an application's own insert for as
+// long as the record lives.
+//
+// The feeder only spends a notice whose promotion is inside its echo window, so
+// an older one is never going to be spent. While the record died with its hold
+// that self-corrected within minutes. Once the record started outliving the
+// hold by an hour, so that a consumer reading late could still recognise a
+// copy-up, an unspent echo would have gone on hiding every insert of that _id
+// for that hour.
+//
+// Both halves matter: the copy-up's own insert is still recognised, because it
+// sits within the promotion window of the promotion that caused it.
+func TestAnEchoNobodySpentStopsAnsweringForLaterInserts(t *testing.T) {
+	promotedAt := time.Now().Add(-45 * time.Minute)
+	promoted := map[string]promotion{
+		"shop.orders|x": {at: promotedAt, pending: true},
+	}
+	recent := time.Now().Add(-promotionWindow)
+
+	// The copy-up's own insert, whenever it is read.
+	if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(20*time.Millisecond),
+		bson.Timestamp{T: 1000, I: 1}, recent) {
+		t.Error("a copy-up whose echo was never spent was delivered as an insert")
+	}
+	// The application writing that same _id three quarters of an hour later.
+	if isPromotion(promoted, "shop.orders|x", time.Now(), bson.Timestamp{T: 9000, I: 1}, recent) {
+		t.Error("an unspent echo hid an application's own insert made long afterwards")
+	}
+}

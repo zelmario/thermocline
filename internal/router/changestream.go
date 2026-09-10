@@ -51,6 +51,26 @@ import (
 // token and resuming is the correct thing for an application to do.
 const promotionWindow = 30 * time.Second
 
+// echoOutstanding is how long an unspent echo may still be waiting for its
+// insert.
+//
+// It matches the feeder's echoWindow, and it has to: the feeder only ever spends
+// a notice whose promotion is inside that window, so an echo older than it is
+// one the feeder has already decided it will never spend. Treating it as still
+// outstanding waits for something that is not coming.
+//
+// Unbounded, it used to expire with the row, and the row used to be destroyed
+// when its hold ended. Now that the row outlives the hold by an hour so a late
+// reader can still recognise a copy-up, an echo nothing ever spent would go on
+// hiding every insert of that _id for that hour. Which is the wrong way round:
+// the branch exists to suppress a copy-up nobody has accounted for yet, not to
+// hide an application's own writes an hour later.
+//
+// Falling past it is safe. A copy-up whose echo was never spent is still
+// recognised, because its insert sits within promotionWindow of the promotion
+// that caused it, and that is exactly what the comparison below asks.
+const echoOutstanding = 60 * time.Second
+
 // changeStreamRegistry remembers which cursors are change streams that need
 // their events filtered, and on what namespace.
 //
@@ -473,10 +493,14 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 		return false
 	}
 	// Announced and not yet spent, which means the insert this record was
-	// written to precede has not been seen. Unconditional, the way an
-	// unclaimed eviction announcement is, and for the same reason: it can only
-	// suppress more than the window would and never less.
-	if p.pending {
+	// written to precede has not been seen. The way an unclaimed eviction
+	// announcement is, and for the same reason: while nobody has accounted for
+	// the copy-up, suppressing is the side that does not tell an application
+	// its data changed when it did not.
+	//
+	// Bounded, though, by the same window the feeder spends notices in. See
+	// echoOutstanding.
+	if p.pending && !p.at.IsZero() && time.Since(p.at) <= echoOutstanding {
 		return true
 	}
 	if p.at.After(recent) {
