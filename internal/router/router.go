@@ -302,11 +302,6 @@ func (r *Router) Listen(ctx context.Context) error {
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
 	r.ensureFastTierIndexes(ctx)
-	// And then, with the fast tier's own listing settled, whether anything has
-	// ever claimed the keys those indexes constrain. On an adoption nothing
-	// has, and the constraint is then not enforced against the archive at all.
-	// See warnAboutUnclaimedUniqueKeys.
-	r.warnAboutUnclaimedUniqueKeys(ctx)
 	// And the definitions that hold no documents, in the other direction: a view
 	// the fast tier has and the archive does not. See mirrorViewsToArchive.
 	r.mirrorViewsToArchive(ctx)
@@ -341,6 +336,25 @@ func (r *Router) Listen(ctx context.Context) error {
 		_ = ln.Close()
 	})
 	r.goSafely("reaping abandoned cursors", func() { r.reapCursors(ctx) })
+	// Whether anything has ever claimed the keys the fast tier's unique indexes
+	// constrain. On an adoption nothing has, and the constraint is then not
+	// enforced against the archive at all: see warnAboutUnclaimedUniqueKeys.
+	//
+	// After the listener rather than before it, and that is not a preference.
+	// It reads one index listing per tiered namespace, and the other startup
+	// warnings are per *database*: with 139 tiered namespaces it took a router
+	// past the thirty seconds a suite waits for one, so the first write after it
+	// got ECONNREFUSED and the check that a write rebuilds a dropped
+	// collection failed for want of a router. A diagnostic that delays the
+	// listener costs an application its writes, which is worse than anything it
+	// can tell an operator.
+	//
+	// Still after ensureFastTierIndexes, which is what it has to be after: on an
+	// adoption the fast tier's copy of the index may only exist because the
+	// Indexer has just built it, and that pass is above, before the listener.
+	r.goSafely("checking whether the archive's unique keys were ever claimed", func() {
+		r.warnAboutUnclaimedUniqueKeys(ctx)
+	})
 	// The advisor publishes one last report as it stops, and that write has to
 	// finish before this function returns or the process exits out from under
 	// it. Started fire-and-forget, it usually won that race on an idle machine
@@ -1127,12 +1141,27 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			c.r.refreshIndexes(ctx, db+"."+coll)
 			c.r.forgetHint(db + "." + coll)
 			c.r.forgetView(db + "." + coll)
-			// And tell the other routers, which have no other way to hear it:
-			// no change stream carries index DDL. They read the claim on the
-			// hot path anyway, so the number rides there. Best effort, because
-			// the DDL has already been applied and failing the client's command
-			// over a bookkeeping write would be worse than the minute of
-			// disagreement this exists to shorten.
+			// And tell the other routers. They read the claim on the hot path
+			// anyway, so the number rides there. Best effort, because the DDL
+			// has already been applied and failing the client's command over a
+			// bookkeeping write would be worse than the disagreement this
+			// exists to shorten.
+			//
+			// This said "no change stream carries index DDL", which stopped
+			// being true when the fast tier watch started asking for
+			// showExpandedEvents: on 6.0 and up another router hears the
+			// createIndexes itself. See watchFastTier and
+			// noteFastTierIndexDDL. Two mechanisms rather than one on purpose,
+			// and a comment asserting the opposite of what another file does is
+			// how a reader ends up trusting the wrong one:
+			//
+			//   - showExpandedEvents is 6.0 and up, and this supports 4.2,
+			//     where passing it makes the whole stream fail to open. Below
+			//     6.0 this is the only way another router hears anything.
+			//   - a router whose watch is down, for a privilege it lacks or a
+			//     tier it cannot reach, still reads claims.
+			//
+			// So the generation is the floor and the stream is the fast path.
 			if c.r.cfg.Manages(db + "." + coll) {
 				if berr := c.r.marks.BumpIndexGen(ctx, db+"."+coll); berr != nil {
 					c.log.Warn("could not tell the other routers the unique indexes changed",
