@@ -131,6 +131,12 @@ func testCold(t *testing.T) (*mongo.Client, func()) {
 	clear := func() {
 		_, _ = client.Database(DB).Collection(Evicting).DeleteMany(ctx,
 			bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^tctest\\."}}}})
+		// The same prefix, in the collection the own-DDL tests write to. This
+		// database is a real deployment's, shared with whatever else is running
+		// against the cluster, so a test that leaves rows behind is litter in
+		// somebody's bookkeeping.
+		_, _ = client.Database(DB).Collection(OwnDDL).DeleteMany(ctx,
+			bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^tctest\\."}}}})
 	}
 	clear()
 	return client, func() { clear(); _ = client.Disconnect(ctx) }
@@ -210,5 +216,96 @@ func TestNoticeWithoutACountIsWorthOne(t *testing.T) {
 	have, _ := ConsumeEvictionNotices(ctx, c, []string{noticeID})
 	if have[noticeID] != 1 {
 		t.Errorf("a notice written before the count existed is worth %d, want 1", have[noticeID])
+	}
+}
+
+// Covers is what decides whether a create or a createIndexes on the fast tier
+// reaches a client's change stream, and every branch of it is a way to get that
+// wrong in one of two directions: show an application DDL it did not do, or
+// hide DDL it did.
+func TestOwnDDLCovers(t *testing.T) {
+	ts := func(sec, i uint32) bson.Timestamp { return bson.Timestamp{T: sec, I: i} }
+	closed := OwnDDLRecord{Spans: []OwnDDLSpan{{From: ts(100, 2), To: ts(100, 9)}}}
+	open := OwnDDLRecord{Spans: []OwnDDLSpan{{From: ts(100, 2)}}}
+
+	cases := []struct {
+		name string
+		rec  OwnDDLRecord
+		pos  bson.Timestamp
+		want bool
+	}{
+		{"inside a closed span", closed, ts(100, 5), true},
+		{"on the lower bound", closed, ts(100, 2), true},
+		{"on the upper bound", closed, ts(100, 9), true},
+		{"before it", closed, ts(100, 1), false},
+		{"after it", closed, ts(100, 10), false},
+		// The ordinal is what separates two writes in the same second, so a
+		// comparison that comes down to seconds alone reads them as one.
+		{"a later second, after the span", closed, ts(101, 1), false},
+		{"an earlier second", closed, ts(99, 99), false},
+		// An unfinished span means either that the DDL is still running or that
+		// whatever ran it went away, and the second must not last: a row saying
+		// "still building" for ever would hide an application's own builds.
+		{"inside an open span", open, ts(100, 7), true},
+		{"an open span, later but within the bound", open, ts(100+OpenSpanSeconds, 1), true},
+		{"an open span, past the bound", open, ts(100+OpenSpanSeconds+1, 1), false},
+		{"an open span, before it", open, ts(99, 1), false},
+		// No record at all, and a zero position, which is what an event carries
+		// on a server too old to report one. Neither is evidence of anything.
+		{"no spans", OwnDDLRecord{}, ts(100, 5), false},
+		{"a zero position", closed, bson.Timestamp{}, false},
+	}
+	for _, c := range cases {
+		if got := c.rec.Covers(c.pos); got != c.want {
+			t.Errorf("%s: Covers((%d,%d)) = %v, want %v", c.name, c.pos.T, c.pos.I, got, c.want)
+		}
+	}
+}
+
+// Two brackets are open on one namespace whenever a first copy-up creates the
+// collection and the index build that follows it runs in a goroutine, and on a
+// fast tier nothing else is writing to they read the same position. Closing by
+// position therefore closed both, so whichever finished second decided both,
+// and the later event stopped being covered. Each bracket carries its own
+// token now, and this is the case that says so.
+func TestTwoBracketsFromOnePositionCloseSeparately(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+	const ns = "tctest.ddl"
+	from := bson.Timestamp{T: 500, I: 1}
+
+	a, err := AnnounceOwnDDL(ctx, c, ns, from)
+	if err != nil {
+		t.Fatalf("announce the first: %v", err)
+	}
+	b, err := AnnounceOwnDDL(ctx, c, ns, from)
+	if err != nil {
+		t.Fatalf("announce the second: %v", err)
+	}
+	if a == b {
+		t.Fatalf("two brackets share a token, so one close would still take both: %q", a)
+	}
+	// The later one finishes first, which is the order that used to lose.
+	if err := CloseOwnDDL(ctx, c, ns, b, bson.Timestamp{T: 500, I: 20}); err != nil {
+		t.Fatalf("close the second: %v", err)
+	}
+	if err := CloseOwnDDL(ctx, c, ns, a, bson.Timestamp{T: 500, I: 4}); err != nil {
+		t.Fatalf("close the first: %v", err)
+	}
+	rows, err := ReadOwnDDL(ctx, c, []string{ns})
+	if err != nil {
+		t.Fatalf("read them back: %v", err)
+	}
+	rec := rows[ns]
+	if n := len(rec.Spans); n != 2 {
+		t.Fatalf("kept %d spans, want 2", n)
+	}
+	// Both events are still covered: the one at (500,3) inside the first
+	// bracket and the one at (500,15) inside the second.
+	for _, pos := range []bson.Timestamp{{T: 500, I: 3}, {T: 500, I: 15}} {
+		if !rec.Covers(pos) {
+			t.Errorf("(%d,%d) is not covered, so that event reaches the client", pos.T, pos.I)
+		}
 	}
 }

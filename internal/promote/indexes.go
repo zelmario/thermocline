@@ -42,7 +42,8 @@ func (ix *Indexer) beginOwnDDL(ctx context.Context, ns string) func() {
 	// Detached, because the span has to outlive a cancelled request: the DDL
 	// below happens either way and a client is watching for it.
 	bctx := context.WithoutCancel(ctx)
-	if err := meta.AnnounceOwnDDL(bctx, ix.cold, ns, from); err != nil {
+	tok, err := meta.AnnounceOwnDDL(bctx, ix.cold, ns, from)
+	if err != nil {
 		ix.log.Warn("could not record that this system is about to change the fast tier's catalog",
 			"ns", ns, "err", err,
 			"effect", "a client watching with showExpandedEvents is told its collection or its "+
@@ -56,7 +57,7 @@ func (ix *Indexer) beginOwnDDL(ctx context.Context, ns string) func() {
 			// at a position that may be before the write.
 			return
 		}
-		if err := meta.CloseOwnDDL(bctx, ix.cold, ns, from, to); err != nil {
+		if err := meta.CloseOwnDDL(bctx, ix.cold, ns, tok, to); err != nil {
 			ix.log.Warn("could not close the record of this system's own catalog change",
 				"ns", ns, "err", err)
 		}

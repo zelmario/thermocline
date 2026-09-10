@@ -633,6 +633,17 @@ type OwnDDLSpan struct {
 	// To is unset while the DDL is still running. See OwnDDLRecord.Covers for
 	// how far an unfinished span reaches.
 	To bson.Timestamp `bson:"to,omitempty"`
+	// Tok identifies this bracket, so the close finds the one it opened.
+	//
+	// Matching on From instead was wrong, and not only untidy. Two brackets can
+	// be open on one namespace at once -- EnsureCollection runs inline and the
+	// index build that follows it runs in a goroutine -- and on a fast tier
+	// nothing else is writing to, both read the same lastWrite position. One
+	// close then set `to` on both, so whichever closed second decided both, and
+	// if that was the earlier of the two the later event stopped being covered
+	// and reached the client after all: the defect back again, on an idle
+	// cluster only, which is the hardest kind to see.
+	Tok string `bson:"tok,omitempty"`
 }
 
 // OwnDDLRecord is one namespace's row in OwnDDL.
@@ -706,34 +717,38 @@ const MaxOwnDDLRecorded = 16
 // leaves a window in which the event has been delivered and nothing yet says it
 // was ours, which is the same window recordResidency is written first to avoid:
 // the client's next getMore can arrive inside one round trip to the archive.
-func AnnounceOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from bson.Timestamp) error {
+// It returns the token the close has to be given.
+func AnnounceOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from bson.Timestamp) (string, error) {
+	tok := bson.NewObjectID().Hex()
 	_, err := cold.Database(DB).Collection(OwnDDL).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: ns}},
 		bson.D{
 			{Key: "$set", Value: bson.D{{Key: "at", Value: time.Now().UTC()}}},
 			{Key: "$push", Value: bson.D{{Key: "spans", Value: bson.D{
-				{Key: "$each", Value: bson.A{OwnDDLSpan{From: from}}},
+				{Key: "$each", Value: bson.A{OwnDDLSpan{From: from, Tok: tok}}},
 				{Key: "$slice", Value: -MaxOwnDDLRecorded},
 			}}}},
 		},
 		options.UpdateOne().SetUpsert(true))
 	if err != nil {
-		return fmt.Errorf("announce own ddl for %s: %w", ns, err)
+		return "", fmt.Errorf("announce own ddl for %s: %w", ns, err)
 	}
-	return nil
+	return tok, nil
 }
 
-// CloseOwnDDL closes the span this system opened at from.
+// CloseOwnDDL closes the span AnnounceOwnDDL opened, named by its token.
 //
-// Matched on the position it was opened with rather than on the last element,
-// because two callers can be repairing two namespaces at once and a retry can
-// leave more than one span on a row.
-func CloseOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from, to bson.Timestamp) error {
+// By token and not by position: see OwnDDLSpan.Tok for what matching on the
+// position did when two brackets were open on one namespace at once.
+func CloseOwnDDL(ctx context.Context, cold *mongo.Client, ns, tok string, to bson.Timestamp) error {
+	if tok == "" {
+		return nil
+	}
 	_, err := cold.Database(DB).Collection(OwnDDL).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: ns}},
 		bson.D{{Key: "$set", Value: bson.D{{Key: "spans.$[s].to", Value: to}}}},
 		options.UpdateOne().SetArrayFilters([]interface{}{
-			bson.D{{Key: "s.from", Value: from}},
+			bson.D{{Key: "s.tok", Value: tok}},
 		}))
 	if err != nil {
 		return fmt.Errorf("close own ddl for %s: %w", ns, err)
