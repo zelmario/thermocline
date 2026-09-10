@@ -471,6 +471,65 @@ chk "no scratch collection is reported"                "true" \
 chk "the application's own insert still arrives"       "true" \
     "$(echo "${WIDE3:-none}" | grep -q "insert:$NS" && echo true || echo false)"
 
+echo "== the router's own bookkeeping is not the application's data =="
+# The unique key registry is the one piece of this system's state that lives on
+# the *fast* tier, because it has to be written where the data it constrains is
+# written. That is exactly where a client's change stream watches.
+#
+# A deployment-wide stream carried a claim row for every unique key every write
+# touched, in a database the same client cannot even list: listDatabases has
+# hidden it all along and the stream did not. Scratch collections were hidden
+# one level up, and the database they sit beside was missed.
+#
+# The section above could never have caught it, because its watcher keeps only
+# events whose database is the application's -- it discarded these before
+# looking at them. This one keeps everything and names what it saw.
+KNS=tcs4
+# The daemons stop first, and the index is created before they start again.
+#
+# A router caches a namespace's unique indexes for a minute, so one already
+# running when the index is created does not claim keys for it and the check
+# reads zero. The sections above leave a router up -- startRouter then says the
+# address is in use and the old one keeps serving -- so starting one here is not
+# enough on its own. Seen exactly that way once: this section failed on its
+# first run and passed on its second.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$KNS')" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).$KNS.createIndex({sku:1},{unique:true})" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$KNS.createIndex({sku:1},{unique:true})" >/dev/null 2>&1
+startFeeder; startRouter
+sleep 2
+KTS=$(( $(date +%s) - 1 ))
+sleep 1
+R "db.getSiblingDB(process.env.TC_DB).$KNS.insertMany([1,2,3].map(i=>({_id:i, sku:'K'+i})))" >/dev/null
+sleep 4
+# Scoped to this collection. The registry is one collection per deployment and
+# every suite on this worker has been claiming keys into it, so counting all of
+# it reads whatever ran before: 220 once, under a sweep.
+# Scoped to this collection. The registry is one collection per deployment and
+# every suite on this worker claims keys into it, so counting all of it reads
+# whatever ran before: 220 once under a sweep, against the 3 this section made.
+chk "the writes did claim keys in the registry"      "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$KNS'}))")"
+# Every database, counted by database, so nothing is discarded before it is seen.
+KDRAIN="const r = db.getSiblingDB('admin').runCommand({
+     aggregate: 1,
+     pipeline: [{\$changeStream: {allChangesForCluster: true, startAtOperationTime: Timestamp({t: $KTS, i: 1})}}],
+     cursor: {}});
+   if (!r.ok) { print('FAILED'); } else {
+     print(r.cursor.firstBatch.filter(e => e.ns && e.ns.db === process.env.TC_META).length); }"
+KGOT=$(R "$KDRAIN")
+KCTRL=$(mongosh "$HOT" --quiet --eval "$KDRAIN" 2>&1 | tail -1)
+echo "  the client saw $KGOT bookkeeping events, the fast tier's own stream $KCTRL"
+chk "no bookkeeping reaches the application"         "0" "$KGOT"
+chk "and the fast tier's own stream did carry it"    "3" "$KCTRL"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.'+'$KNS'})" >/dev/null 2>&1
+
 echo "== a promotion read after the application deleted the document =="
 # The residency record is two things at once: a hold saying the document should
 # stay on the fast tier, and the only evidence that the insert a copy-up causes

@@ -263,8 +263,9 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 	// listing already hides them for the same reason: a client that acts on
 	// what it finds would act on that. Every kind of event, not just inserts
 	// and deletes, because a scratch collection is created, written, renamed
-	// and dropped.
-	scratch := make([]bool, len(events))
+	// and dropped, and the bookkeeping the router keeps on the fast tier is
+	// written and deleted continuously.
+	ours := make([]bool, len(events))
 
 	for i, ev := range events {
 		doc, ok := ev.DocumentOK()
@@ -274,8 +275,20 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 		op, _ := lookupString(doc, "operationType")
 		kinds[i] = op
 		if evns, nsok := eventNS(doc); nsok {
-			_, coll := splitNS(evns)
-			scratch[i] = meta.IsScratch(coll)
+			edb, coll := splitNS(evns)
+			// The bookkeeping database as well as the scratch collections, and
+			// missing it was the same oversight one level up. The unique key
+			// registry is the one piece of this system's own state that lives on
+			// the *fast* tier, because it has to be written where the data it
+			// constrains is written -- which is exactly where a client's change
+			// stream watches. A deployment-wide stream carried a claim row for
+			// every unique key every write touched, in a database the same client
+			// cannot even list: listDatabases has hidden it all along.
+			//
+			// Measured: five documents inserted through the router into a
+			// collection with a unique index, and a client.watch() delivered ten
+			// events, five of them the registry's.
+			ours[i] = meta.IsScratch(coll) || edb == meta.DB
 		}
 		if op != "delete" && op != "insert" {
 			continue
@@ -321,7 +334,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 	dropped := 0
 	for i, ev := range events {
 		switch {
-		case scratch[i]:
+		case ours[i]:
 			dropped++
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev)):
 			dropped++
