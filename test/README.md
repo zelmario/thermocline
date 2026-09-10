@@ -19,6 +19,25 @@ nothing.
 measurements were getting skipped, and a forty minute feedback loop costs more
 than it saves. See "Running them in parallel" below for what a worker is.
 
+**`psweep.sh` is only half the suites.** Seven run on the host rather than in the
+node, each for a reason: they stop and start mongod on other containers, build
+clusters of their own, or need a Prometheus and the router's metrics endpoint at
+once. They were listed here and in nothing that ran them, so they went whenever
+somebody remembered — on 2026-09-10 the in-node sweep had run three times and
+none of the seven had run at all, while between them they cover a rollback
+procedure, an election, TLS on both sides, a refused mongos, a version mismatch
+and the alert rules an operator is told to trust. `bash test/hostsweep.sh` runs
+them serially from the repository root, with one log each and a tally, and runs
+`testchaos` in both authentication modes because that is a different code path
+through the same election rather than the same test twice.
+
+It refuses to start while anything else is driving the cluster, on both sides of
+the fence: an in-node sweep and a host-side suite fight over the same six
+containers and the same `/usr/local/bin/cline`. A missing prerequisite is
+reported as SKIPPED with the reason and counted on its own line, never as a
+pass, because a shape nobody checked is exactly what it exists to stop happening
+quietly.
+
 Or one at a time:
 
     docker exec <node> bash /root/testall.sh       # every subcommand, flag and error path
@@ -58,6 +77,7 @@ Or one at a time:
     go run ./test/exhaust 127.0.0.1:27600 router    # the OP_MSG exhaust bit (host side, see exhaust/README.md)
     go run ./test/cursorowner 127.0.0.1:27600      # whether one client can read another's cursor
     go run ./test/compressed 127.0.0.1:27600       # a client that compresses without being invited to
+    bash test/hostsweep.sh                         # all seven host-side suites, serially, with a tally
     bash test/testtls.sh                           # TLS to the client and to the fast tier (host side)
     bash test/testsharded.sh                       # a mongos fast tier, which is refused (host side)
     bash test/testchaos.sh                         # kill things under load (host side, slow)
