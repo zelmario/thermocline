@@ -1381,6 +1381,134 @@ func (r *Router) UniqueNamespaces(ctx context.Context, candidates []string) []st
 	return out
 }
 
+// warnAboutUnclaimedUniqueKeys names tiered collections whose unique indexes
+// the registry has never claimed a single key for, while the archive holds
+// documents those indexes would index.
+//
+// That combination means one thing: a cluster adopted with data and indexes
+// already in it. A unique index created *through* this router walks both tiers
+// and claims what is already there before the build is forwarded, and a fast
+// tier built from nothing has nothing to claim, so neither of those is warned
+// about. What is left is the archive that arrived with the constraint already
+// on it and nothing having walked it.
+//
+// **Until something claims them the constraint is not enforced across the
+// tiers.** An insert duplicating a value only the archive holds is accepted:
+// the fast tier's own index cannot see the other half, and the registry has no
+// row to collide with -- a key whose row inserts cleanly is settled there and
+// then, with no question asked of the archive. So this is not a slow answer, it
+// is a uniqueness guarantee an application has relied on for years quietly not
+// holding on the day it is adopted.
+//
+// The remedy is one command. It was written down as the answer to "an index
+// created out of band, a fast tier rebuilt from nothing, a cluster adopted with
+// data already in it" and never as a consequence of skipping it, and a
+// documented step is not a guarantee.
+//
+// After ensureFastTierIndexes on purpose: on an adoption the fast tier's copy
+// of the index may only exist because the Indexer has just built it, and it is
+// the fast tier's listing the router enforces from, so before that pass the
+// state this looks for is not yet meaningful.
+//
+// It stays quiet whenever it cannot tell. A read it cannot make is not evidence
+// of an unclaimed constraint, and a warning naming a namespace that is fine
+// costs as much as silence over one that is not.
+func (r *Router) warnAboutUnclaimedUniqueKeys(ctx context.Context) {
+	for _, ns := range r.cfg.Managed {
+		for _, idx := range r.uniqueIndexes(ctx, ns) {
+			if r.registryHasAClaimFor(ctx, ns, idx) {
+				continue
+			}
+			if !r.archiveHoldsSomethingIndexedBy(ctx, ns, idx) {
+				continue
+			}
+			r.log.Warn("a unique index on a tiered collection has no claims in the registry",
+				"ns", ns, "index", idx.name,
+				"meaning", "this constraint is not being enforced against documents only the archive "+
+					"holds, so an insert duplicating one of their values is accepted",
+				"why", "nothing has walked the archive for this index; that happens when a unique "+
+					"index is created through the router, and an adopted cluster arrives with "+
+					"its indexes already built",
+				"action", "cline keys --rebuild, which reports any duplicates that got in")
+		}
+	}
+}
+
+// registryHasAClaimFor reports whether the registry holds any row for this
+// index, and says yes when it cannot tell.
+func (r *Router) registryHasAClaimFor(ctx context.Context, ns string, idx uniqueIndex) bool {
+	prefix := ns + "|" + idx.name + "|"
+	// A range over _id rather than a query on the ns and idx fields, because
+	// the _id index serves it and the registry carries no other: one row per
+	// claimed key makes it the largest bookkeeping collection there is. Every
+	// id is prefix + base64, and "}" sorts above every base64 character.
+	err := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: bson.D{
+		{Key: "$gte", Value: prefix},
+		{Key: "$lt", Value: prefix + "}"},
+	}}}).Err()
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return false
+	}
+	// Found one, or could not look. Both mean no warning.
+	return true
+}
+
+// archiveHoldsSomethingIndexedBy reports whether the archive holds a live
+// document this index would index, and says no when it cannot tell.
+//
+// Scoped by the index rather than merely counting documents, because a partial
+// index over a value no archived document carries has nothing to claim and is
+// not the state being warned about.
+func (r *Router) archiveHoldsSomethingIndexedBy(ctx context.Context, ns string, idx uniqueIndex) bool {
+	db, coll := splitNS(ns)
+	filter := bson.D{meta.NotArchivedDeleted()}
+	if scope := indexScope(idx); len(scope) > 0 {
+		filter = append(filter, bson.E{Key: "$and", Value: scope})
+	}
+	err := r.cold.Database(db).Collection(coll).FindOne(ctx, filter,
+		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+	return err == nil
+}
+
+// indexScope narrows a query to the documents a unique index actually indexes,
+// as clauses for an $and.
+//
+// A sparse or partial unique index constrains only some documents, and one
+// outside it does not hold the key however plainly it holds the value. Matching
+// on the values alone refused writes mongod accepts: measured on a unique index
+// over sku with partialFilterExpression {active: true}, one document
+// {sku: "K", active: false} and an ownerless claim row for that key, an insert
+// of {sku: "K", active: true} came back E11000 from the router and was accepted
+// by mongod on an untiered collection carrying the same index.
+//
+// In a query rather than per document, unlike pruneClaims, which reads each
+// candidate and asks constrains. Both answer the same question and agree on the
+// rules; this shape is for the paths where the point is to let the partial
+// index serve the lookup instead of fetching what it would have excluded. Every
+// operator MongoDB allows in a partialFilterExpression is one a find filter
+// takes.
+//
+// One function rather than the same two rules written out twice, because the
+// two places that need them must not drift: whether a value is still held, and
+// whether the archive holds anything an index would index at all.
+func indexScope(idx uniqueIndex) bson.A {
+	var scope bson.A
+	if len(idx.partial) > 0 {
+		scope = append(scope, idx.partial)
+	}
+	if idx.sparse {
+		// A compound sparse index still indexes a document that has any one of
+		// its fields, so only one missing all of them is exempt. The same rule
+		// constrains applies, in the same polarity.
+		var present bson.A
+		for _, f := range idx.fields {
+			present = append(present, bson.D{{Key: f, Value: bson.D{{Key: "$exists", Value: true}}}})
+		}
+		scope = append(scope, bson.D{{Key: "$or", Value: present}})
+	}
+	return scope
+}
+
 // keyHeldByLiveDocument reports whether either tier holds a live document with
 // this key, in the comparison the index itself uses.
 //
@@ -1400,38 +1528,8 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
 	}
 	// Narrowed to the documents the index actually indexes, because holding the
-	// value and holding the key are not the same thing.
-	//
-	// A sparse or partial unique index constrains only some documents, and one
-	// outside it does not hold the key however plainly it holds the value.
-	// Matching on the values alone therefore refused writes mongod accepts:
-	// measured on a unique index over sku with partialFilterExpression
-	// {active: true}, one document {sku: "K", active: false} and an ownerless
-	// claim row for that key, an insert of {sku: "K", active: true} came back
-	// E11000 from the router and was accepted by mongod on an untiered
-	// collection carrying the same index.
-	//
-	// In the query rather than per document, unlike pruneClaims, which reads
-	// each candidate and asks constrains. Both answer the same question and
-	// agree on the rules; this one is on the write path, where the point is to
-	// let the partial index serve the lookup instead of fetching what it would
-	// have excluded. Every operator MongoDB allows in a
-	// partialFilterExpression is one a find filter takes.
-	var scope bson.A
-	if len(idx.partial) > 0 {
-		scope = append(scope, idx.partial)
-	}
-	if idx.sparse {
-		// A compound sparse index still indexes a document that has any one of
-		// its fields, so only one missing all of them is exempt. The same rule
-		// constrains applies, in the same polarity.
-		var present bson.A
-		for _, f := range idx.fields {
-			present = append(present, bson.D{{Key: f, Value: bson.D{{Key: "$exists", Value: true}}}})
-		}
-		scope = append(scope, bson.D{{Key: "$or", Value: present}})
-	}
-	if len(scope) > 0 {
+	// value and holding the key are not the same thing. See indexScope.
+	if scope := indexScope(idx); len(scope) > 0 {
 		filter = append(filter, bson.E{Key: "$and", Value: scope})
 	}
 

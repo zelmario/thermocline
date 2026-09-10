@@ -786,6 +786,69 @@ C 'db.getSiblingDB(process.env.TC_DB).tkgone.deleteOne({_id:2})' >/dev/null
 chk "  with the duplicate gone it is built"              "ok" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkgone.createIndex({sku:1},{unique:true,name:"u_sku"});print("ok")}catch(e){print(e.code||e.message.substring(0,60))}')"
 
+echo "== an adopted archive whose keys nothing has claimed =="
+# The shape every adoption starts in: the archive arrives with its documents and
+# its unique index already on it, so no createIndexes ever went through the
+# router and nothing walked the tiers to claim the values already there.
+#
+# Until something does, the constraint is not enforced across the tiers. The
+# fast tier's own index cannot see a document only the archive holds, and the
+# registry has no row to collide with -- a key whose row inserts cleanly is
+# settled there and then, with no question asked of the archive. So a duplicate
+# of an archived value goes straight in, which this section measures rather than
+# asserts.
+#
+# The remedy was written down as the answer to "a cluster adopted with data
+# already in it" and never as a consequence of skipping it, and a documented
+# step is not a guarantee. The router says so at startup now.
+ANS=tkadopt
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:'$DB.$ANS'})" >/dev/null
+# On the archive only, which is what makes it an adoption rather than a create
+# through the router.
+C "const d=db.getSiblingDB(process.env.TC_DB).$ANS;
+   d.insertMany([{_id:1,sku:'x'},{_id:2,sku:'y'}]); d.createIndex({sku:1},{unique:true,name:'u_sku'})" >/dev/null
+# Its own log, so the count is this router's and not every router the suite has
+# started. The warning is a startup one, so it takes a fresh router either way.
+rm -f $LOGDIR/keys_adopt1.log
+cline router --config $CFG --log-file $LOGDIR/keys_adopt1.log & RPA=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+# Scoped to this namespace rather than counted across the file. Every other
+# section leaves collections with unique indexes behind, and a bare count of the
+# message would be a number that depends on all of them: the same mistake as
+# counting the whole key registry instead of one collection's rows.
+chk "it warns that nothing has claimed this index"       "1" \
+    "$(grep 'has no claims in the registry' $LOGDIR/keys_adopt1.log 2>/dev/null | grep -c "ns=$DB.$ANS" || true)"
+chk "  and names the command that fixes it"              "true" \
+    "$(grep 'has no claims in the registry' $LOGDIR/keys_adopt1.log 2>/dev/null | grep -q 'keys --rebuild' && echo true || echo false)"
+# The thing the warning is about. Not enforced means not enforced.
+chk "  a duplicate of an archived value gets in"         "ok" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:99,sku:'x'});print('ok')}catch(e){print(e.code||e.message.substring(0,40))}")"
+R "db.getSiblingDB(process.env.TC_DB).$ANS.deleteOne({_id:99})" >/dev/null
+kill $RPA 2>/dev/null; sleep 2
+
+cline keys --config $CFG --rebuild >/dev/null 2>&1
+chk "the rebuild claimed the archive's keys"             "true" \
+    "$([ "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.$ANS'}))")" -ge 2 ] && echo true || echo false)"
+rm -f $LOGDIR/keys_adopt2.log
+cline router --config $CFG --log-file $LOGDIR/keys_adopt2.log & RPB=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "and then it stops warning about it"                 "0" \
+    "$(grep 'has no claims in the registry' $LOGDIR/keys_adopt2.log 2>/dev/null | grep -c "ns=$DB.$ANS" || true)"
+chk "  while the duplicate is now refused"               "11000" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:98,sku:'x'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
+kill $RPB 2>/dev/null
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"

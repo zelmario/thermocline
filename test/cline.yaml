@@ -89,6 +89,11 @@ feeder:
     # router, once by dropping the index and once by dropping the whole
     # collection, both out of band so nothing forwards the DDL.
     - "shop.tkgone"
+    # testkeys.sh: an adoption, which is the archive arriving with its documents
+    # and its unique index already on it and nothing having claimed any of their
+    # keys. Its own collection, because the section restarts routers and counts
+    # what they say about this namespace alone.
+    - "shop.tkadopt"
     # testevict.sh: the collection the restored-archive section mirrors, updates
     # and then restores to an older backup underneath a live fast tier.
     - "shop.trestore"

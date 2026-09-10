@@ -302,6 +302,11 @@ func (r *Router) Listen(ctx context.Context) error {
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
 	r.ensureFastTierIndexes(ctx)
+	// And then, with the fast tier's own listing settled, whether anything has
+	// ever claimed the keys those indexes constrain. On an adoption nothing
+	// has, and the constraint is then not enforced against the archive at all.
+	// See warnAboutUnclaimedUniqueKeys.
+	r.warnAboutUnclaimedUniqueKeys(ctx)
 	// And the definitions that hold no documents, in the other direction: a view
 	// the fast tier has and the archive does not. See mirrorViewsToArchive.
 	r.mirrorViewsToArchive(ctx)

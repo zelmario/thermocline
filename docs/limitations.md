@@ -406,6 +406,34 @@ Part of [Thermocline](../README.md).
   walk is the dominant cost of creating the index. It happens only for a spec
   asking for `unique: true` on a tiered collection.
 
+- **An adopted archive's unique constraints are not enforced until something
+  claims their keys, and the router now says so at startup.** The registry is
+  what remembers that a value is taken once its document is only in the archive,
+  and it is filled by whatever claimed the key: a write through the router, or
+  the walk of both tiers that a `createIndexes` for `unique: true` performs
+  before the build is forwarded.
+
+  An adoption has had neither. The archive arrives with its documents and its
+  indexes already on it, so no `createIndexes` ever went through the router and
+  nothing has walked it. Until something does, an insert duplicating a value
+  only the archive holds is **accepted**: the fast tier's own index cannot see
+  the other half, and a key whose registry row inserts cleanly is settled there
+  and then, with nothing asked of the archive. Measured on an archive holding
+  two documents and a unique index on `sku` with an empty registry: a third
+  document repeating one of those values went in, and after `cline keys
+  --rebuild` claimed the two the same insert was refused with 11000.
+
+  So a uniqueness guarantee an application has relied on for years quietly stops
+  holding on the day it is adopted, until one command is run. `cline keys
+  --rebuild` was documented as the answer to "an index created out of band, a
+  fast tier rebuilt from nothing, a cluster adopted with data already in it" and
+  never as a consequence of skipping it, and a documented step is not a
+  guarantee. The router now warns at startup for each tiered collection whose
+  unique index has no claims at all while the archive holds documents that index
+  would index, naming the namespace, the index and the command. It stays quiet
+  for a fast tier built from nothing, which has nothing to claim, and for an
+  index created through the router, which claimed on the way.
+
 - **Dropping a tiered collection on the fast tier ends its unique constraints,
   and the router says so rather than pretending.** The router enforces a unique
   index across the tiers by reading the fast tier's listing, so a collection
