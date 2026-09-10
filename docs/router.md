@@ -174,7 +174,23 @@ Range queries are governed by the watermark below.
   the same in bulk ahead of time; and an eviction. The first two are inserts on
   the fast tier and the third is a delete, and all three are hidden from a
   client's stream. So are events for the router's own scratch collections, which
-  a `$out` or `$merge` creates and drops.
+  a `$out` or `$merge` creates and drops, and the rows this system writes to its
+  own bookkeeping, including the unique key registry, which is the one piece of
+  it that lives on the fast tier.
+
+  **And the catalog repair behind a copy-up.** The fast tier is repaired, not
+  merely filled: before the first copy-up into a namespace the router creates
+  the collection there with the archive's options, because a collation decides
+  which documents match and cannot be added afterwards, and then builds the
+  archive's indexes on it. Both land on the application's own namespace, so with
+  `showExpandedEvents` a client would be told its collection had just been
+  created and its indexes with it. Those two events are hidden; the
+  application's own `create` and `createIndexes` on a tiered collection are not,
+  and are matched apart from this system's by the oplog position of each, so a
+  client still hears about its own DDL.
+
+  `showExpandedEvents` is MongoDB 6.0 and up. Below it a change stream carries
+  no `create` or `createIndexes` at all, so there was nothing to hide.
 
   **An event is judged when the client reads it, not when it happened**, and the
   client decides when that is. A consumer that stores its resume token and comes
