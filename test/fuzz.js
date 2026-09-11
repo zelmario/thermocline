@@ -226,6 +226,34 @@ function updateSpec() {
   }
 }
 
+// multiSafe is an update spec with the one thing taken out that must not appear
+// in a write over many documents.
+//
+// `items` is an array in these documents, so $set of items.sku or items.qty
+// fails with code 28, "Cannot create field 'sku' in element {items: [...]}",
+// on every document that has one. Both sides fail identically, so the
+// comparison is vacuous -- and in an updateMany it is worse than vacuous. The
+// update applies to the documents without an array and stops at the first one
+// with, so the two collections end up holding different things and the round
+// stops there. Measured on seed 777001: four rounds in ten stopped early, one
+// after nine of a hundred and fifty operations, and code 28 was the commonest
+// cause of it.
+//
+// Left alone for single-document writes, where a failure is atomic and the
+// error parity is still worth comparing: an update of an archive-only document
+// has to be copied up and applied, and it has to fail the same way there.
+// Rewritten rather than redrawn, so the generated stream is unchanged.
+function multiSafe(u) {
+  const touchesArray = Object.keys(u).some(op =>
+    Object.keys(u[op]).some(f => f.indexOf('items.') === 0));
+  // opt, because nothing in IDX_SPECS indexes it. The first substitute here was
+  // $inc on n, which every one of those specs does index: a constant increment
+  // across many documents collides on a unique one and fails partway, which is
+  // the thing this function exists to avoid. A fix that reintroduces the defect
+  // it removes is worth catching before it is measured rather than after.
+  return touchesArray ? { $set: { opt: 'yes' } } : u;
+}
+
 // Set per side before a pipeline is generated. The two sides pick the same
 // branch, because the generator is replayed from the same seed; only the name
 // it lands on differs.
@@ -358,7 +386,13 @@ const refusals = [], bugs = [], stale = [];
 const shapes = {};
 // The writes that touch more than one document, and so can stop half done. A
 // failed updateOne or replaceOne is one document and cannot.
-const MULTI_WRITE = /^(updateMany|deleteMany|bulkWrite|contents after (updateMany|deleteMany|bulkWrite))/;
+// bulkWrite is deliberately not here. Every operation this grammar puts in one
+// is single-document -- an updateOne and a deleteOne by _id and an insertOne --
+// and with ordered:false each is attempted independently, so two collections
+// holding the same documents apply exactly the same subset and cannot diverge.
+// Voiding for it cost a round in four measured on seed 777001 and protected
+// nothing. Revisit if a multi-document operation is ever generated inside one.
+const MULTI_WRITE = /^(updateMany|deleteMany|contents after (updateMany|deleteMany))/;
 // Set when the two collections stop holding the same documents through no fault
 // of the router. Declared here with the rest of the run's state, and not beside
 // contentsMatch where it is explained, because ask reads it: a `let` further
@@ -817,8 +851,11 @@ function oneOp(i) {
       ask('total', 'countDocuments {}', c => c.countDocuments({}), 'seq');
       break;
     case 6: {
-      const op = 'updateMany ' + ser(F) + ' ' + ser(U);
-      if (ask('updateMany', op, c => { const r = c.updateMany(F, U); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateMany', op);
+      // multiSafe, because this one writes many documents and a half-applied
+      // failure ends the round. See multiSafe.
+      const UM = multiSafe(U);
+      const op = 'updateMany ' + ser(F) + ' ' + ser(UM);
+      if (ask('updateMany', op, c => { const r = c.updateMany(F, UM); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateMany', op);
       break;
     }
     case 7: {
