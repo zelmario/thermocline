@@ -36,6 +36,32 @@ SUITES=${SUITES:-"testconform testfuzz testauthterm testkeys testtxn testconcern
         testreadpref testreadprefterm testtypes testbson testwarm testevict
         testdaemonmetrics testretry testpool testnotice"}
 
+# CACHE=1 runs the whole sweep with the query cache on.
+#
+# Worth having as a switch rather than a procedure somebody remembers. Every
+# suite but testcache.sh runs with the cache off, so this is the only way to
+# find a cached answer disagreeing with the tiers, and until 2026-09-11 it had
+# never been run: 36 suites and 1591 checks that had never seen a cached read.
+#
+# Derived here rather than by editing the shared config, so a run cannot leave
+# the cache on for the next one. testcache.sh still derives its own pair either
+# way: it turns the block on when it is there and off for its own control.
+if [ "${CACHE:-0}" = "1" ]; then
+  CACHED=/root/cline_cache_sweep.yaml
+  if grep -q '^  cache:' "$SHARED"; then
+    sed 's/^\( *\)enabled: false/\1enabled: true/' "$SHARED" > "$CACHED"
+  else
+    sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' \
+      "$SHARED" > "$CACHED"
+  fi
+  # Asserted, not assumed. A sweep that silently ran with the cache off would be
+  # twenty-five minutes proving nothing, and it would look exactly like a pass.
+  grep -q 'enabled: true' "$CACHED" || {
+    echo "psweep: CACHE=1 but $CACHED does not turn the cache on"; exit 2; }
+  SHARED=$CACHED
+  echo "psweep: the query cache is on for every worker in this run"
+fi
+
 rm -rf "$OUT"; mkdir -p "$OUT"
 printf '%s\n' $SUITES > "$OUT/queue"
 TOTAL=$(wc -l < "$OUT/queue")
@@ -127,3 +153,12 @@ MINS=$(( ($(date +%s) - START) / 60 ))
   # indented, and counting those would double every number.
   echo "checks: $(grep -hE '^PASS [0-9]+ +FAIL [0-9]+' "$OUT"/*.log | awk '{p+=$2; f+=$4} END {print p+0" passed, "f+0" failed"}')"
 } >> "$OUT/summary.txt"
+
+# And a status a caller can read. Without this the script ended on whatever the
+# last command happened to return -- 1 on a clean run, as it turned out -- so
+# nothing could tell a passing sweep from a failing one except a person reading
+# the summary. The same rule hostsweep.sh follows: a tally is for people, an
+# exit status is for whatever started it.
+cat "$OUT/summary.txt"
+grep -qE 'FAIL [1-9]|TIMED OUT|MISSING|no tally|SETUP FAILED' "$OUT/summary.txt" && exit 1
+exit 0

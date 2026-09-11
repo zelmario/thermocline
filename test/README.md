@@ -19,6 +19,24 @@ nothing.
 measurements were getting skipped, and a forty minute feedback loop costs more
 than it saves. See "Running them in parallel" below for what a worker is.
 
+**`CACHE=1 psweep.sh` runs the whole sweep with the query cache on.** Every
+suite but `testcache.sh` runs with it off, so this is the only way to find a
+cached answer disagreeing with the tiers, and until 2026-09-11 it had never been
+run: 36 suites and 1591 checks that had never seen a cached read. It is a switch
+rather than a procedure somebody remembers, and it derives its own config so a
+run cannot leave the cache on for the next one.
+
+The first run of it was clean, 1591 passed and 0 failed, with 97 of the 98
+routers started in that sweep logging `query cache on` — the one exception being
+`testcache`'s own control, which turns it off deliberately. The cache does serve
+reads on this cluster, which is what makes that number mean something: six
+identical queries through a cache-on router gave 2 entries and 4 hits.
+
+`psweep.sh` exits non-zero when anything failed. It never used to exit
+explicitly, so its status was whatever the last command returned — 1 on a clean
+run — and nothing could tell a passing sweep from a failing one except a person
+reading the summary.
+
 **`psweep.sh` is only half the suites.** Seven run on the host rather than in the
 node, each for a reason: they stop and start mongod on other containers, build
 clusters of their own, or need a Prometheus and the router's metrics endpoint at
