@@ -101,7 +101,28 @@ chk "while the archive still holds the marks"  "$((SAW + CANCEL))" "$RAW"
 echo "== stop everything, then clear the marks =="
 # The documented order. A delete that reaches the archive after the clear writes
 # another mark, which is why the command refuses while a feeder publishes.
-stopAll; sleep 2
+stopAll
+# Wait until the command will not refuse, rather than sleeping and hoping.
+#
+# `rollback --clear` refuses while a feeder looks like it is still publishing,
+# and "still publishing" means its last position is younger than four times its
+# own publish interval, with a two second floor. This slept exactly two seconds
+# -- the floor itself -- so whether it passed came down to how long the count
+# before it happened to take. Measured under hostsweep: the clear refused,
+# printed nothing at all because refusing returns before it prints, and three
+# checks read that as a rollback that had not cleared. It passes alone.
+#
+# The same arithmetic the command does, asked of the same document.
+for _ in $(seq 1 40); do
+  SAFE=$(C "const p = db.getSiblingDB('_thermocline_two').positions.findOne({_id:'two'});
+    if (!p || !p.savedAt) { print('yes'); }
+    else { const every = (p.everyMS > 0 ? p.everyMS : 1000);
+           const stale = Math.max(4 * every, 2000);
+           print((Date.now() - p.savedAt.getTime()) > stale ? 'yes' : 'no'); }")
+  [ "$SAFE" = "yes" ] && break
+  sleep 1
+done
+[ "$SAFE" = "yes" ] || echo "  WARN  the feeder still looks like it is publishing, so the clear will refuse"
 COUNTED=$(N "cline rollback --config $CFG --ns $SHOP.orders" 2>&1 | grep -oE '[0-9]+ marked deleted' | grep -oE '^[0-9]+')
 chk "rollback counts exactly what was deleted" "$CANCEL" "$COUNTED"
 CLEARED=$(N "cline rollback --config $CFG --ns $SHOP.orders --clear" 2>&1 | grep -oE 'cleared [0-9]+' | grep -oE '[0-9]+')
