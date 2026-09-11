@@ -119,6 +119,44 @@ documents the fast tier does not hold from the archive and requiring that the
 comparison notices, because a harness that reports agreement is worth nothing
 until it has been seen reporting a disagreement that is really there.
 
+**The sweep runs fixed seeds, which is the wrong tool for finding anything
+new.** A fixed seed makes a failure mean "something changed", which is what a
+sweep is for; exploring means passing `TC_SEED`. Four fresh seeds were run on
+2026-09-10 and the second of them disagreed, so there is more here to find by
+running more of them.
+
+### An open disagreement, found 2026-09-10 and not explained
+
+```
+TC_SEED=800758 TC_ROUNDS=1 TC_OPS=75  bash /root/testfuzz.sh    # 3 disagreements
+TC_SEED=800758 TC_ROUNDS=1 TC_OPS=80  bash /root/testfuzz.sh    # 5, twice running
+TC_SEED=800758 TC_ROUNDS=1 TC_OPS=70  bash /root/testfuzz.sh    # clean
+```
+
+That seed puts the failing round first; it was round 4 of `TC_SEED=777001`.
+
+What is known. One document's `n` differs: the reference holds the value it was
+seeded with and **both tiers agree with each other** on a later one, so nothing
+is mis-tiered and no read is resolving across the tiers wrongly — the tiered
+side applied a write the reference did not, or the reference applied one the
+tiered side did not. Every disagreement after the first is an echo of that one
+document. It reproduces on `2a4fb8d`, so it is **not** something this session
+introduced, and the grammar has been generating these shapes for weeks: it took
+a new seed rather than new code.
+
+What has been ruled out. The transactions that run their body twice on the
+tiered side are not it: that is by design and the run at 70 operations does it
+seven times and agrees. The contents check after every write agreed up to the
+point the difference appears, which is what makes it hard — the write that
+diverges is one whose own answer agreed, so the two sides matched a different
+*set* of documents while returning the same counts.
+
+Where to start. `$mod: [1, 0]` appears in the filter of the `updateMany` that
+sets that field, and it matches every numeric value, so both sides should match
+the document. Run with `TC_TRACE=1`, and note that the DISAGREE blocks are
+printed as an end-of-round summary rather than in sequence with the `op` lines,
+so their position says nothing about which operation caused them.
+
 Each round prints one `SHAPES` line naming what it actually compared, as
 `shape=done/vacuous`. A shape missing from it was never generated, and a shape
 whose two numbers are equal compared nothing but error messages: both sides
