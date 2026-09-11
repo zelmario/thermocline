@@ -167,12 +167,34 @@ sed 's/position_every: .*/position_every: 10s/; s/checkpoint_every: .*/checkpoin
 grep -q 'position_every' $WDIR/conc_slow.yaml || sed -i 's/  checkpoint_every: 30s/  checkpoint_every: 30s\n  position_every: 10s/' $WDIR/conc_slow.yaml
 cline feeder --config $WDIR/conc_slow.yaml --log-file $LOGDIR/conc_slow.log & FP=$!
 sleep 3
+# Measured against the same read without a budget, rather than against a clock.
+#
+# An absolute threshold was the first version and it fails on a busy box for a
+# reason that has nothing to do with the deadline: itcount pays for the getMores
+# too, and maxTimeMS does not bound those -- it applies to the find, and a
+# getMore carries its own or none. Measured under a parallel sweep, 3153ms for a
+# 250ms budget, with the barrier itself behaving perfectly. The suite passed
+# alone either side of it.
+#
+# Both arms pay whatever the box is charging, so the difference between them is
+# the wait and nothing else. Bounded first, while the position is still stale,
+# then a second write so the unbounded read has something of its own to wait for.
+timed() { # EVAL -> milliseconds
+  R "const t=Date.now(); try { $1 } catch(e) {} print(Date.now()-t);"
+}
 R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:900,v:'z'})" >/dev/null
-SLOWMS=$( { R "
-  const t=Date.now();
-  try { db.getSiblingDB(process.env.TC_DB).$NS.find({}).maxTimeMS(250).itcount(); } catch(e) {}
-  print(Date.now()-t);"; } )
-chk "maxTimeMS bounds the freshness wait"        "true" "$([ "${SLOWMS:-99999}" -lt 2000 ] && echo true || echo false)"
+BOUNDED=$(timed "db.getSiblingDB(process.env.TC_DB).$NS.find({}).maxTimeMS(250).itcount();")
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:901,v:'z'})" >/dev/null
+UNBOUNDED=$(timed "db.getSiblingDB(process.env.TC_DB).$NS.find({}).itcount();")
+echo "      the same read took ${BOUNDED}ms with a 250ms budget and ${UNBOUNDED}ms with none"
+# A fixture that produced no wait proves nothing either way, and saying so beats
+# a green check over a comparison that never happened.
+if [ "${UNBOUNDED:-0}" -lt 1000 ]; then
+  echo "      SKIPPED  the unbounded read did not wait either, so there was no wait to bound"
+else
+  chk "maxTimeMS bounds the freshness wait"      "true" \
+      "$(awk -v b="${BOUNDED:-99999}" -v u="${UNBOUNDED:-0}" 'BEGIN{print (b+0 < u/2) ? "true" : "false"}')"
+fi
 echo "      (a 250 ms budget returned in ${SLOWMS} ms, against a 10s position interval)"
 pkill -f "cline feeder --config $WDIR/conc_slow" 2>/dev/null
 for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
