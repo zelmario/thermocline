@@ -240,7 +240,11 @@ oneRound() {
   echo "$OUT" | grep -E "^  HARNESS|^  VOID$(printf '\t')|^  txn$(printf '\t')|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
   # What the round actually compared, as shape=done/vacuous. A clean tally over
   # a grammar that never generated a shape is not evidence about that shape.
-  echo "$OUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
+  # -s so it breaks at spaces. Plain fold -w splits shape names down the middle,
+  # which turns the one line that says what was actually exercised into tokens
+  # like "ndOneAndDelete" and "ter_updateMany": unreadable by a person and
+  # unparseable by anything counting coverage, which is the only thing it is for.
+  echo "$OUT" | grep -m1 '^SHAPES ' | fold -s -w 150 | sed 's/^/  /'
   LINE=$(echo "$OUT" | grep -m1 '^AGREED ')
   if [ -z "$LINE" ]; then
     echo "  FATAL  the round produced no tally:"; echo "$OUT" | tail -20
@@ -443,7 +447,7 @@ chk "and the fast tier holds them all" "60" "$(H "print(db.getSiblingDB(process.
 SOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=$OPS TC_NO_TTL=1 mongosh --port $P1 -u dba -p secret \
          --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
 echo "$SOUT" | grep -E '^  HARNESS|^DISAGREE|^REFUSAL|^\t' | head -40
-echo "$SOUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'
+echo "$SOUT" | grep -m1 '^SHAPES ' | fold -s -w 150 | sed 's/^/  /'
 SLINE=$(echo "$SOUT" | grep -m1 '^AGREED ')
 echo "  $SLINE"
 set -- $SLINE

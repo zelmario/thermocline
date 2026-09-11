@@ -231,10 +231,45 @@ function updateSpec() {
 // it lands on differs.
 let SELF = 'tcref';
 let OTHER = 'tcref2';
+
+// One sub-pipeline for a $facet, and every one of them ends in a deterministic
+// order.
+//
+// That is the whole difficulty of generating this stage. A $facet returns one
+// document whose fields are arrays, and the comparison normalises the top level
+// as a bag; the arrays inside are compared in order. MongoDB promises no order
+// without a $sort, so a sub-pipeline that merely filters can hand the two sides
+// the same documents in different orders and be reported as a disagreement
+// about the router. Each shape here either ends in a $sort or collapses to a
+// single value.
+//
+// What may not appear inside a $facet, per MongoDB: $out, $merge, $geoNear,
+// $collStats, $indexStats, $planCacheStats, and another $facet. $lookup,
+// $unionWith and $graphLookup are allowed, and they are the interesting ones
+// here: a sub-pipeline reading a tiered collection of its own is exactly what
+// the outer pipeline's filter does not reach.
+function facetBranch() {
+  switch (ri(5)) {
+    case 0: return [{ $match: filter(0) }, { $count: 'c' }];
+    case 1: return [{ $group: { _id: '$grp', c: { $sum: 1 }, s: { $sum: '$n' } } },
+                    { $sort: { _id: 1 } }];
+    case 2: return [{ $match: filter(0) }, { $sort: { _id: 1 } }, { $limit: 1 + ri(5) },
+                    { $project: { n: 1, grp: 1 } }];
+    case 3: return [{ $lookup: { from: pick([SELF, OTHER]), localField: 'grp',
+                                 foreignField: 'grp', as: 'sib' } },
+                    { $sort: { _id: 1 } }, { $limit: 1 + ri(4) },
+                    { $project: { grp: 1, sibs: { $size: '$sib' } } }];
+    default: return [{ $unionWith: { coll: pick([SELF, OTHER]),
+                                     pipeline: [{ $match: filter(0) }] } },
+                     { $group: { _id: '$grp', c: { $sum: 1 } } },
+                     { $sort: { _id: 1 } }];
+  }
+}
+
 function pipeline() {
   const stages = [];
   if (maybe(0.8)) stages.push({ $match: filter(1) });
-  switch (ri(10)) {
+  switch (ri(11)) {
     case 0:
       stages.push({ $group: { _id: '$' + pick(['grp', 'opt', 'meta.active']),
                               c: { $sum: 1 }, s: { $sum: '$n' }, mx: { $max: '$f' } } });
@@ -277,6 +312,14 @@ function pipeline() {
       stages.push({ $lookup: { from: pick([SELF, OTHER]), let: { g: '$grp' },
                                pipeline: [{ $match: { $expr: { $eq: ['$grp', '$$g'] } } }], as: 'sib' } },
                   { $project: { grp: 1, sibs: { $size: '$sib' } } });
+      break;
+    case 10:
+      // Sub-pipelines over one input, which the router has to reason about
+      // without a filter in front of them. It guards $facet by recursing into
+      // every field, in the completeness pass and again in the rewrite, and
+      // nothing generated was reaching either: the hand-written suites cover
+      // the stage and the grammar never produced one.
+      stages.push({ $facet: { a: facetBranch(), b: facetBranch() } });
       break;
     default:
       stages.push({ $sortByCount: '$grp' });
