@@ -295,7 +295,40 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 		c.r.forgetHint(ns)
 		c.r.forgetView(ns)
 		c.r.forgetCollation(ns)
+		// A rename puts a different collection under each of these names, so
+		// the age brackets describe the wrong one: the field a collection is
+		// aged by can be typed differently in the collection that has arrived.
+		// The same argument forgetDropped makes for a drop and a recreate.
+		c.r.forgetBrackets(ns)
+		// And the indexer's memory, which is the one that does not correct
+		// itself. It remembers that a namespace's collection exists on the fast
+		// tier with the archive's options and its indexes built. After a rename
+		// neither name means what it meant: nothing is under the old one, and
+		// something else is under the new. A later write to the old name then
+		// creates the collection implicitly, with no collation, no validator
+		// and no index but _id_, and a unique index the archive still carries
+		// stops being enforced on either tier. That consequence is not
+		// hypothetical -- it is the one measured for a drop the router never
+		// saw, and written up in docs/router.md.
+		c.r.indexer.Forget(ns)
 	}
+	// This list is forgetDropped's, minus one deliberate difference: that one
+	// uses staleIndexes where this uses forgetIndexes above, because a rename
+	// leaves the new name holding a real collection whose listing should be
+	// re-read rather than merely aged out. Everything else has to match, and
+	// two of these were missing until the lists were compared. See
+	// forgetEverythingIn, which was made to delegate for exactly this reason:
+	// two lists disagreeing about what a name still means is how the next
+	// reader gets it wrong.
+	//
+	// No reproduction for the two added here, and that is stated rather than
+	// dressed up. This router's own fast tier watch carries the rename a moment
+	// later and calls forgetDropped for both names, which closes the window on
+	// an ordinary deployment. It does not close it where that watch is down --
+	// a privilege the router's account lacks, or a tier it cannot reach -- and
+	// that is a state the router already reports at ERROR and docs/router.md
+	// already describes. Correctness here should not rest on a stream that is
+	// documented as optional.
 
 	// Unique key claims are the registry's, and they name the collection.
 	if _, kerr := c.r.keys().UpdateMany(ctx,
