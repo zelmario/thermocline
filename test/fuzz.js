@@ -1205,8 +1205,33 @@ if (STREAM) {
 }
 
 let ran = 0;
+// TC_WATCH=<id> prints one document from both sides after every operation.
+//
+// Kept because it is the only thing that has ever found which operation
+// diverged two collections. The report names the operation that *noticed*, and
+// that is rarely the one that did it: an operation whose own answer agreed gets
+// no contents check, so the difference surfaces at the next write that does.
+// Twice now the answer has come from watching one _id through a round.
+//
+// Printed as an op line because oneRound filters the round's output and a prefix
+// of its own would be dropped before anybody saw it.
+const WATCH = Number(process.env.TC_WATCH || 0);
+function watch(i) {
+  if (!WATCH) return;
+  const f = d => d ? ('n=' + d.n) : 'MISSING';
+  const rs = f(REF.findOne({ _id: WATCH }));
+  const ts = f(TIER.findOne({ _id: WATCH }));
+  // Each tier as well as the router, for the reason the disagreement report
+  // gives: the router answering differently from what both tiers hold is a
+  // different fault from the tiers disagreeing with each other, and one line
+  // showing only the router leaves them looking identical.
+  const hs = HOT ? f(HOT.getDB(DB).getCollection(TIER.getName()).findOne({ _id: WATCH })) : '-';
+  const cs = COLD ? f(COLD.getDB(DB).getCollection(TIER.getName()).findOne({ _id: WATCH })) : '-';
+  print('  op\tWATCH ' + i + ': ref ' + rs + ' | router ' + ts + ' | fast ' + hs + ' | archive ' + cs +
+        (rs === ts ? '' : '   <<<< ROUTER DIFFERS FROM REF'));
+}
 for (let i = 0; i < OPS; i++) {
-  try { oneOp(i); }
+  try { oneOp(i); watch(i); }
   catch (e) {
     // A generator that produced something mongosh itself cannot send is a
     // harness fault, not a finding, and it must not be silent.

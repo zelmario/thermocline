@@ -143,6 +143,45 @@ sweep is for; exploring means passing `TC_SEED`. Four fresh seeds were run on
 2026-09-10 and the second of them disagreed, so there is more here to find by
 running more of them.
 
+### An open disagreement, found 2026-09-11 and not explained
+
+```
+TC_SEED=20316344 TC_ROUNDS=1 TC_OPS=134     # 2 disagreements, 5 runs in 5
+TC_SEED=20316344 TC_ROUNDS=1 TC_OPS=133     # clean
+```
+
+It was round 8 of `TC_SEED=20260911`; the seed above puts that round first.
+
+**What happens.** Operation 132 is a `bulkWrite` whose middle operation is
+`{deleteOne: {_id: 1017}}`. Watching that document through the round with
+`TC_WATCH=1017` shows it inserted at operation 17 and present in all four views,
+then after operation 132: gone from the reference, gone from the fast tier, gone
+from a point read through the router — and **still live in the archive**, which
+is ordinary mirroring lag. At operation 133 the contents scan through the router
+returns it again, so the tiered side has 56 documents where the reference has 55.
+
+**Why it is not simply the freshness barrier giving up.** `stale_reads` is
+**zero** in all five runs. The barrier did not wait and then answer anyway,
+which is the documented trade and would have been counted and logged. It never
+waited at all.
+
+**The signature worth starting from:** the same router, an operation apart,
+disagrees with itself. A point read of `_id: 1017` says the document is not
+there while an unbounded scan returns it.
+
+**What has been ruled out.** A plain `deleteOne` is gated correctly, and so is
+the fuzzer's exact `bulkWrite` shape — three operations, unordered, delete in
+the middle — reproduced by hand against a collection whose reads all fall
+through to the archive: the count is right and the archive has caught up. So it
+is not the bulkWrite path on its own. The difference left is the fuzzer's
+fixture: half its documents are archive-only and its completeness claim says the
+fast tier is short, so reads **merge both tiers** rather than going to one. A
+document deleted from the fast tier and still live in the archive is exactly
+what the archive half of a merge would add back.
+
+**Do not assume it is the freshness barrier.** That was the first hypothesis
+here and the stale-read count refuted it.
+
 ### Two ways the comparison stopped meaning anything, both fixed 2026-09-10
 
 Four fresh seeds were run and one disagreed: 40 disagreements in a 150-operation
