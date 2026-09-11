@@ -235,7 +235,9 @@ oneRound() {
   # A disagreement is usually about state something earlier left behind, and the
   # report names only the operation that noticed.
   [ "${TC_TRACE:-0}" = "1" ] && echo "$OUT" | grep -E "^  (op|wait)$(printf '\t')"
-  echo "$OUT" | grep -E "^  HARNESS|^  txn$(printf '\t')|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
+  # VOID is in this list because a line nothing prints is a line nobody reads:
+  # the contents comparison stopping matters more than most of what is here.
+  echo "$OUT" | grep -E "^  HARNESS|^  VOID$(printf '\t')|^  txn$(printf '\t')|^DISAGREE|^REFUSAL|^STALE|^$(printf '\t')" | head -60
   # What the round actually compared, as shape=done/vacuous. A clean tally over
   # a grammar that never generated a shape is not evidence about that shape.
   echo "$OUT" | grep -m1 '^SHAPES ' | fold -w 150 | sed 's/^/  /'

@@ -125,43 +125,53 @@ sweep is for; exploring means passing `TC_SEED`. Four fresh seeds were run on
 2026-09-10 and the second of them disagreed, so there is more here to find by
 running more of them.
 
-### An open disagreement, found 2026-09-10 and not explained
+### Two ways the comparison stopped meaning anything, both fixed 2026-09-10
 
-```
-TC_SEED=800758 TC_ROUNDS=1 TC_OPS=75  bash /root/testfuzz.sh    # 3 disagreements
-TC_SEED=800758 TC_ROUNDS=1 TC_OPS=80  bash /root/testfuzz.sh    # 5, twice running
-TC_SEED=800758 TC_ROUNDS=1 TC_OPS=70  bash /root/testfuzz.sh    # clean
-```
+Four fresh seeds were run and one disagreed: 40 disagreements in a 150-operation
+round, all naming one document. Neither cause was the router. Both were the same
+shape -- the two collections legitimately stopped holding the same thing, and
+everything compared afterwards reported that difference over and over.
 
-That seed puts the failing round first; it was round 4 of `TC_SEED=777001`.
+**A multi-document write that fails has already applied some of it.** Seed
+800758 operation 68, `updateMany {$or: [{meta.score: {$mod: [1,0]}}, ...]}
+{$set: {n: 53}}`, with a unique partial index on `n`. Both sides returned
+`E11000 dup key: { n: 53 }`, so `ask` counted them as agreeing, which is right:
+the answers *are* the same. But `updateMany` stops at the first error and keeps
+what it has already done, and MongoDB does not specify the order it visits
+documents in, so the reference had stopped before document 44 and the tiered
+side had already written it.
 
-What is known. One document's `n` differs: the reference holds the value it was
-seeded with and **both tiers agree with each other** on a later one, so nothing
-is mis-tiered and no read is resolving across the tiers wrongly — the tiered
-side applied a write the reference did not, or the reference applied one the
-tiered side did not. Every disagreement after the first is an echo of that one
-document. It reproduces on `2a4fb8d`, so it is **not** something this session
-introduced, and the grammar has been generating these shapes for weeks: it took
-a new seed rather than new code.
+The round now ends there and says so. Skipping only the contents comparison was
+the first attempt and it was half a fix: once the collections differ, every
+*read* of them can differ too, and the same seed went on reporting 30
+`aggregate`, `find`, `countDocuments` and `distinct` disagreements instead.
 
-What has been ruled out. The transactions that run their body twice on the
-tiered side are not it: that is by design and the run at 70 operations does it
-seven times and agrees. The contents check after every write agreed up to the
-point the difference appears, which is what makes it hard — the write that
-diverges is one whose own answer agreed, so the two sides matched a different
-*set* of documents while returning the same counts.
+The cost is real and is printed rather than hidden: `VOID round stopped after 9
+of 150 operations`, four rounds in ten on that seed. Recovering it means keeping
+the generator from setting a constant onto a uniquely-indexed field across many
+documents, which is a change worth measuring rather than guessing at.
 
-Where to start. `$mod: [1, 0]` appears in the filter of the `updateMany` that
-sets that field, and it matches every numeric value, so both sides should match
-the document. Run with `TC_TRACE=1`, and note that the DISAGREE blocks are
-printed as an end-of-round summary rather than in sequence with the `op` lines,
-so their position says nothing about which operation caused them.
+**A refusal leaves the two index catalogs different, and that outlives it.** A
+TTL index on a tiered collection is refused by design; the untiered reference
+accepts it. Encoding the options in the index name, which is what the createIndex
+case does, stops two indexes on one key colliding under one name and does not
+help here: mongod refuses a later *equivalent* index under a **different** name
+with code 85. So the reference failed 85 where the tiered side built the index
+happily. The reference's catalog is realigned after a refusal now -- the
+reference only, because dropping an index through the router to make a
+comparison agree would hide whatever it was about to find.
 
-Each round prints one `SHAPES` line naming what it actually compared, as
-`shape=done/vacuous`. A shape missing from it was never generated, and a shape
-whose two numbers are equal compared nothing but error messages: both sides
-rejected every operation of that kind. A clean tally over a grammar that never
-generated a shape is not evidence about that shape.
+**What this cost, and the lesson worth keeping.** Most of a session, because the
+first thing it looks like is silent data divergence. Three things made it slow,
+and all three are about the harness rather than the product: `oneRound` filters
+the round's output, so a diagnostic line with a prefix of its own is generated
+and thrown away before anybody sees it (`VOID` had to be added to that filter,
+and `TC_TRACE` lines are the only ones that pass); the DISAGREE blocks print as
+an end-of-round summary, so their position says nothing about which operation
+caused them; and an operation whose own answer agreed is exactly the one that
+will not be reported, so the first disagreement you see is never the one that
+matters. Bisecting on `TC_OPS`, which is a prefix of the same generated stream,
+is what found it: 70 clean, 72 not.
 
 `TC_VIEWS=1` reads the same collections through views instead, and it is there
 because a view is the one way of naming a collection that nothing else in the

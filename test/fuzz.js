@@ -313,6 +313,14 @@ const refusals = [], bugs = [], stale = [];
 // exercised it only through operations both sides rejected, which compares the
 // error message and nothing else.
 const shapes = {};
+// The writes that touch more than one document, and so can stop half done. A
+// failed updateOne or replaceOne is one document and cannot.
+const MULTI_WRITE = /^(updateMany|deleteMany|bulkWrite|contents after (updateMany|deleteMany|bulkWrite))/;
+// Set when the two collections stop holding the same documents through no fault
+// of the router. Declared here with the rest of the run's state, and not beside
+// contentsMatch where it is explained, because ask reads it: a `let` further
+// down the file is in the temporal dead zone for anything that runs before it.
+let contentsVoid = null;
 function note(what, kind) {
   const t = shapes[what] || (shapes[what] = { n: 0, vacuous: 0 });
   t.n++;
@@ -331,7 +339,17 @@ function ask(what, op, fn, how) {
   const a = attempt(fn, REF), b = attempt(fn, TIER);
 
   if (!a.ok && !b.ok) {
-    if (a.code === b.code) { agreed++; note(what, 'vacuous'); return false; }
+    if (a.code === b.code) {
+      agreed++; note(what, 'vacuous');
+      // A write over many documents that failed has applied some of them, and
+      // which ones is not specified. See contentsVoid.
+      if (!contentsVoid && MULTI_WRITE.test(what)) {
+        contentsVoid = what + ' failed on both sides with ' + a.code;
+        print('  VOID\tcontents are no longer comparable: ' + contentsVoid +
+              ', which applies to some documents and stops');
+      }
+      return false;
+    }
     // Both failed differently. Only interesting when the tiered side is not
     // simply saying no.
     if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return false; }
@@ -526,7 +544,29 @@ function cmpTS(a, b) {
 // apply $pull to a non-array value", was correctly counted as agreed, and then
 // the contents comparison after it reported 45 disagreements across the rest of
 // the round. None of them was the router.
+// Whether the two collections can still be expected to hold the same documents.
+//
+// They cannot, after a multi-document write that failed on both sides. An
+// updateMany applies document by document and stops at the first error, keeping
+// what it has already done, and MongoDB does not specify the order it visits
+// them in. So both sides fail the same way -- the answers agree, and ask counts
+// that -- while a different subset of documents carries the change.
+//
+// Measured, and it is the reason this exists: seed 800758 operation 68,
+// `updateMany {$or: [{meta.score: {$mod: [1,0]}}, ...]} {$set: {n: 53}}`, with a
+// unique partial index on n. Both sides returned E11000 for `dup key: { n: 53 }`
+// and the reference had stopped before document 44 while the tiered side had
+// already written it. Every contents comparison for the rest of the round then
+// disagreed, 40 of them in a 150-operation round, all reporting the same
+// document and none of them a defect. It cost most of a session to chase.
+//
+// So the round ends there, loudly. Skipping only the contents comparison was
+// the first attempt and it was half a fix: once the two collections hold
+// different documents, every *read* of them can differ too, and the same seed
+// went on reporting aggregate, find, countDocuments and distinct disagreements
+// instead -- 30 in one round. Nothing compared after this point means anything.
 function contentsMatch(after, op) {
+  if (contentsVoid) { note(after, 'vacuous'); return; }
   ask(after, op, c => c.find({}).sort({ _id: 1 }).toArray(), 'seq');
 }
 
@@ -876,6 +916,33 @@ function oneOp(i) {
       // tiered side is a refusal, and one that fails on the tiered side alone
       // for another reason is a finding.
       const madeOK = ask('createIndex', op, c => c.createIndex(entry.spec, full), 'seq');
+      // A refusal leaves the two catalogs different, and that difference outlives
+      // the operation it came from.
+      //
+      // A TTL index on a tiered collection is refused by design -- it would
+      // delete the newest documents and keep the oldest -- and the untiered
+      // reference accepts it. Encoding the options in the name, above, stops two
+      // indexes on one key colliding under one name, and does not help here:
+      // mongod refuses a later *equivalent* index under a different name with
+      // code 85, "An equivalent index already exists with a different name and
+      // options". So the reference failed 85 where the tiered side built the
+      // index happily, and that was reported as a disagreement about the router.
+      // Measured on seed 840353, the last failure in an otherwise clean run.
+      //
+      // Only the reference is corrected, never the tiered side: the oracle is
+      // ours to keep in step, and dropping an index through the router to make a
+      // comparison agree would be hiding whatever it was about to find.
+      if (!madeOK) {
+        const onRef  = REF.getIndexes().some(i => i.name === name);
+        const onTier = TIER.getIndexes().some(i => i.name === name);
+        if (onRef && !onTier) {
+          try {
+            REF.dropIndex(name);
+            if (TRACE) print('  op\tcatalogs realigned: dropped ' + name + ' from the reference, ' +
+                             'which the tiered side refused');
+          } catch (e) { /* nothing to put back */ }
+        }
+      }
       // Only a name both sides now carry. A TTL index is refused on the tiered
       // collection and accepted on the untiered reference, so recording it
       // regardless left a later dropIndex succeeding on one side and answering
@@ -1057,12 +1124,20 @@ if (STREAM) {
   csRef.tryNext(); csTier.tryNext(); csDb.tryNext();
 }
 
+let ran = 0;
 for (let i = 0; i < OPS; i++) {
   try { oneOp(i); }
   catch (e) {
     // A generator that produced something mongosh itself cannot send is a
     // harness fault, not a finding, and it must not be silent.
     print('  HARNESS  op ' + i + ': ' + String(e.message || e).slice(0, 160));
+  }
+  ran++;
+  // The two collections no longer hold the same documents, so nothing after
+  // this compares anything. See contentsVoid.
+  if (contentsVoid) {
+    print('  VOID\tround stopped after ' + ran + ' of ' + OPS + ' operations');
+    break;
   }
 }
 
