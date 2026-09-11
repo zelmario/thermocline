@@ -109,15 +109,41 @@ chk "a point lookup does not find it"       "null" "$(R "print(db.getSiblingDB(p
 echo "== the same, in a tight write-then-read loop =="
 # One iteration is easy to pass by luck. Ten in a row with no pause is where a
 # read that does not wait for mirroring will show up.
-chk "ten write-then-read pairs all agree" "ok" "$(R "
+#
+# Judged against what the barrier actually promises, which is not "every write
+# is visible". It waits up to router.archive_wait for mirroring to reach the
+# archive and then answers anyway, counting a stale read and saying so at WARN.
+# That is the documented trade, and under a loaded sweep the feeder can be
+# behind by more than the budget: measured once in six sweeps, the router waited
+# its five seconds, admitted the stale read and warned, and this check called it
+# a failure. A suite that reports the design as a defect costs an investigation
+# every time the box is busy.
+#
+# So the contract is checked instead: a short answer is allowed only if the
+# router admitted it. Every missing write has to be matched by a stale read the
+# router counted; one that is not is the defect this check exists for, a read
+# answered early with nothing said. The loop counts rather than stopping at the
+# first, because the comparison is between two totals.
+staleReads() {
+  curl -s "http://127.0.0.1:$PDASH/api/snapshot" 2>/dev/null |
+    grep -oE '"stale_reads": *[0-9]+' | grep -oE '[0-9]+$'
+}
+SR0=$(staleReads)
+LOOP=$(R "
   const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  let missed = 0;
   for (let i = 200; i < 210; i++) {
     c.insertOne({_id:i, n:i, grp:'b'});
-    if (c.countDocuments({n:i}) !== 1) { print('missing write ' + i); quit(); }
+    if (c.countDocuments({n:i}) !== 1) missed++;
     c.deleteOne({_id:i});
-    if (c.countDocuments({n:i}) !== 0) { print('resurrected ' + i); quit(); }
+    if (c.countDocuments({n:i}) !== 0) missed++;
   }
-  print('ok');")"
+  print(missed);")
+SR1=$(staleReads)
+ADMITTED=$(( ${SR1:-0} - ${SR0:-0} ))
+echo "      ${LOOP:-?} of twenty reads were short, and the router admitted $ADMITTED stale read(s)"
+chk "every short answer was one the router admitted" "true" \
+    "$(awk -v m="${LOOP:-x}" -v a="$ADMITTED" 'BEGIN{print (m ~ /^[0-9]+$/ && m+0 <= a+0) ? "true" : "false"}')"
 
 echo "== deleting a document the fast tier does not hold =="
 # The delete that the barrier could not see. A deleteOne naming a document the
