@@ -397,6 +397,51 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== another deployment's bookkeeping, with one of MongoDB's own beside it =="
+# The exclusion above is for another Thermocline's bookkeeping database, which
+# must not be reported as an application's data: the advice that follows is to
+# tier it, and following it would mean tiering somebody's checkpoints.
+#
+# It is recognised by content, and the test was every collection in the
+# database being one this system writes. MongoDB's own collections are not, so
+# one of them appearing was enough to lose the exclusion. Profiling is all it
+# takes: system.profile is created the moment it is switched on, and the router
+# then names another deployment's checkpoints, watermarks and residency as
+# stranded application data. The same loop skips system collections four lines
+# further down, which is what makes this an inconsistency rather than a
+# judgement call.
+BKDB=${TC_LOSTDB}bk
+C "db.getSiblingDB('$BKDB').dropDatabase()" >/dev/null
+C "db.getSiblingDB('$BKDB').checkpoints.insertOne({_id:'other'});
+   db.getSiblingDB('$BKDB').watermarks.insertOne({_id:'other.ns'});
+   db.getSiblingDB('$BKDB').residency.insertOne({_id:'other.ns|1'})" >/dev/null
+rm -f $LOGDIR/bk_r.log
+cline router --config $CFG --log-file $LOGDIR/bk_r.log & BKP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $BKP 2>/dev/null; wait $BKP 2>/dev/null
+chk "plain bookkeeping is left alone"           "false" \
+    "$(grep -q "$BKDB" $LOGDIR/bk_r.log && echo true || echo false)"
+# Profiling on, which is the whole difference.
+C "db.getSiblingDB('$BKDB').setProfilingLevel(2)" >/dev/null
+chk "system.profile is there now"               "true" \
+    "$(C "print(db.getSiblingDB('$BKDB').getCollectionNames().indexOf('system.profile') >= 0)")"
+rm -f $LOGDIR/bk2_r.log
+cline router --config $CFG --log-file $LOGDIR/bk2_r.log & BKQ=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $BKQ 2>/dev/null; wait $BKQ 2>/dev/null
+chk "and it is still left alone once profiled"  "false" \
+    "$(grep -q "$BKDB" $LOGDIR/bk2_r.log && echo true || echo false)"
+C "db.getSiblingDB('$BKDB').setProfilingLevel(0)" >/dev/null
+C "db.getSiblingDB('$BKDB').dropDatabase()" >/dev/null
+
 echo "== a read preference on cold.uri, which does not do what it looks like =="
 # The natural thing to reach for when adopting a large cluster: during the
 # adoption most reads fall through to the archive, which is the production

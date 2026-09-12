@@ -104,6 +104,17 @@ func TestIsBookkeeping(t *testing.T) {
 		// collections an application cannot see.
 		{"application data beside a lookalike", []string{"checkpoints", "orders"}, false},
 		{"an empty database says nothing either way", nil, false},
+		// MongoDB's own collections belong to the server, not to a deployment.
+		// One of these appearing beside the bookkeeping used to turn the whole
+		// database into application data, and the advice that followed was to
+		// tier another deployment's checkpoints. Profiling is enough to put
+		// system.profile there.
+		{"bookkeeping that has been profiled", []string{"checkpoints", "residency", "system.profile"}, true},
+		{"bookkeeping with a view in it", []string{"watermarks", "system.views"}, true},
+		{"system collections alone are not bookkeeping", []string{"system.profile"}, false},
+		// Still false, because the application collection is still there: the
+		// system prefix must not become a way to smuggle one past.
+		{"application data beside a system collection", []string{"checkpoints", "orders", "system.profile"}, false},
 	}
 	for _, c := range cases {
 		if got := IsBookkeeping(c.colls); got != c.want {

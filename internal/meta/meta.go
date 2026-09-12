@@ -37,16 +37,30 @@ var bookkeepingCollections = map[string]bool{
 // It is recognised by content and not by name, because the name is whatever
 // somebody's meta.db said. An empty database is not bookkeeping: there is
 // nothing to go on, and nothing to warn about either.
+// MongoDB's own collections are not counted either way. They belong to the
+// server rather than to anybody's deployment, and one of them appearing beside
+// the bookkeeping turned the whole database into application data: profiling
+// writes system.profile, a view writes system.views, and every collection in
+// the database was then reported as an application's and an operator told to
+// tier another deployment's checkpoints. The caller's own loop skips system
+// collections four lines further down, for the same reason, and this is the one
+// place the list was not applied.
+//
+// A database holding nothing but system collections falls through to the empty
+// case, which says nothing either way, and that is right: there is no
+// bookkeeping in it to recognise.
 func IsBookkeeping(collections []string) bool {
-	if len(collections) == 0 {
-		return false
-	}
+	seen := 0
 	for _, c := range collections {
+		if strings.HasPrefix(c, "system.") {
+			continue
+		}
 		if !bookkeepingCollections[c] {
 			return false
 		}
+		seen++
 	}
-	return true
+	return seen > 0
 }
 
 // DB is the database holding all Thermocline bookkeeping. It lives on the cold
