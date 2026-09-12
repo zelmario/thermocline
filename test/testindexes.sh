@@ -754,6 +754,37 @@ H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$PNS'})" >/dev/null
 
+echo "== the same index name on two different key patterns =="
+# An index does its work by its keys, and a name is a label. mongod lets two
+# indexes on different keys share a name when the name is given explicitly, and
+# the report used to take a matching name as proof the index was there.
+#
+# Measured with idx_a on {customer: 1} on the fast tier and idx_a on
+# {unrelated: 1} on the archive: "the archive can answer anything the fast tier
+# can", over an archive with no index on customer at all. That is the whole
+# point of the command, reported backwards.
+KNS=tacct
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$KNS.createIndex({customer:1},{name:'idx_a'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$KNS.createIndex({unrelated:1},{name:'idx_a'})" >/dev/null
+KREP=$(cline indexes --config $CFG --ns $DB.$KNS 2>&1)
+chk "the archive is short the keys the fast tier has" "true" \
+    "$(echo "$KREP" | grep -A2 'missing from the archive' | grep -q '{customer: 1}' && echo true || echo false)"
+chk "and the fast tier the ones the archive has"      "true" \
+    "$(echo "$KREP" | grep -A2 'missing from the FAST TIER' | grep -q '{unrelated: 1}' && echo true || echo false)"
+chk "so the tiers are not called equivalent"          "false" \
+    "$(echo "$KREP" | grep -q 'the archive can answer anything the fast tier can' && echo true || echo false)"
+# The same keys under different names are the same index, and must stay quiet,
+# or every collection whose indexes were built by hand reports a difference.
+H "db.getSiblingDB(process.env.TC_DB).$KNS.dropIndex('idx_a')" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$KNS.createIndex({unrelated:1},{name:'named_differently'})" >/dev/null
+chk "the same keys under another name are the same index" "true" \
+    "$(cline indexes --config $CFG --ns $DB.$KNS 2>&1 | grep -q 'the archive can answer anything the fast tier can' && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$KNS.drop()" >/dev/null
+
 echo "== a collection dropped through the router has to be built again =="
 # The indexer records a namespace as done once the fast tier has the collection
 # and its indexes, and never asks again. A drop makes that untrue. Without being

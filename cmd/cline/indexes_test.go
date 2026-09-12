@@ -178,6 +178,51 @@ func TestAbsentFromIgnoresOptions(t *testing.T) {
 	cold := map[string]indexInfo{"email_1": idx("email_1", "{email: 1}", true)}
 	hot := map[string]indexInfo{"email_1": idx("email_1", "{email: 1}", false)}
 	if got := absentFrom(cold, hot); len(got) != 0 {
-		t.Fatalf("absentFrom reported %v; it matches on name and keys, not options", names(got))
+		t.Fatalf("absentFrom reported %v; it matches on keys, not options", names(got))
+	}
+}
+
+// An index does its work by its keys, so that is what "the same index" means
+// here. A name is a label, and mongod lets two indexes on different keys share
+// one when it is given explicitly.
+func TestAbsentFromMatchesKeysNotNames(t *testing.T) {
+	t.Run("the same name on different keys is a different index", func(t *testing.T) {
+		// Measured: idx_a on {customer: 1} on the fast tier and idx_a on
+		// {unrelated: 1} on the archive reported nothing, so a read falling
+		// through and filtering on customer scanned.
+		have := map[string]indexInfo{"idx_a": idx("idx_a", "{customer: 1}", false)}
+		want := map[string]indexInfo{"idx_a": idx("idx_a", "{unrelated: 1}", false)}
+		if got := absentFrom(have, want); !eq(names(got), "idx_a") {
+			t.Fatalf("got %v, want [idx_a]", names(got))
+		}
+	})
+	t.Run("a different name on the same keys is the same index", func(t *testing.T) {
+		have := map[string]indexInfo{"idx_a": idx("idx_a", "{customer: 1}", false)}
+		want := map[string]indexInfo{"whatever": idx("whatever", "{customer: 1}", false)}
+		if got := absentFrom(have, want); len(got) != 0 {
+			t.Fatalf("got %v, want none", names(got))
+		}
+	})
+	t.Run("the same name on the same keys is present", func(t *testing.T) {
+		have := map[string]indexInfo{"idx_a": idx("idx_a", "{customer: 1}", false)}
+		want := map[string]indexInfo{"idx_a": idx("idx_a", "{customer: 1}", false)}
+		if got := absentFrom(have, want); len(got) != 0 {
+			t.Fatalf("got %v, want none", names(got))
+		}
+	})
+}
+
+// A constraint whose keys the fast tier does not carry at all is absentFrom's
+// finding, not the lost-constraint one, however the names line up. Reporting it
+// in both places would print the same index twice under two headings that
+// contradict each other.
+func TestLostUniqueIgnoresANameCollision(t *testing.T) {
+	cold := map[string]indexInfo{"idx_a": idx("idx_a", "{code: 1}", true)}
+	hot := map[string]indexInfo{"idx_a": idx("idx_a", "{unrelated: 1}", true)}
+	if got := lostUniqueConstraints(cold, hot); len(got) != 0 {
+		t.Fatalf("got %v; the fast tier has no index on those keys, which absentFrom reports", names(got))
+	}
+	if got := absentFrom(cold, hot); !eq(names(got), "idx_a") {
+		t.Fatalf("absentFrom got %v, want [idx_a]", names(got))
 	}
 }

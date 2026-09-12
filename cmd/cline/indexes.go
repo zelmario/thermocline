@@ -513,29 +513,16 @@ func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
 		if c.name == "_id_" || !c.unique {
 			continue
 		}
-		if h, ok := hot[c.name]; ok {
-			if !h.enforcesSameAs(c) {
-				out = append(out, c)
-			}
-			continue
-		}
-		// No index of that name. absentFrom would still call it present when
-		// the key pattern matches one, so ask the same question of those: the
-		// constraint holds if any index on the same keys is unique.
-		var onKeys []indexInfo
-		for _, h := range hot {
-			if h.spec == c.spec {
-				onKeys = append(onKeys, h)
-			}
-		}
-		if len(onKeys) == 0 {
+		if _, ok := counterpartOf(c, hot); !ok {
 			// Genuinely missing, which is absentFrom's finding and already
 			// reported as "missing from the FAST TIER". Not this one's.
 			continue
 		}
+		// The counterpart is one index on those keys, and any index on them
+		// that enforces the same constraint is enough to hold it.
 		enforced := false
-		for _, h := range onKeys {
-			if h.enforcesSameAs(c) {
+		for _, h := range hot {
+			if h.spec == c.spec && h.enforcesSameAs(c) {
 				enforced = true
 				break
 			}
@@ -554,15 +541,7 @@ func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
 // The counterpart is found the same two ways lostUniqueConstraints finds it, by
 // name and then by key pattern, so the two always describe the same index.
 func whyNotEnforced(c indexInfo, hot map[string]indexInfo) string {
-	h, ok := hot[c.name]
-	if !ok {
-		for _, cand := range hot {
-			if cand.spec == c.spec {
-				h, ok = cand, true
-				break
-			}
-		}
-	}
+	h, ok := counterpartOf(c, hot)
 	if !ok {
 		return "the fast tier has no index on these keys"
 	}
@@ -593,21 +572,39 @@ func absentFrom(have, want map[string]indexInfo) []indexInfo {
 		if h.name == "_id_" {
 			continue
 		}
-		if _, ok := want[h.name]; ok {
-			continue
-		}
-		found := false
-		for _, w := range want {
-			if w.spec == h.spec {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if _, ok := counterpartOf(h, want); !ok {
 			out = append(out, h)
 		}
 	}
 	return out
+}
+
+// counterpartOf finds the index in want that is the same index as h.
+//
+// The same key pattern, whatever it is called: an index does its work by its
+// keys, and the same one under another name is still that one.
+//
+// The name on its own used to be enough, and it is not. mongod lets two indexes
+// on different keys share a name when the name is given explicitly, and an
+// index matched that way is a different index with the same label. Measured
+// with idx_a on {customer: 1} on the fast tier and idx_a on {unrelated: 1} on
+// the archive: the report said "the archive can answer anything the fast tier
+// can", over an archive that has no index on customer at all and scans for
+// every read that falls through and filters on it.
+//
+// The name is still worth preferring when both match, so that a collection
+// carrying two indexes on the same keys is compared against the one an operator
+// would say is the same one.
+func counterpartOf(h indexInfo, want map[string]indexInfo) (indexInfo, bool) {
+	if w, ok := want[h.name]; ok && w.spec == h.spec {
+		return w, true
+	}
+	for _, w := range want {
+		if w.spec == h.spec {
+			return w, true
+		}
+	}
+	return indexInfo{}, false
 }
 
 // indexesOf reads one collection's indexes from one tier.
