@@ -206,6 +206,28 @@ func unmirrorableKind(info bson.Raw) (kind, why string, namedOnly bool) {
 			"stores its documents in a system bucket collection, so what the change stream " +
 				"describes is not the collection the application reads", true
 	}
+	// A clustered collection with a TTL, which is the capped collection above
+	// wearing different clothes. mongod removes its own oldest documents,
+	// nothing announces those removals, so the rule that tells an eviction from
+	// an application delete calls them the application deleting and the archive
+	// tombstones the history it exists to keep.
+	//
+	// The clustering on its own is not refused, and that is deliberate. It is a
+	// storage decision about one tier; the documents are ordinary documents and
+	// mirroring them is ordinary work. The archive's copy is simply not
+	// clustered, which is the latitude a plain index already gets. Only the
+	// expiry destroys anything.
+	//
+	// Measured on PSMDB 8.0.26: twenty documents whose _id values were dates an
+	// hour old, in a collection created with expireAfterSeconds 1, were gone
+	// from the fast tier 45 seconds later.
+	if _, cerr := odoc.LookupErr("clusteredIndex"); cerr == nil {
+		if _, eerr := odoc.LookupErr("expireAfterSeconds"); eerr == nil {
+			return "a clustered collection with a TTL",
+				"removes its own oldest documents the way a capped collection does, and nothing " +
+					"announces those either, so the archive would record them as deletions", false
+		}
+	}
 	// Queryable encryption. The documents themselves would copy across as any
 	// other binary would, and that is what makes this worth refusing rather than
 	// leaving: what does not copy is the state that makes them searchable. mongod

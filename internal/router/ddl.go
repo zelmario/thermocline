@@ -62,7 +62,13 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 		return c.guardNewUniqueIndex(ctx, msg, cmd, db)
 
 	case "convertToCapped", "cloneCollectionAsCapped", "create":
-		return c.guardUnmirrorable(ctx, msg, cmd, db, name)
+		if out, done := c.guardUnmirrorable(ctx, msg, cmd, db, name); done {
+			return out, true
+		}
+		// After it, not before: a time series create carries expireAfterSeconds
+		// too, and the reason it is refused is the bucket collection rather
+		// than the expiry.
+		return c.guardTTL(ctx, msg, cmd, db, name)
 
 	case "mapReduce", "mapreduce":
 		coll, ok := stringField(cmd, name)
@@ -407,11 +413,20 @@ func (c *conn) guardTTL(ctx context.Context, msg *wire.Message, cmd bson.Raw, db
 		return nil, false
 	}
 
+	// Named the way the client spelled it. A clustered collection's TTL is not
+	// an index the client created, and telling somebody who sent a create that
+	// their TTL index is refused leaves them looking for an index they never
+	// asked for.
+	what := "a TTL index on " + ns
+	if _, err := cmd.LookupErr("expireAfterSeconds"); err == nil && (name == "create" || name == "collMod") {
+		what = "expireAfterSeconds on " + ns + ", which is a clustered collection's own TTL"
+	}
+
 	c.r.Stats.Refused.Add(1)
 	c.cls = ClassRefused
-	c.log.Warn("refused a TTL index on a tiered collection", "ns", ns, "command", name)
+	c.log.Warn("refused a TTL on a tiered collection", "ns", ns, "command", name, "as", what)
 	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-		"thermocline: refusing a TTL index on "+ns+", because it would delete the newest "+
+		"thermocline: refusing "+what+", because it would delete the newest "+
 			"documents and keep the oldest. This command reaches the fast tier, which holds "+
 			"only the recent part of "+ns+": those copies would expire and be recorded as "+
 			"deletions in the archive, while the older documents the rule is written for sit "+
@@ -424,9 +439,39 @@ func (c *conn) guardTTL(ctx context.Context, msg *wire.Message, cmd bson.Raw, db
 	return out, true
 }
 
-// asksForTTL reports whether a createIndexes or collMod would leave a TTL index
-// behind.
+// asksForTTL reports whether a create, createIndexes or collMod would leave a
+// TTL index behind.
+//
+// Three spellings, and the third is not an index in a list at all. A clustered
+// collection's TTL is a top-level expireAfterSeconds on the create that makes
+// it, and on any collMod that changes it afterwards, so a check that reads a
+// createIndexes command's `indexes` array and a collMod's `index` document
+// never sees it. mongod expires those documents exactly as it expires a capped
+// collection's oldest, and nothing announces either.
+//
+// Measured on PSMDB 8.0.26: a collection created with
+// {clusteredIndex: {key: {_id: 1}, unique: true}, expireAfterSeconds: 1} and
+// twenty documents whose _id values were dates an hour old was empty 45 seconds
+// later, with nothing else running.
 func asksForTTL(cmd bson.Raw, name string) bool {
+	if name == "create" || name == "collMod" {
+		if v, err := cmd.LookupErr("expireAfterSeconds"); err == nil {
+			// "off" removes the expiry rather than asking for one, and it is
+			// the command an operator needs to undo this on a collection that
+			// already has it. Refusing that would leave them with a tiered
+			// collection quietly expiring and no way through the router to
+			// stop it.
+			if sv, sok := v.StringValueOK(); sok && sv == "off" {
+				return false
+			}
+			return true
+		}
+	}
+	if name == "create" {
+		// Nothing else on a create can leave one behind: an index list is not
+		// part of the command.
+		return false
+	}
 	if name == "collMod" {
 		idx, err := cmd.LookupErr("index")
 		if err != nil {
@@ -488,7 +533,7 @@ func asksForTTL(cmd bson.Raw, name string) bool {
 // series, because create is otherwise an ordinary thing to send at a namespace
 // that already exists.
 func (c *conn) guardUnmirrorable(ctx context.Context, msg *wire.Message, cmd bson.Raw, db, name string) (*wire.Message, bool) {
-	coll, kind, ok := unmirrorableTarget(cmd, name)
+	coll, kind, why, ok := unmirrorableTarget(cmd, name)
 	if !ok {
 		return nil, false
 	}
@@ -502,13 +547,9 @@ func (c *conn) guardUnmirrorable(ctx context.Context, msg *wire.Message, cmd bso
 	c.log.Warn("refused a command that would make a tiered collection unmirrorable",
 		"ns", ns, "command", name, "kind", kind)
 	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-		"thermocline: refusing to make "+ns+" "+kind+", because the feeder cannot mirror one. "+
-			"A capped collection removes its own oldest documents when it fills and nothing "+
-			"announces those, so the archive would record them as deletions and lose the history "+
-			"it is there to keep; a time series collection keeps its documents in a system bucket "+
-			"collection, which is not what the change stream describes. The fast tier would also "+
-			"be truncated the moment this ran, and it holds documents the archive is still "+
-			"waiting for.")
+		"thermocline: refusing to make "+ns+" "+kind+", because the feeder cannot mirror one: "+
+			why+". The feeder refuses to start against one for the same reason, so this would "+
+			"stop mirroring for every namespace behind it as well.")
 	if rerr != nil {
 		return nil, false
 	}
@@ -516,31 +557,87 @@ func (c *conn) guardUnmirrorable(ctx context.Context, msg *wire.Message, cmd bso
 }
 
 // unmirrorableTarget names the collection a command would make unmirrorable,
-// and what it would become.
-func unmirrorableTarget(cmd bson.Raw, name string) (coll, kind string, ok bool) {
+// what it would become, and why that cannot be mirrored.
+//
+// The kinds are the feeder's, and they have to stay the feeder's. Its startup
+// check refuses five things and this used to refuse two of them, so a client
+// could make a tiered namespace into a third and the next feeder restart would
+// refuse to run at all, which stops mirroring for every namespace rather than
+// for the one somebody changed. The reachable shape is an adoption: create
+// fails with NamespaceExists once the fast tier holds the collection, and in an
+// adoption it does not hold it yet.
+//
+// Kept as prose here rather than shared with internal/feeder/collkind.go,
+// because the two answer different questions: that one reads a listCollections
+// entry describing what a collection *is*, this one reads a command describing
+// what one would *become*, and the fields are spelled differently in each.
+func unmirrorableTarget(cmd bson.Raw, name string) (coll, kind, why string, ok bool) {
+	const cappedWhy = "a capped collection removes its own oldest documents when it fills and " +
+		"nothing announces those, so the archive would record them as deletions and lose the " +
+		"history it is there to keep, and the fast tier would be truncated the moment this ran " +
+		"while it still holds documents the archive is waiting for"
 	switch name {
 	case "convertToCapped":
 		if v, vok := stringField(cmd, "convertToCapped"); vok {
-			return v, "a capped collection", true
+			return v, "a capped collection", cappedWhy, true
 		}
 	case "cloneCollectionAsCapped":
 		// The target is the new collection, not the one being read.
 		if v, vok := stringField(cmd, "toCollection"); vok {
-			return v, "a capped collection", true
+			return v, "a capped collection", cappedWhy, true
 		}
 	case "create":
 		v, vok := stringField(cmd, "create")
 		if !vok {
-			return "", "", false
+			return "", "", "", false
 		}
-		if capped, cok := cmd.Lookup("capped").BooleanOK(); cok && capped {
-			return v, "a capped collection", true
+		if safeBool(cmd.Lookup("capped")) {
+			return v, "a capped collection", cappedWhy, true
 		}
 		if _, terr := cmd.LookupErr("timeseries"); terr == nil {
-			return v, "a time series collection", true
+			return v, "a time series collection",
+				"a time series collection keeps its documents in a system bucket collection, " +
+					"which is not the collection the change stream describes", true
+		}
+		if _, eerr := cmd.LookupErr("encryptedFields"); eerr == nil {
+			return v, "encrypted with queryable encryption",
+				"the state that makes its fields searchable lives in companion enxcol_ " +
+					"collections that nothing here tiers, so the archive would hold the " +
+					"documents without it and an encrypted read that falls through would be " +
+					"answered from documents whose index state was never mirrored", true
+		}
+		if _, verr := cmd.LookupErr("viewOn"); verr == nil {
+			return v, "a view",
+				"a view holds no documents of its own, only a pipeline over another collection, " +
+					"so there is nothing to mirror and the collection it reads from is what " +
+					"wants tiering", true
 		}
 	}
-	return "", "", false
+	return "", "", "", false
+}
+
+// safeBool reads a flag the way mongod reads create's capped option.
+//
+// MongoDB declares that one safeBool in its IDL, which accepts a number as well
+// as a boolean and calls anything non-zero true. BooleanOK does not, so
+// {create: "orders", capped: 1, size: 4096} made a capped collection while this
+// guard read no boolean and let it through, which is the capped refusal
+// reopened by a type.
+//
+// Measured on PSMDB 8.0.26: capped as an int32 1, as a long 1 and as a double
+// 1.0 each created a capped collection. The same latitude is not offered
+// elsewhere and this must not be used as though it were: renameCollection's
+// dropTarget and an update's upsert are plain bools, and mongod refuses a
+// number for either with "the wrong type 'int', expected type 'bool'". A guard
+// that coerced those would be accepting commands the server never would.
+func safeBool(v bson.RawValue) bool {
+	if b, ok := v.BooleanOK(); ok {
+		return b
+	}
+	if n, ok := intOf64(v); ok {
+		return n != 0
+	}
+	return false
 }
 
 // pendingIndexDrop is a unique index the fast tier is being asked to drop,

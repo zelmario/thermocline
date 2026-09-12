@@ -456,6 +456,49 @@ Part of [Thermocline](../README.md).
   about it. If the drop was not deliberate, recreate the index and run
   `cline keys --rebuild`, which reports any duplicates that got in.
 
+- **`create` with `capped` written as a number was not refused, and mongod
+  accepts it.** MongoDB declares that option `safeBool` in its IDL, which takes a
+  number as well as a boolean and calls anything non-zero true. The router read
+  it as a boolean, found none, and forwarded the command, so the capped refusal
+  could be stepped around by spelling the flag differently.
+
+  Measured on PSMDB 8.0.26: `capped` as an int32 `1`, as a long `1` and as a
+  double `1.0` each created a capped collection. The same latitude is not offered
+  elsewhere, which is why the fix is narrow: `renameCollection`'s `dropTarget`
+  and an update's `upsert` are plain bools and mongod refuses a number for either
+  with "the wrong type 'int', expected type 'bool'". A guard that coerced those
+  would be turning down commands the server would never have run.
+
+- **A clustered collection cannot carry a TTL while it is tiered, and its
+  clustering does not reach the archive.** MongoDB 5.3+ lets a collection be
+  created with `clusteredIndex`, and such a collection can expire its own
+  documents through a top-level `expireAfterSeconds` rather than through a TTL
+  index. mongod then removes its own oldest documents exactly as a capped
+  collection does, nothing announces those removals, and the feeder reads them
+  as the application deleting.
+
+  Measured on PSMDB 8.0.26 before this was refused: twenty documents whose `_id`
+  values were dates an hour old, in a tiered collection created with
+  `expireAfterSeconds: 1`, mirrored to the archive as twenty live documents and
+  were gone from the fast tier 27 seconds later. The archive was then holding
+  **twenty tombstones and nothing live**, and the router answered `0`. That is
+  the capped collection's failure through a door neither check was looking at:
+  the router's TTL refusal reads a `createIndexes` command's `indexes` array and
+  a `collMod`'s `index` document, and this is neither.
+
+  Both spellings are refused now, on `create` and on `collMod`, and the feeder
+  refuses to start against a collection that already has one, and stops the same
+  way if one appears while it is running.
+  `collMod: {expireAfterSeconds: "off"}` is deliberately allowed through, because
+  it is what takes the expiry away.
+
+  **The clustering itself is not refused**, and that is a decision rather than an
+  oversight: the documents are ordinary documents, mirroring them is ordinary
+  work, and the archive's copy is simply not clustered. So `listIndexes` through
+  the router reports the fast tier's `_id_` index while the archive's copy has an
+  ordinary one, and a `hint` on the clustered index is not answerable on the
+  archive. That is the latitude a plain index already gets here.
+
 - **A collection of a kind that cannot be mirrored stops the feeder, whenever it
   appears.** Capped, time series and queryable-encryption collections are
   refused at startup, and the reasons are in `internal/feeder/collkind.go`: a

@@ -313,12 +313,78 @@ chk "and is not capped"                                  "false" \
     "$(H "const i=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$UNS'})[0]; print(!!(i&&i.options&&i.options.capped))")"
 chk "creating it capped in the first place is refused"   "true" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', capped:true, size:4096});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+# mongod declares create's capped option safeBool in its IDL, so a number is
+# accepted and anything non-zero is true. Measured on PSMDB 8.0.26: capped as an
+# int32 1, a long 1 and a double 1.0 each created a capped collection, while a
+# guard reading it as a boolean saw none and let the command through. That is
+# the refusal above reopened by a type.
+#
+# The same latitude is not offered elsewhere and this must not be generalised:
+# renameCollection's dropTarget and an update's upsert are plain bools, and
+# mongod refuses a number for either with "the wrong type 'int'".
+chk "and capped written as a number, which mongod takes" "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', capped:1, size:4096});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+chk "and as a double, which it also takes"               "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', capped:1.0, size:4096});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+# Zero is false in every spelling, and a create that says so is an ordinary one.
+chk "capped: 0 is an ordinary create"                    "accepted" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', capped:0});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
 chk "and as a time series collection too"                "true" \
-    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', timeseries:{timeField:'at'}});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', timeseries:{timeField:'at'}});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+# The feeder refuses five kinds of collection at startup and this used to refuse
+# two of them, so a client could make a tiered namespace into a third and the
+# next feeder restart would refuse to run at all, which stops mirroring for
+# every namespace rather than for the one somebody changed.
+#
+# The reachable shape is an adoption. create fails with NamespaceExists once the
+# fast tier holds the collection, and in an adoption it does not hold it yet:
+# the archive arrives carrying the application's collections and the fast tier
+# starts empty.
+# Each of these drops ${UNS}2 first. Without that, a create this guard lets
+# through leaves the collection behind as that kind, and every check after it
+# reports NamespaceExists rather than what it was asking about: measured against
+# the pre-fix binary, the collMod check came back "already exists, but with
+# different options: encryptedFields" from two checks earlier.
+chk "and encrypted with queryable encryption"            "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', encryptedFields:{fields:[]}});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+chk "and as a view at the tiered name"                   "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', viewOn:'$UNS'});print('false')}catch(e){print(/cannot mirror one/.test(e.message))}")"
+
+# A clustered collection can carry a TTL, and mongod then removes its own oldest
+# documents exactly as a capped collection does. It is written as a top-level
+# expireAfterSeconds rather than as an index in a list, so the TTL refusal that
+# reads a createIndexes command's `indexes` array and a collMod's `index`
+# document never saw it.
+#
+# Measured on PSMDB 8.0.26 against an untiered collection: twenty documents
+# whose _id values were dates an hour old, created with expireAfterSeconds 1,
+# were gone 45 seconds later with nothing else running.
+chk "a clustered collection's TTL is refused"            "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2',
+           clusteredIndex:{key:{_id:1},unique:true}, expireAfterSeconds:1});print('false')}catch(e){print(/clustered collection's own TTL/.test(e.message))}")"
+chk "and the same TTL added later by collMod"            "true" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', clusteredIndex:{key:{_id:1},unique:true}});
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'${UNS}2', expireAfterSeconds:1});print('false')}catch(e){print(/clustered collection's own TTL/.test(e.message))}")"
+# Clustering on its own is a storage decision about one tier. The documents are
+# ordinary documents, mirroring them is ordinary work, and the archive's copy
+# simply is not clustered. Refusing it would cost a shape that works.
+chk "clustering without a TTL is not refused"            "accepted" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2', clusteredIndex:{key:{_id:1},unique:true}});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+
 # The controls. create is an ordinary command and most of what it does is fine,
 # so a guard that refuses it wholesale would be worse than the bug.
 chk "an ordinary create on a tiered name is accepted"    "accepted" \
-    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+    "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
+          try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
 chk "and a capped collection nothing tiers is fine"      "accepted" \
     "$(R "db.getSiblingDB(process.env.TC_DB2).capfree.drop();
           try{db.getSiblingDB(process.env.TC_DB2).runCommand({create:'capfree', capped:true, size:4096});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
