@@ -762,40 +762,84 @@ func (r *Router) warnAboutLostConstraint(ctx context.Context, ns, db, coll strin
 	if cerr != nil || herr != nil {
 		return
 	}
-	var missing []string
-	for name := range cold {
-		if !hot[name] {
+	// Two lists: the ones the fast tier has no unique index for at all, and the
+	// ones it has under the same name enforcing something else. The second kind
+	// is worse, because the indexer repairs the first on the next start and
+	// leaves the second alone: an index of that name already exists.
+	var missing, differs []string
+	for name, enforces := range cold {
+		switch got, ok := hot[name]; {
+		case !ok:
 			missing = append(missing, name)
+		case got != enforces:
+			differs = append(differs, name)
 		}
 	}
-	if len(missing) == 0 {
-		return
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		r.log.Warn("the archive has a unique index the fast tier does not",
+			"ns", ns, "indexes", missing,
+			"meaning", "uniqueness is enforced from the fast tier's indexes, so a value this one "+
+				"refuses is accepted here and then refused by the archive, and that document stays "+
+				"on the fast tier alone",
+			"action", "build it on the fast tier, or drop it from the archive if the constraint is "+
+				"genuinely gone")
 	}
-	sort.Strings(missing)
-	r.log.Warn("the archive has a unique index the fast tier does not",
-		"ns", ns, "indexes", missing,
-		"meaning", "uniqueness is enforced from the fast tier's indexes, so a value this one "+
-			"refuses is accepted here and then refused by the archive, and that document stays "+
-			"on the fast tier alone",
-		"action", "build it on the fast tier, or drop it from the archive if the constraint is "+
-			"genuinely gone")
+	if len(differs) > 0 {
+		sort.Strings(differs)
+		r.log.Warn("a unique index enforces something different on each tier",
+			"ns", ns, "indexes", differs,
+			"meaning", "both tiers have it and both are unique, but a partial filter or a collation "+
+				"makes them cover different documents or treat different values as the same, and "+
+				"uniqueness is enforced from the fast tier's, so a value the archive refuses is "+
+				"accepted here and that document stays on the fast tier alone",
+			"action", "recreate the fast tier's copy with the archive's partial filter and "+
+				"collation, or change the archive's to match if the narrower one is what is wanted")
+	}
 }
 
-// uniqueIndexNames is the names of one collection's unique indexes.
-func uniqueIndexNames(ctx context.Context, client *mongo.Client, db, coll string) (map[string]bool, error) {
+// uniqueIndexNames maps each unique index's name to what it enforces.
+//
+// The value used to be a bool, which made the comparison above "does the fast
+// tier have a unique index of this name" and nothing more. unique on its own
+// does not say which documents a constraint covers: a partial filter narrows it
+// to the documents the filter matches, and a collation decides which values
+// count as the same. Two indexes that are both unique and differ in either
+// enforce different things, and the registry protects from the fast tier's.
+//
+// Measured with {code: 1} unique on both tiers, the archive's filtered to
+// {active: true} and the fast tier's to {active: true, vip: true}: two active
+// non-vip documents sharing a code were both accepted through the router, the
+// feeder logged the archive refusing the second, and afterwards the fast tier
+// held two and the archive one. Nothing warned, here or in `cline indexes`,
+// because both names were present and both were unique.
+//
+// Compared as written rather than for meaning, so {active: true} and
+// {active: {$eq: true}} warn when they need not. That is the safe direction: a
+// warning costs a look and silence costs the document.
+func uniqueIndexNames(ctx context.Context, client *mongo.Client, db, coll string) (map[string]string, error) {
 	cur, err := client.Database(db).Collection(coll).Indexes().List(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-	out := map[string]bool{}
+	out := map[string]string{}
 	for cur.Next(ctx) {
 		if unique, ok := cur.Current.Lookup("unique").BooleanOK(); !ok || !unique {
 			continue
 		}
-		if name, ok := cur.Current.Lookup("name").StringValueOK(); ok {
-			out[name] = true
+		name, ok := cur.Current.Lookup("name").StringValueOK()
+		if !ok {
+			continue
 		}
+		enforces := "unique"
+		if v, lerr := cur.Current.LookupErr("partialFilterExpression"); lerr == nil {
+			enforces += " partial=" + v.String()
+		}
+		if v, lerr := cur.Current.LookupErr("collation"); lerr == nil {
+			enforces += " collation=" + v.String()
+		}
+		out[name] = enforces
 	}
 	return out, cur.Err()
 }

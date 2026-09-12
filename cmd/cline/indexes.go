@@ -67,6 +67,32 @@ type indexInfo struct {
 	// spec is the readable form and is not always valid JavaScript, because an
 	// index on a nested path has a dot in its field name.
 	keyJSON string
+	// partial and collation are the rest of what a unique index enforces, kept
+	// as the raw extended JSON so two tiers' copies can be compared.
+	//
+	// unique alone does not say which documents a constraint covers. A partial
+	// filter narrows it to the documents the filter matches, and a collation
+	// decides which values count as the same. Two indexes that are both unique
+	// and differ in either enforce different things, and the fast tier's is the
+	// one the router protects from. Measured with {code: 1} unique on both
+	// tiers, the archive's filtered to {active: true} and the fast tier's to
+	// {active: true, vip: true}: two active non-vip documents sharing a code
+	// were both accepted, the archive refused the second, and it was left on
+	// the fast tier alone.
+	partial   string
+	collation string
+}
+
+// enforcesSameAs reports whether two unique indexes cover the same documents
+// and treat the same values as equal.
+//
+// Compared as written rather than for meaning, because a filter is an arbitrary
+// expression and deciding whether two of them select the same documents is not
+// something this can do. So {active: true} and {active: {$eq: true}} are
+// reported as different when they are not. That is the safe direction for a
+// report: it errs towards telling the operator to look.
+func (i indexInfo) enforcesSameAs(o indexInfo) bool {
+	return i.unique == o.unique && i.partial == o.partial && i.collation == o.collation
 }
 
 func runIndexes(args []string) error {
@@ -205,17 +231,18 @@ func runIndexes(args []string) error {
 		// is different: the index is there and has to be rebuilt with unique
 		// rather than created from nothing.
 		if len(lost) > 0 {
-			fmt.Printf("  the FAST TIER carries these WITHOUT unique, and the archive with it:\n")
+			fmt.Printf("  the archive enforces these and the FAST TIER does not, or not the same way:\n")
 			for _, m := range lost {
-				fmt.Printf("    %-34s %s\n", m.name, m.spec)
+				fmt.Printf("    %-34s %s   (%s)\n", m.name, m.spec, whyNotEnforced(m, hotIdx))
 			}
 			fmt.Printf("  the constraint is not being enforced anywhere: the router protects the\n" +
 				"  values the FAST TIER's unique indexes name, so it accepts a duplicate, and\n" +
 				"  the archive then refuses the copy. That document stays on the fast tier\n" +
 				"  alone and the evictor will not remove it. The index exists, so the indexer\n" +
 				"  does not rebuild it either.\n" +
-				"  Drop it on the fast tier and recreate it with unique, or drop it from the\n" +
-				"  archive if the constraint is genuinely gone.\n")
+				"  Drop the fast tier's copy and recreate it the way the archive has it, with\n" +
+				"  the same unique, partial filter and collation, or change the archive's if\n" +
+				"  the narrower constraint is the one that is wanted.\n")
 			lostTotal += len(lost)
 		}
 
@@ -487,7 +514,7 @@ func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
 			continue
 		}
 		if h, ok := hot[c.name]; ok {
-			if !h.unique {
+			if !h.enforcesSameAs(c) {
 				out = append(out, c)
 			}
 			continue
@@ -508,7 +535,7 @@ func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
 		}
 		enforced := false
 		for _, h := range onKeys {
-			if h.unique {
+			if h.enforcesSameAs(c) {
 				enforced = true
 				break
 			}
@@ -519,6 +546,41 @@ func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
+}
+
+// whyNotEnforced says which part of the archive's constraint the fast tier's
+// copy does not carry, in the words the operator needs to fix it.
+//
+// The counterpart is found the same two ways lostUniqueConstraints finds it, by
+// name and then by key pattern, so the two always describe the same index.
+func whyNotEnforced(c indexInfo, hot map[string]indexInfo) string {
+	h, ok := hot[c.name]
+	if !ok {
+		for _, cand := range hot {
+			if cand.spec == c.spec {
+				h, ok = cand, true
+				break
+			}
+		}
+	}
+	if !ok {
+		return "the fast tier has no index on these keys"
+	}
+	switch {
+	case !h.unique:
+		return "the fast tier's copy is not unique"
+	case h.partial != c.partial:
+		if h.partial == "" {
+			return "the archive's is limited to " + c.partial + " and the fast tier's covers every document"
+		}
+		if c.partial == "" {
+			return "the fast tier's is limited to " + h.partial + " and the archive's covers every document"
+		}
+		return "archive " + c.partial + " against fast tier " + h.partial
+	case h.collation != c.collation:
+		return "the two copies collate differently, so they disagree on which values are the same"
+	}
+	return "the fast tier's copy does not enforce the same constraint"
 }
 
 // absentFrom returns the indexes in have that want does not carry.
@@ -569,6 +631,15 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 		info := indexInfo{name: name, spec: keyPattern(raw), keyJSON: keyPatternJSON(raw)}
 		if u, ok := raw.Lookup("unique").BooleanOK(); ok && u {
 			info.unique = true
+		}
+		if v, err := raw.LookupErr("partialFilterExpression"); err == nil {
+			info.partial = v.String()
+		}
+		if v, err := raw.LookupErr("collation"); err == nil {
+			// mongod fills a collation in with every default it applies, so
+			// two copies created the same way compare equal and one created
+			// differently does not.
+			info.collation = v.String()
 		}
 		if v, err := raw.LookupErr("expireAfterSeconds"); err == nil {
 			info.ttl = true

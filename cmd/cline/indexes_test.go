@@ -107,6 +107,46 @@ func TestLostUniqueConstraints(t *testing.T) {
 			want: nil,
 		},
 		{
+			// Both unique, and still not the same constraint. The archive
+			// protects every active document and the fast tier only the active
+			// ones that are also vip, so the router accepts a duplicate the
+			// archive then refuses. Measured: both inserts accepted, fast tier
+			// held two and the archive one.
+			name: "both unique, the fast tier's filter is narrower",
+			cold: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				partial: `{"active":true}`}},
+			hot: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				partial: `{"active":true,"vip":true}`}},
+			want: []string{"code_u"},
+		},
+		{
+			name: "both unique with the same filter is nothing to report",
+			cold: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				partial: `{"active":true}`}},
+			hot: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				partial: `{"active":true}`}},
+			want: nil,
+		},
+		{
+			// A filter on one side and none on the other is the same gap in
+			// whichever direction it runs: the two cover different documents.
+			name: "a filter on the archive only",
+			cold: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				partial: `{"active":true}`}},
+			hot:  map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true}},
+			want: []string{"code_u"},
+		},
+		{
+			// Which values collide is part of the constraint too: under
+			// strength 2 'A' and 'a' are the same key and under the default
+			// they are not.
+			name: "both unique, collating differently",
+			cold: map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true,
+				collation: `{"locale":"en","strength":2}`}},
+			hot:  map[string]indexInfo{"code_u": {name: "code_u", spec: "{code: 1}", unique: true}},
+			want: []string{"code_u"},
+		},
+		{
 			// Sorted, so the report reads the same way twice running: a map
 			// range would order these differently on each call.
 			name: "several are reported in name order",

@@ -674,7 +674,7 @@ func (c *conn) noteIndexDrop(ctx context.Context, cmd bson.Raw, db, coll string)
 			for n := range unique {
 				names = append(names, n)
 			}
-		} else if unique[name] {
+		} else if _, ok := unique[name]; ok {
 			names = append(names, name)
 		}
 	case bson.TypeArray:
@@ -683,7 +683,10 @@ func (c *conn) noteIndexDrop(ctx context.Context, cmd bson.Raw, db, coll string)
 			return
 		}
 		for _, e := range vals {
-			if name, ok := e.StringValueOK(); ok && unique[name] {
+			if name, sok := e.StringValueOK(); sok {
+				if _, uok := unique[name]; !uok {
+					continue
+				}
 				names = append(names, name)
 			}
 		}

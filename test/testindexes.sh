@@ -684,7 +684,7 @@ chk "same name on both tiers, unique on the archive only" "true/false" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$UNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")/$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")"
 UREP=$(cline indexes --config $CFG --ns $DB.$UNS 2>&1)
 chk "cline indexes names the index"                "true" \
-    "$(echo "$UREP" | grep -q 'WITHOUT unique' && echo true || echo false)"
+    "$(echo "$UREP" | grep -q "the fast tier's copy is not unique" && echo true || echo false)"
 chk "and does not call the tiers equivalent"       "false" \
     "$(echo "$UREP" | grep -q 'the archive can answer anything the fast tier can' && echo true || echo false)"
 rm -f $LOGDIR/lostu.log
@@ -704,6 +704,55 @@ kill $URP 2>/dev/null; wait $URP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$UNS'})" >/dev/null
+
+echo "== both tiers unique, and still not the same constraint =="
+# The case that was missed in both places, which is the one worth the most.
+# unique on its own does not say which documents a constraint covers: a partial
+# filter narrows it to the documents the filter matches, and a collation decides
+# which values count as the same. Both tiers carrying a unique index of the same
+# name was treated as agreement by `cline indexes` and by the router's
+# warnAboutLostConstraint alike.
+#
+# Measured with {code: 1} unique on both tiers, the archive's filtered to
+# {active: true} and the fast tier's to {active: true, vip: true}: two active
+# non-vip documents sharing a code were both accepted through the router, the
+# feeder logged the archive refusing the second, and afterwards the fast tier
+# held two and the archive one. Nothing warned anywhere.
+PNS=tacct
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$PNS'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.createIndex({code:1},{unique:true,name:'code_u',partialFilterExpression:{active:true}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$PNS.createIndex({code:1},{unique:true,name:'code_u',partialFilterExpression:{active:true,vip:true}})" >/dev/null
+chk "both tiers carry a unique index of that name"  "true/true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$PNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")/$(H "print(db.getSiblingDB(process.env.TC_DB).$PNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")"
+PREP=$(cline indexes --config $CFG --ns $DB.$PNS 2>&1)
+chk "cline indexes still names it"                  "true" \
+    "$(echo "$PREP" | grep -q 'not the same way' && echo true || echo false)"
+chk "and names both filters"                        "true" \
+    "$(echo "$PREP" | grep -q 'against fast tier' && echo true || echo false)"
+rm -f $LOGDIR/pdrift.log
+cline router --config $CFG --log-file $LOGDIR/pdrift.log >/dev/null 2>&1 & PRP=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+chk "the router says so too"                        "true" \
+    "$(grep -qE "a unique index enforces something different on each tier.*ns=$DB.$PNS" $LOGDIR/pdrift.log && echo true || echo false)"
+kill $PRP 2>/dev/null; wait $PRP 2>/dev/null
+# And the same filter on both must be quiet, or the warning is noise on every
+# start and nobody reads it.
+H "db.getSiblingDB(process.env.TC_DB).$PNS.dropIndex('code_u');
+   db.getSiblingDB(process.env.TC_DB).$PNS.createIndex({code:1},{unique:true,name:'code_u',partialFilterExpression:{active:true}})" >/dev/null
+chk "and says nothing once the filters match"       "false" \
+    "$(cline indexes --config $CFG --ns $DB.$PNS 2>&1 | grep -q 'not the same way' && echo true || echo false)"
+rm -f $LOGDIR/pdrift2.log
+cline router --config $CFG --log-file $LOGDIR/pdrift2.log >/dev/null 2>&1 & PRQ=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+chk "nor does the router"                           "0" \
+    "$(grep -c "a unique index enforces something different on each tier" $LOGDIR/pdrift2.log || true)"
+kill $PRQ 2>/dev/null; wait $PRQ 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$PNS'})" >/dev/null
 
 echo "== a collection dropped through the router has to be built again =="
 # The indexer records a namespace as done once the fast tier has the collection
