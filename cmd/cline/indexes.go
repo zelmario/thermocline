@@ -274,6 +274,19 @@ func runIndexes(args []string) error {
 			if len(bare) == 0 && len(expiring) == 0 && len(lost) == 0 {
 				fmt.Printf("  the archive can answer anything the fast tier can\n")
 			}
+			// The fast tier's own missing indexes still have to reach
+			// --commands. This returned early and dropped them, so the
+			// commands for the fast tier were printed only when the archive
+			// happened to be missing something too.
+			//
+			// That is backwards for the shape this is for. On an adoption the
+			// existing cluster becomes the archive carrying every index the
+			// application has, so there is nothing missing from it, and the
+			// fast tier is the new and empty one. Exactly then, --commands
+			// printed nothing at all for the tier that needs all of them.
+			if len(bare) > 0 {
+				toCreate = append(toCreate, nsMissing{ns: ns, bare: bare})
+			}
 			fmt.Print("\n")
 			continue
 		}
@@ -323,6 +336,15 @@ func runIndexes(args []string) error {
 	if missingTotal == 0 {
 		if lostTotal == 0 {
 			fmt.Println("Every index the fast tier has, the archive has too.")
+		}
+		// The same early exit as the per-namespace one above, one level up, and
+		// it dropped the same half. The verdict here is about what the ARCHIVE
+		// is missing, and returning on it took the fast tier's commands with
+		// it: on an adoption, where the archive is missing nothing and the fast
+		// tier is missing everything, --commands printed the report and then
+		// no commands at all.
+		if *commands {
+			printCreateCommands(toCreate)
 		}
 		return nil
 	}
@@ -432,6 +454,22 @@ func printCreateCommands(groups []nsMissing) {
 			if m.unique {
 				opts += ", unique: true"
 			}
+			// The partial filter and the collation come along with unique, and
+			// leaving them off was worse than leaving off unique would have
+			// been. A unique index on {code: 1} limited to {active: true} was
+			// emitted as a plain unique index on {code: 1}, which is a
+			// different and stricter constraint: the build fails outright when
+			// the collection holds two inactive documents sharing a code, and
+			// when it succeeds the fast tier then refuses writes the archive
+			// accepts. An application that worked before the adoption stops
+			// working after it, which is the one thing this system promises not
+			// to do, and the advice to do it came from here.
+			if m.partial != "" {
+				opts += ", partialFilterExpression: " + m.partial
+			}
+			if m.collation != "" {
+				opts += ", collation: " + m.collation
+			}
 			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, %s})\n",
 				db, coll, m.keyJSON, opts)
 		}
@@ -457,8 +495,23 @@ data would reach into the tier that exists to keep it.
 				printed = true
 			}
 			db, coll := splitNamespace(g.ns)
-			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, {name: %q})\n",
-				db, coll, m.keyJSON, m.name)
+			// unique is left off here on purpose and these two are not, which
+			// is not a contradiction: unique is a constraint and these say
+			// which documents the index covers and how its values compare. An
+			// index built without the collation does not serve a query that
+			// uses one, so the fallback read scans anyway and the storage buys
+			// nothing; one built without the partial filter covers the whole
+			// collection, which is more of the storage the tiering exists to
+			// save than the operator agreed to.
+			opts := fmt.Sprintf("{name: %q", m.name)
+			if m.partial != "" {
+				opts += ", partialFilterExpression: " + m.partial
+			}
+			if m.collation != "" {
+				opts += ", collation: " + m.collation
+			}
+			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, %s})\n",
+				db, coll, m.keyJSON, opts)
 		}
 	}
 	if !printed {
@@ -579,6 +632,31 @@ func absentFrom(have, want map[string]indexInfo) []indexInfo {
 	return out
 }
 
+// extJSON renders one value the way a command can take it back.
+//
+// Relaxed rather than canonical, and that is the whole point of it being a
+// function. RawValue.String() is canonical extended JSON, which writes an int
+// as {"$numberInt":"2"}, and mongod will not read its own output back:
+// createIndex answered "BSON field 'collation.strength' is the wrong type
+// 'object', expected types '[long, int, double, decimal]'" for a collation
+// copied straight out of listIndexes. Relaxed writes it as 2.
+//
+// Not every value survives the round trip even so. A date in a partial filter
+// is {"$date": ...} in both forms and is not a Date when pasted into a shell,
+// so a filter carrying one produces a command that has to be edited. The
+// alternative is printing nothing, which is what this did before.
+func extJSON(v bson.RawValue) string {
+	doc, ok := v.DocumentOK()
+	if !ok {
+		return v.String()
+	}
+	b, err := bson.MarshalExtJSON(doc, false, false)
+	if err != nil {
+		return v.String()
+	}
+	return string(b)
+}
+
 // counterpartOf finds the index in want that is the same index as h.
 //
 // The same key pattern, whatever it is called: an index does its work by its
@@ -630,13 +708,13 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 			info.unique = true
 		}
 		if v, err := raw.LookupErr("partialFilterExpression"); err == nil {
-			info.partial = v.String()
+			info.partial = extJSON(v)
 		}
 		if v, err := raw.LookupErr("collation"); err == nil {
 			// mongod fills a collation in with every default it applies, so
 			// two copies created the same way compare equal and one created
 			// differently does not.
-			info.collation = v.String()
+			info.collation = extJSON(v)
 		}
 		if v, err := raw.LookupErr("expireAfterSeconds"); err == nil {
 			info.ttl = true

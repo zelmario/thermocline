@@ -754,6 +754,53 @@ H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$PNS'})" >/dev/null
 
+echo "== the command offered for a partial unique index rebuilds it whole =="
+# --commands emitted {name, unique} and nothing else, so a unique index the
+# archive limits to {active: true} was offered as a plain unique index on the
+# same keys. That is a different and stricter constraint. The build fails
+# outright when the collection holds two inactive documents sharing a code, and
+# when it succeeds the fast tier refuses writes the archive accepts, which is an
+# application that worked before the adoption and does not after.
+#
+# Checked by running what it prints, the way the archive's own section does: the
+# proof is that the report goes quiet afterwards, because the two copies now
+# enforce the same thing.
+ENS=tacct
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.createIndex({code:1},{unique:true,name:'code_u',partialFilterExpression:{active:true}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$ENS')" >/dev/null
+# The documents that make the difference bite: two sharing a code, neither
+# active, which the archive's partial index allows and a full unique one does not.
+H "db.getSiblingDB(process.env.TC_DB).$ENS.insertMany([{_id:1,code:'d',active:false},{_id:2,code:'d',active:false}])" >/dev/null
+ECMD=$(cline indexes --config $CFG --ns $DB.$ENS --commands 2>&1 | grep 'createIndex(' | grep 'code_u')
+chk "the command carries the partial filter"       "true" \
+    "$(grep -q 'partialFilterExpression' <<<"$ECMD" && echo true || echo false)"
+mongosh "$HOT" --quiet --eval "$ECMD" >/dev/null 2>&1
+chk "and it builds on documents a full one refuses" "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ENS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
+chk "the rebuilt copy enforces the same constraint" "false" \
+    "$(cline indexes --config $CFG --ns $DB.$ENS 2>&1 | grep -q 'not the same way' && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+# The collation half, which is the riskier one to emit: listIndexes reports a
+# collation with every default mongod filled in, version included, and that
+# whole document is what gets pasted back into createIndex. Whether mongod
+# accepts its own output is not something to assume.
+C "db.getSiblingDB(process.env.TC_DB).$ENS.createIndex({code:1},{unique:true,name:'code_c',collation:{locale:'en',strength:2}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$ENS')" >/dev/null
+CCMD=$(cline indexes --config $CFG --ns $DB.$ENS --commands 2>&1 | grep 'createIndex(' | grep 'code_c')
+chk "the command carries the collation"            "true" \
+    "$(grep -q 'collation' <<<"$CCMD" && echo true || echo false)"
+mongosh "$HOT" --quiet --eval "$CCMD" >/dev/null 2>&1
+chk "mongod accepts the collation it reported"     "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ENS.getIndexes().some(function (i) { return i.name === 'code_c' }))")"
+chk "and the two copies then agree"                "false" \
+    "$(cline indexes --config $CFG --ns $DB.$ENS 2>&1 | grep -q 'not the same way' && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+
 echo "== the same index name on two different key patterns =="
 # An index does its work by its keys, and a name is a label. mongod lets two
 # indexes on different keys share a name when the name is given explicitly, and
