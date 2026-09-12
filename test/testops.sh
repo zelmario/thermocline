@@ -257,9 +257,27 @@ chk "and with the one nothing was copied up for"       "5" \
 # The other half, and the reason only one field moves: bytes on disk are a
 # per-tier fact. The router's storage figures must still be the fast tier's, so
 # an operator sizing one reads its own number and not two clusters added up.
+#
+# Bracketed rather than compared to one reading, because storageSize is a
+# physical number and the two calls are not one instant. WiredTiger allocates
+# and checkpoints on its own schedule, and under a parallel sweep the gap
+# between these is long enough for it: measured on 2026-09-12, the router
+# answered 8192 and the fast tier answered 12288 a moment later, and the check
+# reported the router summing two clusters when it had done nothing of the kind.
+#
+# So the fast tier is asked on both sides of the router's call and the router's
+# answer has to fall between them. That is the contract -- the number is the
+# fast tier's own -- and it is what can be held still. The archive's is printed
+# with a failure, because the mistake this guards against would show up as the
+# sum of the two.
+DBSZ_H1=$(H "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
 DBSZ_R=$(R "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
-DBSZ_H=$(H "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
-chk "storageSize is the fast tier's, unchanged"        "$DBSZ_H" "$DBSZ_R"
+DBSZ_H2=$(H "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)")
+DBSZ_LO=$(( DBSZ_H1 < DBSZ_H2 ? DBSZ_H1 : DBSZ_H2 ))
+DBSZ_HI=$(( DBSZ_H1 > DBSZ_H2 ? DBSZ_H1 : DBSZ_H2 ))
+chk "storageSize is the fast tier's, not the two added up" "true" \
+    "$([ "$DBSZ_R" -ge "$DBSZ_LO" ] && [ "$DBSZ_R" -le "$DBSZ_HI" ] 2>/dev/null && echo true \
+       || echo "false (router $DBSZ_R, fast tier $DBSZ_LO..$DBSZ_HI, archive $(C "print(db.getSiblingDB(process.env.TC_DB3).stats().storageSize)"))")"
 H "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB3).dropDatabase()" >/dev/null
 
