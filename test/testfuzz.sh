@@ -472,6 +472,159 @@ chk "strict: nothing refused"      "0" "${4:-none}"
 chk "strict: no disagreement"      "0" "${8:-none}"
 
 echo
+echo "== a claim partway through the data, where the bound decides =="
+# The branch the other sections never reach.
+#
+# A completeness claim is only ever consulted against a bound read out of the
+# query, by lowerTimeBound, and the answer decides whether the fast tier
+# answers alone or the read falls through. Every section above puts the claim at
+# one extreme or the other: complete-from 2030 means no bound is ever inside it,
+# complete-all means every bound is, and the churn section claims from now while
+# every document is dated 2024, so a generated bound is always outside again. In
+# none of them does the bound decide anything.
+#
+# So here the tiers are split BY THE AGE FIELD rather than by _id: every
+# document is in the archive, and only those dated on or after the cutoff are on
+# the fast tier. The claim is that cutoff, and it is true. A generated filter
+# bounded at or after it is answered by the fast tier alone and has to match the
+# untiered reference anyway; one bounded before it has to fall through and be
+# whole. The reference holds all sixty throughout, so it is the oracle either
+# way.
+#
+# Reads only. A write copies documents up, which fills the fast tier and papers
+# over exactly the divergence this arranges, the same reason the negative
+# control above is read-only.
+BOUNDNS=$WDIR/fuzz_bound.yaml
+SPLIT=2024-07-01T00:00:00Z
+stopDaemons
+# The router has to be told which field the namespace ages by, or it reads no
+# bound at all and this section is the first one under another name. An eviction
+# rule is what says so; no evictor is started, so nothing acts on it.
+awk '
+  /^evictor:/ { inev = 1 }
+  /^warmer:/  { inev = 0 }
+  { print }
+  inev && /^  rules:/ && !done {
+    print "    - ns: \"'"$DB"'.tcfuzz\""
+    print "      older_than: 40m"
+    print "      date_field: \"when\""
+    done = 1
+  }
+' $CFG > $BOUNDNS
+grep -q "$DB.tcfuzz" $BOUNDNS || { echo "  FATAL  the bound config carries no rule"; exit 2; }
+
+BSEED=$(mongosh "$HOT" --quiet --eval "
+  const hot  = db.getSiblingDB(process.env.TC_DB);
+  const cold = Mongo(process.env.TC_COLD).getDB(process.env.TC_DB);
+  function mkIndexes(c) {
+    c.createIndex({n:1}); c.createIndex({grp:1}); c.createIndex({when:1});
+    c.createIndex({'meta.score':1}); c.createIndex({tags:1});
+  }
+  const all  = $DOCS;
+  const split = new Date('$SPLIT');
+  hot.tcref.drop(); hot.tcfuzz.drop(); cold.tcfuzz.drop();
+  hot.tcref.insertMany(all);
+  // Everything in the archive, and on the fast tier only what the claim covers.
+  cold.tcfuzz.bulkWrite(
+    all.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
+    {ordered:false});
+  const inside = all.filter(d => d.when >= split);
+  if (inside.length) hot.tcfuzz.insertMany(inside);
+  // The same optional field the other sections give them, on both sides, so a
+  // predicate on it means here what it means everywhere else in this file.
+  hot.tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
+  hot.tcfuzz.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
+  cold.tcfuzz.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
+  mkIndexes(hot.tcref); mkIndexes(hot.tcfuzz); mkIndexes(cold.tcfuzz);
+  print(inside.length + '/' + all.length);
+" 2>&1 | tail -1)
+echo "  the fast tier holds $BSEED of them, the ones the claim covers"
+startRouterWith() {
+  cline router --config "$1" --log-file $LOGDIR/fuzz_bound_r.log &
+  for _ in $(seq 1 30); do
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "  FATAL  the router never came up on $PORT"; exit 2
+}
+# The claim is written before the router starts, not after.
+#
+# A router caches a claim for watermark.ClaimCacheTTL, five seconds, and the
+# section before this one leaves complete-all standing. Writing the new claim
+# under a running router and reading straight away means the first seconds of
+# the run are answered against the old one, which says the fast tier holds
+# everything: measured that way, 26 of 40 operations disagreed, every one of
+# them an unbounded read coming back with the fast tier's thirty instead of
+# sixty. The router was right and the section was asking before it had changed
+# the thing it was asking about. See the claim cache note in
+# internal/watermark.
+cline watermark --config $BOUNDNS --ns $DB.tcfuzz --complete-from $SPLIT --force >/dev/null 2>&1
+startRouterWith $BOUNDNS
+chk "the claim was recorded"           "$SPLIT" \
+    "$(C "const m=db.getSiblingDB(process.env.TC_META).watermarks.findOne({_id:process.env.TC_DB+'.tcfuzz'});
+          print(m && m.completeFrom ? m.completeFrom.toISOString().replace('.000','') : 'none')")"
+# The precondition the section rests on: the claim has to be true, or a
+# disagreement below is the seed's fault rather than the router's.
+chk "the claim is true of the two tiers" "0" \
+    "$(C "const split=new Date('$SPLIT');
+          const c=db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({when:{\$gte:split},_tcDeletedAt:{\$exists:false}});
+          const h=Mongo(process.env.TC_HOT).getDB(process.env.TC_DB).tcfuzz.countDocuments({when:{\$gte:split}});
+          print(c-h)")"
+# The question this section exists for, asked directly as well as generated.
+#
+# The generated operations are worth having and are not enough on their own: 600
+# of them over three seeds, against a claim proved false below, reported no
+# disagreement at all, because a predicate on the age field has to survive into
+# a shape the router will read a bound from, and most generated ones do not. So
+# the decisive question is also asked by hand, and the control below shows it
+# can fail.
+# Two bounds, and which side of the claim each falls on is the whole point.
+#
+# September is inside the claim, so the fast tier answers it alone: that is the
+# branch no other section reaches, and the answer still has to be whole.
+# March is outside it, so the read has to fall through and come back whole from
+# the archive.
+INQ='{when:{$gte:new Date("2024-09-01")}}'
+OUTQ='{when:{$gte:new Date("2024-03-01")}}'
+ask()  { R "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments($1))"; }
+ref()  { R "print(db.getSiblingDB(process.env.TC_DB).tcref.countDocuments($1))"; }
+chk "a bound inside the claim is answered whole"    "$(ref "$INQ")"  "$(ask "$INQ")"
+chk "a bound before it falls through and is whole"  "$(ref "$OUTQ")" "$(ask "$OUTQ")"
+
+# The negative control, and the reason to believe either of those.
+#
+# The claim is moved back to a January the fast tier cannot support, which makes
+# it simply false. March is now inside it, so the router answers that one from
+# the fast tier alone and it has to come back short. Without this both checks
+# above would pass against a router that never consults a claim at all.
+#
+# The wait is watermark.ClaimCacheTTL. A router caches a claim for five seconds,
+# so asking sooner asks the old one, which is what made this section report 26
+# disagreements against a router that was right.
+#
+# --force because the command refuses a claim the counts contradict, which is
+# that guard working; this section means to record it anyway.
+cline watermark --config $BOUNDNS --ns $DB.tcfuzz --complete-from 2024-01-01T00:00:00Z --force >/dev/null 2>&1
+sleep 7
+FALSE_ANS=$(ask "$OUTQ"); TRUE_ANS=$(ref "$OUTQ")
+chk "a false claim is seen to answer short"         "short" \
+    "$([ "${FALSE_ANS:-0}" -lt "${TRUE_ANS:-0}" ] 2>/dev/null && echo short || echo "not short ($FALSE_ANS of $TRUE_ANS)")"
+cline watermark --config $BOUNDNS --ns $DB.tcfuzz --complete-from $SPLIT --force >/dev/null 2>&1
+sleep 7
+chk "and the true claim answers it whole again"     "$(ref "$OUTQ")" "$(ask "$OUTQ")"
+
+BOUT=$(TC_SEED=$((SEED0+7)) TC_OPS=$OPS TC_READONLY=1 TC_NO_FEEDER=1 mongosh --port $PORT -u dba -p secret \
+         --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
+echo "$BOUT" | grep -E '^  HARNESS|^DISAGREE|^\t' | head -40
+BLINE=$(echo "$BOUT" | grep -m1 '^AGREED ')
+echo "  $BLINE"
+set -- $BLINE
+TA=$((TA+${2:-0})); TR=$((TR+${4:-0})); TS=$((TS+${6:-0})); TD=$((TD+${8:-0}))
+chk "a mid-range claim: no disagreement" "0" "${8:-none}"
+stopDaemons
+
+echo
 echo "== totals =="
 echo "  agreed $TA   refused $TR   settled on a retry $TS   disagreed $TD"
 stopDaemons

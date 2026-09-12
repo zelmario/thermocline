@@ -48,6 +48,9 @@ const TRACE = process.env.TC_TRACE === '1';
 // the oldest. Generating one there would make that section fail for the guard
 // working.
 const NO_TTL = process.env.TC_NO_TTL === '1';
+// Set by a section that seeds both tiers itself and runs no feeder. See
+// waitForMirroring.
+const NO_FEEDER = process.env.TC_NO_FEEDER === '1';
 // Compare what a change stream on each collection delivered for the round's own
 // writes. Off by default because it holds two cursors open for the whole round.
 const STREAM = process.env.TC_STREAM === '1';
@@ -565,6 +568,13 @@ const META = process.env.TC_META || '_thermocline';
 // Bounded, and it falls back to the old sleep when the runner did not pass an
 // archive address, because a comparison that hangs is its own kind of useless.
 function waitForMirroring() {
+  // TC_NO_FEEDER says the two tiers were seeded directly and no feeder is
+  // running, so there is no mirroring to wait for. Without it this waits the
+  // full thirty seconds for a position that will never move and then warns that
+  // the disagreements below may be the feeder, which is the one caveat that
+  // must not be printed when it cannot be true: a warning on every round is a
+  // warning nobody reads, and this one would discount a real disagreement.
+  if (NO_FEEDER) { if (TRACE) print('  wait\tno feeder in this section, nothing to wait for'); return; }
   if (!COLD) { if (TRACE) print('  wait\tno TC_COLD, sleeping 1500ms'); sleep(1500); return; }
 
   const target = clusterTimeNow();
