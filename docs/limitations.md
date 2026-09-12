@@ -326,6 +326,28 @@ Part of [Thermocline](../README.md).
   here. Ask `countDocuments({field: {$exists: false}})` for that, which is a
   logical fact and is correct through the router.
 
+- **A filter written with `$expr` never bounds a query, so it is always answered
+  by the archive.** The router decides whether the fast tier can answer a read
+  alone by reading a lower bound out of the filter, in the dimension the
+  namespace ages by. It reads that bound from the age field's own predicate:
+  `{createdAt: {$gte: T}}` and the `$and` and `$or` forms around it.
+  `{$expr: {$gte: ["$createdAt", T]}}` says the same thing to mongod and nothing
+  to this, because the field name is an argument inside an expression rather
+  than a key in the filter.
+
+  Nothing wrong is returned. The query reaches the archive and comes back whole,
+  which is the safe direction, and the cost is the whole optimisation for that
+  query: on a large archive that is the difference between seeking and scanning.
+  Measured against `lowerTimeBound` directly, plain and nested inside `$and`:
+  neither is bounded.
+
+  Write the bound as an ordinary predicate where the query allows it. `$expr` is
+  needed to compare two fields of the same document, and a comparison against a
+  constant is not that. Closing it properly means reading `$expr` arguments of
+  the shape `["$field", constant]`, which is a narrow case of an expression
+  language this does not otherwise parse, and it has not been worth it against
+  rewriting the query.
+
 - **A claim declared by hand past the counting budget is recorded unchecked.**
   `cline watermark --complete-all` says the fast tier holds every document there
   is, and recording one it does not have makes every unbounded read answer short

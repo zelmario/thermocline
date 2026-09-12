@@ -1,16 +1,16 @@
 #!/bin/bash
-# The alert rules in the README, checked against a real Prometheus.
+# The alert rules in docs/monitoring.md, checked against a real Prometheus.
 #
 # This one runs on the HOST, like testchaos and testtls, because it needs a
 # Prometheus and the router's metrics endpoint at the same time.
 #
 #   bash test/testalerts.sh
 #
-# Why it exists. The README carries eleven alert rules and they were written
+# Why it exists. docs/monitoring.md carries eleven alert rules and they were written
 # down and never run. That is a strange thing to leave unproved: the rules are
 # what an operator is told to trust, and a rule that does not fire is
 # indistinguishable from a system with nothing wrong. The failure modes are all
-# quiet ones. A metric renamed in the exporter and not in the README. A label
+# quiet ones. A metric renamed in the exporter and not in the document. A label
 # selector that matches nothing. A PromQL typo. None of them shows up until the
 # night an alert should have paged somebody and did not.
 #
