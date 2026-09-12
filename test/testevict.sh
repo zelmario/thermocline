@@ -314,28 +314,63 @@ chkv "both tiers hold all forty"                    "40" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
 chkv "and the router answers forty"                 "40" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
-# The evictor runs from here rather than from inside mongosh, which cannot start
-# a process. The cursor below waits on the fast tier's own count instead of
-# sleeping for a guess.
-cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_cursor.log & CEVP=$!
+# The evictor runs from the shell rather than from inside mongosh, which cannot
+# start a process, and it starts only once the cursor says it is open.
+#
+# It used to start first and sweep every two seconds, which is a race the shell
+# could not see. mongosh takes a second or three to reach the first batch and
+# longer under a parallel sweep, so a sweep could land before there was a cursor
+# at all: the claim was already narrow when the query arrived, the router sent it
+# to the archive, and the answer came back whole and unrefused from a cursor
+# eviction never touched. That is the right answer to a different question, and
+# it was reported as the guard failing. Seen twice under contention, delivering
+# 40 of 40 with the evictor's log showing the watermark already raised.
+#
+# So the cursor opens the gate and the shell sweeps behind it. The wait below is
+# still on the fast tier's own count rather than a sleep.
+GATE=evgate
 export TC_HOT="$HOT"
-CUROUT=$(R "
+openGate() { # $1 marker, $2 evictor log; echoes the evictor's pid
+  H "db.getSiblingDB(process.env.TC_DB).$GATE.deleteMany({_id:'$1'})" >/dev/null
+}
+waitGate() { # $1 marker
+  for _ in $(seq 1 60); do
+    [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$GATE.countDocuments({_id:'$1'}))")" = "1" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+openGate find
+CUROUT_F=$LOGDIR/ev_cursor.out
+( R "
   const c = db.getSiblingDB(process.env.TC_DB).$CNS;
   const cur = c.find({}).sort({_id:1}).batchSize(3);
   let first = 0;
   for (let i=0;i<3 && cur.hasNext();i++) { cur.next(); first++; }
   const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  const before = hot.$CNS.countDocuments({});
+  // The cursor is open and the first batch is in hand: sweep now.
+  hot.$GATE.insertOne({_id:'find'});
   for (let i=0;i<60 && hot.$CNS.countDocuments({}) > 10; i++) sleep(500);
   const left = hot.$CNS.countDocuments({});
   let got = first, refused = false;
   try { while (cur.hasNext()) { cur.next(); got++; } }
   catch (e) { refused = /^thermocline:/.test(String(e.message)); }
-  print(left + '/' + got + '/' + refused);")
+  print(before + '/' + left + '/' + got + '/' + refused);" > "$CUROUT_F" ) & CURPID=$!
+waitGate find
+cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_cursor.log & CEVP=$!
+wait $CURPID
 kill $CEVP 2>/dev/null; wait $CEVP 2>/dev/null
-echo "  the fast tier was left with $(echo "$CUROUT" | cut -d/ -f1), the cursor delivered $(echo "$CUROUT" | cut -d/ -f2)"
+CUROUT=$(tail -1 "$CUROUT_F")
+CUR_BEFORE=$(echo "$CUROUT" | cut -d/ -f1)
+echo "  the fast tier held $CUR_BEFORE when the cursor opened and $(echo "$CUROUT" | cut -d/ -f2) after, and the cursor delivered $(echo "$CUROUT" | cut -d/ -f3)"
+# The precondition the rest of the section rests on, asserted rather than
+# assumed: there is no cursor to protect if the sweep got there first.
+chkv "the cursor opened while the fast tier still held them" "true" \
+    "$([ "$CUR_BEFORE" -gt 10 ] 2>/dev/null && echo true || echo false)"
 chkv "the sweep did empty the fast tier"            "true" \
-    "$([ "$(echo "$CUROUT" | cut -d/ -f1)" -lt 10 ] 2>/dev/null && echo true || echo false)"
-chkv "the getMore is refused, not answered short"   "true" "$(echo "$CUROUT" | cut -d/ -f3)"
+    "$([ "$(echo "$CUROUT" | cut -d/ -f2)" -lt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "the getMore is refused, not answered short"   "true" "$(echo "$CUROUT" | cut -d/ -f4)"
 # And the remedy the refusal names has to work.
 chkv "re-running the query answers in full"         "40" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.find({}).sort({_id:1}).batchSize(3).itcount())")"
@@ -387,24 +422,53 @@ chkv "both tiers hold all forty"                    "40" \
 # whole, and a thermocline field on it says the opposite.
 chkv "and the fast tier is what will answer it"     "false" \
     "$(R "print(!!db.getSiblingDB(process.env.TC_DB).$CNS.explain().aggregate([{\$sort:{_id:1}}]).thermocline)")"
-cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_aggcursor.log & AEVP=$!
-AGGOUT=$(R "
+openGate agg
+AGGOUT_F=$LOGDIR/ev_aggcursor.out
+( R "
   const c = db.getSiblingDB(process.env.TC_DB).$CNS;
   const cur = c.aggregate([{\$sort:{_id:1}}], {cursor:{batchSize:3}});
   let first = 0;
   for (let i=0;i<3 && cur.hasNext();i++) { cur.next(); first++; }
   const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  // What the fast tier holds with the cursor open and the first batch in hand.
+  //
+  // The evictor was started from the shell just above, and mongosh takes a
+  // second or three to get this far. Under a parallel sweep it takes longer
+  // than the two the evictor pauses for, so the sweep can finish before the
+  // cursor is opened at all: the claim is already narrow, the router sends the
+  // aggregation to the archive, and it comes back whole and unrefused from a
+  // cursor eviction never touched. That is the right answer to a different
+  // question, and it was reported as the guard failing.
+  //
+  // Measured under contention twice: 40 delivered and no refusal, with the
+  // evictor's log showing one sweep and the watermark already raised. Printed
+  // here so the run says which question it answered.
+  const before = hot.$CNS.countDocuments({});
+  hot.$GATE.insertOne({_id:'agg'});
   for (let i=0;i<60 && hot.$CNS.countDocuments({}) > 10; i++) sleep(500);
   const left = hot.$CNS.countDocuments({});
   let got = first, refused = false;
   try { while (cur.hasNext()) { cur.next(); got++; } }
   catch (e) { refused = /^thermocline:/.test(String(e.message)); }
-  print(left + '/' + got + '/' + refused);")
+  print(before + '/' + left + '/' + got + '/' + refused);" > "$AGGOUT_F" ) & AGGPID=$!
+waitGate agg
+cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_aggcursor.log & AEVP=$!
+wait $AGGPID
 kill $AEVP 2>/dev/null; wait $AEVP 2>/dev/null
-echo "  the fast tier was left with $(echo "$AGGOUT" | cut -d/ -f1), the aggregation delivered $(echo "$AGGOUT" | cut -d/ -f2)"
+AGGOUT=$(tail -1 "$AGGOUT_F")
+AGG_BEFORE=$(echo "$AGGOUT" | cut -d/ -f1)
+AGG_LEFT=$(echo "$AGGOUT" | cut -d/ -f2)
+AGG_GOT=$(echo "$AGGOUT" | cut -d/ -f3)
+AGG_REFUSED=$(echo "$AGGOUT" | cut -d/ -f4)
+echo "  the fast tier held $AGG_BEFORE when the cursor opened and $AGG_LEFT after, and the aggregation delivered $AGG_GOT"
+# The precondition, asserted rather than assumed. Everything below is about a
+# cursor the fast tier was answering when it was opened, and if the sweep got
+# there first there is no such cursor and nothing to say about it.
+chkv "the cursor opened while the fast tier still held them" "true" \
+    "$([ "$AGG_BEFORE" -gt 10 ] 2>/dev/null && echo true || echo false)"
 chkv "the sweep did empty the fast tier"            "true" \
-    "$([ "$(echo "$AGGOUT" | cut -d/ -f1)" -lt 10 ] 2>/dev/null && echo true || echo false)"
-chkv "the aggregation getMore is refused too"       "true" "$(echo "$AGGOUT" | cut -d/ -f3)"
+    "$([ "$AGG_LEFT" -lt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "the aggregation getMore is refused too"       "true" "$AGG_REFUSED"
 chkv "re-running the aggregation answers in full"   "40" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.aggregate([{\$sort:{_id:1}}],{cursor:{batchSize:3}}).itcount())")"
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
