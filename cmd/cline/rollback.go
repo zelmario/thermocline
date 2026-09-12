@@ -208,6 +208,27 @@ func splitNS(ns string) (db, coll string) {
 	return db, coll
 }
 
+// isBookkeepingDB reports whether a database is Thermocline's own rather than
+// the application's, for the three listings that must leave it alone.
+//
+// Both spellings, and that is the point. The configured one comes from
+// meta.db, which config.Load has already applied to meta.DB by the time any of
+// this runs, and a deployment sharing one pair of tiers with another sets it to
+// something of its own. The default is kept beside it because the other
+// deployment on those tiers may be the one that never set it, and because the
+// parallel test sweep gives each worker its own _thermocline_wN.
+//
+// It used to read `HasPrefix(db, meta.DefaultDB) || HasPrefix(db, "_thermocline")`,
+// which is the same literal twice: meta.DefaultDB is "_thermocline". The
+// comment beside it said "the configured bookkeeping database and the default
+// one", so the intention was written down and only the default was implemented.
+// A deployment with meta.db set to anything not starting with "_thermocline"
+// had its own bookkeeping listed as application data by rollback, which is the
+// command that reads the archive back out as the application's cluster.
+func isBookkeepingDB(db string) bool {
+	return strings.HasPrefix(db, meta.DB) || strings.HasPrefix(db, meta.DefaultDB)
+}
+
 // archiveNamespaces lists every collection the archive holds, for the
 // configuration that tiers all of them.
 //
@@ -225,7 +246,7 @@ func archiveNamespaces(ctx context.Context, cold *mongo.Client) ([]string, error
 		case "admin", "local", "config":
 			continue
 		}
-		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+		if isBookkeepingDB(db) {
 			continue
 		}
 		cur, lerr := cold.Database(db).ListCollections(ctx, bson.D{{Key: "type", Value: "collection"}})
@@ -398,7 +419,7 @@ func collectionsIn(ctx context.Context, client *mongo.Client) (map[string]bool, 
 		case "admin", "local", "config":
 			continue
 		}
-		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+		if isBookkeepingDB(db) {
 			continue
 		}
 		names, lerr := client.Database(db).ListCollectionNames(ctx,
@@ -488,9 +509,7 @@ func viewsIn(ctx context.Context, client *mongo.Client) (map[string]bool, error)
 		case "admin", "local", "config":
 			continue
 		}
-		// The same two spellings archiveNamespaces skips: the configured
-		// bookkeeping database and the default one.
-		if strings.HasPrefix(db, meta.DefaultDB) || strings.HasPrefix(db, "_thermocline") {
+		if isBookkeepingDB(db) {
 			continue
 		}
 		names, lerr := client.Database(db).ListCollectionNames(ctx,

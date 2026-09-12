@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zelmario/thermocline/internal/meta"
+)
 
 // The report's two questions about one index, asked without a cluster.
 //
@@ -224,5 +228,33 @@ func TestLostUniqueIgnoresANameCollision(t *testing.T) {
 	}
 	if got := absentFrom(cold, hot); !eq(names(got), "idx_a") {
 		t.Fatalf("absentFrom got %v, want [idx_a]", names(got))
+	}
+}
+
+// rollback leaves Thermocline's own bookkeeping out of the three listings it
+// makes of the archive. Both spellings have to be left out, and only one of
+// them was: the test read meta.DefaultDB and the literal "_thermocline", which
+// are the same string, so a deployment that set meta.db to anything else had
+// its bookkeeping listed as the application's data.
+func TestIsBookkeepingDB(t *testing.T) {
+	saved := meta.DB
+	defer func() { meta.DB = saved }()
+
+	meta.DB = "bookkeeping"
+	for _, db := range []string{"bookkeeping", "_thermocline", "_thermocline_w0", "bookkeeping_two"} {
+		if !isBookkeepingDB(db) {
+			t.Errorf("with meta.db=bookkeeping: %q should be left alone", db)
+		}
+	}
+	for _, db := range []string{"shop", "warehouse", "books"} {
+		if isBookkeepingDB(db) {
+			t.Errorf("with meta.db=bookkeeping: %q is the application's", db)
+		}
+	}
+
+	// The default deployment, which is the case that already worked.
+	meta.DB = meta.DefaultDB
+	if !isBookkeepingDB("_thermocline") || isBookkeepingDB("shop") {
+		t.Errorf("the default spelling stopped working")
 	}
 }
