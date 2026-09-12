@@ -143,6 +143,11 @@ sweep is for; exploring means passing `TC_SEED`. Four fresh seeds were run on
 2026-09-10 and the second of them disagreed, so there is more here to find by
 running more of them.
 
+Of those four, `4242424` and `90210` were left unrun because the driver was
+stopped to chase the one that failed. Both were run on 2026-09-12 at
+`TC_ROUNDS=4 TC_OPS=150`: 28 checks each, no failures, no disagreements in eight
+rounds apiece, and no round voided.
+
 ### A disagreement whose explanation was withdrawn, 2026-09-12
 
 ```
@@ -173,9 +178,17 @@ at operation 132.
 
 **The seed no longer disagrees.** Six runs in six agreed on an idle machine, at
 the same commit the failure was seen on. It was five in five when it was found,
-which says the difference is in the machine rather than in the code, and the
-first suspect is mirroring lag: a busy box puts the feeder behind and an idle
-one does not.
+so the difference is in the machine rather than in the code, and mirroring lag
+was the obvious suspect: a busy box puts the feeder behind and an idle one does
+not.
+
+**That suspect is refuted too.** The round was run four more times with a writer
+putting the feeder 6 to 16 seconds behind on another tiered collection, which is
+measured rather than assumed: the position is read and printed before each
+round. All four agreed, and the watch line reads `mirrored` equal to `fast` at
+the operations in question every time. The round paces itself slowly enough that
+the feeder catches up between operations, so the lag at the start of a round
+never reaches the operation that matters.
 
 **The contract it was supposed to have broken holds.** Re-running a seed that
 has stopped failing proves nothing either way, so the claim was asked directly
@@ -189,9 +202,14 @@ came back unadmitted, and a scan and a point read never once disagreed**, which
 was the signature the write-up was named for.
 
 **What is left.** Two disagreements were seen, and nothing here explains them.
-The seed is kept above because it is still the only lead, and because a
-disagreement that stops reproducing when the machine goes quiet is worth trying
-again under load. What is gone is the explanation, not the observation.
+Ten runs of that round have now agreed: six on an idle machine and four under
+measured lag. The seed is kept above because it is the only record of the
+observation, not because it is still a lead. What is gone is the explanation; what remains is two numbers nobody can
+account for.
+
+`TC_WATCH` prints the feeder's published cluster time beside the fast tier's own
+now, so the next time something like this comes up, "the barrier did not wait"
+is a thing to read off the line rather than infer from a counter.
 
 **Three things to take from it.** A printer that renders two different states
 the same way will be believed. `stale_reads` at zero is evidence about the
