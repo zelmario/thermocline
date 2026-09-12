@@ -88,6 +88,33 @@ ok "bad --complete-from rejected"       1 "RFC3339"           -- cline watermark
 ok "--count-for is accepted"            0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all --count-for 5s
 ok "a nonsense duration is refused"     2 ""                  -- cline watermark --config $CFG --ns tc.probe --complete-all --count-for banana
 ok "--complete-from sets"               0 "newer than"        -- cline watermark --config $CFG --ns tc.probe --complete-from 2026-01-01T00:00:00Z
+# A window that selects nothing is not the tiers agreeing, and it used to print
+# as though it were: checkClaim says nothing when the counts bear the claim out,
+# and nothing was also what it said when neither tier held a document in the
+# window. The operator reads silence as "checked".
+#
+# tintid is the plain way to reach it. Its rule carries no date_field, so the
+# age comes from the _id timestamp and the window is {_id: {$gte: ObjectId(T)}};
+# the documents carry integer _ids, MongoDB brackets the predicate by type, and
+# an integer is never in that range however many there are. Both tiers count
+# nought while the collection is not empty at all.
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop();
+   db.getSiblingDB(process.env.TC_DB).tintid.insertMany([{_id:1,n:'a'},{_id:2,n:'b'}])" >/dev/null 2>&1
+ok "a window that selects nothing says so" 0 "bear out nothing" \
+   -- cline watermark --config $CFG --ns $DB.tintid --complete-from 2026-01-01T00:00:00Z
+# The control, on the same two documents: --complete-all counts the whole
+# collection rather than a window, so the counts do bear something out and the
+# note must not appear. Without this the check above passes on a command that
+# prints it every time.
+ALLOUT=$(cline watermark --config $CFG --ns $DB.tintid --complete-all 2>&1)
+if grep -q "bear out nothing" <<<"$ALLOUT"; then
+  FAIL=$((FAIL+1)); FAILED+=("the note is not printed when the counts do say something")
+  echo "  FAIL  the note is not printed when the counts do say something"
+else
+  PASS=$((PASS+1)); echo "  PASS  the note is not printed when the counts do say something"
+fi
+mongosh "$HOTU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
+cline watermark --config $CFG --ns $DB.tintid --clear >/dev/null 2>&1
 ok "--complete-all sets"                0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all
 ok "--clear withdraws"                  0 "withdrew"          -- cline watermark --config $CFG --ns tc.probe --clear
 ok "--clear again is not an error"      0 "no claim"          -- cline watermark --config $CFG --ns tc.probe --clear

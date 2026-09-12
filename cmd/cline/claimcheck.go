@@ -96,6 +96,35 @@ func checkClaim(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
 		return "", unchecked("the fast tier", ns, err)
 	}
 
+	// Nothing on either side is not agreement, and it printed as agreement:
+	// checkClaim says nothing when the counts bear the claim out, and nothing
+	// is also what it said when the window selected no documents at all. The
+	// operator reads silence as "checked".
+	//
+	// It is reachable without anything being wrong. A namespace aged by the _id
+	// timestamp whose documents carry integer _ids is the plain case: the window
+	// is {_id: {$gte: ObjectId(from)}}, MongoDB brackets it by type, and an
+	// integer _id is never in it, so both tiers count nought however much they
+	// hold. The same goes for an instant no document reaches.
+	//
+	// Said rather than refused. The claim may well be right, and the counts
+	// simply have nothing to say about it, which is the one thing the operator
+	// cannot tell from silence.
+	if hotN == 0 && coldN == 0 {
+		if from.IsZero() {
+			// The whole collection, on both tiers, and nothing in it. The claim
+			// is true of an empty collection, so this is a note and not a doubt.
+			fmt.Printf("%s is empty on both tiers, so the claim is true of nothing so far.\n", ns)
+			return "", nil
+		}
+		fmt.Printf("neither tier holds a document with %s in %s, so the counts bear out nothing "+
+			"and this claim is being recorded on your word.\nA window selects nothing when the "+
+			"age field does not hold the type it is compared against: a rule reading the age from "+
+			"the _id timestamp, against documents whose _id is not an ObjectId, is the usual "+
+			"one.\n", window, ns)
+		return "", nil
+	}
+
 	if hotN >= coldN {
 		return "", nil
 	}
