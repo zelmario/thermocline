@@ -261,6 +261,23 @@ for r in $(seq 1 $ROUNDS); do
   oneRound "round $r of $ROUNDS" $((SEED0 + r*7919))
 done
 
+# TC_ONLY=rounds stops here.
+#
+# A disagreement that reproduces some of the time has to be run again and again,
+# and the four sections below take about four minutes between them. None of them
+# is about the seed under investigation, and a run that costs four minutes is a
+# run nobody does twenty times. The sweep sets nothing, so it still runs all of
+# it.
+if [ "${TC_ONLY:-}" = "rounds" ]; then
+  echo
+  echo "  agreed $TA   refused $TR   settled on a retry $TS   disagreed $TD"
+  stopDaemons
+  echo "PASS $PASS   FAIL $FAIL"
+  for f in "${FAILED[@]}"; do echo "  - $f"; done
+  [ $FAIL -eq 0 ]
+  exit
+fi
+
 echo
 echo "== the same operations with the tiers moving underneath them =="
 # Every round above ran with documents moving one way only: a read or a write

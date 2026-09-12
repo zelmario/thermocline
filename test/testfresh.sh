@@ -184,6 +184,115 @@ done
 chk "and once mirroring catches up it is gone"     "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")"
 
+echo "== every deleted document that comes back is one the router admitted =="
+# The section above asks the question once. This asks it eight times, through
+# both of the paths a delete can take, and counts.
+#
+# It exists because of a fuzz disagreement reported on 2026-09-11 and written up
+# as "a document deleted by a bulkWrite comes back in the next unbounded read
+# with stale_reads at zero". Two things were wrong with that write-up and one of
+# them was the evidence: the watch line it rested on printed `n=57` for the
+# archive whether the archive held the document or its tombstone, so "still live
+# in the archive" was never established. The seed then agreed six times in six.
+#
+# What could not be settled by re-running a seed is settled by asking the
+# contract directly. With the feeder stopped the archive cannot catch up, so
+# every read of a just-deleted document is offered the document; the barrier
+# must wait out router.archive_wait and then count what it does. Measured at
+# HEAD: 49 of 60 rounds were offered the document and the router admitted all
+# 49, with the plain and the bulkWrite arms alternating.
+#
+# The two arms alternate rather than running in blocks, because a block of one
+# and then a block of the other is two measurements of two different machine
+# states. The bulkWrite is the fuzzer's shape: three operations, unordered, the
+# delete in the middle.
+DNS=tfdel
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+R "const c=db.getSiblingDB(process.env.TC_DB).$DNS;
+   c.insertMany(Array.from({length:20},(_,i)=>({_id:i+1, n:i+1,
+     when:new Date(Date.UTC(2024, i%12, 1+(i%27), 13,45,30,250))})));" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "20" ] && break
+  sleep 0.5
+done
+cline watermark --config $CFG --ns $DB.$DNS --complete-from 2030-01-01T00:00:00Z >/dev/null
+sleep 3
+# Five documents only the archive holds. Without them both tiers hold the same
+# twenty and twenty proves nothing about which tier answered: the first version
+# of this probe took a document off the fast tier instead, which the feeder
+# promptly mirrored as a tombstone, and the guard failed against a router that
+# was behaving perfectly.
+C "db.getSiblingDB(process.env.TC_DB).$DNS.insertMany(
+     Array.from({length:5},(_,i)=>({_id:41+i, n:41+i,
+       when:new Date(Date.UTC(2024, i, 14, 13,45,30,250))})))" >/dev/null
+chk "reads fall through to the archive"            "25" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({}))")"
+
+DFEEDER=$(pgrep -f "cline feeder --config $WDIR/" | head -1)
+# Named rather than assumed. With no pid the stops below are no-ops, mirroring
+# keeps up, nothing is ever offered, and the section would report three passes
+# for having asked nothing.
+[ -n "$DFEEDER" ] || { echo "  FATAL  no feeder to stop, so this section would test nothing"; exit 2; }
+DBACK=0; DSILENT=0; DSPLIT=0
+for r in $(seq 1 8); do
+  DID=$(( (r % 20) + 1 ))
+  kill -STOP $DFEEDER 2>/dev/null
+  DS0=$(staleReads)
+  if [ $((r % 2)) -eq 1 ]; then
+    DOUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$DNS;
+              c.deleteOne({_id:$DID});
+              const scan=c.find({}).sort({_id:1}).toArray().filter(x=>x._id===$DID).length;
+              print(scan + ' ' + (c.findOne({_id:$DID}) ? 1 : 0));")
+  else
+    DOUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$DNS;
+              c.bulkWrite([{updateOne:{filter:{_id:$(( (DID % 20) + 1 ))}, update:{\$set:{v:$r}}}},
+                           {deleteOne:{filter:{_id:$DID}}},
+                           {insertOne:{document:{_id:9000+$r, n:1, when:new Date(Date.UTC(2024,1,1))}}}],
+                          {ordered:false});
+              const scan=c.find({}).sort({_id:1}).toArray().filter(x=>x._id===$DID).length;
+              print(scan + ' ' + (c.findOne({_id:$DID}) ? 1 : 0));")
+  fi
+  DS1=$(staleReads)
+  kill -CONT $DFEEDER 2>/dev/null
+  set -- $DOUT
+  # The signature the write-up named: the same router, an instant apart, saying
+  # the document is gone on a point read and returning it on a scan.
+  [ "${1:-0}" = "1" ] && [ "${2:-0}" = "0" ] && DSPLIT=$((DSPLIT+1))
+  if [ "${1:-0}" = "1" ]; then
+    DBACK=$((DBACK+1))
+    [ $(( ${DS1:-0} - ${DS0:-0} )) -eq 0 ] && DSILENT=$((DSILENT+1))
+  fi
+  # Put it back only once the tombstone has landed, or the next round starts
+  # against an archive that is behind for a reason of its own.
+  for _ in $(seq 1 60); do
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_id:$DID,_tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+    sleep 0.2
+  done
+  R "db.getSiblingDB(process.env.TC_DB).$DNS.insertOne({_id:$DID, n:$DID,
+       when:new Date(Date.UTC(2024, $DID%12, 1+($DID%27), 13,45,30,250))})" >/dev/null 2>&1
+done
+kill -CONT $DFEEDER 2>/dev/null
+echo "      $DBACK of 8 rounds were offered the deleted document"
+# Vacuity first. A run where nothing came back tested the wait, not the thing
+# the wait protects, and reporting it as a pass would be reporting silence.
+chk "the archive did offer a deleted document"     "true" \
+    "$([ "$DBACK" -gt 0 ] && echo true || echo false)"
+chk "and none of them came back unadmitted"        "0" "$DSILENT"
+chk "a scan and a point read never disagreed"      "0" "$DSPLIT"
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+# The last round's reinsert was not waited on, and the section after this one
+# times a fallback read against a 700ms budget. Leaving mirroring behind here
+# would spend that budget on this section's leftovers, which is a failure
+# reported against the wrong code.
+for _ in $(seq 1 60); do
+  BEHIND=$(C 'const p=db.getSiblingDB(process.env.TC_META).positions.findOne({_id:"test"});
+              print(p && p.at ? (Date.now() - p.at.getTime()) : 99999)')
+  [ "${BEHIND:-99999}" -lt 1000 ] && break
+  sleep 0.5
+done
+
 echo "== a fallback read waits for mirroring, not for a checkpoint =="
 # The barrier can only be as precise as the position it waits on. While that
 # position was the durable checkpoint, a fallback read paid a whole

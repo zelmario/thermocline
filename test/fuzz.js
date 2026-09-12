@@ -595,6 +595,13 @@ function clusterTimeNow() {
   } catch (e) { return null; }
 }
 
+// showTS prints a cluster time the way the two halves actually compare.
+function showTS(v) {
+  const t = Number(v.t !== undefined ? v.t : v.getTime());
+  const i = Number(v.i !== undefined ? v.i : v.getInc());
+  return t + '.' + i;
+}
+
 // cmpTS orders two BSON timestamps, seconds first and increment second, which is
 // how a cluster time orders. Comparing the seconds alone would treat everything
 // inside one second as simultaneous, which is the mistake the checkpoint's own
@@ -1219,6 +1226,11 @@ const WATCH = Number(process.env.TC_WATCH || 0);
 function watch(i) {
   if (!WATCH) return;
   const f = d => d ? ('n=' + d.n) : 'MISSING';
+  // The archive keeps a deleted document as a tombstone rather than removing
+  // it, so "the archive holds it" and "the archive says it is gone" look the
+  // same through findOne. They are the two halves of every question about a
+  // delete, and reading `n=` for both is how an afternoon goes missing.
+  const g = d => !d ? 'MISSING' : (d._tcDeletedAt ? 'TOMBSTONE' : 'n=' + d.n);
   const rs = f(REF.findOne({ _id: WATCH }));
   const ts = f(TIER.findOne({ _id: WATCH }));
   // Each tier as well as the router, for the reason the disagreement report
@@ -1226,10 +1238,34 @@ function watch(i) {
   // different fault from the tiers disagreeing with each other, and one line
   // showing only the router leaves them looking identical.
   const hs = HOT ? f(HOT.getDB(DB).getCollection(TIER.getName()).findOne({ _id: WATCH })) : '-';
-  const cs = COLD ? f(COLD.getDB(DB).getCollection(TIER.getName()).findOne({ _id: WATCH })) : '-';
+  const cs = COLD ? g(COLD.getDB(DB).getCollection(TIER.getName()).findOne({ _id: WATCH })) : '-';
   print('  op\tWATCH ' + i + ': ref ' + rs + ' | router ' + ts + ' | fast ' + hs + ' | archive ' + cs +
+        ' | ' + mirroringSays() +
         (rs === ts ? '' : '   <<<< ROUTER DIFFERS FROM REF'));
 }
+
+// mirroringSays reports how far the feeder claims to have mirrored, as a cluster
+// time, beside the fast tier's own clock at this instant.
+//
+// The freshness barrier compares exactly these two numbers, so a read that was
+// let through without waiting is a claim that the first had passed the second.
+// Printing them beside the document turns "the barrier did not wait" from an
+// inference about a counter into something that can be read off the line.
+function mirroringSays() {
+  if (!COLD) return 'position -';
+  try {
+    const pos = COLD.getDB(META).getCollection('positions').findOne({ _id: 'test' });
+    const hot = HOT ? HOT.getDB('admin').runCommand({ hello: 1 }) : null;
+    // Through showTS, because a BSON timestamp is spelled differently by every
+    // driver and mongosh's own is `.t`/`.i`, not the getters the shell's help
+    // suggests. See cmpTS, which learned the same thing.
+    const at = pos && pos.ts ? showTS(pos.ts) : 'none';
+    const now = hot && hot.lastWrite && hot.lastWrite.opTime
+      ? showTS(hot.lastWrite.opTime.ts) : 'none';
+    return 'mirrored ' + at + ' fast ' + now;
+  } catch (e) { return 'position ' + String(e.message).slice(0, 40); }
+}
+
 for (let i = 0; i < OPS; i++) {
   try { oneOp(i); watch(i); }
   catch (e) {

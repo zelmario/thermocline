@@ -110,6 +110,11 @@ feeder:
     - "shop.tevunaged"
     # testfresh.sh: read while the feeder is stopped, so every read copies up.
     - "shop.tfstopped"
+    # testfresh.sh: eight deletes with the feeder stopped, checking that every
+    # document the archive hands back was one the router counted. Its own
+    # collection because the section stops and starts the feeder around each
+    # one, and tprobe is read by the sections either side of it.
+    - "shop.tfdel"
     # testevict.sh: a claim narrowed and acted on in the same sweep.
     - "shop.tevclaim"
     # testevict.sh: a cursor held open while a sweep takes its documents off the

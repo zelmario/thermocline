@@ -143,44 +143,63 @@ sweep is for; exploring means passing `TC_SEED`. Four fresh seeds were run on
 2026-09-10 and the second of them disagreed, so there is more here to find by
 running more of them.
 
-### An open disagreement, found 2026-09-11 and not explained
+### A disagreement whose explanation was withdrawn, 2026-09-12
 
 ```
-TC_SEED=20316344 TC_ROUNDS=1 TC_OPS=134     # 2 disagreements, 5 runs in 5
+TC_SEED=20316344 TC_ROUNDS=1 TC_OPS=134     # 2 disagreements on 2026-09-11
 TC_SEED=20316344 TC_ROUNDS=1 TC_OPS=133     # clean
 ```
 
 It was round 8 of `TC_SEED=20260911`; the seed above puts that round first.
+Operation 132 is a `bulkWrite` whose middle operation is `{deleteOne: {_id:
+1017}}`, and operation 133 is where the contents scan came back with 56
+documents against the reference's 55.
 
-**What happens.** Operation 132 is a `bulkWrite` whose middle operation is
-`{deleteOne: {_id: 1017}}`. Watching that document through the round with
-`TC_WATCH=1017` shows it inserted at operation 17 and present in all four views,
-then after operation 132: gone from the reference, gone from the fast tier, gone
-from a point read through the router — and **still live in the archive**, which
-is ordinary mirroring lag. At operation 133 the contents scan through the router
-returns it again, so the tiered side has 56 documents where the reference has 55.
+Add `TC_ONLY=rounds` to stop after the numbered rounds. The four sections after
+them take about four minutes and none of them is about the seed being chased,
+which is the difference between running it six times and running it once.
 
-**Why it is not simply the freshness barrier giving up.** `stale_reads` is
-**zero** in all five runs. The barrier did not wait and then answer anyway,
-which is the documented trade and would have been counted and logged. It never
-waited at all.
+It was written up as "a document deleted by a bulkWrite comes back in the next
+unbounded read". **That explanation is withdrawn.** Two things went into it and
+both have since failed.
 
-**The signature worth starting from:** the same router, an operation apart,
-disagrees with itself. A point read of `_id: 1017` says the document is not
-there while an unbounded scan returns it.
+**The evidence could not tell a tombstone from a document.** `TC_WATCH` printed
+`n=` for whatever the archive's `findOne` returned, and the archive keeps a
+deleted document as a tombstone rather than removing it, so `archive n=57` is
+what a correctly tombstoned document looks like. "Still live in the archive" was
+never established, and it is the whole of the claim. The watch line prints
+`TOMBSTONE` now, and on six clean runs of the same seed it prints exactly that
+at operation 132.
 
-**What has been ruled out.** A plain `deleteOne` is gated correctly, and so is
-the fuzzer's exact `bulkWrite` shape — three operations, unordered, delete in
-the middle — reproduced by hand against a collection whose reads all fall
-through to the archive: the count is right and the archive has caught up. So it
-is not the bulkWrite path on its own. The difference left is the fuzzer's
-fixture: half its documents are archive-only and its completeness claim says the
-fast tier is short, so reads **merge both tiers** rather than going to one. A
-document deleted from the fast tier and still live in the archive is exactly
-what the archive half of a merge would add back.
+**The seed no longer disagrees.** Six runs in six agreed on an idle machine, at
+the same commit the failure was seen on. It was five in five when it was found,
+which says the difference is in the machine rather than in the code, and the
+first suspect is mirroring lag: a busy box puts the feeder behind and an idle
+one does not.
 
-**Do not assume it is the freshness barrier.** That was the first hypothesis
-here and the stale-read count refuted it.
+**The contract it was supposed to have broken holds.** Re-running a seed that
+has stopped failing proves nothing either way, so the claim was asked directly
+instead, and it is now the "every deleted document that comes back is one the
+router admitted" section of `testfresh.sh`. With the feeder stopped outright the
+archive cannot catch up, so every read of a just-deleted document is offered the
+document and the barrier has to say what it did about it. Measured over sixty
+rounds alternating a plain `deleteOne` with the fuzzer's exact `bulkWrite`
+shape: **49 rounds were offered the document, the router admitted all 49, none
+came back unadmitted, and a scan and a point read never once disagreed**, which
+was the signature the write-up was named for.
+
+**What is left.** Two disagreements were seen, and nothing here explains them.
+The seed is kept above because it is still the only lead, and because a
+disagreement that stops reproducing when the machine goes quiet is worth trying
+again under load. What is gone is the explanation, not the observation.
+
+**Three things to take from it.** A printer that renders two different states
+the same way will be believed. `stale_reads` at zero is evidence about the
+barrier and not about the archive, and it was read as both. And a fixture check
+has to prove the thing it is about: the first probe written for this took a
+document off the fast tier to prove reads were falling through, which the feeder
+promptly mirrored as a tombstone, so the guard failed against a router that was
+behaving perfectly.
 
 ### Two ways the comparison stopped meaning anything, both fixed 2026-09-10
 
@@ -525,6 +544,13 @@ Things these encode that are easy to get wrong when testing by hand:
   `testlife` and `testtxn` that no longer existed a minute later, which is worse
   than no result: it costs an investigation into a product that is fine. Let the
   regression finish, or stop it and start again.
+- **A suite run by hand kills every worker's daemons, not only its own.** The
+  isolation is `pkill -f "cline feeder --config $WDIR/"`, and `$WDIR` defaults
+  to `/root`, which is a prefix of `/root/w0`. Under `psweep.sh` each worker
+  sets its own `$WDIR` and the pattern is exact; run the same suite directly and
+  it reaches into all of them. That is the mechanism behind the rule above
+  rather than a second rule: give a hand run its own `WDIR=/root/wX` if anything
+  else is on the cluster.
 - **A dashboard address is a port like any other.** `router.dashboard` was set
   to 27101, which `testrouter.sh` already uses for its strict-mode router; they
   raced for the bind and the strict check failed for reasons entirely unrelated
