@@ -654,6 +654,57 @@ chk "and the indexer then builds it"               "true" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$LNS.getIndexes().some(function (i) { return i.name === 'code_u' }))")"
 kill $LRP 2>/dev/null; wait $LRP 2>/dev/null
 
+echo "== the same index still there, with unique gone =="
+# The section above drops the fast tier's copy entirely. This one leaves an
+# index of the same name and keys in place and takes only the unique off it,
+# which is what a drop and a recreate through the router does, and it is worse
+# in two ways.
+#
+# The indexer does not repair it: it builds what the fast tier does not have,
+# and an index of that name is there, so the constraint is off until somebody
+# acts rather than until the next router start. Measured: fast tier unique=false
+# before a router start and a point read, and still false after.
+#
+# And `cline indexes` used to say nothing at all. absentFrom matches an index by
+# name and then by key pattern and never looks at the options, so this one
+# counted as present and the report printed "the archive can answer anything the
+# fast tier can" over a constraint nothing was enforcing. The router's
+# warnAboutLostConstraint compares the two tiers' sets of unique index names and
+# had it right all along, so the two places that answer this question disagreed.
+UNS=tacct
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$UNS'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.insertOne({_id:1,code:'a'});
+   db.getSiblingDB(process.env.TC_DB).$UNS.createIndex({code:1},{unique:true,name:'code_u'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$UNS.insertOne({_id:1,code:'a'});
+   db.getSiblingDB(process.env.TC_DB).$UNS.createIndex({code:1},{name:'code_u'})" >/dev/null
+chk "same name on both tiers, unique on the archive only" "true/false" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$UNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")/$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")"
+UREP=$(cline indexes --config $CFG --ns $DB.$UNS 2>&1)
+chk "cline indexes names the index"                "true" \
+    "$(echo "$UREP" | grep -q 'WITHOUT unique' && echo true || echo false)"
+chk "and does not call the tiers equivalent"       "false" \
+    "$(echo "$UREP" | grep -q 'the archive can answer anything the fast tier can' && echo true || echo false)"
+rm -f $LOGDIR/lostu.log
+cline router --config $CFG --log-file $LOGDIR/lostu.log >/dev/null 2>&1 & URP=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+chk "the router says so too"                       "true" \
+    "$(grep -qE "unique index the fast tier does not.*ns=$DB.$UNS" $LOGDIR/lostu.log && echo true || echo false)"
+# A point read is what asks the indexer for the namespace.
+R "db.getSiblingDB(process.env.TC_DB).$UNS.findOne({_id:1})" >/dev/null
+sleep 8
+chk "the indexer does not put unique back"         "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.getIndexes().find(function (i) { return i.name === 'code_u' }).unique === true)")"
+# The consequence the report exists to warn about, measured rather than argued.
+chk "so the router accepts a duplicate"            "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$UNS.insertOne({_id:2,code:'a'});print('ACCEPTED')}catch(e){print('refused '+e.codeName)}")"
+kill $URP 2>/dev/null; wait $URP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$UNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_META).keys.deleteMany({ns:process.env.TC_DB+'.$UNS'})" >/dev/null
+
 echo "== a collection dropped through the router has to be built again =="
 # The indexer records a namespace as done once the fast tier has the collection
 # and its indexes, and never asks again. A drop makes that untrue. Without being

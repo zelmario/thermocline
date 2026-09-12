@@ -109,6 +109,10 @@ func runIndexes(args []string) error {
 	sort.Strings(namespaces)
 
 	missingTotal := 0
+	// Counted separately from missingTotal because it is not about speed: these
+	// are constraints nothing is enforcing, and the verdict must not read as an
+	// all-clear while any stand.
+	lostTotal := 0
 	var toCreate []nsMissing
 	// Namespaces whose archive copy is being expired by an index of its own.
 	var toStopExpiring []nsMissing
@@ -136,6 +140,9 @@ func runIndexes(args []string) error {
 		// the fast tier can" about a fast tier that can answer nothing except
 		// by _id, which is true and useless.
 		bare := absentFrom(coldIdx, hotIdx)
+		// And the case neither list can show: an index both tiers carry, whose
+		// fast tier copy is no longer unique. See lostUniqueConstraints.
+		lost := lostUniqueConstraints(coldIdx, hotIdx)
 
 		fmt.Printf("%s\n", ns)
 		fmt.Printf("  fast tier %2d index(es), archive %2d\n", len(hotIdx), len(coldIdx))
@@ -145,15 +152,31 @@ func runIndexes(args []string) error {
 			fmt.Printf("  missing from the FAST TIER:\n")
 			uniqueBare := 0
 			for _, m := range bare {
-				note := ""
-				if m.ttl {
-					note = "   (TTL: expiring on the fast tier would delete the archive's" +
-						" copies too, through the feeder)"
-				}
+				// Both notes, not the last one to be set. An index can carry
+				// both options at once -- mongod accepts
+				// {unique: true, expireAfterSeconds: N} -- and assigning here
+				// meant the unique branch overwrote the TTL branch, so only one
+				// hazard of the two ever printed.
+				//
+				// The pair is worse than either alone. The unique warning below
+				// ends "either build it on the fast tier", and the TTL note is
+				// exactly the reason not to: building it there would expire the
+				// documents and the feeder would carry those deletions into the
+				// archive. Measured on an index created with both options: the
+				// report advised building it and said nothing about the TTL.
+				var notes []string
 				if m.unique {
-					note = "   (unique: the archive refuses writes this one rejects, and the" +
-						" fast tier no longer does)"
+					notes = append(notes, "unique: the archive refuses writes this one rejects,"+
+						" and the fast tier no longer does")
 					uniqueBare++
+				}
+				if m.ttl {
+					notes = append(notes, "TTL: expiring on the fast tier would delete the archive's"+
+						" copies too, through the feeder")
+				}
+				note := ""
+				if len(notes) > 0 {
+					note = "   (" + strings.Join(notes, "; ") + ")"
 				}
 				fmt.Printf("    %-34s %s%s\n", m.name, m.spec, note)
 			}
@@ -176,6 +199,24 @@ func runIndexes(args []string) error {
 					"  Either build it on the fast tier, or drop it from the archive if the\n" +
 					"  constraint is genuinely gone.\n")
 			}
+		}
+
+		// Printed separately from the missing ones, because the operator's fix
+		// is different: the index is there and has to be rebuilt with unique
+		// rather than created from nothing.
+		if len(lost) > 0 {
+			fmt.Printf("  the FAST TIER carries these WITHOUT unique, and the archive with it:\n")
+			for _, m := range lost {
+				fmt.Printf("    %-34s %s\n", m.name, m.spec)
+			}
+			fmt.Printf("  the constraint is not being enforced anywhere: the router protects the\n" +
+				"  values the FAST TIER's unique indexes name, so it accepts a duplicate, and\n" +
+				"  the archive then refuses the copy. That document stays on the fast tier\n" +
+				"  alone and the evictor will not remove it. The index exists, so the indexer\n" +
+				"  does not rebuild it either.\n" +
+				"  Drop it on the fast tier and recreate it with unique, or drop it from the\n" +
+				"  archive if the constraint is genuinely gone.\n")
+			lostTotal += len(lost)
 		}
 
 		// A TTL index on the archive is not a missing index in either
@@ -203,7 +244,7 @@ func runIndexes(args []string) error {
 		}
 
 		if len(missing) == 0 {
-			if len(bare) == 0 && len(expiring) == 0 {
+			if len(bare) == 0 && len(expiring) == 0 && len(lost) == 0 {
 				fmt.Printf("  the archive can answer anything the fast tier can\n")
 			}
 			fmt.Print("\n")
@@ -212,14 +253,24 @@ func runIndexes(args []string) error {
 		sort.Slice(missing, func(i, j int) bool { return missing[i].name < missing[j].name })
 		fmt.Printf("  missing from the archive:\n")
 		for _, m := range missing {
-			note := ""
+			// Both notes here too, for the same reason as the block above: the
+			// TTL branch used to overwrite the unique one, so an index carrying
+			// both said nothing about being unique. This direction is the
+			// safer of the two -- the note that survived was the one that
+			// matters most -- but a report that drops half of what it knows is
+			// how a finding gets built on the difference it cannot show.
+			var notes []string
 			if m.unique {
-				note = "   (unique: uniqueness across the tiers is the key registry's job," +
-					" so this one is only about speed)"
+				notes = append(notes, "unique: uniqueness across the tiers is the key registry's job,"+
+					" so this one is only about speed")
 			}
 			if m.ttl {
-				note = "   (TTL: do NOT create this one on the archive, it would delete" +
-					" the copies the archive exists to keep)"
+				notes = append(notes, "TTL: do NOT create this one on the archive, it would delete"+
+					" the copies the archive exists to keep")
+			}
+			note := ""
+			if len(notes) > 0 {
+				note = "   (" + strings.Join(notes, "; ") + ")"
 			}
 			fmt.Printf("    %-34s %s%s\n", m.name, m.spec, note)
 			missingTotal++
@@ -233,8 +284,19 @@ func runIndexes(args []string) error {
 	// still be losing history to an index they both have.
 	printExpiring(toStopExpiring, *commands)
 
+	// Said before the verdict below, which is about speed and would otherwise
+	// be the last word on a report that found a constraint nothing enforces.
+	if lostTotal > 0 {
+		fmt.Printf("%d unique index(es) are enforced on the archive and not on the fast tier.\n"+
+			"Uniqueness is protected from the fast tier's indexes, so those constraints are\n"+
+			"off now, and the writes that break them are accepted and then not mirrored.\n\n",
+			lostTotal)
+	}
+
 	if missingTotal == 0 {
-		fmt.Println("Every index the fast tier has, the archive has too.")
+		if lostTotal == 0 {
+			fmt.Println("Every index the fast tier has, the archive has too.")
+		}
 		return nil
 	}
 	fmt.Printf("%d index(es) exist only on the fast tier.\n\n", missingTotal)
@@ -392,6 +454,71 @@ type nsMissing struct {
 	ns      string
 	missing []indexInfo // the archive does not have these
 	bare    []indexInfo // the fast tier does not have these
+}
+
+// lostUniqueConstraints returns the archive's unique indexes whose fast tier
+// counterpart exists and is not unique.
+//
+// absentFrom answers "is this index there", matching on the name and then on
+// the key pattern, and it never looks at the options. So an index the fast tier
+// still carries under the same name, with unique gone, counts as present and
+// the whole report goes quiet: measured on {email: 1} unique on the archive and
+// plain on the fast tier, the report said "the archive can answer anything the
+// fast tier can", which is an all-clear over a constraint nothing is enforcing.
+//
+// It matters because the router reads the FAST TIER's unique indexes to know
+// which values to protect across both tiers. The same question is answered in
+// internal/router/tiers.go by warnAboutLostConstraint, which compares the two
+// tiers' sets of unique index names and gets this case right. Two places
+// answering one question disagreed, and the one an operator runs on purpose was
+// the one that was wrong.
+//
+// Reachable the same way the missing-index case is: DDL is not mirrored, so an
+// index dropped and recreated without unique through the router reaches the
+// fast tier alone. The indexer does not repair it either, because an index of
+// that name already exists.
+//
+// Matched on the name and then on the key pattern, the same two steps and in
+// the same order as absentFrom, so "present" means one thing in this file.
+func lostUniqueConstraints(cold, hot map[string]indexInfo) []indexInfo {
+	var out []indexInfo
+	for _, c := range cold {
+		if c.name == "_id_" || !c.unique {
+			continue
+		}
+		if h, ok := hot[c.name]; ok {
+			if !h.unique {
+				out = append(out, c)
+			}
+			continue
+		}
+		// No index of that name. absentFrom would still call it present when
+		// the key pattern matches one, so ask the same question of those: the
+		// constraint holds if any index on the same keys is unique.
+		var onKeys []indexInfo
+		for _, h := range hot {
+			if h.spec == c.spec {
+				onKeys = append(onKeys, h)
+			}
+		}
+		if len(onKeys) == 0 {
+			// Genuinely missing, which is absentFrom's finding and already
+			// reported as "missing from the FAST TIER". Not this one's.
+			continue
+		}
+		enforced := false
+		for _, h := range onKeys {
+			if h.unique {
+				enforced = true
+				break
+			}
+		}
+		if !enforced {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out
 }
 
 // absentFrom returns the indexes in have that want does not carry.
