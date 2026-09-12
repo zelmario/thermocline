@@ -119,7 +119,18 @@ function predicate(f) {
     case 6:  return { $in: [v, w] };
     case 7:  return { $nin: [v, w] };
     case 8:  return { $exists: maybe(0.7) };
-    case 9:  return { $gte: v, $lt: w };
+    // Ordered, because the two values are drawn independently and about half
+    // of them came out with the start after the end. An empty range matches
+    // nothing on either side, so the operation agreed without having asked
+    // anything about tiering, and this is the one predicate shape that puts a
+    // lower bound and an upper bound on the same field at once, which is how an
+    // application asks for a period. Measured on one 200 operation round: 9 of
+    // the generated `when` predicates carried a $gte and the ones that were
+    // ranges were mostly backwards.
+    case 9:  {
+      const lo = (v <= w) ? v : w, hi = (v <= w) ? w : v;
+      return lo < hi ? { $gte: lo, $lt: hi } : { $gte: lo };
+    }
     case 10: return { $not: { $gt: v } };
     case 11: return f.t === 'num' ? { $mod: [1 + ri(4), 0] } : { $ne: v };
     case 12: return f.t === 'arr' ? { $all: [v] } : { $eq: v };
