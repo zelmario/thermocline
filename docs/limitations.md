@@ -326,6 +326,33 @@ Part of [Thermocline](../README.md).
   here. Ask `countDocuments({field: {$exists: false}})` for that, which is a
   logical fact and is correct through the router.
 
+- **A change stream consumer more than an hour behind is shown the tiering
+  itself.** What makes a copy-up an insert the application never made, an
+  eviction a delete it never issued, and a catalog repair a `create` it never
+  ran, is a record this system writes beside the event: a residency hold, an
+  eviction notice, an `ownddl` span. A client's stream is judged against those
+  when it reads the event, not when the event happened, which is what lets a
+  consumer resume from a stored token and still be told the truth.
+
+  Every one of those records is kept on a TTL and then goes. An eviction notice
+  and an `ownddl` span last an hour from being written (`meta.NoticeTTL`); a
+  residency row lasts an hour past the end of the hold it records, so its bound
+  is `router.residency` plus that hour. Past whichever applies, the evidence is
+  gone and the event is handed over as the application's own. A consumer that
+  keeps up never reaches it; one that is stopped for an afternoon, or resumes
+  from a token it stored overnight, does.
+
+  The hour is a choice about how long to keep evidence nothing else needs, and
+  raising it costs storage in the bookkeeping database rather than correctness.
+  What is *not* on the same footing is the feeder: `evictor.max_feeder_lag` is
+  refused when it reaches `NoticeTTL`, because there an expired notice means a
+  document destroyed on both tiers rather than an event described oddly. A
+  client's stream has no such bound to enforce, so this is written down instead.
+
+  Keep consumers of a tiered collection's change stream inside the hour, or
+  treat `create`, `createIndexes` and unexplained inserts on a tiered namespace
+  as possible tiering activity rather than the application's.
+
 - **A filter written with `$expr` never bounds a query, so it is always answered
   by the archive.** The router decides whether the fast tier can answer a read
   alone by reading a lower bound out of the filter, in the dimension the
