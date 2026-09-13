@@ -113,7 +113,16 @@ if grep -q "bear out nothing" <<<"$ALLOUT"; then
 else
   PASS=$((PASS+1)); echo "  PASS  the note is not printed when the counts do say something"
 fi
-mongosh "$HOTU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
+# Both tiers, and the archive is the half that matters. A feeder running beside
+# this mirrors the two documents down, and dropping the fast tier's copy is not
+# a delete: the archive keeps what the fast tier stops holding, which is the
+# whole point of it. Left there, the warmer finds documents in shop.tintid it
+# cannot age on every start and says so at ERROR -- which is the refusal
+# testwarm.sh relies on, and which testchaos counts as an unexpected daemon
+# error. Measured: two documents left behind here failed testchaos twice, 25 of
+# 26, in a suite that has nothing to do with this one.
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
 cline watermark --config $CFG --ns $DB.tintid --clear >/dev/null 2>&1
 ok "--complete-all sets"                0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all
 ok "--clear withdraws"                  0 "withdrew"          -- cline watermark --config $CFG --ns tc.probe --clear
