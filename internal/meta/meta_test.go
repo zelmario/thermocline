@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -319,4 +320,95 @@ func TestTwoBracketsFromOnePositionCloseSeparately(t *testing.T) {
 			t.Errorf("(%d,%d) is not covered, so that event reaches the client", pos.T, pos.I)
 		}
 	}
+}
+
+// Which clock stamps each field of a residency row, which is the question that
+// decides whether a hold means what it says.
+//
+// Every field here is written on one machine and judged on another, and they do
+// not all get judged by the same one. hotUntil is read by the evictor, expiresAt
+// by the archive's own TTL monitor, and promotedAt is weighed against the
+// wall-clock time of a change stream event from the fast tier's primary. So the
+// first two are stamped from the archive's clock, which is the one thing both
+// of their readers share with the writer, and the third stays on the writer's
+// because the window it is judged in is generous enough that skew can only
+// widen it.
+//
+// The failure this prevents is quiet: a promoter whose clock runs behind writes
+// a hold that is already shorter than configured, the next eviction sweep
+// removes a document that was fetched a moment ago, and the read after that
+// fetches it again. Nothing in the logs says the clocks are the reason.
+func TestResidencyIsStampedByTheArchive(t *testing.T) {
+	promotedAt := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	pipe := ResidencyUpdate("shop.orders", bson.RawValue{}, promotedAt, 5*time.Minute)
+
+	set := setStage(t, pipe)
+	// The two the archive judges, as expressions over its own clock.
+	wantHot := bson.D{{Key: "$add", Value: bson.A{"$$NOW", int64(300000)}}}
+	if got := field(set, "hotUntil"); !reflect.DeepEqual(got, wantHot) {
+		t.Errorf("hotUntil is %#v, want it counted from the archive's clock: %#v", got, wantHot)
+	}
+	// The hold plus NoticeTTL, because the row has to outlive the hold by long
+	// enough for a late change stream reader to recognise the copy-up.
+	wantExp := bson.D{{Key: "$add", Value: bson.A{"$$NOW", (5*time.Minute + NoticeTTL).Milliseconds()}}}
+	if got := field(set, "expiresAt"); !reflect.DeepEqual(got, wantExp) {
+		t.Errorf("expiresAt is %#v, want %#v", got, wantExp)
+	}
+	// And the one that stays on the writer's clock, which is the "then" arm of
+	// the $cond that decides whether this is a new promotion.
+	cond, ok := field(set, "promotedAt").(bson.D)
+	if !ok {
+		t.Fatalf("promotedAt is %#v, want the $cond that reopens a record", field(set, "promotedAt"))
+	}
+	arms, ok := field(cond, "$cond").(bson.A)
+	if !ok || len(arms) != 3 {
+		t.Fatalf("promotedAt's $cond is %#v", field(cond, "$cond"))
+	}
+	if got, ok := arms[1].(time.Time); !ok || !got.Equal(promotedAt) {
+		t.Errorf("promotedAt is %#v, want the writer's own instant %v", arms[1], promotedAt)
+	}
+}
+
+// Ending a hold is the same question from the other side: "in the past" has to
+// mean in the past to whoever is asking, and that is the evictor reading it
+// against the archive's clock. endedAt keeps the caller's, because what it is
+// weighed against is a change stream event's own time.
+func TestEndingAHoldUsesTheArchivesClock(t *testing.T) {
+	endedAt := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	set := setStage(t, HoldIsOver(endedAt))
+
+	if got := field(set, "hotUntil"); got != "$$NOW" {
+		t.Errorf("hotUntil is %#v, want the archive's own clock", got)
+	}
+	if got, ok := field(set, "endedAt").(time.Time); !ok || !got.Equal(endedAt) {
+		t.Errorf("endedAt is %#v, want the instant the caller passed", field(set, "endedAt"))
+	}
+}
+
+// setStage returns the $set document of a one-stage pipeline.
+func setStage(t *testing.T, pipe mongo.Pipeline) bson.D {
+	t.Helper()
+	if len(pipe) != 1 {
+		t.Fatalf("pipeline has %d stages, want 1", len(pipe))
+	}
+	for _, e := range pipe[0] {
+		if e.Key == "$set" {
+			d, ok := e.Value.(bson.D)
+			if !ok {
+				t.Fatalf("$set is %T, want bson.D", e.Value)
+			}
+			return d
+		}
+	}
+	t.Fatalf("no $set stage in %v", pipe[0])
+	return nil
+}
+
+func field(d bson.D, name string) interface{} {
+	for _, e := range d {
+		if e.Key == name {
+			return e.Value
+		}
+	}
+	return nil
 }

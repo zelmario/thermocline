@@ -298,13 +298,9 @@ func (f *Feeder) dropResidency(ctx context.Context, ids []string) {
 	// that instant is the promotion's own; one after it is the application
 	// writing that _id again, which is what deleting the record was for. The row
 	// goes on its own TTL as it always did.
-	now := time.Now().UTC()
 	res, err := f.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "endedAt", Value: now},
-			{Key: "hotUntil", Value: now},
-		}}})
+		meta.HoldIsOver(time.Now().UTC()))
 	if err != nil {
 		f.log.Warn("could not end the residency holds for documents the application deleted",
 			"documents", len(ids), "err", err,

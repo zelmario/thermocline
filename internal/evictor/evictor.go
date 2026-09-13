@@ -75,6 +75,17 @@ func (e *Evictor) lastSkew() (time.Duration, bool) {
 	return e.skew, e.skewKnown
 }
 
+// archiveNow is this instant on the archive's clock, as well as this process
+// can say. It falls back to its own when no comparison has been managed, which
+// is what everything did before there was one.
+func (e *Evictor) archiveNow() time.Time {
+	now := time.Now().UTC()
+	if skew, ok := e.lastSkew(); ok {
+		return now.Add(-skew)
+	}
+	return now
+}
+
 // SetMaxHealthWait bounds how long RunOnce waits for an unhealthy cluster
 // before giving up. Zero, the default, waits indefinitely.
 func (e *Evictor) SetMaxHealthWait(d time.Duration) { e.maxHealthWait = d }
@@ -376,10 +387,19 @@ func (e *Evictor) classify(ctx context.Context, ns string, cands []candidate) (o
 
 // residencyHolds returns the documents whose stay in the fast tier has not
 // expired. Age makes a document a candidate; recent use overrides it.
+//
+// Asked in the archive's frame, because that is the frame the hold was written
+// in. A router or warmer promotes a document and stamps the hold from the
+// archive's own clock; this process may be on a third machine, and its own
+// clock is what would otherwise decide whether that hold has passed. Ahead by
+// more than the hold and every hold reads as expired, so a document fetched a
+// moment ago is evicted and the next read fetches it again, which is the whole
+// thing residency exists to stop. The reading is taken against the archive
+// every pass already, for the announcements.
 func (e *Evictor) residencyHolds(ctx context.Context, docIDs []string) (map[string]bool, error) {
 	cur, err := e.cold.Database(meta.DB).Collection(meta.Residency).Find(ctx, bson.D{
 		{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
-		{Key: "hotUntil", Value: bson.D{{Key: "$gt", Value: time.Now().UTC()}}},
+		{Key: "hotUntil", Value: bson.D{{Key: "$gt", Value: e.archiveNow()}}},
 	}, options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
 		return nil, fmt.Errorf("read residency: %w", err)
@@ -511,11 +531,15 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	// judging.
 	//
 	// Ending it releases the hold exactly as deleting did -- residencyHolds
-	// wants hotUntil in the future, and this puts it in the past -- and the TTL
-	// index on hotUntil clears the row within the minute. The same thing the
-	// feeder's dropResidency does for a document the application deleted, and
-	// the third and last instance of one pattern: the evidence a change stream
-	// reader needs was being destroyed the moment nothing else needed it.
+	// wants hotUntil in the future, and this puts it in the past -- and the row
+	// then goes on its own expiry, which outlives the hold by NoticeTTL. The
+	// same thing the feeder's dropResidency does for a document the application
+	// deleted, and the third and last instance of one pattern: the evidence a
+	// change stream reader needs was being destroyed the moment nothing else
+	// needed it.
+	//
+	// "In the past" is decided by whoever reads it, so the instant comes from
+	// the archive rather than from here. See meta.HoldIsOver.
 	//
 	// What is left is a bound rather than a guarantee: a consumer more than a
 	// TTL pass behind reads the insert with no record to recognise it by. That
@@ -523,13 +547,9 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	// and it is a minute where it used to be nothing at all.
 	//
 	// Failing here is untidy rather than dangerous, so it only warns.
-	now := time.Now().UTC()
 	if _, err := e.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "endedAt", Value: now},
-			{Key: "hotUntil", Value: now},
-		}}}); err != nil {
+		meta.HoldIsOver(time.Now().UTC())); err != nil {
 		e.log.Warn("could not end the residency records of evicted documents", "ns", ns, "err", err)
 	}
 	return nil

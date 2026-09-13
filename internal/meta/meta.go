@@ -325,7 +325,7 @@ type ResidencyRecord struct {
 //
 // A pipeline update, which needs MongoDB 4.2, the floor this project already
 // supports.
-func ResidencyUpdate(ns string, id bson.RawValue, now, until time.Time) mongo.Pipeline {
+func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Duration) mongo.Pipeline {
 	// Missing promotedAt: never promoted, so this is the first. Present
 	// endedAt: the last promotion is over, so this is a new one.
 	reopening := bson.D{{Key: "$or", Value: bson.A{
@@ -341,10 +341,29 @@ func ResidencyUpdate(ns string, id bson.RawValue, now, until time.Time) mongo.Pi
 			{Key: "doc", Value: bson.D{{Key: "$literal", Value: id}}},
 			// Refreshed on every read, because that is what the hold is for: a
 			// document read again should stay hot longer.
-			{Key: "hotUntil", Value: until},
-			// When the row goes, which is later than when the hold does. See
-			// ResidencyRecord.ExpiresAt.
-			{Key: "expiresAt", Value: ResidencyExpiry(until)},
+			//
+			// Counted from the archive's own clock rather than from the
+			// writer's. Both the reader of this field and the expiry below are
+			// somewhere else: the evictor decides whether the hold has passed,
+			// and the archive's TTL monitor decides when the row goes. A
+			// promoter whose clock runs behind wrote a hold that was already
+			// shorter than configured by the difference, and an eviction sweep
+			// then removed a document that had just been fetched, which the
+			// next read fetches again. $$NOW is the server's, so nobody's
+			// clock comes into it and there is nothing to correct.
+			{Key: "hotUntil", Value: after(hold)},
+			// When the row goes, which is later than when the hold does, by
+			// NoticeTTL. See ResidencyRecord.ExpiresAt: the gap is what a
+			// change stream consumer reading late has to recognise a copy-up
+			// by, and a row expiring early is that consumer being shown an
+			// insert the application never made.
+			{Key: "expiresAt", Value: after(hold + NoticeTTL)},
+			// This one stays on the writer's clock, deliberately. It is weighed
+			// against the wall-clock time of a change stream event, which comes
+			// from the fast tier's primary, and the window it is weighed in is
+			// generous enough that skew can only widen it. Moving it into the
+			// archive's frame would put a third clock in a comparison that
+			// already errs on the safe side. See isPromotion.
 			{Key: "promotedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, now, "$promotedAt"}}}},
 			// The insert this record precedes is about to appear on the
 			// feeder's change stream, and mirroring it would write the
@@ -388,11 +407,29 @@ func WithdrawEchoes(ctx context.Context, cold *mongo.Client, docIDs []string) er
 	return err
 }
 
-// ResidencyExpiry is when a residency row whose hold runs to hotUntil may be
-// removed. Every writer of a hold goes through this, so the gap between the two
-// is stated in one place.
-func ResidencyExpiry(hotUntil time.Time) time.Time {
-	return hotUntil.Add(NoticeTTL)
+// after is an instant that far past the archive's own clock, for a field
+// something on the archive will judge. $$NOW is the server's reading, and $add
+// with a date treats the other operand as milliseconds.
+func after(d time.Duration) bson.D {
+	return bson.D{{Key: "$add", Value: bson.A{"$$NOW", d.Milliseconds()}}}
+}
+
+// HoldIsOver is the update that ends a hold: the document has left the fast
+// tier, so nothing is holding it there any more.
+//
+// hotUntil goes to the archive's own clock for the same reason ResidencyUpdate
+// sets it from there: the evictor is what reads it, and "in the past" has to
+// mean in the past to the one asking. endedAt keeps the caller's clock, because
+// what it is weighed against is the wall-clock time of a change stream event.
+// They were one instant when both were simply "now", and they answer different
+// questions to different readers.
+func HoldIsOver(endedAt time.Time) mongo.Pipeline {
+	return mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "endedAt", Value: endedAt},
+			{Key: "hotUntil", Value: "$$NOW"},
+		}}},
+	}
 }
 
 // MaxEchoRecorded is how many promotion positions a residency record keeps. A

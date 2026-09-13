@@ -695,12 +695,11 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 // copy-up writes, so both are recognised the same way.
 func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDoc) error {
 	now := time.Now().UTC()
-	until := now.Add(w.cfg.Residency.D())
 	models := make([]mongo.WriteModel, len(docs))
 	for i, d := range docs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, d.id)}}).
-			SetUpdate(meta.ResidencyUpdate(ns, d.id, now, until)).
+			SetUpdate(meta.ResidencyUpdate(ns, d.id, now, w.cfg.Residency.D())).
 			SetUpsert(true)
 	}
 	_, err := w.cold.Database(meta.DB).Collection(meta.Residency).

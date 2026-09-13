@@ -135,7 +135,7 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 	now := time.Now().UTC()
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: meta.DocID(ns, id)}},
-		meta.ResidencyUpdate(ns, id, now, now.Add(r.cfg.Residency.D())),
+		meta.ResidencyUpdate(ns, id, now, r.cfg.Residency.D()),
 		options.UpdateOne().SetUpsert(true))
 	return err
 }
@@ -154,12 +154,11 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 		return nil
 	}
 	now := time.Now().UTC()
-	until := now.Add(r.cfg.Residency.D())
 	models := make([]mongo.WriteModel, 0, len(ids))
 	for _, id := range ids {
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(meta.ResidencyUpdate(ns, id, now, until)).
+			SetUpdate(meta.ResidencyUpdate(ns, id, now, r.cfg.Residency.D())).
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written
