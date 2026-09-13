@@ -382,8 +382,20 @@ hour are one setting in two places: the config refuses a lag that reaches it.
 The same relationship depends on the two machines agreeing about the time. The
 announcement is stamped by the evictor and expired by the archive's TTL monitor,
 so an evictor whose clock runs behind the archive's has its announcements
-expiring early, and far enough behind they are gone before they are read. Both
-daemons check their clock against the archive at startup and say what they find.
+expiring early, and far enough behind they are gone before they are read. Every
+daemon checks its clock against the archive at startup and says what it finds,
+and `cline preflight` reports it without starting anything.
+
+Two more things are decided by comparing instants read on different machines,
+and unlike the announcements they are corrected rather than only reported: the
+freshness barrier, which weighs the feeder's published position against the
+instant a read began, and `thermocline_mirroring_lag_seconds`, which is the
+number the alert rules watch and the one eviction is gated on. The feeder
+publishes how far its own clock is from the archive's, every reader measures its
+own, and the two instants are subtracted in the archive's frame. The correction
+is measured over a round trip on a one-minute cadence, so it is a good answer
+rather than a perfect one: run NTP on every host that runs a cline daemon and
+none of this has to work hard.
 
 **15. Expect the warm to cost something and the evictor not to.** With a shop
 running against the router while all four daemons worked underneath it, 38,248

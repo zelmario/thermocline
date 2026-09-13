@@ -662,6 +662,54 @@ A fallback read has to clear both bars, never either, so requiring the cluster
 time can only make the barrier stricter, and it falls back to the clock alone
 against a feeder from before this.
 
+**The wall-clock bar stayed, and it had the same disease with the symptoms
+reversed.** It has to stay, because it is the only one that covers a write this
+router never saw: a second router's writes are not in this one's `operationTime`,
+and the feeder having mirrored past the instant your read began covers them
+whatever anybody wrote them through. But a router running a few seconds ahead of
+its feeder never clears it. Every read that falls through then waits the entire
+`archive_wait` and answers stale anyway, which is slow and stale, the pair this
+barrier exists to avoid, and the log line it produces is the one a genuinely
+lagging feeder produces. Nothing distinguishes them.
+
+So the two instants are put in one frame before they are compared. Both daemons
+talk to the archive, so both can say how far their own clock is from that one:
+the feeder publishes its offset in the position record, the router measures its
+own in the background on the same one-minute cadence, and the archive's clock is
+then a reference neither has to trust the other about. With either offset
+missing, which is a feeder from before this or a router that has not managed a
+reading yet, the raw instants are compared exactly as they were. A correction
+applied on one side only would be worse than none.
+
+The same arithmetic is what `thermocline_mirroring_lag_seconds` is made of, and
+what gates eviction, so both were wrong in the same way. Lag had been clamped at
+zero, which treats the direction that produces a negative number and leaves the
+other one looking like real lag: a host thirty seconds ahead of its feeder
+graphed thirty seconds of mirroring lag on a deployment where nothing was
+behind, and that is the number the alert rules watch.
+
+**Liveness is decided by watching, not by subtracting.** A feeder that has
+stopped leaves its last position behind, and a router that read that as
+"mirroring is a little behind" would make every fallback read wait the whole
+barrier for a feeder that is never going to catch up: measured with the feeder
+stopped, 40 point reads took 185 seconds against 97 ms straight at the archive.
+So a position that has gone quiet means "nothing is mirroring" and reads answer
+at once. Deciding that by subtracting the feeder's stamp from this host's clock
+put the whole freshness barrier behind a clock difference of two seconds, which
+is the floor of the staleness window at the default cadence, and two seconds
+between two hosts is ordinary. A record that differs from the one seen before is
+a publication that happened between the two readings, whatever either machine
+thinks the time is, so that is what is watched now: it moved, it is alive; it
+has not moved for a staleness window of this router's own elapsed time, it is
+stopped. A record first seen already stale by more than five minutes is taken at
+its word, so a router started while the feeder has been down for hours does not
+make the first read wait to learn what is obvious.
+
+`cline preflight` and every daemon start now report a host clock more than
+thirty seconds from either tier's, because three separate things here are
+decided by comparing instants read on different machines and the third one,
+the eviction announcements, destroys data rather than slowing a read down.
+
 **A caller's own deadline bounds all of this, and it is spent once.** The wait
 takes at most half of `maxTimeMS` and the archive read is given what is left,
 rather than the whole of it a second time. Measured before that: a client asking

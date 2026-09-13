@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -68,6 +69,22 @@ type PositionRecord struct {
 	// whether silence means "behind" or "gone" without being told how this
 	// feeder is configured.
 	EveryMS int64 `bson:"everyMS,omitempty"`
+	// SkewMS is how far the publisher's clock is ahead of the archive's, in
+	// milliseconds, as the publisher last measured it.
+	//
+	// It is what makes At usable across hosts. At is the feeder's clock and
+	// whoever compares against it is reading their own, so the comparison is
+	// only as sound as the skew between two machines nothing keeps in step.
+	// Both sides do talk to the archive, though, so both can say where they
+	// stand against that one clock, and a reader that knows its own offset can
+	// put the two instants in the same frame before comparing them.
+	//
+	// Absent on a record written by a feeder from before this, and on one that
+	// has not managed to read the archive's clock yet. A reader without it
+	// compares raw instants, which is what everything did before. It is a
+	// pointer for that distinction alone: a feeder that measured no skew is
+	// saying something, and zero has to be tellable from silence.
+	SkewMS *int64 `bson:"skewMS,omitempty"`
 }
 
 // PackTS makes a cluster time comparable as a single number.
@@ -100,13 +117,20 @@ func NewPositions(cold *mongo.Client) *Positions {
 // tick, and the durable checkpoint is what recovery actually uses. Paying for
 // majority acknowledgement several times a second to speed up reads would be a
 // poor trade.
-func (p *Positions) Save(ctx context.Context, id string, at time.Time, ts bson.Timestamp, every time.Duration) error {
+func (p *Positions) Save(ctx context.Context, id string, at time.Time, ts bson.Timestamp, every, skew time.Duration, skewKnown bool) error {
 	if at.IsZero() && ts.T == 0 {
 		return nil
 	}
 	set := bson.D{
 		{Key: "savedAt", Value: time.Now().UTC()},
 		{Key: "everyMS", Value: every.Milliseconds()},
+	}
+	if skewKnown {
+		// Rounded to milliseconds, which is well inside the error of measuring
+		// it over a round trip, and zero is written as zero rather than left
+		// out: a feeder that measured no skew is saying something, and dropping
+		// the field would make it indistinguishable from one that never looked.
+		set = append(set, bson.E{Key: "skewMS", Value: skew.Milliseconds()})
 	}
 	if !at.IsZero() {
 		set = append(set, bson.E{Key: "at", Value: at})
@@ -142,22 +166,137 @@ func (p *Positions) At(ctx context.Context, id string) (PositionRecord, bool, er
 	return rec, !rec.At.IsZero() || rec.TS.T != 0, nil
 }
 
-// Live reports whether the publisher still looks alive.
+// Liveness decides whether the feeder is still publishing, by watching the
+// record move rather than by comparing two machines' clocks.
 //
-// A position left behind by a feeder that has stopped would otherwise be read
-// as "mirroring is behind", and every fallback read would wait the full
-// archive_wait before answering. That turns a stopped background daemon into a
-// slow database, which is exactly what the wait is not supposed to do. Four
-// missed publications is the line; the record carries the cadence so this does
-// not have to guess it.
-func (rec PositionRecord) Live(now time.Time) bool {
-	every := time.Duration(rec.EveryMS) * time.Millisecond
+// What this replaced read savedAt, which the feeder stamps with its own clock,
+// and compared it against the reader's. That is the mistake this package already
+// fixed once for the position itself: markCaughtUp's comment in the feeder says
+// it plainly, a wall-clock instant "published for a router to compare against
+// its own" is only as sound as the skew between two hosts, and the cluster time
+// replaced it. The liveness test beside it kept the habit.
+//
+// It matters more than it looks, because of which way it errs. A router whose
+// clock is *ahead* of the feeder's by more than the staleness window reads a
+// perfectly healthy feeder as stopped, and a feeder read as stopped turns the
+// freshness barrier off: every read that falls through to the archive answers
+// at once without waiting for mirroring, counts a stale read and warns about a
+// feeder that is doing its job. With position_every at its default of 20ms the
+// window is its two second floor, so three seconds between two hosts is enough,
+// and three seconds is ordinary on machines nobody is keeping in step.
+//
+// Movement needs one clock, not two. A record that differs from the one seen
+// before is a publication that happened between the two readings, whatever
+// either machine thinks the time is. So: it moved, it is alive; it has not
+// moved for a whole staleness window of this reader's own elapsed time, it is
+// stopped; and with no history yet, the wall clock is allowed to decide only
+// when it is stale beyond any plausible skew.
+type Liveness struct {
+	mu    sync.Mutex
+	seen  posFingerprint
+	since time.Time // local instant that reading was first seen
+	have  bool
+}
+
+// posFingerprint is everything about a record that changes when the feeder
+// publishes. savedAt alone would do on a working feeder, since Save sets it
+// every time, but a feeder whose clock is stopped still moves the position, and
+// a position that moves is the feeder being alive.
+type posFingerprint struct {
+	savedAt int64
+	at      int64
+	ts      uint64
+}
+
+func fingerprint(rec PositionRecord) posFingerprint {
+	return posFingerprint{
+		savedAt: rec.SavedAt.UnixNano(),
+		at:      rec.At.UnixNano(),
+		ts:      PackTS(rec.TS),
+	}
+}
+
+// beyondSkew is how stale a record has to look, on first sight, before this
+// believes the wall clock over the absence of evidence.
+//
+// It exists so that a router started while the feeder has been down for hours
+// does not make the first read that falls through wait the whole barrier to
+// learn what is obvious. Five minutes is well past what two hosts drift apart
+// by, and well short of how long a stopped feeder stays stopped.
+const beyondSkew = 5 * time.Minute
+
+// Observe records a reading and reports whether the feeder still looks alive.
+//
+// mine is how far the caller's own clock is ahead of the archive's, when it
+// knows. With that and the offset the feeder publishes, the record's age is
+// exact whatever either machine's clock says, and no watching is needed: both
+// instants go into the archive's frame and are subtracted there. That is the
+// normal path, and it is why a feeder that stopped a moment ago is known to
+// have stopped on the first look rather than after a window of silence.
+//
+// Movement is what is left when either offset is missing, which is a feeder too
+// old to publish one or a reader that has not managed a reading of its own yet.
+// It also stands above the arithmetic: a record that moved between two readings
+// is a publication that happened between them, whatever any clock says, so a
+// feeder whose clock has stopped while it goes on mirroring is alive and is
+// reported alive.
+//
+// now is the caller's own clock, used for elapsed time between its own readings
+// and, on first sight with no offsets, for the one case below.
+func (l *Liveness) Observe(rec PositionRecord, now time.Time, mine time.Duration, mineKnown bool) bool {
+	fp := fingerprint(rec)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	moved := l.have && fp != l.seen
+	first := !l.have
+	if moved || first {
+		l.seen, l.since, l.have = fp, now, true
+	}
+	if moved {
+		return true
+	}
+
+	if theirs, ok := rec.Skew(); ok && mineKnown {
+		age := now.Add(-mine).Sub(rec.SavedAt.Add(-theirs))
+		return age <= staleAfter(rec.EveryMS)
+	}
+
+	if first {
+		// Nothing has been watched yet and the clocks cannot be reconciled, so
+		// the only evidence is the feeder's own stamp. It is believed only when
+		// it is stale beyond anything skew explains, which keeps a router
+		// started while the feeder has been down for hours from making the
+		// first read that falls through wait the whole barrier to learn it.
+		return now.Sub(rec.SavedAt) <= beyondSkew
+	}
+
+	// It has not moved, and there is no way to date it. That is only evidence
+	// once it has been watched for as long as a publication would have taken.
+	return now.Sub(l.since) <= staleAfter(rec.EveryMS)
+}
+
+// staleAfter is how long without a publication means stopped. Four missed
+// publications is the line; the record carries the cadence so this does not
+// have to guess it, and the floor keeps a fast cadence from calling a feeder
+// dead over one slow write.
+func staleAfter(everyMS int64) time.Duration {
+	every := time.Duration(everyMS) * time.Millisecond
 	if every <= 0 {
 		every = time.Second
 	}
-	stale := 4 * every
-	if stale < 2*time.Second {
-		stale = 2 * time.Second
+	if stale := 4 * every; stale > 2*time.Second {
+		return stale
 	}
-	return now.Sub(rec.SavedAt) <= stale
+	return 2 * time.Second
+}
+
+// Skew is how far the publisher's clock was ahead of the archive's when it last
+// looked, and whether it ever managed to look.
+func (rec PositionRecord) Skew() (time.Duration, bool) {
+	if rec.SkewMS == nil {
+		return 0, false
+	}
+	return time.Duration(*rec.SkewMS) * time.Millisecond, true
 }

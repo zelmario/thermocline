@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"github.com/zelmario/thermocline/internal/health"
 	"io"
 	"log/slog"
 	"regexp"
@@ -194,5 +195,82 @@ func TestMetricsIsSilentAboutACacheThatIsOff(t *testing.T) {
 	r.writeMetrics(context.Background(), &b)
 	if strings.Contains(b.String(), "thermocline_cache_") {
 		t.Error("the exporter published cache metrics for a cache that is off")
+	}
+}
+
+// thermocline_mirroring_lag_seconds is the number the README tells operators to
+// alert on, and it is one machine's clock minus another's.
+//
+// The clamp that used to be the whole treatment kept it from going negative,
+// which is what skew in one direction produced. Skew in the other direction
+// produces a positive number, and a positive number is not obviously wrong: a
+// router thirty seconds ahead of its feeder graphs thirty seconds of mirroring
+// lag on a deployment where nothing is behind at all, and the alert fires.
+func TestLagIsMeasuredInOneFrame(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+
+	// The archive is the reference. This host is 30s ahead of it, the feeder is
+	// 5s behind it, and the feeder published a position for the instant the
+	// archive calls 11:59:59, so the true lag is one second.
+	const mine = 30 * time.Second
+	const theirs = -5 * time.Second
+	at := now.Add(-mine).Add(-time.Second).Add(theirs)
+
+	if got := health.LagFrom(now, at, mine, theirs, true); got != time.Second {
+		t.Errorf("lag = %v, want 1s", got)
+	}
+	// What it looked like before: 36 seconds of lag on a healthy deployment.
+	if got := health.LagFrom(now, at, mine, theirs, false); got != 36*time.Second {
+		t.Errorf("uncorrected lag = %v, want the 36s this exists to stop reporting", got)
+	}
+	// Still clamped. The correction is measured over a round trip, so a
+	// position published a moment ago can subtract to a hair below zero.
+	if got := health.LagFrom(now, now.Add(time.Millisecond), 0, 0, true); got != 0 {
+		t.Errorf("lag = %v, want it clamped at zero", got)
+	}
+	// And real lag still reads as real lag with no offsets to hand.
+	if got := health.LagFrom(now, now.Add(-90*time.Second), 0, 0, false); got != 90*time.Second {
+		t.Errorf("lag = %v, want 90s", got)
+	}
+}
+
+// One quantity, one metric family, whatever route the reading travelled by. The
+// alert rules in docs/monitoring.md select on the gauge name and not on the
+// daemon, so a reading published anywhere else is a reading nothing alerts on.
+func TestClockSkewFromEveryDaemonLandsInOneFamily(t *testing.T) {
+	var b strings.Builder
+	writeDaemonGauges(&b,
+		// The router measures its own, the feeder's arrives in the position
+		// record it writes several times a second, and the evictor's comes from
+		// the report it publishes after every pass.
+		[]daemonSkew{{"router", 0.002}, {"feeder", -0.5}, {"evictor", -61}},
+		[]daemonGaugeRow{{"evictor", "something_else", 1}},
+	)
+	out := b.String()
+
+	for _, want := range []string{
+		`thermocline_daemon_gauge{daemon="evictor",gauge="clock_skew_seconds"} -61`,
+		`thermocline_daemon_gauge{daemon="feeder",gauge="clock_skew_seconds"} -0.5`,
+		`thermocline_daemon_gauge{daemon="router",gauge="clock_skew_seconds"} 0.002`,
+		`thermocline_daemon_gauge{daemon="evictor",gauge="something_else"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing:\n%s\ngot:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "# HELP thermocline_daemon_gauge"); n != 1 {
+		t.Errorf("the family is declared %d times, want once: Prometheus rejects a repeated HELP", n)
+	}
+	// Sorted, because an exporter that shuffles its own output makes every diff
+	// of two scrapes unreadable.
+	if i, j := strings.Index(out, `daemon="evictor"`), strings.Index(out, `daemon="feeder"`); i > j {
+		t.Errorf("the rows are not sorted by daemon:\n%s", out)
+	}
+	// Nothing to say, nothing said: an empty family with a HELP and no series
+	// is noise in every scrape.
+	var empty strings.Builder
+	writeDaemonGauges(&empty, nil, nil)
+	if empty.Len() != 0 {
+		t.Errorf("wrote a family with no readings in it:\n%s", empty.String())
 	}
 }

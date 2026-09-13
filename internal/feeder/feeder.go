@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -67,6 +68,13 @@ type Feeder struct {
 
 	// buffered work, flushed together
 	pending []pendingOp
+
+	// How far this host's clock is ahead of the archive's, as last measured,
+	// and when that was. Published with the position: see clockSkew.
+	skew      time.Duration
+	skewAt    time.Time
+	skewKnown bool
+	clockOnce sync.Once
 
 	// kindSeen is the namespaces whose collection kind has been checked at
 	// least once since this feeder started. Read and written only from the

@@ -401,6 +401,22 @@ Part of [Thermocline](../README.md).
   A router that is already **running** is a different case and has a knob:
   `router.claim_grace` keeps tiered reads alive through an outage.
 
+- **Two daemons on hosts whose clocks differ are corrected, not required to
+  agree.** Three things here are decided by comparing instants read on different
+  machines, and none of them can be got from a logical clock: mirroring lag, the
+  freshness barrier's wall-clock bar, and the eviction announcements. The first
+  two are now subtracted in the archive's frame, because both daemons talk to
+  the archive and each publishes how far its own clock is from it. That reading
+  is taken over a round trip once a minute, so it is good to a fraction of a
+  millisecond and stale by up to a minute of drift, which is nothing beside the
+  seconds a barrier weighs. The third is not corrected at all: an announcement
+  is stamped by the evictor and expired by the archive's own TTL monitor, and
+  nothing in the middle can adjust what a TTL monitor does. An evictor far
+  enough behind loses documents, which is why it is the one that logs at ERROR
+  rather than WARN, and why the number is published as
+  `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` with an alert rule of
+  its own. Run NTP on every host that runs a cline daemon.
+
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server

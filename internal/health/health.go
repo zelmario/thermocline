@@ -10,12 +10,14 @@ package health
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -118,6 +120,23 @@ type Checker struct {
 	hot      *mongo.Client
 	cold     *mongo.Client
 	feederID string
+
+	// live watches the published position move, which is how this decides
+	// whether the feeder is still running. The alternative is subtracting the
+	// feeder's clock from this one, and this process and the feeder are not
+	// required to be on the same host. See checkpoint.Liveness.
+	live checkpoint.Liveness
+
+	// skew is how far this host's clock is ahead of the archive's, as last
+	// measured, so the feeder's published instant and this one can be compared
+	// in the archive's frame. See LagFrom.
+	//
+	// Guarded because a Checker is a long-lived object handed to a daemon, and
+	// nothing about it says samples have to be taken one at a time.
+	skewMu    sync.Mutex
+	skew      time.Duration
+	skewAt    time.Time
+	skewKnown bool
 }
 
 // New returns a Checker. feederID must match the running feeder's id.
@@ -155,30 +174,24 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 		EventAt time.Time `bson:"eventAt"`
 		SavedAt time.Time `bson:"savedAt"`
 	}
-	var pos struct {
-		At      time.Time `bson:"at"`
-		SavedAt time.Time `bson:"savedAt"`
-		EveryMS int64     `bson:"everyMS"`
-	}
+	// Decoded into the record the feeder writes rather than a copy of its
+	// fields, so there is one definition of what is in there.
+	var pos checkpoint.PositionRecord
 	if perr := c.cold.Database(meta.DB).Collection(meta.PositionsColl).
 		FindOne(ctx, bson.D{{Key: "_id", Value: c.feederID}}).Decode(&pos); perr == nil && !pos.At.IsZero() {
 		// A position left behind by a feeder that has stopped must not read as
-		// "caught up". Four missed publications says the publisher is gone, and
-		// the checkpoint below is then the honest answer.
-		every := time.Duration(pos.EveryMS) * time.Millisecond
-		if every <= 0 {
-			every = time.Second
-		}
-		stale := 4 * every
-		if stale < 2*time.Second {
-			stale = 2 * time.Second
-		}
-		if time.Since(pos.SavedAt) <= stale {
+		// "caught up": the checkpoint below is then the honest answer. It is
+		// decided by watching the record move, because the feeder need not be
+		// on this host and subtracting its clock from this one is only as sound
+		// as the difference between two machines nothing keeps in step.
+		theirs, theirsKnown := pos.Skew()
+		mine, mineKnown := c.archiveSkew(ctx)
+		if c.live.Observe(pos, time.Now(), mine, mineKnown) {
 			latest := pos.At
 			if pos.SavedAt.After(latest) {
 				latest = pos.SavedAt
 			}
-			r.FeederLag = max(time.Since(latest), 0)
+			r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
 			return
 		}
 	}

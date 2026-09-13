@@ -13,6 +13,7 @@ import (
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -423,6 +424,69 @@ func (f *Feeder) namespaceDescription() string {
 // compile-time guard that the policy constants stay in sync with classify.
 var _ = []config.UnannouncedDeletes{config.Tombstone, config.Ignore, config.Halt}
 
+// skewRemeasure is how often the feeder rereads the archive's clock. Clocks
+// drift slowly and a daemon that watched them closely would be paying a round
+// trip several times a second to learn nothing.
+const skewRemeasure = time.Minute
+
+// clockSkew reports how far this feeder's clock is ahead of the archive's.
+//
+// It is published with the position so that a router can put the feeder's
+// instant and its own into one frame before comparing them. Both daemons talk
+// to the archive, so the archive's clock is the reference neither of them has to
+// trust the other about.
+//
+// A failed reading is not an error here. The previous one stands until it can be
+// taken again, and a feeder that has never managed one publishes no skew at all,
+// which readers understand as "compare the raw instants, as everything did
+// before this existed".
+func (f *Feeder) clockSkew(ctx context.Context) (time.Duration, bool) {
+	if f.skewKnown && time.Since(f.skewAt) < skewRemeasure {
+		return f.skew, true
+	}
+	if !f.skewKnown && time.Since(f.skewAt) < time.Second {
+		// A cluster that refuses the reading should not be asked on every
+		// publication, which at the default cadence is fifty times a second.
+		return 0, false
+	}
+	skew, err := health.Skew(ctx, f.cold)
+	f.skewAt = time.Now()
+	if err != nil {
+		f.log.Debug("could not read the archive's clock", "err", err)
+		return f.skew, f.skewKnown
+	}
+	if f.skewKnown && absDuration(skew-f.skew) > health.SkewWarn {
+		f.log.Warn("this host's clock moved against the archive's",
+			"was", f.skew.Round(time.Millisecond).String(),
+			"now", skew.Round(time.Millisecond).String(),
+			"effect", "reads that fall through to the archive judge mirroring against this")
+	}
+	// Said out loud once, the way the evictor says its own. A clock that
+	// disagrees disagrees on every publication, and at the default cadence that
+	// is fifty log lines a second.
+	f.clockOnce.Do(func() {
+		if absDuration(skew) <= health.SkewWarn {
+			f.log.Debug("clocks agree with the archive", "skew", skew.Round(time.Millisecond).String())
+			return
+		}
+		f.log.Warn("this clock and the archive's do not agree",
+			"skew", skew.Round(time.Millisecond).String(),
+			"note", "mirroring lag is measured from an instant stamped here, and so is the wait "+
+				"before a read falls through to the archive. Both are corrected for this "+
+				"difference, and the correction is only as good as the reading",
+			"action", "run NTP on every host that runs a cline daemon")
+	})
+	f.skew, f.skewKnown = skew, true
+	return skew, true
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
 // publishPosition tells everyone else how far mirroring has got.
 //
 // A failure here is logged at debug and otherwise ignored. The position is a
@@ -436,7 +500,8 @@ func (f *Feeder) publishPosition(ctx context.Context) {
 	if time.Since(f.lastPublished) < f.cfg.PositionEvery {
 		return
 	}
-	if err := f.pos.Save(ctx, f.cfg.ID, f.lastEventAt, f.lastEventTS, f.cfg.PositionEvery); err != nil {
+	skew, known := f.clockSkew(ctx)
+	if err := f.pos.Save(ctx, f.cfg.ID, f.lastEventAt, f.lastEventTS, f.cfg.PositionEvery, skew, known); err != nil {
 		f.log.Debug("could not publish the mirroring position", "err", err)
 		return
 	}

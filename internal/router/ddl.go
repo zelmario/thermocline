@@ -188,11 +188,11 @@ func (c *conn) guardRename(ctx context.Context, msg *wire.Message, cmd bson.Raw)
 		}
 	}
 
-	if lag, ok := c.r.mirroringLag(ctx); !ok {
+	if mirroring := c.r.mirroringLag(ctx); !mirroring.known {
 		return refuse("mirroring lag is unknown, so writes to " + from +
 			" may still be in flight and would land in an archive collection that no longer exists")
-	} else if lag > renameMaxLag {
-		return refuse("mirroring is " + lag.Round(time.Millisecond).String() + " behind, limit " +
+	} else if mirroring.lag > renameMaxLag {
+		return refuse("mirroring is " + mirroring.lag.Round(time.Millisecond).String() + " behind, limit " +
 			renameMaxLag.String() + ": writes to " + from + " are still in flight and would land in " +
 			"an archive collection that no longer exists. Retry once the feeder has caught up")
 	}

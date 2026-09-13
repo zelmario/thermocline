@@ -107,6 +107,15 @@ its copy, and the document is lost from both tiers. Negative is behind, which is
 the direction that loses data. The evictor measures this against the archive on
 every pass.
 
+Every daemon publishes into this one family, by whatever route it has: the
+evictor in its report, the feeder in the position record it writes several times
+a second, and the router by measuring its own. The rules below select on the
+gauge name rather than the daemon, so all of them are covered without a rule
+each. The other two matter less than the evictor and are worth watching anyway:
+mirroring lag and the freshness barrier are both worked out by subtracting one
+host's instant from another's, and both are corrected for exactly this reading,
+so a correction nobody can see is a correction nobody can check.
+
 **7. A series that is absent, which is the failure no threshold catches.** Every
 alert above compares a number, and a daemon that never started publishes no
 number at all: the evictor's `seconds_since_pass` climbs when it stops and does

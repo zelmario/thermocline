@@ -54,3 +54,60 @@ func Skew(ctx context.Context, c *mongo.Client) (time.Duration, error) {
 	middle := before.Add(after.Sub(before) / 2)
 	return middle.Sub(res.LocalTime), nil
 }
+
+// LagFrom is how far behind a published instant is, with both clocks accounted
+// for when they are known.
+//
+// The two instants come from two machines: the feeder stamps the position with
+// its own clock and whoever reads it is holding its own. Clamping at zero used
+// to be the whole treatment, and it only hides the direction that produces a
+// negative number. The other direction produces a positive one, which nothing
+// can tell from real lag: a host thirty seconds ahead of its feeder reads
+// thirty seconds of mirroring lag on a deployment where nothing is behind, and
+// that number gates eviction and is what the alert rules watch.
+//
+// Both sides talk to the archive, so both can say where they stand against that
+// one clock. With either offset missing the raw instants are subtracted, which
+// is what this did before.
+//
+// Still clamped. The correction is measured over a round trip and is good to a
+// fraction of a millisecond, not exact, and a lag of minus one millisecond is
+// not a small number, it is a nonsense one.
+func LagFrom(now, at time.Time, mine, theirs time.Duration, known bool) time.Duration {
+	if known {
+		now = now.Add(-mine)
+		at = at.Add(-theirs)
+	}
+	return max(now.Sub(at), 0)
+}
+
+// skewRemeasure is how often the archive's clock is reread. Clocks drift
+// slowly, and a daemon that watched them closely would pay a round trip per
+// sample to learn nothing.
+const skewRemeasure = time.Minute
+
+// archiveSkew is how far this host's clock is ahead of the archive's, and
+// whether it has ever been measured.
+//
+// This one is taken in line rather than in the background, unlike the router's,
+// because a sample is already several round trips to both tiers and is taken on
+// a sweep's cadence rather than a read's.
+func (c *Checker) archiveSkew(ctx context.Context) (time.Duration, bool) {
+	c.skewMu.Lock()
+	defer c.skewMu.Unlock()
+	if c.skewKnown && time.Since(c.skewAt) < skewRemeasure {
+		return c.skew, true
+	}
+	if !c.skewKnown && !c.skewAt.IsZero() && time.Since(c.skewAt) < skewRemeasure {
+		// A cluster that refuses the reading is not asked again every sample.
+		return 0, false
+	}
+	skew, err := Skew(ctx, c.cold)
+	c.skewAt = time.Now()
+	if err != nil {
+		// The last reading stands, which is a better answer than none.
+		return c.skew, c.skewKnown
+	}
+	c.skew, c.skewKnown = skew, true
+	return skew, true
+}

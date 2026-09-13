@@ -447,6 +447,111 @@ stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 
+echo "== the barrier across two clocks =="
+# The wall-clock bar compares an instant the feeder wrote with one the router
+# took, and the two daemons are not required to be on the same host. A router
+# running a few seconds ahead of its feeder never clears that bar: every read
+# that falls through waits the whole archive_wait and then answers stale anyway,
+# which is slow and stale, the pair this barrier exists to avoid. The warning it
+# prints is the one a genuinely lagging feeder prints, so nothing says why.
+#
+# Both instants are put in the archive's frame first. The feeder publishes how
+# far ahead of the archive its own clock is, the router measures its own, and
+# the archive is a reference neither has to trust the other about.
+#
+# Measuring that needs two clocks that differ, and both daemons here are on one
+# machine. So the feeder is replaced by a record: a router pointed at a feeder id
+# nothing is publishing under, and a loop that writes that id's position by hand.
+# Moving it is what keeps it looking alive, and everything else about the two
+# runs below is identical except the one field that says where the publisher's
+# clock stands. The outcomes are opposite.
+GHOST_NS=$NS
+FID=$(sed -n '/^feeder:/,/^[a-z]/{s/^  id: *"\(.*\)"/\1/p}' $CFG | head -1)
+stopDaemons
+sed "/id:/s/\"$FID\"/\"${FID}ghost\"/" $CFG > $WDIR/fresh_skew.yaml
+chk "the ghost config names a feeder nothing publishes for" "1" \
+    "$(grep -c "^  id: \"${FID}ghost\"" $WDIR/fresh_skew.yaml)"
+C "db.getSiblingDB(process.env.TC_META).positions.deleteOne({_id:'${FID}ghost'})" >/dev/null
+
+# One mongosh for the whole loop: starting it per write costs a second each and
+# the record has to move faster than the staleness window.
+#
+# BACK is how far behind the archive's present the published position is, and
+# SKEW is what the publisher says about its own clock. A publisher two minutes
+# behind the archive, whose position is a minute old by its own reckoning, has
+# mirrored a minute past the present in the archive's frame.
+moveGhost() {
+  TC_GHOST="${FID}ghost" TC_BACK="$1" TC_SKEW="$2" \
+  mongosh "$COLD" --quiet --eval '
+    const d = db.getSiblingDB(process.env.TC_META);
+    const back = Number(process.env.TC_BACK), skew = Number(process.env.TC_SKEW);
+    for (let i = 0; i < 150; i++) {
+      d.positions.updateOne({_id: process.env.TC_GHOST},
+        {$set: {at: new Date(Date.now() - back), savedAt: new Date(),
+                everyMS: 20, skewMS: skew, moved: i}}, {upsert: true});
+      sleep(200);
+    }' >/dev/null 2>&1 &
+  GHOSTPID=$!
+  for _ in $(seq 1 40); do
+    [ "$(C "print(!!db.getSiblingDB(process.env.TC_META).positions.findOne({_id:'${FID}ghost'}))")" = "true" ] && return 0
+    sleep 0.5
+  done
+  echo "  WARN  the ghost position was never written"
+}
+stopGhost() { kill $GHOSTPID 2>/dev/null; wait $GHOSTPID 2>/dev/null; }
+
+# A read through the router, timed inside mongosh. Timing the invocation would
+# measure node starting up, which already cost this suite a false failure once.
+timedRead() {
+  R "const t=Date.now();
+     const n=db.getSiblingDB(process.env.TC_DB).$GHOST_NS.countDocuments({});
+     print(n + ' ' + (Date.now()-t));"
+}
+
+# What the archive holds now is what a fall-through read must return. Counted
+# rather than assumed: the sections above have inserted and deleted in this
+# namespace, and a hard-coded ten would be a check on their arithmetic.
+WANT=$(C "print(db.getSiblingDB(process.env.TC_DB).$GHOST_NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
+
+# The uncorrected case first: a position a minute old, from a publisher that
+# says its clock agrees with the archive. That is a feeder genuinely a minute
+# behind, and waiting is the right answer.
+moveGhost 60000 0
+rm -f $LOGDIR/fresh_r.log
+startRouter $WDIR/fresh_skew.yaml
+# The router measures its own offset in the background and the first read that
+# asks gets "not known yet" and the uncorrected comparison. That is deliberate:
+# a correction applied on one side only would be worse than none. This read is
+# what makes the offset known for the ones that follow.
+timedRead >/dev/null
+BEHIND=$(timedRead)
+BEHIND_MS=${BEHIND##* }
+echo "      a position a minute behind, publisher in step with the archive: ${BEHIND_MS} ms"
+chk "a feeder genuinely behind is waited for"  "true" \
+    "$([ "${BEHIND_MS:-0}" -ge 1000 ] && echo true || echo false)"
+chk "and the read is answered anyway"          "$WANT" "${BEHIND%% *}"
+stopDaemons
+stopGhost
+
+# The same record, one field different: the publisher's clock is two minutes
+# behind the archive's. Its position is then a minute past the present in the
+# archive's frame, and there is nothing to wait for.
+moveGhost 60000 -120000
+rm -f $LOGDIR/fresh_r.log
+startRouter $WDIR/fresh_skew.yaml
+timedRead >/dev/null
+SKEWED=$(timedRead)
+SKEWED_MS=${SKEWED##* }
+echo "      the same position from a publisher two minutes behind the archive: ${SKEWED_MS} ms"
+chk "a clock difference is not mirroring lag"  "true" \
+    "$([ "${SKEWED_MS:-9999}" -lt 700 ] && echo true || echo false)"
+chk "and that read is correct too"             "$WANT" "${SKEWED%% *}"
+chk "nothing was answered short"               "false" \
+    "$(grep -q 'before mirroring caught up' $LOGDIR/fresh_r.log && echo true || echo false)"
+stopDaemons
+stopGhost
+C "db.getSiblingDB(process.env.TC_META).positions.deleteOne({_id:'${FID}ghost'})" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

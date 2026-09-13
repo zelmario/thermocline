@@ -44,7 +44,8 @@ func TestCaughtUp(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := caughtUp(tc.at, tc.ts, read, tc.untilTS); got != tc.want {
+			r := reading{at: tc.at, ts: tc.ts, known: true}
+			if got := caughtUp(r, read, tc.untilTS, 0, false); got != tc.want {
 				t.Fatalf("caughtUp = %v, want %v", got, tc.want)
 			}
 		})
@@ -113,10 +114,83 @@ func TestPollIntervalPacesToTheFeeder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &checkpointCache{everyMS: tc.everyMS}
+			c := &checkpointCache{last: reading{everyMS: tc.everyMS}}
 			if got := c.pollInterval(); got != tc.want {
 				t.Fatalf("pollInterval = %v, want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+// The wall-clock bar compares an instant the feeder wrote against one this
+// router took, and two hosts do not agree about what time it is.
+//
+// It is the direction that makes it worth fixing. A router running ahead of its
+// feeder never clears the bar, so every read that falls through waits the whole
+// archive_wait and then answers stale anyway: slow and stale, the pair the
+// barrier exists to avoid, and the log line it produces is the one a genuinely
+// lagging feeder produces. Nothing distinguishes them.
+//
+// Both instants are put in the archive's frame first. The feeder publishes how
+// far ahead of the archive it is, this side measures the same for itself, and
+// the archive is then a reference neither has to trust the other about.
+func TestCaughtUpAcrossTwoClocks(t *testing.T) {
+	read := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+
+	// Mirroring is genuinely up to date: in the archive's frame the feeder's
+	// position is a second past the instant this read began.
+	//
+	//   archive     12:00:00      the reference
+	//   router      12:00:05      five seconds ahead, so `read` reads 12:00:05
+	//   feeder      11:59:58      two behind, so its position reads 11:59:59
+	//
+	// Raw, that is 11:59:59 against 12:00:05 and the bar never clears.
+	const routerSkew = 5 * time.Second
+	const feederSkew = -2 * time.Second
+	position := read.Add(-routerSkew).Add(time.Second).Add(feederSkew)
+
+	got := reading{at: position, known: true, skew: feederSkew, skewKnown: true}
+
+	t.Run("with both offsets it clears", func(t *testing.T) {
+		if !caughtUp(got, read, 0, routerSkew, true) {
+			t.Fatalf("mirroring is a second past this read and the bar did not clear")
+		}
+	})
+
+	t.Run("and a feeder that is genuinely behind still does not", func(t *testing.T) {
+		behind := got
+		behind.at = read.Add(-routerSkew).Add(-time.Second).Add(feederSkew)
+		if caughtUp(behind, read, 0, routerSkew, true) {
+			t.Fatalf("mirroring is a second short of this read and the bar cleared")
+		}
+	})
+
+	t.Run("a feeder that publishes no offset is compared raw", func(t *testing.T) {
+		// The upgrade case: correcting one side and not the other would be
+		// worse than correcting neither.
+		old := got
+		old.skewKnown = false
+		if caughtUp(old, read, 0, routerSkew, true) {
+			t.Fatalf("one-sided correction was applied")
+		}
+	})
+
+	t.Run("a router that has not measured yet compares raw", func(t *testing.T) {
+		// Which is this defect: uncorrected, a healthy feeder never clears the
+		// bar. It is asserted rather than left implied, because a correction
+		// applied on one side only would be worse than none.
+		if caughtUp(got, read, 0, 0, false) {
+			t.Fatalf("the feeder's offset was applied on its own")
+		}
+	})
+
+	t.Run("the cluster-time bar still binds", func(t *testing.T) {
+		// Correcting the clocks does not weaken the sound bar: mirroring is
+		// past this read by the wall clock and short of it by cluster time.
+		withTS := got
+		withTS.ts = bson.Timestamp{T: 100, I: 4}
+		if caughtUp(withTS, read, checkpoint.PackTS(bson.Timestamp{T: 100, I: 5}), routerSkew, true) {
+			t.Fatalf("a corrected wall clock cleared a read the cluster time says is not mirrored")
+		}
+	})
 }

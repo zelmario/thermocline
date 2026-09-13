@@ -93,6 +93,22 @@ type Router struct {
 	checkpoints *checkpoint.Store
 	positions   *checkpoint.Positions
 	ckptCache   checkpointCache
+	// posLive watches the published position move, which is how this decides
+	// whether the feeder is still running. It is a watcher rather than a
+	// reading because the alternative compares this host's clock against the
+	// feeder's, and getting that wrong turns the freshness barrier off.
+	posLive checkpoint.Liveness
+	// clock is how far this host's clock is ahead of the archive's, as last
+	// measured. The feeder publishes the same reading about itself, and the two
+	// together are what make the freshness barrier's wall-clock comparison mean
+	// anything across hosts. See caughtUp.
+	clock struct {
+		mu        sync.Mutex
+		skew      time.Duration
+		at        time.Time // when the last reading was attempted
+		known     bool
+		measuring bool
+	}
 	// seenOpTime is the newest cluster time the fast tier has reported, packed
 	// so it fits an atomic. A read falling through to the archive waits for
 	// mirroring to reach it. See freshness.go for why a cluster time and not a
@@ -313,6 +329,7 @@ func (r *Router) Survey(ctx context.Context) error {
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
 	r.warnAboutOptionDrift(ctx)
+	r.warnAboutClocks(ctx)
 	// Last here, first in Listen's ordering terms: it reads one index listing
 	// per tiered namespace and a start defers it behind the listener for that
 	// reason. Nothing is waiting on this one, so it runs inline.
@@ -445,6 +462,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
 	r.warnAboutOptionDrift(ctx)
+	r.warnAboutClocks(ctx)
 	// And the litter a router that died mid-aggregation leaves in the
 	// application's own database. See dropLeftoverScratch.
 	r.dropLeftoverScratch(ctx, false)

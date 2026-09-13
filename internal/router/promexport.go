@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -114,6 +115,28 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		fmt.Fprintf(b, "thermocline_command_duration_seconds_count{class=\"%s\"} %d\n", promEscape(c.Name), c.Count)
 	}
 
+	// What each daemon says about its own clock, in one place, because one
+	// alert rule has to cover all of them.
+	//
+	// Values that go up and down and may be negative, so they cannot travel
+	// with the counters. The evictor's is why this exists: far enough behind
+	// and an eviction announcement expires before the feeder reads the delete
+	// it explains, and the document is lost from both tiers. The router's and
+	// the feeder's are here because the freshness barrier and mirroring lag are
+	// both worked out by subtracting one host's instant from another's, and a
+	// correction nobody can see is a correction nobody can check.
+	//
+	// The evictor's arrives in its daemon report, which it writes after every
+	// pass. The feeder publishes no report, so its reading travels in the
+	// position record it writes several times a second, and the router's is its
+	// own. Alert rules select on the gauge name rather than the daemon, so all
+	// of them are covered by what is already written down.
+	var skews []daemonSkew
+	var other []daemonGaugeRow
+	if mine, ok := r.archiveSkew(ctx); ok {
+		skews = append(skews, daemonSkew{"router", mine.Seconds()})
+	}
+
 	// Mirroring lag: the first alert anyone should build.
 	//
 	// Infinity, not a missing series, when nothing has ever been mirrored. A
@@ -126,8 +149,12 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	const lagHelp = "How far the archive trails the fast tier. Eviction safety, recovery " +
 		"exposure and fallback read latency all hang off this. +Inf means nothing has been " +
 		"mirrored at all, which is a feeder that has never run."
-	if lag, ok := r.mirroringLag(ctx); ok {
-		gauge("mirroring_lag_seconds", lagHelp, lag.Seconds())
+	mirroring := r.mirroringLag(ctx)
+	if mirroring.feederSkewKnown {
+		skews = append(skews, daemonSkew{"feeder", mirroring.feederSkew.Seconds()})
+	}
+	if mirroring.known {
+		gauge("mirroring_lag_seconds", lagHelp, mirroring.lag.Seconds())
 	} else if r.cfg.FeederID != "" {
 		gauge("mirroring_lag_seconds", lagHelp, math.Inf(1))
 	}
@@ -156,32 +183,6 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			}
 			fmt.Fprintf(b, "thermocline_daemon_dry_run{daemon=\"%s\"} %d\n", promEscape(rep.ID), dry)
 		}
-		// Values that go up and down, and may be negative, so they cannot
-		// travel with the counters: the evictor's clock skew against the
-		// archive is why this exists. Far enough behind and an eviction
-		// announcement expires before the feeder reads the delete it explains,
-		// and the document is lost from both tiers.
-		gauged := false
-		for _, rep := range reports {
-			if len(rep.Gauges) == 0 {
-				continue
-			}
-			if !gauged {
-				fmt.Fprintf(b, "# HELP thermocline_daemon_gauge What each daemon last measured about itself. clock_skew_seconds is this daemon's clock less the archive's; negative means behind, which is the direction that loses documents.\n")
-				fmt.Fprintf(b, "# TYPE thermocline_daemon_gauge gauge\n")
-				gauged = true
-			}
-			names := make([]string, 0, len(rep.Gauges))
-			for k := range rep.Gauges {
-				names = append(names, k)
-			}
-			sort.Strings(names)
-			for _, k := range names {
-				fmt.Fprintf(b, "thermocline_daemon_gauge{daemon=\"%s\",gauge=\"%s\"} %s\n",
-					promEscape(rep.ID), promEscape(k),
-					strconv.FormatFloat(rep.Gauges[k], 'f', -1, 64))
-			}
-		}
 		fmt.Fprintf(b, "# HELP thermocline_daemon_documents_total Documents each daemon has handled since it started, by outcome.\n")
 		fmt.Fprintf(b, "# TYPE thermocline_daemon_documents_total counter\n")
 		for _, rep := range reports {
@@ -195,7 +196,19 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 					promEscape(rep.ID), promEscape(k), rep.Counters[k])
 			}
 		}
+		for _, rep := range reports {
+			for name, v := range rep.Gauges {
+				if name == "clock_skew_seconds" {
+					skews = append(skews, daemonSkew{rep.ID, v})
+					continue
+				}
+				// Anything else a daemon measured about itself, kept where it
+				// has always been published.
+				other = append(other, daemonGaugeRow{rep.ID, name, v})
+			}
+		}
 	}
+	writeDaemonGauges(b, skews, other)
 
 	// An operator hold on eviction, exported because a hold that is forgotten is
 	// its own outage: the fast tier fills up with everything that should have
@@ -241,9 +254,9 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 // barrier waits on, and falls back to the durable checkpoint when no position
 // is being published. A feeder that has stopped shows as lag that grows, which
 // is exactly what it should look like from outside.
-func (r *Router) mirroringLag(ctx context.Context) (time.Duration, bool) {
+func (r *Router) mirroringLag(ctx context.Context) mirroringReading {
 	if r.cfg.FeederID == "" {
-		return 0, false
+		return mirroringReading{}
 	}
 	// Clamped at zero, the way internal/health does it for the same value.
 	//
@@ -256,14 +269,79 @@ func (r *Router) mirroringLag(ctx context.Context) (time.Duration, bool) {
 	// The evictor's copy of this arithmetic has clamped since it was written,
 	// and this one is the twin nobody treated: the same quantity was honest in
 	// the health check and wrong in the metric an operator graphs.
+	//
+	// Clamping treated the symptom, and the cause is that the two instants come
+	// from two machines. The feeder publishes how far ahead of the archive its
+	// own clock is, and this side measures the same for itself, so both can be
+	// put in the archive's frame before being subtracted. Without that, a
+	// router thirty seconds ahead of its feeder graphs thirty seconds of
+	// mirroring lag on a healthy deployment, and the README tells operators to
+	// alert on this value.
 	if rec, ok, err := r.positions.At(ctx, r.cfg.FeederID); err == nil && ok {
-		return max(time.Since(rec.At), 0), true
+		theirs, theirsKnown := rec.Skew()
+		mine, mineKnown := r.archiveSkew(ctx)
+		return mirroringReading{
+			lag:        health.LagFrom(time.Now(), rec.At, mine, theirs, mineKnown && theirsKnown),
+			known:      true,
+			feederSkew: theirs, feederSkewKnown: theirsKnown,
+		}
 	}
 	at, ok, err := r.checkpoints.EventAt(ctx, r.cfg.FeederID)
 	if err != nil || !ok {
-		return 0, false
+		return mirroringReading{}
 	}
-	return max(time.Since(at), 0), true
+	return mirroringReading{lag: max(time.Since(at), 0), known: true}
+}
+
+// daemonSkew is one daemon's clock less the archive's, in seconds.
+type daemonSkew struct {
+	daemon string
+	value  float64
+}
+
+// daemonGaugeRow is anything else a daemon measured about itself.
+type daemonGaugeRow struct {
+	daemon string
+	name   string
+	value  float64
+}
+
+// writeDaemonGauges prints what each daemon last measured about itself, with
+// the clock offsets from every daemon in one family whatever route they
+// travelled by: a daemon report, the feeder's position record, or this process
+// measuring its own.
+func writeDaemonGauges(b *strings.Builder, skews []daemonSkew, other []daemonGaugeRow) {
+	if len(skews) == 0 && len(other) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "# HELP thermocline_daemon_gauge What each daemon last measured about itself. clock_skew_seconds is this daemon's clock less the archive's; negative means behind, which is the direction that loses documents.\n")
+	fmt.Fprintf(b, "# TYPE thermocline_daemon_gauge gauge\n")
+	sort.Slice(skews, func(i, j int) bool { return skews[i].daemon < skews[j].daemon })
+	for _, s := range skews {
+		fmt.Fprintf(b, "thermocline_daemon_gauge{daemon=\"%s\",gauge=\"clock_skew_seconds\"} %s\n",
+			promEscape(s.daemon), strconv.FormatFloat(s.value, 'f', -1, 64))
+	}
+	sort.Slice(other, func(i, j int) bool {
+		if other[i].daemon != other[j].daemon {
+			return other[i].daemon < other[j].daemon
+		}
+		return other[i].name < other[j].name
+	})
+	for _, g := range other {
+		fmt.Fprintf(b, "thermocline_daemon_gauge{daemon=\"%s\",gauge=\"%s\"} %s\n",
+			promEscape(g.daemon), promEscape(g.name), strconv.FormatFloat(g.value, 'f', -1, 64))
+	}
+}
+
+// mirroringReading is what one look at the feeder's published position says
+// about it: how far behind mirroring is, and where the feeder's own clock
+// stands, which is both how that lag was worked out and a number worth
+// exporting on its own.
+type mirroringReading struct {
+	lag             time.Duration
+	known           bool
+	feederSkew      time.Duration
+	feederSkewKnown bool
 }
 
 // daemonReports reads what the background daemons last published.

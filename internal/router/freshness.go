@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
+	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -79,7 +81,7 @@ const (
 // pollInterval is how long to wait before reading the position again.
 func (c *checkpointCache) pollInterval() time.Duration {
 	c.mu.Lock()
-	every := c.everyMS
+	every := c.last.everyMS
 	c.mu.Unlock()
 	if every <= 0 {
 		// A feeder that promises no cadence gets the slowest of these, which is
@@ -113,13 +115,8 @@ const checkpointIdle = time.Second
 // both, and removes the load of one query per waiting read at the same time.
 type checkpointCache struct {
 	mu      sync.Mutex
-	at      time.Time      // the feeder's position, by the clock
-	ts      bson.Timestamp // and as a cluster time, when it published one
-	known   bool
+	last    reading
 	fetched time.Time // when this reading was taken
-	// everyMS is the cadence the feeder promised, which is what this side
-	// paces itself against. Zero until a position has been read.
-	everyMS int64
 
 	// updated is closed and replaced every time the reading changes, so a
 	// waiter can take it, check the reading, and block on it without a race:
@@ -132,6 +129,21 @@ type checkpointCache struct {
 	polling bool
 }
 
+// reading is everything one look at the published position says.
+type reading struct {
+	at    time.Time      // the feeder's position, by the feeder's clock
+	ts    bson.Timestamp // and as a cluster time, when it published one
+	known bool
+	// everyMS is the cadence the feeder promised, which is what this side
+	// paces itself against. Zero until a position has been read.
+	everyMS int64
+	// skew is how far the feeder's clock was ahead of the archive's when it
+	// last looked, which is what makes at comparable with an instant taken
+	// here. See caughtUp.
+	skew      time.Duration
+	skewKnown bool
+}
+
 // waitChan returns the channel that will be closed on the next reading.
 func (c *checkpointCache) waitChan() chan struct{} {
 	if c.updated == nil {
@@ -141,11 +153,14 @@ func (c *checkpointCache) waitChan() chan struct{} {
 }
 
 // publish records a reading and wakes everything waiting on it.
-func (c *checkpointCache) publish(at time.Time, ts bson.Timestamp, known bool, everyMS int64) {
+func (c *checkpointCache) publish(r reading) {
 	c.mu.Lock()
-	c.at, c.ts, c.known, c.fetched = at, ts, known, time.Now()
-	if everyMS > 0 {
-		c.everyMS = everyMS
+	everyMS := c.last.everyMS
+	c.last, c.fetched = r, time.Now()
+	if c.last.everyMS <= 0 {
+		// A reading that says nothing about the cadence does not unsay what the
+		// last one did, since this side paces itself against it.
+		c.last.everyMS = everyMS
 	}
 	if c.updated != nil {
 		close(c.updated)
@@ -163,8 +178,7 @@ func (r *Router) poll(ctx context.Context) {
 	}()
 	idleSince := time.Time{}
 	for {
-		at, ts, known, everyMS := r.readPosition(ctx)
-		r.ckptCache.publish(at, ts, known, everyMS)
+		r.ckptCache.publish(r.readPosition(ctx))
 
 		r.ckptCache.mu.Lock()
 		n := r.ckptCache.waiters
@@ -235,38 +249,37 @@ func (r *Router) noteOpTime(reply *wire.Message) {
 }
 
 // mirroredThrough returns how far mirroring has got, reusing a recent reading.
-func (r *Router) mirroredThrough(ctx context.Context) (time.Time, bson.Timestamp, bool) {
+func (r *Router) mirroredThrough(ctx context.Context) reading {
 	r.ckptCache.mu.Lock()
 	if !r.ckptCache.fetched.IsZero() {
-		at, ts, known := r.ckptCache.at, r.ckptCache.ts, r.ckptCache.known
+		last := r.ckptCache.last
 		r.ckptCache.mu.Unlock()
-		return at, ts, known
+		return last
 	}
 	r.ckptCache.mu.Unlock()
 	// Nothing has been read yet, so this first caller fetches it rather than
 	// waiting a poll to find out.
-	at, ts, known, everyMS := r.readPosition(ctx)
-	r.ckptCache.publish(at, ts, known, everyMS)
-	return at, ts, known
+	got := r.readPosition(ctx)
+	r.ckptCache.publish(got)
+	return got
 }
 
 // readPosition asks the archive how far mirroring has got.
-func (r *Router) readPosition(ctx context.Context) (time.Time, bson.Timestamp, bool, int64) {
+func (r *Router) readPosition(ctx context.Context) reading {
 	// The position first. It says the same thing the checkpoint's eventAt says,
 	// published on its own much faster cadence, and it is the difference
 	// between this wait costing a couple of milliseconds and costing a whole
 	// checkpoint interval. The checkpoint remains the fallback, for a feeder
 	// that publishes no position.
-	var at time.Time
-	var ts bson.Timestamp
-	var known bool
-	var everyMS int64
+	var got reading
+	mine, mineKnown := r.archiveSkew(ctx)
 	rec, ok, err := r.positions.At(ctx, r.cfg.FeederID)
 	switch {
-	case err == nil && ok && rec.Live(time.Now()):
-		at, ts, known, everyMS = rec.At, rec.TS, true, rec.EveryMS
+	case err == nil && ok && r.posLive.Observe(rec, time.Now(), mine, mineKnown):
+		got.at, got.ts, got.known, got.everyMS = rec.At, rec.TS, true, rec.EveryMS
+		got.skew, got.skewKnown = rec.Skew()
 	case err == nil && ok:
-		// A position that exists and has gone stale is evidence, not an
+		// A position that exists and has stopped moving is evidence, not an
 		// absence: this feeder was publishing and has stopped. Falling back to
 		// its checkpoint would read as "mirroring is a little behind" and every
 		// read would then wait out the whole barrier for a feeder that is never
@@ -278,16 +291,16 @@ func (r *Router) readPosition(ctx context.Context) (time.Time, bson.Timestamp, b
 		// every time. Saying "nothing is mirroring" instead answers at once and
 		// warns, which is what the barrier already does when there is no
 		// checkpoint at all.
-		return time.Time{}, bson.Timestamp{}, false, rec.EveryMS
+		return reading{everyMS: rec.EveryMS}
 	default:
 		// No position record at all, which is a feeder too old to publish one.
 		// Its checkpoint is the only signal there is.
-		at, known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
+		got.at, got.known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
 	}
 	if err != nil {
-		return time.Time{}, bson.Timestamp{}, false, 0
+		return reading{}
 	}
-	return at, ts, known, everyMS
+	return got
 }
 
 // waitForArchive blocks until mirroring has reached until, and reports whether
@@ -327,14 +340,14 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		next := r.ckptCache.waitChan()
 		r.ckptCache.mu.Unlock()
 
-		at, ts, known := r.mirroredThrough(ctx)
-		if known && caughtUp(at, ts, until, untilTS) {
+		got := r.mirroredThrough(ctx)
+		if got.known && r.caughtUp(ctx, got, until, untilTS) {
 			return true
 		}
 		// No checkpoint at all means nothing is mirroring. Waiting the full
 		// timeout on every read would turn a stopped feeder into an outage, so
 		// this gives up at once and lets the caller answer and warn.
-		if !known {
+		if !got.known {
 			return false
 		}
 		left := time.Until(deadline)
@@ -401,12 +414,172 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 // no reply has taken none; in both cases the wall-clock comparison is the whole
 // answer, exactly as it was before. Refusing instead would turn an upgrade into
 // a stall.
-func caughtUp(at time.Time, ts bson.Timestamp, until time.Time, untilTS uint64) bool {
+//
+// The wall-clock bar is the one that needs care, because the two instants were
+// read from two machines. `at` is the feeder's clock and `until` is this one,
+// and a router running a few seconds ahead of its feeder never clears the bar:
+// every read that falls through waits the whole archive_wait and then answers
+// stale anyway, which is slow and stale, the pair this barrier exists to avoid.
+// Nothing said so, because the answer it gives is the one a genuinely lagging
+// feeder gives.
+//
+// So both instants are put in the archive's frame before they are compared. The
+// feeder publishes how far ahead of the archive its own clock is, this side
+// measures the same thing for itself, and the archive's clock is then the one
+// reference neither daemon has to trust the other about. When either offset is
+// missing the raw instants are compared, which is what this did before.
+func (r *Router) caughtUp(ctx context.Context, got reading, until time.Time, untilTS uint64) bool {
+	mine, ok := r.archiveSkew(ctx)
+	return caughtUp(got, until, untilTS, mine, ok)
+}
+
+// caughtUp is the decision itself, with both offsets already in hand.
+func caughtUp(got reading, until time.Time, untilTS uint64, mine time.Duration, mineKnown bool) bool {
+	at := got.at
+	if mineKnown && got.skewKnown {
+		at = at.Add(-got.skew)
+		until = until.Add(-mine)
+	}
 	if at.Before(until) {
 		return false
 	}
-	if untilTS == 0 || ts.T == 0 {
+	if untilTS == 0 || got.ts.T == 0 {
 		return true
 	}
-	return checkpoint.PackTS(ts) >= untilTS
+	return checkpoint.PackTS(got.ts) >= untilTS
+}
+
+// archiveSkew is how far this host's clock is ahead of the archive's, and
+// whether it has ever been measured.
+//
+// It never waits for the answer. The reading is a round trip to the archive and
+// the callers are a read deciding whether to wait and a metrics scrape, so
+// blocking either on the archive would put the archive's latency in front of
+// work that had no reason to touch it, and holding the lock across the call
+// would put every other caller behind it too. The measurement runs in the
+// background and the previous answer is given meanwhile, which for the first
+// call means "not known" and a comparison of raw instants, exactly as before.
+//
+// Reread on the same cadence the feeder rereads its own, and for the same
+// reason: clocks drift slowly, and asking several times a second would pay a
+// round trip to learn nothing.
+func (r *Router) archiveSkew(ctx context.Context) (time.Duration, bool) {
+	r.clock.mu.Lock()
+	fresh := r.clock.known && time.Since(r.clock.at) < skewRemeasure
+	// A cluster that refuses the reading is not asked again on every read, and
+	// one measurement is enough to have in flight at a time.
+	backOff := !r.clock.known && !r.clock.at.IsZero() && time.Since(r.clock.at) < time.Second
+	start := !fresh && !backOff && !r.clock.measuring
+	if start {
+		r.clock.measuring = true
+	}
+	skew, known := r.clock.skew, r.clock.known
+	r.clock.mu.Unlock()
+
+	if start {
+		r.goSafely("reading the archive's clock", func() {
+			r.measureArchiveSkew(context.WithoutCancel(ctx))
+		})
+	}
+	return skew, known
+}
+
+// noteArchiveSkew records a reading somebody else took.
+func (r *Router) noteArchiveSkew(skew time.Duration) {
+	r.clock.mu.Lock()
+	defer r.clock.mu.Unlock()
+	r.clock.skew, r.clock.known, r.clock.at = skew, true, time.Now()
+}
+
+// measureArchiveSkew takes the reading and records it.
+func (r *Router) measureArchiveSkew(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, skewTimeout)
+	defer cancel()
+	skew, err := health.Skew(ctx, r.cold)
+
+	r.clock.mu.Lock()
+	defer r.clock.mu.Unlock()
+	r.clock.measuring = false
+	r.clock.at = time.Now()
+	if err != nil {
+		// The last reading stands. It is minutes of drift out of date at worst,
+		// which is a better answer than none.
+		return
+	}
+	if r.clock.known && absDuration(skew-r.clock.skew) > health.SkewWarn {
+		r.log.Warn("this host's clock moved against the archive's",
+			"was", r.clock.skew.Round(time.Millisecond).String(),
+			"now", skew.Round(time.Millisecond).String(),
+			"effect", "reads that fall through to the archive judge mirroring against this")
+	}
+	r.clock.skew, r.clock.known = skew, true
+}
+
+// skewTimeout bounds the reading. It is a hello on an existing pool; taking
+// longer than this means the archive has troubles that this is not the place to
+// wait out.
+const skewTimeout = 5 * time.Second
+
+// skewRemeasure is how often each side rereads the archive's clock.
+const skewRemeasure = time.Minute
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+// warnAboutClocks reports a host clock that disagrees with either tier.
+//
+// Three things in this system are decided by comparing instants that were read
+// on different machines, and this is the one place a human is told before any
+// of them misbehaves:
+//
+//   - the freshness barrier, which compares the feeder's published position
+//     against the instant a read began, and answers stale or waits the whole
+//     archive_wait when the two hosts disagree;
+//   - thermocline_mirroring_lag_seconds, which is the number the alert rules
+//     watch and reads as lag that is not there;
+//   - the eviction announcements, which expire on the archive's TTL and are
+//     what the feeder needs to tell an eviction from the application's own
+//     delete. That one destroys data. See internal/health's own note.
+//
+// The offsets are corrected for where they can be, and the correction is
+// measured over a round trip on a cadence, so it is a good answer rather than a
+// perfect one. A host that is minutes out is still worth fixing rather than
+// working around.
+func (r *Router) warnAboutClocks(ctx context.Context) {
+	for _, tier := range []struct {
+		name   string
+		client *mongo.Client
+	}{{"the archive", r.cold}, {"the fast tier", r.hot}} {
+		if tier.client == nil {
+			continue
+		}
+		skew, err := health.Skew(ctx, tier.client)
+		if err != nil {
+			r.log.Debug("could not read a tier's clock", "tier", tier.name, "err", err)
+			continue
+		}
+		if tier.client == r.cold {
+			// Kept rather than read and thrown away. It is the same reading
+			// the barrier and the lag metric use, so a start primes them and
+			// the first scrape has a number in it.
+			r.noteArchiveSkew(skew)
+		}
+		if absDuration(skew) <= health.SkewWarn {
+			continue
+		}
+		ahead := "ahead of"
+		if skew < 0 {
+			ahead = "behind"
+		}
+		r.log.Warn("this host's clock disagrees with a tier's",
+			"tier", tier.name,
+			"by", absDuration(skew).Round(time.Millisecond).String(),
+			"direction", "this host is "+ahead+" "+tier.name,
+			"effect", "mirroring lag is measured against this, and so is the wait before a read falls through to the archive",
+			"fix", "run an NTP client on every host that runs a cline daemon")
+	}
 }

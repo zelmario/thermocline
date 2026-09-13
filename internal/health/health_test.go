@@ -117,3 +117,38 @@ func TestEvaluateChecksMirroringFirst(t *testing.T) {
 		t.Errorf("reason %q should lead with mirroring, the only correctness guard", v.Reason)
 	}
 }
+
+// Eviction is gated on feeder lag, and feeder lag was one machine's clock minus
+// another's. The evictor and the feeder are not required to be on the same
+// host.
+//
+// Which way it errs depends on which way the clocks differ, and both are wrong:
+// an evictor running ahead of its feeder sees lag that is not there and stops
+// evicting for ever, and one running behind sees less lag than there is. The
+// first is what an operator notices, the second is the one that matters,
+// because this gate is the coarse net over a campaign of deletes.
+func TestFeederLagAcrossTwoClocks(t *testing.T) {
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+
+	// The archive is the reference: this host is 30s ahead of it, the feeder
+	// 5s behind it, and mirroring is genuinely one second behind.
+	const mine = 30 * time.Second
+	const theirs = -5 * time.Second
+	at := now.Add(-mine).Add(-time.Second).Add(theirs)
+
+	if got := LagFrom(now, at, mine, theirs, true); got != time.Second {
+		t.Errorf("lag = %v, want 1s", got)
+	}
+	if got := LagFrom(now, at, mine, theirs, false); got != 36*time.Second {
+		t.Errorf("uncorrected lag = %v, want 36s, which is what this exists to stop reporting", got)
+	}
+	// The other direction, which the clamp used to swallow whole: this host
+	// half a minute behind its feeder, mirroring genuinely 10s behind.
+	behind := now.Add(30 * time.Second).Add(-10 * time.Second)
+	if got := LagFrom(now, behind, -30*time.Second, 0, true); got != 10*time.Second {
+		t.Errorf("lag = %v, want 10s", got)
+	}
+	if got := LagFrom(now, behind, -30*time.Second, 0, false); got != 0 {
+		t.Errorf("uncorrected lag = %v, want the zero the clamp used to report", got)
+	}
+}
