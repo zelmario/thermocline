@@ -25,6 +25,40 @@ question answerable. From it the router works out, in this order:
 4. A suggested TTL, ten per cent inside that, so the suggestion is always
    within the evidence for it.
 
+## The fourth ask is the first one answered
+
+A query has to be asked **four times** before the cache answers one of them, and
+that is the number to hold a workload against.
+
+The first ask has no evidence of anything and stores nothing. The second derives
+a TTL from the single interval it has watched, ten per cent inside it, so the
+entry expires just before the third arrives. The third stores again from the
+longer span it has now seen, and that one reaches the fourth. After that a
+stable query settles at roughly three hits in four: the single miss in each run
+is the entry being re-validated against the database, because a hit deliberately
+does not refresh its age. Measured over twenty asks at a steady interval, and
+the same at one second, ten seconds and a minute apart:
+
+| the answer | asks 1-20 | hits |
+|---|---|---|
+| never changes | `...H.HHH.HHHHHHH.HHH` | 14 |
+| changes every fourth ask | `...H.HHH.HHH.HHH.HHH` | 13 |
+| changes every second ask | `...H.H.H.H.H.H.H.H.H` | 9 |
+| changes every time it is looked at | `....................` | 0 |
+
+Two things follow. A query whose answer holds still for even a few looks is
+nearly as cacheable as one that never changes, because the TTL is drawn from how
+long the answer actually held rather than from a guess. And a query whose answer
+is different every time costs nothing but the observation: it is never stored
+and never served.
+
+The warm-up is also why a hit rate measured over a short run understates the
+feature. A pilot that asked each of its questions about three and a half times
+recorded 7%, and the conclusion drawn at the time was that the workload did not
+repeat itself. It did; it stopped one ask short.
+
+## What the report says
+
 `cline cache` prints it, most valuable first, ranked by how often a query is
 asked weighted by how long each answer would survive:
 
