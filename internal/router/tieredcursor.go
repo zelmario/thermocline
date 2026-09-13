@@ -133,6 +133,29 @@ func liveCursorOf(reply *wire.Message, fallbackNS string) (int64, bool) {
 	return id, id != 0
 }
 
+// stillCovers reports whether a claim still covers what it covered when the
+// cursor was opened.
+//
+// Its own function so the decision can be asked directly. The end-to-end check
+// in testevict.sh needs a gate, an evictor and forty documents to reach it, and
+// the boundary cases are not among them: the claim being withdrawn rather than
+// raised, the claim being *widened* under an open cursor, and an archive that
+// cannot be reached at all. Each of those is one line here.
+//
+// ok false means the claim could not be read, which happens when the archive is
+// unreachable and router.claim_grace is off. That is not evidence the claim
+// still holds, so it does not count as covering.
+//
+// A claim that has been withdrawn covers nothing, whatever From says: Claimed
+// and From are separate for that reason, and reading From alone would treat a
+// withdrawal as a claim from the zero time, which is the widest claim there is.
+//
+// Equal is covered. The evictor raises a claim to the boundary it then evicts
+// against, so a claim that has not moved has removed nothing under the cursor.
+func stillCovers(prev nsClaim, now watermark.Mark, ok bool) bool {
+	return ok && now.Claimed && !now.From.After(prev.from)
+}
+
 // guardTieredGetMore refuses a getMore whose claim has narrowed under it.
 //
 // Only for a cursor this router authorised against a claim; a getMore on
@@ -163,12 +186,10 @@ func (c *conn) guardTieredGetMore(ctx context.Context, msg *wire.Message) (*wire
 	var now watermark.Mark
 	for _, prev := range was.on {
 		now, ok = c.r.completenessForRead(ctx, prev.ns)
-		if ok && now.Claimed && !now.From.After(prev.from) {
-			// Unchanged, or wider than it was. Nothing to say.
-			continue
+		if !stillCovers(prev, now, ok) {
+			narrowed = prev
+			break
 		}
-		narrowed = prev
-		break
 	}
 	if narrowed.ns == "" {
 		return nil, false
