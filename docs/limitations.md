@@ -591,6 +591,23 @@ Part of [Thermocline](../README.md).
   moment the versions are legitimately unequal. **Upgrade both tiers, then
   restart the daemons**, and they will tell you at once if the pair is wrong.
 
+  **Upgrade the archive first.** The window where the two are unequal is
+  unavoidable, and which way round it runs is not. The exposure above is one
+  direction only: the archive runs the client's own pipeline, so what breaks is
+  a stage or operator *newer than the archive*, and it breaks with the archive's
+  own error naming a stage the application has always used. An archive ahead of
+  the fast tier has no equivalent, because everything the router needs of a tier
+  it asks of the fast one. The feeder points the same way: it reads the fast
+  tier's change stream and writes what it finds into the archive, so a fast tier
+  ahead of the archive is the order in which mirroring can meet something the
+  other side will not take.
+
+  So: archive, then fast tier, then restart the daemons, then raise the feature
+  compatibility version on both. Reasoned from the exposure rather than measured
+  — `testversion.sh` builds the unequal pair and checks that every daemon
+  refuses to *start* against it, which is the other half of this and not this
+  half. Nobody has run a rolling upgrade under live traffic in either order.
+
 - **The query cache drops an answer when a collection it depends on changes, and
   working out what it depends on is a best effort.** An entry is hung from every
   collection the answer was made of: the one the command named, every hop of a

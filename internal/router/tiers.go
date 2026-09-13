@@ -934,6 +934,29 @@ func (r *Router) warnAboutDefaultConcerns(ctx context.Context) {
 		return
 	}
 
+	for _, d := range concernDrift(cold, hot) {
+		r.log.Warn("the archive has a cluster-wide default the fast tier does not",
+			"concern", d.kind, "archive", d.archive, "fast_tier", d.fastTier,
+			"meaning", "a client that names no "+d.kind+" concern gets the fast tier's, so this "+
+				"changed on the day the application was pointed at the router",
+			"action", "run setDefaultRWConcern on the fast tier with the same values")
+	}
+}
+
+// concernDrift is the comparison behind that warning, on its own so it can be
+// asked directly.
+//
+// The end-to-end path needs setDefaultRWConcern, which is cluster-wide: setting
+// it to arrange a test changes the durability of every write on that cluster
+// for as long as the test runs, and a suite that failed to put it back would
+// leave every other suite running against a different guarantee. The decision
+// is pure given the two tiers' answers, so it is asked here instead.
+//
+// Only a default the archive set *globally* counts. getDefaultRWConcern reports
+// an implicit default too, and the tiers agreeing on an implicit one is them
+// both being untouched rather than a difference anybody made.
+func concernDrift(cold, hot tierConcerns) []struct{ kind, archive, fastTier string } {
+	var out []struct{ kind, archive, fastTier string }
 	for _, d := range []struct{ kind, coldSet, coldVal, hotVal string }{
 		{"write", cold.writeSource, cold.write, hot.write},
 		{"read", cold.readSource, cold.read, hot.read},
@@ -941,12 +964,9 @@ func (r *Router) warnAboutDefaultConcerns(ctx context.Context) {
 		if d.coldSet != "global" || d.coldVal == d.hotVal {
 			continue
 		}
-		r.log.Warn("the archive has a cluster-wide default the fast tier does not",
-			"concern", d.kind, "archive", d.coldVal, "fast_tier", d.hotVal,
-			"meaning", "a client that names no "+d.kind+" concern gets the fast tier's, so this "+
-				"changed on the day the application was pointed at the router",
-			"action", "run setDefaultRWConcern on the fast tier with the same values")
+		out = append(out, struct{ kind, archive, fastTier string }{d.kind, d.coldVal, d.hotVal})
 	}
+	return out
 }
 
 type tierConcerns struct {
