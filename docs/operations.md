@@ -24,9 +24,31 @@ What to take, and where each piece lives:
   piece of bookkeeping that lives on the fast tier, because it constrains the
   data there. It is also the one piece you can rebuild rather than restore, with
   `cline keys --rebuild`.
+- **The fast tier's accounts and roles**, `admin.system.users` and
+  `admin.system.roles` on the fast tier. This is the piece with no other source,
+  and the reason it is easy to miss is that it is not data: the router
+  authenticates clients against the *fast* tier, and that replica set was new at
+  adoption, so its accounts were created by hand at step 3 of the rollout and
+  have never come from anywhere else. The archive's copies are its own and are
+  not the ones being used.
+
+  Restore everything else and leave this out and the system is correct and
+  unusable: every client gets an ordinary authentication failure naming nothing.
+  The daemons say so at startup — "the archive has accounts the fast tier does
+  not" — and `cline preflight` reports it without starting anything, which is
+  the check to run after a restore rather than the thing to rely on instead of
+  taking the backup.
+
 - **The fast tier's documents, optionally.** They are a subset of the archive
   except for anything the feeder never mirrored, which the daemons name at
   startup as documents "the archive has none of". Warming refills the rest.
+
+Everything else on the fast tier is rebuilt rather than restored, and it is
+worth knowing which is which before an outage rather than during one. Collection
+options and indexes come back from the archive when a router starts, the unique
+key registry from `cline keys --rebuild`, views from the archive if a router
+mirrored them there, and the documents from warming. Accounts are the one thing
+on that tier that nothing rebuilds.
 
 Restoring the archive under a live fast tier needs eviction held first:
 

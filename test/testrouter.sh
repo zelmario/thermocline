@@ -442,6 +442,47 @@ chk "and it is still left alone once profiled"  "false" \
 C "db.getSiblingDB('$BKDB').setProfilingLevel(0)" >/dev/null
 C "db.getSiblingDB('$BKDB').dropDatabase()" >/dev/null
 
+echo "== accounts and roles the fast tier does not have =="
+# The router authenticates clients against the FAST tier, and that replica set
+# was new at adoption: its accounts were created by hand and come from nowhere
+# else. An account the archive has and the fast tier does not cannot log in, and
+# what the application sees is an ordinary authentication failure naming
+# nothing.
+#
+# This is also the check docs/operations.md now sends an operator to after
+# restoring a backup, because accounts are the one thing on the fast tier that
+# nothing rebuilds: collection options and indexes come back from the archive,
+# the key registry from `cline keys --rebuild`, the documents from warming.
+# Nothing covered the warning at all -- removing it outright left every test in
+# the repository passing.
+C "db.getSiblingDB('admin').dropUser('tcrestore')" >/dev/null 2>&1
+C "db.getSiblingDB('admin').dropRole('tcrestorerole')" >/dev/null 2>&1
+C "db.getSiblingDB('admin').createRole({role:'tcrestorerole', privileges:[], roles:[]})" >/dev/null 2>&1
+C "db.getSiblingDB('admin').createUser({user:'tcrestore', pwd:'tcrestore', roles:[{role:'read', db:process.env.TC_DB}]})" >/dev/null 2>&1
+rm -f $LOGDIR/acct_r.log
+cline router --config $CFG --log-file $LOGDIR/acct_r.log & ARP=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+kill $ARP 2>/dev/null; wait $ARP 2>/dev/null
+chk "the router names the account by name"      "true" \
+    "$(grep -q 'tcrestore@admin' $LOGDIR/acct_r.log && echo true || echo false)"
+chk "and says the application sees a login failure" "true" \
+    "$(grep -q 'accounts the fast tier does not' $LOGDIR/acct_r.log && echo true || echo false)"
+chk "the role is named too"                     "true" \
+    "$(grep -q 'tcrestorerole' $LOGDIR/acct_r.log && echo true || echo false)"
+# And preflight says the same without starting anything, which is what the
+# restore procedure asks for.
+chk "preflight reports it without a router"     "true" \
+    "$(cline preflight --config $CFG 2>&1 | grep -q 'tcrestore@admin' && echo true || echo false)"
+C "db.getSiblingDB('admin').dropUser('tcrestore')" >/dev/null 2>&1
+C "db.getSiblingDB('admin').dropRole('tcrestorerole')" >/dev/null 2>&1
+# Quiet once the tiers agree again, or the warning is noise on every start.
+rm -f $LOGDIR/acct2_r.log
+cline router --config $CFG --log-file $LOGDIR/acct2_r.log & ARQ=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+kill $ARQ 2>/dev/null; wait $ARQ 2>/dev/null
+chk "and says nothing about it once it is gone" "false" \
+    "$(grep -q 'tcrestore' $LOGDIR/acct2_r.log && echo true || echo false)"
+
 echo "== a read preference on cold.uri, which does not do what it looks like =="
 # The natural thing to reach for when adopting a large cluster: during the
 # adoption most reads fall through to the archive, which is the production
