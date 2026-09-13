@@ -1,7 +1,10 @@
 package main
 
 import (
+	"strings"
 	"testing"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -256,5 +259,30 @@ func TestIsBookkeepingDB(t *testing.T) {
 	meta.DB = meta.DefaultDB
 	if !isBookkeepingDB("_thermocline") || isBookkeepingDB("shop") {
 		t.Errorf("the default spelling stopped working")
+	}
+}
+
+// extJSON renders a value the way a command can take it back, and the
+// difference from RawValue.String() is the whole reason it exists.
+//
+// Canonical extended JSON writes an int as {"$numberInt":"2"}, and mongod will
+// not read its own listIndexes output back in that form: createIndex answers
+// "BSON field 'collation.strength' is the wrong type 'object', expected types
+// '[long, int, double, decimal]'". Relaxed writes it as 2.
+//
+// testindexes.sh catches this by running what the command prints, which needs a
+// cluster. This is the same question asked in a line.
+func TestExtJSONIsRelaxed(t *testing.T) {
+	raw, err := bson.Marshal(bson.D{{Key: "locale", Value: "en"}, {Key: "strength", Value: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := extJSON(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw})
+
+	if strings.Contains(got, "$numberInt") {
+		t.Errorf("canonical extended JSON: %s\nmongod refuses its own output in that form", got)
+	}
+	if !strings.Contains(got, `"strength":2`) {
+		t.Errorf("got %s, want strength as a plain number", got)
 	}
 }

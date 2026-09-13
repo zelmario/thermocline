@@ -124,6 +124,29 @@ fi
 mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
 mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null 2>&1
 cline watermark --config $CFG --ns $DB.tintid --clear >/dev/null 2>&1
+
+# The refusal itself, which nothing checked. checkClaim exists because
+# declaring a claim by hand is the one operator action that can make every
+# unbounded read return short answers, silently, for as long as it stands: it
+# counts both tiers and refuses a claim the numbers contradict. Replacing that
+# comparison with `true` left every test in the repository passing.
+#
+# Its own namespace, and not one the feeder tiers, so the counts are this
+# section's to arrange and no daemon moves them underneath it. The archive holds
+# two and the fast tier none, which is exactly the state the refusal is for.
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB('tc').refuse.drop();
+   db.getSiblingDB('tc').refuse.insertMany([{_id:1},{_id:2}])" >/dev/null 2>&1
+ok "a claim the counts contradict is refused"  1 "short of the claim" \
+   -- cline watermark --config $CFG --ns tc.refuse --complete-all
+# And the escape hatch works, or the refusal is a wall rather than a check: a
+# warm still running is the case it is there for.
+ok "--force records it anyway, saying so"      0 "because --force was given" \
+   -- cline watermark --config $CFG --ns tc.refuse --complete-all --force
+# Both tiers and the claim. Dropping the fast tier's copy is not a delete and
+# this one was only ever on the archive, so the archive is the half that counts.
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB('tc').refuse.drop()" >/dev/null 2>&1
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB('tc').refuse.drop()" >/dev/null 2>&1
+cline watermark --config $CFG --ns tc.refuse --clear >/dev/null 2>&1
 ok "--complete-all sets"                0 "all of history"    -- cline watermark --config $CFG --ns tc.probe --complete-all
 ok "--clear withdraws"                  0 "withdrew"          -- cline watermark --config $CFG --ns tc.probe --clear
 ok "--clear again is not an error"      0 "no claim"          -- cline watermark --config $CFG --ns tc.probe --clear
