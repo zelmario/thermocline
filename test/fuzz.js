@@ -148,6 +148,33 @@ function leaf() {
   return out;
 }
 
+// AGE is the field the tiered collections here are aged by, and ageBound builds
+// a lower bound on it at the top level of a filter, where the router will read
+// one.
+//
+// Deliberate, because left to chance it was almost never generated, and it is
+// the centre of the system: the router reads a lower bound out of a filter to
+// decide whether the fast tier can answer the query alone, and everything the
+// completeness claim is for turns on that. `when` is one of ten fields, a leaf
+// takes one or two of them, five of the fourteen predicate shapes yield a bound
+// at all, and a fifth of filters wrap the leaf in $or or $nor where reading one
+// would be wrong. Measured against a claim deliberately made false: 600
+// generated operations over three seeds produced no disagreement at all, while
+// a direct query on the same pair was short by twenty.
+const AGE = 'when';
+function ageBound() {
+  const f = FIELDS.find(x => x.p === AGE);
+  const v = f.v(), w = f.v();
+  switch (ri(3)) {
+    case 0: return { $gte: v };
+    case 1: return { $gt: v };
+    default: {
+      const lo = (v <= w) ? v : w, hi = (v <= w) ? w : v;
+      return lo < hi ? { $gte: lo, $lt: hi } : { $gte: lo };
+    }
+  }
+}
+
 function filter(depth) {
   if (depth <= 0) return leaf();
   const r = rnd();
@@ -156,6 +183,9 @@ function filter(depth) {
   if (r < 0.36) return { $nor: [filter(depth - 1)] };
   if (r < 0.42) return { items: { $elemMatch: { qty: predicate(FIELDS[5]), sku: predicate(FIELDS[6]) } } };
   if (r < 0.46) return { $expr: { $gt: [ '$n', ri(70) ] } };
+  // The age field last, so a leaf that happened to pick it too does not
+  // overwrite the bound with a predicate that yields none.
+  if (r < 0.58) return Object.assign(leaf(), { [AGE]: ageBound() });
   return leaf();
 }
 
