@@ -190,6 +190,43 @@ mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()
 mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()" >/dev/null 2>&1
 cline watermark --config $CFG --ns $DB.$PFNS --clear >/dev/null 2>&1
 
+# The other two things a start changes, which it also has to name rather than
+# do: the collections it would remove from the fast tier, and the views it would
+# give the archive. A start removing a collection is worth seeing beforehand
+# even when the collection is this system's own litter.
+mongosh "$HOTU" --quiet --eval "
+  const old = Math.floor(Date.now()-3*3600*1000)*1000000;
+  db.getSiblingDB(process.env.TC_DB).createCollection('tmp.thermocline.out.'+old);
+  db.getSiblingDB(process.env.TC_DB).$PFNS.insertOne({_id:1,n:1});
+  db.getSiblingDB(process.env.TC_DB).createView('${PFNS}view','$PFNS',[])" >/dev/null 2>&1
+ok "it names what a start would remove"     0 "would remove these from the fast tier" \
+   -- cline preflight --config $CFG
+ok "and the views it would give the archive" 0 "would give the archive these views" \
+   -- cline preflight --config $CFG
+# Neither happened. The scratch collection is the sharper half: it is the one
+# thing a start deletes.
+PFLEFT=$(mongosh "$HOTU" --quiet --eval "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(function (n) { return n.indexOf('tmp.thermocline') === 0 }).length)" 2>&1 | tail -1)
+if [ "$PFLEFT" = "1" ]; then
+  PASS=$((PASS+1)); echo "  PASS  and removed nothing"
+else
+  FAIL=$((FAIL+1)); FAILED+=("preflight removed a scratch collection")
+  echo "  FAIL  and removed nothing                              got=$PFLEFT want=1"
+fi
+PFVIEW=$(mongosh "$COLDU" --quiet --eval "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().indexOf('${PFNS}view') >= 0)" 2>&1 | tail -1)
+if [ "$PFVIEW" = "false" ]; then
+  PASS=$((PASS+1)); echo "  PASS  and created nothing on the archive"
+else
+  FAIL=$((FAIL+1)); FAILED+=("preflight created a view on the archive")
+  echo "  FAIL  and created nothing on the archive               got=$PFVIEW want=false"
+fi
+for U in "$HOTU" "$COLDU"; do
+  mongosh "$U" --quiet --eval "
+    const d = db.getSiblingDB(process.env.TC_DB);
+    d.getCollectionNames().filter(function (n) { return n.indexOf('tmp.thermocline') === 0 }).forEach(function (n) { d.getCollection(n).drop() });
+    try { d.${PFNS}view.drop() } catch (e) {}
+    d.$PFNS.drop()" >/dev/null 2>&1
+done
+
 echo "== keys =="
 # The key registry only has work to do when a tiered collection carries a unique
 # index, so give it one and a document to claim.

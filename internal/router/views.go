@@ -702,11 +702,16 @@ func (r *Router) managesDatabase(db string) bool {
 // it is, because the archive's definition may be the one somebody meant and this
 // has no way to tell. A difference is reported by the read path instead, as a
 // refusal naming the view.
-func (r *Router) mirrorViewsToArchive(ctx context.Context) {
+// dryRun names what it would give the archive and gives it nothing, for
+// cline preflight: creating a view on the archive is a write to the tier a
+// rollback reads from, and an operator should see the list before a start makes
+// it rather than in the log afterwards. One function with a flag, so which
+// views are chosen has a single answer.
+func (r *Router) mirrorViewsToArchive(ctx context.Context, dryRun bool) []string {
 	dbs, err := r.viewDatabases(ctx)
 	if err != nil {
 		r.log.Debug("could not list the fast tier's databases to compare its views", "err", err)
-		return
+		return nil
 	}
 	var carried []string
 	for _, db := range dbs {
@@ -730,17 +735,23 @@ func (r *Router) mirrorViewsToArchive(ctx context.Context) {
 			if have[name] || strings.HasPrefix(name, "system.") {
 				continue
 			}
-			promote.MirrorCollection(ctx, r.hot, r.cold, db, name, r.log)
+			if !dryRun {
+				promote.MirrorCollection(ctx, r.hot, r.cold, db, name, r.log)
+			}
 			carried = append(carried, db+"."+name)
 		}
 	}
+	sort.Strings(carried)
+	if dryRun {
+		return carried
+	}
 	if len(carried) > 0 {
-		sort.Strings(carried)
 		r.log.Info("gave the archive views it did not have",
 			"views", carried,
 			"why", "repointing the application at the archive is what rollback is, and a view read "+
 				"the fast tier cannot answer goes there only when the archive holds the same view")
 	}
+	return carried
 }
 
 // viewDatabases is where this router will look for views to give the archive.

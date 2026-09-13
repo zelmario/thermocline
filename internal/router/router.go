@@ -324,7 +324,27 @@ func (r *Router) Survey(ctx context.Context) error {
 	// the honest answer to "what is true now" and is worth knowing beside the
 	// index report above it.
 	r.warnAboutUnclaimedUniqueKeys(ctx)
+
+	// The three writes a start makes, reported rather than made. Together with
+	// the checks above this answers the question the command exists for: what
+	// will starting a router do to these two clusters?
 	r.warnAboutWhatAStartWouldBuild(ctx)
+	if dropped := r.dropLeftoverScratch(ctx, true); len(dropped) > 0 {
+		r.log.Warn("a router start would remove these from the fast tier",
+			"collections", dropped,
+			"meaning", "scratch collections a previous router left in the application's own "+
+				"database, from an aggregation writing into a tiered collection that was "+
+				"interrupted before it could rename its result into place",
+			"action", "nothing; they are this system's own litter and hold no application data. "+
+				"They are named because a start removing a collection is worth seeing first")
+	}
+	if carried := r.mirrorViewsToArchive(ctx, true); len(carried) > 0 {
+		r.log.Warn("a router start would give the archive these views",
+			"views", carried,
+			"meaning", "the fast tier has them and the archive does not, and repointing the "+
+				"application at the archive is what rollback is, so a view has to exist there too",
+			"action", "nothing, if the archive is meant to answer these after a rollback")
+	}
 	return nil
 }
 
@@ -427,14 +447,14 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutOptionDrift(ctx)
 	// And the litter a router that died mid-aggregation leaves in the
 	// application's own database. See dropLeftoverScratch.
-	r.dropLeftoverScratch(ctx)
+	r.dropLeftoverScratch(ctx, false)
 	// Before the listener opens: a unique index the fast tier is missing is one
 	// nothing is enforcing, and the first client to write is what creates the
 	// collection there. See ensureFastTierIndexes.
 	r.ensureFastTierIndexes(ctx)
 	// And the definitions that hold no documents, in the other direction: a view
 	// the fast tier has and the archive does not. See mirrorViewsToArchive.
-	r.mirrorViewsToArchive(ctx)
+	r.mirrorViewsToArchive(ctx, false)
 
 	// Open one pooled connection before accepting anybody, so the first client's
 	// handshake can be answered from the fast tier's own reply. Without it that

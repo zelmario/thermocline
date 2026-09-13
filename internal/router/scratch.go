@@ -57,7 +57,16 @@ func scratchAge(name string, now time.Time) (time.Duration, bool) {
 // the application's own database, for ever, because nothing else ever looks at
 // it. It is litter rather than a wrong answer, which is why this runs at
 // startup rather than on a timer.
-func (r *Router) dropLeftoverScratch(ctx context.Context) {
+// dryRun reports what it would remove and removes nothing, which is what
+// cline preflight needs: this is the one thing a router start deletes, and an
+// operator pointing it at a cluster for the first time should see the list
+// before it happens rather than in a log afterwards.
+//
+// One function with a flag rather than a survey beside it, because the
+// selection is the whole of the safety here -- the prefix, a timestamp that
+// parses out of the name, and an age -- and a second copy of it would be a
+// second answer to drift away from the first.
+func (r *Router) dropLeftoverScratch(ctx context.Context, dryRun bool) []string {
 	dbs := map[string]struct{}{}
 	for _, ns := range r.cfg.Managed {
 		if db, _ := splitNS(ns); db != "" {
@@ -69,7 +78,7 @@ func (r *Router) dropLeftoverScratch(ctx context.Context) {
 	if len(r.cfg.Managed) == 0 {
 		names, err := r.hot.ListDatabaseNames(ctx, bson.D{})
 		if err != nil {
-			return
+			return nil
 		}
 		for _, db := range names {
 			switch db {
@@ -81,6 +90,7 @@ func (r *Router) dropLeftoverScratch(ctx context.Context) {
 	}
 
 	now := time.Now()
+	var found []string
 	for db := range dbs {
 		names, err := r.hot.Database(db).ListCollectionNames(ctx,
 			bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: scratchNameRegex}}}})
@@ -90,6 +100,10 @@ func (r *Router) dropLeftoverScratch(ctx context.Context) {
 		for _, name := range names {
 			age, ok := scratchAge(name, now)
 			if !ok || age < scratchLeftoverAge {
+				continue
+			}
+			found = append(found, db+"."+name)
+			if dryRun {
 				continue
 			}
 			if derr := r.hot.Database(db).Collection(name).Drop(ctx); derr != nil {
@@ -103,4 +117,5 @@ func (r *Router) dropLeftoverScratch(ctx context.Context) {
 					"before it could rename its result into place")
 		}
 	}
+	return found
 }
