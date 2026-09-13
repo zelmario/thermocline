@@ -276,3 +276,26 @@ func TestInvalidateLeavesNoDeadReferences(t *testing.T) {
 		t.Errorf("%d dead references left behind, want 0", n)
 	}
 }
+
+// A cache told to hold nothing holds the default instead, rather than holding
+// nothing at all.
+//
+// config.Load fills MaxBytes in before it unmarshals, so a file that turns the
+// cache on without naming a budget still gets 64 MB and this guard never fires
+// for it. A Config built in code has no such help, and the failure it prevents
+// is the quiet one: a cache that is on, reports itself on, and stores nothing
+// because every answer is larger than its budget.
+func TestZeroByteBudgetMeansTheDefault(t *testing.T) {
+	for _, budget := range []int{0, -1, -(1 << 20)} {
+		c := NewWithBytes(100, budget, time.Minute)
+		if c.maxBytes != DefaultMaxBytes {
+			t.Errorf("NewWithBytes(budget=%d) kept maxBytes=%d, want the default %d",
+				budget, c.maxBytes, DefaultMaxBytes)
+		}
+	}
+	// And a budget that was asked for is honoured, or the guard could swallow
+	// every value and still pass the cases above.
+	if c := NewWithBytes(100, 4096, time.Minute); c.maxBytes != 4096 {
+		t.Errorf("NewWithBytes(budget=4096) kept maxBytes=%d, want 4096", c.maxBytes)
+	}
+}
