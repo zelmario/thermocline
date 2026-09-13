@@ -155,6 +155,41 @@ test -s $LOGDIR/wm.log && { PASS=$((PASS+1)); echo "  PASS  watermark wrote its 
 
 cline watermark --config $CFG --ns $DB.orders --clear >/dev/null
 
+echo "== preflight =="
+# The one command meant to be pointed at a cluster nobody has decided about yet,
+# so the property that matters is that it writes nothing. A router start is not
+# read-only -- it creates tiered collections on the fast tier and builds the
+# archive's indexes on them -- and until this existed those findings could only
+# be had by starting one.
+ok "preflight runs against the pair"        0 "Nothing will be written" \
+   -- cline preflight --config $CFG
+ok "and says nothing refuses a start"       0 "Nothing above refuses a start" \
+   -- cline preflight --config $CFG
+# The adoption shape, which is the case it exists for and the one it used to be
+# silent about: a tiered collection the archive has and the fast tier has never
+# held. warnAboutOptionDrift skips a collection only one tier has, because by
+# the time a started router reaches it the indexer has already made the other
+# side; in a survey the indexer has not run, so that reasoning does not hold.
+PFNS=zprobe
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$PFNS.insertOne({_id:1,email:'a@b.c'});
+   db.getSiblingDB(process.env.TC_DB).$PFNS.createIndex({email:1},{unique:true,name:'pf_u'})" >/dev/null 2>&1
+mongosh "$HOTU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()" >/dev/null 2>&1
+ok "it names what a start would build"      0 "would create these on the fast tier" \
+   -- cline preflight --config $CFG
+# And the whole point: the fast tier is exactly as it was. A router start here
+# would have created the collection and built both indexes, one of them unique.
+PFHOT=$(mongosh "$HOTU" --quiet --eval "try{print(db.getSiblingDB(process.env.TC_DB).$PFNS.getIndexes().length)}catch(e){print('none')}" 2>&1 | tail -1)
+if [ "$PFHOT" = "none" ]; then
+  PASS=$((PASS+1)); echo "  PASS  and built nothing on the fast tier"
+else
+  FAIL=$((FAIL+1)); FAILED+=("preflight wrote to the fast tier")
+  echo "  FAIL  and built nothing on the fast tier                got=$PFHOT indexes want=none"
+fi
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()" >/dev/null 2>&1
+cline watermark --config $CFG --ns $DB.$PFNS --clear >/dev/null 2>&1
+
 echo "== keys =="
 # The key registry only has work to do when a tiered collection carries a unique
 # index, so give it one and a document to claim.

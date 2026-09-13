@@ -59,6 +59,11 @@ Usage:
                                           as long as the archive cannot be
                                           trusted, such as while it is restored
   cline resume   --config FILE            let the evictor remove again
+  cline preflight --config FILE
+                                          whether a pair is fit to tier, without
+                                          writing to either: the checks a router
+                                          runs at startup, and none of the
+                                          building it does
   cline rollback --config FILE [--ns NS] [--clear] [--force]
                                           count, and then remove, the documents
                                           the archive holds marked deleted, so it
@@ -102,6 +107,8 @@ func run() error {
 		return runPause(os.Args[2:], true)
 	case "resume":
 		return runPause(os.Args[2:], false)
+	case "preflight":
+		return runPreflight(os.Args[2:])
 	case "indexes":
 		return runIndexes(os.Args[2:])
 	case "cache":

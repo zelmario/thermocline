@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -278,6 +279,135 @@ func (r *Router) enableCache() {
 // queries times this is the bound on rows held, and at a thousand shapes the
 // larger number is a hundred thousand of them for no more insight.
 const maxParamsPerShape = 50
+
+// Survey runs everything a starting router would tell an operator about the
+// pair, and writes nothing to either tier.
+//
+// It exists because those findings were only obtainable by starting a router,
+// and a starting router is not read-only: ensureFastTierIndexes builds the
+// archive's indexes on the fast tier, mirrorViewsToArchive creates views on the
+// archive, and dropLeftoverScratch removes collections. Every one of those is
+// right for a router that is about to serve traffic and wrong for a first look
+// at a cluster somebody is still deciding about. So pointing this at a
+// production pair to find out whether it is suitable meant building indexes on
+// it to ask.
+//
+// The same checks, in the same order, minus those three and the listener. What
+// it reports is therefore exactly what a real start would report, which is the
+// point: an operator should not have to wonder whether the dry run and the real
+// thing look at different things.
+//
+// The version check is the one that returns an error, because it is the one a
+// start refuses on. Everything else is a warning on the logger, which is where
+// a router puts them too.
+func (r *Router) Survey(ctx context.Context) error {
+	if err := r.refreshPrimary(ctx); err != nil {
+		return err
+	}
+	if err := r.checkTierVersions(ctx); err != nil {
+		return err
+	}
+	r.warnAboutMissingWatermarks(ctx)
+	r.warnAboutStrandedCollections(ctx)
+	r.warnAboutMissingUsers(ctx)
+	r.warnAboutMissingRoles(ctx)
+	r.warnAboutDefaultConcerns(ctx)
+	r.warnAboutOptionDrift(ctx)
+	// Last here, first in Listen's ordering terms: it reads one index listing
+	// per tiered namespace and a start defers it behind the listener for that
+	// reason. Nothing is waiting on this one, so it runs inline.
+	//
+	// It reads the fast tier's own unique indexes, and a real start would have
+	// built any the archive has and it lacks a moment earlier. So on an
+	// adoption this says "nothing has claimed these" about indexes that do not
+	// exist on the fast tier yet yet will the moment a router starts, which is
+	// the honest answer to "what is true now" and is worth knowing beside the
+	// index report above it.
+	r.warnAboutUnclaimedUniqueKeys(ctx)
+	r.warnAboutWhatAStartWouldBuild(ctx)
+	return nil
+}
+
+// warnAboutWhatAStartWouldBuild names the tiered collections a router start
+// would create on the fast tier, and how many indexes it would build there.
+//
+// Every other check here reports a state. This one reports an action, and it is
+// in a survey because the survey is the one caller that does not take it: a
+// real start creates each of these from the archive's options and builds the
+// archive's indexes on it before the listener opens.
+//
+// Without it the survey was quietest about the case it exists for. A tiered
+// collection the archive has and the fast tier has never held is the adoption
+// shape, and nothing above says a word about it: it is not stranded, because
+// something does tier it; and warnAboutOptionDrift skips a collection only one
+// tier has on purpose, because by the time a started router reaches it the
+// indexer has already created the other side. In a survey the indexer has not
+// run, so that reasoning does not hold and the gap was silence.
+//
+// The unique count is separate because it is the number that costs. A unique
+// index build walks both tiers and can refuse, and until something claims those
+// keys the constraint is not enforced across the pair at all.
+func (r *Router) warnAboutWhatAStartWouldBuild(ctx context.Context) {
+	byDB := map[string][]string{}
+	for _, ns := range r.cfg.Managed {
+		if db, _ := splitNS(ns); db != "" {
+			byDB[db] = append(byDB[db], ns)
+		}
+	}
+
+	var pending []string
+	indexes, unique := 0, 0
+	for db, nss := range byDB {
+		cold, cerr := collectionsIn(ctx, r.cold, db)
+		hot, herr := collectionsIn(ctx, r.hot, db)
+		if cerr != nil || herr != nil {
+			continue
+		}
+		for _, ns := range nss {
+			_, coll := splitNS(ns)
+			if cold[coll] != "collection" || hot[coll] != "" {
+				continue
+			}
+			pending = append(pending, ns)
+			names, err := uniqueIndexNames(ctx, r.cold, db, coll)
+			if err == nil {
+				unique += len(names)
+			}
+			if all, aerr := indexNamesOf(ctx, r.cold, db, coll); aerr == nil {
+				indexes += all
+			}
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	sort.Strings(pending)
+	r.log.Warn("a router start would create these on the fast tier and build their indexes",
+		"collections", pending, "indexes", indexes, "unique_indexes", unique,
+		"meaning", "this is the adoption shape and it is not an error: the archive carries the "+
+			"application's collections and the fast tier has never held them, so a start creates "+
+			"each one the way the archive has it and builds the archive's indexes on it before "+
+			"the listener opens",
+		"cost", "index builds on the fast tier, and a unique one walks both tiers before it is "+
+			"accepted; until cline keys --rebuild has claimed their values the constraint is not "+
+			"enforced across the pair",
+		"action", "nothing, if that is what is wanted; otherwise narrow feeder.namespaces first, "+
+			"because this is what a start will do to the fast tier")
+}
+
+// indexNamesOf counts one collection's indexes on one tier.
+func indexNamesOf(ctx context.Context, client *mongo.Client, db, coll string) (int, error) {
+	cur, err := client.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	n := 0
+	for cur.Next(ctx) {
+		n++
+	}
+	return n, cur.Err()
+}
 
 func (r *Router) Listen(ctx context.Context) error {
 	r.enableCache()

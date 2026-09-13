@@ -20,6 +20,22 @@ adoption rather than something to do afterwards.
 
 The order matters, because most of what goes wrong goes wrong quietly.
 
+**0. Run `cline preflight` first, which writes nothing.** It makes the same
+comparison a router makes at startup -- versions and feature compatibility,
+collections and databases the fast tier has never held, collation and validator
+drift, unique indexes the fast tier is missing, accounts and roles the archive
+lacks, and whether anything has claimed the unique keys an adopted archive
+carries -- and it also names what a start *would* build on the fast tier, with
+the index counts.
+
+That last line is the one to read before step 1, because step 1 is not a reader.
+A router start creates each tiered collection on the fast tier the way the
+archive has it and builds the archive's indexes on it, unique ones included,
+before it opens the listener. That is right for a router about to serve traffic
+and it is a surprise on a cluster somebody is still deciding about. Preflight
+exits non-zero only when the pair is one a router would refuse outright, so a
+rollout script can gate on it.
+
 **1. Point the router at both, and read what it says at startup.** It compares
 the two tiers and names, once, everything the fast tier is missing that the
 application will need. Nothing here is fatal and all of it is silent afterwards.
