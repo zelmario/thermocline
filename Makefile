@@ -1,17 +1,51 @@
 BIN     := bin/cline
 DEV     := .dev
+NODE    ?= thermocline-zelmar-node0
 HOT_PORT  := 28017
 COLD_PORT := 28018
 
-.PHONY: build test check fmt clean dev dev-down dev-status
+.PHONY: build test check fmt clean dev dev-down dev-status install check-installed
 
 # CGO_ENABLED=0 because the binary is built here and run in the test containers,
 # which carry an older glibc. A dynamically linked build fails there at exec with
 # a version error, which reads like the router refusing to start.
+#
+# -buildvcs=false because nothing reads the stamp and it makes the binary a
+# function of the Go sources alone. With it on, editing this Makefile or a test
+# script flips vcs.modified and the binary changes though no code did, which is
+# what check-installed below has to be able to tell apart.
 build:
 	@mkdir -p bin
-	CGO_ENABLED=0 go build -o $(BIN) ./cmd/cline
+	CGO_ENABLED=0 go build -buildvcs=false -o $(BIN) ./cmd/cline
 	@echo "built $(BIN)"
+
+## install puts this working tree's binary where the suites look for it.
+##
+## The suites run `cline` inside the test node, so what they measure is whatever
+## /usr/local/bin/cline is in there, not what is in bin/ and not what is
+## committed. Use this rather than a docker cp by hand.
+install: build
+	docker cp $(BIN) $(NODE):/usr/local/bin/cline
+	@docker exec $(NODE) chmod +x /usr/local/bin/cline
+	@echo "installed into $(NODE)"
+
+## check-installed answers one question before a sweep: is the node running this
+## working tree's code?
+##
+## Build it the same way before comparing, which is why this depends on build
+## rather than hashing whatever bin/cline happens to hold. A plain `go build`
+## differs from the installed binary byte for byte at the same commit, because
+## build sets CGO_ENABLED=0 and the setting is recorded in the binary. Comparing
+## against one is a check that reports a mismatch every time and so means
+## nothing: it cost two needless reinstalls on 2026-09-13 before anybody diffed
+## `go version -m`.
+check-installed: build
+	@here=$$(md5sum $(BIN) | cut -d' ' -f1); \
+	 there=$$(docker exec $(NODE) md5sum /usr/local/bin/cline 2>/dev/null | cut -d' ' -f1); \
+	 if [ -z "$$there" ]; then echo "$(NODE) has no /usr/local/bin/cline; run make install"; exit 1; \
+	 elif [ "$$here" = "$$there" ]; then echo "$(NODE) is running this working tree ($$here)"; \
+	 else echo "$(NODE) is running something else: $$there, this tree builds $$here"; \
+	      echo "run make install"; exit 1; fi
 
 test:
 	go test ./...
