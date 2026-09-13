@@ -232,6 +232,30 @@ chk "one connection asking eight times agrees with itself" "20" "$HITS"
 # learned once a minute and once on the way out, and this suite is much shorter
 # than a minute.
 
+echo "== a read that asked for a secondary is never cached =="
+# cacheableRead refuses any read whose $readPreference is not primary, and the
+# rule is load-bearing rather than tidy. With terminate_auth on, such a read is
+# sent to a secondary on purpose, so the answer may come from a member behind
+# the primary. The cache key deliberately leaves $readPreference out -- two
+# clients asking the same question are asking the same question -- so an answer
+# held from a secondary would be handed to the next reader who asked for the
+# primary, staler than they asked for, which is the one direction a cache must
+# not move a read in.
+#
+# Nothing checked it. The branch could be deleted and every suite would still
+# pass, which is how a rule that costs nothing to keep gets dropped as dead
+# weight.
+#
+# Observed through the shape report rather than a hit counter, because the
+# counters are per router and every mongosh here makes its own connection and
+# its own reads: counting hits globally attributed other queries' hits to this
+# one. A shape the cache never admitted is never recorded at all, so its
+# absence from the report is the whole answer. Its own field name, so it cannot
+# collapse into the shape the section below builds.
+for _ in $(seq 1 4); do
+  R "db.getSiblingDB(process.env.TC_DB).$NS.find({secpref:'x'}).readPref('secondary').itcount()" >/dev/null
+done
+
 echo "== what it learned, and what it suggests =="
 # Enough repeats for a stability to be measured at all.
 for _ in $(seq 1 6); do
@@ -257,6 +281,13 @@ chk "and reports hits"                             "true" \
 # are what proves the cache serves rather than merely measures.
 chk "some reads were served from the cache"        "true" \
     "$(echo "$ADVICE" | grep -oE '[0-9]+ hits' | head -1 | grep -qE '^[1-9][0-9]* hits' && echo true || echo false)"
+# And the secondary-preference reads above are nowhere in it. A shape the cache
+# refused to admit is never recorded, so the report naming it would mean the
+# guard had gone. The control is the line above: this report does name shapes
+# and does count hits, so an absence here is an absence rather than an empty
+# report.
+chk "a secondary read never became a shape"        "false" \
+    "$(cline cache --config $CCFG --ns $DB.$NS --top 20 2>&1 | grep -q 'secpref' && echo true || echo false)"
 
 echo "== with the cache off, it still measures =="
 # The advice is the reason to turn caching on, so it cannot need caching to be
