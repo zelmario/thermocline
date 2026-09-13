@@ -367,6 +367,32 @@ ok "with nothing left it says so"                0 "Nothing is marked deleted" \
     -- cline rollback --config $CFG --ns $DB.$RBNS
 C "db.getSiblingDB(process.env.TC_DB).$RBNS.drop()" >/dev/null
 
+# The fixture this suite leaves behind, dropped last and then checked.
+#
+# tintid's two documents are inserted on the fast tier near the top, and both
+# tiers are dropped there. That is not enough: the feeder this suite starts
+# afterwards resumes from a checkpoint older than the drop and replays those
+# inserts into the archive, and a collection drop is not mirrored, so nothing
+# takes them out again. The warmer then finds documents in shop.tintid it cannot
+# age on every start and says so at ERROR, which is the refusal testwarm.sh
+# relies on and which testchaos counts as an unexpected daemon error. Measured:
+# two documents left here failed testchaos twice, 25 of 26, in a suite that has
+# nothing to do with this one, and the second time was a month after the first.
+#
+# So it goes after the last feeder has stopped, and the suite says whether it
+# worked rather than leaving the next one to find out.
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+LEFT=""
+for _ in $(seq 1 10); do
+  C "db.getSiblingDB(process.env.TC_DB).tintid.drop()" >/dev/null
+  LEFT=$(C "print(db.getSiblingDB(process.env.TC_DB).tintid.countDocuments({}))")
+  [ "$LEFT" = "0" ] && break
+  sleep 0.5
+done
+chkrb "the tintid fixture left nothing in the archive" "0" "$LEFT"
+cline watermark --config $CFG --ns $DB.tintid --clear >/dev/null 2>&1
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
