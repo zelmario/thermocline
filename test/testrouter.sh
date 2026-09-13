@@ -315,12 +315,36 @@ kill $SP 2>/dev/null; wait $SP 2>/dev/null
 
 echo "== completeness: permissive =="
 sed 's/completeness: archive/completeness: permissive/' $CFG > $WDIR/perm.yaml
+# Truncated first. A router appends, so a check that greps this for a line the
+# run is supposed to produce would otherwise pass on the previous run's copy of
+# it -- which is how the check below first passed against a router that had been
+# changed to not write it at all.
+rm -f $LOGDIR/rp.log
 cline router --config $WDIR/perm.yaml --listen 0.0.0.0:$P2 --log-file $LOGDIR/rp.log &
 PP=$!; sleep 5
 P() { mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 HOTN=$(H 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')
 chk "permissive returns the fast tier answer" "$HOTN" "$(P 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount())')"
+# And says so. This is the only record that a client was handed less than the
+# collection holds: permissive answers rather than refusing, the client gets no
+# error, and the count it received looks like an answer. Nothing checked that
+# the line is written, so a deployment running in this mode could have been
+# serving short answers with no trace of it anywhere.
+# At WARN, and the level is half the check. This router logs at debug too, so
+# grepping the message alone matched a line demoted to Debug just as happily --
+# the first version of this passed against a build where the warning had been
+# demoted, which is the whole failure it exists to catch.
+chk "and says at WARN that it may be short" "true" \
+    "$(grep -q 'level=WARN msg="answer may be short"' $LOGDIR/rp.log && echo true || echo false)"
+chk "naming the collection and the reason"  "true" \
+    "$(grep 'level=WARN msg="answer may be short"' $LOGDIR/rp.log | grep -q "ns=$DB.tprobe" && \
+       grep 'level=WARN msg="answer may be short"' $LOGDIR/rp.log | grep -q 'because=' && echo true || echo false)"
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
+# The control: the same read against the default archive mode is answered in
+# full and says nothing, or the check above passes on a router that logs it
+# whatever happens.
+chk "and the archive mode does not say it"  "false" \
+    "$(grep -q 'level=WARN msg="answer may be short"' $LOGDIR/r.log 2>/dev/null && echo true || echo false)"
 
 echo "== a collection nothing tiers is the fast tier's alone =="
 # Adoption puts every collection on the archive, because the archive is the
