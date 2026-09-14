@@ -957,7 +957,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// Aggregations are judged before they run, not on the way back. A pipeline
 	// can end in $out or $merge, and acting after the fact would leave a
 	// truncated collection already written.
-	if nameErr == nil && name == "aggregate" && !msg.MoreToCome() {
+	// Unacknowledged too. A client that sets moreToCome is saying it does not
+	// want an answer, not that it does not want the guards: the write path
+	// learned that the expensive way, and these two dispatches kept the old
+	// habit. Measured, with an archived document nothing else held: an
+	// applyOps sent with writeConcern {w:0} walked past the refusal that the
+	// same command gets when it is acknowledged, and the archive held the
+	// clobber seven seconds later. Where a guard would have answered, the
+	// command is simply not performed and nothing is sent back, which is what
+	// w:0 already means. See answer.
+	if nameErr == nil && name == "aggregate" {
 		// Cleared here rather than beside the guard that sets it, so that an
 		// aggregation which never reaches that guard cannot have its reply
 		// registered against the claims of the one before it. See
@@ -989,12 +998,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// decides what to do by looking at what it can see there. See
 			// mergetarget.go.
 			if out, done := c.guardMergeTarget(ctx, msg, cmd, db); done {
-				return c.send(out)
+				return c.answer(msg, out)
 			}
 		}
 		if !explainOnly {
 			if out, done := c.guardAggregate(ctx, msg, db); done {
-				return c.send(out)
+				return c.answer(msg, out)
 			}
 		}
 	}
@@ -1005,12 +1014,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// TTL index is the third: it would reach the fast tier, which holds the
 	// recent part, and expire exactly the documents the archive was still
 	// keeping while the old ones it is written for go untouched.
-	if nameErr == nil && !msg.MoreToCome() &&
+	if nameErr == nil &&
 		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce" ||
 			name == "createIndexes" || name == "collMod" || name == "applyOps" ||
 			name == "convertToCapped" || name == "cloneCollectionAsCapped" || name == "create") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 
