@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/router"
+	"github.com/zelmario/thermocline/internal/watermark"
 )
 
 // Everything a starting router would say about a pair, without starting one.
@@ -55,6 +60,8 @@ func runPreflight(args []string) error {
 	path := fs.String("config", "/etc/cline.yaml", "path to cline.yaml")
 	logPath := fs.String("log-file", "", "append findings here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every decision the checks make")
+	countFor := fs.Duration("count-for", claimCheckBudget,
+		"how long to spend counting both tiers to check the completeness claims; a claim not reached stands unchecked")
 	fs.Usage = func() { fmt.Print(preflightUsage); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -99,6 +106,8 @@ func runPreflight(args []string) error {
 		return err
 	}
 
+	verifyClaims(ctx, hot, cold, cfg, *countFor)
+
 	fmt.Print(`
 Nothing above refuses a start. Read the warnings: most of them name something an
 application would notice and no error would report, and the two worth acting on
@@ -106,4 +115,69 @@ before any eviction are a unique index the fast tier is missing and unique keys
 nothing has claimed. See docs/adoption.md.
 `)
 	return nil
+}
+
+// verifyClaims counts both tiers for every tiered namespace that carries a
+// completeness claim, and names the ones the numbers contradict.
+//
+// A claim is what makes a bounded read answerable from the fast tier alone, so
+// one the fast tier no longer covers is every such read coming back short,
+// silently, for as long as it stands. It is checked when it is declared and
+// never again, and the ordinary way it stops being true has nothing to do with
+// anybody declaring it: restore the fast tier from a backup and the claim,
+// which lives on the archive, still describes the tier that backup replaced.
+// The same goes for a collection dropped and recreated out of band, or a fast
+// tier rebuilt from nothing.
+//
+// The counting is the same counting `cline watermark` does before recording a
+// claim, so there is one definition of what bears a claim out. It is bounded,
+// and a namespace the budget does not reach is reported as not reached rather
+// than passed over: a claim not checked is a claim that stands.
+func verifyClaims(ctx context.Context, hot, cold *mongo.Client, cfg config.Config, budget time.Duration) {
+	marks, err := watermark.New(cold).All(ctx)
+	if err != nil {
+		fmt.Printf("\nthe completeness claims could not be read, so none of them was checked: %v\n", err)
+		return
+	}
+
+	claimed := make([]string, 0, len(marks))
+	for _, ns := range cfg.Feeder.Namespaces {
+		if m, ok := marks[ns]; ok && m.Claimed {
+			claimed = append(claimed, ns)
+		}
+	}
+	if len(claimed) == 0 {
+		return
+	}
+	sort.Strings(claimed)
+
+	fmt.Printf("\nChecking %d completeness claim(s) against what the two tiers hold.\n", len(claimed))
+	deadline := time.Now().Add(budget)
+	short, checked := 0, 0
+	for _, ns := range claimed {
+		left := time.Until(deadline)
+		if left <= 0 {
+			fmt.Printf("  %s: not reached inside %s, so this claim stands unchecked\n", ns, budget)
+			continue
+		}
+		why, err := checkClaimFor(ctx, hot, cold, cfg, ns, marks[ns].From, left, false)
+		if err != nil {
+			fmt.Printf("  %s: %v\n", ns, err)
+			continue
+		}
+		checked++
+		if why != "" {
+			short++
+			fmt.Printf("  %s: %s\n", ns, why)
+		}
+	}
+	switch {
+	case short > 0:
+		fmt.Printf("\n%d of %d claim(s) checked are short. Until that is put right, a read bounded\n"+
+			"inside the claimed range is answered from the fast tier alone and returns fewer\n"+
+			"documents than exist, with no error. Warm the namespace, or clear the claim with\n"+
+			"cline watermark --ns <ns> --clear and let the warmer record it again.\n", short, checked)
+	case checked > 0:
+		fmt.Printf("Every claim checked is borne out by the counts.\n")
+	}
 }

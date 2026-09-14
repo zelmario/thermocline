@@ -205,6 +205,11 @@ feeder:
     - "shop.tconc2u"
     - "shop.tconc2z"
     - "shop.zprobe"
+    # testall.sh: a completeness claim checked against what the two tiers hold,
+    # which is what preflight does after a restore. Its own collection because
+    # the section takes documents off the fast tier out of band to make the
+    # claim false, and any other section reading it would see a short answer.
+    - "shop.zclaim"
     # testtypes.sh
     - "shop.tcap"
     - "shop.tts"

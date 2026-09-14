@@ -48,6 +48,18 @@ const claimCheckBudget = time.Minute
 // operator knows something the counts cannot show, such as a warm still running.
 func checkClaim(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
 	ns string, from time.Time, budget time.Duration) (string, error) {
+	return checkClaimFor(ctx, hot, cold, cfg, ns, from, budget, true)
+}
+
+// checkClaimFor is checkClaim with the tense spelled out, because the same
+// counting answers two questions. `cline watermark` asks before recording one,
+// and the answer is about what recording it would do; `cline preflight` asks
+// about a claim that is already standing, and the answer is about what it is
+// doing now. The numbers are identical and the sentence is not, and a report
+// that says "recording it would" about a claim recorded last week reads as a
+// warning about something that has not happened yet.
+func checkClaimFor(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
+	ns string, from time.Time, budget time.Duration, declaring bool) (string, error) {
 	if budget <= 0 {
 		budget = claimCheckBudget
 	}
@@ -128,12 +140,17 @@ func checkClaim(ctx context.Context, hot, cold *mongo.Client, cfg config.Config,
 	if hotN >= coldN {
 		return "", nil
 	}
+	effect := "It has the router answer those reads from the fast tier alone and return " +
+		fmt.Sprintf("%d documents where there are %d, with no error.", hotN, coldN)
+	if declaring {
+		effect = "Recording it would have the router answer those reads from the fast tier alone " +
+			fmt.Sprintf("and return %d documents where there are %d, with no error.\n", hotN, coldN) +
+			"Warm it first, or pass --force if a warm is running and you mean to claim it anyway"
+	}
 	return fmt.Sprintf(
 		"the fast tier holds %d of %s in %s and the archive holds %d, so it is %d short of the "+
-			"claim.\nRecording it would have the router answer those reads from the fast tier "+
-			"alone and return %d documents where there are %d, with no error.\n"+
-			"Warm it first, or pass --force if a warm is running and you mean to claim it anyway",
-		hotN, window, ns, coldN, coldN-hotN, hotN, coldN), nil
+			"claim.\n%s",
+		hotN, window, ns, coldN, coldN-hotN, effect), nil
 }
 
 // unchecked turns a counting failure into a note rather than a refusal, and

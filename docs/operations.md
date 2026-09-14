@@ -50,6 +50,30 @@ key registry from `cline keys --rebuild`, views from the archive if a router
 mirrored them there, and the documents from warming. Accounts are the one thing
 on that tier that nothing rebuilds.
 
+**Restoring the fast tier is the other direction, and it has its own trap.** The
+completeness claim says the fast tier holds every live document newer than some
+instant, and it lives on the *archive*. Restore the fast tier from a backup and
+that claim survives, describing the tier the backup replaced: every read bounded
+inside the claimed range is then answered from the fast tier alone and comes
+back short, with no error and nothing in any log. The claim is checked when it
+is declared and never again.
+
+Measured on a shop holding 6,187 orders, with forty taken off the fast tier the
+way a restore takes them: the same bounded read answered 147 through the router
+where the archive holds 187.
+
+So `cline preflight` counts both tiers for every claim before you start
+anything, and names the ones the numbers contradict:
+
+    shopstore.orders: the fast tier holds 147 of documents whose _id timestamp
+    is at or after 2026-09-14T03:32:06Z and the archive holds 187, so it is 40
+    short of the claim.
+
+Warm the namespace, or clear the claim with `cline watermark --ns <ns> --clear`
+and let the warmer record it again. The counting is bounded by `--count-for`,
+and a claim the budget does not reach is reported as unchecked rather than
+passed over, because a claim not checked is a claim that stands.
+
 Restoring the archive under a live fast tier needs eviction held first:
 
     cline pause --config cline.yaml --reason "restoring the archive"

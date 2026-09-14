@@ -197,6 +197,39 @@ mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()
 mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PFNS.drop()" >/dev/null 2>&1
 cline watermark --config $CFG --ns $DB.$PFNS --clear >/dev/null 2>&1
 
+# A claim the fast tier no longer covers, which is what a restore leaves behind.
+#
+# The completeness claim is checked when it is declared and never again, and it
+# lives on the archive. So restoring the fast tier from a backup, or rebuilding
+# it, leaves a claim describing the tier that backup replaced: every read
+# bounded inside the claimed range is then answered from the fast tier alone and
+# comes back short, with no error and nothing in any log.
+#
+# Measured on a shop with 6,187 orders: forty removed from the fast tier out of
+# band with no feeder running, and the same bounded read answered 147 through
+# the router where the archive holds 187. preflight is the command the runbook
+# already says to run after a restore, so it is what should say so.
+PCNS=zclaim
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.drop()" >/dev/null 2>&1
+# Both tiers hold five, and the claim is true when it is made.
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.insertMany(
+   Array.from({length:5},(_,i)=>({_id:i,when:new Date()})))" >/dev/null 2>&1
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.insertMany(
+   Array.from({length:5},(_,i)=>({_id:i,when:new Date()})))" >/dev/null 2>&1
+cline watermark --config $CFG --ns $DB.$PCNS --complete-all >/dev/null 2>&1
+ok "a claim both tiers bear out is quiet"   0 "borne out by the counts" \
+   -- cline preflight --config $CFG
+# The restore: the fast tier loses three and the archive keeps them.
+mongosh "$HOTU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.deleteMany({_id:{\$lt:3}})" >/dev/null 2>&1
+ok "and one the fast tier is short of is named" 0 "short of the claim" \
+   -- cline preflight --config $CFG
+ok "with what it costs the application"     0 "documents where there are" \
+   -- cline preflight --config $CFG
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PCNS.drop()" >/dev/null 2>&1
+cline watermark --config $CFG --ns $DB.$PCNS --clear >/dev/null 2>&1
+
 # The other two things a start changes, which it also has to name rather than
 # do: the collections it would remove from the fast tier, and the views it would
 # give the archive. A start removing a collection is worth seeing beforehand
