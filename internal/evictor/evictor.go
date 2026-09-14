@@ -50,8 +50,10 @@ type Evictor struct {
 
 	marks   *watermark.Store
 	limiter *limiter
-	// hold is what keeps two sweeps from overlapping. See RunOnce.
-	hold *lease.Lease
+	// hold is what keeps two sweeps from overlapping, and heldAt paces its
+	// renewal. See RunOnce and keepLease.
+	hold   *lease.Lease
+	heldAt time.Time
 
 	// unagedSeen records which namespaces have already been counted for
 	// documents the rule cannot age, so the scan that costs happens once per
@@ -76,6 +78,27 @@ func (e *Evictor) lastSkew() (time.Duration, bool) {
 	e.skewMu.Lock()
 	defer e.skewMu.Unlock()
 	return e.skew, e.skewKnown
+}
+
+// keepLease renews this sweep's claim, at most as often as the lease asks for.
+//
+// A failure that is not the lease being gone is left alone: the archive being
+// unreachable stops the sweep at its next write anyway, and stopping here would
+// report it as somebody else sweeping, which it is not.
+func (e *Evictor) keepLease(ctx context.Context) error {
+	if e.dryRun || time.Since(e.heldAt) < lease.Renew {
+		return nil
+	}
+	if err := e.hold.Keep(ctx); err != nil {
+		if errors.Is(err, lease.ErrLost) {
+			e.log.Warn("another sweep took over, stopping this one", "err", err)
+			return err
+		}
+		e.log.Debug("could not renew the evictor lease", "err", err)
+		return nil
+	}
+	e.heldAt = time.Now()
+	return nil
 }
 
 // archiveNow is this instant on the archive's clock, as well as this process
@@ -190,6 +213,7 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 		if err := e.hold.Take(ctx); err != nil {
 			return Stats{DryRun: e.dryRun}, err
 		}
+		e.heldAt = time.Now()
 		defer func() {
 			if err := e.hold.Release(context.WithoutCancel(ctx)); err != nil {
 				e.log.Debug("could not release the evictor lease", "err", err)
@@ -264,11 +288,12 @@ func (e *Evictor) Run(ctx context.Context, every time.Duration) error {
 		stats, err := e.RunOnce(ctx)
 		var held *lease.ErrHeld
 		switch {
-		case errors.As(err, &held):
+		case errors.As(err, &held), errors.Is(err, lease.ErrLost):
 			// Somebody else is sweeping. Skipping is right where stopping is
 			// not: the other sweep is doing this one's work, and a daemon that
 			// exits because an operator ran a sweep by hand is a fast tier that
-			// fills up.
+			// fills up. ErrLost is the same thing found part way through a
+			// sweep rather than at the start of one.
 			e.log.Warn("another sweep is running, skipping this one", "err", err)
 		case err != nil && !errors.Is(err, context.Canceled):
 			return err
@@ -320,6 +345,19 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 
 	for {
 		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+
+		// The lease is renewed here rather than only taken at the start of the
+		// sweep, for the reason the health check below is taken here: a sweep
+		// can run for hours, and one that is not renewed looks abandoned after
+		// thirty seconds. A second evictor would then take it and the two would
+		// announce the same eviction twice, which is what the lease is for.
+		//
+		// Losing it ends the sweep rather than the daemon. Somebody else is
+		// doing this work now, and the next pass will find out whether they
+		// still are.
+		if err := e.keepLease(ctx); err != nil {
 			return stats, err
 		}
 
@@ -680,6 +718,15 @@ func (e *Evictor) waitForHealth(ctx context.Context) (bool, error) {
 		lastNotice time.Time
 	)
 	for {
+		// The sweep is still this process's while it waits, so the claim on it
+		// is kept up. A pause for mirroring lag lasts as long as mirroring
+		// takes to catch up, which is far longer than the lease outlives a
+		// holder, and a second evictor picking the work up while this one sits
+		// here waiting for the same cluster would help nobody.
+		if err := e.keepLease(ctx); err != nil {
+			return waited, err
+		}
+
 		reading := e.check.Sample(ctx)
 		verdict := health.Evaluate(reading, e.cfg.Backoff, e.cfg.MaxFeederLag.D())
 		if verdict.OK {

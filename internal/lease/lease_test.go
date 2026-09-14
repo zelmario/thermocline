@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -243,4 +244,55 @@ func TestADeadHolderOnThisHostIsNotAHolder(t *testing.T) {
 
 	_ = next.Release(ctx)
 	_ = live.Release(ctx)
+}
+
+// Two processes starting at the same instant against a lease that does not
+// exist yet. Both upsert, one insert wins, and the loser is told the key is
+// taken rather than being told who holds it.
+//
+// It is a real start-up shape: a unit file and an operator, or four suites in a
+// parallel sweep. Exactly one of them must end up holding it and the other must
+// get an answer it can act on, which "E11000 duplicate key" is not.
+func TestTwoTakingAMissingLeaseAtOnce(t *testing.T) {
+	cold, done := testCold(t)
+	defer done()
+	ctx := context.Background()
+
+	const racers = 8
+	held := make([]*Lease, racers)
+	for i := range held {
+		held[i] = New(cold, "tctest", "race")
+	}
+	errs := make([]error, racers)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := range held {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = held[i].Take(ctx)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		var h *ErrHeld
+		switch {
+		case err == nil:
+			winners++
+		case errors.As(err, &h):
+			// The answer a loser should get.
+		default:
+			t.Errorf("racer %d got %v, want either the lease or an ErrHeld", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("%d of %d took the lease, want exactly one", winners, racers)
+	}
+	for _, l := range held {
+		_ = l.Release(ctx)
+	}
 }

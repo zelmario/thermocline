@@ -134,6 +134,18 @@ type record struct {
 // by _id and the pipeline decides whether this process gets to write its name
 // into it.
 func (l *Lease) Take(ctx context.Context) error {
+	err := l.take(ctx)
+	if mongo.IsDuplicateKeyError(err) {
+		// Two processes upserting a row that does not exist yet: one insert
+		// wins and the other is told the key is taken, which is this lease
+		// being created rather than anything being wrong. The retry finds the
+		// row and decides against it properly.
+		return l.take(ctx)
+	}
+	return err
+}
+
+func (l *Lease) take(ctx context.Context) error {
 	mine := l.takeIfFree()
 	res := l.coll.FindOneAndUpdate(ctx,
 		bson.D{{Key: "_id", Value: l.docID()}},
