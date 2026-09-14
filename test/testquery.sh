@@ -743,6 +743,56 @@ C "db.getSiblingDB(process.env.TC_DB).$NNS.drop(); db.getSiblingDB(process.env.T
 cline watermark --config $CFG --ns $DB.$NNS --clear >/dev/null 2>&1
 kill $NRP 2>/dev/null; wait $NRP 2>/dev/null
 
+echo "== applyOps writes past every guard, so it is refused =="
+# applyOps applies oplog entries straight to a collection. It passes none of the
+# checks a write command passes: no _id asked of the archive, no unique key
+# claimed, no archived document brought up first.
+#
+# Measured through the router before this: {_id:800, v:"archived, precious",
+# tier:"gold"} in the archive and nothing on the fast tier, an applyOps insert
+# of that _id applied with results [true], and six seconds later the archive
+# held {_id:800, v:"clobber via applyOps"}. The same insert sent as an insert is
+# refused. It is an internal command that no application sends, so it is refused
+# rather than guarded: a refusal is a limitation and a wrong answer is a bug.
+ANS=tqapply
+AUN=tqapplyfree
+pkill -f "cline router --config $WDIR/" 2>/dev/null; sleep 1
+cline router --config $CFG --log-file $LOGDIR/q_apply_r.log & ARP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a router is up for this section"                  "1" "$(R 'print(db.adminCommand({ping:1}).ok)')"
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop(); db.getSiblingDB(process.env.TC_DB).$AUN.drop();
+   db.getSiblingDB(process.env.TC_DB).createCollection('$AUN')" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop();
+   db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:800, v:'archived, precious', tier:'gold'})" >/dev/null
+APPLY=$(R "try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'i',
+             ns:process.env.TC_DB+'.$ANS', o:{_id:800, v:'clobber via applyOps'}}]});
+           print('APPLIED:'+r.applied); }
+         catch(e) { print('REFUSED'); }")
+chk "an applyOps into a tiered collection is refused"  "REFUSED" "$APPLY"
+chk "and the archived document is untouched"           "archived, precious/gold" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$ANS.findOne({_id:800}); print(d?d.v+'/'+d.tier:'MISSING')")"
+# A command entry hides the collection one level down, inside the entry's own
+# document, and left alone it walks past the guards that refuse the same
+# command when it is sent as a command.
+ADROP=$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'c',
+             ns:process.env.TC_DB+'.\$cmd', o:{drop:'$ANS'}}]}); print('APPLIED'); }
+         catch(e) { print('REFUSED'); }")
+chk "so is one carrying a drop of a tiered collection" "REFUSED" "$ADROP"
+# And an applyOps that touches nothing this system tiers is none of its
+# business, or the refusal is just a ban on a command.
+AFREE=$(R "try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'i',
+             ns:process.env.TC_DB+'.$AUN', o:{_id:1, v:'fine'}}]});
+           print('APPLIED:'+r.applied); }
+         catch(e) { print('REFUSED:'+(e.codeName||'')); }")
+chk "an applyOps on an untiered collection goes through" "APPLIED:1" "$AFREE"
+H "db.getSiblingDB(process.env.TC_DB).$ANS.drop(); db.getSiblingDB(process.env.TC_DB).$AUN.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+kill $ARP 2>/dev/null; wait $ARP 2>/dev/null
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

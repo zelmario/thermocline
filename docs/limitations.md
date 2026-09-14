@@ -401,6 +401,26 @@ Part of [Thermocline](../README.md).
   A router that is already **running** is a different case and has a knob:
   `router.claim_grace` keeps tiered reads alive through an outage.
 
+- **`applyOps` is refused for a tiered collection.** It applies oplog entries
+  straight to the collection, so it passes none of the checks a write command
+  passes: an `_id` or a unique value the archive still holds is never asked
+  about, no archived document is brought up first, and no key is claimed.
+  Measured before it was refused, with `{_id: 800, v: "archived, precious",
+  tier: "gold"}` in the archive and nothing on the fast tier: an `applyOps`
+  insert of that `_id` was applied, and six seconds later the archive held
+  `{_id: 800, v: "clobber via applyOps"}`. The same insert sent as an insert is
+  refused.
+
+  Guarding it properly would mean reimplementing every one of those checks
+  against an internal command whose entries may be inserts, updates, deletes or
+  commands in any mixture. MongoDB documents it as internal and no application
+  sends it, so it is refused with the reason instead, including when the
+  collection is hidden one level down in a command entry such as `{op: "c", ns:
+  "shop.$cmd", o: {drop: "orders"}}`. An `applyOps` that touches nothing tiered
+  is forwarded whole. `mongorestore --oplogReplay` uses this command: point it
+  at the archive directly, which is the restore path the runbook already
+  describes.
+
 - **Two daemons on hosts whose clocks differ are corrected, not required to
   agree.** Several things here are decided by comparing instants read on
   different machines, and none of them can be got from a logical clock.

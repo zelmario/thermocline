@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -69,6 +70,9 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 		// too, and the reason it is refused is the bucket collection rather
 		// than the expiry.
 		return c.guardTTL(ctx, msg, cmd, db, name)
+
+	case "applyOps":
+		return c.refuseApplyOps(ctx, msg, cmd, db)
 
 	case "mapReduce", "mapreduce":
 		coll, ok := stringField(cmd, name)
@@ -800,6 +804,89 @@ func (c *conn) refuseMapReduceOutput(msg *wire.Message, cmd bson.Raw, db string)
 			"writes per document against a tier that holds only part of the collection. Express it "+
 			"as an aggregation ending in $out or $merge, which this router performs on both tiers, "+
 			"or send the output to a collection nothing tiers.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// refuseApplyOps turns down an applyOps that writes into a tiered collection.
+//
+// applyOps applies oplog entries straight to a collection. It passes none of
+// the guards a write command passes: no _id checked against the archive, no
+// unique key claimed, no archived document brought up first. Measured through
+// the router with {_id: 800, v: "archived, precious", tier: "gold"} in the
+// archive and nothing on the fast tier: an applyOps insert of that _id was
+// applied, and six seconds later the archive held {_id: 800, v: "clobber via
+// applyOps"}. The same insert sent as an insert is refused.
+//
+// Refused rather than guarded. Guarding it means reimplementing every one of
+// those checks against an internal command whose entries may be inserts,
+// updates, deletes or commands in any mixture, for a command MongoDB documents
+// as internal and no application sends. A refusal is a limitation; a wrong
+// answer is a bug, and this one loses data.
+//
+// Only when it touches a tiered namespace. An applyOps against anything else is
+// none of this system's business and is forwarded whole.
+func (c *conn) refuseApplyOps(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	_ = ctx
+	arr, err := cmd.LookupErr("applyOps")
+	if err != nil {
+		return nil, false
+	}
+	entries, aok := arr.ArrayOK()
+	if !aok {
+		return nil, false
+	}
+	vals, aerr := entries.Values()
+	if aerr != nil {
+		return nil, false
+	}
+	touched := ""
+	for _, v := range vals {
+		doc, ok := v.DocumentOK()
+		if !ok {
+			continue
+		}
+		ns, nok := stringField(doc, "ns")
+		if !nok || ns == "" {
+			continue
+		}
+		// A command entry names db.$cmd, and the collection it acts on is the
+		// value of the command itself: {op: "c", ns: "shop.$cmd", o: {drop:
+		// "orders"}}. Left alone, an applyOps carrying a create or a drop of a
+		// tiered collection would walk past the guards above that refuse those
+		// same commands when they are sent as commands.
+		if edb, isCmd := strings.CutSuffix(ns, ".$cmd"); isCmd {
+			if inner, ok := doc.Lookup("o").DocumentOK(); ok {
+				if elems, eerr := inner.Elements(); eerr == nil && len(elems) > 0 {
+					if coll, cok := elems[0].Value().StringValueOK(); cok && coll != "" {
+						if c.r.cfg.Manages(edb + "." + coll) {
+							touched = edb + "." + coll
+							break
+						}
+					}
+				}
+			}
+			continue
+		}
+		if c.r.cfg.Manages(ns) {
+			touched = ns
+			break
+		}
+	}
+	if touched == "" {
+		return nil, false
+	}
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused an applyOps writing into a tiered collection", "ns", touched)
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this applyOps because "+touched+" is tiered. applyOps applies oplog "+
+			"entries straight to the collection, so it passes none of the checks a write command "+
+			"passes: an _id or a unique value the archive still holds is not seen, and the archived "+
+			"document is then overwritten by what the feeder mirrors. Send the same change as an "+
+			"ordinary write, which this router resolves across both tiers.")
 	if rerr != nil {
 		return nil, false
 	}

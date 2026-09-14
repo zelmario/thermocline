@@ -317,6 +317,10 @@ feeder:
     - "shop.tsins"
     # testquery.sh
     - "shop.tqcoll"
+    # testquery.sh: applyOps, which writes straight into a collection and so is
+    # refused for a tiered one. Its own collection because the section leaves an
+    # archived document on purpose to see whether it survives.
+    - "shop.tqapply"
     - "shop.tqtext"
     - "shop.tqview"
     # testquery.sh: a view whose own pipeline joins a second tiered collection.

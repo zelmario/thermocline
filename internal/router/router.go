@@ -1007,7 +1007,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// keeping while the old ones it is written for go untouched.
 	if nameErr == nil && !msg.MoreToCome() &&
 		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce" ||
-			name == "createIndexes" || name == "collMod" ||
+			name == "createIndexes" || name == "collMod" || name == "applyOps" ||
 			name == "convertToCapped" || name == "cloneCollectionAsCapped" || name == "create") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
 			return c.send(out)
