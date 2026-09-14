@@ -25,6 +25,28 @@ type Record struct {
 	SavedAt time.Time `bson:"savedAt"`
 	// EventAt is the cluster time of the last event applied, used to report lag.
 	EventAt time.Time `bson:"eventAt,omitempty"`
+	// SkewMS is how far the feeder's clock was ahead of the archive's when it
+	// last looked, which is what makes EventAt comparable on another machine.
+	//
+	// The same field the position record carries and for the same reason: lag
+	// is worked out by subtracting EventAt from a clock that is not the
+	// feeder's. This record is the fallback for a deployment with
+	// position_every set to zero, which is a supported setting, and without
+	// this that deployment is the one place the correction does not reach.
+	//
+	// Absent on a record written by a feeder from before it, and on one that
+	// has not managed to read the archive's clock. A reader without it
+	// subtracts raw instants, which is what everything did before.
+	SkewMS *int64 `bson:"skewMS,omitempty"`
+}
+
+// Skew is how far the publisher's clock was ahead of the archive's when it last
+// looked, and whether it ever managed to look.
+func (r Record) Skew() (time.Duration, bool) {
+	if r.SkewMS == nil {
+		return 0, false
+	}
+	return time.Duration(*r.SkewMS) * time.Millisecond, true
 }
 
 // Store reads and writes checkpoints.
@@ -53,13 +75,17 @@ func (s *Store) Load(ctx context.Context, id string) (bson.Raw, error) {
 
 // Save writes the token for id. eventAt may be zero when the stream has not
 // delivered an event yet.
-func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt time.Time) error {
+func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt time.Time,
+	skew time.Duration, skewKnown bool) error {
 	set := bson.D{
 		{Key: "token", Value: token},
 		{Key: "savedAt", Value: time.Now().UTC()},
 	}
 	if !eventAt.IsZero() {
 		set = append(set, bson.E{Key: "eventAt", Value: eventAt})
+	}
+	if skewKnown {
+		set = append(set, bson.E{Key: "skewMS", Value: skew.Milliseconds()})
 	}
 
 	_, err := s.coll.UpdateOne(ctx,
@@ -79,13 +105,21 @@ func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt tim
 // It is how anything other than the feeder finds out how far behind mirroring
 // is. A read served from the archive is only as current as this instant.
 func (s *Store) EventAt(ctx context.Context, id string) (time.Time, bool, error) {
+	rec, ok, err := s.Mark(ctx, id)
+	return rec.EventAt, ok, err
+}
+
+// Mark returns the whole checkpoint, for a caller that needs more than the
+// instant: how far behind mirroring is cannot be worked out from EventAt alone
+// without knowing whose clock it was read on. See Record.SkewMS.
+func (s *Store) Mark(ctx context.Context, id string) (Record, bool, error) {
 	var rec Record
 	err := s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&rec)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return time.Time{}, false, nil
+		return Record{}, false, nil
 	}
 	if err != nil {
-		return time.Time{}, false, fmt.Errorf("read checkpoint %q: %w", id, err)
+		return Record{}, false, fmt.Errorf("read checkpoint %q: %w", id, err)
 	}
-	return rec.EventAt, !rec.EventAt.IsZero(), nil
+	return rec, !rec.EventAt.IsZero(), nil
 }

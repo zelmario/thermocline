@@ -159,6 +159,31 @@ is not running and an id nothing writes look identical from a log line.
 Spelling the key out and disagreeing with `feeder.id` is still allowed, for a
 feeder run from a separate config, and every daemon says so at startup.
 
+### One feeder and one sweep at a time
+
+Two feeders with the same id destroy data, and the way to arrange it is
+ordinary: start the daemon on a second host for redundancy, or let a unit file
+start one before the old one has exited. Both watch the same namespaces, both
+see every delete, and an eviction is announced once. The first to reach it takes
+the announcement down; the second reads a real eviction as the application
+deleting the document and tombstones the archive's copy, so the document is gone
+from both tiers with nothing said anywhere.
+
+So a feeder takes a lease before it mirrors anything and a second one refuses to
+start, naming the host and pid that holds it. It is released on a clean stop, so
+an ordinary restart is immediate, and a holder this host can see is no longer
+running is replaced at once. A holder on another host that stopped without
+releasing is replaced after thirty seconds.
+
+The evictor takes one per sweep rather than per process, because a sweep is what
+must not overlap: two of them announce one eviction twice and delete it once,
+and the count left standing answers for the application's own delete of that _id
+whenever it comes. `cline evictor --once` while the daemon is mid-sweep refuses;
+`--dry-run` always runs, because it announces nothing and removes nothing.
+
+Routers are the exception and are meant to be run several at a time. See
+[operations.md](docs/operations.md).
+
 ### Both tiers are replica sets
 
 That is the supported shape, and the only one anything here is tested against. A

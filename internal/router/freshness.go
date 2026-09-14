@@ -293,9 +293,14 @@ func (r *Router) readPosition(ctx context.Context) reading {
 		// checkpoint at all.
 		return reading{everyMS: rec.EveryMS}
 	default:
-		// No position record at all, which is a feeder too old to publish one.
-		// Its checkpoint is the only signal there is.
-		got.at, got.known, err = r.checkpoints.EventAt(ctx, r.cfg.FeederID)
+		// No position record at all, which is a feeder too old to publish one
+		// or one with position_every set to zero. Its checkpoint is the only
+		// signal there is, and it carries the same offset for the same reason.
+		var rec checkpoint.Record
+		var ok bool
+		rec, ok, err = r.checkpoints.Mark(ctx, r.cfg.FeederID)
+		got.at, got.known = rec.EventAt, ok
+		got.skew, got.skewKnown = rec.Skew()
 	}
 	if err != nil {
 		return reading{}

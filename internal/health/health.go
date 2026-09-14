@@ -170,11 +170,7 @@ func (c *Checker) Sample(ctx context.Context) Reading {
 // specific document, checked per batch against the cold tier; this lag gate is
 // a coarse net over that, for stopping a sweep while mirroring is struggling.
 func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
-	var rec struct {
-		EventAt time.Time `bson:"eventAt"`
-		SavedAt time.Time `bson:"savedAt"`
-	}
-	// Decoded into the record the feeder writes rather than a copy of its
+	// Both records are decoded into the types the feeder writes rather than a copy of its
 	// fields, so there is one definition of what is in there.
 	var pos checkpoint.PositionRecord
 	if perr := c.cold.Database(meta.DB).Collection(meta.PositionsColl).
@@ -196,6 +192,7 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 		}
 	}
 
+	var rec checkpoint.Record
 	err := c.cold.Database(meta.DB).Collection(meta.Checkpoints).
 		FindOne(ctx, bson.D{{Key: "_id", Value: c.feederID}}).Decode(&rec)
 	if err != nil || rec.EventAt.IsZero() {
@@ -209,7 +206,9 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 	if rec.SavedAt.After(latest) {
 		latest = rec.SavedAt
 	}
-	r.FeederLag = max(time.Since(latest), 0)
+	theirs, theirsKnown := rec.Skew()
+	mine, mineKnown := c.archiveSkew(ctx)
+	r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
 }
 
 func (c *Checker) sampleServerStatus(ctx context.Context, r *Reading) {

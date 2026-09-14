@@ -290,11 +290,20 @@ func (r *Router) mirroringLag(ctx context.Context) mirroringReading {
 			feederSkew: theirs, feederSkewKnown: theirsKnown,
 		}
 	}
-	at, ok, err := r.checkpoints.EventAt(ctx, r.cfg.FeederID)
+	// The fallback, for a deployment with position_every set to zero. It
+	// carries the feeder's offset too, so the subtraction is the same one in
+	// the same frame rather than a raw one hiding under a clamp.
+	rec, ok, err := r.checkpoints.Mark(ctx, r.cfg.FeederID)
 	if err != nil || !ok {
 		return mirroringReading{}
 	}
-	return mirroringReading{lag: max(time.Since(at), 0), known: true}
+	theirs, theirsKnown := rec.Skew()
+	mine, mineKnown := r.archiveSkew(ctx)
+	return mirroringReading{
+		lag:        health.LagFrom(time.Now(), rec.EventAt, mine, theirs, mineKnown && theirsKnown),
+		known:      true,
+		feederSkew: theirs, feederSkewKnown: theirsKnown,
+	}
 }
 
 // daemonSkew is one daemon's clock less the archive's, in seconds.

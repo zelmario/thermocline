@@ -130,7 +130,8 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	if time.Since(f.lastSaved) < f.cfg.CheckpointEvery {
 		return nil
 	}
-	if err := f.cp.Save(ctx, f.cfg.ID, f.lastToken, f.lastEventAt); err != nil {
+	ckSkew, ckSkewKnown := f.clockSkew(ctx)
+	if err := f.cp.Save(ctx, f.cfg.ID, f.lastToken, f.lastEventAt, ckSkew, ckSkewKnown); err != nil {
 		return err
 	}
 	f.lastSaved = time.Now()
