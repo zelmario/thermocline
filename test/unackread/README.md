@@ -22,3 +22,21 @@ hand if the six containers are up.
 `inStep=false` is the failure. It means every command after that one is answered
 by the one before it. `the find WAS answered` against mongod is what would make
 the router's behaviour a defect rather than a matching pair of assumptions.
+
+## What it showed
+
+Run on 2026-09-14 against an unauthenticated pair on 28017 and 28018, mongod
+6.0, with a router in front on 27600:
+
+    mongod    the find was not answered, ping responseTo=9, inStep=true
+    router    the find was not answered, ping responseTo=9, inStep=true
+
+So mongod honours moreToCome on a command that returns documents, exactly as it
+does on a write, and the router's assumption that no reply is coming is the same
+assumption the server is making. **No defect here**, which is worth writing down
+because the shape is the exhaust finding's and that one was real: there the two
+disagreed, mongod sent five replies to one request and the router read one.
+
+This is the answer for `find`. A command that returns documents *and* holds
+state, `getMore` above all, is the same question asked of a different code path,
+and this probe does not ask it.
