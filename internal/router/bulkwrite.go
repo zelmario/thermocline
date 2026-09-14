@@ -218,6 +218,63 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		}
 	}
 
+	// The _id check an ordinary insert gets, because bulkWrite is a second way
+	// to send an insert and it was not getting it.
+	//
+	// An insert carrying an _id that lives only in the archive hides a
+	// collision the application relies on, and the feeder then mirrors the new
+	// document over the archived one. Measured through this command before this
+	// existed: {_id: 500, v: "archived, precious", tier: "gold"} in the archive,
+	// a bulkWrite inserting {_id: 500, v: "clobber via bulkWrite"} accepted with
+	// nInserted 1, and six seconds later the archive held the clobber. The same
+	// insert sent the ordinary way was refused. See insertid.go, whose guard
+	// this reuses whole: the check belongs to the command shape, not to the
+	// command name.
+	//
+	// Before the key claims below, because mongod reports _id first and because
+	// a refusal here has nothing to give back yet.
+	idDocs := map[string][]bson.Raw{}
+	var idOrder []string
+	for _, op := range ops {
+		if op.kind != "insert" || !c.r.cfg.Manages(op.ns) {
+			continue
+		}
+		if _, seen := idDocs[op.ns]; !seen {
+			idOrder = append(idOrder, op.ns)
+		}
+		idDocs[op.ns] = append(idDocs[op.ns], op.doc)
+	}
+	for _, ns := range idOrder {
+		clashes, err := c.r.archivedIDClashes(ctx, ns, idDocs[ns])
+		if err != nil {
+			// An insert that cannot be checked is refused, the way the ordinary
+			// path refuses one, and for the same reason: what this check stops
+			// destroys data that is already safe. The exception is the same too,
+			// a fast tier claiming all of history, where its own _id index is
+			// the whole answer.
+			if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed && mark.CoversAll() {
+				c.log.Warn("could not check a bulkWrite's ids against the archive; the fast tier "+
+					"claims all of history, so its own _id index is the whole answer", "ns", ns, "err", err)
+				continue
+			}
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused a bulkWrite whose ids could not be checked against the archive",
+				"ns", ns, "err", err)
+			out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: refusing this bulkWrite because the archive could not be asked whether it "+
+					"already holds one of these _ids, and accepting it would overwrite an archived "+
+					"document: "+err.Error())
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
+		}
+		if len(clashes) > 0 {
+			return c.refuseBulk(ctx, msg, nil, ns, "_id_")
+		}
+	}
+
 	// Then the unique keys, for the same reason and in the same way as an
 	// ordinary insert or update.
 	var claimed []string

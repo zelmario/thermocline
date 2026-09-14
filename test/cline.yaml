@@ -330,6 +330,10 @@ feeder:
     # testbulk.sh
     - "shop.tbwu"
     - "shop.tbwm"
+    # testbulk.sh: an _id only the archive holds, against a bulkWrite insert of
+    # the same _id. Its own collection because the section leaves the fast tier
+    # without the document on purpose.
+    - "shop.tbwi"
     # testchange.sh
     - "shop.tcs"
     # testchange.sh: a promotion read after the application deleted the

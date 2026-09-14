@@ -117,6 +117,46 @@ LH=$(H "print(db.getSiblingDB(process.env.TC_DB).tbwu.countDocuments({email:'tak
 LC=$(C "print(db.getSiblingDB(process.env.TC_DB).tbwu.countDocuments({email:'taken@x.com',_tcDeletedAt:{\$exists:false}}))")
 chk "one live holder of the key across both tiers"      "1" "$((LH + LC))"
 
+echo "== a bulkWrite insert must not duplicate an archived _id either =="
+# The same guard, one field along, and bulkWrite was not getting it. An insert
+# carrying an _id that lives only in the archive hides a collision the
+# application relies on, and the feeder then mirrors the new document over the
+# archived one.
+#
+# Measured before this: {_id:500, v:"archived, precious", tier:"gold"} in the
+# archive, a bulkWrite inserting {_id:500, v:"clobber via bulkWrite"} accepted
+# with nInserted 1, and six seconds later the archive held the clobber. The same
+# insert sent the ordinary way was refused. The check belongs to the shape of
+# the command, not to its name.
+IDNS=tbwi
+H "db.getSiblingDB(process.env.TC_DB).$IDNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IDNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IDNS.insertOne({_id:500, v:'archived, precious', tier:'gold'})" >/dev/null
+chk "the archive holds it and the fast tier does not"   "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$IDNS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$IDNS.countDocuments({}))")"
+BID=$(R "
+  try {
+    db.adminCommand({bulkWrite:1,
+      ops:[{insert:0, document:{_id:500, v:'clobber via bulkWrite'}}],
+      nsInfo:[{ns:process.env.TC_DB+'.$IDNS'}]});
+    print('ACCEPTED');
+  } catch(e) { print(e.code===11000?'11000':('other:'+(e.code||e.message.substring(0,40)))); }")
+chk "the bulkWrite is refused as a duplicate"           "11000" "$BID"
+sleep 6
+chk "and the archived document is untouched"            "archived, precious/gold" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$IDNS.findOne({_id:500}); print(d?d.v+'/'+d.tier:'MISSING')")"
+# And a fresh _id still goes through, or the guard is just a refusal.
+FRESH=$(R "
+  try {
+    const r = db.adminCommand({bulkWrite:1,
+      ops:[{insert:0, document:{_id:501, v:'new'}}],
+      nsInfo:[{ns:process.env.TC_DB+'.$IDNS'}]});
+    print(r.nInserted);
+  } catch(e) { print('refused:'+(e.code||e.message.substring(0,40))); }")
+chk "an _id nobody holds is still inserted"             "1" "$FRESH"
+H "db.getSiblingDB(process.env.TC_DB).$IDNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IDNS.drop()" >/dev/null
+
 echo "== a bulkWrite multi update must reach archived documents =="
 R "db.getSiblingDB(process.env.TC_DB).tbwm.insertMany(Array.from({length:12},(_,i)=>({_id:i,grp:'g',n:i})))" >/dev/null
 waitMirrored tbwm 12
