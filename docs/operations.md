@@ -119,11 +119,21 @@ application deleting the document and tombstones the archive's copy: the
 document is gone from both tiers with nothing said. The way to get there is
 ordinary, which is why the guard exists rather than a line in a runbook.
 
-What that means for a failover: a feeder that is stopped cleanly releases its
-lease at once, so a restart is immediate. A host that disappears does not, so
-the replacement waits thirty seconds and then takes over. There is nothing to
-clear by hand, and clearing the row by hand is safe if you are sure the other
-process is gone.
+What that means for a failover, measured on the test cluster rather than
+reasoned: a feeder stopped cleanly releases its lease and the replacement is
+mirroring **122 ms** later; one killed with `kill -9` releases nothing and the
+replacement is mirroring **129 ms** later, because this host can see the pid is
+gone; and a replacement started beside a feeder that is still running is refused
+in **126 ms** with the message above. Only a holder on another host that stopped
+without releasing costs the thirty seconds. There is
+nothing to clear by hand, and clearing the row by hand is safe if you are sure
+the other process is gone.
+
+**The lease protects you only once both daemons have it.** A version from before
+it takes none and respects none, so during an upgrade the old feeder and the new
+one run beside each other exactly as two new ones cannot. Stop the old one and
+wait for it to exit before starting the new one, which is the order you would
+use anyway.
 
 The evictor's lease is per sweep rather than per process, because a sweep is
 what must not overlap: two evictors taking turns are two ordinary sweeps. So

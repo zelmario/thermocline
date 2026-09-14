@@ -76,10 +76,21 @@ type ErrHeld struct {
 }
 
 func (e *ErrHeld) Error() string {
-	return fmt.Sprintf("another %s with id %q is running: %s (pid %d), last seen %s ago. "+
+	// "last seen -1s ago" is what this printed once, on a box whose clock had
+	// stepped backwards between the holder's renewal and this reading. A
+	// negative age reads as a defect in the thing reporting it, which is the
+	// wrong thing for an operator to be wondering about while two daemons are
+	// fighting over one deployment. Both instants are the archive's own, so
+	// nothing here can correct it; what it can do is say the true thing
+	// plainly. The clock warnings at startup are where a moving clock belongs.
+	seen := "just now"
+	if e.Ago > 0 {
+		seen = e.Ago.Round(time.Second).String() + " ago"
+	}
+	return fmt.Sprintf("another %s with id %q is running: %s (pid %d), last seen %s. "+
 		"Two of them against one deployment is not redundancy: stop that one, or wait %s for its "+
 		"lease to expire if the host is gone",
-		e.Kind, e.ID, e.Host, e.PID, e.Ago.Round(time.Second), Stale)
+		e.Kind, e.ID, e.Host, e.PID, seen, Stale)
 }
 
 // ErrLost says the lease was taken by somebody else while this process held it.

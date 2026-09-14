@@ -68,6 +68,12 @@ func TestOnlyOneHolderAtATime(t *testing.T) {
 	if msg := err.Error(); msg == "" || !contains(msg, "stop that one") {
 		t.Errorf("the message does not say what to do: %q", msg)
 	}
+	// And it never says a negative age. This box's clock has stepped backwards
+	// between one daemon's renewal and another's reading, and "last seen -1s
+	// ago" reads as a defect in the message rather than as what it is.
+	if msg := (&ErrHeld{Kind: "feeder", ID: "a", Ago: -time.Second}).Error(); contains(msg, "-1s") {
+		t.Errorf("a clock that moved backwards is reported as a negative age: %q", msg)
+	}
 
 	// Taking it again is not a conflict with itself. A daemon that reconnects
 	// and retakes its own lease must not lock itself out.
