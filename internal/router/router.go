@@ -1017,7 +1017,8 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if nameErr == nil &&
 		(name == "renameCollection" || name == "mapReduce" || name == "mapreduce" ||
 			name == "createIndexes" || name == "collMod" || name == "applyOps" ||
-			name == "convertToCapped" || name == "cloneCollectionAsCapped" || name == "create") {
+			name == "convertToCapped" || name == "cloneCollectionAsCapped" ||
+			name == "create" || name == "dropIndexes") {
 		if out, done := c.guardDDL(ctx, msg, db, name); done {
 			return c.answer(msg, out)
 		}

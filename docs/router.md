@@ -926,8 +926,34 @@ The fast tier is asked first and a match there ends it, because without a sort
 any match will do, which is all MongoDB promises. An acknowledged write takes
 exactly the shortcuts it took before and pays nothing new.
 
-`testunack.sh` pins all of it, along with the control that an ordinary
-unacknowledged write still lands on both tiers.
+**Not every guard could be moved in front of the write, and one command is
+refused instead.** A unique index dropped through the router has one to drop
+behind it on the archive, or the archive goes on refusing values the router now
+accepts. Both halves of that live on the reply: which indexes are going has to
+be read before the fast tier removes them, because afterwards there is nothing
+left to ask, and the archive's copy is dropped only once the reply says the fast
+tier accepted it. Doing it before forwarding would drop the archive's index for
+a command the fast tier might turn down.
+
+Measured in the adoption shape, the archive carrying its own unique index:
+
+    acknowledged     both tiers end with _id_, and both duplicates mirror
+    unacknowledged   the fast tier ends with _id_, the archive keeps code_1,
+                     and of two documents the application was now entitled to
+                     write, one reached the archive and one did not
+
+That second document lives on the fast tier alone. Nothing tells the
+application, and the evictor will not remove a document the archive does not
+hold, so it is not lost; the archive is simply incomplete from then on. So an
+unacknowledged `dropIndexes` on a tiered collection is refused, which is the
+`applyOps` reasoning: a refusal is a limitation and a wrong answer is a bug.
+Nothing is lost by refusing, because an operator dropping an index is present to
+see that it is still there, and no driver sends DDL fire-and-forget.
+
+`testunack.sh` pins all of it, along with the controls that an ordinary
+unacknowledged write still lands on both tiers, that an acknowledged
+`dropIndexes` still drops on both, and that an untiered collection's index still
+goes whatever flag is set.
 
 ### Replies the client asked to have several of
 

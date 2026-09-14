@@ -74,6 +74,9 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 	case "applyOps":
 		return c.refuseApplyOps(ctx, msg, cmd, db)
 
+	case "dropIndexes":
+		return c.refuseUnackedIndexDrop(msg, cmd, db)
+
 	case "mapReduce", "mapreduce":
 		coll, ok := stringField(cmd, name)
 		if !ok {
@@ -922,4 +925,61 @@ func mapReduceOutput(cmd bson.Raw, db string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// refuseUnackedIndexDrop turns down a dropIndexes on a tiered collection that
+// the client is not waiting for an answer to.
+//
+// A unique index dropped here has one to drop behind it on the archive, or the
+// archive goes on refusing values the router now accepts. Both halves of that
+// live on the reply: noteIndexDrop reads which indexes are going before the
+// fast tier removes them, because afterwards there is nothing left to ask, and
+// finishIndexDrop drops them on the archive only once the reply says the fast
+// tier accepted it. With moreToCome set there is no reply, so the second half
+// can never run, and doing it before forwarding would drop the archive's index
+// for a command the fast tier might turn down.
+//
+// Measured in the adoption shape, the archive carrying its own unique index,
+// before this:
+//
+//	acknowledged     both tiers end with _id_, and both duplicates mirror
+//	unacknowledged   the fast tier ends with _id_ and the archive keeps code_1,
+//	                 so of the two documents the application was now entitled
+//	                 to write, one reached the archive and one did not
+//
+// That second document lives on the fast tier alone. Nothing tells the
+// application, and the evictor will not remove a document the archive does not
+// hold, so it is not lost; the archive is simply incomplete from then on.
+//
+// Refused rather than guarded, which is the applyOps reasoning: a refusal is a
+// limitation and a wrong answer is a bug. Nothing here is lost by refusing,
+// because an operator dropping an index is present to see that it is still
+// there, and no driver sends DDL fire-and-forget.
+func (c *conn) refuseUnackedIndexDrop(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	if !msg.MoreToCome() {
+		return nil, false
+	}
+	coll, ok := stringField(cmd, "dropIndexes")
+	if !ok {
+		return nil, false
+	}
+	ns := db + "." + coll
+	if !c.r.cfg.Manages(ns) {
+		return nil, false
+	}
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused an unacknowledged dropIndexes on a tiered collection",
+		"ns", ns,
+		"reason", "the archive's copy of the index is dropped only once the reply says the fast tier dropped its own, and this command has no reply",
+		"effect", "the index is still there on both tiers; nothing was changed",
+		"action", "send the same dropIndexes without writeConcern {w: 0}")
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this dropIndexes because "+ns+" is tiered and the command asks for no "+
+			"acknowledgement. The archive's copy of the index is dropped behind the fast tier's, and "+
+			"only the reply says whether the fast tier dropped it. Send it without writeConcern {w: 0}.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
 }

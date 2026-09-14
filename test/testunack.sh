@@ -104,7 +104,7 @@ waitFeeder() {
 
 echo "== setup =="
 stopDaemons
-for t in tunku tunki tunkm tunk1 tunk2 tunk3; do
+for t in tunku tunki tunkm tunk1 tunk2 tunk3 tunkx tunkxfree; do
   H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
 done
@@ -257,6 +257,52 @@ chk "a sorted remove took the document the sort names"     "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk3.countDocuments({seq:3}))")"
 chk "and left the one the fast tier could see"             "1" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk3.countDocuments({seq:9}))")"
+
+echo "== an unacknowledged dropIndexes, which is refused rather than guarded =="
+# Not every guard can be moved in front of the write. A unique index dropped
+# through the router has one to drop behind it on the archive, or the archive
+# goes on refusing values the router now accepts, and both halves of that live
+# on the reply: which indexes are going has to be read before the fast tier
+# removes them, and the archive's copy is dropped only once the reply says the
+# fast tier dropped its own. Doing it before forwarding would drop the archive's
+# index for a command the fast tier might turn down.
+#
+# So it is refused, which is the applyOps reasoning: a refusal is a limitation
+# and a wrong answer is a bug. Measured before, with the archive carrying the
+# index as an adoption leaves it: the fast tier ended with _id_ and the archive
+# kept code_1, and of two documents the application was now entitled to write,
+# one reached the archive and one did not, with nothing said anywhere.
+H "db.getSiblingDB(process.env.TC_DB).tunkx.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tunkx.drop()" >/dev/null
+# Seeded on the fast tier and mirrored down, rather than inserted on both. The
+# feeder is running, so inserting the same _ids on the archive by hand is a
+# duplicate key error, and an uncaught error in mongosh --eval ends the script:
+# the createIndex on the next line would never run and the check below would
+# fail for the fixture rather than for the router.
+H "db.getSiblingDB(process.env.TC_DB).tunkx.insertMany([{_id:1,code:'A'},{_id:2,code:'B'}])" >/dev/null
+waitFeeder
+# The index on both tiers is the adoption shape: the archive arrives carrying
+# its own, and the indexer puts the same one on the fast tier.
+C "db.getSiblingDB(process.env.TC_DB).tunkx.createIndex({code:1},{unique:true,name:'code_1'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tunkx.createIndex({code:1},{unique:true,name:'code_1'})" >/dev/null
+chk "both tiers carry the unique index"                    "_id_,code_1/_id_,code_1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")/$(C "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")"
+R "db.getSiblingDB(process.env.TC_DB).runCommand({dropIndexes:'tunkx', index:'code_1', writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+chk "an unacknowledged dropIndexes changes neither tier"    "_id_,code_1/_id_,code_1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")/$(C "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")"
+# And the acknowledged one still works, or the refusal is a ban on the command.
+chk "an acknowledged one still drops it on both"           "_id_/_id_" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).runCommand({dropIndexes:'tunkx', index:'code_1'})" >/dev/null 2>&1; sleep 4;
+       echo "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")/$(C "print(db.getSiblingDB(process.env.TC_DB).tunkx.getIndexes().map(i=>i.name).join(','))")")"
+# An untiered collection is none of this system's business whatever flag is set.
+H "db.getSiblingDB(process.env.TC_DB).tunkxfree.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).tunkxfree.insertOne({_id:1,code:'A'});
+   db.getSiblingDB(process.env.TC_DB).tunkxfree.createIndex({code:1},{name:'code_1'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({dropIndexes:'tunkxfree', index:'code_1', writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+chk "an untiered collection's index still goes"            "_id_" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkxfree.getIndexes().map(i=>i.name).join(','))")"
 
 echo "== and an ordinary unacknowledged write still lands =="
 # The fix must not turn every w:0 write into a dropped one.
