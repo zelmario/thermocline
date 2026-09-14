@@ -29,6 +29,23 @@ Part of [Thermocline](../README.md).
   that already holds documents, so that one does not heal. The remedy the
   refusal names is to send it without `writeConcern {w: 0}`.
 
+- **A TTL index created straight against the fast tier cannot be refused, and is
+  named rather than prevented.** The router turns down a TTL index on a tiered
+  collection, because the fast tier holds the recent part: the index expires the
+  documents recent enough to be cached, the feeder mirrors those expiries as the
+  application deleting them, and the older documents the rule was written for sit
+  in the archive where no TTL index is watching. That guard is on the router's
+  door. An operator, a migration script or a restored fixture can create the same
+  index directly on the fast tier's mongod, and nothing here can stop it.
+  Measured with five recent documents on both tiers and five a year old in the
+  archive alone: the recent five were gone from the fast tier and tombstoned in
+  the archive, the year-old five untouched, and the only trace was the feeder's
+  ordinary "deletes not announced by the evictor", which is what a real
+  application delete looks like too. The router now says so when it reads the
+  collection's index listing, once per namespace and again whenever the answer
+  changes, naming the index and which way it goes wrong. The archive's own side
+  of this already had such a line; this is the fast tier's.
+
 - **mapReduce cannot write into a tiered collection**, and is refused when it
   tries. A replacing output is built beside the target and renamed over it, and a
   rename is not mirrored, so the result would reach the fast tier and nothing

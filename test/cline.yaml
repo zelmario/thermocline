@@ -52,6 +52,9 @@ feeder:
     - "shop.tdrift"
     # testddl.sh: the collection a TTL index is refused on.
     - "shop.tddlttl"
+    # testddl.sh: the same, for a TTL index that arrives by the other door,
+    # straight at the fast tier, which the router cannot refuse and says so.
+    - "shop.tddlttloob"
     # testddl.sh: the collection that may not be made capped or time series.
     - "shop.tddlcap"
     - "shop.tddlcap2"

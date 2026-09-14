@@ -270,6 +270,40 @@ chk "and no TTL index was created"                      "0" \
 # this guard is refusing far more than it means to.
 chk "an ordinary index on it is still accepted"         "accepted" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).$TNS.createIndex({at:1},{name:'plain_at'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+# The guard above is on this router's door. An index created straight against
+# the fast tier's mongod comes through the other one, and nothing here refuses
+# it: an operator, a migration script or a restored fixture does exactly that.
+#
+# It cannot be prevented from the router, so it has to be said. Measured on
+# 2026-09-14 before it was, five recent documents on both tiers and five a year
+# old in the archive alone, with a thirty second TTL index put on the fast tier
+# by hand: the five recent ones were gone from the fast tier and tombstoned in
+# the archive, the five year-old ones untouched, and the only trace anywhere was
+# the feeder's ordinary "deletes not announced by the evictor", which is what a
+# real application delete looks like too.
+#
+# The listing is what notices, so a read of this namespace is what makes the
+# router look. Dropped again straight away: this section is about what the
+# router says, not about letting mongod expire anything.
+OONS=tddlttloob
+H "db.getSiblingDB(process.env.TC_DB).$OONS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$OONS.drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).$OONS.insertOne({_id:1, at:new Date()})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$OONS.createIndex({at:1},{name:'oob_ttl', expireAfterSeconds:86400})" >/dev/null
+# The cached listing has to expire before the next read re-reads it, and the
+# insert below is what asks.
+sleep 2
+R "db.getSiblingDB(process.env.TC_DB).$OONS.insertOne({_id:2, at:new Date()})" >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  grep -q "has a TTL index on the fast tier" $LOGDIR/ddl_r.log 2>/dev/null && break
+  R "db.getSiblingDB(process.env.TC_DB).$OONS.insertOne({_id:$RANDOM, at:new Date()})" >/dev/null 2>&1
+  sleep 1
+done
+chk "a TTL index put there out of band is named"        "true"     "$(grep -q "has a TTL index on the fast tier.*$OONS\|$OONS.*oob_ttl" $LOGDIR/ddl_r.log 2>/dev/null && echo true || echo false)"
+chk "and the line says which way it goes wrong"         "true"     "$(grep "has a TTL index on the fast tier" $LOGDIR/ddl_r.log 2>/dev/null | grep -q "deletes the newest and keeps the oldest" && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$OONS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$OONS.drop()" >/dev/null 2>&1
+
 # And a collection nothing tiers lives on the fast tier alone, where a TTL index
 # means exactly what it says.
 H "db.getSiblingDB(process.env.TC_DB).customers.drop()" >/dev/null 2>&1

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -171,6 +172,11 @@ type indexCache struct {
 	mu      sync.RWMutex
 	fetched map[string]time.Time
 	byNS    map[string][]uniqueIndex
+	// Which TTL indexes this router has already said are on the fast tier's
+	// copy, per namespace, joined. The listing is re-read every indexRefresh
+	// and saying it every minute would bury it, so it is said when the answer
+	// changes. See warnFastTierExpires.
+	ttlSaid map[string]string
 }
 
 // uniqueIndexes lists the unique indexes on ns, excluding _id.
@@ -205,6 +211,7 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 	// collection has _id_, so a listing that names nothing at all is a
 	// collection that is not there.
 	listed := 0
+	expiring := []string{}
 	cur, err := r.hot.Database(db).Collection(coll).Indexes().List(ctx)
 	if err == nil {
 		defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
@@ -217,9 +224,16 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 				Key                     bson.Raw `bson:"key"`
 				PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
 				Collation               bson.Raw `bson:"collation"`
+				// Not a unique index's business, and read here because this
+				// listing is the only place that sees an index whatever door
+				// it came through. See warnFastTierExpires.
+				ExpireAfterSeconds *float64 `bson:"expireAfterSeconds"`
 			}
 			if derr := cur.Decode(&spec); derr != nil {
 				continue
+			}
+			if spec.ExpireAfterSeconds != nil && spec.Name != "_id_" {
+				expiring = append(expiring, spec.Name)
 			}
 			if !spec.Unique || spec.Name == "_id_" {
 				continue
@@ -241,6 +255,9 @@ func (r *Router) uniqueIndexes(ctx context.Context, ns string) []uniqueIndex {
 			found = append(found, ui)
 		}
 		err = cur.Err()
+	}
+	if err == nil && listed > 0 {
+		r.warnFastTierExpires(ns, expiring)
 	}
 
 	// A listing nobody managed to read must not replace what is remembered.
@@ -1874,4 +1891,66 @@ func valuesFromKeyID(ns string, idx uniqueIndex, id string) ([]any, bool) {
 		out[i] = v
 	}
 	return out, true
+}
+
+// warnFastTierExpires says that the fast tier's copy of a tiered collection has
+// a TTL index on it, which this router would have refused.
+//
+// guardTTL turns down a TTL index on a tiered collection and says why: the fast
+// tier holds the recent part, so the index expires the documents that were
+// recent enough to be cached, the feeder reads those expiries as the
+// application deleting them and the archive tombstones its own copies, and the
+// old documents the rule was written for sit in the archive where no TTL index
+// is watching. That guard is on this router's door. An index created straight
+// against the fast tier's mongod -- an operator, a migration, a restored
+// fixture -- comes through the other one, and nothing here saw it.
+//
+// Measured on 2026-09-14, five recent documents on both tiers and five a year
+// old in the archive alone, with a thirty second TTL index put on the fast tier
+// by hand: the five recent ones were gone from the fast tier and tombstoned in
+// the archive, and the five year-old ones were untouched. The only trace
+// anywhere was the feeder's ordinary "deletes not announced by the evictor",
+// which is what a real application delete looks like too.
+//
+// It cannot be prevented from here, so it is said, which is what this system
+// does everywhere else it cannot prevent something: the archive's own side of
+// this has warnArchiveExpires, and losing a unique constraint to a drop has its
+// own line. Driven by the listing rather than by watching for a createIndexes,
+// because the listing is the one place that learns about an index whichever way
+// it arrived, which is the same argument releaseIndexClaims makes.
+//
+// Said when the answer changes rather than every refresh, because the listing is
+// re-read every indexRefresh and a line every minute is a line nobody reads.
+func (r *Router) warnFastTierExpires(ns string, expiring []string) {
+	sort.Strings(expiring)
+	now := strings.Join(expiring, ",")
+
+	r.idxCache.mu.Lock()
+	if r.idxCache.ttlSaid == nil {
+		r.idxCache.ttlSaid = map[string]string{}
+	}
+	before, seen := r.idxCache.ttlSaid[ns]
+	r.idxCache.ttlSaid[ns] = now
+	r.idxCache.mu.Unlock()
+
+	if seen && before == now {
+		return
+	}
+	if now == "" {
+		if seen && before != "" {
+			r.log.Info("the TTL index on a tiered collection's fast tier copy is gone",
+				"ns", ns, "was", before)
+		}
+		return
+	}
+	r.log.Warn("a tiered collection has a TTL index on the fast tier, which this router refuses "+
+		"and did not put there",
+		"ns", ns, "indexes", expiring,
+		"reason", "it was created straight against the fast tier rather than through this router",
+		"effect", "the fast tier holds the recent part of this collection, so it expires the "+
+			"documents recent enough to be cached and the feeder mirrors those expiries as the "+
+			"application deleting them; the older documents the rule was written for are in the "+
+			"archive where no TTL index is watching, so this deletes the newest and keeps the oldest",
+		"action", "drop it on the fast tier, and use an evictor rule for what it was meant to do; "+
+			"documents already tombstoned in the archive are named by cline rollback")
 }
