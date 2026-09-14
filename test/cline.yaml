@@ -205,6 +205,11 @@ feeder:
     - "shop.tconc2u"
     - "shop.tconc2z"
     - "shop.zprobe"
+    # testsingle.sh: an _id both tiers hold against one only the archive holds,
+    # which is the difference between a refusal mongod owes the client and one
+    # this router owes it. Its own collection because the section seeds the two
+    # tiers differently on purpose.
+    - "shop.tsdup"
     # testall.sh: a completeness claim checked against what the two tiers hold,
     # which is what preflight does after a restore. Its own collection because
     # the section takes documents off the fast tier out of band to make the

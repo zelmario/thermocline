@@ -74,6 +74,7 @@ func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.R
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
+	clashing := make(bson.A, 0, len(ids))
 	var out []keyClash
 	for cur.Next(ctx) {
 		val, lerr := cur.Current.LookupErr("_id")
@@ -84,13 +85,90 @@ func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.R
 		if !ok {
 			continue
 		}
+		clashing = append(clashing, val)
 		out = append(out, keyClash{doc: i, index: "_id_"})
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return nil, cerr
 	}
+
+	// An _id the fast tier holds too is not this guard's business, and
+	// answering for it is how a retried insert was turned into an error.
+	//
+	// A driver retries a write after a network error by sending it again with
+	// the same session and transaction number, and mongod deduplicates it: the
+	// second attempt returns the recorded result and applies nothing. That only
+	// works if mongod sees the command. This guard answered E11000 itself, from
+	// the archive's copy of the document the first attempt had just written, so
+	// the retry came back DuplicateKey where a plain MongoDB answers ok. An
+	// application that reads E11000 as "somebody else has this key" then takes
+	// a branch it should not, over a write of its own that succeeded.
+	//
+	// Measured against the previous binary, two attempts a second apart with one
+	// session and transaction number: n=1 then E11000, where the same pair with
+	// this gives n=1 twice and the collection holds one document.
+	//
+	// What a suite can hold still is the other half of it, because whether the
+	// second attempt is deduplicated depends on the client driver reusing its
+	// session and mongosh does not do that reliably. The observable difference
+	// is who counted the refusal: thermocline_duplicate_keys_total moves when
+	// this router refuses and stays put when mongod does. See testsingle.sh.
+	//
+	// Handing those back to mongod is right whatever the second attempt is. A
+	// retry is deduplicated and answered with the recorded result. A genuine
+	// second insert of an _id the fast tier holds is refused by the fast tier's
+	// own index, with mongod's own error. And an _id only the archive holds is
+	// still this guard's to refuse, because that is the one mongod cannot see.
+	if len(clashing) > 0 {
+		held, herr := r.fastTierAlreadyHas(ctx, ns, clashing, at)
+		if herr != nil {
+			return nil, herr
+		}
+		if len(held) > 0 {
+			kept := out[:0]
+			for _, cl := range out {
+				if !held[cl.doc] {
+					kept = append(kept, cl)
+				}
+			}
+			r.log.Debug("an _id the archive holds is on the fast tier too, so mongod answers for it",
+				"ns", ns, "handed_back", len(out)-len(kept), "still_refused", len(kept))
+			out = kept
+		}
+	}
+
 	sort.Slice(out, func(a, b int) bool { return out[a].doc < out[b].doc })
 	return out, nil
+}
+
+// fastTierAlreadyHas reports which of the batch's positions carry an _id the
+// fast tier already has, so mongod can answer for them.
+//
+// Named apart from fastTierHolds next door, which answers the same question for
+// one document and is only ever used to skip work: this one decides whether a
+// client is told its insert failed, so an error here has to stop the insert
+// rather than be read as "not held".
+func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, at map[string]int) (map[int]bool, error) {
+	db, coll := splitNS(ns)
+	cur, err := r.hot.Database(db).Collection(coll).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	held := map[int]bool{}
+	for cur.Next(ctx) {
+		val, lerr := cur.Current.LookupErr("_id")
+		if lerr != nil {
+			continue
+		}
+		if i, ok := at[string(val.Type)+string(val.Value)]; ok {
+			held[i] = true
+		}
+	}
+	return held, cur.Err()
 }
 
 // mergeClashes joins two lists of rejections, keeping one reason per document

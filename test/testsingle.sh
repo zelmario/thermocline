@@ -129,6 +129,46 @@ sleep 5
 chk "and the archived document is intact"               "dave-gold-100" \
     "$(C "const d=db.getSiblingDB(process.env.TC_DB).tsins.findOne({_id:9}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
 
+echo "== an _id the fast tier holds is mongod's to refuse, not this router's =="
+# The guard above exists for an _id that lives only in the archive, which is the
+# one mongod cannot see. An _id the fast tier already holds is a different
+# question and mongod is the authority on it: its own index answers, and if the
+# insert is a driver's automatic retry of a write that already applied, mongod
+# answers it with the recorded result instead of an error.
+#
+# Answering it here took that away. The client sees the same E11000 either way,
+# so the difference is only visible in who counted it: duplicate_keys moves when
+# this router refuses and stays still when mongod does.
+DUPNS=tsdup
+H "db.getSiblingDB(process.env.TC_DB).$DUPNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DUPNS.drop()" >/dev/null
+# Both tiers hold _id 1; only the archive holds _id 2.
+C "db.getSiblingDB(process.env.TC_DB).$DUPNS.insertMany([{_id:1,n:'both'},{_id:2,n:'archive only'}])" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DUPNS.insertOne({_id:1,n:'both'})" >/dev/null
+# The counter the router keeps of refusals it made itself, read from its own
+# dashboard the way testdaemonmetrics.sh reads it.
+dups() { curl -s http://127.0.0.1:$PDASH/metrics 2>/dev/null | awk '/^thermocline_duplicate_keys_total /{print $2}'; }
+BEFORE=$(dups)
+INS1=$(R "try { db.getSiblingDB(process.env.TC_DB).$DUPNS.insertOne({_id:1,n:'again'}); print('ACCEPTED'); }
+          catch(e) { print(/E11000|duplicate key/i.test(e.message)?'DUPLICATE':'other'); }")
+MID=$(dups)
+chk "an _id both tiers hold is still refused"           "DUPLICATE" "$INS1"
+chk "and this router did not count it as its own"       "true" \
+    "$([ -n "$BEFORE" ] && [ "$BEFORE" = "$MID" ] && echo true || echo "false ($BEFORE then $MID)")"
+INS2=$(R "try { db.getSiblingDB(process.env.TC_DB).$DUPNS.insertOne({_id:2,n:'again'}); print('ACCEPTED'); }
+          catch(e) { print(/E11000|duplicate key/i.test(e.message)?'DUPLICATE':'other'); }")
+AFTER=$(dups)
+chk "an _id only the archive holds is refused too"      "DUPLICATE" "$INS2"
+# The control that makes the check above mean something: the counter does move
+# when the refusal is this router's, so a counter that never moves is not what
+# the first check is reading.
+chk "and that one this router did count"                "true" \
+    "$([ -n "$AFTER" ] && [ "$AFTER" -gt "$MID" ] 2>/dev/null && echo true || echo "false ($MID then $AFTER)")"
+chk "the archived document is untouched"                "archive only" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$DUPNS.findOne({_id:2}); print(d?d.n:'MISSING')")"
+H "db.getSiblingDB(process.env.TC_DB).$DUPNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DUPNS.drop()" >/dev/null
+
 echo "== and an insert of an id nobody holds still works =="
 chk "a fresh id is accepted"                            "1" \
     "$(R "db.getSiblingDB(process.env.TC_DB).tsins.insertOne({_id:10, name:'erin'}); print(db.getSiblingDB(process.env.TC_DB).tsins.countDocuments({_id:10}))")"
