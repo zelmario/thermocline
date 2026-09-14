@@ -286,6 +286,16 @@ feeder:
     - "shop.tunku"
     - "shop.tunki"
     - "shop.tunkm"
+    # testunack.sh: the single-document write, which is the statement
+    # guardMultiWrite skips and interceptWrite puts right on the reply. One
+    # collection for the update and one for the delete, because each section
+    # takes documents off the fast tier behind the feeder and a shared
+    # collection would decide the other's fixture.
+    - "shop.tunk1"
+    - "shop.tunk2"
+    # testunack.sh: findAndModify, which is a third dispatch again: its repair
+    # is interceptFindAndModify and its sort is judged by guardSortedFindAndModify.
+    - "shop.tunk3"
     # testupsert.sh
     - "shop.tups"
     - "shop.tupsf"

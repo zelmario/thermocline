@@ -1078,6 +1078,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// A write naming many documents only reaches the ones the fast tier holds,
 	// so the rest have to come up before it runs. Before, not after: repeating
 	// the write after a copy-up would apply $inc twice.
+	//
+	// A write naming one document is left to the reply, where interceptWrite
+	// resolves it against the archive and runs it again. Unless there is no
+	// reply: an unacknowledged single-document write is judged here too,
+	// because nothing downstream will judge it. See guardMultiWrite.
 	if nameErr == nil && (name == "update" || name == "delete") {
 		if out, done := c.guardMultiWrite(ctx, msg, db, name); done {
 			return c.answer(msg, out)
@@ -1088,7 +1093,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// can only pick from the part it holds. Also before the write: by the time
 	// a reply could be inspected the update has been applied to the wrong
 	// document.
-	if nameErr == nil && !msg.MoreToCome() &&
+	//
+	// Not gated on the reply. An unacknowledged findAndModify has no reply at
+	// all, so the sort, the bare filter and the _id are all this guard's to
+	// settle. See guardSortedFindAndModify.
+	if nameErr == nil &&
 		(name == "findAndModify" || name == "findandmodify") {
 		if out, done := c.guardSortedFindAndModify(ctx, msg, db); done {
 			return c.answer(msg, out)

@@ -888,7 +888,45 @@ same way, so an unacknowledged write now pays that latency, which is a real cost
 on a path chosen for speed. Where a guard would have refused, the command is not
 performed and nothing is sent back, because there is nowhere to send it.
 
-`testunack.sh` pins all three, along with the control that an ordinary
+That sentence was written before it was true of every write, and the gap it
+hid is worth stating, because it is the shape this door keeps taking.
+
+**A write that reaches one document was never guarded at all; it was repaired
+afterwards.** `interceptWrite` and `interceptFindAndModify` read the reply, see
+that the fast tier matched nothing, resolve the filter against the archive, copy
+the document up and run the statement again. That is a good design for a write
+with a reply, and there is no reply here. The pre-write guards covered
+multi-document statements, upserts, inserts, `bulkWrite` and aggregations, and
+a single-document `update`, `delete` or `findAndModify` fell between the two.
+
+Measured on a collection holding three documents, two of them in the archive
+only:
+
+    updateOne({ref: "a1"}, {$set: {status: "shipped"}}, {w: 0})
+      before   status stayed "new" on both tiers; the write landed nowhere
+      after    "shipped", and the fields the fast tier could not see survived
+
+    deleteOne({ref: "b1"}, {w: 0})
+      before   the document was still readable through the router
+      after    erased
+
+    findAndModify({status: "new"}, sort: {seq: 1}, remove: true, {w: 0})
+      before   removed seq 9, the oldest document the fast tier happened to
+               hold, and left seq 3, which is the one the sort names
+      after    removed seq 3
+
+Naming the document by `_id` rather than by another field is the same door:
+`interceptWrite` resolves that on the reply as well.
+
+The fix is the repair moved in front of the write, for unacknowledged writes
+only. One document, not every match: a single-document statement acts on one
+document however many it matches, and copying every match up would turn an
+unacknowledged `updateOne({status: "new"})` into a warm of the whole archive.
+The fast tier is asked first and a match there ends it, because without a sort
+any match will do, which is all MongoDB promises. An acknowledged write takes
+exactly the shortcuts it took before and pays nothing new.
+
+`testunack.sh` pins all of it, along with the control that an ordinary
 unacknowledged write still lands on both tiers.
 
 ### Replies the client asked to have several of

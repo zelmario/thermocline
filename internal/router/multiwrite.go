@@ -36,6 +36,15 @@ import (
 const maxCopyUpForWrite = 10000
 
 // guardMultiWrite brings archived documents up before a multi-document write.
+//
+// It brings them up for a single-document one too, but only when the write is
+// unacknowledged. A single-document statement that matched nothing is normally
+// put right on the reply, by interceptWrite, which resolves the filter against
+// the archive and runs the statement again against a fast tier that now holds
+// the document. An unacknowledged write has no reply to put anything right on:
+// the router returns as soon as the message is written. So for those the
+// choice is to do the work here or to lose the write, and the shortcuts below
+// are taken only where a reply will follow to take them back.
 func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name string) (*wire.Message, bool) {
 	cmd, err := msg.CommandDoc()
 	if err != nil {
@@ -59,8 +68,13 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		return nil, false
 	}
 
+	// An unacknowledged write is judged here whatever it names, because nothing
+	// downstream will judge it. See the note above this function.
+	repliable := !msg.MoreToCome()
+
 	for _, st := range stmts {
-		if !statementIsMulti(st, name) {
+		multi := statementIsMulti(st, name)
+		if !multi && repliable {
 			continue
 		}
 		fval, ferr := st.LookupErr(filterKey)
@@ -73,7 +87,10 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		}
 
 		// A filter that is nothing but an _id cannot reach beyond a single
-		// document, and that case is already resolved on the reply.
+		// document, and that case is already resolved on the reply. Only when
+		// there is one: unacknowledged, naming the document outright is the
+		// same door as naming it by any other field, and neither is resolved
+		// anywhere else.
 		//
 		// Nothing but an _id, not merely carrying one. A filter of an _id and
 		// something else is resolved on the reply against the whole of itself,
@@ -83,7 +100,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		// before the write and no resolution after it, so an archived document
 		// the statement matched was never touched and the write reported
 		// success. See filterIsOnlyID.
-		if _, hasID := idFromFilter(fdoc); hasID && filterIsOnlyID(fdoc) {
+		if _, hasID := idFromFilter(fdoc); hasID && filterIsOnlyID(fdoc) && repliable {
 			continue
 		}
 
@@ -95,6 +112,26 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 			} else if !bounded && mark.CoversAll() {
 				continue
 			}
+		}
+
+		// One statement acting on one document needs one document, however many
+		// it matches. copyUpMatching below brings up every match, which is what
+		// a multi-document statement is owed and would turn an unacknowledged
+		// updateOne({status: "new"}) into a warm of the whole archive: bounded
+		// at maxCopyUpForWrite, so past ten thousand matches it would refuse an
+		// ordinary write instead. This is the resolution interceptWrite does on
+		// the reply, moved in front of the write because there is no reply.
+		//
+		// Before the transaction branch below, and so outside any transaction:
+		// a copy-up is invisible to a snapshot taken before it, and putting
+		// that right means replaying the transaction, which means sending a
+		// reply to a client that is not listening. A statement sent
+		// unacknowledged inside a transaction is not a shape a driver
+		// produces, every statement of one being answered, so this leaves it
+		// where it was rather than inventing a behaviour for it.
+		if !multi {
+			c.bringUpOneForUnacked(ctx, ns, fdoc, docField(st, "collation"), name)
+			continue
 		}
 
 		if inTransaction(cmd) {
@@ -345,4 +382,45 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		return moved, err
 	}
 	return moved, nil
+}
+
+// bringUpOneForUnacked brings up the one archived document an unacknowledged
+// single-document write would otherwise miss.
+//
+// The fast tier is asked first, and a match there ends it: a statement with no
+// sort acts on any document it matches, which is all MongoDB promises, and
+// asking the local tier is much cheaper than asking the archive. Only a fast
+// tier that matches nothing sends this to the archive, which is exactly the
+// case interceptWrite reads off a reply as matched 0.
+//
+// Failures are logged and the write goes on. The alternative is dropping a
+// write because the archive was slow, and an unacknowledged write that reaches
+// only the fast tier is the behaviour this system had all along.
+func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collation bson.Raw, name string) {
+	// An error here is not a match: it means the fast tier could not be asked,
+	// and going on to the archive costs a lookup while believing it would cost
+	// the write.
+	if has, herr := c.r.fastTierMatches(ctx, ns, fdoc, collation); herr == nil && has {
+		return
+	}
+	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil)
+	if err != nil {
+		c.log.Warn("could not ask the archive which document this unacknowledged write means, so it reaches only the fast tier",
+			"ns", ns, "command", name, "err", err)
+		return
+	}
+	if !found {
+		return
+	}
+	copied, cerr := c.r.copyUp(ctx, ns, id)
+	if cerr != nil {
+		c.log.Warn("could not bring up the document an unacknowledged write names, so the write does not reach it",
+			"ns", ns, "command", name, "err", cerr)
+		return
+	}
+	if copied {
+		c.r.Stats.WriteMisses.Add(1)
+		c.cls = ClassMiss
+		c.log.Debug("brought up the document an unacknowledged single-document write names", "ns", ns, "command", name)
+	}
 }

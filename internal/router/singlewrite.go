@@ -125,6 +125,13 @@ func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort b
 // findAndModify is the only single-document write that carries a sort. update
 // and delete statements have no sort field, so the document they act on is
 // whichever one matched, and matching nothing is the case already handled.
+//
+// Two of the shortcuts below hold only while a reply is coming. Without a sort
+// any match will do, and an _id names one document outright: both of those send
+// the command on, and interceptFindAndModify puts it right afterwards if the
+// fast tier turned out to hold nothing. An unacknowledged findAndModify has no
+// reply and nothing runs afterwards, so for those this guard is the only
+// chance, and it takes neither shortcut. See the note above guardMultiWrite.
 func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, db string) (*wire.Message, bool) {
 	cmd, err := msg.CommandDoc()
 	if err != nil {
@@ -141,10 +148,18 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 		return nil, false
 	}
 
+	repliable := !msg.MoreToCome()
+
 	// No sort means any match will do, which is what MongoDB itself promises,
-	// so the fast tier's answer is as good as the archive's.
+	// so the fast tier's answer is as good as the archive's. As good, as long
+	// as it has one: a fast tier holding no match at all answers nothing, and
+	// unacknowledged there is no reply for interceptFindAndModify to correct.
+	// oneArchivedMatch takes an empty sort, which is that same any-match.
 	sortDoc, hasSort := cmd.Lookup("sort").DocumentOK()
-	if !hasSort || len(sortDoc) == 0 {
+	// An empty sort document is no sort: it names no order, so it cannot name
+	// a document. Read once here so the two places below agree about it.
+	sorted := hasSort && len(sortDoc) > 0
+	if !sorted && repliable {
 		return nil, false
 	}
 
@@ -153,9 +168,22 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 		fdoc, _ = qval.DocumentOK()
 	}
 	// A filter pinned to one _id names its document outright, and a sort cannot
-	// change which one that is.
-	if _, hasID := idFromFilter(fdoc); hasID {
+	// change which one that is. That settles which document is meant, not
+	// whether the fast tier holds it, and only a reply settles the second half.
+	// Unacknowledged, the walk below asks the archive for that same _id and
+	// brings it up, which is what interceptFindAndModify would have done.
+	if _, hasID := idFromFilter(fdoc); hasID && repliable {
 		return nil, false
+	}
+
+	// Without a sort any match will do, so a fast tier that already matches
+	// something ends it: only a fast tier matching nothing can lose the write.
+	// With a sort the question is which document, not whether there is one, and
+	// the fast tier's own best match is exactly what cannot be trusted.
+	if !sorted {
+		if has, herr := c.r.fastTierMatches(ctx, ns, fdoc, docField(cmd, "collation")); herr == nil && has {
+			return nil, false
+		}
 	}
 
 	if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed {

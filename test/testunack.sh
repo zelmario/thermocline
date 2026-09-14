@@ -104,7 +104,7 @@ waitFeeder() {
 
 echo "== setup =="
 stopDaemons
-for t in tunku tunki tunkm; do
+for t in tunku tunki tunkm tunk1 tunk2 tunk3; do
   H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
 done
@@ -160,6 +160,103 @@ sleep 4
 waitFeeder
 chk "nothing matching is left to read"                     "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).tunkm.countDocuments({grp:'g'}))")"
+
+echo "== an unacknowledged single-document update over an archived document =="
+# On one cluster this sets status on the one matching document and reports
+# matched 1. Here the document is only in the archive, so the fast tier matches
+# nothing.
+#
+# guardMultiWrite skips any statement that is not multi, and says why: a
+# single-document write that matched nothing is put right on the reply, by
+# interceptWrite, which resolves the filter against the archive, copies the
+# document up and runs the statement again. An unacknowledged write has no
+# reply. Nothing is intercepted, so the update lands nowhere and says nothing.
+#
+# Both filters are checked. interceptWrite resolves an _id-only filter on the
+# reply as well, so naming the document outright is the same door.
+H "db.getSiblingDB(process.env.TC_DB).tunk1.insertMany([
+     {_id:1, ref:'a1', status:'new', tier:'gold'},
+     {_id:2, ref:'a2', status:'new', tier:'gold'},
+     {_id:3, ref:'a3', status:'new'}])" >/dev/null
+waitFeeder
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tunk1.deleteMany({_id:{\$lt:3}})"
+chk "the fast tier holds one of three"                     "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunk1.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunk1.updateOne({ref:'a1'},{\$set:{status:'shipped'}},{writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "an update by another field reached the document"      "shipped" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tunk1.findOne({ref:'a1'}); print(d?d.status:'MISSING')")"
+chk "and the fields it could not see survived"             "gold" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tunk1.findOne({_id:1}); print(d?d.tier:'MISSING')")"
+R "db.getSiblingDB(process.env.TC_DB).tunk1.updateOne({_id:2},{\$set:{status:'shipped'}},{writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "an update naming the _id outright reached it too"     "shipped" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tunk1.findOne({ref:'a2'}); print(d?d.status:'MISSING')")"
+
+echo "== an unacknowledged single-document delete over an archived document =="
+# On one cluster this removes the document. Here it is only in the archive, so
+# without the copy-up the delete matches nothing and the document stays
+# readable: an erasure that did not erase, the same failure the deleteMany
+# section pins for the multi case.
+H "db.getSiblingDB(process.env.TC_DB).tunk2.insertMany([
+     {_id:1, ref:'b1'}, {_id:2, ref:'b2'}, {_id:3, ref:'b3'}])" >/dev/null
+waitFeeder
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tunk2.deleteMany({_id:{\$lt:3}})"
+chk "the fast tier holds one of three here too"            "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunk2.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunk2.deleteOne({ref:'b1'},{writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "a delete by another field erased it"                  "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk2.countDocuments({ref:'b1'}))")"
+R "db.getSiblingDB(process.env.TC_DB).tunk2.deleteOne({_id:2},{writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "and one naming the _id outright erased it too"        "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk2.countDocuments({_id:2}))")"
+
+echo "== an unacknowledged findAndModify over archived documents =="
+# findAndModify is the third dispatch, with a repair of its own
+# (interceptFindAndModify) and a guard of its own for the sort
+# (guardSortedFindAndModify). Both were reachable only through a reply.
+#
+# Three shapes, because they take three different routes through that guard:
+# no sort at all, a sort naming a document the fast tier cannot see, and a
+# filter that is nothing but an _id.
+H "db.getSiblingDB(process.env.TC_DB).tunk3.insertMany([
+     {_id:1, seq:1, ref:'c1', status:'new'},
+     {_id:2, seq:2, ref:'c2', status:'new'},
+     {_id:3, seq:3, ref:'c3', status:'new'},
+     {_id:9, seq:9, ref:'c9', status:'new'}])" >/dev/null
+waitFeeder
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tunk3.deleteMany({_id:{\$lt:9}})"
+chk "the fast tier holds one of four"                      "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunk3.countDocuments({}))")"
+R "db.getSiblingDB(process.env.TC_DB).runCommand({findAndModify:'tunk3',
+     query:{ref:'c1'}, update:{\$set:{status:'shipped'}}, writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "an unsorted findAndModify reached the document"       "shipped" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tunk3.findOne({ref:'c1'}); print(d?d.status:'MISSING')")"
+R "db.getSiblingDB(process.env.TC_DB).runCommand({findAndModify:'tunk3',
+     query:{_id:2}, update:{\$set:{status:'shipped'}}, writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "one naming the _id outright reached it too"           "shipped" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tunk3.findOne({ref:'c2'}); print(d?d.status:'MISSING')")"
+# The sorted case. seq 3 is the oldest document left unshipped and the fast
+# tier cannot see it; seq 9 is the oldest it can. Removing by sort must take
+# the one the sort names, not the oldest of the part that happens to be here.
+R "db.getSiblingDB(process.env.TC_DB).runCommand({findAndModify:'tunk3',
+     query:{status:'new'}, sort:{seq:1}, remove:true, writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+waitFeeder
+chk "a sorted remove took the document the sort names"     "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk3.countDocuments({seq:3}))")"
+chk "and left the one the fast tier could see"             "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tunk3.countDocuments({seq:9}))")"
 
 echo "== and an ordinary unacknowledged write still lands =="
 # The fix must not turn every w:0 write into a dropped one.
