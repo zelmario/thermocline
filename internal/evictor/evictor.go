@@ -25,6 +25,7 @@ import (
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -49,6 +50,8 @@ type Evictor struct {
 
 	marks   *watermark.Store
 	limiter *limiter
+	// hold is what keeps two sweeps from overlapping. See RunOnce.
+	hold *lease.Lease
 
 	// unagedSeen records which namespaces have already been counted for
 	// documents the rule cannot age, so the scan that costs happens once per
@@ -160,12 +163,40 @@ func New(hot, cold *mongo.Client, cfg config.EvictorConfig, dryRun bool, log *sl
 		dryRun:  dryRun,
 		marks:   watermark.New(cold),
 		limiter: newLimiter(cfg.Rate),
+		hold:    lease.New(cold, "evictor", cfg.FeederID),
 	}
 }
 
 // RunOnce walks every rule once and returns when there is nothing left to
 // remove at the current boundary.
+//
+// One sweep at a time across the whole deployment, which the lease is what
+// enforces. Two sweeps overlapping announce the same eviction twice and delete
+// it once, so a count is left standing on the notice, and the next delete of
+// that _id -- the application's own, whenever it comes -- is read as the
+// eviction that never happened: the archive keeps a live copy of a document its
+// owner deleted. The shape that arranges it is ordinary, an operator running
+// cline evict --once while the daemon is up.
+//
+// A pass rather than a process, because that is the thing that must not
+// overlap. Two evictors taking turns are two ordinary sweeps.
+//
+// A dry run takes nothing. It announces nothing and removes nothing, so it
+// cannot do the damage, and making it wait for a daemon's pass would make the
+// one command an operator reaches for when they want to understand the system
+// the one command that will not answer.
 func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
+	if !e.dryRun {
+		if err := e.hold.Take(ctx); err != nil {
+			return Stats{DryRun: e.dryRun}, err
+		}
+		defer func() {
+			if err := e.hold.Release(context.WithoutCancel(ctx)); err != nil {
+				e.log.Debug("could not release the evictor lease", "err", err)
+			}
+		}()
+	}
+
 	// An operator hold comes first, before any candidate is even looked at.
 	// See meta.EvictionPausedMarker for the case it exists for: an archive that
 	// has been restored can hold an older version of a document, which the
@@ -231,7 +262,15 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 func (e *Evictor) Run(ctx context.Context, every time.Duration) error {
 	for {
 		stats, err := e.RunOnce(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		var held *lease.ErrHeld
+		switch {
+		case errors.As(err, &held):
+			// Somebody else is sweeping. Skipping is right where stopping is
+			// not: the other sweep is doing this one's work, and a daemon that
+			// exits because an operator ran a sweep by hand is a fast tier that
+			// fills up.
+			e.log.Warn("another sweep is running, skipping this one", "err", err)
+		case err != nil && !errors.Is(err, context.Canceled):
 			return err
 		}
 		e.log.Info("sweep complete", stats.LogArgs()...)

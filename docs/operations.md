@@ -77,6 +77,39 @@ backup interval is the real exposure of this system, not the fast tier's, and
 `cline rollback`, which counts rather than removes unless you pass `--clear`, is
 what tells you what the two tiers disagree about afterwards.
 
+### One of each daemon
+
+The feeder and the evictor refuse to run twice against one deployment, and the
+refusal names who holds the lease:
+
+```
+$ bin/cline feeder --config cline.yaml
+error: another feeder with id "prod" is running: db7 (pid 2214), last seen 3s
+ago. Two of them against one deployment is not redundancy: stop that one, or
+wait 30s for its lease to expire if the host is gone
+```
+
+This is not tidiness. Two feeders on one namespace both see every delete and an
+eviction is announced once, so the second reads a real eviction as the
+application deleting the document and tombstones the archive's copy: the
+document is gone from both tiers with nothing said. The way to get there is
+ordinary, which is why the guard exists rather than a line in a runbook.
+
+What that means for a failover: a feeder that is stopped cleanly releases its
+lease at once, so a restart is immediate. A host that disappears does not, so
+the replacement waits thirty seconds and then takes over. There is nothing to
+clear by hand, and clearing the row by hand is safe if you are sure the other
+process is gone.
+
+The evictor's lease is per sweep rather than per process, because a sweep is
+what must not overlap: two evictors taking turns are two ordinary sweeps. So
+`cline evictor --once` run while the daemon is mid-sweep refuses and says so,
+and the daemon skips a pass rather than exiting when it finds one running,
+because a daemon that stopped because somebody swept by hand is a fast tier
+that fills up. `--dry-run` takes no lease at all: it announces nothing and
+removes nothing, so the one command you reach for to understand the system
+always answers.
+
 ### Logs
 
 Every daemon logs to stderr by default. Under systemd that is what you want,

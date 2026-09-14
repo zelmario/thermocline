@@ -14,6 +14,7 @@ import (
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -91,6 +92,30 @@ func (f *Feeder) noteEventTime(ct time.Time) {
 func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	if err := f.flush(ctx); err != nil {
 		return err
+	}
+
+	// Renewed here because this is the one place both the busy path and the
+	// idle one pass through, and losing it has to stop mirroring rather than be
+	// noticed at the next restart. See internal/lease.
+	if time.Since(f.heldAt) >= lease.Renew {
+		if err := f.hold.Keep(ctx); err != nil {
+			if errors.Is(err, lease.ErrLost) {
+				f.log.Error("another feeder has taken over, stopping",
+					"id", f.cfg.ID, "err", err,
+					"effect", "two feeders on one namespace read every delete twice, and an "+
+						"eviction is announced once: the second reads a real eviction as the "+
+						"application's own delete and tombstones the archive's copy",
+					"action", "run one feeder per id; if this one was meant to be the survivor, "+
+						"stop the other and start this again")
+				return err
+			}
+			// Anything else is the archive being unreachable, which the writes
+			// above would have failed on first. Worth a line, not worth
+			// stopping for.
+			f.log.Warn("could not renew the feeder lease", "err", err)
+		} else {
+			f.heldAt = time.Now()
+		}
 	}
 
 	// The position goes out first and on its own schedule. Everything buffered

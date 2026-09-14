@@ -30,6 +30,7 @@ import (
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -64,7 +65,12 @@ type Feeder struct {
 	cp    *checkpoint.Store
 	pos   *checkpoint.Positions
 	marks *watermark.Store
-	log   *slog.Logger
+	// hold is what stops a second feeder with this id running beside this one.
+	// Two of them read every delete twice, and an eviction is announced once:
+	// see internal/lease.
+	hold   *lease.Lease
+	heldAt time.Time
+	log    *slog.Logger
 
 	// buffered work, flushed together
 	pending []pendingOp
@@ -234,6 +240,7 @@ func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Fe
 		cp:    checkpoint.New(cold),
 		pos:   checkpoint.NewPositions(cold),
 		marks: watermark.New(cold),
+		hold:  lease.New(cold, "feeder", cfg.ID),
 		log:   log,
 	}
 }
@@ -337,6 +344,19 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 // Run tails the fast tier until ctx is cancelled. It reopens the stream on
 // recoverable errors, resuming from the last saved checkpoint.
 func (f *Feeder) Run(ctx context.Context) error {
+	// Before anything is mirrored, because the damage a second feeder does is
+	// done by mirroring. See internal/lease.
+	if err := f.hold.Take(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		// Best effort, and the point of it is that a restart does not have to
+		// wait the lease out.
+		if err := f.hold.Release(context.WithoutCancel(ctx)); err != nil {
+			f.log.Debug("could not release the feeder lease", "err", err)
+		}
+	}()
+
 	if err := f.EnsureIndexes(ctx); err != nil {
 		return err
 	}
@@ -352,7 +372,10 @@ func (f *Feeder) Run(ctx context.Context) error {
 		case err == nil, errors.Is(err, context.Canceled):
 			return nil
 		case errors.Is(err, ErrUnannouncedDelete), errors.Is(err, ErrResumePointLost),
-			errors.Is(err, ErrUnmirrorableKind):
+			errors.Is(err, ErrUnmirrorableKind), errors.Is(err, lease.ErrLost):
+			// ErrLost belongs in that list rather than in the reopen below:
+			// another process is mirroring these namespaces now, and two of
+			// them is what the lease exists to prevent.
 			return err
 		}
 

@@ -1,0 +1,219 @@
+// Package lease stops two of the same daemon running against one deployment.
+//
+// The feeder is the one that made this necessary. Two feeders with the same id
+// watch the same namespaces and both see every delete, and an eviction is
+// announced once: the first to reach it takes the announcement down, the second
+// finds nothing and reads a real eviction as the application deleting the
+// document. Its policy for that is to tombstone the archive's copy, which is
+// the default, so the document is gone from both tiers with nothing said
+// anywhere. Nobody has to do anything exotic to arrange it. Starting the daemon
+// on a second host for redundancy does it, and so does a unit file that starts
+// one before the old one has exited.
+//
+// The test harness has known this since it was written: mkworker.sh isolates
+// every worker's namespaces "so no two feeders ever watch the same namespace",
+// and says why in the same comment. The product said nothing and did nothing.
+//
+// A second evictor is milder and still wrong. Two of them announce the same
+// eviction twice and only one delete follows, so a count is left standing, and
+// the next delete of that _id -- the application's own, whenever it comes -- is
+// read as the eviction that never happened. The archive keeps a live copy of a
+// document its owner deleted.
+//
+// So: one row per daemon kind and id, owned by one process, renewed while it
+// runs and released when it stops. A daemon that cannot take the lease refuses
+// to start and names who holds it. A daemon that loses it while running stops,
+// because carrying on is the thing this exists to prevent.
+//
+// Every instant here is the archive's own, taken as the row is written. The
+// process that judges whether a lease is stale is never the process that wrote
+// it, which is the whole point, so a clock comparison between the two would be
+// exactly the mistake this guard is made of. See internal/health's note.
+package lease
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/zelmario/thermocline/internal/meta"
+)
+
+// Stale is how long a lease outlives its holder.
+//
+// The trade is between two bad minutes. Short, and an ordinary pause -- a long
+// checkpoint write, a stalled archive, a process the scheduler forgot about --
+// lets a second daemon in beside the first, which is what this exists to stop.
+// Long, and a host that died takes mirroring down for that long, because the
+// replacement waits the lease out.
+//
+// Thirty seconds, renewed every five. Six missed renewals is well past any
+// pause this has been measured to take, and a feeder that is down for half a
+// minute has already cost more than the wait.
+const Stale = 30 * time.Second
+
+// Renew is how often the holder refreshes it.
+const Renew = 5 * time.Second
+
+// ErrHeld says another process holds the lease. It carries who and when, which
+// is the whole of what an operator needs to act.
+type ErrHeld struct {
+	Kind  string
+	ID    string
+	Owner string
+	Host  string
+	PID   int
+	Ago   time.Duration
+}
+
+func (e *ErrHeld) Error() string {
+	return fmt.Sprintf("another %s with id %q is running: %s (pid %d), last seen %s ago. "+
+		"Two of them against one deployment is not redundancy: stop that one, or wait %s for its "+
+		"lease to expire if the host is gone",
+		e.Kind, e.ID, e.Host, e.PID, e.Ago.Round(time.Second), Stale)
+}
+
+// ErrLost says the lease was taken by somebody else while this process held it.
+var ErrLost = errors.New("another process took this daemon's lease")
+
+// Lease is one daemon's claim on one id.
+type Lease struct {
+	coll  *mongo.Collection
+	kind  string
+	id    string
+	owner string
+	host  string
+	pid   int
+}
+
+// New returns a lease for a daemon kind ("feeder", "evictor") and its
+// configured id. The owner token is this process's alone: two processes on one
+// host with the same pid cannot happen, and a restart gets a new one.
+func New(cold *mongo.Client, kind, id string) *Lease {
+	host, _ := os.Hostname()
+	return &Lease{
+		coll:  cold.Database(meta.DB).Collection(meta.Markers),
+		kind:  kind,
+		id:    id,
+		owner: bson.NewObjectID().Hex(),
+		host:  host,
+		pid:   os.Getpid(),
+	}
+}
+
+// docID is the row this lease lives in.
+func (l *Lease) docID() string { return "lease:" + l.kind + ":" + l.id }
+
+// record is what the row holds.
+type record struct {
+	ID    string    `bson:"_id"`
+	Owner string    `bson:"owner"`
+	Host  string    `bson:"host"`
+	PID   int       `bson:"pid"`
+	Seen  time.Time `bson:"seen"`
+	Since time.Time `bson:"since"`
+	// Now is the archive's clock at the moment the row was read back, so
+	// staleness is worked out in the frame the row was written in.
+	Now time.Time `bson:"now"`
+}
+
+// Take claims the lease, or reports who holds it.
+//
+// One update, so that two daemons starting together cannot both win. The
+// condition is written into the pipeline rather than into a filter because a
+// filter that does not match would upsert a second row: the document is found
+// by _id and the pipeline decides whether this process gets to write its name
+// into it.
+func (l *Lease) Take(ctx context.Context) error {
+	mine := l.takeIfFree()
+	res := l.coll.FindOneAndUpdate(ctx,
+		bson.D{{Key: "_id", Value: l.docID()}},
+		mongo.Pipeline{
+			bson.D{{Key: "$set", Value: bson.D{
+				{Key: "owner", Value: bson.D{{Key: "$cond", Value: bson.A{mine, l.owner, "$owner"}}}},
+				{Key: "host", Value: bson.D{{Key: "$cond", Value: bson.A{mine, l.host, "$host"}}}},
+				{Key: "pid", Value: bson.D{{Key: "$cond", Value: bson.A{mine, l.pid, "$pid"}}}},
+				{Key: "since", Value: bson.D{{Key: "$cond", Value: bson.A{mine, "$$NOW", "$since"}}}},
+				{Key: "seen", Value: bson.D{{Key: "$cond", Value: bson.A{mine, "$$NOW", "$seen"}}}},
+				// Read back with the row, so whoever is judging it is not
+				// reading its own clock. See the package note.
+				{Key: "now", Value: "$$NOW"},
+			}}},
+		},
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After))
+
+	var rec record
+	if err := res.Decode(&rec); err != nil {
+		return fmt.Errorf("take the %s lease for %q: %w", l.kind, l.id, err)
+	}
+	if rec.Owner == l.owner {
+		return nil
+	}
+	return &ErrHeld{
+		Kind: l.kind, ID: l.id, Owner: rec.Owner, Host: rec.Host, PID: rec.PID,
+		Ago: rec.Now.Sub(rec.Seen),
+	}
+}
+
+// takeIfFree is the condition under which this process may write its name in:
+// nobody holds it, this process already does, or whoever does has not been seen
+// for Stale.
+func (l *Lease) takeIfFree() bson.D {
+	return bson.D{{Key: "$or", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$owner"}}, "missing"}}},
+		bson.D{{Key: "$eq", Value: bson.A{"$owner", l.owner}}},
+		bson.D{{Key: "$lt", Value: bson.A{"$seen",
+			bson.D{{Key: "$subtract", Value: bson.A{"$$NOW", Stale.Milliseconds()}}}}}},
+	}}}
+}
+
+// Keep renews the lease and reports whether this process still holds it.
+//
+// Cheap enough to call often and paced here rather than by every caller, so a
+// daemon can put it in whatever loop it already has.
+func (l *Lease) Keep(ctx context.Context) error {
+	res := l.coll.FindOneAndUpdate(ctx,
+		bson.D{{Key: "_id", Value: l.docID()}},
+		mongo.Pipeline{
+			bson.D{{Key: "$set", Value: bson.D{
+				{Key: "seen", Value: bson.D{{Key: "$cond", Value: bson.A{
+					bson.D{{Key: "$eq", Value: bson.A{"$owner", l.owner}}}, "$$NOW", "$seen"}}}},
+			}}},
+		},
+		options.FindOneAndUpdate().SetReturnDocument(options.After))
+
+	var rec record
+	err := res.Decode(&rec)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		// Somebody deleted the row. Claiming it again is right: there is no
+		// other holder to displace.
+		return l.Take(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("renew the %s lease for %q: %w", l.kind, l.id, err)
+	}
+	if rec.Owner != l.owner {
+		return fmt.Errorf("%w: %s (pid %d) holds the %s lease for %q",
+			ErrLost, rec.Host, rec.PID, l.kind, l.id)
+	}
+	return nil
+}
+
+// Release gives the lease up, so a restart does not have to wait it out.
+//
+// Best effort by design: a daemon that is killed never gets here, and the
+// staleness window is what covers that. Only this process's own claim is
+// released, because a row whose owner has changed belongs to somebody else.
+func (l *Lease) Release(ctx context.Context) error {
+	_, err := l.coll.DeleteOne(ctx, bson.D{
+		{Key: "_id", Value: l.docID()},
+		{Key: "owner", Value: l.owner},
+	})
+	return err
+}

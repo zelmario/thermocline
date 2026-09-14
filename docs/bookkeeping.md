@@ -16,7 +16,7 @@ configurable as `meta.db`:
 | `residency` | How long a document should stay in the fast tier, and the record that this system put it there. Kept for an hour past the hold on a TTL index |
 | `warming` | Warming announcements, expiring on a TTL index |
 | `watermarks` | How far back the fast tier is complete, one per namespace |
-| `markers` | Daemon heartbeats, currently just the warmer's |
+| `markers` | Daemon heartbeats, the operator's hold on eviction, and one lease per daemon that must not run twice |
 
 `_tcBodyDropped` marks the second of those, and is described below.
 
@@ -33,6 +33,36 @@ this separates the rest. The config refuses a name that also holds a tiered
 collection, because the feeder skips its own bookkeeping database wholesale and
 that combination would stop those collections being mirrored with nothing
 saying so.
+
+**One feeder per id, enforced rather than asked for.** Two feeders with the
+same id watch the same namespaces and both see every delete, and an eviction is
+announced once: the first to reach it takes the announcement down, the second
+finds nothing, reads a real eviction as the application deleting the document,
+and tombstones the archive's copy. The document is then gone from both tiers
+with nothing said anywhere. Starting the daemon on a second host for redundancy
+is enough to arrange it, and so is a unit file that starts one before the old
+one has exited.
+
+So each feeder takes a lease in `markers`, named `lease:feeder:<id>`, and a
+second one refuses to start and names the host and pid holding it. The lease is
+renewed every five seconds and outlives its holder by thirty, so a host that
+dies is replaced after half a minute and a clean stop releases it at once. A
+feeder that loses its lease while running stops, because carrying on is the
+thing the lease exists to prevent.
+
+The evictor takes one too, `lease:evictor:<id>`, and for a milder version of the
+same reason: two sweeps overlapping announce one eviction twice and delete it
+once, so a count is left standing that the application's own delete of that _id
+later answers for, and the archive keeps a live copy of a document its owner
+deleted. That lease is per sweep rather than per process, because a sweep is
+what must not overlap: two evictors taking turns are two ordinary sweeps. A dry
+run takes no lease, announces nothing and removes nothing, so the one command an
+operator reaches for to understand the system always answers.
+
+Every instant in those rows is the archive's own, taken as the row is written.
+The process deciding whether a lease is stale is never the process that wrote
+it, which is the whole point of it, so comparing two hosts' clocks there would
+be the very mistake the guard is made of.
 
 Residency is a sidecar rather than a field on the document on purpose.
 Extending a document's stay rewrites 60 bytes instead of a 5 KB document.
