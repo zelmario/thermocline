@@ -427,6 +427,15 @@ HRB() { mongosh "$HOTU" --quiet --eval "$1" 2>&1 | tail -1; }
 HRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop();
      db.getSiblingDB(process.env.TC_DB).createView('${RBNS}v','$RBNS',[{\$match:{n:'live'}}])" >/dev/null
 HRB "try{db.getSiblingDB('admin').createUser({user:'rbprobe',pwd:'x',roles:[]})}catch(e){}" >/dev/null
+# The archive must actually lack it at this moment, and a router starting is
+# enough to give it one: mirrorViewsToArchive carries every view the fast tier
+# has and the archive does not, on purpose, and this suite starts routers all
+# through it. Without this line the check passes or fails on that race, and once
+# the archive has a copy the teardown below never took it away, so it failed
+# every run on that worker from then on. Found on 2026-09-14 with the view
+# sitting in one worker's archive and three without. See [[clean-both-tiers]].
+CRB() { mongosh "$COLDU" --quiet --eval "$1" 2>&1 | tail -1; }
+CRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop()" >/dev/null
 RBOUT=$(cline rollback --config $CFG --ns $DB.$RBNS 2>&1)
 chkrb "rollback names the view the archive lacks" "true" \
     "$(grep -q "${RBNS}v" <<<"$RBOUT" && echo true || echo false)"
@@ -435,6 +444,9 @@ chkrb "and the account the archive lacks"        "true" \
 chkrb "and says credentials could not be copied" "true" \
     "$(grep -q 'credentials are per cluster' <<<"$RBOUT" && echo true || echo false)"
 HRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop(); db.getSiblingDB('admin').dropUser('rbprobe')" >/dev/null
+# Both tiers. Dropping the fast tier's copy is not a delete, and the archive's
+# is what outlived the run and broke the next one.
+CRB "db.getSiblingDB(process.env.TC_DB).${RBNS}v.drop()" >/dev/null
 # The ordering guard, which is the part nobody was being told about.
 C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},
      {\$set:{at:new Date(), savedAt:new Date(), everyMS:1000}},{upsert:true})" >/dev/null
