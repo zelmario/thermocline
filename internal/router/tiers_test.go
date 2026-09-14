@@ -1,6 +1,10 @@
 package router
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zelmario/thermocline/internal/authz"
+)
 
 // Which collection options a router compares across the two tiers.
 //
@@ -79,5 +83,32 @@ func TestEveryOptionIsCompared(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Two lists of command names in this repository answer two different
+// questions, and the overlap between them is where one of them was wrong.
+//
+// authz.NoAuthNeeded answers "can this command be pointed at data the caller
+// may not see", so listCollections and listIndexes are deliberately not in it.
+// adminCommands answers "is this work or chatter", so that a connection's
+// handshake does not go into the fast tier's latency and make it look faster
+// than it is. Everything in the first list is chatter by construction: it is
+// the set of commands that cannot reach data at all.
+//
+// Four were in the first and not the second, and were being timed as fast tier
+// work: authenticate, startSession, refreshSessions and getLastError. They are
+// what a driver sends before and around a query, which is exactly the traffic
+// the second list exists to keep out of the number.
+func TestHandshakeCommandsAreNotTimedAsWork(t *testing.T) {
+	for name := range authz.NoAuthNeeded {
+		if !adminCommands[name] {
+			t.Errorf("%q needs no privilege, so it cannot reach data, yet it is timed as fast tier work", name)
+		}
+	}
+	// The other direction is not a finding: a command can be housekeeping for
+	// timing and still need a privilege, which is what listCollections is.
+	if authz.NoAuthNeeded["listCollections"] {
+		t.Errorf("listCollections has been let into NoAuthNeeded, where it can name a collection")
 	}
 }

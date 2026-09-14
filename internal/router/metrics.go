@@ -63,10 +63,20 @@ var bucketsMS = [...]float64{0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000
 // adminCommands are handshake and housekeeping. They are the majority of the
 // message count on an idle connection and none of the work, so mixing them into
 // the fast tier's latency would make the fast tier look faster than it is.
+//
+// Not the same list as authz.NoAuthNeeded, though they overlap, and they must
+// not be merged. That one answers "can this command be pointed at data the
+// caller may not see", so listCollections and listIndexes are in this list and
+// not in that one. This one answers "is this work or chatter", so
+// authenticate, startSession, refreshSessions and getLastError are in both:
+// they were missing here and were being timed as fast tier work, which is the
+// thing this list exists to keep out of the number.
 var adminCommands = map[string]bool{
 	"hello": true, "ismaster": true, "isMaster": true, "ping": true,
 	"buildInfo": true, "buildinfo": true, "saslStart": true, "saslContinue": true,
-	"getnonce": true, "logout": true, "endSessions": true, "killCursors": true,
+	"getnonce": true, "authenticate": true, "startSession": true,
+	"refreshSessions": true, "getLastError": true,
+	"logout": true, "endSessions": true, "killCursors": true,
 	"listDatabases": true, "listCollections": true, "listIndexes": true,
 	"connectionStatus": true, "whatsmyuri": true, "getLog": true, "hostInfo": true,
 	"serverStatus": true, "getParameter": true, "commitTransaction": true,

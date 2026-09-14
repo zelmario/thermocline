@@ -452,10 +452,23 @@ chk "and the document really is there"                 "true" \
 # inside the application's own database, which a client watching the database
 # would see appear, fill and vanish. The catalog listing already hides those.
 rm -f /tmp/cs_events9.txt
+# Bounded by the clock and by what it is waiting for, not by a count of
+# iterations. A deployment-wide watch sees every namespace on the fast tier, and
+# under a parallel sweep that is three other workers' traffic: the loop spent
+# its sixty turns discarding their events without ever sleeping, printed "none",
+# and the check below read a watcher that had given up in milliseconds as a
+# router that had swallowed an insert. Measured once in a four-worker sweep, and
+# it is the only way this check has ever failed.
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
   const cs=db.getMongo().watch();
+  const want='$NS';
+  const until=Date.now()+25000;
   let ops=[];
-  for (let i=0;i<60;i++) { const e=cs.tryNext(); if (e && e.ns && e.ns.db===process.env.TC_DB) ops.push(e.operationType+':'+e.ns.coll); else if (!e) sleep(250); }
+  while (Date.now()<until && !ops.some(o => o.endsWith(':'+want))) {
+    const e=cs.tryNext();
+    if (e && e.ns && e.ns.db===process.env.TC_DB) ops.push(e.operationType+':'+e.ns.coll);
+    else if (!e) sleep(250);
+  }
   cs.close();
   print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events9.txt 2>&1 &
 WATCHER9=$!
@@ -464,8 +477,11 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$v',n:{\$su
 R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'deployment-real', v:'real'})" >/dev/null
 WIDE3=$(awaitWatcher /tmp/cs_events9.txt $WATCHER9)
 echo "  the deployment watcher saw: ${WIDE3:-nothing}"
+# Nothing at all is not an answer either. An empty stream and a refused one are
+# different states and this check used to pass on both, which is how a watcher
+# that gave up early was read as a router that had swallowed an event.
 chk "the deployment watcher was actually watching"     "true" \
-    "$(echo "${WIDE3:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+    "$(echo "${WIDE3:-none}" | grep -qiE "error|refus|^none$" && echo false || echo true)"
 chk "no scratch collection is reported"                "true" \
     "$(echo "${WIDE3:-none}" | grep -q "tmp.thermocline" && echo false || echo true)"
 chk "the application's own insert still arrives"       "true" \

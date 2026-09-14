@@ -341,7 +341,7 @@ function facetBranch() {
 function pipeline() {
   const stages = [];
   if (maybe(0.8)) stages.push({ $match: filter(1) });
-  switch (ri(11)) {
+  switch (ri(13)) {
     case 0:
       stages.push({ $group: { _id: '$' + pick(['grp', 'opt', 'meta.active']),
                               c: { $sum: 1 }, s: { $sum: '$n' }, mx: { $max: '$f' } } });
@@ -392,6 +392,31 @@ function pipeline() {
       // nothing generated was reaching either: the hand-written suites cover
       // the stage and the grammar never produced one.
       stages.push({ $facet: { a: facetBranch(), b: facetBranch() } });
+      break;
+    case 11:
+      // A range expressed as boundaries rather than as a predicate, which is
+      // the shape this project keeps getting wrong. MongoDB brackets a range
+      // by type, and $bucket puts the boundaries in a stage rather than in a
+      // filter: the router has to decide completeness for a query whose bounds
+      // are not in its $match at all. `when` boundaries are dates and `n`
+      // boundaries are numbers, so both the aged field and an ordinary one are
+      // reached, and the default catches everything outside them, which is
+      // what makes two tiers comparable rather than one of them erroring.
+      stages.push(maybe(0.5)
+        ? { $bucket: { groupBy: '$n', boundaries: [0, 10, 25, 50, 100],
+                       default: 'outside', output: { c: { $sum: 1 } } } }
+        : { $bucket: { groupBy: '$' + AGE,
+                       boundaries: [new Date(Date.UTC(2024, 0, 1)), new Date(Date.UTC(2024, 4, 1)),
+                                    new Date(Date.UTC(2024, 8, 1)), new Date(Date.UTC(2025, 0, 1))],
+                       default: 'outside', output: { c: { $sum: 1 } } } });
+      stages.push({ $sort: { _id: 1 } });
+      break;
+    case 12:
+      // The same question asked the other way: the boundaries are chosen by
+      // the server from the data it was given, so the two tiers have to have
+      // been given the same documents for the answer to match at all.
+      stages.push({ $bucketAuto: { groupBy: '$n', buckets: 1 + ri(4) } },
+                  { $sort: { '_id.min': 1 } });
       break;
     default:
       stages.push({ $sortByCount: '$grp' });
