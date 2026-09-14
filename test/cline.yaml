@@ -58,6 +58,9 @@ feeder:
     # testtypes.sh: a collection mirrored normally and then converted to capped
     # out of band, which the kind check had already said yes about.
     - "shop.tcapconv"
+    # testtypes.sh: the control for that recheck, an ordinary collection whose
+    # own deletes are unannounced and must not stop anything.
+    - "shop.tdelplain"
     # testddl.sh: the collection that may not be made capped or time series.
     - "shop.tddlcap"
     - "shop.tddlcap2"

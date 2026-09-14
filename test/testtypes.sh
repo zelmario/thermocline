@@ -310,6 +310,48 @@ wait $CONVFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
 
+echo "== an ordinary collection whose own deletes are unannounced =="
+# The control for the section above, and the one that matters: the recheck is
+# triggered by deletes nothing announced, and an application deleting its own
+# documents produces exactly those. If it stopped the feeder for them it would
+# stop for every application that deletes anything, which is most of them.
+#
+# Same collection kind, same trigger, opposite answer.
+stopDaemons
+DNS=tdelplain
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+: > $LOGDIR/t_types_plain.log
+cline feeder --config $CFG --log-file $LOGDIR/t_types_plain.log &
+PLAINFP=$!
+for _ in $(seq 1 40); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+H "const d=[]; for(let i=1;i<=20;i++) d.push({_id:i, pad:'x'});
+   db.getSiblingDB(process.env.TC_DB).$DNS.insertMany(d)" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({}))")" = "20" ] && break
+  sleep 0.5
+done
+# The application removing its own documents, which nothing announced because
+# no evictor was involved.
+H "db.getSiblingDB(process.env.TC_DB).$DNS.deleteMany({_id:{\$lte:10}})" >/dev/null
+sleep 8
+chk "the feeder read them as unannounced"                "true" \
+    "$(grep -q "deletes not announced" $LOGDIR/t_types_plain.log && echo true || echo false)"
+chk "and did not stop over them"                         "1" \
+    "$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)"
+chk "nor said this collection cannot be mirrored"        "0" \
+    "$(grep -c "cannot be mirrored" $LOGDIR/t_types_plain.log 2>/dev/null || true)"
+chk "and the deletes reached the archive"                "10" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+wait $PLAINFP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
+
 echo "== the same collection, capped on the archive instead =="
 # Which tier holds the collection depends on where the deployment is in its
 # life. Ordinarily the application's collections are on the fast tier and the
