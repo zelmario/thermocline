@@ -789,6 +789,45 @@ AFREE=$(R "try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({applyOps
            print('APPLIED:'+r.applied); }
          catch(e) { print('REFUSED:'+(e.codeName||'')); }")
 chk "an applyOps on an untiered collection goes through" "APPLIED:1" "$AFREE"
+
+# And the same three with {w:0}, which is the flag the DDL dispatch used to read
+# as permission to skip the guard entirely. The client is not waiting for an
+# answer, so a refusal has nowhere to go: the right thing is to not perform the
+# write, which is what w:0 already means to an application.
+#
+# Measured before the fix, with a feeder running: the fast tier took the clobber
+# and seven seconds later the archive held it too, tier gone. Nothing is read
+# from the archive here because this section runs no feeder, and the fast tier
+# is where the write would land first either way.
+# Give the fast tier a document of its own first, or neither check below means
+# anything: this section's fixture leaves $ANS on the archive alone, and an
+# applyOps insert into a collection the fast tier does not have fails at mongod
+# whatever the router did. Measured against the previous binary without this
+# line, the insert check passed while the guard was not running at all.
+H "db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:802, v:'fast tier sentinel'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'i',
+     ns:process.env.TC_DB+'.$ANS', o:{_id:800, v:'clobber unacknowledged'}}],
+     writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 2
+chk "an unacknowledged applyOps is not performed"      "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ANS.countDocuments({_id:800}))")"
+chk "so the archived document is still whole"          "archived, precious/gold" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$ANS.findOne({_id:800}); print(d?d.v+'/'+d.tier:'MISSING')")"
+# The command entry hides the collection one level down, and the sentinel above
+# is what makes "the drop did not happen" something to see.
+R "db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'c',
+     ns:process.env.TC_DB+'.\$cmd', o:{drop:'$ANS'}}], writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 2
+chk "nor is an unacknowledged drop one level down"     "fast tier sentinel" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$ANS.findOne({_id:802}); print(d?d.v:'MISSING')")"
+# The positive half, or the fix is just a ban on w:0. An untiered collection is
+# none of this system's business whatever flag the client sets.
+R "db.getSiblingDB(process.env.TC_DB).runCommand({applyOps:[{op:'i',
+     ns:process.env.TC_DB+'.$AUN', o:{_id:2, v:'fine unacknowledged'}}],
+     writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 2
+chk "an unacknowledged applyOps on an untiered one lands" "fine unacknowledged" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$AUN.findOne({_id:2}); print(d?d.v:'MISSING')")"
 H "db.getSiblingDB(process.env.TC_DB).$ANS.drop(); db.getSiblingDB(process.env.TC_DB).$AUN.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 kill $ARP 2>/dev/null; wait $ARP 2>/dev/null

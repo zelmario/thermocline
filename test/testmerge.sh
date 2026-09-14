@@ -177,6 +177,34 @@ mergeIntoX() { # collection in wh, merged into from an aggregation running in sh
      ]).toArray(); print('done')" >/dev/null 2>&1
 }
 
+# A $merge sent with {w:0}. The client is not waiting for an answer, and the
+# aggregation dispatch used to read that as permission to skip the merge target
+# guard: gated on !msg.MoreToCome(), the same habit the write path unlearned
+# long ago. Without the guard the copy-up never runs, so the merge matches
+# nothing and inserts over the archived document instead of merging into it.
+#
+# Measured before the fix, over an _id only the archive held: the archive ended
+# {v: "merged in"} with tier gone.
+#
+# Both sides are sent the same way, so a difference is the router's and not the
+# flag's. An unacknowledged write has no reply to wait on, which is why the
+# sleep is longer here than the acknowledged sections need.
+unackMerge() { # collection -> the same $merge, with nobody waiting for it
+  R "db.getSiblingDB(process.env.TC_DB).runCommand({aggregate:1, pipeline:[
+       {\$documents:[{_id:5, balance:250}]},
+       {\$merge:{into:'$1', whenMatched:'merge', whenNotMatched:'insert'}}],
+       cursor:{}, writeConcern:{w:0}}); print('sent')" >/dev/null 2>&1
+}
+
+echo "== an unacknowledged \$merge, over a document only the archive holds =="
+reseed
+chk "the fast tier does not hold it"                  "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:5}))")"
+unackMerge $REF
+unackMerge $NS
+sleep 8
+chk "the unacknowledged merge matches the reference"  "$(doc $REF)" "$(doc $NS)"
+chk "and the archive kept the fields it had"          "$(doc $REF)" "$(cold5)"
+
 echo "== \$merge into a tiered collection in another database =="
 reseedX
 chk "the cross-database fast tier lacks it"           "0" "$(H "print(db.getSiblingDB(process.env.TC_DB2).$XNS.countDocuments({_id:5}))")"
