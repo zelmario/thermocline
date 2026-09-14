@@ -451,7 +451,7 @@ func (f *Feeder) clockSkew(ctx context.Context) (time.Duration, bool) {
 		f.log.Debug("could not read the archive's clock", "err", err)
 		return f.skew, f.skewKnown
 	}
-	if f.skewKnown && absDuration(skew-f.skew) > health.SkewWarn {
+	if f.skewKnown && health.AbsDuration(skew-f.skew) > health.SkewWarn {
 		f.log.Warn("this host's clock moved against the archive's",
 			"was", f.skew.Round(time.Millisecond).String(),
 			"now", skew.Round(time.Millisecond).String(),
@@ -461,7 +461,7 @@ func (f *Feeder) clockSkew(ctx context.Context) (time.Duration, bool) {
 	// disagrees disagrees on every publication, and at the default cadence that
 	// is fifty log lines a second.
 	f.clockOnce.Do(func() {
-		if absDuration(skew) <= health.SkewWarn {
+		if health.AbsDuration(skew) <= health.SkewWarn {
 			f.log.Debug("clocks agree with the archive", "skew", skew.Round(time.Millisecond).String())
 			return
 		}
@@ -476,11 +476,16 @@ func (f *Feeder) clockSkew(ctx context.Context) (time.Duration, bool) {
 	return skew, true
 }
 
-func absDuration(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
+// archiveNow is this instant on the archive's clock, as well as this process
+// can say, for comparing against something the archive or another daemon
+// stamped. It falls back to this host's own when no reading has been managed,
+// which is what everything did before there was one.
+func (f *Feeder) archiveNow(ctx context.Context) time.Time {
+	now := time.Now().UTC()
+	if skew, ok := f.clockSkew(ctx); ok {
+		return now.Add(-skew)
 	}
-	return d
+	return now
 }
 
 // publishPosition tells everyone else how far mirroring has got.

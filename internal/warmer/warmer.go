@@ -713,13 +713,21 @@ func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDo
 // announce tells the feeder these inserts are coming, so it does not mirror
 // them back into the archive they came from.
 func (w *Warmer) announce(ctx context.Context, ns string, docs []sourceDoc) error {
-	now := time.Now().UTC()
 	models := make([]mongo.WriteModel, len(docs))
 	for i, d := range docs {
 		id := meta.DocID(ns, d.id)
-		models[i] = mongo.NewReplaceOneModel().
+		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetReplacement(meta.WarmingNotice{ID: id, At: now}).
+			// An update rather than a replacement, so the instant can come from
+			// the archive rather than from here. The row holds nothing else, so
+			// this writes exactly what the replacement did.
+			//
+			// It is read twice by another process: by the archive's TTL monitor,
+			// which decides when the row goes, and by the feeder, which asks
+			// whether a warm was announced recently enough to be this insert's.
+			// Both of those are somewhere else, and the archive's clock is the
+			// one they share with this. See meta.AnnounceEviction.
+			SetUpdate(bson.D{{Key: "$currentDate", Value: bson.D{{Key: "at", Value: true}}}}).
 			SetUpsert(true)
 	}
 	_, err := w.cold.Database(meta.DB).Collection(meta.Warming).
@@ -739,7 +747,7 @@ func (w *Warmer) startHeartbeat(ctx context.Context) func() {
 	beat := func(c context.Context) {
 		_, _ = markers.UpdateOne(c,
 			bson.D{{Key: "_id", Value: meta.WarmerActiveMarker}},
-			bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: time.Now().UTC()}}}},
+			meta.HeartbeatUpdate(),
 			options.UpdateOne().SetUpsert(true))
 	}
 	beat(ctx)

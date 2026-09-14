@@ -402,20 +402,35 @@ Part of [Thermocline](../README.md).
   `router.claim_grace` keeps tiered reads alive through an outage.
 
 - **Two daemons on hosts whose clocks differ are corrected, not required to
-  agree.** Three things here are decided by comparing instants read on different
-  machines, and none of them can be got from a logical clock: mirroring lag, the
-  freshness barrier's wall-clock bar, and the eviction announcements. The first
-  two are now subtracted in the archive's frame, because both daemons talk to
-  the archive and each publishes how far its own clock is from it. That reading
-  is taken over a round trip once a minute, so it is good to a fraction of a
-  millisecond and stale by up to a minute of drift, which is nothing beside the
-  seconds a barrier weighs. The third is not corrected at all: an announcement
-  is stamped by the evictor and expired by the archive's own TTL monitor, and
-  nothing in the middle can adjust what a TTL monitor does. An evictor far
-  enough behind loses documents, which is why it is the one that logs at ERROR
-  rather than WARN, and why the number is published as
-  `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` with an alert rule of
-  its own. Run NTP on every host that runs a cline daemon.
+  agree.** Several things here are decided by comparing instants read on
+  different machines, and none of them can be got from a logical clock.
+
+  Where the reader is a daemon, the instants are put in the archive's frame
+  before they are compared: mirroring lag, the freshness barrier's wall-clock
+  bar, how old a published position is, and how long ago a daemon last
+  reported. Both sides talk to the archive, so each publishes how far its own
+  clock is from it. That reading is taken over a round trip once a minute, so it
+  is good to a fraction of a millisecond and stale by up to a minute of drift,
+  which is nothing beside the seconds any of these weigh.
+
+  Where the reader is the archive itself, there is nothing to correct and no
+  reading to take: the row is stamped by the archive as it is written, with
+  `$currentDate` or `$$NOW`. That covers everything the archive's TTL monitor
+  decides the lifetime of, which is the eviction and warming announcements, this
+  system's record of its own DDL, and the residency rows, plus the residency
+  hold itself, which a different daemon judges. An eviction announcement stamped
+  by a clock an hour behind used to be born expired: the feeder then read every
+  eviction as the application's own delete, the archive tombstoned its copy, and
+  the document was lost from both tiers with nothing said. That one is gone
+  rather than corrected.
+
+  What is left is the windows measured against the application's own document
+  dates, an eviction cutoff and a warm window, which shift by the difference
+  rather than breaking. Every daemon's reading against the archive is published
+  as `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` and two alert rules
+  watch it. Run NTP on every host that runs a cline daemon: none of the above is
+  a reason not to, it is what stops a clock nobody noticed becoming a wrong
+  answer.
 
 - **Ticket pressure is measured as a fraction of the pool.** MongoDB 7.0 made
   the write ticket pool dynamic and host-sized, so an absolute floor is

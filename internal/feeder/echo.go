@@ -43,7 +43,11 @@ func (f *Feeder) warmingActive(ctx context.Context) bool {
 		return false
 	}
 
-	active := time.Since(marker.Seen) < markerFresh
+	// The archive's frame, because the warmer stamped the mark there and this
+	// process need not be on the warmer's machine. Ahead of it by more than
+	// markerFresh and every warm reads as "no warmer is running", so nothing is
+	// suppressed. See meta.HeartbeatUpdate.
+	active := f.archiveNow(ctx).Sub(marker.Seen) < markerFresh
 	if active != f.warmActive {
 		if active {
 			f.log.Info("warmer detected, suppressing mirrored copies of warmed documents")
@@ -111,7 +115,13 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 	cur, err := coll.Find(ctx,
 		bson.D{
 			{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}},
-			{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().UTC().Add(-echoWindow)}}},
+			// In the archive's frame, because that is where the warmer's
+			// announcement was stamped and this process need not be on the
+			// warmer's machine. Ahead of it by more than this window and no
+			// notice is ever found, so every warmed document is mirrored back
+			// into the archive it came from and reaches a client's change
+			// stream as an insert it never made. See f.clockSkew.
+			{Key: "at", Value: bson.D{{Key: "$gte", Value: f.archiveNow(ctx).Add(-echoWindow)}}},
 		},
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
@@ -229,7 +239,9 @@ func (f *Feeder) promotingActive(ctx context.Context) bool {
 		return false
 	}
 
-	active := time.Since(marker.Seen) < markerFresh
+	// The archive's frame: the mark was stamped there and this process need not
+	// be on the router's machine. See warmingActive above.
+	active := f.archiveNow(ctx).Sub(marker.Seen) < markerFresh
 	if active != f.promoteActive {
 		if active {
 			f.log.Debug("router is promoting documents, suppressing the mirrored copies")

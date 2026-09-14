@@ -412,3 +412,95 @@ func field(d bson.D, name string) interface{} {
 	}
 	return nil
 }
+
+// Every instant one daemon writes here and another judges is stamped by the
+// archive, and this is the list of them.
+//
+// The reason is the same each time and the consequences are not. A daemon
+// writes a row; something else decides what it means by subtracting it from a
+// clock that is not the writer's, and the daemons are not required to share a
+// machine. Three of these are read by the archive's own TTL monitor, which
+// nothing can correct for afterwards: a notice stamped by a clock an hour
+// behind is born expired and gone within the minute, and an eviction notice
+// that is gone is an eviction the feeder reads as the application's own delete.
+// The archive tombstones its copy and the document is lost from both tiers.
+//
+// $currentDate is the whole fix. It cannot drift, there is no reading to take
+// and no correction to apply, and it works on every version this supports.
+func TestInstantsOthersJudgeComeFromTheArchive(t *testing.T) {
+	cases := []struct {
+		what   string
+		update bson.D
+		field  string
+		why    string
+	}{
+		{
+			what:   "an eviction announcement",
+			update: EvictionAnnouncement(),
+			field:  "at",
+			why:    "expired by the archive's TTL monitor; an early expiry loses documents from both tiers",
+		},
+		{
+			what:   "this system's own DDL",
+			update: OwnDDLAnnouncement(OwnDDLSpan{Tok: "t"}),
+			field:  "at",
+			why:    "expired by the archive's TTL monitor; an early expiry shows a client DDL it never issued",
+		},
+		{
+			what:   "a daemon heartbeat",
+			update: HeartbeatUpdate(),
+			field:  "seen",
+			why:    "the feeder suppresses copies only while it believes the other daemon is running",
+		},
+		{
+			what:   "a daemon's report",
+			update: DaemonReportUpdate(false, nil, nil),
+			field:  "at",
+			why:    "the router exports seconds_since_pass from it, and an alert rule watches that",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.what, func(t *testing.T) {
+			var stamped bool
+			for _, e := range c.update {
+				if e.Key != "$currentDate" {
+					continue
+				}
+				d, ok := e.Value.(bson.D)
+				if !ok {
+					t.Fatalf("$currentDate is %T, want bson.D", e.Value)
+				}
+				for _, f := range d {
+					if f.Key == c.field {
+						if f.Value != true {
+							t.Fatalf("$currentDate on %q is %#v, want true", c.field, f.Value)
+						}
+						stamped = true
+					}
+				}
+			}
+			if !stamped {
+				t.Errorf("%q is not stamped by the archive, and it is %s: %v", c.field, c.why, c.update)
+			}
+		})
+	}
+
+	// The hold on eviction is the odd one: it has to be written once and kept,
+	// so it cannot use $currentDate, which always writes. $ifNull over $$NOW
+	// says the same thing $setOnInsert did, in the archive's frame.
+	t.Run("an operator's hold on eviction", func(t *testing.T) {
+		set := setStage(t, PauseUpdate("restoring the archive"))
+		since, ok := field(set, "since").(bson.D)
+		if !ok {
+			t.Fatalf("since is %#v, want an expression over the archive's clock", field(set, "since"))
+		}
+		arms, ok := field(since, "$ifNull").(bson.A)
+		if !ok || len(arms) != 2 {
+			t.Fatalf("since is %#v, want $ifNull with two arms", since)
+		}
+		if arms[0] != "$since" || arms[1] != "$$NOW" {
+			t.Errorf("since is %v, want the existing value or the archive's clock", arms)
+		}
+	})
+}

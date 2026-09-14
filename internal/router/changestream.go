@@ -499,7 +499,14 @@ func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson
 	if known, yes := (meta.EvictionNotice{Spent: note.spent}).SpentOn(pos); known {
 		return yes
 	}
-	// A notice from a feeder that did not record positions. The old rule.
+	// A notice from a feeder that did not record positions. The old rule, and
+	// the loosest thing here: the event's instant comes from the fast tier's
+	// primary and the notice's from the archive, so the window absorbs whatever
+	// those two machines disagree about. It was two different machines before
+	// this as well, the evictor's and the primary's; the notice moved to the
+	// archive's clock because the archive's TTL monitor is what decides when it
+	// is deleted, and being deleted early is how documents were lost. See
+	// meta.EvictionAnnouncement.
 	if at.IsZero() || note.at.IsZero() {
 		return false
 	}

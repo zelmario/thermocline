@@ -12,22 +12,45 @@ import (
 // Almost everything here is decided by comparing instants, and the instants do
 // not all come from the same machine.
 //
-// The one that destroys data is the eviction announcement. The evictor stamps
-// it with its own clock and the archive's TTL monitor decides when it has
-// expired, so an evictor running behind the archive has its announcements
-// expiring early. Far enough behind and they are gone before the feeder reads
-// the delete they explain, which the feeder then takes for the application's
-// own: the archive tombstones its copy and the document is gone from both
-// tiers, with nothing said anywhere.
+// There are three answers to that, and which one applies depends on who reads
+// the instant.
 //
-// The others are milder and worth knowing about anyway. A residency hold is
-// written by the router and read by the evictor, so skew there evicts a
-// document that was just promoted and it is fetched again. A warm window and an
-// eviction cutoff are both measured against document dates, so a skewed clock
-// shifts the window rather than breaking it.
+// Where the archive reads it, the archive writes it. Everything whose lifetime
+// its TTL monitor decides is stamped as the row is written, with $currentDate
+// or $$NOW: the eviction and warming announcements, the record of this system's
+// own DDL, the residency rows and the hold inside them. The eviction
+// announcement is the one that used to destroy data. It was stamped by the
+// evictor and expired by the archive, so an evictor running behind had its
+// announcements expiring early, and far enough behind they were gone before the
+// feeder read the delete they explained: the feeder took that delete for the
+// application's own, the archive tombstoned its copy, and the document was gone
+// from both tiers with nothing said. There is nothing to correct there now
+// because there is nothing to compare.
 //
-// Nothing here can correct a clock. It reports one, in the words that say which
-// direction is dangerous.
+// Where another daemon reads it, both sides say where they stand against the
+// archive and the instants are put in its frame before they are subtracted.
+// That is Skew below, taken over a round trip on a one-minute cadence: the
+// feeder publishes its reading in the position record, and the router, the
+// evictor and this package each take their own. Mirroring lag, the freshness
+// barrier, how old a published position is and how long ago a daemon reported
+// are all worked out that way.
+//
+// What is left is the windows measured against the application's own document
+// dates, a warm window and an eviction cutoff. A skewed clock shifts those by
+// the difference rather than breaking them, and nothing but a correct clock
+// fixes it.
+//
+// Nothing here can correct a clock. It reports one.
+
+// AbsDuration is how far apart two instants are, whichever way round they came
+// out. Every caller here is asking "do these two clocks disagree by more than
+// X", and the sign is a separate question with a separate answer.
+func AbsDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
 
 // SkewWarn is the difference worth mentioning: past this the residency holds and
 // the windows are visibly not what the configuration says.

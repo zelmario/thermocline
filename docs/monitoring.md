@@ -98,14 +98,13 @@ heartbeat. The feeder stopping is the serious one: mirroring stops, the evictor
 halts behind it, and every fall-through read pays the freshness barrier.
 
 **6. `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` past a minute.
-Investigate; past the eviction notice's lifetime, page.** An eviction
-announcement is stamped by the evictor and expired by the archive's TTL monitor,
-so an evictor whose clock runs behind has its announcements expiring early. Far
-enough behind and they are gone before the feeder reads the delete they explain:
-the feeder takes that delete for the application's own, the archive tombstones
-its copy, and the document is lost from both tiers. Negative is behind, which is
-the direction that loses data. The evictor measures this against the archive on
-every pass.
+Investigate.** Nothing here loses data over it any more: everything the
+archive's own TTL monitor dates is now stamped by the archive as it is written,
+including the eviction announcements, which used to be the way a clock could
+destroy documents. What a clock still shifts is the windows measured against
+your documents' own dates, an eviction cutoff and a warm window, by about this
+much. Negative is behind. The evictor measures it against the archive on every
+pass.
 
 Every daemon publishes into this one family, by whatever route it has: the
 evictor in its report, the feeder in the position record it writes several times
@@ -176,9 +175,9 @@ groups:
       - alert: ThermoclineClockBehind
         expr: thermocline_daemon_gauge{gauge="clock_skew_seconds"} < -60
         for: 5m
-        labels: {severity: page}
+        labels: {severity: ticket}
         annotations:
-          summary: "{{ $labels.daemon }}'s clock is behind the archive's; eviction notices expire early"
+          summary: "{{ $labels.daemon }}'s clock is behind the archive's; the windows differ from the configuration"
       - alert: ThermoclineClockAhead
         expr: thermocline_daemon_gauge{gauge="clock_skew_seconds"} > 60
         for: 5m

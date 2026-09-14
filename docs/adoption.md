@@ -379,12 +379,14 @@ reads as the application's own, the archive tombstones its copy, and the
 document is gone from both tiers with nothing said. So `max_feeder_lag` and that
 hour are one setting in two places: the config refuses a lag that reaches it.
 
-The same relationship depends on the two machines agreeing about the time. The
-announcement is stamped by the evictor and expired by the archive's TTL monitor,
-so an evictor whose clock runs behind the archive's has its announcements
-expiring early, and far enough behind they are gone before they are read. Every
-daemon checks its clock against the archive at startup and says what it finds,
-and `cline preflight` reports it without starting anything.
+That relationship used to depend on the two machines agreeing about the time.
+The announcement was stamped by the evictor and is expired by the archive's TTL
+monitor, so an evictor whose clock ran behind the archive's had its
+announcements expiring early, and far enough behind they were gone before they
+were read. The archive stamps them now, as they are written, so the clock that
+starts the hour is the clock that ends it. Every daemon still checks its clock
+against the archive at startup and says what it finds, and `cline preflight`
+reports it without starting anything.
 
 Two more things are decided by comparing instants read on different machines,
 and unlike the announcements they are corrected rather than only reported: the

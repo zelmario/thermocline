@@ -170,9 +170,13 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		sort.Slice(reports, func(i, j int) bool { return reports[i].ID < reports[j].ID })
 		fmt.Fprintf(b, "# HELP thermocline_daemon_seconds_since_pass How long since this daemon finished a pass. A daemon that has stopped shows this climbing.\n")
 		fmt.Fprintf(b, "# TYPE thermocline_daemon_seconds_since_pass gauge\n")
+		// In the archive's frame, because that is where the report was stamped.
+		// A daemon on a machine whose clock ran behind this one looked like a
+		// daemon that had stopped, and there is an alert rule on this.
+		since := r.archiveNowFallback(ctx)
 		for _, rep := range reports {
 			fmt.Fprintf(b, "thermocline_daemon_seconds_since_pass{daemon=\"%s\"} %s\n",
-				promEscape(rep.ID), strconv.FormatFloat(time.Since(rep.At).Seconds(), 'f', -1, 64))
+				promEscape(rep.ID), strconv.FormatFloat(max(since.Sub(rep.At), 0).Seconds(), 'f', -1, 64))
 		}
 		fmt.Fprintf(b, "# HELP thermocline_daemon_dry_run Whether this daemon is running without making changes.\n")
 		fmt.Fprintf(b, "# TYPE thermocline_daemon_dry_run gauge\n")
@@ -226,7 +230,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			if paused {
 				gauge("eviction_paused_seconds",
 					"How long eviction has been held. Alert on this being long rather than on it being set.",
-					time.Since(rec.Since).Seconds())
+					max(r.archiveNowFallback(ctx).Sub(rec.Since), 0).Seconds())
 			}
 		}
 	}

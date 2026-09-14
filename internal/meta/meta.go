@@ -561,15 +561,11 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 	if len(docIDs) == 0 {
 		return nil
 	}
-	now := time.Now().UTC()
 	models := make([]mongo.WriteModel, len(docIDs))
 	for i, id := range docIDs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(bson.D{
-				{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}},
-				{Key: "$set", Value: bson.D{{Key: "at", Value: now}}},
-			}).
+			SetUpdate(EvictionAnnouncement()).
 			SetUpsert(true)
 	}
 	if _, err := cold.Database(DB).Collection(Evicting).
@@ -577,6 +573,25 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 		return fmt.Errorf("announce eviction: %w", err)
 	}
 	return nil
+}
+
+// EvictionAnnouncement is the write that announces one eviction: another one
+// pending, and the row's life restarted.
+//
+// The instant comes from the archive, not from the evictor. Nothing reads the
+// field to date the announcement; it is there for the TTL index, and the TTL
+// monitor that acts on it is the archive's. An evictor whose clock ran behind
+// wrote notices that were already part expired, and far enough behind they were
+// born expired and gone within the minute. A notice that is gone is an eviction
+// the feeder reads as the application's own delete: the archive tombstones its
+// copy and the document is lost from both tiers, with nothing said anywhere.
+// $currentDate takes the reading where it is judged, so there is nothing left
+// to correct for and nothing to measure.
+func EvictionAnnouncement() bson.D {
+	return bson.D{
+		{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}},
+		{Key: "$currentDate", Value: bson.D{{Key: "at", Value: true}}},
+	}
 }
 
 // ConsumeEvictionNotices takes one announcement down for each document whose
@@ -773,18 +788,28 @@ func AnnounceOwnDDL(ctx context.Context, cold *mongo.Client, ns string, from bso
 	tok := bson.NewObjectID().Hex()
 	_, err := cold.Database(DB).Collection(OwnDDL).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: ns}},
-		bson.D{
-			{Key: "$set", Value: bson.D{{Key: "at", Value: time.Now().UTC()}}},
-			{Key: "$push", Value: bson.D{{Key: "spans", Value: bson.D{
-				{Key: "$each", Value: bson.A{OwnDDLSpan{From: from, Tok: tok}}},
-				{Key: "$slice", Value: -MaxOwnDDLRecorded},
-			}}}},
-		},
+		OwnDDLAnnouncement(OwnDDLSpan{From: from, Tok: tok}),
 		options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		return "", fmt.Errorf("announce own ddl for %s: %w", ns, err)
 	}
 	return tok, nil
+}
+
+// OwnDDLAnnouncement is the write that opens a span for DDL this system is
+// about to do on the fast tier.
+//
+// The instant comes from the archive for the reason EvictionAnnouncement's
+// does: it exists for the TTL index, and an early expiry here reaches a client
+// as a create or a createIndexes on its own collection that nobody issued.
+func OwnDDLAnnouncement(span OwnDDLSpan) bson.D {
+	return bson.D{
+		{Key: "$currentDate", Value: bson.D{{Key: "at", Value: true}}},
+		{Key: "$push", Value: bson.D{{Key: "spans", Value: bson.D{
+			{Key: "$each", Value: bson.A{span}},
+			{Key: "$slice", Value: -MaxOwnDDLRecorded},
+		}}}},
+	}
 }
 
 // CloseOwnDDL closes the span AnnounceOwnDDL opened, named by its token.
@@ -885,6 +910,11 @@ type WarmingNotice struct {
 
 // ActiveMarker is a heartbeat written by a daemon so others can cheaply tell
 // whether it is running.
+//
+// Written through HeartbeatUpdate, so that the instant comes from the archive:
+// the daemon that writes one and the daemon that reads it are different
+// processes and may be different machines, and what the reader does is subtract
+// it from its own clock.
 // DaemonReport is one background daemon's account of itself.
 //
 // Counters are cumulative since the daemon started, which is what a Prometheus
@@ -910,14 +940,27 @@ func PublishDaemonReport(ctx context.Context, cold *mongo.Client, id string, dry
 	counters map[string]int64, gauges map[string]float64) error {
 	_, err := cold.Database(DB).Collection(DaemonStats).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: id}},
-		bson.D{{Key: "$set", Value: bson.D{
-			{Key: "at", Value: time.Now().UTC()},
+		DaemonReportUpdate(dryRun, counters, gauges),
+		options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// DaemonReportUpdate is the write a daemon makes to say what it has done.
+//
+// Stamped by the archive, because what is done with the instant is subtracting
+// it from somebody else's now: the router exports
+// thermocline_daemon_seconds_since_pass from this field and there is an alert
+// rule on that number being large. A daemon on a machine whose clock ran behind
+// the router's looked like a daemon that had stopped.
+func DaemonReportUpdate(dryRun bool, counters map[string]int64, gauges map[string]float64) bson.D {
+	return bson.D{
+		{Key: "$set", Value: bson.D{
 			{Key: "dryRun", Value: dryRun},
 			{Key: "counters", Value: counters},
 			{Key: "gauges", Value: gauges},
-		}}},
-		options.UpdateOne().SetUpsert(true))
-	return err
+		}},
+		{Key: "$currentDate", Value: bson.D{{Key: "at", Value: true}}},
+	}
 }
 
 // ReadDaemonReports returns what every daemon last published.
@@ -943,14 +986,33 @@ type PauseRecord struct {
 
 // PauseEviction stops the evictor until it is resumed.
 func PauseEviction(ctx context.Context, cold *mongo.Client, reason string) error {
+	// A pipeline rather than $set plus $setOnInsert, so that "since" can come
+	// from the archive's clock and still only be written once: $ifNull keeps
+	// whatever is there, which is what $setOnInsert was for. A pause is held
+	// for as long as an operator leaves it, the router exports how long from
+	// this field, and cline can be run from anywhere at all.
 	_, err := cold.Database(DB).Collection(Markers).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: EvictionPausedMarker}},
-		bson.D{
-			{Key: "$set", Value: bson.D{{Key: "reason", Value: reason}}},
-			{Key: "$setOnInsert", Value: bson.D{{Key: "since", Value: time.Now().UTC()}}},
-		},
+		PauseUpdate(reason),
 		options.UpdateOne().SetUpsert(true))
 	return err
+}
+
+// PauseUpdate is the write that holds eviction, and records when the hold
+// began if it is new.
+//
+// A pipeline rather than $set plus $setOnInsert, so that "since" can come from
+// the archive's clock and still be written only once: $ifNull keeps whatever is
+// already there, which is what $setOnInsert was for. The router exports how
+// long the hold has lasted by subtracting this from its own now, and cline can
+// be run from any machine at all.
+func PauseUpdate(reason string) mongo.Pipeline {
+	return mongo.Pipeline{bson.D{{Key: "$set", Value: bson.D{
+		// $literal, because a reason beginning with $ would otherwise be read
+		// as a field path.
+		{Key: "reason", Value: bson.D{{Key: "$literal", Value: reason}}},
+		{Key: "since", Value: bson.D{{Key: "$ifNull", Value: bson.A{"$since", "$$NOW"}}}},
+	}}}}
 }
 
 // ResumeEviction lifts the hold.
@@ -977,6 +1039,19 @@ func EvictionPaused(ctx context.Context, cold *mongo.Client) (PauseRecord, bool,
 type ActiveMarker struct {
 	ID   string    `bson:"_id"`
 	Seen time.Time `bson:"seen"`
+}
+
+// HeartbeatUpdate is the write that says "this daemon is still going", stamped
+// by the archive rather than by the daemon.
+//
+// Both heartbeats are read by the feeder, which asks whether the mark is recent
+// enough to mean the other daemon is running. Ahead of the writer by more than
+// markerFresh and the feeder decides nothing is running: it stops suppressing
+// the copies a warm or a copy-up makes, mirrors them back into the archive they
+// came from, and a client watching that collection is shown inserts nobody
+// made.
+func HeartbeatUpdate() bson.D {
+	return bson.D{{Key: "$currentDate", Value: bson.D{{Key: "seen", Value: true}}}}
 }
 
 // CacheSuggestion is one row of what the router learned about a query: how

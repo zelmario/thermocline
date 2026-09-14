@@ -506,7 +506,7 @@ func (r *Router) measureArchiveSkew(ctx context.Context) {
 		// which is a better answer than none.
 		return
 	}
-	if r.clock.known && absDuration(skew-r.clock.skew) > health.SkewWarn {
+	if r.clock.known && health.AbsDuration(skew-r.clock.skew) > health.SkewWarn {
 		r.log.Warn("this host's clock moved against the archive's",
 			"was", r.clock.skew.Round(time.Millisecond).String(),
 			"now", skew.Round(time.Millisecond).String(),
@@ -522,13 +522,6 @@ const skewTimeout = 5 * time.Second
 
 // skewRemeasure is how often each side rereads the archive's clock.
 const skewRemeasure = time.Minute
-
-func absDuration(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
-	}
-	return d
-}
 
 // warnAboutClocks reports a host clock that disagrees with either tier.
 //
@@ -568,7 +561,7 @@ func (r *Router) warnAboutClocks(ctx context.Context) {
 			// the first scrape has a number in it.
 			r.noteArchiveSkew(skew)
 		}
-		if absDuration(skew) <= health.SkewWarn {
+		if health.AbsDuration(skew) <= health.SkewWarn {
 			continue
 		}
 		ahead := "ahead of"
@@ -577,9 +570,21 @@ func (r *Router) warnAboutClocks(ctx context.Context) {
 		}
 		r.log.Warn("this host's clock disagrees with a tier's",
 			"tier", tier.name,
-			"by", absDuration(skew).Round(time.Millisecond).String(),
+			"by", health.AbsDuration(skew).Round(time.Millisecond).String(),
 			"direction", "this host is "+ahead+" "+tier.name,
 			"effect", "mirroring lag is measured against this, and so is the wait before a read falls through to the archive",
 			"fix", "run an NTP client on every host that runs a cline daemon")
 	}
+}
+
+// archiveNowFallback is this instant on the archive's clock, as well as this
+// process can say, for comparing against something another daemon stamped
+// there. It falls back to this host's own reading when no comparison has been
+// managed, which is what everything did before there was one.
+func (r *Router) archiveNowFallback(ctx context.Context) time.Time {
+	now := time.Now().UTC()
+	if skew, ok := r.archiveSkew(ctx); ok {
+		return now.Add(-skew)
+	}
+	return now
 }

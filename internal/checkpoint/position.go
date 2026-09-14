@@ -48,9 +48,20 @@ type PositionRecord struct {
 	// to the archive. It is written after the batch lands, never before.
 	//
 	// It is kept for a reader that has nothing better, and it is the weaker of
-	// the two: it is the *feeder's* clock, and whoever compares against it is
-	// reading their own. On separate hosts the barrier is then only as sound as
-	// the skew between two machines nothing keeps in step.
+	// the two. SkewMS below is what makes it comparable at all: without it the
+	// reader is subtracting the feeder's clock from its own, and on separate
+	// hosts the barrier is then only as sound as the difference between two
+	// machines nothing keeps in step.
+	//
+	// Even with it, this is the weaker bar, and here is exactly how. The feeder
+	// takes this instant from two places: its own clock when a change stream
+	// poll comes back empty, which SkewMS puts in the archive's frame exactly,
+	// and an event's cluster time when one arrives, which is the fast tier
+	// primary's clock rounded down to the second and which SkewMS is the wrong
+	// correction for. So a fast tier running ahead of the archive can still
+	// publish a position slightly past what has been mirrored. That is bounded
+	// by TS below, which is exact and which a fall-through read has to clear as
+	// well as this one, and it is why neither bar is allowed to pass alone.
 	At      time.Time `bson:"at"`
 	SavedAt time.Time `bson:"savedAt"`
 	// TS is the same position as a cluster time, and is the one to compare

@@ -1278,7 +1278,7 @@ func (r *Router) notePromoting(ctx context.Context) {
 
 	_, err := r.cold.Database(meta.DB).Collection(meta.Markers).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: meta.PromotingActiveMarker}},
-		bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: now.UTC()}}}},
+		meta.HeartbeatUpdate(),
 		options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		// Not fatal. Failing to announce costs the redundant mirror writes this

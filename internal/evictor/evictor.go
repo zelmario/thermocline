@@ -826,12 +826,20 @@ func (e *Evictor) narrowClaims(ctx context.Context, boundaries map[string]time.T
 
 // checkClock says how far this machine's clock is from the archive's, once.
 //
-// The direction that destroys data is behind: an eviction announcement is
+// It used to be the one that destroyed data. An eviction announcement was
 // stamped here and expired by the archive's TTL monitor, so a clock running
-// behind has its announcements expiring early, and far enough behind they are
-// gone before the feeder reads the delete they explain. It then takes that
-// delete for the application's own, the archive tombstones its copy, and the
-// document is gone from both tiers. See health.Skew and meta.NoticeTTL.
+// behind had its announcements expiring early, and far enough behind they were
+// gone before the feeder read the delete they explained: the feeder took that
+// delete for the application's own, the archive tombstoned its copy, and the
+// document was gone from both tiers. The archive stamps those rows now, as it
+// writes them, so the clock that starts the hour is the clock that ends it and
+// this one does not come into it.
+//
+// What is left is real and smaller. Every eviction rule's cutoff is worked out
+// here, against the dates in the application's own documents, so a clock that
+// is out by an hour evicts an hour's worth of the wrong documents: the window
+// shifts rather than breaking. Nothing else here judges another daemon's
+// instant by this clock any more.
 //
 // Reported rather than refused. A clock can be corrected while this runs, and a
 // sweep that stops because of one is a fast tier that fills up instead.
@@ -849,26 +857,14 @@ func (e *Evictor) checkClock(ctx context.Context) {
 	// a clock that disagrees disagrees on every sweep and the log is not where
 	// an alert should live.
 	e.clockOnce.Do(func() {
-		behind := -skew
-		switch {
-		case behind >= meta.NoticeTTL:
-			e.log.Error("this clock is far enough behind the archive's to lose documents",
-				"behind", behind.Round(time.Second).String(),
-				"notice_ttl", meta.NoticeTTL.String(),
-				"reason", "an eviction announcement is stamped here and expired by the archive, so "+
-					"one written now is already older than the archive keeps them",
-				"effect", "the feeder reads every eviction as the application's own delete and "+
-					"tombstones the archive's copy, losing the document from both tiers",
-				"action", "fix the clock on this machine before letting a sweep run")
-		case skew > health.SkewWarn || behind > health.SkewWarn:
-			e.log.Warn("this clock and the archive's do not agree",
-				"skew", skew.Round(time.Millisecond).String(),
-				"note", "eviction announcements are stamped here and expired there, and residency "+
-					"holds are written by the router and read here",
-				"action", "run NTP on both, or expect the windows to differ from the configuration "+
-					"by about this much")
-		default:
+		if health.AbsDuration(skew) <= health.SkewWarn {
 			e.log.Debug("clocks agree with the archive", "skew", skew.Round(time.Millisecond).String())
+			return
 		}
+		e.log.Warn("this clock and the archive's do not agree",
+			"skew", skew.Round(time.Millisecond).String(),
+			"note", "every eviction cutoff is worked out here, against the dates in your own "+
+				"documents, so the window this sweep uses is out by about this much",
+			"action", "run NTP on every host that runs a cline daemon")
 	})
 }
