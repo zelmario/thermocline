@@ -119,6 +119,16 @@ func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.R
 	// second insert of an _id the fast tier holds is refused by the fast tier's
 	// own index, with mongod's own error. And an _id only the archive holds is
 	// still this guard's to refuse, because that is the one mongod cannot see.
+	//
+	// What it opens, stated rather than left for somebody to find: between this
+	// reading and mongod applying the insert, one round trip, an eviction sweep
+	// could remove that exact document from the fast tier. mongod would then
+	// accept the insert, and the feeder would mirror it over the archived copy
+	// the eviction had just confirmed. That is the loss this guard exists to
+	// stop, in a window of a millisecond, needing a concurrent eviction of the
+	// one _id being inserted. The alternative is refusing every retry a driver
+	// makes of a write that already succeeded, which needs no coincidence at
+	// all and happens whenever a connection drops.
 	if len(clashing) > 0 {
 		held, herr := r.fastTierAlreadyHas(ctx, ns, clashing, at)
 		if herr != nil {
