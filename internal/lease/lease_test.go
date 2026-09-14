@@ -177,3 +177,70 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// A lease left behind by a process that was killed, on this host, must not cost
+// the next one the whole window.
+//
+// That is the ordinary way one is left behind: kill -9, an OOM kill, a crash.
+// None of them release, and all of them are followed by somebody starting the
+// daemon again straight away. The test suites do exactly this, ending with
+// pkill -9 and starting the next feeder a second later, and two of them failed
+// on a lease that had been renewed a moment before the kill.
+//
+// Only on this host. Another machine's process cannot be looked up from here,
+// and the staleness window is what covers that.
+func TestADeadHolderOnThisHostIsNotAHolder(t *testing.T) {
+	cold, done := testCold(t)
+	defer done()
+	ctx := context.Background()
+	coll := cold.Database(meta.DB).Collection(meta.Markers)
+
+	killed := New(cold, "tctest", "e")
+	if err := killed.Take(ctx); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	// It was killed: the row says this host and a pid nothing is running under.
+	// 0x7FFFFFFF is above every pid_max this will meet.
+	if _, err := coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: killed.docID()}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "pid", Value: 0x7FFFFFFF}}}}); err != nil {
+		t.Fatalf("set a dead pid: %v", err)
+	}
+
+	next := New(cold, "tctest", "e")
+	if err := next.Take(ctx); err != nil {
+		t.Fatalf("a lease held by a process that has gone was not taken: %v", err)
+	}
+
+	// And the holder that is still running is still respected, which is the
+	// half that makes this safe: the pid in the row is this test's own.
+	live := New(cold, "tctest", "f")
+	if err := live.Take(ctx); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	var held *ErrHeld
+	if err := New(cold, "tctest", "f").Take(ctx); !errors.As(err, &held) {
+		t.Errorf("a live holder was displaced: %v", err)
+	}
+
+	// A holder on another host is left alone whatever its pid says, because
+	// nothing here can look it up.
+	elsewhere := New(cold, "tctest", "g")
+	if err := elsewhere.Take(ctx); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	if _, err := coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: elsewhere.docID()}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "host", Value: "some-other-host"},
+			{Key: "pid", Value: 0x7FFFFFFF},
+		}}}); err != nil {
+		t.Fatalf("move the lease to another host: %v", err)
+	}
+	if err := New(cold, "tctest", "g").Take(ctx); !errors.As(err, &held) {
+		t.Errorf("a lease on another host was taken on a guess about its pid: %v", err)
+	}
+
+	_ = next.Release(ctx)
+	_ = live.Release(ctx)
+}

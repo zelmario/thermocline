@@ -36,6 +36,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -155,10 +158,97 @@ func (l *Lease) Take(ctx context.Context) error {
 	if rec.Owner == l.owner {
 		return nil
 	}
-	return &ErrHeld{
+	held := &ErrHeld{
 		Kind: l.kind, ID: l.id, Owner: rec.Owner, Host: rec.Host, PID: rec.PID,
 		Ago: rec.Now.Sub(rec.Seen),
 	}
+	// A holder on this machine that no longer exists is not a holder. Waiting
+	// the window out for it is pure cost: the process is gone, this host can
+	// see that it is gone, and nothing it wrote is going to change.
+	//
+	// It is the ordinary way a lease is left behind. kill -9, an OOM kill, a
+	// crash: none of them release, and all of them are followed by somebody
+	// starting the daemon again straight away. Measured on the test suites,
+	// which end with pkill -9 and start the next feeder a second later: two
+	// suites failed because a lease renewed a moment before the kill still had
+	// most of its thirty seconds to run.
+	if l.canSteal(held) {
+		took, err := l.steal(ctx, held.Owner)
+		if err != nil {
+			return err
+		}
+		if took {
+			return nil
+		}
+	}
+	return held
+}
+
+// canSteal reports whether the holder can be shown to be gone rather than
+// merely quiet. Only ever true for a holder on this host: another machine's
+// process cannot be looked up from here, and guessing is what the staleness
+// window is for.
+func (l *Lease) canSteal(held *ErrHeld) bool {
+	return held.Host == l.host && held.PID > 0 && !processAlive(held.PID)
+}
+
+// steal takes a lease from a named owner, and reports whether it got it.
+//
+// Conditioned on that owner still holding it, so two processes both finding the
+// same corpse cannot both conclude they won: the second one's filter matches
+// nothing and it is told the lease is held, which by then it is.
+func (l *Lease) steal(ctx context.Context, from string) (bool, error) {
+	res, err := l.coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: l.docID()}, {Key: "owner", Value: from}},
+		mongo.Pipeline{bson.D{{Key: "$set", Value: bson.D{
+			{Key: "owner", Value: bson.D{{Key: "$literal", Value: l.owner}}},
+			{Key: "host", Value: bson.D{{Key: "$literal", Value: l.host}}},
+			{Key: "pid", Value: l.pid},
+			{Key: "since", Value: "$$NOW"},
+			{Key: "seen", Value: "$$NOW"},
+		}}}})
+	if err != nil {
+		return false, fmt.Errorf("take the %s lease for %q from a process that has gone: %w",
+			l.kind, l.id, err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
+// processAlive reports whether a pid on this host still belongs to a process
+// running this same program.
+//
+// The program's name is checked and not merely the pid, because pids are reused
+// and the one a lease remembers may belong to something else entirely by now.
+// Comparing against this process's own name is what makes that check possible
+// without storing anything extra: the holder of a lease runs the same binary as
+// whoever is asking about it, an upgrade included, since a release does not
+// rename cline.
+//
+// Being wrong in the safe direction means deciding a process is alive when it is
+// not, which costs the wait this exists to avoid. The unsafe direction, calling
+// a running daemon dead and taking its lease, needs a pid whose program has a
+// different name, and a pid that still exists under this program's name is this
+// program.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+		// argv is NUL separated; the first entry is the program.
+		argv0, _, _ := strings.Cut(string(data), "\x00")
+		if argv0 == "" {
+			return true
+		}
+		return filepath.Base(argv0) == filepath.Base(os.Args[0])
+	}
+	// No /proc, so the question is only whether the pid exists at all. EPERM
+	// means it does and belongs to somebody else, which is still alive.
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = p.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, os.ErrPermission)
 }
 
 // takeIfFree is the condition under which this process may write its name in:
