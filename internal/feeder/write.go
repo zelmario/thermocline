@@ -389,6 +389,9 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	}
 
 	var unannounced int
+	// Which namespaces the unannounced ones were in, because that is the only
+	// question worth asking about them. See recheckKindOnUnannounced.
+	unannouncedIn := map[string]bool{}
 	for n, slot := range slots {
 		ok := avail[ids[n]] > 0
 		if ok {
@@ -401,6 +404,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		act := classifyDelete(ok, f.cfg.UnannouncedDeletes)
 		if !ok {
 			unannounced++
+			unannouncedIn[f.pending[slot].ns] = true
 		}
 		if act == actionHalt {
 			op := f.pending[slot]
@@ -415,6 +419,54 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 			"count", unannounced,
 			"policy", string(f.cfg.UnannouncedDeletes),
 			"note", "treated as application deletes unless policy says otherwise")
+		if err := f.recheckKindOnUnannounced(ctx, unannouncedIn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recheckKindOnUnannounced asks again whether a namespace has become a kind
+// this feeder must not mirror, when it has just read deletes nothing announced.
+//
+// checkNamespaceKind runs once per namespace, the first time an event for it
+// arrives, and only forgets on a drop. That is right for a collection created
+// capped, which is the case it was written for. It leaves one door: a
+// collection already being mirrored that is converted afterwards. The router
+// refuses convertToCapped on a tiered collection, so it takes somebody running
+// it straight at the fast tier's mongod, which is what an operator or a
+// migration does.
+//
+// Measured on 2026-09-14, twenty mirrored documents and then convertToCapped
+// with size 4096 applied directly to the fast tier: mongod accepted it, the
+// feeder went on running, and filling past the cap left the archive with sixty
+// tombstones and two of the original twenty still live. The history the archive
+// exists to keep, discarded, with nothing said anywhere.
+//
+// Asked here rather than on a timer because unannounced deletes are the only
+// way this does damage and they are its only symptom: a capped collection
+// rolling produces nothing else, and a TTL or clustered expiry is the same
+// shape. Rate limited per namespace, because an application deleting its own
+// documents is ordinary and produces them too.
+func (f *Feeder) recheckKindOnUnannounced(ctx context.Context, in map[string]bool) error {
+	if f.hot == nil || len(in) == 0 {
+		return nil
+	}
+	if f.kindRechecked == nil {
+		f.kindRechecked = map[string]time.Time{}
+	}
+	now := time.Now()
+	for ns := range in {
+		if at, seen := f.kindRechecked[ns]; seen && now.Sub(at) < kindRecheckEvery {
+			continue
+		}
+		f.kindRechecked[ns] = now
+		// checkNamespaceKind memoises its answer, and the whole point here is
+		// to ask again.
+		f.forgetNamespaceKind(ns)
+		if err := f.checkNamespaceKind(ctx, ns); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -55,6 +55,9 @@ feeder:
     # testddl.sh: the same, for a TTL index that arrives by the other door,
     # straight at the fast tier, which the router cannot refuse and says so.
     - "shop.tddlttloob"
+    # testtypes.sh: a collection mirrored normally and then converted to capped
+    # out of band, which the kind check had already said yes about.
+    - "shop.tcapconv"
     # testddl.sh: the collection that may not be made capped or time series.
     - "shop.tddlcap"
     - "shop.tddlcap2"

@@ -29,6 +29,20 @@ Part of [Thermocline](../README.md).
   that already holds documents, so that one does not heal. The remedy the
   refusal names is to send it without `writeConcern {w: 0}`.
 
+- **A collection converted to capped while it is being mirrored stops the
+  feeder.** The kind check runs at startup and again the first time an event for
+  a namespace arrives, and it remembers its answer until the collection is
+  dropped. That covers a collection created capped; it left the case of one
+  already being mirrored and converted afterwards. `convertToCapped` on a tiered
+  collection is refused by the router, so it takes running it straight at the
+  fast tier's mongod. Measured before this: twenty mirrored documents, then the
+  conversion, then filling past the cap, and the archive held sixty tombstones
+  with two of the original twenty still live. The question is asked again when
+  deletes arrive that nothing announced, which is the only way this does damage
+  and its only symptom, at most once a minute per namespace. The feeder then
+  stops with the namespace and the kind named, which is what the startup check
+  already does for the same reason.
+
 - **A TTL index created straight against the fast tier cannot be refused, and is
   named rather than prevented.** The router turns down a TTL index on a tiered
   collection, because the fast tier holds the recent part: the index expires the

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -246,6 +247,15 @@ func unmirrorableKind(info bson.Raw) (kind, why string, namedOnly bool) {
 	}
 	return "", "", false
 }
+
+// kindRecheckEvery bounds how often one namespace's kind is asked again after
+// deletes nothing announced.
+//
+// A minute, because the thing it catches destroys archived history for as long
+// as it goes unnoticed, and the cost is one listCollections for a namespace
+// that is already producing unannounced deletes. An application deleting its
+// own documents pays it too, which is why it is bounded at all.
+const kindRecheckEvery = time.Minute
 
 // checkCollectionKinds refuses to run when any configured namespace cannot be
 // mirrored.

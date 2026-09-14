@@ -246,6 +246,70 @@ wait $LATEFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tcap.drop()" >/dev/null
 
+echo "== a collection converted to capped while it was being mirrored =="
+# The section above closed the door for a collection created capped after the
+# feeder started. checkNamespaceKind asks the first time an event for a
+# namespace arrives and memoises the answer, forgetting it only on a drop. So
+# one door was left: a collection already being mirrored, converted afterwards.
+#
+# Through the router convertToCapped is refused, and that refusal is
+# testddl.sh's. Straight at the fast tier's mongod it is accepted, and nothing
+# here asked again.
+#
+# Measured before this, twenty mirrored documents and then convertToCapped with
+# size 4096: mongod accepted it, the feeder went on running, and filling past
+# the cap left the archive with sixty tombstones and two of the original twenty
+# still live. The history the archive exists to keep, discarded, with nothing
+# said anywhere.
+#
+# Unannounced deletes are what asks the question again. They are the only way
+# this does damage and they are its only symptom: a capped collection rolling
+# produces nothing else.
+stopDaemons
+CNS=tcapconv
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+: > $LOGDIR/t_types_conv.log
+cline feeder --config $CFG --log-file $LOGDIR/t_types_conv.log &
+CONVFP=$!
+for _ in $(seq 1 40); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+# An ordinary collection, mirrored the ordinary way, so the kind check has
+# already run and said yes.
+H "const d=[]; for(let i=1;i<=20;i++) d.push({_id:i, pad:'x'.repeat(200)});
+   db.getSiblingDB(process.env.TC_DB).$CNS.insertMany(d)" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")" = "20" ] && break
+  sleep 0.5
+done
+chk "twenty documents mirrored before the conversion"   "20" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+H "db.getSiblingDB(process.env.TC_DB).runCommand({convertToCapped:'$CNS', size:4096})" >/dev/null 2>&1
+chk "mongod converted it, out of band"                  "true" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$CNS'})[0]; print(!!(c && c.options && c.options.capped))")"
+# Filling it past the cap is what makes mongod roll the oldest off, which is
+# what produces the deletes nothing announced.
+H "for(let i=100;i<160;i++){db.getSiblingDB(process.env.TC_DB).$CNS.insertOne({_id:i,pad:'y'.repeat(200)})}" >/dev/null
+sleep 10
+CONVDEAD=$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")
+CONVLIVE=$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_id:{\$lte:20}, _tcDeletedAt:{\$exists:false}}))")
+echo "  the archive tombstoned $CONVDEAD, and $CONVLIVE of the original 20 are still live"
+chk "the archive kept all twenty originals"             "20" "$CONVLIVE"
+chk "and tombstoned none of them"                       "0"  "$CONVDEAD"
+chk "the feeder stopped, saying why"                    "true" \
+    "$(grep -q "cannot be mirrored" $LOGDIR/t_types_conv.log && echo true || echo false)"
+chk "and it named the kind"                             "true" \
+    "$(grep -q "kind=\"a capped collection\"" $LOGDIR/t_types_conv.log && echo true || echo false)"
+chk "and it is not still mirroring"                     "0" \
+    "$(pgrep -fc "cline feeder --config $WDIR/" 2>/dev/null || true)"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+wait $CONVFP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null 2>&1
+
 echo "== the same collection, capped on the archive instead =="
 # Which tier holds the collection depends on where the deployment is in its
 # life. Ordinarily the application's collections are on the fast tier and the
