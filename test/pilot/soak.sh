@@ -10,6 +10,15 @@
 #
 #   HOURS=3 bash test/pilot/soak.sh
 #
+# Nothing else may drive the cluster while this runs, and the way that goes
+# wrong is not obvious: every suite kills daemons by config *prefix*, `pkill -f
+# "cline feeder --config $WDIR/"`, and WDIR is /root when a suite is run by hand
+# inside the node. That matches this soak's own feeder, which is
+# /root/pilot.yaml. Measured: a testall.sh run in another shell took the feeder
+# out at round 26 and the stale column went from 0 to 45 a round for the rest of
+# the hour, which is the system behaving exactly as designed with nothing
+# mirroring, reported as though the soak had found something.
+#
 # Three things fail the run, and they are asserted rather than printed for
 # somebody to notice:
 #
