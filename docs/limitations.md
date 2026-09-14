@@ -29,6 +29,25 @@ Part of [Thermocline](../README.md).
   that already holds documents, so that one does not heal. The remedy the
   refusal names is to send it without `writeConcern {w: 0}`.
 
+- **A write made straight at the fast tier destroys archived documents, and
+  nothing says so.** The application goes through the router; that is the whole
+  contract, and this is outside it. It is also one connection string away: a
+  migration script, a monitoring tool that writes, a leftover config, somebody
+  in a shell. Measured on an `_id` the archive held and the fast tier did not:
+  through the router the insert is refused, which is what one cluster would do
+  with a duplicate key; straight at the fast tier's mongod it is accepted, and
+  six seconds later the archive holds the new document with the old one's fields
+  gone. No line in the feeder's log, none in the router's.
+
+  It cannot be refused from here — the router is not in that path by
+  definition — and it is not detected either. The feeder could in principle
+  notice that mirroring an *insert* modified a document the archive already
+  held, which through the router cannot happen, but that same shape occurs
+  benignly when a feeder replays events after a restart, so the check would need
+  to tell those apart before it could be trusted. Until then the protection is
+  operational: only the router should hold credentials that can write to the
+  fast tier's application databases.
+
 - **A collection converted to capped while it is being mirrored stops the
   feeder.** The kind check runs at startup and again the first time an event for
   a namespace arrives, and it remembers its answer until the collection is
