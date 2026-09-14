@@ -6,6 +6,18 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **`dropIndexes` on a tiered collection is refused when it asks for no
+  acknowledgement**, and performed normally otherwise. The archive's copy of the
+  index is dropped behind the fast tier's, and only the reply says whether the
+  fast tier dropped its own; dropping it before forwarding would remove the
+  archive's index for a command the fast tier might turn down. Measured before
+  the refusal, in the adoption shape where the archive carries its own unique
+  index: the fast tier ended without the index and the archive kept it, and of
+  two documents the application was then entitled to write, one reached the
+  archive and one did not, with nothing said anywhere. The remedy the refusal
+  names is to send it without `writeConcern {w: 0}`, which no driver sets for
+  DDL on its own.
+
 - **mapReduce cannot write into a tiered collection**, and is refused when it
   tries. A replacing output is built beside the target and renamed over it, and a
   rename is not mirrored, so the result would reach the fast tier and nothing
