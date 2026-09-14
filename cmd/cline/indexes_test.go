@@ -286,3 +286,41 @@ func TestExtJSONIsRelaxed(t *testing.T) {
 		t.Errorf("got %s, want strength as a plain number", got)
 	}
 }
+
+// What a unique index enforces is its key, unique, its partial filter, its
+// collation and whether it is sparse. This file had four of those five.
+//
+// A sparse unique index constrains only the documents that have the field. A
+// plain one treats every document missing it as holding null and allows exactly
+// one of them, so it is the stricter of the two. The router's key registry has
+// always known this, and decides from the same flag whether a document is
+// constrained at all; the report an operator reads before an adoption did not.
+//
+// Both halves were wrong. The comparison called them the same constraint, and
+// the command emitted to rebuild the archive's index on the fast tier left the
+// flag off, which builds the stricter index: the build fails outright where
+// several documents lack the field, and where it succeeds the fast tier refuses
+// writes the archive accepts. That is the same defect that was found and fixed
+// for partialFilterExpression, one option along, and the fix stopped there.
+func TestSparseIsPartOfWhatAUniqueIndexEnforces(t *testing.T) {
+	archive := indexInfo{name: "code_1", spec: "{code: 1}", unique: true, sparse: true}
+	fast := indexInfo{name: "code_1", spec: "{code: 1}", unique: true}
+
+	if archive.enforcesSameAs(fast) {
+		t.Errorf("a sparse unique index and a plain one read as the same constraint")
+	}
+	if !archive.enforcesSameAs(indexInfo{name: "other", spec: "{code: 1}", unique: true, sparse: true}) {
+		t.Errorf("two sparse unique indexes on the same key read as different")
+	}
+
+	// And the report says which way round it is, because the two directions
+	// need different actions.
+	got := whyNotEnforced(archive, map[string]indexInfo{"code_1": fast})
+	if !strings.Contains(got, "sparse") {
+		t.Errorf("whyNotEnforced = %q, want it to name the sparse difference", got)
+	}
+	back := whyNotEnforced(fast, map[string]indexInfo{"code_1": archive})
+	if !strings.Contains(back, "sparse") || back == got {
+		t.Errorf("the other direction reads %q, want its own answer", back)
+	}
+}

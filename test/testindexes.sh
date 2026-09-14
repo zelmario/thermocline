@@ -784,6 +784,31 @@ chk "the rebuilt copy enforces the same constraint" "false" \
     "$(cline indexes --config $CFG --ns $DB.$ENS 2>&1 | grep -q 'not the same way' && echo true || echo false)"
 H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+# The sparse half, which is the same defect one option along and was still there
+# after the partial one was fixed. A sparse unique index constrains only the
+# documents that have the field; a plain one treats every document missing it as
+# holding null and allows exactly one of them, so emitting it without the flag
+# offers the stricter index. The build fails outright on a collection where two
+# documents lack the field, which is what these two are.
+C "db.getSiblingDB(process.env.TC_DB).$ENS.createIndex({tag:1},{unique:true,name:'tag_s',sparse:true})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$ENS')" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$ENS.insertMany([{_id:11,n:'no tag here'},{_id:12,n:'nor here'}])" >/dev/null
+SCMD=$(cline indexes --config $CFG --ns $DB.$ENS --commands 2>&1 | grep 'createIndex(' | grep 'tag_s')
+chk "the command carries sparse"                   "true" \
+    "$(grep -q 'sparse' <<<"$SCMD" && echo true || echo false)"
+mongosh "$HOT" --quiet --eval "$SCMD" >/dev/null 2>&1
+chk "and it builds where a plain unique one cannot" "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$ENS.getIndexes().some(function (i) { return i.name === 'tag_s' }))")"
+chk "the two copies then enforce the same thing"   "false" \
+    "$(cline indexes --config $CFG --ns $DB.$ENS 2>&1 | grep -q 'not the same way' && echo true || echo false)"
+# The control: the report must have had something to say before the rebuild,
+# otherwise the check above passes on a report that is quiet about everything.
+H "db.getSiblingDB(process.env.TC_DB).$ENS.dropIndex('tag_s')" >/dev/null 2>&1
+chk "and it did say so while the fast tier lacked it" "true" \
+    "$(cline indexes --config $CFG --ns $DB.$ENS 2>&1 | grep -q 'tag_s' && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+
 # The collation half, which is the riskier one to emit: listIndexes reports a
 # collation with every default mongod filled in, version included, and that
 # whole document is what gets pasted back into createIndex. Whether mongod

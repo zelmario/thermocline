@@ -81,6 +81,17 @@ type indexInfo struct {
 	// the fast tier alone.
 	partial   string
 	collation string
+	// sparse is the third thing that narrows a unique constraint, and it was
+	// the one this file did not have.
+	//
+	// A sparse unique index constrains only the documents that have the field;
+	// a plain one treats every document missing it as holding null and allows
+	// exactly one of them. So two indexes that are both unique on the same key
+	// and differ in this enforce different things, which is what partial and
+	// collation are here for, one option along. The router's key registry has
+	// always known: see internal/router/uniquekeys.go, where sparse decides
+	// whether a document is constrained at all.
+	sparse bool
 }
 
 // enforcesSameAs reports whether two unique indexes cover the same documents
@@ -92,7 +103,8 @@ type indexInfo struct {
 // reported as different when they are not. That is the safe direction for a
 // report: it errs towards telling the operator to look.
 func (i indexInfo) enforcesSameAs(o indexInfo) bool {
-	return i.unique == o.unique && i.partial == o.partial && i.collation == o.collation
+	return i.unique == o.unique && i.partial == o.partial &&
+		i.collation == o.collation && i.sparse == o.sparse
 }
 
 func runIndexes(args []string) error {
@@ -464,6 +476,17 @@ func printCreateCommands(groups []nsMissing) {
 			// accepts. An application that worked before the adoption stops
 			// working after it, which is the one thing this system promises not
 			// to do, and the advice to do it came from here.
+			if m.sparse {
+				// The same reasoning as the partial filter above, and the same
+				// consequence. A sparse unique index constrains the documents
+				// that have the field; emitted without it, the index built on
+				// the fast tier constrains every document, treats every one
+				// missing the field as holding null, and allows exactly one of
+				// them. The build then fails outright on a collection where
+				// several documents lack the field, and where it succeeds the
+				// fast tier refuses writes the archive accepts.
+				opts += ", sparse: true"
+			}
 			if m.partial != "" {
 				opts += ", partialFilterExpression: " + m.partial
 			}
@@ -504,6 +527,13 @@ data would reach into the tier that exists to keep it.
 			// collection, which is more of the storage the tiering exists to
 			// save than the operator agreed to.
 			opts := fmt.Sprintf("{name: %q", m.name)
+			if m.sparse {
+				// Here for the reason the partial filter is: it says which
+				// documents the index covers, and one built without it covers
+				// the whole collection, which is more of the storage the
+				// tiering exists to save than the operator agreed to.
+				opts += ", sparse: true"
+			}
 			if m.partial != "" {
 				opts += ", partialFilterExpression: " + m.partial
 			}
@@ -611,6 +641,13 @@ func whyNotEnforced(c indexInfo, hot map[string]indexInfo) string {
 		return "archive " + c.partial + " against fast tier " + h.partial
 	case h.collation != c.collation:
 		return "the two copies collate differently, so they disagree on which values are the same"
+	case h.sparse != c.sparse:
+		if h.sparse {
+			return "the fast tier's is sparse and the archive's is not, so the archive constrains " +
+				"documents without the field and the fast tier does not"
+		}
+		return "the archive's is sparse and the fast tier's is not, so the fast tier refuses a " +
+			"second document without the field and the archive accepts it"
 	}
 	return "the fast tier's copy does not enforce the same constraint"
 }
@@ -706,6 +743,9 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 		info := indexInfo{name: name, spec: keyPattern(raw), keyJSON: keyPatternJSON(raw)}
 		if u, ok := raw.Lookup("unique").BooleanOK(); ok && u {
 			info.unique = true
+		}
+		if v, ok := raw.Lookup("sparse").BooleanOK(); ok && v {
+			info.sparse = true
 		}
 		if v, err := raw.LookupErr("partialFilterExpression"); err == nil {
 			info.partial = extJSON(v)
