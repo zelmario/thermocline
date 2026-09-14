@@ -328,10 +328,21 @@ mongosh --port $PALT -u dba -p secret --authenticationDatabase admin --quiet --e
   && { PASS=$((PASS+1)); echo "  PASS  router serves on the overridden port"; } || { FAIL=$((FAIL+1)); FAILED+=("router override serves"); echo "  FAIL  router serves on the overridden port"; }
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 
+# Two finished sweeps, waited for rather than slept at. The check used to sleep
+# seven seconds and count the lines one sweep writes: "evicting" and "sweep
+# complete" are two of them, so a single sweep already met the bar, and under a
+# four-worker sweep the window closed between those two lines and it failed for
+# saying 1. What it means to assert is that --every comes round again.
+rm -f $LOGDIR/t_evictor.log
 cline evictor --config $CFG --every 2s --log-file $LOGDIR/t_evictor.log &
-EP=$!; sleep 7
-N=$(grep -c "sweep complete\|evicting" $LOGDIR/t_evictor.log 2>/dev/null || true)
-[ "$N" -ge 2 ] && { PASS=$((PASS+1)); echo "  PASS  evictor --every loops ($N sweeps)"; } || { FAIL=$((FAIL+1)); FAILED+=("evictor --every"); echo "  FAIL  evictor --every loops (saw $N)"; }
+EP=$!
+N=0
+for _ in $(seq 1 60); do
+  N=$(grep -c "sweep complete" $LOGDIR/t_evictor.log 2>/dev/null || true)
+  [ "$N" -ge 2 ] && break
+  sleep 0.5
+done
+[ "$N" -ge 2 ] && { PASS=$((PASS+1)); echo "  PASS  evictor --every loops ($N sweeps)"; } || { FAIL=$((FAIL+1)); FAILED+=("evictor --every"); echo "  FAIL  evictor --every loops (saw $N in 30s)"; }
 kill $EP 2>/dev/null; wait $EP 2>/dev/null
 
 echo "== two of one daemon =="
