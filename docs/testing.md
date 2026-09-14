@@ -53,3 +53,49 @@ mongosh --port 28017 --eval '
 mongosh --port 28018 --eval '
   print(db.getSiblingDB("app").orders.countDocuments({}))'
 ```
+
+## Every guard, broken on purpose
+
+A suite that passes says the system works. It does not say the suite would
+notice if a guard stopped working, and that is a different question: a check
+that cannot fail is worse than no check, because it is counted.
+
+So on 2026-09-14 each of the router's guards was disabled in turn -- `return
+nil, false` as the first statement of its body -- and the suite that ought to
+notice was run against that binary. A guard whose suite still passes is a guard
+nothing tests.
+
+    guardUpsert                testupsert     caught   (5 checks failed)
+    guardBulkWrite             testbulk       caught   (6)
+    guardMergeTarget           testmerge      caught   (7)
+    guardSortedFindAndModify   testsingle     caught   (6)
+    guardTTL                   testddl        caught   (8)
+    guardRename                testddl        caught   (7)
+    guardUnmirrorable          testddl        caught   (9)
+    guardDBHash                testops        caught   (2)
+    guardTieredGetMore         testevict      caught   (2)
+    guardSimpleRead            testquery      caught   (1)
+    guardAggregate             testaggwrite   caught   (15)
+    guardMultiWrite            testunack      caught   (5)
+    guardInsert                testunack      caught   (1)
+    guardUpdateKeys            testkeys       caught   (19)
+    guardNewUniqueIndex        testkeys       caught   (7)
+
+Fifteen disabled, fifteen caught, none survived. Each by the first suite tried,
+which is the stronger result: the check that notices is the one a reader would
+expect to.
+
+Two of them are caught by a single check in the suite named here, and that is
+worth knowing rather than worrying about: `guardSimpleRead` and `guardInsert`
+both have heavier coverage elsewhere, in `testconform` and `testkeys`, and the
+suite above was chosen for speed rather than for depth.
+
+**What this cannot find is a guard that is missing**, and that is where every
+defect of 2026-09-14 actually was: the unacknowledged single-document write, the
+unacknowledged `dropIndexes` and `create`, the TTL index that arrives by another
+door. Mutation says the guards that exist are watched. It says nothing about the
+door nobody has looked at yet.
+
+The mutants are built and run by a pair of throwaway scripts rather than
+anything kept here; the method is the part worth keeping. See
+[[mutation-to-find-untested-guards]].
