@@ -23,6 +23,22 @@
 # Suites are claimed from a shared queue rather than dealt out in advance,
 # because they range from under a minute to several, and a worker that finishes
 # early should take the next one rather than idle.
+# Stopping a sweep takes three kills, not one.
+#
+# pkill -f psweep.sh reaches the driver and the workers, and leaves every suite
+# they started running: those are `bash /root/testX.sh` under a `timeout`, and
+# they go on driving daemons, databases and ports for as long as their own logic
+# takes. On 2026-09-14 a sweep stopped that way left a testconform running; the
+# next sweep's testall, testlife and testconform then failed 3, 19 and dozens of
+# checks with ECONNREFUSED, because the orphan kept stopping their daemons. It
+# reads exactly like a regression in whatever change is being tested.
+#
+#   pkill -9 -f "[p]sweep.sh"
+#   pkill -9 -f "bash /root/[t]est"      # the suites, which outlive the driver
+#   pkill -9 -f "[c]line (feeder|router|evictor|warmer)"
+#
+# Then check nothing survived, because each of those can miss:
+#   pgrep -af "[t]est|[c]line" ; ss -ltn | grep 272
 WORKERS=${WORKERS:-4}
 # How long one suite may take before it is killed and reported as a failure.
 # Generous next to testconform, the longest, at about seven minutes.

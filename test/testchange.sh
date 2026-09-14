@@ -132,9 +132,23 @@ echo "== an eviction must not look like a deletion =="
 # keeps it and a later read still finds it. An application told that it was
 # deleted would drop its cache entry, emit a deletion event, or tombstone a row
 # in a warehouse, for a document that still exists.
+#
+# Everything the sections above left here has an integer _id, and this
+# namespace's evictor rule takes each document's age from the timestamp inside
+# its _id. One non-ObjectId document is enough for the evictor to refuse the
+# whole namespace, so without this line the fixture below is inserted, mirrored
+# and never evicted, and both checks under it pass on an eviction that never
+# happened. That is what they had been doing: "the fast tier now holds 2 of 2,
+# the watcher saw: none".
+#
+# Measured on 2026-09-14 with the evictor run by hand. With {_id: 1} present it
+# logged "this rule cannot address" and left 2 of 2 on the fast tier; with it
+# removed it evicted the old document and left 0 of 1, the archive keeping its
+# copy.
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$not:{\$type:'objectId'}}})" >/dev/null
 OID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 771)
 R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID'), v:'old'})" >/dev/null
-waitMirrored 2
+waitMirrored 1
 
 # The watcher runs in its own client and writes what it saw to a file, because
 # a change stream has to already be open when the eviction happens. Its pid is
@@ -169,7 +183,14 @@ sleep 3
 cline evictor --config $CFG --once >/dev/null 2>&1
 EVENTS=$(awaitWatcher /tmp/cs_events.txt $WATCHER)
 LEFT=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
-echo "  the fast tier now holds $LEFT of 2, the watcher saw: ${EVENTS:-nothing}"
+echo "  the fast tier now holds $LEFT of 1, the watcher saw: ${EVENTS:-nothing}"
+# First, that there was an eviction at all. An eviction that did not happen
+# cannot be reported as a delete, so the two checks below say nothing until this
+# one passes, and for a long time it was not there to fail: the evictor was
+# refusing this namespace and the section was reporting that as a success.
+chk "the eviction actually took the document"          "0" "$LEFT"
+chk "and the archive kept the document it took"        "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 # An error is not an answer. Without this, a build that refuses change streams
 # outright passes both of these: it saw no delete because it saw nothing at all.
 chk "the watcher was actually watching"                "true" \
@@ -786,7 +807,24 @@ chk "no copy-up arrived as an insert"                  "true" \
 H "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
 
+# $NS is dropped in setup and was never dropped at the end, alone among this
+# suite's collections. What it leaves is six documents whose _id values are
+# plain integers, and the evictor rule that covers this namespace takes each
+# document's age from the timestamp inside its _id. So the next suite on this
+# worker that runs an evictor sweep gets "not evicting a namespace this rule
+# cannot address" and a non-zero exit, a run or a week later: testall's three
+# evictor checks failed exactly this way on 2026-09-14, against a fixture left
+# by a testchange that had passed. See e829c75 for the same shape.
+#
+# After stopDaemons, so the feeder cannot mirror the drop back, and checked
+# rather than assumed: a suppressed cleanup that failed looks exactly like one
+# that worked.
 stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null 2>&1
+LEFT=$(( $(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")        + $(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))") ))
+chk "this suite left nothing of $NS on either tier"     "0" "$LEFT"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
