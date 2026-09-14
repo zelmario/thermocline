@@ -851,6 +851,23 @@ var notCarried = map[string]bool{
 	"idIndex":        true, "info": true, "uuid": true, "type": true,
 }
 
+// CarriedToTheArchive reports whether a create option is one MirrorCollection
+// would carry down to the archive.
+//
+// The router asks before letting an unacknowledged create through, because
+// carrying happens on the reply and an unacknowledged create has none. Asked
+// here rather than answered from a second list in the router, which is the
+// arrangement two lists that must agree always end up wanting: see the drift
+// check in ddl.go, which compared two options while the create path carried
+// every one except a deny-list.
+//
+// A view's viewOn and pipeline answer false here and are carried anyway, which
+// is the exception carryableOptions makes for them. It costs nothing: a create
+// naming viewOn is refused for a tiered namespace before this is reached.
+func CarriedToTheArchive(option string) bool {
+	return !notCarried[option]
+}
+
 // isNamespaceExists reports MongoDB's "collection already exists", which is the
 // benign outcome of racing an insert.
 func isNamespaceExists(err error) bool {

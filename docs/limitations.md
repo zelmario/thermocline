@@ -18,6 +18,17 @@ Part of [Thermocline](../README.md).
   names is to send it without `writeConcern {w: 0}`, which no driver sets for
   DDL on its own.
 
+- **`create` on a tiered collection is refused when it carries options the
+  archive needs and asks for no acknowledgement**, and performed normally
+  otherwise. A bare `create` is not refused. The archive's copy is created with
+  those options on the reply to the command, and without a reply it would be
+  created instead by the first mirrored insert, carrying none of them. Measured
+  with `collation: {locale: "en", strength: 2}`: the fast tier ended with it and
+  the archive without, and `find({name: "ALICE"})` then answered 1 or 0
+  depending on which tier answered. A collation cannot be added to a collection
+  that already holds documents, so that one does not heal. The remedy the
+  refusal names is to send it without `writeConcern {w: 0}`.
+
 - **mapReduce cannot write into a tiered collection**, and is refused when it
   tries. A replacing output is built beside the target and renamed over it, and a
   rename is not mirrored, so the result would reach the fast tier and nothing

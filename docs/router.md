@@ -950,10 +950,34 @@ unacknowledged `dropIndexes` on a tiered collection is refused, which is the
 Nothing is lost by refusing, because an operator dropping an index is present to
 see that it is still there, and no driver sends DDL fire-and-forget.
 
+**A `create` carrying options is the second, and the only one here that never
+heals.** A collection's options are carried to the archive by
+`MirrorCollection`, which also runs on the reply. Without one the archive's copy
+is left to the feeder's first mirrored insert, and that carries no options at
+all. Measured on a tiered namespace, `create` with
+`collation: {locale: "en", strength: 2}`:
+
+    acknowledged     both tiers en/2, and find({name: "ALICE"}) is 1 on both
+    unacknowledged   the fast tier en/2 and the archive none, and the same
+                     find is 1 on the fast tier and 0 on the archive
+
+At strength 2 `ALICE` matches `alice`, so the answer depends on which tier
+answers. A collation is fixed at creation and cannot be added to a collection
+that already holds documents, so unlike everything else in this section that
+divergence is permanent.
+
+So an unacknowledged `create` on a tiered namespace is refused **when it carries
+something the archive needs**. A bare `create` goes through, because the
+collection the feeder's first insert makes is the same collection. Which options
+count is asked of the same list `MirrorCollection` carries by, rather than
+written down a second time here.
+
 `testunack.sh` pins all of it, along with the controls that an ordinary
 unacknowledged write still lands on both tiers, that an acknowledged
-`dropIndexes` still drops on both, and that an untiered collection's index still
-goes whatever flag is set.
+`dropIndexes` still drops on both and an acknowledged `create` still carries its
+collation to both, that a bare unacknowledged `create` still goes through, and
+that an untiered collection's index and collation are none of this system's
+business whatever flag is set.
 
 ### Replies the client asked to have several of
 

@@ -104,7 +104,7 @@ waitFeeder() {
 
 echo "== setup =="
 stopDaemons
-for t in tunku tunki tunkm tunk1 tunk2 tunk3 tunkx tunkxfree; do
+for t in tunku tunki tunkm tunk1 tunk2 tunk3 tunkx tunkxfree tunkc tunkb tunkcfree; do
   H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
 done
@@ -303,6 +303,61 @@ R "db.getSiblingDB(process.env.TC_DB).runCommand({dropIndexes:'tunkxfree', index
 sleep 3
 chk "an untiered collection's index still goes"            "_id_" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkxfree.getIndexes().map(i=>i.name).join(','))")"
+
+# What collation a tier's copy of a collection was created with, as its own
+# catalog reports it. "no collection" and "none" are different answers and the
+# checks below depend on telling them apart.
+collationOf() { # collationOf H|C COLL
+  $1 "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$2'})[0];
+      if(!c){print('no collection')}
+      else if(c.options && c.options.collation){print(c.options.collation.locale+'/'+c.options.collation.strength)}
+      else {print('none')}"
+}
+
+echo "== an unacknowledged create carrying options the archive needs =="
+# A collection's options are carried to the archive by MirrorCollection, which
+# runs on the reply to the create. Unacknowledged there is no reply, so the
+# archive's copy would be left to the feeder's first mirrored insert, and that
+# carries no options at all.
+#
+# Measured before this was refused, with a control: acknowledged, both tiers end
+# en/2 and find({name:'ALICE'}) is 1 on both; unacknowledged, the fast tier ends
+# en/2 and the archive none, and the same find is 1 on the fast tier and 0 on
+# the archive. A collation is fixed at creation and cannot be added to a
+# collection that already holds documents, so unlike the rest of this suite that
+# divergence never heals.
+H "db.getSiblingDB(process.env.TC_DB).tunkc.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tunkc.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({create:'tunkc',
+     collation:{locale:'en', strength:2}, writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+chk "an unacknowledged create with a collation is refused"  "no collection/no collection" \
+    "$(collationOf H tunkc)/$(collationOf C tunkc)"
+# The acknowledged control, or the refusal is a ban on the command.
+R "db.getSiblingDB(process.env.TC_DB).runCommand({create:'tunkc', collation:{locale:'en', strength:2}})" >/dev/null 2>&1
+sleep 3
+chk "an acknowledged one reaches both tiers with it"        "en/2/en/2" \
+    "$(collationOf H tunkc)/$(collationOf C tunkc)"
+R "db.getSiblingDB(process.env.TC_DB).tunkc.insertOne({_id:1, name:'alice'})" >/dev/null 2>&1
+waitFeeder
+# The collation is the whole point: at strength 2 'ALICE' matches 'alice', and
+# a tier created without it answers a different question.
+chk "and the same query means the same on both tiers"       "1/1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tunkc.countDocuments({name:'ALICE'}))")/$(C "print(db.getSiblingDB(process.env.TC_DB).tunkc.countDocuments({name:'ALICE'}))")"
+# A create with nothing to carry is not refused: the collection the feeder's
+# first insert makes is the same collection.
+H "db.getSiblingDB(process.env.TC_DB).tunkb.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tunkb.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({create:'tunkb', writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+chk "a bare unacknowledged create still goes through"       "none" "$(collationOf H tunkb)"
+# And an untiered collection is none of this system's business whatever flag is
+# set, or the refusal is about the write concern rather than about the archive.
+H "db.getSiblingDB(process.env.TC_DB).tunkcfree.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({create:'tunkcfree',
+     collation:{locale:'en', strength:2}, writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 3
+chk "an untiered one is created with its collation"         "en/2" "$(collationOf H tunkcfree)"
 
 echo "== and an ordinary unacknowledged write still lands =="
 # The fix must not turn every w:0 write into a dropped one.

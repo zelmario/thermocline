@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -69,7 +70,13 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 		// After it, not before: a time series create carries expireAfterSeconds
 		// too, and the reason it is refused is the bucket collection rather
 		// than the expiry.
-		return c.guardTTL(ctx, msg, cmd, db, name)
+		if out, done := c.guardTTL(ctx, msg, cmd, db, name); done {
+			return out, true
+		}
+		if name == "create" {
+			return c.refuseUnackedCreateWithOptions(msg, cmd, db)
+		}
+		return nil, false
 
 	case "applyOps":
 		return c.refuseApplyOps(ctx, msg, cmd, db)
@@ -978,6 +985,81 @@ func (c *conn) refuseUnackedIndexDrop(msg *wire.Message, cmd bson.Raw, db string
 		"thermocline: refusing this dropIndexes because "+ns+" is tiered and the command asks for no "+
 			"acknowledgement. The archive's copy of the index is dropped behind the fast tier's, and "+
 			"only the reply says whether the fast tier dropped it. Send it without writeConcern {w: 0}.")
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// refuseUnackedCreateWithOptions turns down a create that carries options the
+// archive needs and asks for no answer.
+//
+// A collection's options are carried down by promote.MirrorCollection, which
+// runs on the reply to the create. With moreToCome there is no reply, so the
+// archive's copy is left to the feeder's first mirrored insert, and that
+// carries no options at all. MirrorCollection's own failure message already
+// names what that costs: "the archive's copy will be created by the first
+// mirrored insert, with no options, and a collation decides which documents
+// match".
+//
+// Measured before this, create with collation {locale: "en", strength: 2} on a
+// tiered namespace, with a control:
+//
+//	acknowledged     both tiers en/2, and find({name: "ALICE"}) is 1 on both
+//	unacknowledged   fast tier en/2 and the archive none, and the same find is
+//	                 1 on the fast tier and 0 on the archive
+//
+// So the answer depends on which tier answers, and a collation is fixed at
+// creation: it cannot be added to a collection that already holds documents.
+// This is the one in this family that never heals.
+//
+// Only a create that carries something worth carrying is refused. A bare
+// create is let through, because the collection the feeder's first insert
+// makes is the same collection. Which options those are is asked of promote
+// rather than listed again here.
+func (c *conn) refuseUnackedCreateWithOptions(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	if !msg.MoreToCome() {
+		return nil, false
+	}
+	coll, ok := stringField(cmd, "create")
+	if !ok {
+		return nil, false
+	}
+	ns := db + "." + coll
+	if !c.r.cfg.Manages(ns) {
+		return nil, false
+	}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, false
+	}
+	var carried []string
+	for _, e := range elems {
+		k := e.Key()
+		// The command's own name, and the envelope every command carries.
+		// Neither describes the collection.
+		if k == "create" || sessionFields[k] || k == "comment" || k == "maxTimeMS" {
+			continue
+		}
+		if promote.CarriedToTheArchive(k) {
+			carried = append(carried, k)
+		}
+	}
+	if len(carried) == 0 {
+		return nil, false
+	}
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused an unacknowledged create that carries options the archive needs",
+		"ns", ns, "options", carried,
+		"reason", "the archive's copy is created with these options on the reply to this command, and this command has no reply",
+		"effect", "nothing was created; without this the archive would get the collection from the first mirrored insert, with none of them",
+		"action", "send the same create without writeConcern {w: 0}")
+	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this create because "+ns+" is tiered, it carries "+strings.Join(carried, ", ")+
+			", and it asks for no acknowledgement. The archive's copy is created with those options on the reply "+
+			"to this command; without one it would be created by the first mirrored insert carrying none of them, "+
+			"and a collation cannot be added afterwards. Send it without writeConcern {w: 0}.")
 	if rerr != nil {
 		return nil, false
 	}

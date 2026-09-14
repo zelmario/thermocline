@@ -300,6 +300,12 @@ feeder:
     # guarded. Its own collection because the section carries a unique index on
     # both tiers and the checks read exactly which indexes each one has.
     - "shop.tunkx"
+    # testunack.sh: an unacknowledged create. tunkc carries a collation, which
+    # is the option that cannot be added afterwards; tunkb is the bare create
+    # that must still go through, and needs its own collection because the
+    # check is that it was created at all.
+    - "shop.tunkc"
+    - "shop.tunkb"
     # testupsert.sh
     - "shop.tups"
     - "shop.tupsf"
