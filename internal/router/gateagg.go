@@ -33,6 +33,11 @@ func aggregateNeeds(cmd bson.Raw, db string) []authz.Need {
 	}
 
 	var needs []authz.Need
+	// As in the query cache, the walk's completeness answer is discarded
+	// because a pipeline deep enough to make it incomplete is one mongod
+	// refuses. If that ever stops being true this is the worse of the two
+	// places: a collection the walk cannot see is a collection this asks for no
+	// privilege on. See maxSubPipelineDepth.
 	joined, _ := joinedCollections(stages, db, 0)
 	for _, ns := range joined {
 		jdb, jcoll := splitNS(ns)

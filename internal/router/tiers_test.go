@@ -112,3 +112,24 @@ func TestHandshakeCommandsAreNotTimedAsWork(t *testing.T) {
 		t.Errorf("listCollections has been let into NoAuthNeeded, where it can name a collection")
 	}
 }
+
+// The scope walk's depth limit is load-bearing in three places, and only one of
+// them is obvious.
+//
+// The tiering gate refuses a pipeline whose collections it could not all
+// establish, which is the obvious one. The other two discard that answer: the
+// query cache hangs an entry from the collections it found, and the
+// authorization gate asks for a privilege on each of them. Both are safe only
+// because a pipeline deep enough to make the walk incomplete is one mongod
+// refuses with MaxSubPipelineDepthExceeded, so there is no answer to cache and
+// nothing to read.
+//
+// Lower this below mongod's and all three break at once, silently. The last
+// time it was under mongod's, a tiered collection read by a $lookup nested 11
+// deep answered 3 where the archive held 10, with no error.
+func TestScopeWalkKeepsUpWithMongod(t *testing.T) {
+	if maxSubPipelineDepth < mongodSubPipelineDepth {
+		t.Fatalf("the scope walk stops at %d and mongod allows %d, so a pipeline between the two "+
+			"runs with collections nothing here could see", maxSubPipelineDepth, mongodSubPipelineDepth)
+	}
+}

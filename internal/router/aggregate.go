@@ -266,7 +266,21 @@ func joinedCollections(stages []bson.RawValue, db string, depth int) ([]string, 
 
 // maxSubPipelineDepth is mongod's own limit on nested sub-pipelines, which is
 // where this stops looking. See joinedCollections for what reaching it does.
+// maxSubPipelineDepth is mongod's own limit, and it has to stay at or above it.
+//
+// Two callers of joinedCollections discard the "did the walk see everything"
+// answer, and both are safe only because of this number: a pipeline deep enough
+// to make the walk incomplete is one mongod refuses with
+// MaxSubPipelineDepthExceeded, so nothing runs and nothing is answered. Lower
+// it and both become defects at once. The query cache would hang an entry from
+// a list of collections known to be short, and the authorization gate would ask
+// for no privilege on the collections it could not see. See TestScopeWalkKeepsUpWithMongod.
 const maxSubPipelineDepth = 20
+
+// mongodSubPipelineDepth is what 8.0.26 refuses at, measured rather than looked
+// up: a $lookup nested 14 deep runs and 20 says MaxSubPipelineDepthExceeded.
+// test/testquery.sh reaches both sides of it end to end.
+const mongodSubPipelineDepth = 20
 
 // subDoc returns val as a document, or an empty one when it is not.
 func subDoc(val bson.RawValue) bson.Raw {

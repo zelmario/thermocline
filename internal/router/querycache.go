@@ -524,6 +524,10 @@ func (r *Router) cacheDeps(ctx context.Context, name string, cmd bson.Raw, db, n
 	}
 	if name == "aggregate" {
 		if stages, sok := pipelineStages(cmd); sok {
+			// The walk's own "I saw everything" answer is discarded, and that
+			// is safe for one reason: a pipeline deep enough to make it
+			// incomplete is one mongod refuses outright, so there is no answer
+			// to cache. See maxSubPipelineDepth, which is what keeps it true.
 			joined, _ := joinedCollections(stages, db, 0)
 			for _, j := range joined {
 				add(j)
