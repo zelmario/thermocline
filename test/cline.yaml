@@ -341,6 +341,13 @@ feeder:
     # collection because the section needs a namespace no other section has
     # already had the router repair.
     - "shop.tcs5"
+    # testchange.sh: pre-images. The archive holds the collection with
+    # changeStreamPreAndPostImages on and the fast tier holds none of it, so a
+    # client watching with fullDocumentBeforeChange gets its pre-image only if
+    # the option travelled with the copy-up's create. Its own collection,
+    # because turning that option on is a property of the collection and every
+    # other section would then be watching one that has it.
+    - "shop.tcs6"
     # testcache.sh
     - "shop.tcache"
     # testcache.sh again, for the cache across an adoption: the archive holds

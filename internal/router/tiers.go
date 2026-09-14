@@ -718,20 +718,19 @@ func (r *Router) warnAboutOptionDrift(ctx context.Context) {
 			}
 			ns := db + "." + coll
 			r.warnAboutLostConstraint(ctx, ns, db, coll)
-			for _, o := range []struct{ key, cold, hot string }{
-				{"collation", c.collation, h.collation},
-				{"validator", c.validator, h.validator},
-			} {
-				if o.cold == o.hot {
-					continue
+			for _, key := range drifted(c, h) {
+				action := optionAdvice[key]
+				if action == "" {
+					action = "make the two copies the same, or know why they differ"
 				}
 				r.log.Warn("a tiered collection is not the same collection on both tiers",
-					"ns", ns, "option", o.key, "archive", shortOption(o.cold), "fast_tier", shortOption(o.hot),
-					"meaning", "which tier answers decides the answer, and a collation decides which "+
-						"documents match while a validator decides which writes are refused",
-					"action", "for a collation, recreate the fast tier's copy with it, because it cannot "+
-						"be added to a collection that already holds documents; for a validator, collMod "+
-						"the tier that is behind")
+					"ns", ns, "option", key,
+					"archive", shortOption(c[key]), "fast_tier", shortOption(h[key]),
+					"meaning", "which tier answers decides the answer, and this option is part of "+
+						"what the answer is: a collation decides which documents match, a validator "+
+						"which writes are refused, and the rest are carried onto the fast tier's copy "+
+						"when this system creates it and never looked at again",
+					"action", action)
 			}
 		}
 	}
@@ -843,41 +842,105 @@ func uniqueIndexNames(ctx context.Context, client *mongo.Client, db, coll string
 	return out, cur.Err()
 }
 
-type answerAffecting struct{ collation, validator string }
+// collOptions is one collection's options, canonical enough to compare across
+// two servers. Missing is a value like any other, and missing on one tier is
+// the common drift.
+type collOptions map[string]string
 
-// answerOptionsIn reads, for one database, the two collection options whose
-// value changes what a query answers. Missing is a value like any other, and
-// missing on one tier is the common drift.
-func answerOptionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]answerAffecting, error) {
+// serverOwned are the fields listCollections reports that belong to the server
+// rather than to the collection's definition. Two tiers disagreeing about them
+// is not drift, it is two servers.
+var serverOwned = map[string]bool{"idIndex": true, "info": true, "uuid": true, "type": true}
+
+// optionAdvice is what to do about a difference in a particular option. The
+// ones with nothing written here still get reported: the whole point is that a
+// list of the options worth checking silently passes every option nobody
+// thought of, which is the mistake the create path next door had already made
+// once and fixed by inverting its list.
+var optionAdvice = map[string]string{
+	"collation": "recreate the fast tier's copy with it, because a collation cannot be added to a " +
+		"collection that already holds documents",
+	"validator":        "collMod the tier that is behind",
+	"validationLevel":  "collMod the tier that is behind",
+	"validationAction": "collMod the tier that is behind",
+	"changeStreamPreAndPostImages": "collMod the tier that is behind; a client asking for a " +
+		"pre-image is refused outright by the tier that does not have it",
+}
+
+// answerOptionsIn reads, for one database, every collection option that could
+// make the two tiers answer differently.
+//
+// Everything except the fields the server owns, rather than a list of the
+// options this has thought about. That polarity is the whole of it. This used
+// to compare exactly two, collation and validator, while the create path beside
+// it carried every option there is except a deny-list of the ones a tiered
+// collection cannot have. So an option nobody had considered travelled to the
+// fast tier and was never checked again: validationAction is one, and it
+// decides whether a write is refused or merely logged;
+// changeStreamPreAndPostImages is another, and a client asking for a pre-image
+// from the tier that does not have it gets an error rather than an event.
+func answerOptionsIn(ctx context.Context, client *mongo.Client, db string) (map[string]collOptions, error) {
 	cur, err := client.Database(db).ListCollections(ctx, bson.D{})
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	out := map[string]answerAffecting{}
+	out := map[string]collOptions{}
 	for cur.Next(ctx) {
 		name, ok := stringField(cur.Current, "name")
 		if !ok {
 			continue
 		}
-		var a answerAffecting
+		opts := collOptions{}
 		if odoc, dok := cur.Current.Lookup("options").DocumentOK(); dok {
-			if v, lerr := odoc.LookupErr("collation"); lerr == nil {
-				// The server fills a collation out with every default it
-				// implies, and two tiers agreeing on locale and strength agree
-				// for every purpose this warning is about.
-				if doc, ddok := v.DocumentOK(); ddok {
-					a.collation = lookupText(doc, "locale") + "/" + lookupText(doc, "strength")
-				}
+			elems, eerr := odoc.Elements()
+			if eerr != nil {
+				continue
 			}
-			if v, lerr := odoc.LookupErr("validator"); lerr == nil {
-				a.validator = v.String()
+			for _, e := range elems {
+				key := e.Key()
+				if serverOwned[key] {
+					continue
+				}
+				if key == "collation" {
+					// The server fills a collation out with every default it
+					// implies, and two tiers agreeing on locale and strength
+					// agree for every purpose this warning is about.
+					if doc, ddok := e.Value().DocumentOK(); ddok {
+						opts[key] = lookupText(doc, "locale") + "/" + lookupText(doc, "strength")
+						continue
+					}
+				}
+				opts[key] = e.Value().String()
 			}
 		}
-		out[name] = a
+		out[name] = opts
 	}
 	return out, cur.Err()
+}
+
+// drifted names the options two copies of one collection disagree about, in a
+// stable order.
+func drifted(cold, hot collOptions) []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, m := range []collOptions{cold, hot} {
+		for k := range m {
+			if !seen[k] {
+				seen[k] = true
+				keys = append(keys, k)
+			}
+		}
+	}
+	sort.Strings(keys)
+	out := keys[:0]
+	for _, k := range keys {
+		if cold[k] != hot[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 func lookupText(doc bson.Raw, key string) string {

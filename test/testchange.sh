@@ -702,6 +702,74 @@ chk "the application's own index build still arrives"  "1" "$DMINE"
 H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null 2>&1
 
+echo "== a pre-image for a document only the archive ever held =="
+# changeStreamPreAndPostImages appears nowhere in this system: not in the code,
+# not in a suite, not in the documentation. A client that turns it on and asks
+# for fullDocumentBeforeChange: "required" gets an error instead of an event
+# when the pre-image is missing, so it is a shape that either works or breaks an
+# application outright, and nothing here had ever tried it.
+#
+# The case only this system has is a document in the archive that the fast tier
+# does not hold. A write to it copies it up first and then applies, so the fast
+# tier's oplog carries an insert the client never made followed by the write.
+# The sieve hides the insert. The pre-image of the write is then the copy-up's
+# own document, which is the right content by construction -- provided the
+# option travelled with the create the copy-up made, which is the half nothing
+# was checking.
+PINS=tcs6
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$PINS', {changeStreamPreAndPostImages:{enabled:true}});
+   db.getSiblingDB(process.env.TC_DB).$PINS.insertMany([{_id:1,n:'one'},{_id:2,n:'two'},{_id:3,n:'three'}])" >/dev/null
+chk "the archive holds them and the fast tier does not" "3/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$PINS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$PINS.countDocuments({}))")"
+startFeeder; startRouter
+sleep 2
+
+rm -f /tmp/cs_preimg.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$PINS;
+  let cs;
+  // A refusal to open is an answer too, and a different one from an empty
+  // stream: it would mean the option never reached the fast tier at all.
+  try { cs = c.watch([], {fullDocumentBeforeChange:'required'}); }
+  catch (e) { print('open refused: ' + e.codeName); quit(0); }
+  const out = [];
+  try {
+    for (let i = 0; i < 80 && out.length < 2; i++) {
+      const ev = cs.tryNext();
+      if (!ev) { sleep(250); continue; }
+      out.push(ev.operationType + ':' + JSON.stringify(ev.documentKey._id) + ':' +
+               (ev.fullDocumentBeforeChange === undefined ? 'NO-PREIMAGE'
+                                                          : JSON.stringify(ev.fullDocumentBeforeChange)));
+    }
+  } catch (e) { print('stream error: ' + e.codeName); quit(0); }
+  cs.close();
+  print(out.length ? out.join(' | ') : 'none');" > /tmp/cs_preimg.txt 2>&1 &
+PWATCH=$!
+sleep 4
+# Both writes are to documents the fast tier has never held, so both go through
+# the copy-up path.
+R "db.getSiblingDB(process.env.TC_DB).$PINS.updateOne({_id:1},{\$set:{n:'ONE'}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$PINS.deleteOne({_id:2})" >/dev/null
+PEVENTS=$(awaitWatcher /tmp/cs_preimg.txt $PWATCH)
+echo "  the watcher saw: ${PEVENTS:-nothing}"
+chk "the option travelled to the fast tier's copy"     "true" \
+    "$(H "const o=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$PINS'})[0]; print(!!(o&&o.options&&o.options.changeStreamPreAndPostImages&&o.options.changeStreamPreAndPostImages.enabled))")"
+chk "the stream opened and delivered"                  "true" \
+    "$(echo "${PEVENTS:-none}" | grep -qiE "refused|error|none" && echo false || echo true)"
+chk "the update carries the archived document as its pre-image" "true" \
+    "$(echo "$PEVENTS" | grep -q 'update:1:{"_id":1,"n":"one"}' && echo true || echo false)"
+chk "the delete carries it too"                        "true" \
+    "$(echo "$PEVENTS" | grep -q 'delete:2:{"_id":2,"n":"two"}' && echo true || echo false)"
+# And the copy-up's own insert is still hidden. A pre-image is no excuse for
+# telling an application it inserted something it did not.
+chk "no copy-up arrived as an insert"                  "true" \
+    "$(echo "$PEVENTS" | grep -q insert && echo false || echo true)"
+H "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
+
 stopDaemons
 echo
 echo "================================"

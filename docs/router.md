@@ -460,6 +460,18 @@ Range queries are governed by the watermark below.
   and nothing failed. A collation cannot be added to a collection that already
   holds documents, so the fix is to recreate the fast tier's copy; a validator
   can be fixed with `collMod` on whichever tier is behind.
+
+  Every option is compared, not a list of the ones anybody thought of. It used
+  to be exactly two, collation and validator, while the create beside it carried
+  every option there is except a deny-list of the ones a tiered collection
+  cannot have. So an option travelled to the fast tier and was never looked at
+  again: `validationAction` is one, and it decides whether a write is refused or
+  merely logged, and `changeStreamPreAndPostImages` is another, where the tier
+  that does not have it answers a client asking for a pre-image with an error
+  rather than an event. Measured on this cluster, the wider comparison reports
+  one warning where the narrow one reported one, and it is the same genuine
+  collation drift; with a validationAction and a pre-image difference arranged
+  on purpose it reports those too.
 - **A validator applies to what your application writes, not to what moves
   between the tiers.** The fast tier enforces it at the moment of the write, the
   way your cluster always did. What reaches the archive afterwards is a copy of
