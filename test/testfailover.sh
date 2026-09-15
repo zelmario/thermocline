@@ -122,12 +122,22 @@ stopRouter
 H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:100}})" >/dev/null
 startRouter $BASE
 stepDown
+PT0=$(date +%s%N)
 PROXOUT=$(RW "const r=db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$inc:{v:1}}); print('matched='+r.matchedCount)")
+PT1=$(date +%s%N)
 waitForPrimary
 case "$PROXOUT" in
   matched=1) PROXRES=succeeded ;;
   *)         PROXRES=failed ;;
 esac
+# Printed whether it passed or failed, because what this check is really
+# asserting is that the election finished inside the router's 20 second wait,
+# and a bare got=failed says nothing about which half ran out. Measured on a
+# quiet cluster: 10 of 10 succeeded, bimodal at about 700ms and about 10.7s, the
+# slow half being the runs where the wait actually engaged. It has failed once
+# under a full hostsweep, where the box is busy enough for an election plus
+# server selection to cross the bound.
+echo "      the client waited $(( (PT1-PT0)/1000000 ))ms and saw: $PROXOUT"
 chk "a proxied write across a failover finishes"       "succeeded" "$PROXRES"
 # And still without applying anything twice, which is what makes the retry an
 # honest one rather than a silent double.
@@ -139,6 +149,59 @@ chk "and nothing was applied twice"                    "true" \
 # router stayed up.
 chk "a client connecting after it reaches the new primary" "true" \
     "$(RW "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d !== null)")"
+
+echo "== a client's other connections, which were told nothing =="
+# A limitation of proxied authentication, pinned here rather than fixed, because
+# the fix was tried and cost more than it bought.
+#
+# Every client connection has an upstream of its own in that mode, and a refusal
+# ends only the connection that got it. A client with a pool has the rest still
+# pointing at the member that stepped down, and each one has to be refused in
+# turn before anything ends it. A driver retries a write once, so that retry can
+# be spent on a sibling that was always going to fail. Measured with two
+# connections made by one client before the stepDown and the driver's own
+# retries on: five runs out of five left one write applied where two were sent.
+#
+# What was tried: end a connection whose upstream is provably no longer the
+# primary before sending its command, which is what mongod does to the clients
+# of a member that stops being primary. It works, 3 runs of 3, and only because
+# it also ends the driver's *monitoring* connection and forces a topology
+# rescan. Restricted to the commands a demoted member would actually refuse, so
+# that monitoring keeps working, it goes back to 0 runs out of 10. Left
+# unrestricted, it ends the monitor and a write that should pause for an
+# election comes back "MongoServerSelectionError: connection <monitor> closed",
+# which undoes the wait added earlier in this same suite.
+#
+# So the check below records what happens rather than demanding a value. The
+# line that matters is the one after it: whichever way the sibling goes, no
+# write is applied twice.
+stopRouter
+H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:300}})" >/dev/null
+startRouter $BASE
+# Single-quoted at the shell and the namespace passed through the environment,
+# because half of what follows is $-prefixed in two languages at once.
+SIB=$(docker exec -e TCNS="$NS" -e TCHOT="$HOT" $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&retryWrites=true" --quiet --eval '
+  const ns = process.env.TCNS;
+  const uri = "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&retryWrites=true";
+  const a = new Mongo(uri), b = new Mongo(uri);
+  const ca = a.getDB("shop")[ns], cb = b.getDB("shop")[ns];
+  // Both used before anything moves, so both have an upstream of their own.
+  ca.countDocuments({}); cb.countDocuments({});
+  const s = new Mongo(process.env.TCHOT);
+  try { s.getDB("admin").runCommand({replSetStepDown: 20, force: true}) } catch (e) {}
+  sleep(1500);
+  try { ca.updateOne({_id:1},{$inc:{v:1}}) } catch (e) {}
+  let second = "";
+  try { cb.updateOne({_id:1},{$inc:{v:1}}); second = "applied" } catch (e) { second = (e.codeName || "refused") }
+  print(second);' 2>&1 | tail -1)
+waitForPrimary
+echo "      the second connection: $SIB"
+# Either outcome is within the contract. What is not is a write applied twice,
+# which is what this section is really guarding: the fast tier's value is set to
+# 300 above and two increments are sent, so anything over 302 is a replay.
+SIBV=$(H "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?d.v:'MISSING')")
+chk "and nothing was applied twice"                    "true" \
+    "$(awk -v v="$SIBV" 'BEGIN{print (v+0 >= 300 && v+0 <= 302) ? "true" : "false"}')"
 
 echo "== and while the fast tier has no primary at all =="
 # The check above races an election. The driver retries a write once, and if a

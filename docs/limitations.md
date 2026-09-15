@@ -57,6 +57,30 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **With authentication proxied, a client's other connections are each refused
+  once when the primary moves.** Every connection has an upstream of its own in
+  that mode, and the refusal that ends one says nothing to the rest: they stay
+  pointed at the member that stepped down until each is refused in turn. A
+  driver retries a write once, so that retry can be spent on a sibling that was
+  always going to fail. Measured with two connections made by one client before
+  a forced stepDown, with the driver's own retries on: five runs out of five
+  left one write applied where two were sent.
+
+  Fixing it was tried and cost more than it bought, which is why this is written
+  down rather than closed. Ending a connection whose upstream is provably no
+  longer the primary, before its command is sent, does work: three runs out of
+  three. It works because it also ends the driver's *monitoring* connection and
+  forces a topology rescan. Restrict it to the commands a demoted member would
+  actually refuse, so monitoring keeps working, and it goes back to zero runs
+  out of ten. Leave it unrestricted and the monitor goes with it: a write that
+  should pause for an election comes back `MongoServerSelectionError: connection
+  <monitor> closed`, which undoes the wait in the entry above.
+
+  Nothing is lost either way, and `testfailover.sh` checks the part that
+  matters: whichever way the sibling goes, no write is applied twice.
+  `router.terminate_auth` does not have this at all, because the connections are
+  the router's and a re-resolution empties the pool for the old member.
+
 - **A `$text` query fails on the archive rather than running slowly, and so does
   `$geoNear`.** Every other index is a decision about speed and the two tiers are
   allowed to differ. These two are not: mongod refuses a `$text` query with no
