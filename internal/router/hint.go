@@ -187,6 +187,20 @@ func (r *Router) hintPredicate(ctx context.Context, ns string, cmd bson.Raw) (bs
 		return nil, false
 	}
 
+	// A pipeline that starts with $geoNear has nowhere to put a translated
+	// predicate: the stage has to be first, so a $match cannot go in front of
+	// it. Keep the hint and let MongoDB be the authority, exactly as for the
+	// sparse index below that cannot be translated either.
+	//
+	// The alternative was tried. Merging the predicate into $geoNear's own
+	// query made the router answer 2 for a hint the archive refuses outright
+	// with NoQueryExecutionPlans, because a hint naming an index $geoNear
+	// cannot use has no plan. Answering where MongoDB refuses is a
+	// disagreement, and a worse one than an error with the wrong reason on it.
+	if pipelineStartsWithGeoNear(cmd) {
+		return nil, true
+	}
+
 	// A sparse index whose key is not all directions does not follow the
 	// any-field-present rule, so there is nothing honest to write down. Send
 	// the hint instead and let MongoDB be the authority: the archive either
@@ -347,4 +361,22 @@ func allDirections(key []bson.RawElement) bool {
 		}
 	}
 	return true
+}
+
+// pipelineStartsWithGeoNear reports whether an aggregate's first stage is the
+// one that has to be first.
+func pipelineStartsWithGeoNear(cmd bson.Raw) bool {
+	val, err := cmd.LookupErr("pipeline")
+	if err != nil {
+		return false
+	}
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return false
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return false
+	}
+	return startsWithGeoNear(vals)
 }

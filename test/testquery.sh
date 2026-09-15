@@ -886,6 +886,22 @@ chk "which is what an ordinary find says too"          "2" \
 # by the tombstone filter.
 chk "a \$geoNear with its own query keeps it"          "1" \
     "$(R "try{ print(db.getSiblingDB(process.env.TC_DB).$GNS.aggregate([{\$geoNear:{near:{type:'Point',coordinates:[0,0]},distanceField:'d',spherical:true,query:{name:/old/}}}]).toArray().length) }catch(e){ print('FAILED '+(e.codeName||e.message)) }")"
+# And a hint beside it, which is where the fix had its own twin. The router
+# drops a hint the archive may not have an index for and compensates with a
+# predicate, and that predicate is a $match: it has the same nowhere to go.
+#
+# Merging it into $geoNear's own query was tried and is wrong. mongod has no
+# plan for a $geoNear hinted at an index it cannot use, so it refuses with
+# NoQueryExecutionPlans, and the merge made the router answer 2 instead. A
+# disagreement is worse than an error with the wrong reason on it, so the hint
+# is kept and MongoDB is left to be the authority, exactly as it is for a sparse
+# index this cannot translate.
+H "db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({tag:1},{name:'tag_sparse',sparse:true})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({tag:1},{name:'tag_sparse',sparse:true})" >/dev/null
+gnHint() { mongosh "$1" --quiet --eval "try{ print(db.getSiblingDB(process.env.TC_DB).$GNS.aggregate($GEO,{hint:'tag_sparse'}).toArray().length) }catch(e){ print('FAILED '+(e.codeName||e.message)) }" 2>&1 | tail -1; }
+GNHR=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "try{ print(db.getSiblingDB(process.env.TC_DB).$GNS.aggregate($GEO,{hint:'tag_sparse'}).toArray().length) }catch(e){ print('FAILED '+(e.codeName||e.message)) }" 2>&1 | tail -1)
+chk "a hinted \$geoNear gets the archive's own answer"  "$(gnHint "$COLD")" "$GNHR"
+chk "and that answer is mongod's refusal, not ours"    "FAILED NoQueryExecutionPlans" "$GNHR"
 kill $GFP 2>/dev/null; wait $GFP 2>/dev/null
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
