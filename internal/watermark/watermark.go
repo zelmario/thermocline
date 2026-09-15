@@ -51,6 +51,24 @@ type Mark struct {
 	// anything has warmed, and dropping the number then would leave the other
 	// routers on their old listing for the full minute.
 	IndexGen int64
+
+	// Dimension is the field the claim was measured in, and Measured says
+	// whether the row recorded one at all.
+	//
+	// "The fast tier holds every live document newer than From" is only a
+	// statement once you know what newer means. It is measured in the field the
+	// rules tier by, and until this was recorded the row carried the instant
+	// alone: change a rule's date_field and every existing claim is re-read in a
+	// dimension it was never made in. Measured on twenty orders whose shippedAt
+	// is thirty days after their createdAt, claimed complete from 15 January in
+	// createdAt: with the field changed to shippedAt the router answered 6 where
+	// the archive holds 20, and reported success.
+	//
+	// Measured is false for rows written before this existed. Those are used as
+	// they always were, because refusing every claim on an upgrade would be a
+	// worse failure than the one being fixed, and the next write stamps them.
+	Dimension string
+	Measured  bool
 }
 
 // Complete reports whether a query reaching back to bound can be answered from
@@ -151,7 +169,13 @@ func markOf(raw bson.Raw, ns string) (Mark, error) {
 		return Mark{}, fmt.Errorf("watermark for %s: completeFrom is %s, not a date",
 			ns, v.Type.String())
 	}
-	return Mark{From: t.UTC(), Claimed: true, IndexGen: gen}, nil
+	m := Mark{From: t.UTC(), Claimed: true, IndexGen: gen}
+	if d, derr := raw.LookupErr("dimension"); derr == nil {
+		if name, ok := d.StringValueOK(); ok {
+			m.Dimension, m.Measured = name, true
+		}
+	}
+	return m, nil
 }
 
 // BumpIndexGen records that this namespace's unique indexes have changed.
@@ -241,11 +265,12 @@ func (s *Store) All(ctx context.Context) (map[string]Mark, error) {
 
 // Set records completeness unconditionally. Used by the warmer, which knows
 // exactly how far it has filled.
-func (s *Store) Set(ctx context.Context, ns string, from time.Time) error {
+func (s *Store) Set(ctx context.Context, ns string, from time.Time, dimension string) error {
 	_, err := s.coll.UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: ns}},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "completeFrom", Value: from.UTC()},
+			{Key: "dimension", Value: dimension},
 			{Key: "updatedAt", Value: time.Now().UTC()},
 		}}},
 		options.UpdateOne().SetUpsert(true))
@@ -278,7 +303,7 @@ func (s *Store) Set(ctx context.Context, ns string, from time.Time) error {
 // The claim belongs to whatever put documents there: the warmer, which knows
 // how far back it filled, or an operator who has checked, with
 // `cline watermark --complete-all`.
-func (s *Store) RaiseTo(ctx context.Context, ns string, from time.Time) (bool, error) {
+func (s *Store) RaiseTo(ctx context.Context, ns string, from time.Time, dimension string) (bool, error) {
 	res, err := s.coll.UpdateOne(ctx,
 		bson.D{
 			{Key: "_id", Value: ns},
@@ -286,6 +311,7 @@ func (s *Store) RaiseTo(ctx context.Context, ns string, from time.Time) (bool, e
 		},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "completeFrom", Value: from.UTC()},
+			{Key: "dimension", Value: dimension},
 			{Key: "updatedAt", Value: time.Now().UTC()},
 		}}})
 	if err != nil {

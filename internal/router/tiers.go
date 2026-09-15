@@ -373,6 +373,27 @@ func (r *Router) completenessClaim(ctx context.Context, ns string) (watermark.Ma
 		r.log.Warn("could not read the completeness watermark", "ns", ns, "err", err)
 		return watermark.Mark{}, false, false
 	}
+	// A claim measured in one field and read in another is not a claim about
+	// anything. The row records which field it was made in, and if that is not
+	// the field this namespace ages by now, the claim is withdrawn rather than
+	// reinterpreted: reads fall through to the archive, which is the answer they
+	// would have had before anybody claimed anything.
+	//
+	// Measured on twenty orders whose shippedAt is thirty days after their
+	// createdAt, claimed complete from 15 January in createdAt: with the rule's
+	// date_field changed to shippedAt, the router answered 6 where the archive
+	// holds 20, and reported success.
+	//
+	// Only when the row says. Rows written before the field was recorded are
+	// used exactly as they were, because refusing every claim on an upgrade is a
+	// worse failure than the one this prevents, and the next write stamps them.
+	if mark.Claimed && mark.Measured {
+		if want, ok := r.cfg.AgeField(ns); ok && want != mark.Dimension {
+			r.warnClaimDimension(ns, mark.Dimension, want)
+			mark = watermark.Mark{IndexGen: mark.IndexGen}
+		}
+	}
+
 	entry := watermarkEntry{mark: mark, known: true, fetched: time.Now()}
 
 	// Another router changed this namespace's unique indexes, so the listing
@@ -431,6 +452,75 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 			"meaning", "range queries will be refused, because nothing has claimed the fast tier is complete",
 			"action", "run the warmer, or declare it with: cline watermark --ns NS --complete-all")
 	}
+}
+
+// warnAboutArchiveWithoutHistory says so when this archive has no record of
+// mirroring while the fast tier already holds tiered data.
+//
+// The archive is where the checkpoint lives, so the archive is what remembers
+// that this deployment has ever mirrored into it. A fast tier holding documents
+// for a tiered namespace, against an archive that has never heard of the
+// feeder, is a pair that has not been working together, and there are only
+// three ways to be in it.
+//
+// The third is the one nothing else catches. `cold.uri` can be repointed at a
+// different cluster by a typo, a config copied from another environment, or a
+// DNS name that now resolves somewhere else, and the router will serve whatever
+// that cluster happens to hold. Measured on two archives with a collection of
+// the same name in each: ten documents mirrored into the first, then the URI
+// changed to the second and everything restarted. A client counted four and
+// read "another environment" out of a collection its own archive holds ten real
+// documents in. The only line in the log was "no completeness watermarks
+// recorded", which a fresh deployment prints too.
+//
+// Nothing records the pairing, and the checkpoint is the nearest thing to a
+// record there is: it is written by this deployment, into this archive, under
+// this feeder's id.
+func (r *Router) warnAboutArchiveWithoutHistory(ctx context.Context) {
+	id := r.cfg.FeederID
+	if id == "" {
+		return
+	}
+	n, err := r.cold.Database(meta.DB).Collection(meta.Checkpoints).
+		CountDocuments(ctx, bson.D{{Key: "_id", Value: id}}, options.Count().SetLimit(1))
+	if err != nil || n > 0 {
+		return
+	}
+
+	// Only worth saying if the fast tier has something to have mirrored. A
+	// deployment that has not started yet has neither, and an adoption has a
+	// full archive and an empty fast tier, so neither of those lands here.
+	var holding []string
+	for db, colls := range r.tieredByDatabase(ctx) {
+		for _, coll := range colls {
+			c, cerr := r.hot.Database(db).Collection(coll).EstimatedDocumentCount(ctx)
+			if cerr != nil || c == 0 {
+				continue
+			}
+			holding = append(holding, db+"."+coll)
+			if len(holding) >= 5 {
+				break
+			}
+		}
+		if len(holding) >= 5 {
+			break
+		}
+	}
+	if len(holding) == 0 {
+		return
+	}
+	sort.Strings(holding)
+
+	r.log.Warn("this archive has no record of mirroring, and the fast tier already holds tiered data",
+		"feeder_id", id,
+		"collections", holding,
+		"meaning", "the checkpoint is written by this deployment into this archive under this "+
+			"feeder's id, and there is none, so this pair has not been working together",
+		"action", "check cold.uri names the archive this deployment has been using, and feeder.id "+
+			"the id it has been using; if both are right then the feeder has simply never run",
+		"why", "an archive repointed at another cluster serves that cluster's data, and nothing "+
+			"else here would notice: measured, a client read another environment's documents "+
+			"out of a collection of the same name")
 }
 
 // warnAboutPartlyStrandedCollections names collections the archive holds more of
@@ -1602,4 +1692,34 @@ func isSystemDatabase(name string) bool {
 		return true
 	}
 	return false
+}
+
+// warnClaimDimension says once per namespace that a claim was made in a field
+// this namespace no longer ages by.
+func (r *Router) warnClaimDimension(ns, was, now string) {
+	r.dimSaidMu.Lock()
+	said := r.dimSaid[ns]
+	if r.dimSaid == nil {
+		r.dimSaid = map[string]string{}
+	}
+	r.dimSaid[ns] = was + "\x00" + now
+	r.dimSaidMu.Unlock()
+	if said == was+"\x00"+now {
+		return
+	}
+	name := func(f string) string {
+		if f == "" {
+			return "the timestamp in the _id"
+		}
+		return f
+	}
+	r.log.Warn("a completeness claim was measured in a field this namespace no longer ages by",
+		"ns", ns, "claim_measured_in", name(was), "rules_now_age_by", name(now),
+		"meaning", "the claim says the fast tier holds every document newer than an instant, and "+
+			"newer means something else now, so the claim has been withdrawn rather than read "+
+			"in a dimension it was never made in",
+		"effect", "reads of this namespace fall through to the archive until something claims it "+
+			"again, which is the answer they would have had before anybody claimed anything",
+		"action", "let the warmer claim it again in the new field, or declare it with "+
+			"cline watermark once you have checked what the fast tier holds")
 }

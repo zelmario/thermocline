@@ -521,6 +521,84 @@ C "db.getSiblingDB(process.env.TC_DB).$WSNS.drop()" >/dev/null 2>&1
 
 echo
 echo "================================"
+echo "== a claim read in a field it was not made in =="
+# A claim says the fast tier holds every live document newer than an instant,
+# and newer is measured in the field the rules tier by. The row used to record
+# the instant alone, so changing a rule's date_field re-read every existing
+# claim in a dimension it was never made in.
+#
+# Measured on twenty orders whose shippedAt is thirty days after their
+# createdAt, claimed complete from 15 January in createdAt: with date_field
+# changed to shippedAt the router answered 6 where the archive holds 20, and
+# reported success. One line in a config file.
+DNS=tevdim
+JAN15='new Date(Date.UTC(2025,0,15))'
+pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null; sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "const c=db.getSiblingDB(process.env.TC_DB).$DNS; const day=24*60*60*1000;
+   for (let i=1;i<=20;i++) c.insertOne({_id:i,createdAt:new Date(Date.UTC(2025,0,i)),shippedAt:new Date(Date.UTC(2025,0,i)+30*day)});" >/dev/null
+H "const c=db.getSiblingDB(process.env.TC_DB).$DNS; const day=24*60*60*1000;
+   for (let i=15;i<=20;i++) c.insertOne({_id:i,createdAt:new Date(Date.UTC(2025,0,i)),shippedAt:new Date(Date.UTC(2025,0,i)+30*day)});" >/dev/null
+# The claim the warmer would have written, stamped with the field it was made in.
+C "db.getSiblingDB(process.env.TC_META).watermarks.replaceOne({_id:'$DB.$DNS'},
+    {_id:'$DB.$DNS',completeFrom:$JAN15,dimension:'createdAt'},{upsert:true})" >/dev/null
+# Appended to the evictor's existing rules rather than starting a second
+# "rules:" key, which yaml refuses and which is how this section first failed.
+mkdim() {
+  awk -v f="$1" -v ns="$DB.$DNS" '
+    /^evictor:/ { inev = 1 }
+    /^[a-z]/ && !/^evictor:/ { inev = 0 }
+    { print }
+    inev && /^  rules:/ && !done { print "    - ns: \"" ns "\""; print "      older_than: 40m"; print "      date_field: \"" f "\""; done = 1 }
+  ' $CFG > $WDIR/dim_$1.yaml
+}
+mkdim createdAt; mkdim shippedAt
+askdim() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval "print(db.getSiblingDB(process.env.TC_DB).$DNS.countDocuments({$1:{\$gte:$JAN15}}))" 2>&1 | tail -1; }
+
+rm -f $LOGDIR/dim_r.log
+cline router --config $WDIR/dim_createdAt.yaml --log-file $LOGDIR/dim_r.log & DRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "in its own field the claim is used"               "6" "$(askdim createdAt)"
+kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
+
+rm -f $LOGDIR/dim2_r.log
+cline router --config $WDIR/dim_shippedAt.yaml --log-file $LOGDIR/dim2_r.log & DRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+# The archive's own answer, which is what the client must get.
+chk "in another field the archive answers"             "20" "$(askdim shippedAt)"
+chk "and the router said the claim was withdrawn"      "true" \
+    "$(grep -q 'measured in a field this namespace no longer ages by' $LOGDIR/dim2_r.log && echo true || echo false)"
+chk "naming both fields"                               "true" \
+    "$(grep 'no longer ages by' $LOGDIR/dim2_r.log | grep -q 'createdAt' && grep 'no longer ages by' $LOGDIR/dim2_r.log | grep -q 'shippedAt' && echo true || echo false)"
+kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
+
+# A row written before the field was recorded has to work exactly as it did, or
+# every deployment loses its claims on upgrade.
+C "db.getSiblingDB(process.env.TC_META).watermarks.replaceOne({_id:'$DB.$DNS'},
+    {_id:'$DB.$DNS',completeFrom:$JAN15},{upsert:true})" >/dev/null
+rm -f $LOGDIR/dim3_r.log
+cline router --config $WDIR/dim_createdAt.yaml --log-file $LOGDIR/dim3_r.log & DRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a claim with no field recorded is still used"     "6" "$(askdim createdAt)"
+chk "and nothing is withdrawn for it"                  "0" \
+    "$(grep -c 'no longer ages by' $LOGDIR/dim3_r.log)"
+kill $DRP 2>/dev/null; wait $DRP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$DNS'})" >/dev/null
+
+
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
 exit $FAIL

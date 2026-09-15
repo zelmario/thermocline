@@ -52,11 +52,11 @@ func TestRaiseToNeverOverstatesCompleteness(t *testing.T) {
 	warmedBackTo := time.Date(2025, 10, 17, 0, 0, 0, 0, time.UTC)
 	evictionBoundary := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 
-	if err := s.Set(ctx, testNS, warmedBackTo); err != nil {
+	if err := s.Set(ctx, testNS, warmedBackTo, ""); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	raised, err := s.RaiseTo(ctx, testNS, evictionBoundary)
+	raised, err := s.RaiseTo(ctx, testNS, evictionBoundary, "")
 	if err != nil {
 		t.Fatalf("RaiseTo: %v", err)
 	}
@@ -84,10 +84,10 @@ func TestRaiseToIsOneWay(t *testing.T) {
 	later := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 	earlier := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 
-	if err := s.Set(ctx, testNS, later); err != nil {
+	if err := s.Set(ctx, testNS, later, ""); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	raised, err := s.RaiseTo(ctx, testNS, earlier)
+	raised, err := s.RaiseTo(ctx, testNS, earlier, "")
 	if err != nil {
 		t.Fatalf("RaiseTo: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestRaiseToDoesNotCreateAClaim(t *testing.T) {
 	ctx := context.Background()
 
 	boundary := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
-	raised, err := s.RaiseTo(ctx, testNS, boundary)
+	raised, err := s.RaiseTo(ctx, testNS, boundary, "")
 	if err != nil {
 		t.Fatalf("RaiseTo: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestClearWithdrawsTheClaim(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if err := s.Set(ctx, testNS, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+	if err := s.Set(ctx, testNS, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), ""); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
 	when := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 
 	for _, ns := range []string{"shop.orders", "shop.events", "shopping.orders", "warehouse.stock"} {
-		if err := s.Set(ctx, ns, when); err != nil {
+		if err := s.Set(ctx, ns, when, ""); err != nil {
 			t.Fatalf("Set %s: %v", ns, err)
 		}
 	}

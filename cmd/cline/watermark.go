@@ -125,7 +125,7 @@ func runWatermark(args []string) error {
 		if err := verify(time.Time{}); err != nil {
 			return err
 		}
-		if err := marks.Set(ctx, *ns, time.Time{}); err != nil {
+		if err := marks.Set(ctx, *ns, time.Time{}, cfg.Router.TieredBy[*ns]); err != nil {
 			return err
 		}
 		fmt.Printf("%s is declared complete for all of history\n", *ns)
@@ -140,7 +140,7 @@ func runWatermark(args []string) error {
 		if err := verify(from.UTC()); err != nil {
 			return err
 		}
-		if err := marks.Set(ctx, *ns, from.UTC()); err != nil {
+		if err := marks.Set(ctx, *ns, from.UTC(), cfg.Router.TieredBy[*ns]); err != nil {
 			return err
 		}
 		fmt.Printf("%s is declared complete for everything newer than %s\n",

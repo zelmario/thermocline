@@ -447,7 +447,7 @@ func (f *Feeder) Run(ctx context.Context) error {
 // to hold everything, and here it does not.
 func (f *Feeder) warnAboutUnmirrorableHead(ctx context.Context) {
 	var stranded []string
-	for _, ns := range f.cfg.Namespaces {
+	for _, ns := range f.namespacesToCheck(ctx) {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
 			continue
@@ -472,7 +472,41 @@ func (f *Feeder) warnAboutUnmirrorableHead(ctx context.Context) {
 			"fast tier, which is the other direction; nothing here reads the fast tier's history",
 		"effect", "the archive is not the complete copy the rest of this system assumes, though nothing "+
 			"is lost: the evictor never removes a document the archive does not hold",
-		"action", "copy these collections into the archive before relying on it, then restart the feeder")
+		"action", "cline backfill --ns NS --apply copies them, and can be run with this feeder "+
+			"still going: it carries what happens next while the copy brings what was already there")
+}
+
+// namespacesToCheck is what this feeder mirrors, spelled out.
+//
+// An empty feeder.namespaces mirrors everything, and reading the list gives
+// "nothing" for it, so the warning above said nothing at all for the deployment
+// that tiers the most. The fast tier is the side to enumerate here because the
+// question is what it holds that the archive has none of.
+func (f *Feeder) namespacesToCheck(ctx context.Context) []string {
+	if len(f.cfg.Namespaces) > 0 {
+		return f.cfg.Namespaces
+	}
+	dbs, err := f.hot.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, db := range dbs {
+		if db == "admin" || db == "local" || db == "config" || db == meta.DB {
+			continue
+		}
+		names, lerr := f.hot.Database(db).ListCollectionNames(ctx, bson.D{})
+		if lerr != nil {
+			continue
+		}
+		for _, name := range names {
+			if !strings.HasPrefix(name, "system.") {
+				out = append(out, db+"."+name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runOnce opens a stream and pumps it until it fails or ctx ends.

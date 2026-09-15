@@ -421,6 +421,48 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== an archive with no record of this deployment mirroring into it =="
+# The archive holds the checkpoint, so the archive is what remembers that this
+# deployment has ever mirrored into it. A fast tier holding tiered data against
+# an archive that has never heard of the feeder is a pair that has not been
+# working together, and one of the three ways to be in it is the one nothing
+# else catches: cold.uri repointed at a different cluster.
+#
+# Measured on two archives with a collection of the same name in each: ten
+# documents mirrored into the first, then the URI changed to the second. A client
+# counted four and read "another environment" out of a collection its own archive
+# holds ten real documents in, and the only line in the log was "no completeness
+# watermarks recorded", which a fresh deployment prints too.
+#
+# Reproduced here with a feeder id nothing has checkpointed under, which is the
+# same state and disturbs no other suite's bookkeeping.
+sed 's|^  id: .*|  id: "nohistory"|' $CFG > $WDIR/cline_nohist.yaml
+H "db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({})" >/dev/null 2>&1
+rm -f $LOGDIR/nohist_r.log
+cline router --config $WDIR/cline_nohist.yaml --log-file $LOGDIR/nohist_r.log & NP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $NP 2>/dev/null; wait $NP 2>/dev/null
+chk "the router says the archive has no record of it"  "true" \
+    "$(grep -q 'this archive has no record of mirroring' $LOGDIR/nohist_r.log && echo true || echo false)"
+chk "and names the feeder id it looked for"            "true" \
+    "$(grep 'this archive has no record of mirroring' $LOGDIR/nohist_r.log | grep -q 'nohistory' && echo true || echo false)"
+# And the control that keeps it from being a line on every start: the id the
+# suites actually use has a checkpoint, so nothing is said.
+rm -f $LOGDIR/hist_r.log
+cline router --config $CFG --log-file $LOGDIR/hist_r.log & HP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $HP 2>/dev/null; wait $HP 2>/dev/null
+chk "and says nothing when the checkpoint is there"    "false" \
+    "$(grep -q 'this archive has no record of mirroring' $LOGDIR/hist_r.log && echo true || echo false)"
+
 echo "== a collection the archive holds more of, that nothing tiers =="
 # The stranded report above is the all-or-nothing form: a collection the fast
 # tier has never held. It skips one the fast tier has, and having some of a

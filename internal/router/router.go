@@ -71,6 +71,11 @@ type Router struct {
 	// on the fast tier alone, so a client that rebuilds one produces one line.
 	fastOnlyMu      sync.Mutex
 	fastOnlyIndexes map[string]bool
+	// dimSaid remembers which namespaces have been reported for a claim made in
+	// a field they no longer age by, so a config left that way does not fill the
+	// log on every claim read.
+	dimSaidMu sync.Mutex
+	dimSaid   map[string]string
 	// primaryProbeAt throttles re-resolving after a refusal. Every command in
 	// flight when a primary steps down comes back refused the same way, and one
 	// lookup answers all of them. primaryProbing is non-nil while one is
@@ -345,6 +350,7 @@ func (r *Router) Survey(ctx context.Context) error {
 	r.warnAboutStrandedCollections(ctx)
 	r.warnAboutUnarchivedCollections(ctx)
 	r.warnAboutPartlyStrandedCollections(ctx)
+	r.warnAboutArchiveWithoutHistory(ctx)
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
@@ -480,6 +486,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutStrandedCollections(ctx)
 	r.warnAboutUnarchivedCollections(ctx)
 	r.warnAboutPartlyStrandedCollections(ctx)
+	r.warnAboutArchiveWithoutHistory(ctx)
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)

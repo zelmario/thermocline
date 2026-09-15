@@ -894,7 +894,7 @@ func (e *Evictor) narrowClaims(ctx context.Context, boundaries map[string]time.T
 		if !ok {
 			continue
 		}
-		raised, err := e.marks.RaiseTo(ctx, rule.NS, boundary)
+		raised, err := e.marks.RaiseTo(ctx, rule.NS, boundary, rule.DateField)
 		if err != nil {
 			return err
 		}

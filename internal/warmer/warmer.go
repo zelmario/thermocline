@@ -519,7 +519,7 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, err
 		}
 		if !w.dryRun {
-			if err := w.marks.Set(ctx, rule.NS, watermarkAfter(oldest)); err != nil {
+			if err := w.marks.Set(ctx, rule.NS, watermarkAfter(oldest), rule.DateField); err != nil {
 				return stats, err
 			}
 		}
@@ -866,7 +866,7 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 		if !w.stillHolds(ctx, rule, time.Time{}) {
 			return nil
 		}
-		if err := w.marks.Set(ctx, rule.NS, time.Time{}); err != nil {
+		if err := w.marks.Set(ctx, rule.NS, time.Time{}, rule.DateField); err != nil {
 			return err
 		}
 		w.log.Info("complete for all of history", "ns", rule.NS,
@@ -878,7 +878,7 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 	if !w.stillHolds(ctx, rule, floor) {
 		return nil
 	}
-	if err := w.marks.Set(ctx, rule.NS, floor); err != nil {
+	if err := w.marks.Set(ctx, rule.NS, floor, rule.DateField); err != nil {
 		return err
 	}
 	w.log.Info("complete", "ns", rule.NS, "complete_from", floor.Format(time.RFC3339),

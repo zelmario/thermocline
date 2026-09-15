@@ -57,6 +57,25 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **A completeness claim records which field it was measured in, because
+  changing that field re-reads every claim in a dimension it was never made in.**
+  "The fast tier holds every live document newer than this instant" is only a
+  statement once you know what newer means, and it means the field the rules
+  tier by. The row carried the instant alone.
+
+  Measured on twenty orders whose `shippedAt` is thirty days after their
+  `createdAt`, claimed complete from 15 January in `createdAt`: with the rule's
+  `date_field` changed to `shippedAt`, the router answered 6 where the archive
+  holds 20, and reported success. One line in a config file.
+
+  A claim measured in a field the namespace no longer ages by is withdrawn
+  rather than reinterpreted, so reads fall through to the archive, which is the
+  answer they would have had before anybody claimed anything. The router says so
+  once per namespace, naming both fields. Rows written before the field was
+  recorded carry none, and are used exactly as they were: refusing every claim on
+  an upgrade would be a worse failure than the one this prevents, and the next
+  write stamps them.
+
 - **Taking a namespace out of `feeder.namespaces` hides everything only the
   archive holds.** The mirror image of tiering one, and the archive is the side
   with the years of it. A collection this system does not tier is the fast
@@ -113,6 +132,26 @@ Part of [Thermocline](../README.md).
   What it cannot do is invent the claim. A namespace nothing has claimed gets
   the copy and no marking, and says so, because without a claim there is no
   range in which absence means anything.
+
+- **Nothing records which archive a deployment has been using.** `cold.uri` can
+  be repointed at a different cluster by a typo, a config copied from another
+  environment, or a DNS name that now resolves somewhere else, and the router
+  will serve whatever that cluster happens to hold. Measured on two archives
+  with a collection of the same name in each: ten documents mirrored into the
+  first, then the URI changed to the second. A client counted four and read
+  "another environment" out of a collection its own archive holds ten real
+  documents in.
+
+  The checkpoint is the nearest thing to a record of the pairing: it is written
+  by this deployment, into this archive, under this feeder's id. A fast tier
+  holding tiered data against an archive with no checkpoint for that id is a
+  pair that has not been working together, and the router says so at startup,
+  naming the id and the collections. Three things put a deployment in that state
+  and the line names all three: the feeder has never run, `feeder.id` changed, or
+  `cold.uri` points somewhere else.
+
+  It is a warning and not a refusal, because the first of those three is an
+  ordinary first start.
 
 - **`feeder.namespaces` empty tiers everything, and several checks read the list
   rather than asking what that means.** The configuration says so plainly and
