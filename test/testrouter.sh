@@ -421,6 +421,42 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== a collection the archive holds more of, that nothing tiers =="
+# The stranded report above is the all-or-nothing form: a collection the fast
+# tier has never held. It skips one the fast tier has, and having some of a
+# collection is not having it.
+#
+# One config line is the way in. Take a namespace out of feeder.namespaces and
+# it stops being tiered, so it becomes the fast tier's alone by definition and
+# the archive's copy stops being read. Measured on fifty documents with the fast
+# tier holding the most recent ten: tiered, a client counted fifty and read the
+# oldest; untiered, it counted ten and the oldest was missing, with nothing said
+# anywhere.
+PNS=tpartly
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$PNS.insertMany(Array.from({length:3},(_,i)=>({_id:i+41,v:'recent'})))" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$PNS.insertMany(Array.from({length:20},(_,i)=>({_id:i+24,v:'all of it'})))" >/dev/null
+rm -f $LOGDIR/partly_r.log
+cline router --config $CFG --log-file $LOGDIR/partly_r.log & PP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+# Nothing tiers it, so the fast tier's three are the whole of what a client sees.
+chk "a client sees the fast tier's part alone"         "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$PNS.countDocuments({}))")"
+chk "while the archive holds twenty"                   "20" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$PNS.countDocuments({}))")"
+kill $PP 2>/dev/null; wait $PP 2>/dev/null
+chk "the router named it at startup"                   "true" \
+    "$(grep -q 'the archive holds more of these collections than the fast tier' $LOGDIR/partly_r.log && echo true || echo false)"
+chk "with both counts, so the size of it is visible"   "true" \
+    "$(grep 'holds more of these collections' $LOGDIR/partly_r.log | grep -q "$DB.$PNS (3 of 20)" && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+
 echo "== a collection whose name has a dot in it =="
 # Legal, ordinary, and untried until now. Every namespace split in this codebase
 # cuts on the *first* dot, which is what makes "shop.tns.dotted" the collection

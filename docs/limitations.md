@@ -57,6 +57,23 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **Taking a namespace out of `feeder.namespaces` hides everything only the
+  archive holds.** The mirror image of tiering one, and the archive is the side
+  with the years of it. A collection this system does not tier is the fast
+  tier's alone by definition, so the archive's copy stops being read the moment
+  the line goes.
+
+  Measured on fifty documents with the fast tier holding the most recent ten:
+  tiered, a client counted fifty and read the oldest one; untiered and the router
+  restarted, it counted ten and the oldest was missing. Nothing was said
+  anywhere, because the stranded report is the all-or-nothing form of this
+  question and skips a collection the fast tier has: having some of a collection
+  and having it are not the same thing.
+
+  The router now names it with both counts, as `shop.orders (10 of 50)`. It
+  cannot refuse the configuration, because a collection the fast tier holds in
+  full and the archive also has is a perfectly ordinary state to untier from.
+
 - **Tiering a collection that already has data hides it until the archive has a
   copy.** Adding a namespace to `feeder.namespaces` is an ordinary operation and
   this is what it does: the feeder is a change stream, so it mirrors what

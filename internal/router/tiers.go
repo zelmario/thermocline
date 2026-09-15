@@ -433,6 +433,75 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 	}
 }
 
+// warnAboutPartlyStrandedCollections names collections the archive holds more of
+// than the fast tier and that nothing tiers.
+//
+// warnAboutStrandedCollections is the all-or-nothing form of this and catches
+// the adoption shape: a collection the fast tier has never held at all. It skips
+// a collection the fast tier has, and that is the case this covers, because
+// having some of a collection and having it are not the same thing.
+//
+// The way in is one config line. Take a namespace out of `feeder.namespaces`
+// and the collection stops being tiered, so it becomes the fast tier's alone by
+// definition and the archive's copy stops being read. Measured on fifty
+// documents with the fast tier holding the most recent ten: tiered, a client
+// counted fifty and read the oldest; untiered, it counted ten and the oldest was
+// missing. Nothing was said anywhere.
+//
+// Estimated counts, because the question is whether one side has much more of it
+// and an exact answer would cost a scan of the archive. Only for collections
+// both tiers hold and nothing tiers, which on an ordinary deployment is a short
+// list: an untiered collection is normally the fast tier's alone.
+func (r *Router) warnAboutPartlyStrandedCollections(ctx context.Context) {
+	var short []string
+	for _, db := range r.archiveDatabases(ctx) {
+		// This system's own bookkeeping is not an application's data, and
+		// another deployment's is not either. The stranded report makes the
+		// same exclusion for the same reason.
+		if db == meta.DB {
+			continue
+		}
+		cold, cerr := collectionsIn(ctx, r.cold, db)
+		hot, herr := collectionsIn(ctx, r.hot, db)
+		if cerr != nil || herr != nil {
+			continue
+		}
+		if meta.IsBookkeeping(collectionNames(cold)) {
+			continue
+		}
+		for name, kind := range cold {
+			ns := db + "." + name
+			if kind != "collection" || hot[name] != "collection" {
+				continue
+			}
+			if r.cfg.Manages(ns) || strings.HasPrefix(name, "system.") || meta.IsScratch(name) {
+				continue
+			}
+			inCold, err := r.cold.Database(db).Collection(name).EstimatedDocumentCount(ctx)
+			if err != nil || inCold == 0 {
+				continue
+			}
+			inHot, err := r.hot.Database(db).Collection(name).EstimatedDocumentCount(ctx)
+			if err != nil || inHot >= inCold {
+				continue
+			}
+			short = append(short, fmt.Sprintf("%s (%d of %d)", ns, inHot, inCold))
+		}
+	}
+	if len(short) == 0 {
+		return
+	}
+	sort.Strings(short)
+	r.log.Warn("the archive holds more of these collections than the fast tier, and nothing tiers them",
+		"collections", short,
+		"meaning", "a collection this system does not tier is the fast tier's alone, so the "+
+			"archive's copy is never read and the application sees only the part the fast tier has",
+		"action", "put them back in feeder.namespaces if they should be tiered; if they should not, "+
+			"copy the archive's copy onto the fast tier before anything reads them",
+		"why", "taking a namespace out of feeder.namespaces does this, and it is one line in a "+
+			"config file away")
+}
+
 // tieredNamespaces is every namespace this router tiers, as "db.coll".
 //
 // The list in the configuration when there is one, and the archive's own
