@@ -444,6 +444,18 @@ because a document quietly removed from a collection breaks no invariant about
 the documents that remain. What caught it was comparing every answer against the
 archive, which is what `test/pilot` does.
 
+**15b. Tiering another collection later needs `cline backfill`.** Adding a
+namespace to `feeder.namespaces` tells the feeder to mirror what happens next.
+What is already on the fast tier it never sees, and a tiered namespace with no
+completeness claim is read from the archive, so those documents stop being
+returned. Measured on twenty: the fast tier held twenty one, the archive held
+the one written after the edit, and a client read the one.
+
+Add it, start the feeder, then `cline backfill --ns db.coll --apply`. That order
+has no window in it: the feeder carries the new writes while the copy brings the
+old ones. The router also names the collection at its next start, under "the
+fast tier holds tiered collections the archive does not".
+
 **16. Check the tiers agree, with `cline indexes`.** It reports both directions:
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.

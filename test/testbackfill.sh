@@ -117,9 +117,25 @@ chk "and mark the one that was deleted"               "true" \
 chk "and wrote nothing while saying so"               "first" \
     "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:1}); print(d?d.v:"absent")')"
 
+echo "== the step after the copy, which had no command behind it =="
+# Refused after --ns, because the checkpoint is not per namespace: clearing it
+# then would restart mirroring from now for every other namespace too, sealing
+# in whatever hole they have.
+ONE=$("$BIN" backfill --config "$DIR/bf.yaml" --ns shop.orders --apply --clear-checkpoint 2>&1)
+chk "clearing the checkpoint is refused after --ns"   "true" \
+    "$(grep -q 'not per namespace' <<<"$ONE" && echo true || echo false)"
+chk "and the checkpoint is still there"               "1" \
+    "$(M $COLDPORT 'print(db.getSiblingDB("_thermocline").checkpoints.countDocuments({_id:"bf"}))')"
+
 echo "== and then applied =="
-"$BIN" backfill --config "$DIR/bf.yaml" --apply >/dev/null 2>&1
-M $COLDPORT 'db.getSiblingDB("_thermocline").checkpoints.deleteOne({_id:"bf"})' >/dev/null
+APPLIED=$("$BIN" backfill --config "$DIR/bf.yaml" --apply --clear-checkpoint 2>&1)
+chk "it cleared the checkpoint itself"                "true" \
+    "$(grep -q 'Cleared the checkpoint' <<<"$APPLIED" && echo true || echo false)"
+chk "and the row is gone"                             "0" \
+    "$(M $COLDPORT 'print(db.getSiblingDB("_thermocline").checkpoints.countDocuments({_id:"bf"}))')"
+# The window the procedure cannot close, said rather than left to be found.
+chk "and it names the window it cannot cover"         "true" \
+    "$(grep -q 'between the copy above and it starting' <<<"$APPLIED" && echo true || echo false)"
 "$BIN" feeder --config "$DIR/bf.yaml" --log-file "$DIR/f3.log" >/dev/null 2>&1 & disown
 "$BIN" router --config "$DIR/bf.yaml" --log-file "$DIR/r.log" >/dev/null 2>&1 & disown
 for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r.log" 2>/dev/null && break; sleep 1; done
@@ -148,8 +164,61 @@ echo "== and it refuses to run underneath a feeder =="
 ALIVE=$("$BIN" backfill --config "$DIR/bf.yaml" --apply 2>&1)
 chk "it refuses while a feeder is still publishing"   "true" \
     "$(grep -q 'still publishing' <<<"$ALIVE" && echo true || echo false)"
-chk "and says to stop it first"                       "true" \
-    "$(grep -q 'Stop it first' <<<"$ALIVE" && echo true || echo false)"
+chk "and says how to get the marking done"             "true" \
+    "$(grep -q 'Stop it, or --force, to mark them' <<<"$ALIVE" && echo true || echo false)"
+pkill -9 -f "cline.*$DIR" 2>/dev/null
+
+echo "== the other thing this is for: tiering a collection that already has data =="
+# Adding a collection to feeder.namespaces is an ordinary operation and it hides
+# the collection until the archive has it. Measured on twenty documents living
+# on the fast tier untiered, then tiered and one more written: the fast tier held
+# twenty one, the archive held the one, and a client read the one. The other
+# twenty were invisible the moment somebody edited the config.
+#
+# The feeder stays running for this, which is what makes it the order with no
+# window: it carries what happens next while the copy brings what was already
+# there. Marking is held while it runs, and nothing needs marking here anyway.
+# The twenty have to be older than the feeder's checkpoint, which is what makes
+# them invisible: a collection tiered today has been on the fast tier for months
+# and its inserts are long past the oplog. Writing them and then letting a feeder
+# that does not tier them checkpoint past is the same state in three seconds.
+# Without that the feeder resumes from before the inserts and replays them, which
+# is what the first version of this section measured: it reported the client
+# seeing all twenty one and called the scenario reproduced.
+M $HOTPORT 'const c=db.getSiblingDB("shop").invoices;
+  for (let i=1;i<=20;i++) c.insertOne({_id:i,v:"existing",at:new Date()});' >/dev/null
+"$BIN" feeder --config "$DIR/bf.yaml" --log-file "$DIR/f3b.log" >/dev/null 2>&1 & disown
+sleep 6
+pkill -9 -f "cline.*$DIR/bf.yaml" 2>/dev/null; sleep 1
+sed 's|    - "shop.orders"|    - "shop.orders"\n    - "shop.invoices"|' "$DIR/bf.yaml" > "$DIR/bf2.yaml"
+"$BIN" feeder --config "$DIR/bf2.yaml" --log-file "$DIR/f4.log" >/dev/null 2>&1 & disown
+"$BIN" router --config "$DIR/bf2.yaml" --log-file "$DIR/r2.log" >/dev/null 2>&1 & disown
+for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r2.log" 2>/dev/null && break; sleep 1; done
+R 'db.getSiblingDB("shop").invoices.insertOne({_id:21,v:"after tiering",at:new Date()})' >/dev/null
+sleep 4
+# How many are hidden depends on where the previous feeder's checkpoint landed,
+# so the count is printed and the claim is the one that does not move: the fast
+# tier holds all of them and the client cannot see them.
+HID=$(R 'print(db.getSiblingDB("shop").invoices.countDocuments({}))')
+echo "      the fast tier holds 21 and a client sees $HID"
+chk "tiering it hides what was already there"         "true" \
+    "$(awk -v n="$HID" 'BEGIN{print (n+0 < 21) ? "true" : "false (" n ")"}')"
+chk "and the fast tier still has all of them"         "21" \
+    "$(M $HOTPORT 'print(db.getSiblingDB("shop").invoices.countDocuments({}))')"
+chk "and the router said which collection"            "true" \
+    "$(grep 'the fast tier holds tiered collections the archive does not' "$DIR/r2.log" | grep -q 'shop.invoices' && echo true || echo false)"
+OUT=$("$BIN" backfill --config "$DIR/bf2.yaml" --ns shop.invoices --apply 2>&1)
+chk "it copies them with the feeder still running"    "true" \
+    "$(grep -q 'copied 21' <<<"$OUT" && echo true || echo false)"
+chk "and holds the marking while it is"               "true" \
+    "$(grep -q 'no deletes looked for: a feeder is still publishing' <<<"$OUT" && echo true || echo false)"
+# The advice has to fit the job. Clearing the checkpoint here would restart
+# mirroring from now for every namespace, for no reason at all.
+chk "and does not tell you to clear the checkpoint"   "true" \
+    "$(grep -q 'no checkpoint to clear' <<<"$OUT" && echo true || echo false)"
+sleep 2
+chk "the client can see all twenty one now"           "21" \
+    "$(R 'print(db.getSiblingDB("shop").invoices.countDocuments({}))')"
 pkill -9 -f "cline.*$DIR" 2>/dev/null
 
 echo

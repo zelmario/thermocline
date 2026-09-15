@@ -64,7 +64,7 @@ Usage:
                                           writing to either: the checks a router
                                           runs at startup, and none of the
                                           building it does
-  cline backfill --config FILE [--ns NS] [--apply] [--force]
+  cline backfill --config FILE [--ns NS] [--apply] [--clear-checkpoint] [--force]
                                           close the hole a stopped feeder left:
                                           copy the fast tier's documents into the
                                           archive, and mark the ones it holds

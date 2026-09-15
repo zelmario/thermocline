@@ -57,6 +57,24 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **Tiering a collection that already has data hides it until the archive has a
+  copy.** Adding a namespace to `feeder.namespaces` is an ordinary operation and
+  this is what it does: the feeder is a change stream, so it mirrors what
+  happens next, and what was already on the fast tier it never sees. A tiered
+  namespace with no completeness claim is read from the archive, so the
+  documents that were there before the edit stop being returned.
+
+  Measured on twenty documents living on the fast tier untiered, then tiered
+  with one more written: the fast tier held twenty one, the archive held the
+  one, and a client read the one. The other twenty were invisible from the
+  moment somebody edited the config.
+
+  The router names the collection at its next start, and `cline backfill --ns`
+  is the fix. Do it with the feeder running, which is the order with no window
+  in it: the feeder carries what happens next while the copy brings what was
+  already there. Marking deletes is held while a feeder publishes, and nothing
+  needs marking in this case anyway.
+
 - **A delete made while nothing was mirroring cannot be recovered by copying the
   fast tier, and `cline backfill` is what closes it.** The feeder exits when the
   fast tier's oplog has rolled past its checkpoint, and the remedy named there

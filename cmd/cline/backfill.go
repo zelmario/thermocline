@@ -51,6 +51,8 @@ func runBackfill(args []string) error {
 	nsFlag := fs.String("ns", "", "one namespace, rather than every tiered one")
 	apply := fs.Bool("apply", false, "make the changes, rather than reporting them")
 	force := fs.Bool("force", false, "apply even though a feeder still looks alive")
+	clearCP := fs.Bool("clear-checkpoint", false,
+		"also clear the feeder's checkpoint, so mirroring starts again from now")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -85,20 +87,26 @@ func runBackfill(args []string) error {
 	}
 	sort.Strings(namespaces)
 
-	// The same ordering rollback insists on, for the same reason: a feeder
-	// still mirroring is writing into the window this is trying to close, so
-	// what it copies is a moving target and what it marks may be a document the
-	// feeder is about to put back.
+	// A running feeder holds the marking and not the copying, and the difference
+	// is what each half does when it is wrong.
+	//
+	// Copying under a feeder is harmless: it upserts what the fast tier holds,
+	// which is what the feeder would have mirrored anyway. Marking is not. The
+	// feeder may be writing a document back at the moment this decides the fast
+	// tier does not have it, and then the mark lands on a live document.
+	//
+	// Holding both was the first version and it made the ordinary use
+	// impossible. Tiering a collection that already has data means adding it to
+	// feeder.namespaces, starting the feeder so nothing new is missed, and then
+	// copying what was already there. Refusing while the feeder runs leaves only
+	// the other order, and that one has a window in it.
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
-	if *apply && alive && !*force {
-		fmt.Printf("A feeder published %s ago, so it is still mirroring.\n\n", since.Round(time.Second))
-		fmt.Print(`Stop it first. This exists for the window where it was not running, and
-running it underneath one copies a moving target and can mark a document the
-feeder is about to write back.
-
---force applies anyway, which is only right if you know nothing is mirroring.
-`)
-		return fmt.Errorf("a feeder is still publishing")
+	markingHeld := alive && !*force
+	if markingHeld {
+		fmt.Printf("A feeder published %s ago, so it is still mirroring.\n", since.Round(time.Second))
+		fmt.Println("Documents are copied anyway. Deletes are not marked, because the feeder may be")
+		fmt.Println("writing back the very document this would mark. Stop it, or --force, to mark them.")
+		fmt.Println()
 	}
 
 	if !*apply {
@@ -120,7 +128,7 @@ feeder is about to write back.
 		}
 		totalCopied += copied
 
-		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply)
+		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
 		totalMarked += marked
 		verb := "would copy"
 		if *apply {
@@ -132,8 +140,7 @@ feeder is about to write back.
 	fmt.Println()
 	if *apply {
 		fmt.Printf("Copied %d document(s) into the archive and marked %d as deleted.\n", totalCopied, totalMarked)
-		fmt.Println("Now clear the feeder's checkpoint and start it again.")
-		return nil
+		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld)
 	}
 	fmt.Printf("Would copy %d document(s) into the archive and mark %d as deleted.\n", totalCopied, totalMarked)
 	fmt.Println("Re-run with --apply to do it.")
@@ -235,8 +242,11 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 // every completeness decision is made in. Reading it in any other would compare
 // a bound against a different clock.
 func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.Store,
-	hot, cold *mongo.Client, ns, db, coll string, apply bool) (int64, string) {
+	hot, cold *mongo.Client, ns, db, coll string, apply, held bool) (int64, string) {
 
+	if held {
+		return 0, "no deletes looked for: a feeder is still publishing"
+	}
 	mark, err := marks.Load(ctx, ns)
 	if err != nil {
 		return 0, fmt.Sprintf("could not read the completeness claim: %v", err)
@@ -343,4 +353,65 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 		verb = "marked"
 	}
 	return marked, fmt.Sprintf("%s %d deleted in the claimed range", verb, marked)
+}
+
+// finishBackfill clears the feeder's checkpoint, or says why it did not.
+//
+// The step after the copy, and until now the one with no command behind it. The
+// feeder's own error says to clear the checkpoint and so did this command, and
+// the only way to do it was to delete a row out of the bookkeeping collection by
+// hand, during an incident, against the right tier: run against the fast tier it
+// does nothing and looks like it worked, which is the same way the hand-typed
+// rollback went wrong before `cline rollback` existed.
+//
+// Not done by default, because it is the irreversible half: clearing restarts
+// mirroring from now, and if the copy above did not cover every affected
+// namespace then the rest of the hole is sealed in rather than closed.
+//
+// Refused outright after --ns for that exact reason. One namespace was copied
+// and the checkpoint is not per namespace.
+func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
+	only string, clear, feederRunning bool) error {
+
+	// Which of the two jobs this was decides what to say next, and saying the
+	// wrong one is worse than saying nothing. A feeder that is running means
+	// this was not a gap being closed: it was a collection with data in it
+	// being tiered, and its checkpoint is fine. Telling an operator to clear it
+	// there would restart mirroring from now for every namespace, for no
+	// reason.
+	if feederRunning {
+		fmt.Println("The feeder is mirroring, so there is no checkpoint to clear: what was already")
+		fmt.Println("on the fast tier is in the archive now, and what happens next it will carry.")
+		return nil
+	}
+	if !clear {
+		fmt.Println("Now clear the feeder's checkpoint and start it again, or re-run with")
+		fmt.Println("--clear-checkpoint to have this do it.")
+		return nil
+	}
+	if only != "" {
+		fmt.Println()
+		fmt.Print(`Not clearing the checkpoint: this ran over one namespace and the checkpoint is
+not per namespace. Clearing it now would restart mirroring from now for every
+other namespace too, sealing in whatever hole they have rather than closing it.
+
+Run this without --ns first.
+`)
+		return fmt.Errorf("--clear-checkpoint needs a run over every namespace")
+	}
+
+	res, err := cold.Database(meta.DB).Collection(meta.Checkpoints).
+		DeleteOne(ctx, bson.D{{Key: "_id", Value: cfg.Feeder.ID}})
+	if err != nil {
+		return fmt.Errorf("could not clear the checkpoint for feeder %q: %w", cfg.Feeder.ID, err)
+	}
+	if res.DeletedCount == 0 {
+		fmt.Printf("No checkpoint was stored for feeder %q, so mirroring would have started from now anyway.\n",
+			cfg.Feeder.ID)
+	} else {
+		fmt.Printf("Cleared the checkpoint for feeder %q.\n", cfg.Feeder.ID)
+	}
+	fmt.Println("Start the feeder. Writes made between the copy above and it starting are not")
+	fmt.Println("covered by either, so do this with the application stopped if you can.")
+	return nil
 }
