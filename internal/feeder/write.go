@@ -136,6 +136,7 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	}
 	f.lastSaved = time.Now()
 	f.reportRate()
+	f.publishCounters(ctx)
 
 	// Only now are the eviction announcements this run has used written off.
 	//
@@ -250,6 +251,14 @@ func (f *Feeder) flush(ctx context.Context) error {
 			"upserted", res.UpsertedCount,
 			"modified", res.ModifiedCount,
 			"matched", res.MatchedCount)
+		for _, op := range opsByNS[ns] {
+			switch op.kind {
+			case actionUpsert:
+				f.counters.mirrored++
+			case actionTombstone:
+				f.counters.tombstoned++
+			}
+		}
 	}
 
 	// The batch is in the archive, so the announcements it claimed are now this
@@ -660,6 +669,7 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 				"effect", "the archive does not hold this document, and the evictor will not remove it from the fast tier",
 				"action", "resolve the duplicate, then re-run the write; see cline keys --rebuild",
 				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
+			f.counters.unmirrorable++
 			models = append(models[:i:i], models[i+1:]...)
 			ops = append(ops[:i:i], ops[i+1:]...)
 			if len(models) == 0 {
@@ -803,7 +813,31 @@ func (f *Feeder) noteInsertsOverExisting(ns string, ops []pendingOp, res *mongo.
 	if n == 0 {
 		return
 	}
-	f.insertsOverExisting += int64(n)
+	f.counters.insertsOverExisting += int64(n)
 	f.log.Debug("mirrored an insert onto a document the archive already held",
-		"ns", ns, "count", n, "total", f.insertsOverExisting)
+		"ns", ns, "count", n, "total", f.counters.insertsOverExisting)
+}
+
+// publishCounters tells the archive what this feeder has done, so the router can
+// export it.
+//
+// On the checkpoint's cadence rather than the position's. The position is
+// written far more often because a fallback read waits on it; nothing waits on
+// this, and one more upsert per position write would be paid on the hot path for
+// a number nobody reads that fast.
+//
+// The evictor and the warmer have published this way since the daemon metrics
+// went in, and the feeder had not, which left the one daemon whose failures stop
+// a document reaching the archive reporting them to a log line and nothing else.
+// A daemon's counters reaching only a log is precisely what that work was for.
+func (f *Feeder) publishCounters(ctx context.Context) {
+	counters := map[string]int64{
+		"mirrored":              f.counters.mirrored,
+		"tombstoned":            f.counters.tombstoned,
+		"unmirrorable":          f.counters.unmirrorable,
+		"inserts_over_existing": f.counters.insertsOverExisting,
+	}
+	if err := meta.PublishDaemonReport(ctx, f.cold, "feeder:"+f.cfg.ID, false, counters, nil); err != nil {
+		f.log.Debug("could not publish feeder statistics", "err", err)
+	}
 }

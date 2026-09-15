@@ -186,6 +186,52 @@ chk "a running feeder puts a number back"              "true" \
     "$(echo "$LAGV" | awk '{print ($1 != "+Inf" && $1 != "" && $1+0 >= 0) ? "true" : "false (" $1 ")"}')"
 # The router and feeder stay up: the sections below scrape /metrics.
 
+echo "== and the feeder publishes what it has done, like the other two =="
+# The evictor and the warmer have published their counters since this suite was
+# written and the feeder had not, which left the one daemon whose failures stop a
+# document reaching the archive reporting them to a log line and nothing else.
+# That is the exact thing this file's own opening paragraph says the work was
+# for.
+#
+# Waited for rather than slept on: the counters go out on the checkpoint's
+# cadence, not the position's, because nothing waits on them and the position is
+# written far more often.
+# Something for it to mirror. The feeder in this section started after the
+# documents above were written, so it has seen no events at all and would
+# publish a mirrored count of zero, which is a true number about nothing.
+H "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:900,n:900},{_id:901,n:901},{_id:902,n:902}])" >/dev/null
+# Waiting for the value rather than for the row. The row is published on the
+# feeder's first checkpoint whether or not it has mirrored anything, so a loop
+# that stops as soon as the line exists reads a zero and calls it an answer,
+# which is how this check first failed against the change that makes it pass.
+FEEDERN=""
+for _ in $(seq 1 40); do
+  FEEDERN=$(M | awk -F' ' '/daemon="feeder:test",outcome="mirrored"/{print $2}')
+  [ -n "$FEEDERN" ] && [ "$(awk -v n="$FEEDERN" 'BEGIN{print (n+0 >= 3)}')" = "1" ] && break
+  sleep 1
+done
+chk "the feeder's mirrored count is exported"          "true" \
+    "$([ -n "$FEEDERN" ] && echo true || echo false)"
+chk "and it counted the three it mirrored"             "true" \
+    "$(awk -v n="$FEEDERN" 'BEGIN{print (n+0 >= 3) ? "true" : "false (" n ")"}')"
+chk "seconds_since_pass covers it too"                 "true" \
+    "$(M | grep -q 'thermocline_daemon_seconds_since_pass{daemon="feeder:test"}' && echo true || echo false)"
+# Zero is the answer these must give on a deployment nothing is wrong with, and
+# a metric that is absent looks the same as one that is zero to every rule
+# written on it.
+chk "documents the archive refused are counted"        "0" \
+    "$(M | awk -F' ' '/daemon="feeder:test",outcome="unmirrorable"/{print $2}')"
+chk "and inserts onto an _id the archive held"         "0" \
+    "$(M | awk -F' ' '/daemon="feeder:test",outcome="inserts_over_existing"/{print $2}')"
+# Put the namespace back the way the section below expects to find it: it counts
+# what an eviction sweep left and would read these three as documents the hold
+# failed to protect.
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:900}})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")" = "5" ] && break
+  sleep 1
+done
+
 echo "== an operator can hold eviction, and the hold is visible =="
 # The case this exists for is a restored archive. The evictor's own check is per
 # document and presence only, so an archive holding an older version of a

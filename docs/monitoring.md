@@ -52,6 +52,29 @@ tuning question, not a page, and the two things it could get wrong that *are*
 worth paging on are already covered: a stale answer would show as a wrong
 answer, and the memory is bounded by configuration rather than by an alert.
 
+The feeder publishes its counters the way the evictor and the warmer do, under
+`thermocline_daemon_documents_total{daemon="feeder:<id>"}`:
+
+    outcome="mirrored"               documents copied into the archive
+    outcome="tombstoned"             documents marked deleted there
+    outcome="unmirrorable"           documents the archive refused and this gave up on
+    outcome="inserts_over_existing"  inserts mirrored onto an _id the archive already held
+
+`unmirrorable` has a rule below and should be zero: each one is a document the
+archive will never hold while the fast tier does, so the evictor will never
+remove it and a read that falls through will never find it.
+
+`inserts_over_existing` has no rule, deliberately, because it counts a shape
+rather than a fault. Through the router an insert for an `_id` the archive holds
+live is refused as a duplicate key, so a write straight at the fast tier's
+mongod raises this and nothing else does — except an application that deletes an
+`_id` and uses it again, which is legitimate and raises it too. Measured on a
+shop run of 348 mirrored batches with copy-ups and evictions underneath: zero.
+On one write made straight at the fast tier: one. On a delete and re-insert of
+the same `_id` through the router: also one. So it is a number to go and look at
+rather than one to be woken by, and a deployment where it climbs without anybody
+reusing `_id`s has a writer that is not going through the router.
+
 
 ### What to alert on
 
@@ -208,6 +231,18 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "the router is answering from an unverifiable completeness claim; is the archive down, or is the router partitioned?"
+      - alert: ThermoclineUnmirrorableDocument
+        # The archive refused a document the fast tier accepted, and the feeder
+        # gave it up rather than retrying it for ever, because no retry of that
+        # document can succeed. Each one is a document the archive will never
+        # hold while the fast tier does, so the evictor will never remove it and
+        # a read that falls through will never find it. It was an ERROR in the
+        # feeder's log and nothing else until the feeder started publishing its
+        # counters.
+        expr: increase(thermocline_daemon_documents_total{outcome="unmirrorable"}[15m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "the archive refused a document the fast tier holds; see the feeder's log for which and why"
       - alert: ThermoclineMemberNotReadable
         # A member of the fast tier is in the set and refusing reads, which is
         # what a resync, an initial sync or a maintenance window looks like from

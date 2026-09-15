@@ -91,10 +91,12 @@ type Feeder struct {
 	// Same goroutine. See recheckKindOnUnannounced.
 	kindRechecked map[string]time.Time
 
-	// insertsOverExisting counts inserts mirrored onto an _id the archive
-	// already held, which through the router cannot happen. See
-	// noteInsertsOverExisting.
-	insertsOverExisting int64
+	// counters are what this feeder has done since it started, published into
+	// the archive so the router can export them. The evictor and the warmer
+	// have done this since 2026-09-03 and the feeder had not, which left the
+	// one daemon whose failures stop mirroring reporting them only to a log
+	// line. See publishCounters.
+	counters feederCounters
 	// Where mirroring's time goes, since the rate it sustains is a ceiling on
 	// how fast the fast tier can take writes before every fall-through read
 	// waits. End-to-end timing on a loaded machine varied by 70% between runs
@@ -202,6 +204,30 @@ func (f *Feeder) withdrawDatabase(ctx context.Context, db string) {
 }
 
 // pendingOp is one decoded change waiting to be written.
+// feederCounters is what a feeder has done since it started. Cumulative, which
+// is what a Prometheus counter wants, and touched only from the stream
+// goroutine.
+type feederCounters struct {
+	// mirrored and tombstoned are the two things mirroring does.
+	mirrored   int64
+	tombstoned int64
+	// unmirrorable counts documents the archive refused and this feeder gave
+	// up on, which it does rather than retrying for ever. Each one is a
+	// document the archive will never hold while the fast tier does, and it was
+	// an ERROR in a log and nothing else. See writeBatch.
+	unmirrorable int64
+	// insertsOverExisting counts inserts mirrored onto an _id the archive
+	// already held. Through the router an insert for an _id the archive holds
+	// live is refused as a duplicate key, so this is either a write that did
+	// not come through the router or an _id the application deleted and used
+	// again. Measured on a shop run of 348 batches with copy-ups and evictions
+	// underneath: zero. Measured on one write made straight at the fast tier's
+	// mongod: one. Measured on a delete and re-insert of the same _id through
+	// the router: also one, which is why this is a number to look at rather
+	// than a warning to act on.
+	insertsOverExisting int64
+}
+
 type pendingOp struct {
 	ns   string
 	key  bson.Raw // documentKey, always {_id: ...}

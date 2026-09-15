@@ -40,13 +40,22 @@ Part of [Thermocline](../README.md).
   gone. No line in the feeder's log, none in the router's.
 
   It cannot be refused from here — the router is not in that path by
-  definition — and it is not detected either. The feeder could in principle
-  notice that mirroring an *insert* modified a document the archive already
-  held, which through the router cannot happen, but that same shape occurs
-  benignly when a feeder replays events after a restart, so the check would need
-  to tell those apart before it could be trusted. Until then the protection is
-  operational: only the router should hold credentials that can write to the
-  fast tier's application databases.
+  definition — and it cannot be told apart from an application reusing an `_id`
+  either. It is now counted rather than silent. The feeder publishes
+  `inserts_over_existing`: inserts it mirrored onto an `_id` the archive already
+  held, which through the router is refused as a duplicate key.
+
+  What that number is worth, measured rather than reasoned. A shop run of 348
+  mirrored batches with copy-ups and eviction sweeps underneath: zero. Three
+  unclean feeder kills mid-batch, which is the replay this entry used to say
+  would confuse it: also zero. One write made straight at the fast tier's
+  mongod: one. And a delete and re-insert of the same `_id` through the router,
+  which is legitimate: also one. So it is a lead rather than a verdict, and it
+  carries no alert rule for that reason, but a deployment where it climbs and
+  nobody reuses `_id`s has a writer that is not going through the router.
+
+  The protection is still operational: only the router should hold credentials
+  that can write to the fast tier's application databases.
 
 - **A tiered collection dropped on the archive reads as empty, while the fast
   tier still holds it.** The archive is the superset, which is what makes it
