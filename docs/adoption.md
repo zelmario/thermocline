@@ -448,6 +448,14 @@ archive, which is what `test/pilot` does.
 what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
+You are told about the ones your application makes, without having to remember
+to run it. A `createIndexes` through the router on a tiered namespace that
+leaves the archive without an index over the same fields is one WARN naming the
+index, because the divergence is made by an ordinary application command and
+felt much later by a read that falls through. A text or geospatial index gets a
+different line, because those two the archive needs in order to answer at all
+rather than to answer quickly.
+
 What the router does for you, at startup, for every namespace it manages that
 the archive already holds: it creates the collection on the fast tier the way
 the archive has it, carrying the default collation and the validator, and builds

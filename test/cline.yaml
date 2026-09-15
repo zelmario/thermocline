@@ -273,6 +273,7 @@ feeder:
     - "shop.tgeo"
     - "shop.tqgeo"
     - "shop.tfirst"
+    - "shop.tns.dotted"
     # testindexes.sh
     - "shop.tidx"
     # testindexes.sh again, for what `cline indexes` reports and what it

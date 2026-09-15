@@ -421,6 +421,34 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== a collection whose name has a dot in it =="
+# Legal, ordinary, and untried until now. Every namespace split in this codebase
+# cuts on the *first* dot, which is what makes "shop.tns.dotted" the collection
+# "tns.dotted" in the database "shop" rather than something in a database called
+# "shop.tns". One split cutting the other way would send the read somewhere that
+# does not exist, and nothing would have noticed.
+DNS='tns.dotted'
+H "db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').drop();
+   db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').insertMany([{_id:1,v:'hot'},{_id:2,v:'hot'}])" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').drop();
+   db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').insertMany([{_id:1,v:'hot'},{_id:2,v:'hot'},{_id:3,v:'archive only'}])" >/dev/null
+rm -f $LOGDIR/dotted_r.log
+cline router --config $CFG --log-file $LOGDIR/dotted_r.log & DP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the fast tier holds two of them"                  "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').countDocuments({}))")"
+chk "and the read reaches the archive's third"         "3" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').countDocuments({}))")"
+chk "by _id, the one only the archive holds"           "archive only" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').findOne({_id:3}); print(d?d.v:'MISSING')")"
+kill $DP 2>/dev/null; wait $DP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).getCollection('$DNS').drop()" >/dev/null
+
 echo "== a tiered collection the archive does not have =="
 # The stranded case the other way round, and it costs more than an empty
 # catalogue. A tiered namespace the fast tier cannot claim is complete is read
