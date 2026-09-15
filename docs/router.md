@@ -442,6 +442,15 @@ Range queries are governed by the watermark below.
   serves the read exactly as well. A unique index raises it too: the constraint
   is enforced by the key registry across both tiers rather than by an index on
   the archive, so the archive has none and a read filtering on that field scans.
+
+  **Two kinds of index are not a decision about speed**, and they get their own
+  line saying so. mongod refuses a `$text` query with no text index and a
+  `$geoNear` with no geospatial one, rather than scanning, so a read that falls
+  through to an archive without them fails rather than slows. Measured with the
+  text index on the fast tier alone: `text index required for $text query`
+  through the router, and answered as soon as the archive had one too. Build it
+  on the archive, or keep the namespace warm enough that these reads never fall
+  through.
 - **A tiered collection cannot be turned into one the feeder cannot mirror.**
   `convertToCapped`, `cloneCollectionAsCapped`, and `create` asking for `capped`
   or `timeseries` are refused on a tiered namespace. The feeder already refuses
