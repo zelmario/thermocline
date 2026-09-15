@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -163,5 +164,88 @@ func TestNothingIsRoutedWhileAuthenticationIsProxied(t *testing.T) {
 	if c.routeToSecondary(msgOf(t, secondaryRead()), "find") {
 		t.Fatal("a read was sent to a secondary without terminated authentication, " +
 			"where it could only be authenticated as the router itself")
+	}
+}
+
+// Which members a read may be sent to, and what taking one out of the rotation
+// means. The live suite proves a member in RECOVERING stops receiving reads;
+// what it cannot hold still is the other half, that the member comes back.
+func routerWithMembers(primary string, members ...string) *Router {
+	return &Router{
+		primary: primary,
+		members: members,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+func TestTheRotationIsEveryMemberButThePrimary(t *testing.T) {
+	r := routerWithMembers("a:27017", "a:27017", "b:27017", "c:27017")
+	seen := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		addr, ok := r.nextSecondary()
+		if !ok {
+			t.Fatalf("no secondary offered on attempt %d", i)
+		}
+		seen[addr] = true
+	}
+	if seen["a:27017"] {
+		t.Error("the primary was offered as a secondary")
+	}
+	if !seen["b:27017"] || !seen["c:27017"] {
+		t.Errorf("round robin missed a member: %v", seen)
+	}
+}
+
+func TestAMemberThatRefusedLeavesTheRotation(t *testing.T) {
+	r := routerWithMembers("a:27017", "a:27017", "b:27017", "c:27017")
+	r.avoidSecondary("b:27017")
+	for i := 0; i < 20; i++ {
+		addr, ok := r.nextSecondary()
+		if !ok {
+			t.Fatalf("no secondary offered on attempt %d", i)
+		}
+		if addr == "b:27017" {
+			t.Fatal("a read was sent to a member that said it is not readable")
+		}
+	}
+}
+
+// The half a live suite cannot measure without waiting out the cooldown, and
+// the half that decides whether this is a fix or an outage: a member that
+// finished its resync is used again, without anybody restarting a router.
+func TestTheCooldownEndsOnItsOwn(t *testing.T) {
+	r := routerWithMembers("a:27017", "a:27017", "b:27017", "c:27017")
+	r.avoidSecondary("b:27017")
+	if !r.avoidingSecondary("b:27017") {
+		t.Fatal("the member was not taken out of the rotation at all")
+	}
+	// Reach past the clock rather than sleep for it: the cooldown is thirty
+	// seconds and a test that waits it out is a test nobody runs.
+	r.avoidMu.Lock()
+	r.avoidUntil["b:27017"] = time.Now().Add(-time.Second)
+	r.avoidMu.Unlock()
+	if r.avoidingSecondary("b:27017") {
+		t.Fatal("the member is still out of the rotation after its cooldown")
+	}
+	back := false
+	for i := 0; i < 20 && !back; i++ {
+		if addr, ok := r.nextSecondary(); ok && addr == "b:27017" {
+			back = true
+		}
+	}
+	if !back {
+		t.Error("the member never came back into the rotation")
+	}
+}
+
+// Every member cooling at once is the state where the primary has to answer,
+// which is the same choice already made for a secondary that cannot be dialled:
+// answering is better than refusing.
+func TestWithNoReadableMemberThereIsNoSecondary(t *testing.T) {
+	r := routerWithMembers("a:27017", "a:27017", "b:27017", "c:27017")
+	r.avoidSecondary("b:27017")
+	r.avoidSecondary("c:27017")
+	if addr, ok := r.nextSecondary(); ok {
+		t.Errorf("offered %s when no member is readable", addr)
 	}
 }
