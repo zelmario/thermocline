@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -94,7 +95,7 @@ func (r *Router) nextSecondary() (string, bool) {
 
 	var candidates []string
 	for _, m := range members {
-		if m != primary {
+		if m != primary && !r.avoidingSecondary(m) {
 			candidates = append(candidates, m)
 		}
 	}
@@ -240,4 +241,90 @@ func cursorIDFromReply(reply *wire.Message) (int64, bool) {
 	}
 	id, ok := v.Int64OK()
 	return id, ok
+}
+
+// secondaryCooldown is how long a member stays out of the rotation after it
+// says it is neither primary nor secondary.
+//
+// Long enough that a maintenance window or a resync is not retried on every
+// read, short enough that a member which finished one is used again without
+// anybody restarting a router. A driver's own equivalent is heartbeat driven
+// and finer than this; the router has no heartbeats of its own and learns from
+// what the member said, which is the same rule dialPrimary follows.
+const secondaryCooldown = 30 * time.Second
+
+// avoidingSecondary reports whether a member is in its cooldown.
+func (r *Router) avoidingSecondary(addr string) bool {
+	r.avoidMu.Lock()
+	defer r.avoidMu.Unlock()
+	until, ok := r.avoidUntil[addr]
+	return ok && time.Now().Before(until)
+}
+
+// avoidSecondary takes a member out of the rotation for a while.
+func (r *Router) avoidSecondary(addr string) {
+	now := time.Now()
+	r.avoidMu.Lock()
+	if r.avoidUntil == nil {
+		r.avoidUntil = make(map[string]time.Time)
+	}
+	until, ok := r.avoidUntil[addr]
+	fresh := !ok || now.After(until)
+	r.avoidUntil[addr] = now.Add(secondaryCooldown)
+	r.avoidMu.Unlock()
+
+	if fresh {
+		// Once per cooldown rather than once per read, and worth saying at all:
+		// a member that is up and not readable spreads no load, and nothing
+		// else here would mention it.
+		r.log.Warn("a member of the fast tier is in the set but not readable, so reads are not being sent to it",
+			"addr", addr, "for", secondaryCooldown,
+			"meaning", "it answered a read saying it is neither primary nor secondary, which is what a resync, an initial sync or a maintenance window looks like",
+			"effect", "reads that asked for a secondary go to the remaining members, and to the primary if there are none")
+	}
+	// The connections already open to it are no more readable than the next
+	// one would be.
+	r.closePool(addr)
+}
+
+// moveReadToPrimary sends a read again on the primary after the secondary it
+// was given refused it, and reports whether it got an answer.
+//
+// The router picks a secondary out of hello's `hosts`, and `hosts` is every
+// configured member rather than every readable one. A member in a maintenance
+// window, an initial sync or a rollback stays in that list, stays up, keeps
+// accepting connections and answers reads with NotPrimaryOrSecondary. A driver
+// talking to the set directly never picks such a member, so the application
+// never sees it. Measured with one secondary in maintenance and retries turned
+// off: ten reads straight at the set all answered, ten through the router all
+// failed.
+//
+// Re-sending is safe in a way a write would not be: the read did not run, and
+// reading it again on the primary is the same fallback this already does when a
+// secondary cannot be dialled at all.
+func (c *conn) moveReadToPrimary(ctx context.Context, msg *wire.Message, name string, borrowed *pooled) (*wire.Message, bool) {
+	// A cursor lives on the node that made it and cannot be moved, so the
+	// client is told, which is exactly what it would be told talking to the set
+	// directly.
+	if name == "getMore" || name == "killCursors" {
+		return nil, false
+	}
+	c.r.avoidSecondary(borrowed.pool.addr)
+	borrowed.discard()
+	c.unpinExhausted(borrowed)
+
+	if c.upstream == nil {
+		return nil, false
+	}
+	if err := wire.Write(c.upstream, msg); err != nil {
+		c.upstreamBroke()
+		return nil, false
+	}
+	out, err := wire.Read(c.upstream)
+	if err != nil {
+		c.upstreamBroke()
+		return nil, false
+	}
+	c.r.Stats.SecondaryReadsMoved.Add(1)
+	return out, true
 }

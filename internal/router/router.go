@@ -63,6 +63,10 @@ type Router struct {
 	// member that steps down stays up and keeps accepting connections, so the
 	// pinned address is reachable and wrong at the same time.
 	primaryRefused bool
+	// avoidUntil keeps a member out of the secondary rotation until an instant,
+	// because it answered a read saying it is neither primary nor secondary.
+	avoidMu    sync.Mutex
+	avoidUntil map[string]time.Time
 	// primaryProbeAt throttles re-resolving after a refusal. Every command in
 	// flight when a primary steps down comes back refused the same way, and one
 	// lookup answers all of them. primaryProbing is non-nil while one is
@@ -230,6 +234,11 @@ type Stats struct {
 	// PrimaryOnlyReads counts reads that asked for a secondary and were served
 	// by the primary anyway. See readpref.go for why that cannot be honoured.
 	PrimaryOnlyReads atomic.Int64
+	// SecondaryReadsMoved counts reads a secondary refused and the primary then
+	// answered. Any value above zero means a member of the fast tier is in the
+	// set but not readable, which is what a resync or a maintenance window
+	// looks like from here. See secondaryread.go.
+	SecondaryReadsMoved atomic.Int64
 	Unreadable       atomic.Int64
 	EventsHidden     atomic.Int64
 	StaleReads       atomic.Int64
@@ -1269,7 +1278,18 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				c.unpinExhausted(borrowed)
 				return fmt.Errorf("read from fast tier: %w", err)
 			}
-			c.keepOrRelease(borrowed, reply)
+			// A member in the set is not the same as a member that can be read
+			// from, and until this existed the difference reached the client as
+			// an error. See moveReadToPrimary.
+			if rdoc, derr := reply.ReplyDoc(); derr == nil && isFailoverReply(rdoc) {
+				if out, moved := c.moveReadToPrimary(ctx, msg, name, borrowed); moved {
+					reply = out
+				} else {
+					c.keepOrRelease(borrowed, reply)
+				}
+			} else {
+				c.keepOrRelease(borrowed, reply)
+			}
 		} else if err != nil {
 			c.upstreamBroke()
 			out, replayed := c.replayAfterFailover(ctx, msg, name)

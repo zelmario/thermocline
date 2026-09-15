@@ -173,6 +173,46 @@ chk "and its read ran on the primary"                   "PRIMARY" "$(landed "rt-
 chk "a cursor paged across getMore returns everything"  "21" \
     "$(P secondary "print(db.getSiblingDB(process.env.TC_DB).$NS.find({_id:{\$lt:100}}).batchSize(2).itcount()+db.getSiblingDB(process.env.TC_DB).$NS.find({_id:100}).itcount())")"
 
+echo "== a member that is in the set and not readable =="
+# The router picks a secondary out of hello's `hosts`, and `hosts` is every
+# configured member rather than every readable one. A member in a maintenance
+# window, an initial sync or a rollback stays in that list, stays up, keeps
+# accepting connections and answers reads with NotPrimaryOrSecondary. A driver
+# never picks such a member, so an application never sees it.
+#
+# Measured before this was fixed, with retries off, which is what a getMore and
+# an application that turned retryReads off both look like: ten reads straight
+# at the set all answered, ten through the router all failed.
+#
+# retryReads=false is what makes this a measurement rather than a coin toss. With
+# the driver's own retry on, a read refused by the recovering member is quietly
+# re-sent to the other one and the check passes whether or not the router
+# noticed anything.
+HOTMEMBERS="172.24.0.5:27017 172.24.0.6:27017 172.24.0.7:27017"
+DIRECT() { mongosh "mongodb://dba:secret@$1/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
+NORETRY() { mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin&readPreference=secondary&retryReads=false" --quiet --eval "$1" 2>&1 | tail -1; }
+maintOff() { for a in $HOTMEMBERS; do DIRECT $a 'try{ db.adminCommand({replSetMaintenance:false}) }catch(e){}' >/dev/null 2>&1; done; }
+# A member left in RECOVERING is not this suite's to leave behind.
+trap 'maintOff' EXIT
+RPRIM=$(H 'print(db.hello().primary)')
+RVICTIM=""
+for a in $HOTMEMBERS; do [ "$a" = "$RPRIM" ] && continue; RVICTIM=$a; break; done
+DIRECT $RVICTIM 'try{ db.adminCommand({replSetMaintenance:true}) }catch(e){}' >/dev/null
+chk "one secondary is in RECOVERING"                    "3" \
+    "$(DIRECT $RVICTIM 'print(db.adminCommand({replSetGetStatus:1}).myState)')"
+chk "and the set still lists it"                        "true" \
+    "$(H "print(db.hello().hosts.includes('$RVICTIM'))")"
+RQ="try{ print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({})) }catch(e){ print('ERR '+(e.codeName||e.message)) }"
+RBAD=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  case "$(NORETRY "$RQ")" in *ERR*) RBAD=$((RBAD+1)) ;; esac
+done
+chk "ten reads with retries off, none refused"          "0" "$RBAD"
+chk "and the router said which member it stopped using" "true" \
+    "$(grep -qc "not readable" $LOG >/dev/null 2>&1 && grep -q "$RVICTIM" $LOG && echo true || echo false)"
+maintOff
+trap - EXIT
+
 echo "== the router counts what it moved =="
 chk "secondary reads are counted"                       "true" \
     "$([ -f $LOG ] && echo true || echo false)"

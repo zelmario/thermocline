@@ -122,6 +122,29 @@ Range queries are governed by the watermark below.
   `router.terminate_auth` on, read preference is honoured: measured with the
   profiler recording on all three fast tier members, `secondary`,
   `secondaryPreferred` and `nearest` each landed on a secondary.
+
+  **A member in the set is not the same as a member you can read from**, and the
+  router learns the difference from what the member says rather than from a
+  health check of its own. It picks a secondary out of `hello`'s `hosts`, and
+  `hosts` lists every configured member: one in a maintenance window, an initial
+  sync or a rollback stays in it, stays up, accepts connections and answers
+  reads with `NotPrimaryOrSecondary`. A driver never picks such a member.
+  Measured with one secondary in maintenance and `retryReads=false`, which is
+  what a `getMore` looks like too: ten reads straight at the set all answered,
+  ten through the router all failed. The read is now sent again on the primary,
+  which is the same fallback a secondary that cannot be dialled already got, and
+  the member leaves the rotation for 30 seconds with one line saying so.
+  `thermocline_secondary_reads_moved_total` counts them, and anything above zero
+  means a member is up and not readable.
+
+  Two edges are worth knowing. A `getMore` cannot be moved, because the cursor
+  is on that node and nowhere else, so the client is told exactly what it would
+  be told talking to the set directly. And when no member is readable the router
+  answers from the primary, where a driver asking for `secondary` would block in
+  server selection until it gave up: measured with both secondaries in
+  maintenance, ten reads through the router answered and ten straight at the set
+  timed out. Answering is the same choice this makes for a secondary it cannot
+  dial.
 - **A stats call counts the whole collection and measures one tier.** Those are
   different questions and a single reply carries both. `db.coll.stats().count`,
   the `collStats` command and `$collStats` all report the collection's document
