@@ -75,7 +75,10 @@ func (r *Router) refreshInventory(ctx context.Context) {
 }
 
 func (r *Router) readInventory(ctx context.Context) {
-	managed := append([]string(nil), r.cfg.Managed...)
+	// Not r.cfg.Managed directly: `feeder.namespaces` empty tiers everything,
+	// and reading the list there gave an operator a dashboard saying nothing is
+	// tiered on a router tiering the lot.
+	managed := r.tieredNamespaces(ctx)
 	sort.Strings(managed)
 
 	out := Inventory{

@@ -114,6 +114,24 @@ chk "and says which"                                      "true" \
     "$(grep 'the fast tier holds tiered collections the archive does not' "$DIR/r2.log" | grep -q 'shop.stray' && echo true || echo false)"
 pkill -9 -f "cline.*$DIR" 2>/dev/null
 
+echo "== the dashboard on a router that tiers everything =="
+# An operator looking at a router tiering the lot was shown a list of nothing,
+# because the inventory read the configured list too.
+pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+sed 's|  dashboard: ""|  dashboard: "127.0.0.1:'$((PORT+10))'"|' "$DIR/all.yaml" > "$DIR/dash.yaml"
+"$BIN" router --config "$DIR/dash.yaml" --log-file "$DIR/r3.log" >/dev/null 2>&1 &
+disown
+for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r3.log" 2>/dev/null && break; sleep 1; done
+INV=""
+for _ in $(seq 1 30); do
+  INV=$(curl -s "http://127.0.0.1:$((PORT+10))/api/snapshot" 2>/dev/null | grep -o '"ns":' | wc -l)
+  [ "${INV:-0}" -gt 0 ] && break
+  sleep 1
+done
+chk "the inventory lists the namespaces it tiers"        "true" \
+    "$(awk -v n="${INV:-0}" 'BEGIN{print (n+0 >= 2) ? "true" : "false (" n ")"}')"
+pkill -9 -f "cline.*$DIR" 2>/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

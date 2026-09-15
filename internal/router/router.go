@@ -1927,11 +1927,13 @@ func isClosed(err error) bool {
 // warmer notices a fast tier that has lost its contents and withdraws it. This
 // closes the router's own window, which is the one that opens immediately.
 func (r *Router) forgetEverythingIn(db string) {
-	prefix := db + "."
-	for _, ns := range r.cfg.Managed {
-		if !strings.HasPrefix(ns, prefix) {
-			continue
-		}
+	// What this router remembers, rather than what the configuration lists.
+	// They are the same set for a deployment that names its namespaces, and a
+	// namespace it names but has never touched has nothing cached to forget
+	// anyway. They are not the same set when `feeder.namespaces` is empty,
+	// which tiers everything: reading the list there found nothing to forget
+	// and left every cached answer for a database that had just gone.
+	for _, ns := range r.rememberedIn(db) {
 		// Deliberately the same list as forgetDropped, which is what a drop of
 		// one collection runs, and deliberately without forgetIndexes for the
 		// reason written there: the unique index listing is the one memory whose
@@ -1949,6 +1951,57 @@ func (r *Router) forgetEverythingIn(db string) {
 		// allowed to be stale is how the next reader gets it wrong.
 		r.forgetDropped(ns)
 	}
+}
+
+// rememberedIn names every namespace in one database this router holds a cached
+// answer about.
+//
+// The union of the caches forgetDropped clears, which is what makes it the right
+// list: a namespace none of them holds has nothing that could be stale.
+func (r *Router) rememberedIn(db string) []string {
+	prefix := db + "."
+	seen := map[string]bool{}
+	take := func(ns string) {
+		if strings.HasPrefix(ns, prefix) {
+			seen[ns] = true
+		}
+	}
+
+	r.wmCache.mu.Lock()
+	for ns := range r.wmCache.entries {
+		take(ns)
+	}
+	r.wmCache.mu.Unlock()
+
+	r.brackets.mu.Lock()
+	for ns := range r.brackets.byNS {
+		take(ns)
+	}
+	r.brackets.mu.Unlock()
+
+	r.collCache.mu.Lock()
+	for ns := range r.collCache.fetched {
+		take(ns)
+	}
+	r.collCache.mu.Unlock()
+
+	r.hintCache.mu.Lock()
+	for ns := range r.hintCache.byNS {
+		take(ns)
+	}
+	r.hintCache.mu.Unlock()
+
+	r.viewCache.mu.Lock()
+	for ns := range r.viewCache.fetched {
+		take(ns)
+	}
+	r.viewCache.mu.Unlock()
+
+	out := make([]string, 0, len(seen))
+	for ns := range seen {
+		out = append(out, ns)
+	}
+	return out
 }
 
 // remoteAddr names a client for a log line, without assuming there is one: a
