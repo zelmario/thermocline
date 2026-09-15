@@ -270,6 +270,8 @@ feeder:
     - "shop.tarchdrop"
     - "shop.tlostarch"
     - "shop.tidxsay"
+    - "shop.tgeo"
+    - "shop.tqgeo"
     # testindexes.sh
     - "shop.tidx"
     # testindexes.sh again, for what `cline indexes` reports and what it

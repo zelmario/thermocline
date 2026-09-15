@@ -832,6 +832,65 @@ H "db.getSiblingDB(process.env.TC_DB).$ANS.drop(); db.getSiblingDB(process.env.T
 C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 kill $ARP 2>/dev/null; wait $ARP 2>/dev/null
 
+echo "== \$geoNear over a tiered collection =="
+# The one stage in the language that has to come first and also reads the input
+# documents. Everything the archive answers gets a tombstone filter put in front
+# of it, so no stage ever sees a deleted record, and putting anything in front of
+# $geoNear is what mongod refuses.
+#
+# Measured before this, with a 2dsphere index on both tiers so the index was not
+# the question: the same pipeline answered 3 straight at the archive and failed
+# through the router with "$geoNear was not the first stage in the pipeline
+# after optimization", which names the router's own $match and reads to a
+# developer as their own mistake.
+#
+# The filter goes into $geoNear's own `query` instead, which is what that field
+# is for, and the check below that matters most is the second one: a rewrite
+# that fixed the stage order and lost the tombstone filter would pass the first.
+GNS=tqgeo
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+rm -f $LOGDIR/q_r.log
+cline feeder --config $CFG --log-file $LOGDIR/q_geo_f.log & GFP=$!
+startRouter
+R "const c=db.getSiblingDB(process.env.TC_DB).$GNS;
+   c.insertMany([{_id:1,name:'old dock',loc:{type:'Point',coordinates:[0,0]}},
+                 {_id:2,name:'old pier',loc:{type:'Point',coordinates:[1,1]}},
+                 {_id:3,name:'new harbour',loc:{type:'Point',coordinates:[2,2]}}]);" >/dev/null
+waitMirrored $GNS 3
+# On both tiers, so the index is not what this section is about. Built directly
+# because the router builds a plain index on the fast tier alone, which is the
+# subject of testindexes.sh rather than this one.
+H "db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({loc:'2dsphere'},{name:'loc_2dsphere'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({loc:'2dsphere'},{name:'loc_2dsphere'})" >/dev/null
+GEO='[{$geoNear:{near:{type:"Point",coordinates:[0,0]},distanceField:"d",spherical:true}}]'
+gn() { mongosh "$1" --quiet --eval "try{ const r=db.getSiblingDB(process.env.TC_DB).$GNS.aggregate($GEO).toArray(); print(r.length+' '+r.map(x=>x.name).join('|')) }catch(e){ print('FAILED '+(e.codeName||e.message)) }" 2>&1 | tail -1; }
+gnR() { mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "try{ const r=db.getSiblingDB(process.env.TC_DB).$GNS.aggregate($GEO).toArray(); print(r.length+' '+r.map(x=>x.name).join('|')) }catch(e){ print('FAILED '+(e.codeName||e.message)) }" 2>&1 | tail -1; }
+# Nothing claims this namespace, so the archive answers, which is the path the
+# rewrite is on.
+chk "the router agrees with the archive"               "$(gn "$COLD")" "$(gnR)"
+chk "and it answered rather than failing"              "3 old dock|old pier|new harbour" "$(gnR)"
+# The half a stage-order fix could quietly drop.
+R "db.getSiblingDB(process.env.TC_DB).$GNS.deleteOne({_id:1})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$GNS.findOne({_id:1}); print(d && d._tcDeletedAt ? 'yes' : 'no')")" = "yes" ] && break
+  sleep 1
+done
+chk "the archive kept it as a tombstone"               "yes" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$GNS.findOne({_id:1}); print(d && d._tcDeletedAt ? 'yes' : 'no')")"
+chk "and \$geoNear does not return a deleted document" "2 old pier|new harbour" "$(gnR)"
+chk "which is what an ordinary find says too"          "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$GNS.find({}).itcount())")"
+# A $geoNear that brought its own query keeps it, rather than having it replaced
+# by the tombstone filter.
+chk "a \$geoNear with its own query keeps it"          "1" \
+    "$(R "try{ print(db.getSiblingDB(process.env.TC_DB).$GNS.aggregate([{\$geoNear:{near:{type:'Point',coordinates:[0,0]},distanceField:'d',spherical:true,query:{name:/old/}}}]).toArray().length) }catch(e){ print('FAILED '+(e.codeName||e.message)) }")"
+kill $GFP 2>/dev/null; wait $GFP 2>/dev/null
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

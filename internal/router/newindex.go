@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -71,6 +72,33 @@ func (c *conn) noteIndexNotOnTheArchive(ctx context.Context, cmd bson.Raw, db, c
 		return
 	}
 	sort.Strings(missing)
+
+	// Two kinds of index are not a decision about speed. mongod will not answer
+	// a $text query or a $geoNear without one, so a read of this namespace that
+	// falls through does not get slow, it fails, and the message it fails with
+	// names an index the application can see on the fast tier. Measured: a
+	// $text query with the text index on the fast tier alone came back "text
+	// index required for $text query", and answered as soon as the archive had
+	// one too.
+	required := false
+	for _, name := range missing {
+		if indexTypeNeedsItsIndex(wanted[name]) {
+			required = true
+		}
+	}
+	if required {
+		c.log.Warn("an index was built on the fast tier that the archive needs to answer at all",
+			"ns", ns, "indexes", missing,
+			"meaning", "a text or geospatial query is refused rather than slowed when the "+
+				"collection has no such index, so reads this router cannot answer from the "+
+				"fast tier will fail on the archive",
+			"action", "build the same index on the archive, or keep this namespace warm enough "+
+				"that these reads never fall through",
+			"why", "nothing copies an index between the tiers on purpose, and for these two "+
+				"kinds that choice costs the query rather than its speed")
+		return
+	}
+
 	c.log.Warn("an index was built on the fast tier and the archive does not have one over the same fields",
 		"ns", ns, "indexes", missing,
 		"meaning", "reads this router cannot answer from the fast tier are run on the archive, "+
@@ -80,6 +108,17 @@ func (c *conn) noteIndexNotOnTheArchive(ctx context.Context, cmd bson.Raw, db, c
 		"why", "nothing copies a plain index between the tiers on purpose: an index describes the "+
 			"whole collection, and carrying every one of them on the archive gives back most of "+
 			"what tiering buys")
+}
+
+// indexTypeNeedsItsIndex reports whether a key document describes an index a
+// query cannot run without, rather than one it runs slowly without.
+func indexTypeNeedsItsIndex(key string) bool {
+	for _, kind := range []string{`"text"`, `"2dsphere"`, `"2d"`} {
+		if strings.Contains(key, kind) {
+			return true
+		}
+	}
+	return false
 }
 
 // requestedIndexKeys reads the name and key of each index a createIndexes asks

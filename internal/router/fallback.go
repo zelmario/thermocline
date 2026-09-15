@@ -754,14 +754,18 @@ func liveOnly(filter bson.RawValue) bson.D {
 // both groups. The outer side of the same pipeline was right throughout, which
 // is what made this look like a working feature.
 func livePipeline(pipeline bson.RawValue) bson.A {
-	out := bson.A{bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}}
+	matchLive := bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}}
 	arr, ok := pipeline.ArrayOK()
 	if !ok {
-		return out
+		return bson.A{matchLive}
 	}
 	vals, err := arr.Values()
 	if err != nil {
-		return out
+		return bson.A{matchLive}
+	}
+	out := bson.A{}
+	if !startsWithGeoNear(vals) {
+		out = append(out, matchLive)
 	}
 	for _, v := range vals {
 		if doc, ok := v.DocumentOK(); ok {
@@ -769,6 +773,50 @@ func livePipeline(pipeline bson.RawValue) bson.A {
 		}
 	}
 	return out
+}
+
+// startsWithGeoNear reports whether a stage that has to come first does.
+//
+// One stage in the whole language cannot have anything put in front of it and
+// also reads the input documents, and this is the test for it. $collStats and
+// $indexStats have the same rule and are not here because they read no
+// documents, so no tombstone can reach them; $changeStream has it too and never
+// travels this path.
+func startsWithGeoNear(vals []bson.RawValue) bool {
+	if len(vals) == 0 {
+		return false
+	}
+	doc, ok := vals[0].DocumentOK()
+	if !ok {
+		return false
+	}
+	elems, err := doc.Elements()
+	if err != nil || len(elems) != 1 {
+		return false
+	}
+	return elems[0].Key() == "$geoNear"
+}
+
+// liveGeoNear puts the tombstone filter into a $geoNear's own query.
+func liveGeoNear(spec bson.Raw) (bson.D, bool) {
+	elems, err := spec.Elements()
+	if err != nil {
+		return nil, false
+	}
+	out := make(bson.D, 0, len(elems)+1)
+	sawQuery := false
+	for _, e := range elems {
+		if e.Key() == "query" {
+			out = append(out, bson.E{Key: "query", Value: liveOnly(e.Value())})
+			sawQuery = true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	if !sawQuery {
+		out = append(out, bson.E{Key: "query", Value: bson.D{meta.NotArchivedDeleted()}})
+	}
+	return out, true
 }
 
 // tombstoneRewriteDepth bounds the recursion below. A stage nested this deep
@@ -789,6 +837,22 @@ func liveStage(stage bson.Raw, depth int) any {
 	}
 	name, val := elems[0].Key(), elems[0].Value()
 	switch name {
+	case "$geoNear":
+		// $geoNear must be the first stage in the pipeline, so the tombstone
+		// filter cannot go in front of it. It takes a `query` of its own, which
+		// is what that filter is, and which is why this is a rewrite rather
+		// than a refusal.
+		//
+		// Measured before this, with a 2dsphere index on both tiers and nothing
+		// claiming the namespace: the same pipeline answered 3 straight at the
+		// archive and failed through the router with "$geoNear was not the
+		// first stage in the pipeline after optimization", which names the
+		// router's own $match and reads as the client's mistake.
+		spec, ok := liveGeoNear(subDoc(val))
+		if !ok {
+			return stage
+		}
+		return bson.D{{Key: name, Value: spec}}
 	case "$lookup":
 		spec, ok := liveJoin(subDoc(val), "from", depth)
 		if !ok {
@@ -928,7 +992,7 @@ func liveSubPipeline(pipeline bson.RawValue, depth int, prepend bool) (bson.A, b
 		return nil, false
 	}
 	out := bson.A{}
-	if prepend {
+	if prepend && !startsWithGeoNear(vals) {
 		out = append(out, bson.D{{Key: "$match", Value: bson.D{meta.NotArchivedDeleted()}}})
 	}
 	for _, v := range vals {

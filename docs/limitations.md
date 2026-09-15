@@ -57,6 +57,23 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **A `$text` query fails on the archive rather than running slowly, and so does
+  `$geoNear`.** Every other index is a decision about speed and the two tiers are
+  allowed to differ. These two are not: mongod refuses a `$text` query with no
+  text index and a `$geoNear` with no geospatial one, so a read of a tiered
+  namespace that falls through to an archive without them does not get slow, it
+  fails, and the message names an index the application can see on the fast tier.
+  Measured with the text index on the fast tier alone: `text index required for
+  $text query` through the router, answered straight at the fast tier, and
+  answered through the router as soon as the archive had one too.
+
+  The router says so where the difference is made rather than where it is felt:
+  a `createIndexes` building a text or geospatial index on a tiered namespace
+  the archive has no equivalent for gets its own line, saying the archive needs
+  it to answer at all rather than to answer quickly. Building it on the archive
+  is one answer and keeping the namespace warm enough that these reads never
+  fall through is the other.
+
 - **A tiered collection dropped on the archive reads as empty, while the fast
   tier still holds it.** The archive is the superset, which is what makes it
   right to answer a read the fast tier cannot claim from the archive alone. Take
