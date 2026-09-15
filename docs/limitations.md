@@ -762,10 +762,25 @@ Part of [Thermocline](../README.md).
   other side will not take.
 
   So: archive, then fast tier, then restart the daemons, then raise the feature
-  compatibility version on both. Reasoned from the exposure rather than measured
-  — `testversion.sh` builds the unequal pair and checks that every daemon
-  refuses to *start* against it, which is the other half of this and not this
-  half. Nobody has run a rolling upgrade under live traffic in either order.
+  compatibility version on both.
+
+  The ordering is still reasoned from the exposure: `testversion.sh` measures
+  that exposure on a static pair, where a pipeline the archive cannot parse fails
+  with the archive's own error, and it is one-directional. What had never been
+  run was the window itself, and `verskew.sh` runs it now — a deployment serving
+  traffic while the two tiers are a release apart, in both orders, against an
+  equal pair as the control. MongoDB 8.0.26 and 7.0.37, 200 inserts, 100
+  updates, 20 deletes and a read whose answer is on both sides of the boundary:
+  every arm mirrored all 180 surviving documents, refused none, kept its feeder
+  running and answered 182. So the window is survivable in either direction for
+  mirroring and for reads, and which way round to run it is still decided by the
+  exposure above rather than by anything measured here.
+
+  The control is what makes that readable. The first run of this reported that
+  an index created through the router never reached the archive and read as a
+  release-gap finding; the equal pair did exactly the same, because a plain index
+  is a decision about speed and the two tiers are allowed to differ. A check that
+  fails on an equal pair is measuring something else.
 
 - **The query cache drops an answer when a collection it depends on changes, and
   working out what it depends on is a best effort.** An entry is hung from every

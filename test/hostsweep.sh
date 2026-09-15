@@ -32,7 +32,7 @@ NODE=${NODE:-thermocline-zelmar-node0}
 # primary, which is the only thing that exercises that pool during a real
 # election. Set CHAOS_BOTH=0 to run only the default.
 CHAOS_BOTH=${CHAOS_BOTH:-1}
-SUITES=${SUITES:-"testrollback testfailover testalerts testversion testtls testsharded testchaos"}
+SUITES=${SUITES:-"testrollback testfailover testalerts testversion verskew testtls testsharded testchaos"}
 
 [ -f test/hostsweep.sh ] || { echo "run this from the repository root"; exit 2; }
 
@@ -78,6 +78,11 @@ why() {
       for i in mongo:8.0 mongo:7.0 mongo:7; do
         haveImage "$i" || { echo "docker pull mongo:8.0 mongo:7.0 mongo:7"; return; }
       done ;;
+    verskew)
+      for i in mongo:8.0 mongo:7.0; do
+        haveImage "$i" || { echo "docker pull mongo:8.0 mongo:7.0"; return; }
+      done
+      [ -x bin/cline ] || echo "bin/cline is not built: make build" ;;
     testtls)
       command -v openssl >/dev/null || { echo "openssl is not installed"; return; }
       command -v mongod  >/dev/null || echo "a host mongod is needed and not installed" ;;

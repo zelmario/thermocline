@@ -21,6 +21,7 @@
 # the other suites use is one release throughout.
 HOTA=${HOTA:-28070}   # the 7.0 server
 HOTB=${HOTB:-28071}   # the 8.0 server
+HOTC=${HOTC:-28072}   # a second 8.0 server, so the control pair is equal
 PORT=${PORT:-28075}
 DIR=$(mktemp -d /tmp/verskew.XXXXXX)
 BIN=${BIN:-$(pwd)/bin/cline}
@@ -31,7 +32,7 @@ chk() {
 }
 cleanup() {
   pkill -9 -f "cline.*$DIR" 2>/dev/null
-  docker rm -f tc-skew-7 tc-skew-8 >/dev/null 2>&1
+  docker rm -f tc-skew-7 tc-skew-8 tc-skew-8b >/dev/null 2>&1
   rm -rf "$DIR"
 }
 trap cleanup EXIT
@@ -50,11 +51,14 @@ docker run -d --rm --name tc-skew-7 -p $HOTA:$HOTA mongo:7.0 \
   mongod --replSet skew7 --port $HOTA --bind_ip_all --wiredTigerCacheSizeGB 0.25 --oplogSize 128 >/dev/null 2>&1
 docker run -d --rm --name tc-skew-8 -p $HOTB:$HOTB mongo:8.0 \
   mongod --replSet skew8 --port $HOTB --bind_ip_all --wiredTigerCacheSizeGB 0.25 --oplogSize 128 >/dev/null 2>&1
-for p in $HOTA $HOTB; do
+docker run -d --rm --name tc-skew-8b -p $HOTC:$HOTC mongo:8.0 \
+  mongod --replSet skew8b --port $HOTC --bind_ip_all --wiredTigerCacheSizeGB 0.25 --oplogSize 128 >/dev/null 2>&1
+for p in $HOTA $HOTB $HOTC; do
   for _ in $(seq 1 40); do mongosh --quiet --port $p --eval 'db.hello()' >/dev/null 2>&1 && break; sleep 1; done
 done
 M $HOTA "rs.initiate({_id:'skew7',members:[{_id:0,host:'127.0.0.1:$HOTA'}]})" >/dev/null
 M $HOTB "rs.initiate({_id:'skew8',members:[{_id:0,host:'127.0.0.1:$HOTB'}]})" >/dev/null
+M $HOTC "rs.initiate({_id:'skew8b',members:[{_id:0,host:'127.0.0.1:$HOTC'}]})" >/dev/null
 sleep 6
 REL7=$(M $HOTA 'const v=db.getSiblingDB("admin").runCommand({buildInfo:1}).versionArray; print(v[0]+"."+v[1])')
 REL8=$(M $HOTB 'const v=db.getSiblingDB("admin").runCommand({buildInfo:1}).versionArray; print(v[0]+"."+v[1])')
@@ -120,7 +124,7 @@ arm() { # label hotport hotset coldport coldset
   chk "  the router starts on the unequal pair"           "true" \
       "$(grep -q 'router listening' "$DIR/$label.router.log" 2>/dev/null && echo true || echo false)"
   chk "  and the feeder does"                             "true" \
-      "$(grep -q 'watching' "$DIR/$label.feeder.log" 2>/dev/null && echo true || echo false)"
+      "$(grep -q 'msg=mirroring' "$DIR/$label.feeder.log" 2>/dev/null && echo true || echo false)"
 
   # Traffic. Ordinary documents, an index, and a collection option, because a
   # release gap shows up in what one side will store rather than in a number.
@@ -137,12 +141,21 @@ arm() { # label hotport hotset coldport coldset
   done
   chk "  every write reached the archive"                 "$want" \
       "$(M $cp 'print(db.getSiblingDB("probe").orders.countDocuments({_tcDeletedAt:{$exists:false},_id:{$lt:900}}))')"
-  chk "  and the index did too"                           "true" \
+  # Not a check that it reached the archive, because it does not and that is the
+  # contract: a plain index is a decision about speed, the two tiers are allowed
+  # to differ, and `cline indexes` is what reports the difference. Asserted the
+  # other way round so the day that changes is noticed, and so this section is
+  # not read as a release-gap finding when the control does the same thing.
+  chk "  the index stayed on the fast tier, as documented"  "true" \
+      "$(M $hp 'print(db.getSiblingDB("probe").orders.getIndexes().some(i=>i.name==="n_1"))')"
+  chk "  and the archive still has only its own"            "false" \
       "$(M $cp 'print(db.getSiblingDB("probe").orders.getIndexes().some(i=>i.name==="n_1"))')"
   # The reason this matters more than a count: one refusal stops mirroring for
   # every namespace, not just the one that caused it.
+  # grep -c prints 0 and exits 1 when it matches nothing, so the obvious
+  # `|| echo 0` prints it twice and the check fails against a clean run.
   chk "  the feeder never refused a write"                "0" \
-      "$(grep -c 'the archive refused' "$DIR/$label.feeder.log" 2>/dev/null || echo 0)"
+      "$(grep -c 'the archive refuses' "$DIR/$label.feeder.log" 2>/dev/null | head -1)"
   chk "  and is still running"                            "true" \
       "$(pgrep -f "cline feeder --config $cfg" >/dev/null && echo true || echo false)"
 
@@ -152,6 +165,9 @@ arm() { # label hotport hotset coldport coldset
   pkill -9 -f "cline.*$cfg" 2>/dev/null; sleep 1
 }
 
+# The control, and it comes first. Every check below is about what a release gap
+# costs, and a check that fails on an equal pair is measuring something else.
+arm control "$HOTB" skew8 "$HOTC" skew8b
 arm A "$HOTA" skew7 "$HOTB" skew8
 arm B "$HOTB" skew8 "$HOTA" skew7
 
