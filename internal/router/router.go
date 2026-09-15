@@ -1285,7 +1285,10 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			// an error. See moveReadToPrimary.
 			if rdoc, derr := reply.ReplyDoc(); derr == nil && isFailoverReply(rdoc) {
 				if out, moved := c.moveReadToPrimary(ctx, msg, name, borrowed); moved {
-					reply = out
+					// The primary can have stepped down in the same breath, and
+					// then this reply says so too. It gets exactly what a read
+					// that went to the primary in the first place gets.
+					reply = c.afterFailoverReply(ctx, msg, name, out)
 				} else {
 					c.keepOrRelease(borrowed, reply)
 				}
@@ -1300,16 +1303,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			}
 			reply = out
 		} else if !fromPool {
-			if rdoc, derr := reply.ReplyDoc(); derr == nil && isFailoverReply(rdoc) {
-				// Whether or not this command can be sent again, the address
-				// this router is pinned to is wrong from here on.
-				c.r.primaryMoved()
-				if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
-					reply = out
-				} else {
-					c.endAfterFailover(ctx)
-				}
-			}
+			reply = c.afterFailoverReply(ctx, msg, name, reply)
 		}
 	}
 	// Every reply from the fast tier says what time the cluster thinks it is,
@@ -1883,6 +1877,26 @@ func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// afterFailoverReply gives a reply from the primary the treatment a reply saying
+// the primary moved needs, and returns the reply to send.
+//
+// Anything that is not such a reply comes back untouched, so callers can hand
+// every primary reply through this rather than deciding first.
+func (c *conn) afterFailoverReply(ctx context.Context, msg *wire.Message, name string, reply *wire.Message) *wire.Message {
+	rdoc, derr := reply.ReplyDoc()
+	if derr != nil || !isFailoverReply(rdoc) {
+		return reply
+	}
+	// Whether or not this command can be sent again, the address this router is
+	// pinned to is wrong from here on.
+	c.r.primaryMoved()
+	if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
+		return out
+	}
+	c.endAfterFailover(ctx)
+	return reply
 }
 
 func isClosed(err error) bool {

@@ -163,7 +163,14 @@ echo "== and while the fast tier has no primary at all =="
 # primary, and lift it on a timer. If the window does not open the section says
 # so rather than passing on a question nobody was asked.
 MEMBERS="172.24.0.5:27017 172.24.0.6:27017 172.24.0.7:27017"
-NOPRIMFOR=8
+# Three seconds, not eight, and the difference is the election that follows.
+# Lifting the freeze does not make a primary, it makes the members eligible: the
+# one that will win still has to wait out its election timeout, which is ten
+# seconds by default. So the window the client actually waits is this plus that,
+# and at eight it measured 18.5s and 16.9s against the router's own 20 second
+# bound and failed the run in between. What this section is for is whether the
+# router waits at all, not where its ceiling is.
+NOPRIMFOR=3
 D() { docker exec $NODE mongosh "mongodb://dba:secret@$1/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
 unfreezeAll() { for a in $MEMBERS; do D $a 'try{rs.freeze(0)}catch(e){}' >/dev/null 2>&1; done; }
 # Whatever happens below, the set must be left electable for the sections after
