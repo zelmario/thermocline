@@ -1431,7 +1431,7 @@ func (r *Router) UniqueNamespaces(ctx context.Context, candidates []string) []st
 // of an unclaimed constraint, and a warning naming a namespace that is fine
 // costs as much as silence over one that is not.
 func (r *Router) warnAboutUnclaimedUniqueKeys(ctx context.Context) {
-	for _, ns := range r.cfg.Managed {
+	for _, ns := range r.tieredNamespaces(ctx) {
 		for _, idx := range r.uniqueIndexes(ctx, ns) {
 			if r.registryHasAClaimFor(ctx, ns, idx) {
 				continue

@@ -433,6 +433,73 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 	}
 }
 
+// tieredNamespaces is every namespace this router tiers, as "db.coll".
+//
+// The list in the configuration when there is one, and the archive's own
+// collections when there is not, because `feeder.namespaces` empty tiers
+// everything and the archive is the superset. Every report that iterates
+// r.cfg.Managed directly says nothing at all in that configuration, which is
+// the deployment those reports matter most in.
+func (r *Router) tieredNamespaces(ctx context.Context) []string {
+	if len(r.cfg.Managed) > 0 {
+		return append([]string(nil), r.cfg.Managed...)
+	}
+	var out []string
+	for _, db := range r.archiveDatabases(ctx) {
+		cold, err := collectionsIn(ctx, r.cold, db)
+		if err != nil {
+			continue
+		}
+		for name, kind := range cold {
+			if kind == "collection" && !strings.HasPrefix(name, "system.") {
+				out = append(out, db+"."+name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// tieredByDatabase groups the namespaces this router tiers by database.
+//
+// `feeder.namespaces` empty is not "nothing", it is "everything except the
+// system databases and this deployment's own bookkeeping", and it is a
+// documented configuration. Reading r.cfg.Managed alone therefore answers
+// "nothing is tiered" for the deployment that tiers the most, which is how the
+// check above did nothing at all in exactly the shape it matters most in.
+func (r *Router) tieredByDatabase(ctx context.Context) map[string][]string {
+	byDB := map[string][]string{}
+	for _, ns := range r.cfg.Managed {
+		if db, coll := splitNS(ns); db != "" && coll != "" {
+			byDB[db] = append(byDB[db], coll)
+		}
+	}
+	if len(byDB) > 0 {
+		return byDB
+	}
+
+	names, err := r.hot.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return byDB
+	}
+	for _, db := range names {
+		if isSystemDatabase(db) || db == meta.DB {
+			continue
+		}
+		hot, herr := collectionsIn(ctx, r.hot, db)
+		if herr != nil {
+			continue
+		}
+		for name, kind := range hot {
+			if kind != "collection" || strings.HasPrefix(name, "system.") {
+				continue
+			}
+			byDB[db] = append(byDB[db], name)
+		}
+	}
+	return byDB
+}
+
 // warnAboutUnarchivedCollections names tiered collections the fast tier holds
 // and the archive does not.
 //
@@ -456,15 +523,8 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 // the count is taken: a namespace nothing has written to yet has no copy on
 // either tier and is not worth a word.
 func (r *Router) warnAboutUnarchivedCollections(ctx context.Context) {
-	byDB := map[string][]string{}
-	for _, ns := range r.cfg.Managed {
-		if db, coll := splitNS(ns); db != "" && coll != "" {
-			byDB[db] = append(byDB[db], coll)
-		}
-	}
-
 	var missing []string
-	for db, colls := range byDB {
+	for db, colls := range r.tieredByDatabase(ctx) {
 		hot, herr := collectionsIn(ctx, r.hot, db)
 		if herr != nil {
 			continue
@@ -475,6 +535,9 @@ func (r *Router) warnAboutUnarchivedCollections(ctx context.Context) {
 		}
 		for _, coll := range colls {
 			if hot[coll] == "" || cold[coll] != "" {
+				continue
+			}
+			if strings.HasPrefix(coll, "system.") {
 				continue
 			}
 			// An estimate, because the question is whether anything is there
@@ -754,7 +817,7 @@ func (r *Router) warnAboutOptionDrift(ctx context.Context) {
 	// asking per namespace took the router from 1.0s to 2.1s to start, and
 	// asking per database takes it back.
 	byDB := map[string][]string{}
-	for _, ns := range r.cfg.Managed {
+	for _, ns := range r.tieredNamespaces(ctx) {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
 			continue
@@ -1248,6 +1311,16 @@ func (r *Router) ensureFastTierIndexes(ctx context.Context) {
 			byDB[db] = append(byDB[db], ns)
 		}
 	}
+	// `feeder.namespaces` empty tiers everything, and reading the list alone
+	// answers "nothing" for it. That is not a quieter start, it is a fast tier
+	// left without the archive's unique indexes on the deployment that tiers
+	// the most. The archive is the superset, so it is the list.
+	everything := len(byDB) == 0
+	if everything {
+		for _, db := range r.archiveDatabases(ctx) {
+			byDB[db] = nil
+		}
+	}
 	for db, nss := range byDB {
 		cold, err := collectionsIn(ctx, r.cold, db)
 		if err != nil {
@@ -1257,6 +1330,13 @@ func (r *Router) ensureFastTierIndexes(ctx context.Context) {
 			r.log.Warn("could not list the archive's collections to build its indexes on the fast tier",
 				"db", db, "err", err)
 			continue
+		}
+		if everything {
+			for name := range cold {
+				if !strings.HasPrefix(name, "system.") {
+					nss = append(nss, db+"."+name)
+				}
+			}
 		}
 		for _, ns := range nss {
 			// Only real collections: a view holds no documents, so there is

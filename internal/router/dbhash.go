@@ -90,6 +90,19 @@ func (c *conn) shortForDBHash(ctx context.Context, db string, cmd bson.Raw) []st
 				wanted = append(wanted, coll)
 			}
 		}
+		// And `feeder.namespaces` empty tiers everything, where reading the
+		// list finds nothing and this guard would pass a hash of the fast
+		// tier's half as the database's. The archive is the superset, so it is
+		// what "everything" means here.
+		if len(c.r.cfg.Managed) == 0 {
+			if cold, err := collectionsIn(ctx, c.r.cold, db); err == nil {
+				for name, kind := range cold {
+					if kind == "collection" && !strings.HasPrefix(name, "system.") {
+						wanted = append(wanted, name)
+					}
+				}
+			}
+		}
 	}
 
 	var short []string

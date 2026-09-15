@@ -405,7 +405,7 @@ func (r *Router) Survey(ctx context.Context) error {
 // keys the constraint is not enforced across the pair at all.
 func (r *Router) warnAboutWhatAStartWouldBuild(ctx context.Context) {
 	byDB := map[string][]string{}
-	for _, ns := range r.cfg.Managed {
+	for _, ns := range r.tieredNamespaces(ctx) {
 		if db, _ := splitNS(ns); db != "" {
 			byDB[db] = append(byDB[db], ns)
 		}

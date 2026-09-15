@@ -57,6 +57,25 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **`feeder.namespaces` empty tiers everything, and several checks read the list
+  rather than asking what that means.** The configuration says so plainly and
+  `RouterConfig.Manages` honours it by answering true for every namespace. Nine
+  other places iterate the list directly, and for them empty meant nothing
+  rather than everything, so the deployment that tiers the most was the one
+  those checks did not run for at all.
+
+  Two of them cost more than a missing report. The fast tier was left without
+  the archive's unique indexes, because the startup build iterates the list; and
+  `dbHash` over such a database **answered**
+  `d41d8cd98f00b204e9800998ecf8427e`, the hash of nothing, for a database the
+  archive holds four documents in. The guard that exists to refuse exactly that
+  found no tiered collection to be careful about. `testeverything.sh` is the
+  suite for this shape, which had none before.
+
+  The archive is what "everything" means, because it is the superset, and that
+  is what the shared answer reads now. The remaining readers are reports whose
+  silence costs a line rather than an answer.
+
 - **With authentication proxied, a client's other connections are each refused
   once when the primary moves.** Every connection has an upstream of its own in
   that mode, and the refusal that ends one says nothing to the rest: they stay
