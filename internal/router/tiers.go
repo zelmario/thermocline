@@ -433,6 +433,74 @@ func (r *Router) warnAboutMissingWatermarks(ctx context.Context) {
 	}
 }
 
+// warnAboutUnarchivedCollections names tiered collections the fast tier holds
+// and the archive does not.
+//
+// This is the stranded case the other way round and it costs more, because the
+// archive is what answers. A tiered namespace the fast tier cannot claim is
+// complete is read from the archive, whatever the fast tier happens to hold, and
+// the archive being the superset is what makes that right. Take its collection
+// away and the read is answered from nothing: the documents are still on the
+// fast tier, present and unreachable, and the reply is ok.
+//
+// Measured on thirty mirrored documents with the archive's copy dropped out of
+// band: the fast tier still held all thirty, the client was told zero, and
+// nothing in either tier's log mentioned it. An eviction sweep over the same
+// namespace evicted nothing, which is the one piece of good news, so the fast
+// tier's copy is not at further risk while this stands.
+//
+// Three ways to arrive here and the advice differs, so the line names all three
+// rather than guessing: the collection was dropped on the archive, the archive
+// was restored from a backup older than the collection, or nothing has ever
+// mirrored this namespace because the feeder is not running. The last is why
+// the count is taken: a namespace nothing has written to yet has no copy on
+// either tier and is not worth a word.
+func (r *Router) warnAboutUnarchivedCollections(ctx context.Context) {
+	byDB := map[string][]string{}
+	for _, ns := range r.cfg.Managed {
+		if db, coll := splitNS(ns); db != "" && coll != "" {
+			byDB[db] = append(byDB[db], coll)
+		}
+	}
+
+	var missing []string
+	for db, colls := range byDB {
+		hot, herr := collectionsIn(ctx, r.hot, db)
+		if herr != nil {
+			continue
+		}
+		cold, cerr := collectionsIn(ctx, r.cold, db)
+		if cerr != nil {
+			continue
+		}
+		for _, coll := range colls {
+			if hot[coll] == "" || cold[coll] != "" {
+				continue
+			}
+			// An estimate, because the question is whether anything is there
+			// at all and the exact number would cost a scan. A namespace
+			// written to seconds ago and not yet mirrored lands here too, which
+			// is the mirroring lag and is named in the line below.
+			n, err := r.hot.Database(db).Collection(coll).EstimatedDocumentCount(ctx)
+			if err != nil || n == 0 {
+				continue
+			}
+			missing = append(missing, db+"."+coll)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	r.log.Warn("the fast tier holds tiered collections the archive does not",
+		"collections", missing,
+		"meaning", "a tiered collection the fast tier cannot claim is complete is read from the archive, "+
+			"so these answer as empty while the fast tier still holds the documents",
+		"action", "check the feeder is running and mirroring; if the archive lost them, the fast tier's "+
+			"copy is still there to put back, and an eviction sweep will not remove it",
+		"note", "a namespace written to in the last few seconds is here because mirroring has not caught up yet")
+}
+
 // warnAboutStrandedCollections names collections the archive holds that the
 // fast tier does not and that nothing tiers, because the application will not
 // be able to see them at all.

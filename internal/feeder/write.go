@@ -648,6 +648,7 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 		res, err := c.BulkWrite(ctx, models,
 			options.BulkWrite().SetOrdered(true).SetBypassDocumentValidation(true))
 		if err == nil {
+			f.noteInsertsOverExisting(ns, ops, res)
 			return res, nil
 		}
 		if i, dup, ok := refusedByUniqueIndex(err, ops); ok {
@@ -770,4 +771,39 @@ func (f *Feeder) warnReservedField(op pendingOp) {
 		"effect", "the archive's copy of this document is indistinguishable from one the application deleted, "+
 			"so a read the fast tier cannot answer will not return it",
 		"action", "rename the field; mirroring continues either way, and this is reported once per collection")
+}
+
+// noteInsertsOverExisting counts events that arrived as an insert on the fast
+// tier for an _id the archive already held.
+//
+// Through the router this cannot happen. An insert for an _id the archive holds
+// is refused as a duplicate key, which is what one cluster would do, and that
+// refusal is what stops a write destroying an archived document. So every one of
+// these is an insert that did not come through the router.
+//
+// Measuring before deciding what to say about it. docs/limitations.md says this
+// shape "occurs benignly when a feeder replays events after a restart", and a
+// warning that fires in ordinary operation is a line nobody reads. The count is
+// here so the claim can be checked against a running deployment rather than
+// argued about.
+func (f *Feeder) noteInsertsOverExisting(ns string, ops []pendingOp, res *mongo.BulkWriteResult) {
+	if res == nil {
+		return
+	}
+	var n int
+	for i, op := range ops {
+		if !op.wasInsert {
+			continue
+		}
+		if _, upserted := res.UpsertedIDs[int64(i)]; upserted {
+			continue
+		}
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	f.insertsOverExisting += int64(n)
+	f.log.Debug("mirrored an insert onto a document the archive already held",
+		"ns", ns, "count", n, "total", f.insertsOverExisting)
 }

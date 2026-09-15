@@ -267,6 +267,8 @@ feeder:
     # collection whose cursor the router only forwards.
     - "shop.tfail"
     - "shop.tfoc"
+    - "shop.tarchdrop"
+    - "shop.tlostarch"
     # testindexes.sh
     - "shop.tidx"
     # testindexes.sh again, for what `cline indexes` reports and what it

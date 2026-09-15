@@ -192,8 +192,10 @@ HOTMEMBERS="172.24.0.5:27017 172.24.0.6:27017 172.24.0.7:27017"
 DIRECT() { mongosh "mongodb://dba:secret@$1/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
 NORETRY() { mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin&readPreference=secondary&retryReads=false" --quiet --eval "$1" 2>&1 | tail -1; }
 maintOff() { for a in $HOTMEMBERS; do DIRECT $a 'try{ db.adminCommand({replSetMaintenance:false}) }catch(e){}' >/dev/null 2>&1; done; }
-# A member left in RECOVERING is not this suite's to leave behind.
-trap 'maintOff' EXIT
+# A member left in RECOVERING is not this suite's to leave behind, and the
+# suite's own cleanup still has to run: replacing the trap rather than adding to
+# it is how this section first left a router and its daemons behind.
+trap 'maintOff; cleanup' EXIT
 RPRIM=$(H 'print(db.hello().primary)')
 RVICTIM=""
 for a in $HOTMEMBERS; do [ "$a" = "$RPRIM" ] && continue; RVICTIM=$a; break; done
@@ -211,7 +213,7 @@ chk "ten reads with retries off, none refused"          "0" "$RBAD"
 chk "and the router said which member it stopped using" "true" \
     "$(grep -qc "not readable" $LOG >/dev/null 2>&1 && grep -q "$RVICTIM" $LOG && echo true || echo false)"
 maintOff
-trap - EXIT
+trap cleanup EXIT
 
 echo "== the router counts what it moved =="
 chk "secondary reads are counted"                       "true" \

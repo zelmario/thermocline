@@ -339,6 +339,7 @@ func (r *Router) Survey(ctx context.Context) error {
 	}
 	r.warnAboutMissingWatermarks(ctx)
 	r.warnAboutStrandedCollections(ctx)
+	r.warnAboutUnarchivedCollections(ctx)
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
@@ -472,6 +473,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	}
 	r.warnAboutMissingWatermarks(ctx)
 	r.warnAboutStrandedCollections(ctx)
+	r.warnAboutUnarchivedCollections(ctx)
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)

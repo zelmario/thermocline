@@ -6,7 +6,7 @@
 #
 #   bash test/testalerts.sh
 #
-# Why it exists. docs/monitoring.md carries eleven alert rules and they were written
+# Why it exists. docs/monitoring.md carries a dozen alert rules and they were written
 # down and never run. That is a strange thing to leave unproved: the rules are
 # what an operator is told to trust, and a rule that does not fire is
 # indistinguishable from a system with nothing wrong. The failure modes are all

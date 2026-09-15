@@ -90,6 +90,11 @@ type Feeder struct {
 	// per namespace, which happens when deletes arrive that nothing announced.
 	// Same goroutine. See recheckKindOnUnannounced.
 	kindRechecked map[string]time.Time
+
+	// insertsOverExisting counts inserts mirrored onto an _id the archive
+	// already held, which through the router cannot happen. See
+	// noteInsertsOverExisting.
+	insertsOverExisting int64
 	// Where mirroring's time goes, since the rate it sustains is a ceiling on
 	// how fast the fast tier can take writes before every fall-through read
 	// waits. End-to-end timing on a loaded machine varied by 70% between runs

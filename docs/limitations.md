@@ -48,6 +48,32 @@ Part of [Thermocline](../README.md).
   operational: only the router should hold credentials that can write to the
   fast tier's application databases.
 
+- **A tiered collection dropped on the archive reads as empty, while the fast
+  tier still holds it.** The archive is the superset, which is what makes it
+  right to answer a read the fast tier cannot claim from the archive alone. Take
+  the archive's copy away and that read is answered from nothing.
+
+  Measured on thirty mirrored documents with the archive's copy dropped straight
+  at the archive's mongod: the fast tier still held all thirty, the client was
+  told zero, and neither tier's log mentioned it. One piece of good news in it,
+  also measured: an eviction sweep over the same namespace evicted nothing, so
+  the fast tier's copy is not at further risk while this stands.
+
+  The same state arrives three ways and the advice differs, so the router names
+  all three rather than guessing: the collection was dropped on the archive, the
+  archive was restored from a backup older than the collection, or nothing has
+  ever mirrored the namespace because the feeder is not running. The last is why
+  the check counts documents first: a namespace nothing has written to yet has
+  no copy on either tier and is not worth a word.
+
+  It is said at startup and by `cline survey`, which is where the mirror image
+  of it is already said, and not on the read path: the read that goes short is
+  the cheapest possible one and putting a catalog lookup on it would cost every
+  deployment for a state almost none of them are in. So a drop that happens
+  while a router runs is named at its next start rather than at once, and the
+  first run of this named two namespaces left behind by the test suites that
+  nobody had noticed.
+
 - **A collection converted to capped while it is being mirrored stops the
   feeder.** The kind check runs at startup and again the first time an event for
   a namespace arrives, and it remembers its answer until the collection is

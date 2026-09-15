@@ -208,6 +208,18 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "the router is answering from an unverifiable completeness claim; is the archive down, or is the router partitioned?"
+      - alert: ThermoclineMemberNotReadable
+        # A member of the fast tier is in the set and refusing reads, which is
+        # what a resync, an initial sync or a maintenance window looks like from
+        # the router. Reads are being answered by the remaining members, so
+        # nothing is wrong with the answers; what is wrong is that the load is
+        # not spread the way the deployment was sized for. Only ever fires where
+        # router.terminate_auth is on, since that is where read preference is
+        # honoured at all.
+        expr: increase(thermocline_secondary_reads_moved_total[10m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "a fast tier member is in the set and not readable; reads that asked for a secondary are going to the primary"
       - alert: ThermoclineUnguardedOrUnauthorized
         expr: increase(thermocline_unauthorized_total[15m]) > 0
           or increase(thermocline_unreadable_total[15m]) > 0

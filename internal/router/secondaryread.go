@@ -303,13 +303,17 @@ func (r *Router) avoidSecondary(addr string) {
 // reading it again on the primary is the same fallback this already does when a
 // secondary cannot be dialled at all.
 func (c *conn) moveReadToPrimary(ctx context.Context, msg *wire.Message, name string, borrowed *pooled) (*wire.Message, bool) {
+	// Noted before the command is looked at, because what the member said about
+	// itself does not depend on which command asked.
+	c.r.avoidSecondary(borrowed.pool.addr)
+
 	// A cursor lives on the node that made it and cannot be moved, so the
 	// client is told, which is exactly what it would be told talking to the set
-	// directly.
+	// directly. The member still leaves the rotation, so the next read does not
+	// go the same way.
 	if name == "getMore" || name == "killCursors" {
 		return nil, false
 	}
-	c.r.avoidSecondary(borrowed.pool.addr)
 	borrowed.discard()
 	c.unpinExhausted(borrowed)
 

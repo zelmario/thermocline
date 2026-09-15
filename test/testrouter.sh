@@ -421,6 +421,43 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== a tiered collection the archive does not have =="
+# The stranded case the other way round, and it costs more than an empty
+# catalogue. A tiered namespace the fast tier cannot claim is complete is read
+# from the archive whatever the fast tier holds, because the archive being the
+# superset is what makes that right. Take its collection away and the read is
+# answered from nothing: the documents are on the fast tier, present and
+# unreachable, and the reply is ok.
+#
+# Measured on thirty mirrored documents with the archive's copy dropped out of
+# band: fast tier 30, archive 0, client told 0, and nothing said anywhere. An
+# eviction sweep over the same namespace evicted nothing, so the fast tier's
+# copy is not at further risk while this stands, which is the only good news in
+# it.
+H "db.getSiblingDB(process.env.TC_DB).tlostarch.drop();
+   db.getSiblingDB(process.env.TC_DB).tlostarch.insertMany([{_id:1,v:'a'},{_id:2,v:'b'},{_id:3,v:'c'}])" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tlostarch.drop()" >/dev/null
+rm -f $LOGDIR/lostarch_r.log
+cline router --config $CFG --log-file $LOGDIR/lostarch_r.log & AP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the fast tier holds three"                 "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tlostarch.countDocuments({}))")"
+chk "the archive holds none"                    "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tlostarch.countDocuments({}))")"
+chk "and the client is told none of them"       "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tlostarch.countDocuments({}))")"
+kill $AP 2>/dev/null; wait $AP 2>/dev/null
+# Which is why it has to be said. Correct and silent is the wrong pair again.
+chk "the router named it at startup"            "true" \
+    "$(grep -q 'the fast tier holds tiered collections the archive does not' $LOGDIR/lostarch_r.log && echo true || echo false)"
+chk "and named the collection"                  "true" \
+    "$(grep 'the fast tier holds tiered collections the archive does not' $LOGDIR/lostarch_r.log | grep -q "$DB.tlostarch" && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).tlostarch.drop()" >/dev/null
+
 echo "== another deployment's bookkeeping, with one of MongoDB's own beside it =="
 # The exclusion above is for another Thermocline's bookkeeping database, which
 # must not be reported as an application's data: the advice that follows is to
