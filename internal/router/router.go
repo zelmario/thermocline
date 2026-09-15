@@ -58,6 +58,11 @@ type Router struct {
 	// members is every node of the fast tier, so a read asking for a secondary
 	// can be sent to one.
 	members []string
+	// primaryRefused records that a member answered "not primary" and that no
+	// lookup since has found one. It exists because a dial cannot tell: a
+	// member that steps down stays up and keeps accepting connections, so the
+	// pinned address is reachable and wrong at the same time.
+	primaryRefused bool
 	// primaryProbeAt throttles re-resolving after a refusal. Every command in
 	// flight when a primary steps down comes back refused the same way, and one
 	// lookup answers all of them. primaryProbing is non-nil while one is
@@ -1612,6 +1617,10 @@ func (r *Router) currentPrimary() string {
 	return r.primary
 }
 
+// errNoPrimaryYet says the lookup reached the fast tier and there is no primary
+// to point at, which is an election rather than a failure.
+var errNoPrimaryYet = errors.New("the fast tier has no primary yet")
+
 // refreshPrimary asks the fast tier which member is currently primary.
 //
 // Raw byte proxying needs one address, but a replica set moves. Re-resolving
@@ -1622,6 +1631,7 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 		Primary string   `bson:"primary"`
 		Me      string   `bson:"me"`
 		Hosts   []string `bson:"hosts"`
+		SetName string   `bson:"setName"`
 	}
 	err := r.hot.Database("admin").
 		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
@@ -1631,6 +1641,16 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 
 	addr := hello.Primary
 	if addr == "" {
+		// `me` is the right answer only where there is no set to have a
+		// primary. A replica set member that knows of no primary is an election
+		// in progress, and pinning whichever member answered would pin a
+		// secondary: every write through it would be refused, and the refusal
+		// would look exactly like the stale pin this function exists to clear.
+		// Reachable whenever the fast tier URI carries a read preference, which
+		// is the operator's to write.
+		if hello.SetName != "" || len(hello.Hosts) > 0 {
+			return errNoPrimaryYet
+		}
 		addr = hello.Me
 	}
 	if addr == "" {
@@ -1642,6 +1662,7 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 	old := r.primary
 	r.primary = addr
 	r.members = hello.Hosts
+	r.primaryRefused = false
 	r.primaryMu.Unlock()
 
 	if changed {
@@ -1689,6 +1710,12 @@ const primaryProbeWait = 5 * time.Second
 // election, and waiting for that here would stall a connection that has an
 // answer to deliver.
 func (r *Router) primaryMoved() {
+	// Before the throttle, because every refusal is evidence about the pin
+	// whether or not this one is the caller that gets to go and look.
+	r.primaryMu.Lock()
+	r.primaryRefused = true
+	r.primaryMu.Unlock()
+
 	r.primaryProbeMu.Lock()
 	if r.primaryProbing != nil || time.Since(r.primaryProbeAt) < primaryProbeEvery {
 		r.primaryProbeMu.Unlock()
@@ -1765,12 +1792,48 @@ func (r *Router) awaitPrimaryProbe(ctx context.Context) {
 // behaviour the application would have had without the proxy.
 const primaryWait = 20 * time.Second
 
+// primaryKnown reports whether the pinned address is still believed to be the
+// primary, meaning no member has refused a command as not primary since the
+// last successful lookup.
+func (r *Router) primaryKnown() bool {
+	r.primaryMu.RLock()
+	defer r.primaryMu.RUnlock()
+	return !r.primaryRefused
+}
+
 func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(primaryWait)
 
 	var lastErr error
 	for attempt := 0; ; attempt++ {
+		// A failed dial is not what finds a stale pin, and waiting for one is
+		// why this used to fail. A member that steps down stays up and keeps
+		// accepting connections, so the dial below succeeds against a member
+		// that will refuse every command: the wait never engaged and the client
+		// was told "not primary" on its first write instead of pausing.
+		// Measured with the two other members frozen so no election could
+		// finish: the write failed outright, where a driver talking to the set
+		// directly would have blocked in server selection. So when the last
+		// thing this router heard was a refusal, ask who is primary before
+		// dialing anybody, and keep asking until somebody is.
+		for !r.primaryKnown() {
+			rctx, cancel := context.WithTimeout(ctx, primaryProbeWait)
+			err := r.refreshPrimary(rctx)
+			cancel()
+			if err == nil {
+				break
+			}
+			lastErr = err
+			if time.Now().After(deadline) || ctx.Err() != nil {
+				return nil, fmt.Errorf("the fast tier has no primary to connect to: %w", lastErr)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 		addr := r.currentPrimary()
 		conn, err := d.DialContext(ctx, "tcp", addr)
 		if err == nil {

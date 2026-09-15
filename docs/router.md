@@ -64,13 +64,25 @@ Range queries are governed by the watermark below.
   connection to the fast tier, so SCRAM works, at the cost of one upstream
   connection per client. It also sets what happens during a fast tier election:
   the router never sees the credentials, so it cannot re-authenticate a fresh
-  upstream and replay a command that was in flight. Writes issued while the fast
-  tier has no primary fail and the client has to retry, where a driver talking
-  to the replica set directly would block in server selection instead. Measured
-  during a real election: six writes a second apart were refused, every
+  upstream and replay a command that was in flight. The command in flight when
+  the primary goes away fails and the client has to retry it, where a driver
+  talking to the replica set directly would block in server selection instead.
+  Measured during a real election: six writes a second apart were refused, every
   acknowledged write was present, none was applied twice, and a retry finished
-  the job. A client reconnecting mid-election now waits up to 20 seconds for a
-  new primary rather than failing outright.
+  the job.
+
+  The client's retry is a new connection, and that connection waits up to 20
+  seconds for the fast tier to have a primary rather than failing outright,
+  which is the pause a driver would have had. That wait used to be reachable
+  only when the pinned member was *down*, because it hung off a failed dial, and
+  a member that steps down stays up and accepts connections perfectly well: the
+  dial succeeded, the client's first write came back `not primary`, and its one
+  retry was spent. Measured with every member frozen so no election could
+  finish, 3 of 3 writes were refused. It now asks who is primary before dialing
+  anybody whenever the last thing it heard was such a refusal, and keeps asking
+  until somebody is: 4 of 4 paused and landed, applied exactly once each. A
+  window longer than the wait still ends the connection rather than holding it,
+  and the router logs the set's own topology as the reason.
 
   A client that is *already* connected was the worse half of this, and it was
   not a pause but a permanent outage. The router re-resolved which member is

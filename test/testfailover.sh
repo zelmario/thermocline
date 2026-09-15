@@ -140,6 +140,85 @@ chk "and nothing was applied twice"                    "true" \
 chk "a client connecting after it reaches the new primary" "true" \
     "$(RW "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d !== null)")"
 
+echo "== and while the fast tier has no primary at all =="
+# The check above races an election. The driver retries a write once, and if a
+# primary exists by then the retry lands, which it did nine runs in ten. The
+# tenth looked like a flake and was not.
+#
+# A member that steps down stays up and keeps accepting connections, so the
+# router's dial succeeded against a member that refuses every command, and the
+# 20 second wait for a primary never engaged because nothing ever failed to
+# dial. That is the same defect the comment above describes for a connection
+# already open, left unfixed on the path a reconnecting client takes. It now
+# asks who is primary before dialing anybody whenever the last thing it heard
+# was a refusal, and keeps asking until somebody is. Measured with every member
+# frozen so no election could finish: 3 of 3 writes refused before, 4 of 4
+# paused and landed after, applied exactly once each time, and a window longer
+# than the wait still fails rather than hanging.
+#
+# Holding the window open is the awkward part, and the first version of this
+# lied about having it: a stepDown with the other members frozen is refused
+# often enough to matter, and reading the topology straight afterwards reads a
+# view the driver has not rescanned yet. So freeze everybody, prove there is no
+# primary, and lift it on a timer. If the window does not open the section says
+# so rather than passing on a question nobody was asked.
+MEMBERS="172.24.0.5:27017 172.24.0.6:27017 172.24.0.7:27017"
+NOPRIMFOR=8
+D() { docker exec $NODE mongosh "mongodb://dba:secret@$1/?authSource=admin&directConnection=true" --quiet --eval "$2" 2>&1 | tail -1; }
+unfreezeAll() { for a in $MEMBERS; do D $a 'try{rs.freeze(0)}catch(e){}' >/dev/null 2>&1; done; }
+# Whatever happens below, the set must be left electable for the sections after
+# it, and a 60 second freeze outlives this suite.
+trap 'unfreezeAll; cleanup' EXIT
+
+stopRouter
+H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:200}})" >/dev/null
+startRouter $BASE
+# Three goes at it. The section above has just moved the primary, so the first
+# read of who holds it can be a member that no longer does: the freeze then
+# skips the real primary and the stepDown is sent to a secondary, both are
+# refused, and nothing happens. That is how this reported a skip the first time
+# it ran.
+waitForPrimary
+NOPRIM=""
+for _ in 1 2 3; do
+  PRIM=$(primaryNow)
+  [ -n "$PRIM" ] || { waitForPrimary; continue; }
+  for a in $MEMBERS; do [ "$a" = "$PRIM" ] || D $a 'try{ rs.freeze(60) }catch(e){}' >/dev/null; done
+  # force, because an ordinary stepDown wants an electable secondary caught up
+  # and the two frozen ones do not count as electable: measured, it refused
+  # with ExceededTimeLimit about half the time and the window never opened.
+  D "$PRIM" 'try { db.adminCommand({replSetStepDown: 60, force: true}) } catch (e) {}' >/dev/null
+  sleep 3
+  NOPRIM=$(H 'print(db.hello().primary || "NONE")')
+  case "$NOPRIM" in NONE|*Error*) break ;; esac
+  unfreezeAll
+  waitForPrimary
+done
+case "$NOPRIM" in
+  NONE|*Error*)
+    ( sleep $NOPRIMFOR; unfreezeAll ) &
+    LIFTER=$!
+    T0=$(date +%s%N)
+    NPOUT=$(RW "const r=db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$inc:{v:1}}); print('matched='+r.matchedCount)")
+    T1=$(date +%s%N)
+    wait $LIFTER
+    waitForPrimary
+    echo "      no primary for ${NOPRIMFOR}s, the client waited $(( (T1-T0)/1000000 ))ms"
+    chk "a write with nowhere to go waits and lands"    "matched=1" "$NPOUT"
+    # 201 means it waited and applied once. 200 means it was refused, which is
+    # the defect. 202 means it was applied twice, which would be worse than
+    # either.
+    chk "and it was applied exactly once"               "201" \
+        "$(H "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?d.v:'MISSING')")"
+    ;;
+  *)
+    unfreezeAll
+    waitForPrimary
+    echo "      SKIP  the window never opened, primary is $NOPRIM (2 checks)"
+    ;;
+esac
+unfreezeAll
+
 # A cursor open across a change of primary.
 #
 # Two cursors are involved in one tiered read and they live on different
