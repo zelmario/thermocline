@@ -269,6 +269,7 @@ feeder:
     - "shop.tfoc"
     - "shop.tarchdrop"
     - "shop.tlostarch"
+    - "shop.tidxsay"
     # testindexes.sh
     - "shop.tidx"
     # testindexes.sh again, for what `cline indexes` reports and what it

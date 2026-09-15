@@ -1147,6 +1147,61 @@ C "db.getSiblingDB(process.env.TC_DB).$VNS.drop()" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.deleteMany({vprobe:'after'})" >/dev/null
 
+echo "== an index built through the router is on one tier, and it says so =="
+# Nothing copies a plain index between the tiers and nothing should: an index
+# describes the whole collection, and carrying every one of them on the archive
+# gives back most of what tiering buys. `cline indexes` is the report that
+# decision is made from, and it is a command somebody has to remember to run.
+#
+# What was missing is the moment. An application adding an index for a new query
+# gets it on the fast tier, where the working set is, and every read that falls
+# through runs on the archive without it. On a multi-terabyte archive that is
+# minutes against milliseconds, which is `cline indexes`' own argument for
+# existing, and until this the divergence was made by an ordinary application
+# command with nobody watching.
+IXNS=tidxsay
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+rm -f $LOGDIR/idx_r.log
+startRouter
+R "db.getSiblingDB(process.env.TC_DB).$IXNS.insertMany([{_id:1,grp:'a',at:new Date()},{_id:2,grp:'b',at:new Date()}])" >/dev/null
+R "print(db.getSiblingDB(process.env.TC_DB).$IXNS.createIndex({grp:1},{name:'grp_1'}))" >/dev/null
+sleep 2
+chk "the fast tier has it"                             "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$IXNS.getIndexes().some(i=>i.name==='grp_1'))")"
+# Caught, because getIndexes on a collection the archive does not hold throws,
+# and "the archive does not have this index" is true either way. No feeder runs
+# in this section, so the archive has never heard of the namespace at all.
+chk "and the archive does not"                         "false" \
+    "$(C "try{ print(db.getSiblingDB(process.env.TC_DB).$IXNS.getIndexes().some(i=>i.name==='grp_1')) }catch(e){ print('false') }")"
+chk "the router said which index and which namespace"  "true" \
+    "$(grep 'the archive does not have one over the same fields' $LOGDIR/idx_r.log | grep -q "grp_1" && echo true || echo false)"
+# Once, not once per build. A client that recreates an index in a loop must not
+# fill the log, and building an index is rare enough that once is generous.
+R "print(db.getSiblingDB(process.env.TC_DB).$IXNS.createIndex({grp:1},{name:'grp_1'}))" >/dev/null
+sleep 2
+chk "and said it once rather than per build"           "1" \
+    "$(grep -c 'the archive does not have one over the same fields' $LOGDIR/idx_r.log)"
+# By key rather than by name, because an archive index over the same fields
+# under another name serves the read exactly as well, and a warning an operator
+# checks and finds nothing wrong with is how a warning stops being read.
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.createIndex({at:1},{name:'archive_at'})" >/dev/null
+R "print(db.getSiblingDB(process.env.TC_DB).$IXNS.createIndex({at:1},{name:'fast_at'}))" >/dev/null
+sleep 2
+chk "an archive index under another name is enough"    "1" \
+    "$(grep -c 'the archive does not have one over the same fields' $LOGDIR/idx_r.log)"
+# And a collection nothing tiers is the fast tier's alone, so there is no
+# archive read to be slow.
+R "db.getSiblingDB(process.env.TC_DB).tidxsayuntiered.insertOne({a:1});
+   print(db.getSiblingDB(process.env.TC_DB).tidxsayuntiered.createIndex({a:1}))" >/dev/null
+sleep 2
+chk "and nothing is said for a namespace it manages not" "1" \
+    "$(grep -c 'the archive does not have one over the same fields' $LOGDIR/idx_r.log)"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop(); db.getSiblingDB(process.env.TC_DB).tidxsayuntiered.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

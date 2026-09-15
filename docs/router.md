@@ -427,6 +427,21 @@ Range queries are governed by the watermark below.
   about speed, the two tiers are allowed to differ, and you may want one on the
   archive for the reads that fall through; `cline indexes` reports that, and
   flags a unique index missing from the fast tier as the hazard it is.
+
+  **The router now says so at the moment the difference is made.** `cline
+  indexes` is a report somebody has to remember to run, and the divergence is
+  created by an ordinary application command that nobody is watching: an index
+  added for a new query lands on the fast tier, where the working set is, and
+  every read that falls through runs on the archive without it. On a
+  multi-terabyte archive that is minutes against milliseconds, which is that
+  command's own argument for existing. So a `createIndexes` on a tiered
+  namespace that leaves the archive without an index over the same fields is one
+  WARN naming the index and the namespace. Once per index per router, because a
+  client that rebuilds one should not fill the log, and compared by key rather
+  than by name, because an archive index over the same fields under another name
+  serves the read exactly as well. A unique index raises it too: the constraint
+  is enforced by the key registry across both tiers rather than by an index on
+  the archive, so the archive has none and a read filtering on that field scans.
 - **A tiered collection cannot be turned into one the feeder cannot mirror.**
   `convertToCapped`, `cloneCollectionAsCapped`, and `create` asking for `capped`
   or `timeseries` are refused on a tiered namespace. The feeder already refuses

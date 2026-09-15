@@ -67,6 +67,10 @@ type Router struct {
 	// because it answered a read saying it is neither primary nor secondary.
 	avoidMu    sync.Mutex
 	avoidUntil map[string]time.Time
+	// fastOnlyIndexes remembers which indexes this router has already said are
+	// on the fast tier alone, so a client that rebuilds one produces one line.
+	fastOnlyMu      sync.Mutex
+	fastOnlyIndexes map[string]bool
 	// primaryProbeAt throttles re-resolving after a refusal. Every command in
 	// flight when a primary steps down comes back refused the same way, and one
 	// lookup answers all of them. primaryProbing is non-nil while one is
@@ -1335,6 +1339,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// a field unique.
 	if cmd, cerr := msg.CommandDoc(); cerr == nil {
 		if coll, ok := indexDDL(cmd, name); ok {
+			// Said here rather than left to `cline indexes`, which is a report
+			// somebody has to remember to run, and this is the moment the
+			// divergence is made. See newindex.go.
+			if name == "createIndexes" {
+				c.noteIndexNotOnTheArchive(ctx, cmd, db, coll, reply)
+			}
 			// Stale rather than forgotten, and then read again on purpose.
 			// Forgetting leaves nothing for the next listing to be compared
 			// against, and that comparison is what notices a unique index has
