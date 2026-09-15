@@ -395,6 +395,21 @@ Range queries are governed by the watermark below.
   nobody. Clearing the checkpoint restarts mirroring from now, which hides the
   gap rather than closing it, so copy the affected namespaces into the archive
   first.
+
+  **Copying them closes two of the three things that can happen in that window,
+  and cannot close the third.** Measured on ten mirrored documents with the
+  feeder stopped, one update, one insert and one delete made against the fast
+  tier, the oplog rolled, and the remedy then followed exactly: the updated
+  document came back right, the inserted one arrived, and the deleted one stayed
+  live in the archive and was served to a client. The router counted eleven
+  where the application had left ten.
+
+  It is not an oversight in the remedy, it is what the remedy can see. A delete
+  leaves nothing on the fast tier to copy, so copying the fast tier cannot know
+  it happened. What can know is the completeness claim: inside the range the
+  fast tier claims to hold in full, a document the archive holds live and the
+  fast tier does not is one that was deleted. `cline backfill` does both halves
+  and is the command to run here; doing it by hand does the first half only.
 - **A sorted `findAndModify` acts on the document the sort really names.** The
   sort is how you say which of several matches you mean, and the fast tier can
   only choose from the part it holds. The repair paths for a write that matched

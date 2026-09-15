@@ -57,6 +57,28 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **A delete made while nothing was mirroring cannot be recovered by copying the
+  fast tier, and `cline backfill` is what closes it.** The feeder exits when the
+  fast tier's oplog has rolled past its checkpoint, and the remedy named there
+  is to copy the affected namespaces into the archive. Measured on ten mirrored
+  documents with the feeder stopped, one update, one insert and one delete, and
+  the remedy then followed by hand: the update came back right, the insert
+  arrived, and the deleted document stayed live in the archive and was served to
+  a client. The router counted eleven where the application had left ten.
+
+  A delete leaves nothing on the fast tier to copy, so copying cannot know it
+  happened. The completeness claim can: inside the range the fast tier claims to
+  hold in full, a document the archive holds live and the fast tier does not is
+  one that was deleted. `cline backfill` does both halves, reports before it
+  writes, and refuses twice on the way: while a feeder is still publishing,
+  because it would be closing a window something is still writing into; and when
+  the claim is one the fast tier cannot support, because marking on the strength
+  of a wrong claim tombstones the archive rather than recovering it.
+
+  What it cannot do is invent the claim. A namespace nothing has claimed gets
+  the copy and no marking, and says so, because without a claim there is no
+  range in which absence means anything.
+
 - **`feeder.namespaces` empty tiers everything, and several checks read the list
   rather than asking what that means.** The configuration says so plainly and
   `RouterConfig.Manages` honours it by answering true for every namespace. Nine

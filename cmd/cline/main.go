@@ -64,6 +64,12 @@ Usage:
                                           writing to either: the checks a router
                                           runs at startup, and none of the
                                           building it does
+  cline backfill --config FILE [--ns NS] [--apply] [--force]
+                                          close the hole a stopped feeder left:
+                                          copy the fast tier's documents into the
+                                          archive, and mark the ones it holds
+                                          that the application deleted while
+                                          nothing was mirroring
   cline rollback --config FILE [--ns NS] [--clear] [--force]
                                           count, and then remove, the documents
                                           the archive holds marked deleted, so it
@@ -115,6 +121,8 @@ func run() error {
 		return runCache(os.Args[2:])
 	case "rollback":
 		return runRollback(os.Args[2:])
+	case "backfill":
+		return runBackfill(os.Args[2:])
 	case "version":
 		fmt.Println("cline 0.1.0-dev")
 		return nil

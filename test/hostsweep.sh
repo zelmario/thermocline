@@ -32,7 +32,7 @@ NODE=${NODE:-thermocline-zelmar-node0}
 # primary, which is the only thing that exercises that pool during a real
 # election. Set CHAOS_BOTH=0 to run only the default.
 CHAOS_BOTH=${CHAOS_BOTH:-1}
-SUITES=${SUITES:-"testrollback testfailover testalerts testversion verskew testeverything testtls testsharded testchaos"}
+SUITES=${SUITES:-"testrollback testbackfill testfailover testalerts testversion verskew testeverything testtls testsharded testchaos"}
 
 [ -f test/hostsweep.sh ] || { echo "run this from the repository root"; exit 2; }
 
@@ -84,6 +84,9 @@ why() {
       done
       [ -x bin/cline ] || echo "bin/cline is not built: make build" ;;
     testeverything)
+      haveImage mongo:8.0 || { echo "docker pull mongo:8.0"; return; }
+      [ -x bin/cline ] || echo "bin/cline is not built: make build" ;;
+    testbackfill)
       haveImage mongo:8.0 || { echo "docker pull mongo:8.0"; return; }
       [ -x bin/cline ] || echo "bin/cline is not built: make build" ;;
     testtls)
