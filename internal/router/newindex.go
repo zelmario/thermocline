@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 
@@ -155,6 +156,15 @@ func requestedIndexKeys(cmd bson.Raw) map[string]string {
 func indexKeysOf(ctx context.Context, client *mongo.Client, db, coll string) (map[string]bool, error) {
 	cur, err := client.Database(db).Collection(coll).Indexes().List(ctx)
 	if err != nil {
+		// A collection the archive has never heard of holds no indexes, which
+		// is the answer rather than a failure to get one. It is also the state
+		// of every tiered collection for the first seconds of its life, and
+		// without this the first index built on a new collection was the one
+		// index nothing said anything about.
+		var ce mongo.CommandError
+		if errors.As(err, &ce) && ce.Code == namespaceNotFound {
+			return map[string]bool{}, nil
+		}
 		return nil, err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
@@ -180,3 +190,7 @@ func (r *Router) saidIndexIsFastTierOnly(ns, index string) bool {
 	r.fastOnlyIndexes[k] = true
 	return said
 }
+
+// namespaceNotFound is what MongoDB answers when listIndexes names a collection
+// that does not exist.
+const namespaceNotFound = 26

@@ -341,7 +341,7 @@ function facetBranch() {
 function pipeline() {
   const stages = [];
   if (maybe(0.8)) stages.push({ $match: filter(1) });
-  switch (ri(13)) {
+  switch (ri(16)) {
     case 0:
       stages.push({ $group: { _id: '$' + pick(['grp', 'opt', 'meta.active']),
                               c: { $sum: 1 }, s: { $sum: '$n' }, mx: { $max: '$f' } } });
@@ -417,6 +417,33 @@ function pipeline() {
       // been given the same documents for the answer to match at all.
       stages.push({ $bucketAuto: { groupBy: '$n', buckets: 1 + ri(4) } },
                   { $sort: { '_id.min': 1 } });
+      break;
+    case 13:
+      // A window function, which computes over neighbouring documents rather
+      // than over one. If the two tiers were given different documents the
+      // windows differ and every running total is wrong, which a $group would
+      // not show: a sum over the whole partition is the same however the
+      // documents are split. Sorted by two fields so ties cannot make the
+      // running total ambiguous and turn agreement into luck.
+      stages.push({ $setWindowFields: { partitionBy: '$grp', sortBy: { n: 1, _id: 1 },
+                                        output: { run: { $sum: '$n',
+                                                         window: { documents: ['unbounded', 'current'] } } } } },
+                  { $sort: { _id: 1 } },
+                  { $project: { grp: 1, n: 1, run: 1 } });
+      break;
+    case 14:
+      // A stage that invents documents. $densify fills the gaps in a sequence,
+      // so what it emits depends on which documents it was given, and a tier
+      // holding half of them produces a different set of gaps rather than half
+      // the answer.
+      stages.push({ $densify: { field: 'n', range: { step: 10, bounds: 'full' } } },
+                  { $group: { _id: null, c: { $sum: 1 } } });
+      break;
+    case 15:
+      // A sample, compared by how many came back rather than by which ones,
+      // because which ones is random and the size is not. It says whether the
+      // pool sampled from was the whole collection.
+      stages.push({ $sample: { size: 1 + ri(30) } }, { $count: 'c' });
       break;
     default:
       stages.push({ $sortByCount: '$grp' });
