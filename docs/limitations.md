@@ -93,6 +93,36 @@ Part of [Thermocline](../README.md).
   `thermocline_daemon_documents_total{outcome="unmirrorable"}` counts them and
   has a page rule, and `cline keys --rebuild` reports the duplicates.
 
+- **Two field names are reserved in a tiered collection, and a write that uses
+  one is refused.** `_tcDeletedAt` is how an archived document is marked as one
+  the application deleted, and every read of the archive carries a predicate
+  excluding the documents that hold it. `_tcBodyDropped` marks a tombstone that
+  could not keep the document it stood for. Both are ordinary field names that
+  mongod accepts from anybody.
+
+  Measured before they were refused, on an insert of `{_id: "x", n: 5000,
+  _tcDeletedAt: <a date>}` into a tiered collection: both tiers took it, and
+  `countDocuments({n: 5000})` answered **0** through the router where the same
+  document in an untiered collection answered **1**, with `ok` on both. A lookup
+  by `_id` still returned it, because a point read asks the fast tier too, so one
+  collection answered two different ways about one document. The read is the
+  smaller half of it: a fast tier rebuilt from that archive, which is the
+  documented recovery, does not have the document at all, because its copy reads
+  as deleted.
+
+  Every write path that can leave one is refused: an insert, a `$set`, a
+  replacement document, a `$rename` whose target is the name, a pipeline update,
+  and `findAndModify`. The refusal names the field and says to rename it. Three
+  things are deliberately not refused, and they are checked: an ordinary write, a
+  *nested* field of the same name, which no predicate here reads, and the same
+  field in a collection nothing tiers, where it means nothing at all.
+
+  What is not closed is the door every out-of-band write uses. A document
+  carrying one of these names, written straight at the fast tier's mongod, is
+  mirrored and the archive's copy reads as deleted, the same way a write made
+  there can already destroy archived documents. That is the limitation two
+  entries down, and the protection is the same operational one.
+
 - **A completeness claim records which field it was measured in, because
   changing that field re-reads every claim in a dimension it was never made in.**
   "The fast tier holds every live document newer than this instant" is only a

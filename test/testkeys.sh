@@ -1028,6 +1028,51 @@ H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_META).unmirrored.deleteMany({})" >/dev/null
 
+echo "== this system's own marks, written by an application =="
+# _tcDeletedAt is how an archived document is marked as one the application
+# deleted, and every read of the archive excludes the documents carrying it.
+# Nothing stopped an application writing a field of that name, and mongod takes
+# it like any other.
+#
+# Measured before this was refused: an insert of {_id:"x", n:5000,
+# _tcDeletedAt:<a date>} into a tiered collection was taken by both tiers, and
+# countDocuments({n:5000}) answered 0 through the router where the same document
+# in an untiered collection answered 1, ok on both. A lookup by _id still found
+# it, so one collection answered two ways about one document. The read is the
+# smaller half: a fast tier rebuilt from that archive, which is the documented
+# recovery, does not have the document at all.
+RNS=tkreserved
+fresh $RNS
+R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:1,v:'ordinary'})" >/dev/null
+res() { case "$1" in *"refusing this write"*) echo REFUSED ;; *) echo "$1" ;; esac; }
+chk "an insert carrying the mark is refused"           "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:2,_tcDeletedAt:new Date()});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and a set of it"                                  "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and a replacement document carrying it"           "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.replaceOne({_id:1},{_tcDeletedAt:new Date(),v:'x'});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+# A rename names its target in the value rather than the key, which is the one
+# operator that writes a field the keys never mention.
+chk "and a rename onto it"                             "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$rename:{'v':'_tcDeletedAt'}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and a pipeline update setting it"                 "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$set:{_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and findAndModify"                                "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findOneAndUpdate({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+# The controls matter as much as the refusals. A guard that turned down ordinary
+# writes, or writes to collections this system does not tier, would be this
+# proxy inventing a rule about data it does not touch.
+chk "an ordinary write is untouched"                   "1" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:3,n:7}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:3}))")"
+chk "a nested field of that name is fine"              "1" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:4,inner:{_tcDeletedAt:1}}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:4}))")"
+chk "and so is the field on an untiered collection"    "1" \
+    "$(R "db.getSiblingDB(process.env.TC_DB2).tkfree.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.insertOne({_id:1,_tcDeletedAt:new Date()}); print(db.getSiblingDB(process.env.TC_DB2).tkfree.countDocuments({}))")"
+chk "and the collection never took a mark"             "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+H "db.getSiblingDB(process.env.TC_DB).$RNS.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"

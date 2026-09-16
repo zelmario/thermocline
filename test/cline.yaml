@@ -46,6 +46,10 @@ feeder:
     - "shop.tcatalog2"
     # testindexes.sh: an adopted collection whose indexes carry options the copy
     # has to bring across whole, a text index and a wildcard one.
+    # testkeys.sh: the collection the reserved field names are checked on. It is
+    # tiered because that is the point: those marks mean nothing in a collection
+    # nothing mirrors, and the guard deliberately leaves those alone.
+    - "shop.tkreserved"
     - "shop.tidxtext"
     # testindexes.sh: a collection deliberately made different on the two tiers,
     # to check the router says so.

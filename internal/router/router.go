@@ -1177,6 +1177,18 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// Before the unique key guards, because this one is about what the document
+	// says rather than about what else holds its values, and a write refused
+	// here should not first walk both tiers. See reserved.go.
+	if nameErr == nil {
+		switch name {
+		case "insert", "update", "findAndModify", "findandmodify":
+			if out, done := c.guardReservedField(msg, db, name); done {
+				return c.answer(msg, out)
+			}
+		}
+	}
+
 	// A unique key has to be claimed before the write lands, or two writes
 	// racing both see a free slot.
 	if nameErr == nil {
