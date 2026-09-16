@@ -1390,7 +1390,9 @@ claim whose document lives in the archive alone is kept, which is the only reaso
 the registry exists; a claim whose document has been deleted from both tiers goes,
 and that key can be used again. Bounded by `--prune-for` and safe to interrupt: a
 claim it did not reach is a claim that stays. Run it on a schedule beside
-whatever else maintains the deployment. If it finds one key held by two live
+whatever else maintains the deployment, and watch
+`thermocline_key_registry_rows` to see whether you are: it is how many claims
+the fast tier holds, and nothing else would have told you it was growing. If it finds one key held by two live
 documents it says so and picks no winner, because that means the constraint was
 already broken.
 

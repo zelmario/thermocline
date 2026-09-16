@@ -44,6 +44,22 @@ type Inventory struct {
 	Namespaces  []NamespaceSize `json:"namespaces"`
 	UpdatedUnix int64           `json:"updated"`
 	Err         string          `json:"err,omitempty"`
+
+	// KeyRegistryRows is how many unique-key claims the registry holds, which
+	// is the one piece of this system's bookkeeping that grows with history and
+	// does so on the fast tier.
+	//
+	// A claim is permanent on purpose: evicting a document takes its index entry
+	// off the fast tier and the claim is what remembers the value was taken.
+	// Nothing removes one whose document has been deleted from both tiers except
+	// `cline keys --prune`, and that is an operator's obligation with nothing
+	// asking for it. Measured in docs/router.md: 500 inserts and 500 deletes
+	// leave 500 claims, about 100 bytes each, on the expensive tier.
+	//
+	// Reported rather than alerted on. There is no number that is wrong on its
+	// own: what matters is this climbing while the data it constrains does not,
+	// and only somebody who knows the application can say that.
+	KeyRegistryRows int64 `json:"keyRegistryRows"`
 }
 
 type inventoryCache struct {
@@ -84,6 +100,12 @@ func (r *Router) readInventory(ctx context.Context) {
 	out := Inventory{
 		Namespaces:  make([]NamespaceSize, 0, len(managed)),
 		UpdatedUnix: time.Now().Unix(),
+	}
+	// An estimate, from collection metadata rather than a scan: the registry is
+	// the largest collection this system writes and counting it exactly on a
+	// timer would be the dashboard hurting the tier it reports on.
+	if n, err := r.keys().EstimatedDocumentCount(ctx); err == nil {
+		out.KeyRegistryRows = n
 	}
 	// Concurrently, bounded. collStats answers about one collection, so there is
 	// no batched form of it to reach for; what makes this affordable at a

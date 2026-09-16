@@ -30,6 +30,9 @@ var dashboardHTML []byte
 type Snapshot struct {
 	NowUnix     int64            `json:"now"`
 	UptimeS     int64            `json:"uptime_s"`
+	// KeyRegistryRows is how many unique-key claims the fast tier holds. See
+	// Inventory.KeyRegistryRows for why it is reported and not alerted on.
+	KeyRegistryRows int64 `json:"key_registry_rows"`
 	Listen      string           `json:"listen"`
 	FastTier    string           `json:"fast_tier"`
 	Completenes string           `json:"completeness"`
@@ -120,6 +123,10 @@ func (r *Router) SnapshotAll() Snapshot {
 	return Snapshot{
 		NowUnix:     time.Now().Unix(),
 		UptimeS:     int64(time.Since(r.started).Seconds()),
+		// From the inventory rather than counted here: the snapshot is served
+		// per scrape and the registry is the largest collection this system
+		// writes.
+		KeyRegistryRows: r.InventorySnapshot().KeyRegistryRows,
 		Listen:      r.Addr(),
 		FastTier:    r.currentPrimary(),
 		Completenes: string(r.cfg.Completeness),

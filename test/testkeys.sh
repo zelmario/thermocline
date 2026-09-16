@@ -849,6 +849,53 @@ chk "  while the duplicate is now refused"               "11000" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:98,sku:'x'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
 kill $RPB 2>/dev/null
 
+echo "== the registry's size, which nothing reported =="
+# A claim is permanent on purpose: evicting a document takes its index entry off
+# the fast tier and the claim is what remembers the value was taken. Nothing
+# removes one whose document has been deleted from both tiers except
+# `cline keys --prune`, and that is an operator's obligation with nothing asking
+# for it. It grows with history, on the expensive tier.
+#
+# Measured: 300 inserts into a collection with one unique index, then deleting
+# all 300, leaves nought documents on either tier and 300 claims on the fast
+# tier. Reported rather than alerted on, because no number is wrong on its own:
+# what matters is this climbing while the data it constrains does not.
+GNS=tkregistry
+pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null; sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$GNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.drop();
+   db.getSiblingDB(process.env.TC_DB).$GNS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null
+BEFORE=$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.$GNS'}))")
+rm -f $LOGDIR/reg_r.log
+cline router --config $CFG --log-file $LOGDIR/reg_r.log & GRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+R "for (let i=0;i<40;i++) db.getSiblingDB(process.env.TC_DB).$GNS.insertOne({_id:i,code:'k'+i})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$GNS.deleteMany({})" >/dev/null
+sleep 1
+chk "claims outlive the documents that made them"      "40" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.$GNS'}) - $BEFORE)")"
+# The number an operator can watch. The inventory refreshes on a timer, so this
+# waits for it rather than sampling once.
+REG=""
+for _ in $(seq 1 40); do
+  REG=$(curl -s "http://127.0.0.1:$PDASH/metrics" 2>/dev/null | awk '/^thermocline_key_registry_rows /{print $2}')
+  [ -n "$REG" ] && [ "${REG%%.*}" -gt 0 ] 2>/dev/null && break
+  sleep 2
+done
+chk "and the registry's size is reported"              "true" \
+    "$(awk -v n="${REG:-0}" 'BEGIN{print (n+0 >= 40) ? "true" : "false (" n ")"}')"
+kill $GRP 2>/dev/null; wait $GRP 2>/dev/null
+cline keys --config $CFG --prune >/dev/null 2>&1
+chk "and pruning removes the ones nothing holds"       "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.$GNS'}))")"
+H "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$GNS.drop()" >/dev/null
+
 echo "== a write sent as a document sequence, which is how a driver sends one =="
 # Every guard reads its statements through wire.AllOf, which takes both the
 # inline array and the kind 1 section a driver actually sends, and there is a

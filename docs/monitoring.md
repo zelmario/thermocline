@@ -52,6 +52,19 @@ tuning question, not a page, and the two things it could get wrong that *are*
 worth paging on are already covered: a stale answer would show as a wrong
 answer, and the memory is bounded by configuration rather than by an alert.
 
+`thermocline_key_registry_rows` is how many unique-key claims the fast tier
+holds. A claim is permanent on purpose, so it grows with history and only
+`cline keys --prune` removes the ones nothing holds, which is an operator's
+obligation with nothing else asking for it. Measured: 300 inserts into a
+collection with one unique index and then deleting all 300 leaves nought
+documents on either tier and 300 claims, about 100 bytes each, on the expensive
+one.
+
+There is no rule on it, because no number is wrong on its own. What matters is
+this climbing while the data it constrains does not, and only somebody who knows
+the application can say that. Watch it beside the collection counts on the
+dashboard.
+
 The feeder publishes its counters the way the evictor and the warmer do, under
 `thermocline_daemon_documents_total{daemon="feeder:<id>"}`:
 

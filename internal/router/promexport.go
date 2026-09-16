@@ -72,6 +72,11 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("clients_total", "Client connections accepted since start.", snap.Counters["clients_total"])
 	gauge("clients_open", "Client connections open now.", float64(snap.Counters["clients_open"]))
 	gauge("uptime_seconds", "How long this router has been running.", float64(snap.UptimeS))
+	gauge("key_registry_rows",
+		"Unique-key claims held on the fast tier. A claim is permanent on purpose, so this grows "+
+			"with history and only `cline keys --prune` removes the ones nothing holds. Watch it "+
+			"against the data it constrains rather than against a threshold.",
+		float64(snap.KeyRegistryRows))
 
 	// The query cache, and only when it is on.
 	//
