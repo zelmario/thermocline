@@ -513,7 +513,7 @@ func (r *Router) warnAboutArchiveWithoutHistory(ctx context.Context) {
 
 	r.log.Warn("this archive has no record of mirroring, and the fast tier already holds tiered data",
 		"feeder_id", id,
-		"collections", holding,
+		"collections", firstFew(holding),
 		"meaning", "the checkpoint is written by this deployment into this archive under this "+
 			"feeder's id, and there is none, so this pair has not been working together",
 		"action", "check cold.uri names the archive this deployment has been using, and feeder.id "+
@@ -583,13 +583,31 @@ func (r *Router) warnAboutPartlyStrandedCollections(ctx context.Context) {
 	}
 	sort.Strings(short)
 	r.log.Warn("the archive holds more of these collections than the fast tier, and nothing tiers them",
-		"collections", short,
+		"collections", firstFew(short),
 		"meaning", "a collection this system does not tier is the fast tier's alone, so the "+
 			"archive's copy is never read and the application sees only the part the fast tier has",
 		"action", "put them back in feeder.namespaces if they should be tiered; if they should not, "+
 			"copy the archive's copy onto the fast tier before anything reads them",
 		"why", "taking a namespace out of feeder.namespaces does this, and it is one line in a "+
 			"config file away")
+}
+
+// namesInALine is how many names a warning puts in one line before it stops.
+//
+// A line is read by a person. Measured on a cluster with a long history of test
+// runs behind it, the report above named just under three hundred collections in
+// one line, which is not a report, it is a wall: nobody finds the collection
+// they care about in it and nobody reads the next field either.
+const namesInALine = 20
+
+// firstFew caps a list for a log line and says how much it left out.
+func firstFew(names []string) []string {
+	if len(names) <= namesInALine {
+		return names
+	}
+	out := make([]string, 0, namesInALine+1)
+	out = append(out, names[:namesInALine]...)
+	return append(out, fmt.Sprintf("... and %d more", len(names)-namesInALine))
 }
 
 // tieredNamespaces is every namespace this router tiers, as "db.coll".
@@ -715,7 +733,7 @@ func (r *Router) warnAboutUnarchivedCollections(ctx context.Context) {
 	}
 	sort.Strings(missing)
 	r.log.Warn("the fast tier holds tiered collections the archive does not",
-		"collections", missing,
+		"collections", firstFew(missing),
 		"meaning", "a tiered collection the fast tier cannot claim is complete is read from the archive, "+
 			"so these answer as empty while the fast tier still holds the documents",
 		"action", "check the feeder is running and mirroring; if the archive lost them, the fast tier's "+
@@ -785,7 +803,7 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 		if len(stranded) > 0 {
 			sort.Strings(stranded)
 			r.log.Warn("the archive holds collections the fast tier does not, and nothing tiers them",
-				"collections", stranded,
+				"collections", firstFew(stranded),
 				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
 					"application sees them empty",
 				"action", "add them to feeder.namespaces to tier them, or copy them to the fast tier "+
@@ -794,7 +812,7 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 		if len(views) > 0 {
 			sort.Strings(views)
 			r.log.Warn("the archive holds views the fast tier does not",
-				"views", views,
+				"views", firstFew(views),
 				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
 					"application sees them empty",
 				"action", "recreate them on the fast tier with createView, and tier the collections "+
