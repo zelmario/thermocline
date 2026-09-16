@@ -68,7 +68,12 @@ for r in $(seq 1 "$ROUNDS"); do
   # from the suite's exit code: another section failing under load is a fact
   # about this box and would hide or fake this answer either way.
   streams=$(grep -E "streams: no disagreement" "$OUT/fuzz.log" | head -1)
-  agreed=$(grep -m1 '^  AGREED ' "$OUT/fuzz.log")
+  # The streams section's own tally, which is the line above its check, and not
+  # the first AGREED in the file. That one belongs to the harness's negative
+  # control, where five documents are hidden from the archive on purpose and
+  # fifteen disagreements are the passing answer. Quoting it in this summary
+  # made a clean round read as fifteen disagreements.
+  agreed=$(grep -B1 "streams: no disagreement" "$OUT/fuzz.log" | head -1 | sed 's/^ *//')
   secs=$(( $(date +%s) - start ))
   if echo "$streams" | grep -q "^  PASS"; then
     printf 'round %-3s %4ss  streams agreed   testfuzz rc=%s  %s\n' "$r" "$secs" "$rc" "$agreed" >> "$OUT/summary.txt"
