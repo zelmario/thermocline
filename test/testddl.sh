@@ -419,6 +419,43 @@ chk "clustering without a TTL is not refused"            "accepted" \
 chk "an ordinary create on a tiered name is accepted"    "accepted" \
     "$(R "db.getSiblingDB(process.env.TC_DB).${UNS}2.drop();
           try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'${UNS}2'});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"
+# The seventh shape, which was the one not refused at this door.
+#
+# The feeder treats a collection named enxcol_ as unmirrorable and stops when
+# one appears, which is right: the state belongs to mongod and moving it out
+# from under the collection it describes is worse than not tiering it. Six other
+# shapes that would stop it the same way are refused by the router, and this one
+# was not. Measured: create on a tiered enxcol_ name was accepted, one insert
+# into it stopped the feeder with every namespace behind it, and an ordinary
+# document written to another tiered collection afterwards never reached the
+# archive.
+ENX=enxcol_probe
+chk "create on a tiered enxcol_ name is refused"         "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({create:'$ENX'});print('false')}catch(e){print(/enxcol_|state collection/.test(e.message))}")"
+# The other door to the same state. A rename is the one piece of DDL replayed
+# into the archive, so a tiered collection renamed to that name is mirrored
+# under it and the feeder stops for every namespace behind it.
+R "db.getSiblingDB(process.env.TC_DB).tddlren.drop();
+   db.getSiblingDB(process.env.TC_DB).tddlren.insertOne({_id:1})" >/dev/null
+chk "and renaming a tiered collection to one is too"     "true" \
+    "$(R "try{db.adminCommand({renameCollection:process.env.TC_DB+'.tddlren', to:process.env.TC_DB+'.$ENX'});print('false')}catch(e){print(/enxcol_|state collection/.test(e.message))}")"
+# The half that matters more than either refusal: mirroring is still running.
+# The failure this prevents is not a refused command, it is every namespace
+# going unmirrored behind one.
+chk "and mirroring is still running afterwards"          "true" \
+    "$(pgrep -f "cline feeder --config $WDIR/" >/dev/null && echo true || echo false)"
+# Neither tier may be left holding it, because a tiered enxcol_ collection that
+# exists is a feeder that refuses to start for every suite after this one.
+chk "and neither tier holds such a collection"           "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().filter(n=>n.startsWith('enxcol_')).length)")"
+# Asserted above, removed here, and the order matters. If either refusal ever
+# regresses, the collection exists, and a tiered enxcol_ collection that exists
+# is a feeder that refuses to start for every suite after this one. The check
+# says so and this makes sure it is only said once.
+H "db.getSiblingDB(process.env.TC_DB).getCollection('$ENX').drop()" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).getCollection('$ENX').drop()" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).tddlren.drop()" >/dev/null 2>&1
+
 chk "and a capped collection nothing tiers is fine"      "accepted" \
     "$(R "db.getSiblingDB(process.env.TC_DB2).capfree.drop();
           try{db.getSiblingDB(process.env.TC_DB2).runCommand({create:'capfree', capped:true, size:4096});print('accepted')}catch(e){print('refused: '+e.message.substring(0,60))}")"

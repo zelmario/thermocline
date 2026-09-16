@@ -189,6 +189,16 @@ func (c *conn) guardRename(ctx context.Context, msg *wire.Message, cmd bson.Raw)
 			"neither")
 	}
 
+	// The other door to the same state a create is refused for. A rename is the
+	// one piece of DDL this system replays into the archive, so a tiered
+	// collection renamed to an enxcol_ name is mirrored under that name and the
+	// feeder then stops for every namespace behind it.
+	if _, toColl, ok := strings.Cut(to, "."); ok {
+		if _, why, bad := enxcolName(toColl); bad {
+			return refuse(why)
+		}
+	}
+
 	// dropTarget replaces whatever is at the new name. On the fast tier that is
 	// the client's business; in the archive it is the one thing that must never
 	// happen by accident.
@@ -626,8 +636,35 @@ func unmirrorableTarget(cmd bson.Raw, name string) (coll, kind, why string, ok b
 					"so there is nothing to mirror and the collection it reads from is what " +
 					"wants tiering", true
 		}
+		if kind, why, bad := enxcolName(v); bad {
+			return v, kind, why, true
+		}
 	}
 	return "", "", "", false
+}
+
+// enxcolName reports whether a collection name is one queryable encryption
+// keeps its own state in.
+//
+// The feeder refuses to mirror these and stops when one appears, which is the
+// right answer there: the state belongs to mongod and moving it out from under
+// the collection it describes is worse than not tiering it. What it means here
+// is that creating one through the router is a command that stops mirroring for
+// every namespace, and six shapes that would do exactly that are already
+// refused at this door.
+//
+// Measured before this was the seventh: `create` on a tiered `enxcol_` name was
+// accepted, one insert into it stopped the feeder with every namespace behind
+// it, and an ordinary document written to another tiered collection afterwards
+// never reached the archive.
+func enxcolName(coll string) (kind, why string, bad bool) {
+	if !strings.HasPrefix(coll, "enxcol_") {
+		return "", "", false
+	}
+	return "queryable encryption's own state collection",
+		"a collection named enxcol_ belongs to mongod rather than to the application, and " +
+			"tiering it would move the state out from under the collection it describes, so " +
+			"mirroring stops for every namespace the moment one is written to", true
 }
 
 // safeBool reads a flag the way mongod reads create's capped option.

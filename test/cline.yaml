@@ -50,6 +50,13 @@ feeder:
     # testindexes.sh: a collection deliberately made different on the two tiers,
     # to check the router says so.
     - "shop.tdrift"
+    # testddl.sh: a tiered name of the shape queryable encryption keeps its own
+    # state under. Nothing ever creates it: the point is that the router refuses
+    # every way of bringing one into being, because the feeder stops mirroring
+    # for every namespace the moment one is written to. If it ever does exist,
+    # the feeder here will refuse to start and say so, which is the loud end of
+    # the same rule.
+    - "shop.enxcol_probe"
     # testddl.sh: the collection a TTL index is refused on.
     - "shop.tddlttl"
     # testddl.sh: the same, for a TTL index that arrives by the other door,

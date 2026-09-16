@@ -909,7 +909,20 @@ Part of [Thermocline](../README.md).
   archive. That is the latitude a plain index already gets here.
 
 - **A collection of a kind that cannot be mirrored stops the feeder, whenever it
-  appears.** Capped, time series and queryable-encryption collections are
+  appears**, and the router refuses every way of creating one through it. Seven
+  shapes: capped, time series, a view, a clustered collection with a TTL, one
+  with `encryptedFields`, a name of the form `enxcol_`, and `convertToCapped` or
+  `cloneCollectionAsCapped` onto a tiered name.
+
+  The `enxcol_` name was the seventh and was not refused until 2026-09-16, found
+  by tabulating what the feeder refuses to mirror against what the router
+  refuses to create. Measured: `create` on a tiered `enxcol_` name was accepted,
+  one insert into it stopped the feeder with every namespace behind it, and a
+  document written to a different tiered collection afterwards never reached the
+  archive. A rename is the other door to it, and the one that matters more,
+  because a rename is the single piece of DDL this system replays into the
+  archive. Both are refused now.
+ Capped, time series and queryable-encryption collections are
   refused at startup, and the reasons are in `internal/feeder/collkind.go`: a
   capped one removes its own oldest documents with nothing to announce them, so
   the archive tombstones its copies and discards the history it exists to keep.
