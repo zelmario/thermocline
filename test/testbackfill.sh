@@ -154,6 +154,59 @@ chk "so a client does not read the deleted document"  "absent" \
 chk "and the count is what the application left"      "10" \
     "$(R 'print(db.getSiblingDB("shop").orders.countDocuments({}))')"
 
+echo "== an archive restored from a backup, which is the documented exposure =="
+# docs/operations.md calls this the real exposure of the system: documents
+# written after the backup are still on the fast tier if they are recent enough
+# to be there, and the feeder cannot fetch them, because a change stream reports
+# changes from now and mirroring only moves forward.
+#
+# That was written before this command existed. What the fast tier still holds
+# is exactly the set the copy brings back, and with the feeder left running
+# there is no window: it carries what happens next.
+#
+# Measured: ten documents mirrored, a backup, five more written, the archive
+# dropped and restored. A client read ten where the application had written
+# fifteen. After the copy it read fifteen.
+RNS=trestore
+# The section above leaves its daemons running on purpose, so they have to go
+# first: a second router on the same port never binds, and every read below then
+# goes to the old one, which does not tier this namespace. That is what the first
+# run of this section measured, and it reported the archive holding nought and
+# the client reading all fifteen as though nothing were wrong.
+pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+M $HOTPORT "db.getSiblingDB('shop').$RNS.drop()" >/dev/null
+M $COLDPORT "db.getSiblingDB('shop').$RNS.drop()" >/dev/null
+sed 's|    - "shop.orders"|    - "shop.orders"\n    - "shop.'"$RNS"'"|' "$DIR/bf.yaml" > "$DIR/bf3.yaml"
+"$BIN" feeder --config "$DIR/bf3.yaml" --log-file "$DIR/f5.log" >/dev/null 2>&1 & disown
+"$BIN" router --config "$DIR/bf3.yaml" --log-file "$DIR/r3.log" >/dev/null 2>&1 & disown
+for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r3.log" 2>/dev/null && break; sleep 1; done
+R "for (let i=1;i<=10;i++) db.getSiblingDB('shop').$RNS.insertOne({_id:i,v:'before the backup'})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")" = "10" ] && break
+  sleep 1
+done
+docker exec tc-bf-cold mongodump --port $COLDPORT --db shop --collection $RNS -o /tmp/bk$RNS --quiet >/dev/null 2>&1
+R "for (let i=11;i<=15;i++) db.getSiblingDB('shop').$RNS.insertOne({_id:i,v:'written after the backup'})" >/dev/null
+sleep 3
+chk "fifteen documents, mirrored"                      "15" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
+M $COLDPORT "db.getSiblingDB('shop').$RNS.drop()" >/dev/null
+docker exec tc-bf-cold mongorestore --port $COLDPORT --quiet /tmp/bk$RNS >/dev/null 2>&1
+chk "the restored archive holds the backup's ten"      "10" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
+# The exposure, stated as a number before it is closed.
+chk "and a client reads ten of the fifteen written"    "10" \
+    "$(R "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
+"$BIN" backfill --config "$DIR/bf3.yaml" --ns "shop.$RNS" --apply >/dev/null 2>&1
+sleep 2
+chk "after the copy the archive holds fifteen"         "15" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
+chk "and a client reads all fifteen"                   "15" \
+    "$(R "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
+chk "including one written after the backup"           "written after the backup" \
+    "$(R "const d=db.getSiblingDB('shop').$RNS.findOne({_id:13}); print(d?d.v:'MISSING')")"
+# Left running, because the section below needs a feeder publishing to refuse.
+
 echo "== and it refuses to run underneath a feeder =="
 # Tested last, and for a reason worth writing down: the first version of this
 # suite started a feeder in the middle of the gap to check the refusal, and that

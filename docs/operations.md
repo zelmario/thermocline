@@ -110,10 +110,30 @@ and the danger it guards against is real.
 
 **And the limit worth knowing before you need it.** A restored archive is a
 restored past. Documents written after the backup are still on the fast tier if
-they are recent enough to be there, and the feeder cannot fetch them: a change
-stream reports changes from now, and mirroring only moves forward. Anything
-written after the backup and already evicted is in neither tier. So the archive's
-backup interval is the real exposure of this system, not the fast tier's, and
+they are recent enough to be there, and mirroring will not fetch them: a change
+stream reports changes from now, and it only moves forward.
+
+**`cline backfill` is what fetches them**, and it is the step to run after a
+restore, before letting the evictor go again:
+
+```
+bin/cline pause    --config cline.yaml --reason "restoring the archive"
+# restore the archive
+bin/cline backfill --config cline.yaml --apply
+bin/cline resume   --config cline.yaml
+```
+
+Leave the feeder running while it copies. That is the order with no window in
+it: the feeder carries what happens next while the copy brings back what the
+restore dropped. Measured on ten documents mirrored, a backup, five more
+written, then the archive dropped and restored: a client read ten of the fifteen
+the application had written, and fifteen after the copy. `test/testbackfill.sh`
+walks exactly those steps.
+
+What it cannot fetch is what the fast tier no longer holds: anything written
+after the backup **and already evicted** is in neither tier, and nothing can
+recover it. That is why the pause comes first, and why the archive's backup
+interval is the real exposure of this system rather than the fast tier's.
 `cline rollback`, which counts rather than removes unless you pass `--clear`, is
 what tells you what the two tiers disagree about afterwards.
 

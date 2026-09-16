@@ -573,9 +573,15 @@ func (r *Router) Listen(ctx context.Context) error {
 		"addr", ln.Addr().String(),
 		"fast_tier", r.currentPrimary(),
 		"completeness", string(r.cfg.Completeness),
+		// Which of the two authentication modes is running, because it decides
+		// who enforces authorisation and the line said nothing about it. An
+		// operator reading this log could not tell, and the two modes are not
+		// the same product: see warnTerminatedAuth.
+		"auth", authMode(r.cfg.TerminateAuth),
 		// An operator who has just moved an application onto this address needs
 		// to know whether it still speaks what the application expects.
 		"connections", describeTLS(r.cfg.TLS, r.cfg.HotTLS))
+	r.warnTerminatedAuth()
 
 	var wg sync.WaitGroup
 	for {
@@ -2011,6 +2017,50 @@ func (r *Router) rememberedIn(db string) []string {
 		out = append(out, ns)
 	}
 	return out
+}
+
+// authMode names which of the two authentication modes is running.
+func authMode(terminated bool) string {
+	if terminated {
+		return "terminated"
+	}
+	return "proxied"
+}
+
+// warnTerminatedAuth says, every start, what terminating authentication means.
+//
+// It is off by default and it is the one setting here that moves a decision out
+// of mongod. Proxied, every command is judged by the fast tier against the
+// account the client authenticated as, and this proxy cannot grant what mongod
+// would refuse. Terminated, the router authenticates the client itself and
+// checks every command against the privileges it loaded, so its own
+// authorisation gate is the only thing between a client and somebody else's
+// data.
+//
+// That gate denies by default and has fifty six checks behind it, including the
+// ones that caught it allowing a $lookup, a $merge and an unacknowledged write
+// it should have refused. A clean pilot says the mode serves an application
+// correctly; it does not say the gate cannot be got round, and those are
+// different claims.
+//
+// Said on every start rather than once in a document, because the setting is one
+// line in a config file and the person who turns it on is not always the person
+// who reads the log afterwards.
+func (r *Router) warnTerminatedAuth() {
+	if !r.cfg.TerminateAuth {
+		return
+	}
+	r.log.Warn("this router is authenticating clients itself, rather than letting the fast tier do it",
+		"setting", "router.terminate_auth",
+		"meaning", "every command is checked against privileges this router loaded, so its own "+
+			"authorisation gate is the only thing between a client and somebody else's data; "+
+			"with the setting off the fast tier judges every command and this proxy cannot "+
+			"grant what mongod would refuse",
+		"why_it_is_on", "it buys read preference, connection pooling and a client's own retry "+
+			"finishing a write across a failover, none of which are possible while one upstream "+
+			"connection carries one client's SCRAM exchange",
+		"before_relying_on_it", "have somebody who did not write the gate review it; the default "+
+			"is off and staying off costs only those three things")
 }
 
 // remoteAddr names a client for a log line, without assuming there is one: a

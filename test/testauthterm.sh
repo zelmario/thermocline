@@ -359,6 +359,35 @@ REFBYP=$(denied "$(HOTAS narrow narrowpass "$BYP")")
 H 'db.getSiblingDB(process.env.TC_DB).tazopen.deleteMany({_id:950})' >/dev/null
 chk "bypassing validation matches mongod"           "$REFBYP" "$(denied "$(AS narrow narrowpass "$BYP")")"
 H 'db.getSiblingDB(process.env.TC_DB).tazopen.deleteMany({_id:950})' >/dev/null
+echo "== the router says which mode it is in, every start =="
+# The startup line named the address, the fast tier, the completeness mode and
+# whether the connections are encrypted, and said nothing about which of the two
+# authentication modes was running. They are not the same product: proxied, the
+# fast tier judges every command against the account the client authenticated
+# as, and this proxy cannot grant what mongod would refuse; terminated, the
+# router's own authorisation gate is the only thing between a client and
+# somebody else's data.
+#
+# An operator reading the log could not tell which one they had.
+chk "the listening line names the mode"                "true" \
+    "$(grep 'router listening' $LOGDIR/authterm_r.log | grep -q 'auth=terminated' && echo true || echo false)"
+chk "and says what it means, every start"              "true" \
+    "$(grep -q 'authenticating clients itself, rather than letting the fast tier do it' $LOGDIR/authterm_r.log && echo true || echo false)"
+# The control, because a line that appears in both modes says nothing.
+sed 's|^  terminate_auth: true|  terminate_auth: false|' $CFG > $WDIR/cline_authoff.yaml
+rm -f $LOGDIR/authoff_r.log
+cline router --config $WDIR/cline_authoff.yaml --log-file $LOGDIR/authoff_r.log & AOP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $AOP 2>/dev/null; wait $AOP 2>/dev/null
+chk "with it off the line says proxied"                "true" \
+    "$(grep 'router listening' $LOGDIR/authoff_r.log | grep -q 'auth=proxied' && echo true || echo false)"
+chk "and the warning is not printed"                   "false" \
+    "$(grep -q 'authenticating clients itself' $LOGDIR/authoff_r.log && echo true || echo false)"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

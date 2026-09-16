@@ -57,6 +57,11 @@ This is the whole list. Nothing else blocks. **Five of six remain.**
   of read preference and connection pooling. Shipping with it on needs its
   authorisation gate reviewed by somebody who did not write it.
 
+  The decision is still Zelmar's, but it is no longer a silent one: the startup
+  line carries `auth=proxied` or `auth=terminated`, and turning it on prints a
+  WARN every start saying that the router's own gate is then the only thing
+  between a client and somebody else's data. It said nothing at all before.
+
 - [x] **2. Refuse, or accept in writing, an archive that is not a replica set.**
   Closed by decision on 2026-09-16: accepted in writing rather than refused,
   because both shapes work and refusing would break a deployment that is running
@@ -77,9 +82,18 @@ This is the whole list. Nothing else blocks. **Five of six remain.**
 
 - [ ] **5. Rehearse the four procedures, by a person, against a staging pair.**
   Adoption, rollback, recovery after a feeder stops with a rolled oplog, and a
-  rolling upgrade. Each has commands and suites; none has been walked end to end
-  by somebody following the runbook. `rehearse-the-procedure` is the lesson
-  here: testing a command is not testing the procedure it belongs to.
+  rolling upgrade. `rehearse-the-procedure` is the lesson here: testing a
+  command is not testing the procedure it belongs to.
+
+  Each is walked by a suite now, which is the half that can be automated:
+  adoption by `test/pilot/setup.sh` on 425,367 real documents, the rolling
+  upgrade by `verskew.sh` in both orders, the feeder gap and the **archive
+  restore** by `testbackfill.sh`, rollback by `testrollback.sh`. The restore was
+  the gap worth closing on 2026-09-16: the procedure said mirroring could not
+  fetch the writes made after the backup, which was true when it was written and
+  is not now. Measured, a client read ten of the fifteen the application had
+  written, and fifteen after `cline backfill`. What remains is a person walking
+  the prose, which nothing here can do for them.
 
 - [ ] **6. One shape never tried: a second application writing continuously**
   for hours, beside the first, through the same router.
