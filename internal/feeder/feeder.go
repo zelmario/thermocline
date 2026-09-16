@@ -91,6 +91,15 @@ type Feeder struct {
 	// Same goroutine. See recheckKindOnUnannounced.
 	kindRechecked map[string]time.Time
 
+	// unmirroredNS is the namespaces this feeder has given up a document in,
+	// loaded from the archive at startup so a restart does not forget. Same
+	// goroutine as everything else here.
+	//
+	// It exists so that clearing costs nothing in the ordinary case: with no
+	// such document anywhere, which is every healthy deployment, no batch asks
+	// the archive about one.
+	unmirroredNS map[string]bool
+
 	// counters are what this feeder has done since it started, published into
 	// the archive so the router can export them. The evictor and the warmer
 	// have done this since 2026-09-03 and the feeder had not, which left the
@@ -200,6 +209,46 @@ func (f *Feeder) withdrawDatabase(ctx context.Context, db string) {
 		f.log.Warn("withdrew every completeness claim in a dropped database",
 			"db", db, "claims", n,
 			"note", "range queries fall through to the archive until the warmer refills it")
+	}
+}
+
+// hasUnmirrored reports whether this feeder has given up a document in this
+// namespace.
+func (f *Feeder) hasUnmirrored(ns string) bool { return f.unmirroredNS[ns] }
+
+// noteUnmirrored remembers that it has.
+func (f *Feeder) noteUnmirrored(ns string) {
+	if f.unmirroredNS == nil {
+		f.unmirroredNS = map[string]bool{}
+	}
+	f.unmirroredNS[ns] = true
+}
+
+// forgetUnmirrored is called when every row for a namespace has been cleared.
+func (f *Feeder) forgetUnmirrored(ns string) { delete(f.unmirroredNS, ns) }
+
+// loadUnmirrored reads the rows written by whatever ran before this feeder.
+//
+// Without it a restarted feeder would never clear a row it did not write
+// itself, and the namespace would stay refused after the duplicate was
+// resolved. A failure here is a warning rather than a stop: the rows still do
+// their work in the router, and the only cost is that clearing waits for the
+// next feeder that can read them.
+func (f *Feeder) loadUnmirrored(ctx context.Context) {
+	byNS, err := meta.UnmirroredNamespaces(ctx, f.cold)
+	if err != nil {
+		f.log.Warn("could not read which documents the archive has refused",
+			"err", err,
+			"effect", "reads of those namespaces stay refused until a feeder can read these rows")
+		return
+	}
+	for ns, n := range byNS {
+		f.noteUnmirrored(ns)
+		f.log.Warn("the archive holds none of a document the fast tier does, from before this feeder started",
+			"ns", ns, "documents", n,
+			"effect", "reads of this namespace that fall through to the archive are refused, "+
+				"because the archive is not a superset of the fast tier while this stands",
+			"action", "resolve the duplicate value, then write the document again; see cline keys --rebuild")
 	}
 }
 
@@ -400,6 +449,7 @@ func (f *Feeder) Run(ctx context.Context) error {
 	if err := f.checkCollectionKinds(ctx); err != nil {
 		return err
 	}
+	f.loadUnmirrored(ctx)
 
 	for {
 		err := f.runOnce(ctx)

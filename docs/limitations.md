@@ -57,23 +57,39 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
-- **A document the archive refuses stays on the fast tier, and every read that
-  falls through is short by it.** The feeder gives up on a document the archive's
-  unique index refuses, because no retry of it can ever succeed, and says so at
-  ERROR. The evictor then never removes it, which is the half that works: the
-  document is not lost.
+- **A document the archive refuses stays on the fast tier, and reads of that
+  namespace are refused until it is resolved.** The feeder gives up on a document
+  the archive's unique index refuses, because no retry of it can ever succeed,
+  and says so at ERROR. The evictor then never removes it, which is the half
+  that works: the document is not lost.
 
-  What is easy to miss is what reads do afterwards. The archive is the superset
-  by assumption, so a read the fast tier cannot claim is answered there, and
-  there is the one place this document is not. Measured with a unique index on
-  the archive alone and two documents sharing its value written at the fast
-  tier: the archive refused one, an eviction sweep correctly kept it and removed
-  the other two, and a client then counted two where three documents exist. A
-  lookup by `_id` still found it, because a point read asks both tiers, which
-  makes the collection answer differently depending on how it is asked.
+  What reads do afterwards used to be the easy half to miss. The archive is the
+  superset by assumption, so a read the fast tier cannot claim is answered
+  there, and there is the one place this document is not. Measured with a unique
+  index on the archive alone and two documents sharing its value written at the
+  fast tier: the archive refused one, an eviction sweep correctly kept it and
+  removed the other two, and a client then counted two where three documents
+  exist. A lookup by `_id` still found it, because a point read asks both tiers,
+  which makes the collection answer differently depending on how it is asked.
 
-  There is no repair inside this system: the value belongs to another live
-  document in the archive and nothing here can choose which should keep it.
+  That was a wrong answer rather than a limitation, so it is refused now. The
+  feeder records the document in `unmirrored` in the bookkeeping database, and a
+  read that would be answered from the archive is refused instead, naming the
+  namespace, what is wrong and what to do. A log line cannot be read by a router
+  and a counter cannot name a namespace, which is why recording it was the whole
+  of the work. Measured on the same three documents: `countDocuments`, `find`,
+  `distinct` and an aggregation are refused, `findOne({_id: ...})` still returns
+  the document, and `updateMany` still reaches all three, because a write is
+  applied at the fast tier after the archive's matches are copied up.
+
+  **It lifts by itself.** Nobody runs a command here after resolving a duplicate,
+  so the write that finally reaches the archive is what clears the row: measured,
+  reads answered in full again within seconds of the value being changed, and the
+  feeder said so. Pinned by `testkeys.sh`.
+
+  What is still true is that there is no repair for the duplicate itself: the
+  value belongs to another live document in the archive and nothing here can
+  choose which should keep it.
   `thermocline_daemon_documents_total{outcome="unmirrorable"}` counts them and
   has a page rule, and `cline keys --rebuild` reports the duplicates.
 

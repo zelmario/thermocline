@@ -292,6 +292,12 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	if err != nil {
 		return nil, err
 	}
+	// Before the archive is asked anything, because what is wrong here is the
+	// archive's answer rather than the question. See superset.go.
+	if out, refused := c.refuseIfNotSuperset(ctx, db+"."+coll,
+		msg.Header.RequestID, msg.Header.RequestID); refused {
+		return out, nil
+	}
 	collation, _ := c.r.defaultCollation(ctx, db+"."+coll)
 	// Resolved here rather than inside the rewrite, because it needs the fast
 	// tier's index list and the rewrite is a pure function of the command.
@@ -1234,6 +1240,14 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	}
 	if rc, ok := archiveReadConcern(level); ok {
 		out = append(out, bson.E{Key: "readConcern", Value: rc})
+	}
+	// The same question as on the find path, asked here too: a count or a
+	// distinct answered from an archive missing documents is short in exactly
+	// the same way, and this path builds its own command rather than going
+	// through answerFromArchive.
+	if refusal, refused := c.refuseIfNotSuperset(ctx, db+"."+coll,
+		msg.Header.RequestID, msg.Header.RequestID); refused {
+		return refusal, nil
 	}
 	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
 

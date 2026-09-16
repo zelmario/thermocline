@@ -22,7 +22,7 @@ import (
 var bookkeepingCollections = map[string]bool{
 	Residency: true, Evicting: true, Checkpoints: true, PositionsColl: true,
 	Warming: true, Markers: true, DaemonStats: true, CacheAdvice: true,
-	Watermarks: true, OwnDDL: true, "keys": true,
+	Watermarks: true, OwnDDL: true, Unmirrored: true, "keys": true,
 }
 
 // IsBookkeeping reports whether a database holding exactly these collections is
@@ -207,6 +207,29 @@ const (
 	// BodyDroppedField marks a tombstone that could not keep the document it
 	// stands for. See MinimalTombstone.
 	BodyDroppedField = "_tcBodyDropped"
+
+	// Unmirrored names the documents the archive refused and the feeder gave up
+	// on, one row each.
+	//
+	// It exists because the archive being a superset of the fast tier is what
+	// makes a fall-through read correct, and this is the one state in which it
+	// is not. The feeder stops retrying a document the archive's unique index
+	// refuses, because no retry of it can ever succeed, and says so at ERROR.
+	// The document then stays on the fast tier, which is the half that works.
+	//
+	// What nothing recorded was which document. A read the fast tier cannot
+	// claim is answered from the archive, and there is the one place this
+	// document is not, so the answer was short by it and said ok. Measured on
+	// three documents written at the fast tier with the archive holding a
+	// unique index the third breaks: a count answered 2, a find returned two of
+	// three, and findOne by _id returned the third, because a point read asks
+	// both tiers. The same collection answering differently depending on how it
+	// is asked.
+	//
+	// A log line cannot be read by the router, and a counter cannot name a
+	// namespace. This can, and it lives in the archive beside every other piece
+	// of bookkeeping so a restarted router still knows.
+	Unmirrored = "unmirrored"
 )
 
 // SetDB names the bookkeeping database for this process.
@@ -230,6 +253,112 @@ func DocID(ns string, id bson.RawValue) string {
 	buf = append(buf, byte(id.Type))
 	buf = append(buf, id.Value...)
 	return ns + "|" + hex.EncodeToString(buf)
+}
+
+// UnmirroredRecord is one document the archive refused, which the feeder has
+// stopped trying to mirror.
+//
+// Keyed by DocID so one collection covers every namespace, and carrying NS on
+// its own so the router can ask "has this namespace any" without decoding.
+type UnmirroredRecord struct {
+	ID    string        `bson:"_id"`
+	NS    string        `bson:"ns"`
+	Doc   bson.RawValue `bson:"doc"`
+	Why   string        `bson:"why"`
+	First time.Time     `bson:"first"`
+	Last  time.Time     `bson:"last"`
+}
+
+// RecordUnmirrored notes a document the archive will not take.
+//
+// Upserted rather than inserted, and First is left alone on a repeat: the same
+// document is refused again every time the application writes it, and the
+// question an operator asks is how long this has been true.
+func RecordUnmirrored(ctx context.Context, cold *mongo.Client, ns string, id bson.RawValue, why string, now time.Time) error {
+	_, err := cold.Database(DB).Collection(Unmirrored).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: DocID(ns, id)}},
+		bson.D{
+			{Key: "$set", Value: bson.D{
+				{Key: "ns", Value: ns},
+				{Key: "doc", Value: id},
+				{Key: "why", Value: why},
+				{Key: "last", Value: now},
+			}},
+			{Key: "$setOnInsert", Value: bson.D{{Key: "first", Value: now}}},
+		},
+		options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// ClearUnmirrored removes the row for one document, for when the archive has
+// taken it after all.
+//
+// Whoever resolves the duplicate does not run a command here afterwards, so
+// nothing would ever clear these if only an operator could. The feeder clears
+// on the write that finally succeeds, which is the event that makes the row
+// untrue.
+func ClearUnmirrored(ctx context.Context, cold *mongo.Client, ns string, id bson.RawValue) error {
+	_, err := cold.Database(DB).Collection(Unmirrored).DeleteOne(ctx,
+		bson.D{{Key: "_id", Value: DocID(ns, id)}})
+	return err
+}
+
+// ClearUnmirroredMany forgets the rows for a batch of documents and reports how
+// many rows the namespace has left.
+//
+// One round trip for the batch rather than one per document, and the count is
+// what decides whether the namespace is whole again. Counting rather than
+// assuming matters: the batch that clears a row is usually the retry that
+// followed a refusal, and that retry has had the refused document taken out of
+// it, so "this batch succeeded" says nothing about the document the row is
+// actually about.
+func ClearUnmirroredMany(ctx context.Context, cold *mongo.Client, ns string, ids []bson.RawValue) (int64, error) {
+	coll := cold.Database(DB).Collection(Unmirrored)
+	keys := make(bson.A, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, DocID(ns, id))
+	}
+	if len(keys) > 0 {
+		if _, err := coll.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: keys}}}}); err != nil {
+			return 0, err
+		}
+	}
+	return coll.CountDocuments(ctx, bson.D{{Key: "ns", Value: ns}})
+}
+
+// UnmirroredNamespaces names every namespace holding at least one such
+// document, which is what a reader needs to know before it trusts the archive
+// to be a superset.
+func UnmirroredNamespaces(ctx context.Context, cold *mongo.Client) (map[string]int, error) {
+	cur, err := cold.Database(DB).Collection(Unmirrored).Find(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	out := map[string]int{}
+	for cur.Next(ctx) {
+		var rec UnmirroredRecord
+		if err := cur.Decode(&rec); err != nil {
+			return nil, err
+		}
+		out[rec.NS]++
+	}
+	return out, cur.Err()
+}
+
+// UnmirroredIn lists the rows for one namespace, so a refusal can name a
+// document rather than a count.
+func UnmirroredIn(ctx context.Context, cold *mongo.Client, ns string) ([]UnmirroredRecord, error) {
+	cur, err := cold.Database(DB).Collection(Unmirrored).Find(ctx, bson.D{{Key: "ns", Value: ns}})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	var out []UnmirroredRecord
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ResidencyRecord is one row of the residency sidecar. NS and Doc are kept

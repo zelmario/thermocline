@@ -658,6 +658,7 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 			options.BulkWrite().SetOrdered(true).SetBypassDocumentValidation(true))
 		if err == nil {
 			f.noteInsertsOverExisting(ns, ops, res)
+			f.clearUnmirrored(ctx, ns, ops)
 			return res, nil
 		}
 		if i, dup, ok := refusedByUniqueIndex(err, ops); ok {
@@ -672,6 +673,22 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 				"action", "resolve the duplicate, then re-run the write; see cline keys --rebuild",
 				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
 			f.counters.unmirrorable++
+			// Recorded where a reader can see it, not only in this log.
+			//
+			// The archive being a superset of the fast tier is what makes a
+			// fall-through read correct, and this document is the one state in
+			// which it is not. A router reading this row refuses the reads that
+			// would be short by it, rather than answering them short with ok:1.
+			// A failure to write the row is logged and nothing more: mirroring
+			// every other namespace is worth more than this record, and the
+			// next write of the same document tries again.
+			f.noteUnmirrored(ns)
+			if rerr := meta.RecordUnmirrored(ctx, f.cold, ns, dup.id, dup.msg, now); rerr != nil {
+				f.log.Error("could not record the document the archive refuses",
+					"ns", ns, "id", dup.id.String(), "err", rerr,
+					"effect", "a read that falls through to the archive is short by this document "+
+						"and nothing will refuse it")
+			}
 			models = append(models[:i:i], models[i+1:]...)
 			ops = append(ops[:i:i], ops[i+1:]...)
 			if len(models) == 0 {
@@ -695,6 +712,43 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 		}
 	}
 	return nil, fmt.Errorf("mirroring %s made no progress", ns)
+}
+
+// clearUnmirrored forgets the rows for documents this batch did get into the
+// archive.
+//
+// Nobody runs a command here after resolving a duplicate, so a row only an
+// operator could clear would stand for ever and go on refusing reads of a
+// namespace that is whole again. The write that finally lands is the event that
+// makes the row untrue, so that is what clears it.
+//
+// It costs nothing in the ordinary case: the set of namespaces with such rows
+// is empty, and this asks only about the ones in it.
+func (f *Feeder) clearUnmirrored(ctx context.Context, ns string, ops []pendingOp) {
+	if !f.hasUnmirrored(ns) {
+		return
+	}
+	ids := make([]bson.RawValue, 0, len(ops))
+	for _, op := range ops {
+		ids = append(ids, op.id)
+	}
+	// The count decides, not this batch's success. A refusal takes the document
+	// out of the batch and retries the rest, so the write that lands is usually
+	// one the refused document is no longer in: forgetting the namespace on the
+	// strength of it left the row standing and the reads refused for ever after
+	// the duplicate was resolved. Measured, on the first version of this.
+	left, err := meta.ClearUnmirroredMany(ctx, f.cold, ns, ids)
+	if err != nil {
+		f.log.Warn("could not clear the record of a document the archive refused",
+			"ns", ns, "err", err,
+			"effect", "reads of this namespace stay refused until it is cleared")
+		return
+	}
+	if left == 0 {
+		f.forgetUnmirrored(ns)
+		f.log.Info("the archive now holds every document of this namespace again",
+			"ns", ns, "effect", "reads of it are no longer refused")
+	}
 }
 
 // refusedByUniqueIndex reports whether a bulk write failed because the archive's

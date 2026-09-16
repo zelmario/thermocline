@@ -136,6 +136,9 @@ type Router struct {
 	wmCache  watermarkCache
 	idxCache indexCache
 	brackets bracketCache
+	// unmirrored is the set of namespaces the archive is not a superset of,
+	// because it refused a document the fast tier holds. See superset.go.
+	unmirrored unmirroredCache
 
 	// warnedKillCursor keeps the privilege warning in superseded.go to one per
 	// router, since the condition does not change while it runs.

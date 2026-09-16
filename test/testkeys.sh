@@ -971,8 +971,62 @@ chk "naming what reads that fall through will do"      "true" \
     "$(grep -q 'every read that falls through to the archive is short by it' $LOGDIR/refused_f.log && echo true || echo false)"
 chk "the fast tier still holds all three"              "3" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
+
+# And now the half this section used to stop before: what a client reads.
+#
+# The row the feeder writes is what makes this answerable at all. A log line
+# cannot be read by a router and a counter cannot name a namespace, so until
+# this existed the router had no way to know the archive was not a superset and
+# answered from it anyway: measured, a count of 2 where three documents exist,
+# a find returning two of three, and findOne by _id returning the third.
+chk "the feeder recorded which document"               "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS'}))")"
+startRouter
+chk "a count that falls through is refused"            "refused" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))}catch(e){print(/not a superset|does not hold one document/.test(e.message)?'refused':'other: '+e.message.substring(0,50))}")"
+chk "and so is a find"                                 "refused" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.find().toArray().length)}catch(e){print(/does not hold one document/.test(e.message)?'refused':'other: '+e.message.substring(0,50))}")"
+chk "and a distinct"                                   "refused" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.distinct('code').length)}catch(e){print(/does not hold one document/.test(e.message)?'refused':'other: '+e.message.substring(0,50))}")"
+# A point read asks both tiers, so it was always right and must stay allowed.
+# Refusing it would take away the one way an application can still reach the
+# document while somebody resolves the duplicate.
+chk "but a lookup by _id still answers"                "the duplicate" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).$FNS.findOne({_id:2}); print(d?d.what:'missing')")"
+# A write is not refused, and measuring that is the point: the document is on
+# the fast tier, and a multi-document write is applied there after the archive's
+# matches are copied up, so it reaches every document including this one.
+chk "an updateMany still reaches all three"            "3" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.updateMany({},{\$set:{seen:1}}).modifiedCount)}catch(e){print('refused: '+e.message.substring(0,40))}")"
+
+# The refusal has to lift by itself, or it is a deployment that never recovers.
+# Whoever resolves the duplicate does not run a command here afterwards, so the
+# write that finally reaches the archive is what clears the row.
+cline feeder --config $CFG --log-file $LOGDIR/refused_f2.log & FRP2=$!
+sleep 3
+H "db.getSiblingDB(process.env.TC_DB).$FNS.updateOne({_id:2},{\$set:{code:'C'}})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS'}))")" = "0" ] && break
+  sleep 1
+done
+kill $FRP2 2>/dev/null; wait $FRP2 2>/dev/null
+chk "resolving the duplicate clears the record"        "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS'}))")"
+chk "and the archive holds all three"                  "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+# The router caches its reading for supersetTTL, so this waits rather than
+# asking once: a check that races a cache reports a product defect that is a
+# five second wait.
+for _ in $(seq 1 20); do
+  [ "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))}catch(e){print('refused')}")" = "3" ] && break
+  sleep 1
+done
+chk "and reads answer in full again"                   "3" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))}catch(e){print('still refused')}")"
+
 H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).unmirrored.deleteMany({})" >/dev/null
 
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
