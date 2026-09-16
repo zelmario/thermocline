@@ -109,7 +109,7 @@ func runPreflight(args []string) error {
 	}
 	fmt.Printf("Checking %d tiered namespace(s) across both tiers. Nothing will be written.\n\n", tiered)
 
-	r := router.New(hot, cold, cfg.Router, log)
+	r := router.New(hot, cold, cfg.Router, log).Reporting()
 	if err := r.Survey(ctx); err != nil {
 		// The pair itself is one a router refuses. Said as an error rather than
 		// a warning because that is what it would be at a real start, and a

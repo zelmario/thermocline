@@ -525,8 +525,17 @@ chk "while the archive holds twenty"                   "20" \
 kill $PP 2>/dev/null; wait $PP 2>/dev/null
 chk "the router named it at startup"                   "true" \
     "$(grep -q 'the archive holds more of these collections than the fast tier' $LOGDIR/partly_r.log && echo true || echo false)"
+# The log line caps its list at twenty names, deliberately, so this cannot grep
+# for its own collection there: on a box with a long history behind it the line
+# named 20 and said "and 269 more", and this collection was in the 269. It
+# failed as a product defect and was a check asserting more than the warning
+# promises. What the warning does promise is the format, and what promises the
+# collection itself is `cline preflight`, which lists them all for exactly this
+# reason.
 chk "with both counts, so the size of it is visible"   "true" \
-    "$(grep 'holds more of these collections' $LOGDIR/partly_r.log | grep -q "$DB.$PNS (3 of 20)" && echo true || echo false)"
+    "$(grep 'holds more of these collections' $LOGDIR/partly_r.log | grep -qE '\([0-9]+ of [0-9]+\)' && echo true || echo false)"
+chk "and preflight names this one, not the first few"  "true" \
+    "$(cline preflight --config $CFG --count-for 5s 2>&1 | grep -q "$DB.$PNS (3 of 20)" && echo true || echo false)"
 H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
 

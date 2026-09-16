@@ -276,7 +276,7 @@ Part of [Thermocline](../README.md).
   the check counts documents first: a namespace nothing has written to yet has
   no copy on either tier and is not worth a word.
 
-  It is said at startup and by `cline survey`, which is where the mirror image
+  It is said at startup and by `cline preflight`, which is where the mirror image
   of it is already said, and not on the read path: the read that goes short is
   the cheapest possible one and putting a catalog lookup on it would cost every
   deployment for a state almost none of them are in. So a drop that happens

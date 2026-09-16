@@ -47,10 +47,11 @@ const supersetTTL = 5 * time.Second
 // set is empty in a healthy deployment and tiny otherwise: one read answers for
 // every namespace, and the common answer is "none anywhere".
 type unmirroredCache struct {
-	mu      sync.RWMutex
-	byNS    map[string]int
-	fetched time.Time
-	known   bool
+	mu       sync.RWMutex
+	byNS     map[string]int
+	fetched  time.Time
+	known    bool
+	lastFail time.Time
 }
 
 // notSuperset reports how many documents the archive is missing for this
@@ -63,23 +64,33 @@ type unmirroredCache struct {
 func (r *Router) notSuperset(ctx context.Context, ns string) int {
 	r.unmirrored.mu.RLock()
 	fresh := r.unmirrored.known && time.Since(r.unmirrored.fetched) < supersetTTL
+	// A read that failed a moment ago is not worth repeating on every query.
+	// These rows live in the archive, so a failure to read them means the
+	// archive is unreachable, and then this lookup is a server selection
+	// timeout charged to a read that is about to fail with the archive's own
+	// error anyway. The claim cache holds itself back the same way and for the
+	// same reason.
+	failedRecently := !r.unmirrored.lastFail.IsZero() && time.Since(r.unmirrored.lastFail) < supersetTTL
 	n := r.unmirrored.byNS[ns]
 	r.unmirrored.mu.RUnlock()
-	if fresh {
+	if fresh || failedRecently {
 		return n
 	}
 
 	byNS, err := meta.UnmirroredNamespaces(ctx, r.cold)
 	if err != nil {
-		r.unmirrored.mu.RLock()
-		defer r.unmirrored.mu.RUnlock()
-		return r.unmirrored.byNS[ns]
+		r.unmirrored.mu.Lock()
+		r.unmirrored.lastFail = time.Now()
+		n := r.unmirrored.byNS[ns]
+		r.unmirrored.mu.Unlock()
+		return n
 	}
 
 	r.unmirrored.mu.Lock()
 	r.unmirrored.byNS = byNS
 	r.unmirrored.fetched = time.Now()
 	r.unmirrored.known = true
+	r.unmirrored.lastFail = time.Time{}
 	r.unmirrored.mu.Unlock()
 	return byNS[ns]
 }

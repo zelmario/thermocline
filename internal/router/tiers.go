@@ -513,7 +513,7 @@ func (r *Router) warnAboutArchiveWithoutHistory(ctx context.Context) {
 
 	r.log.Warn("this archive has no record of mirroring, and the fast tier already holds tiered data",
 		"feeder_id", id,
-		"collections", firstFew(holding),
+		"collections", r.listFor(holding),
 		"meaning", "the checkpoint is written by this deployment into this archive under this "+
 			"feeder's id, and there is none, so this pair has not been working together",
 		"action", "check cold.uri names the archive this deployment has been using, and feeder.id "+
@@ -583,7 +583,7 @@ func (r *Router) warnAboutPartlyStrandedCollections(ctx context.Context) {
 	}
 	sort.Strings(short)
 	r.log.Warn("the archive holds more of these collections than the fast tier, and nothing tiers them",
-		"collections", firstFew(short),
+		"collections", r.listFor(short),
 		"meaning", "a collection this system does not tier is the fast tier's alone, so the "+
 			"archive's copy is never read and the application sees only the part the fast tier has",
 		"action", "put them back in feeder.namespaces if they should be tiered; if they should not, "+
@@ -607,7 +607,25 @@ func firstFew(names []string) []string {
 	}
 	out := make([]string, 0, namesInALine+1)
 	out = append(out, names[:namesInALine]...)
-	return append(out, fmt.Sprintf("... and %d more", len(names)-namesInALine))
+	return append(out, fmt.Sprintf("... and %d more; cline preflight lists them all",
+		len(names)-namesInALine))
+}
+
+// listFor is firstFew for a router that was asked for a report rather than
+// started.
+//
+// The cap is right for a log line, which a person reads in passing and which
+// nothing can page. It is wrong for `cline preflight`, which somebody ran on
+// purpose and is reading on a terminal, and where the action every one of these
+// warnings names is per collection: an adoption with three hundred collections
+// the archive holds more of was told about twenty of them and had no way to see
+// the rest. Measured on this box, whose archive carries the pilot's sample
+// datasets: the line named 20 and said "and 269 more".
+func (r *Router) listFor(names []string) []string {
+	if r.reporting {
+		return names
+	}
+	return firstFew(names)
 }
 
 // tieredNamespaces is every namespace this router tiers, as "db.coll".
@@ -733,7 +751,7 @@ func (r *Router) warnAboutUnarchivedCollections(ctx context.Context) {
 	}
 	sort.Strings(missing)
 	r.log.Warn("the fast tier holds tiered collections the archive does not",
-		"collections", firstFew(missing),
+		"collections", r.listFor(missing),
 		"meaning", "a tiered collection the fast tier cannot claim is complete is read from the archive, "+
 			"so these answer as empty while the fast tier still holds the documents",
 		"action", "check the feeder is running and mirroring; if the archive lost them, the fast tier's "+
@@ -803,7 +821,7 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 		if len(stranded) > 0 {
 			sort.Strings(stranded)
 			r.log.Warn("the archive holds collections the fast tier does not, and nothing tiers them",
-				"collections", firstFew(stranded),
+				"collections", r.listFor(stranded),
 				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
 					"application sees them empty",
 				"action", "add them to feeder.namespaces to tier them, or copy them to the fast tier "+
@@ -812,7 +830,7 @@ func (r *Router) warnAboutStrandedCollections(ctx context.Context) {
 		if len(views) > 0 {
 			sort.Strings(views)
 			r.log.Warn("the archive holds views the fast tier does not",
-				"views", firstFew(views),
+				"views", r.listFor(views),
 				"meaning", "reads of these go to the fast tier, which has never held them, so the "+
 					"application sees them empty",
 				"action", "recreate them on the fast tier with createView, and tier the collections "+

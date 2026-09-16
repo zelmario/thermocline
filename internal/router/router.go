@@ -136,6 +136,11 @@ type Router struct {
 	wmCache  watermarkCache
 	idxCache indexCache
 	brackets bracketCache
+	// reporting says this router was made to survey a deployment rather than
+	// to serve it, which is what `cline preflight` does. The only difference is
+	// how long a list in a warning may be: see listFor.
+	reporting bool
+
 	// unmirrored is the set of namespaces the archive is not a superset of,
 	// because it refused a document the fast tier holds. See superset.go.
 	unmirrored unmirroredCache
@@ -251,9 +256,9 @@ type Stats struct {
 	// set but not readable, which is what a resync or a maintenance window
 	// looks like from here. See secondaryread.go.
 	SecondaryReadsMoved atomic.Int64
-	Unreadable       atomic.Int64
-	EventsHidden     atomic.Int64
-	StaleReads       atomic.Int64
+	Unreadable          atomic.Int64
+	EventsHidden        atomic.Int64
+	StaleReads          atomic.Int64
 	// ClaimGraceReads counts reads answered from a completeness claim the
 	// router could not re-read, which router.claim_grace allowed. Any value
 	// above zero means the archive was unreachable and this router answered
@@ -342,6 +347,13 @@ const maxParamsPerShape = 50
 // The version check is the one that returns an error, because it is the one a
 // start refuses on. Everything else is a warning on the logger, which is where
 // a router puts them too.
+// Reporting marks this router as one whose output a person asked for, which
+// lets the warnings name every collection rather than the first twenty.
+func (r *Router) Reporting() *Router {
+	r.reporting = true
+	return r
+}
+
 func (r *Router) Survey(ctx context.Context) error {
 	if err := r.refreshPrimary(ctx); err != nil {
 		return err

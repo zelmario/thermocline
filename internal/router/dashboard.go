@@ -28,20 +28,20 @@ var dashboardHTML []byte
 
 // Snapshot is everything the dashboard draws.
 type Snapshot struct {
-	NowUnix     int64            `json:"now"`
-	UptimeS     int64            `json:"uptime_s"`
+	NowUnix int64 `json:"now"`
+	UptimeS int64 `json:"uptime_s"`
 	// KeyRegistryRows is how many unique-key claims the fast tier holds. See
 	// Inventory.KeyRegistryRows for why it is reported and not alerted on.
-	KeyRegistryRows int64 `json:"key_registry_rows"`
-	Listen      string           `json:"listen"`
-	FastTier    string           `json:"fast_tier"`
-	Completenes string           `json:"completeness"`
-	FeederID    string           `json:"feeder_id"`
-	ArchiveWait string           `json:"archive_wait"`
-	Counters    map[string]int64 `json:"counters"`
-	Metrics     MetricsSnapshot  `json:"metrics"`
-	Inventory   Inventory        `json:"inventory"`
-	Cache       CacheSnapshot    `json:"cache"`
+	KeyRegistryRows int64            `json:"key_registry_rows"`
+	Listen          string           `json:"listen"`
+	FastTier        string           `json:"fast_tier"`
+	Completenes     string           `json:"completeness"`
+	FeederID        string           `json:"feeder_id"`
+	ArchiveWait     string           `json:"archive_wait"`
+	Counters        map[string]int64 `json:"counters"`
+	Metrics         MetricsSnapshot  `json:"metrics"`
+	Inventory       Inventory        `json:"inventory"`
+	Cache           CacheSnapshot    `json:"cache"`
 }
 
 // CacheSnapshot is what the dashboard shows about the learned cache: whether it
@@ -121,18 +121,18 @@ const dashboardAdviceRows = 12
 // SnapshotAll gathers everything the dashboard needs in one read.
 func (r *Router) SnapshotAll() Snapshot {
 	return Snapshot{
-		NowUnix:     time.Now().Unix(),
-		UptimeS:     int64(time.Since(r.started).Seconds()),
+		NowUnix: time.Now().Unix(),
+		UptimeS: int64(time.Since(r.started).Seconds()),
 		// From the inventory rather than counted here: the snapshot is served
 		// per scrape and the registry is the largest collection this system
 		// writes.
 		KeyRegistryRows: r.InventorySnapshot().KeyRegistryRows,
-		Listen:      r.Addr(),
-		FastTier:    r.currentPrimary(),
-		Completenes: string(r.cfg.Completeness),
-		Cache:       r.cacheSnapshot(),
-		FeederID:    r.cfg.FeederID,
-		ArchiveWait: r.cfg.ArchiveWait.String(),
+		Listen:          r.Addr(),
+		FastTier:        r.currentPrimary(),
+		Completenes:     string(r.cfg.Completeness),
+		Cache:           r.cacheSnapshot(),
+		FeederID:        r.cfg.FeederID,
+		ArchiveWait:     r.cfg.ArchiveWait.String(),
 		Counters: map[string]int64{
 			"commands":              r.Stats.Commands.Load(),
 			"read_misses":           r.Stats.ReadMisses.Load(),
