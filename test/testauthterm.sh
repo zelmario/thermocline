@@ -374,14 +374,33 @@ chk "the listening line names the mode"                "true" \
 chk "and says what it means, every start"              "true" \
     "$(grep -q 'authenticating clients itself, rather than letting the fast tier do it' $LOGDIR/authterm_r.log && echo true || echo false)"
 # The control, because a line that appears in both modes says nothing.
-sed 's|^  terminate_auth: true|  terminate_auth: false|' $CFG > $WDIR/cline_authoff.yaml
+#
+# On its own port, and this is the whole of why the control was worthless
+# before. The router started at the top of this suite holds $PORT for the length
+# of it, so a second one here could never bind: it died with "address already in
+# use" and wrote no log at all. The wait below then succeeded against the *first*
+# router, which was answering on that port perfectly well, so the section walked
+# on as though its control had started. The check that reads the log failed, and
+# the one beside it, "the warning is not printed", passed against an empty file.
+# A control nothing proved, asserting a mode it never ran in.
+# The dashboard goes with it. It is "empty for off" in the config, and leaving
+# the running router's dashboard port in this file is the same collision one
+# line further down.
+sed -e 's|^  terminate_auth: true|  terminate_auth: false|' \
+    -e "s|^  listen:.*|  listen: \"0.0.0.0:$PALT\"|" \
+    -e 's|^  dashboard:.*|  dashboard: ""|' $CFG > $WDIR/cline_authoff.yaml
 rm -f $LOGDIR/authoff_r.log
 cline router --config $WDIR/cline_authoff.yaml --log-file $LOGDIR/authoff_r.log & AOP=$!
 for _ in $(seq 1 30); do
-  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+  mongosh --port $PALT -u dba -p secret --authenticationDatabase admin --quiet \
     --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
   sleep 1
 done
+# Asserted rather than assumed, for the same reason: a control that did not come
+# up must say so here rather than three checks later in words about auth modes.
+chk "the control router came up on its own port"       "true" \
+    "$(mongosh --port $PALT -u dba -p secret --authenticationDatabase admin --quiet \
+        --eval 'print(db.adminCommand({ping:1}).ok===1)' 2>&1 | tail -1)"
 kill $AOP 2>/dev/null; wait $AOP 2>/dev/null
 chk "with it off the line says proxied"                "true" \
     "$(grep 'router listening' $LOGDIR/authoff_r.log | grep -q 'auth=proxied' && echo true || echo false)"
