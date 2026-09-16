@@ -128,6 +128,29 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 	return "", false
 }
 
+// reservedInStages names a reserved field an aggregation pipeline writes.
+//
+// The same reading as a pipeline update, over a whole pipeline rather than one
+// update's stages, for the $merge that mongod performs rather than this router.
+func reservedInStages(stages []bson.RawValue) (string, bool) {
+	for _, stage := range stages {
+		sd, ok := stage.DocumentOK()
+		if !ok {
+			continue
+		}
+		for _, op := range []string{"$set", "$addFields", "$replaceWith", "$replaceRoot"} {
+			if v, err := sd.LookupErr(op); err == nil {
+				if d, ok := v.DocumentOK(); ok {
+					if f, bad := reservedTopLevel(d); bad {
+						return f, true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
 // guardReservedField refuses a write that would leave one of this system's own
 // marks on an application document in a tiered collection.
 //

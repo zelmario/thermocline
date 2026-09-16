@@ -75,6 +75,37 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		// archive and a write to the fast tier that nothing asked for.
 		return nil, false
 	}
+	// A pipeline that sets one of this system's own marks, merging into a
+	// collection this system tiers. The sink in aggwrite.go checks the
+	// documents themselves, and it only sees the ones the router writes: a
+	// $merge whose input the fast tier can answer alone is forwarded whole and
+	// mongod performs the write, so this is the only place to catch it.
+	//
+	// The stages are what can be read here, which makes this narrower than the
+	// sink's check and worth being honest about: a $merge of documents that
+	// already carry the field, from a collection where it is allowed because
+	// nothing tiers it, is not visible in any stage and is not caught. That
+	// residue is in docs/limitations.md.
+	if c.r.cfg.Manages(target) {
+		if f, bad := reservedInStages(stages); bad {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused a $merge that would put this system's own mark on a document",
+				"into", target, "field", f)
+			out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: refusing this write to "+target+" because the pipeline sets "+f+
+					", which is the field this system marks archived documents deleted with. A "+
+					"document carrying it is written to both tiers and is then invisible to every "+
+					"read that falls through to the archive, and a fast tier rebuilt from the "+
+					"archive does not have it at all. Rename the field; it is reserved only in "+
+					"collections this system tiers.")
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
+		}
+	}
+
 	if !c.r.cfg.Manages(target) {
 		// Untiered, so the fast tier is the whole of it and it can see
 		// everything the merge might match.

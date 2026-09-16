@@ -110,12 +110,25 @@ Part of [Thermocline](../README.md).
   documented recovery, does not have the document at all, because its copy reads
   as deleted.
 
-  Every write path that can leave one is refused: an insert, a `$set`, a
+  Every write command that can leave one is refused: an insert, a `$set`, a
   replacement document, a `$rename` whose target is the name, a pipeline update,
-  and `findAndModify`. The refusal names the field and says to rename it. Three
-  things are deliberately not refused, and they are checked: an ordinary write, a
-  *nested* field of the same name, which no predicate here reads, and the same
-  field in a collection nothing tiers, where it means nothing at all.
+  and `findAndModify`. A pipeline writes documents too, and both of its paths
+  refuse as well, by two different readings: a tiered `$out` is performed by the
+  router, so each document it writes is read as it passes, and a `$merge` whose
+  input the fast tier can answer alone is forwarded whole for mongod to perform,
+  so what can be read there is the pipeline's stages. The refusal names the
+  field and says to rename it. Three things are deliberately not refused, and
+  they are checked: an ordinary write, a *nested* field of the same name, which
+  no predicate here reads, and the same field in a collection nothing tiers,
+  where it means nothing at all.
+
+  **One path is not covered**, and it follows from that split: a `$merge` into a
+  tiered collection, of documents that already carry the field, taken from a
+  collection where carrying it is allowed because nothing tiers it. No stage
+  mentions the field, mongod performs the write, and nothing here sees the
+  documents. Closing it would mean the router performing every `$merge` into a
+  tiered collection rather than forwarding the ones the fast tier can answer,
+  which is a large cost for a narrow case.
 
   What is not closed is the door every out-of-band write uses. A document
   carrying one of these names, written straight at the fast tier's mongod, is

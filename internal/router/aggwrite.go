@@ -187,6 +187,12 @@ type writeSink struct {
 	mergeStage bson.Raw
 	mergeDB    string
 
+	// guardReserved says the target is a collection this system tiers, so the
+	// documents written here are checked for this system's own marks. See
+	// reserved.go: in an untiered collection the field means nothing and
+	// refusing there would be inventing a rule about data this does not touch.
+	guardReserved bool
+
 	// out writes documents into a collection, either the target itself or a
 	// temporary one that is renamed over it at the end.
 	outColl  *mongo.Collection
@@ -212,9 +218,19 @@ type writeSink struct {
 func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*writeSink, error) {
 	outDB, outColl, isOut := outTarget(final, db)
 	if !isOut {
+		// A $merge writes documents too, and its target is named inside the
+		// stage rather than by the command. Resolved here so the sink knows
+		// whether what it is about to write lands in a collection this system
+		// tiers: see writeSink.write and reserved.go.
+		tiered := false
+		if v, err := final.LookupErr("$merge"); err == nil {
+			if ns, _, ok := mergeTarget(v, db); ok {
+				tiered = c.r.cfg.Manages(ns)
+			}
+		}
 		return &writeSink{
 			r: c.r, how: "$merge", target: db,
-			mergeStage: final, mergeDB: db,
+			mergeStage: final, mergeDB: db, guardReserved: tiered,
 		}, nil
 	}
 
@@ -248,6 +264,7 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 			tempName:      outDB + "." + temp,
 			tieredColl:    c.r.hot.Database(outDB).Collection(outColl),
 			tieredArchive: c.r.cold.Database(outDB).Collection(outColl),
+			guardReserved: true,
 		}, nil
 	}
 
@@ -341,6 +358,33 @@ func (s *writeSink) fill(ctx context.Context) error {
 func (s *writeSink) write(ctx context.Context, batch []any) error {
 	if len(batch) == 0 {
 		return nil
+	}
+	// A pipeline writes documents as much as an insert does, and the guard on
+	// the write commands never sees one. Checked here rather than on the
+	// pipeline's stages, because the stages are not the whole story: a $merge
+	// of documents that already carry the field copies it across without any
+	// stage mentioning it. This is the one place every document the router
+	// writes on this path passes through, with the document in hand.
+	//
+	// Measured before this existed: a $merge and a $out each set _tcDeletedAt
+	// on a tiered collection and both were accepted, leaving live documents on
+	// the fast tier wearing the mark that makes the archive's copy read as
+	// deleted. See reserved.go for what that costs.
+	if s.guardReserved {
+		for _, d := range batch {
+			raw, ok := d.(bson.Raw)
+			if !ok {
+				continue
+			}
+			if f, bad := reservedTopLevel(raw); bad {
+				return fmt.Errorf("thermocline: refusing this write to %s because a document it "+
+					"writes sets %s, which is the field this system marks archived documents "+
+					"deleted with. A document carrying it is written to both tiers and is then "+
+					"invisible to every read that falls through to the archive, and a fast tier "+
+					"rebuilt from the archive does not have it at all. Rename the field; it is "+
+					"reserved only in collections this system tiers", s.target, f)
+			}
+		}
 	}
 	if s.outColl != nil {
 		// Into the temporary collection. The claims are made when the target is

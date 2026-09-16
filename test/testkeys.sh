@@ -1062,7 +1062,17 @@ chk "and findAndModify"                                "REFUSED" \
 # The controls matter as much as the refusals. A guard that turned down ordinary
 # writes, or writes to collections this system does not tier, would be this
 # proxy inventing a rule about data it does not touch.
+# A pipeline writes documents too, and the two paths are read differently: a
+# tiered $out is performed by the router, which reads each document as it
+# passes, while a $merge the fast tier can answer alone is forwarded for mongod
+# to perform, where the stages are all there is to read. Both were accepted
+# before this, and two live documents on the fast tier ended up wearing the mark.
+chk "and a \$out into a tiered collection"              "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and a \$merge into one"                            "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
 chk "an ordinary write is untouched"                   "1" \
+
     "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:3,n:7}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:3}))")"
 chk "a nested field of that name is fine"              "1" \
     "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:4,inner:{_tcDeletedAt:1}}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:4}))")"
