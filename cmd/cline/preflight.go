@@ -95,8 +95,19 @@ func runPreflight(args []string) error {
 	warnColdShape(log)
 	warnIfArchiveReadPreferenceIgnored(cfg.Cold.URI, log)
 
-	fmt.Printf("Checking %d tiered namespace(s) across both tiers. Nothing will be written.\n\n",
-		len(cfg.Feeder.Namespaces))
+	// Not len(cfg.Feeder.Namespaces): empty tiers everything, and the count is
+	// the first thing an operator reads. It said "0 tiered namespace(s)" for the
+	// deployment that tiers the most.
+	tiered := len(cfg.Feeder.Namespaces)
+	all := tiered == 0
+	if all {
+		fmt.Println("feeder.namespaces is empty, which tiers everything except the system")
+		fmt.Println("databases and this deployment's own bookkeeping.")
+		if found, ferr := archiveNamespaces(ctx, cold); ferr == nil {
+			tiered = len(found)
+		}
+	}
+	fmt.Printf("Checking %d tiered namespace(s) across both tiers. Nothing will be written.\n\n", tiered)
 
 	r := router.New(hot, cold, cfg.Router, log)
 	if err := r.Survey(ctx); err != nil {
@@ -140,10 +151,23 @@ func verifyClaims(ctx context.Context, hot, cold *mongo.Client, cfg config.Confi
 		return
 	}
 
+	// Every recorded claim when the configuration names nothing, because empty
+	// tiers everything and a claim exists only for a namespace something has
+	// tiered. Reading the list instead checked no claim at all on such a
+	// deployment, which is the one failure this function exists to catch:
+	// a claim not checked is a claim that stands.
 	claimed := make([]string, 0, len(marks))
-	for _, ns := range cfg.Feeder.Namespaces {
-		if m, ok := marks[ns]; ok && m.Claimed {
-			claimed = append(claimed, ns)
+	if len(cfg.Feeder.Namespaces) == 0 {
+		for ns, m := range marks {
+			if m.Claimed {
+				claimed = append(claimed, ns)
+			}
+		}
+	} else {
+		for _, ns := range cfg.Feeder.Namespaces {
+			if m, ok := marks[ns]; ok && m.Claimed {
+				claimed = append(claimed, ns)
+			}
 		}
 	}
 	if len(claimed) == 0 {

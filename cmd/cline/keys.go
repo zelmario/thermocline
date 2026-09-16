@@ -60,12 +60,27 @@ func runKeys(args []string) error {
 	}
 	defer disconnect(cold, log)
 
-	if len(cfg.Feeder.Namespaces) == 0 {
-		return errors.New("feeder.namespaces is empty, so there is no list of collections to scan; name them to use this command")
+	// Empty tiers everything, and refusing here left the command the adoption
+	// guide tells you to run unusable on that deployment. The archive holds
+	// every document, so it also knows every collection: the same answer the
+	// configuration would have given, which is what rollback does too.
+	namespaces := cfg.Feeder.Namespaces
+	if len(namespaces) == 0 {
+		fmt.Println("No namespaces are configured, so every collection is tiered.")
+		fmt.Println("Asking the archive which ones it holds.")
+		found, ferr := archiveNamespaces(ctx, cold)
+		if ferr != nil {
+			return fmt.Errorf("could not ask the archive which collections it holds: %w", ferr)
+		}
+		if len(found) == 0 {
+			return errors.New("the archive holds no collections to scan")
+		}
+		namespaces = found
+		fmt.Printf("Found %d.\n", len(namespaces))
 	}
 
 	r := router.New(hot, cold, cfg.Router, log)
-	guarded := r.UniqueNamespaces(ctx, cfg.Feeder.Namespaces)
+	guarded := r.UniqueNamespaces(ctx, namespaces)
 	if len(guarded) == 0 {
 		fmt.Println("no unique indexes on any tiered collection, so there is nothing to enforce")
 		return nil

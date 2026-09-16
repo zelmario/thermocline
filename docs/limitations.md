@@ -189,8 +189,17 @@ Part of [Thermocline](../README.md).
   suite for this shape, which had none before.
 
   The archive is what "everything" means, because it is the superset, and that
-  is what the shared answer reads now. The remaining readers are reports whose
-  silence costs a line rather than an answer.
+  is what the shared answer reads now.
+
+  The commands an operator runs had it too, and the worst of them was
+  `cline preflight`: its header said "Checking 0 tiered namespace(s)" and
+  `verifyClaims` looked at no claim at all, which is the one failure that
+  function exists to catch, since a claim not checked is a claim that stands. It
+  now verifies every recorded claim, because a claim exists only for a namespace
+  something has tiered. `cline indexes` and `cline keys` refused outright, which
+  left the two commands the adoption guide sends you to unusable on the
+  deployment that tiers the most; both ask the archive now, as `cline rollback`
+  and `cline backfill` already did.
 
 - **With authentication proxied, a client's other connections are each refused
   once when the primary moves.** Every connection has an upstream of its own in

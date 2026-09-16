@@ -141,8 +141,23 @@ func runIndexes(args []string) error {
 	if *only != "" {
 		namespaces = []string{*only}
 	}
+	// Empty tiers everything, and this is the command the adoption guide sends
+	// you to for exactly the divergence that matters most on such a deployment.
+	// The archive knows every collection, which is the same answer the
+	// configuration would have given.
 	if len(namespaces) == 0 {
-		return errors.New("no namespaces configured, and none given with --ns")
+		fmt.Println("No namespaces are configured, so every collection is tiered.")
+		fmt.Println("Asking the archive which ones it holds.")
+		found, ferr := archiveNamespaces(ctx, cold)
+		if ferr != nil {
+			return fmt.Errorf("could not ask the archive which collections it holds, "+
+				"so this cannot know what to compare; name one with --ns: %w", ferr)
+		}
+		if len(found) == 0 {
+			return errors.New("the archive holds no collections to compare")
+		}
+		namespaces = found
+		fmt.Printf("Found %d.\n", len(namespaces))
 	}
 	sort.Strings(namespaces)
 

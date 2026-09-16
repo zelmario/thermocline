@@ -114,6 +114,29 @@ chk "and says which"                                      "true" \
     "$(grep 'the fast tier holds tiered collections the archive does not' "$DIR/r2.log" | grep -q 'shop.stray' && echo true || echo false)"
 pkill -9 -f "cline.*$DIR" 2>/dev/null
 
+echo "== the commands an operator runs on a deployment that tiers everything =="
+# Every one of these reads feeder.namespaces, and empty means everything. Two of
+# them refused outright, which left the commands the adoption guide sends you to
+# unusable on the deployment that tiers the most, and preflight silently checked
+# nothing: its own header said "0 tiered namespace(s)" and verifyClaims looked at
+# no claim at all, which is the one failure that function exists to catch.
+PRE=$("$BIN" preflight --config "$DIR/all.yaml" 2>&1)
+chk "preflight counts what it is really checking"        "true" \
+    "$(grep -qE 'Checking [1-9][0-9]* tiered namespace' <<<"$PRE" && echo true || echo false)"
+chk "and says the empty list means everything"           "true" \
+    "$(grep -q 'which tiers everything' <<<"$PRE" && echo true || echo false)"
+# A claim to check, so verifyClaims has something to do.
+M $COLDPORT 'db.getSiblingDB("_thermocline").watermarks.replaceOne({_id:"shop.orders"},{_id:"shop.orders",completeFrom:new Date(0),dimension:""},{upsert:true})' >/dev/null
+PRE2=$("$BIN" preflight --config "$DIR/all.yaml" 2>&1)
+chk "and checks the claims it finds"                     "true" \
+    "$(grep -q 'completeness claim(s) against what the two tiers hold' <<<"$PRE2" && echo true || echo false)"
+IDX=$("$BIN" indexes --config "$DIR/all.yaml" 2>&1)
+chk "cline indexes runs rather than refusing"            "true" \
+    "$(grep -q 'Asking the archive which ones it holds' <<<"$IDX" && echo true || echo false)"
+KEYS=$("$BIN" keys --config "$DIR/all.yaml" 2>&1)
+chk "cline keys runs rather than refusing"               "true" \
+    "$(grep -q 'Asking the archive which ones it holds' <<<"$KEYS" && echo true || echo false)"
+
 echo "== the dashboard on a router that tiers everything =="
 # An operator looking at a router tiering the lot was shown a list of nothing,
 # because the inventory read the configured list too.
