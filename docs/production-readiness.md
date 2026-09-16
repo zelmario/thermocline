@@ -75,7 +75,17 @@ This is the whole list. Nothing else blocks. **Four of seven remain.**
   24 events in one sweep on 2026-09-16. The mechanism the code suggested was
   measured and refuted; the same seed then passed three times. The suite now
   captures the line that would name the document. Needs either a reproduction or
-  a decision to accept it as unreproduced after N clean sweeps.
+  a decision to accept it as unreproduced after N clean runs.
+
+  **N is 20, and the runs have to be the right shape.** It appeared during a
+  parallel sweep, not a quiet run, so `test/streamsoak.sh` runs `testfuzz` with
+  three other suites driving the same six mongods beside it, about eighteen
+  minutes a round. Twenty quiet rounds would prove much less than twenty
+  contended ones, and saying it loudly would be worse than saying nothing. On a
+  disagreement the round's router log is kept, with the "hiding an insert as a
+  promotion" lines that name the document; read those before anything else,
+  because a count cannot be worked back to a document and a guess at the
+  mechanism has already been refuted once.
 
 - [ ] **4. Measure off this box.** Every number above is six mongods on one
   WSL2 host. Throughput, mirroring rate and failover timing are the ones that
