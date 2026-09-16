@@ -110,9 +110,15 @@ Part of [Thermocline](../README.md).
   documented recovery, does not have the document at all, because its copy reads
   as deleted.
 
-  Every write command that can leave one is refused: an insert, a `$set`, a
-  replacement document, a `$rename` whose target is the name, a pipeline update,
-  and `findAndModify`. A pipeline writes documents too, and both of its paths
+  Every write command that can leave one is refused: an insert, a replacement
+  document, `findAndModify`, a pipeline update, and an update by **any**
+  operator that names the field. Any, rather than a list of the likely ones,
+  because the predicate that hides a document is `{$exists: false}` and a field
+  of any type hides it: measured against a first version of this guard that read
+  `$set`, `$setOnInsert` and `$addFields`, both `$currentDate` and `$min` wrote
+  the mark and were accepted. `$rename` is read through its value, where its
+  target is named, and `$unset` is deliberately allowed, because it is how the
+  field is taken off a document that has one. A pipeline writes documents too, and both of its paths
   refuse as well, by two different readings: a tiered `$out` is performed by the
   router, so each document it writes is read as it passes, and a `$merge` whose
   input the fast tier can answer alone is forwarded whole for mongod to perform,

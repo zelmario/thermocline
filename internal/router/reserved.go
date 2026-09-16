@@ -81,12 +81,27 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 			// becomes.
 			return reservedTopLevel(doc)
 		}
-		for _, op := range []string{"$set", "$setOnInsert", "$addFields"} {
-			if v, err := doc.LookupErr(op); err == nil {
-				if d, ok := v.DocumentOK(); ok {
-					if f, bad := reservedTopLevel(d); bad {
-						return f, true
-					}
+		// Every operator that names the field, rather than a list of the ones
+		// that seemed likely. The first version of this read $set,
+		// $setOnInsert and $addFields, and the predicate that hides a document
+		// is {$exists: false}, so a field of any type hides it: measured,
+		// $currentDate and $min each wrote the mark and were accepted, and
+		// $inc and $push would have on a document that did not have it yet.
+		// An allow-list is the wrong shape for a rule about a name.
+		for _, e := range elems {
+			key := e.Key()
+			if len(key) == 0 || key[0] != '$' {
+				continue
+			}
+			// $unset takes the field away, which is how an operator cleans up a
+			// document that has one, and $rename names its target in the value
+			// rather than the key and is read below.
+			if key == "$unset" || key == "$rename" {
+				continue
+			}
+			if d, ok := e.Value().DocumentOK(); ok {
+				if f, bad := reservedTopLevel(d); bad {
+					return f, true
 				}
 			}
 		}
@@ -114,13 +129,24 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 			if !ok {
 				continue
 			}
-			for _, op := range []string{"$set", "$addFields", "$replaceWith", "$replaceRoot"} {
-				if v, err := sd.LookupErr(op); err == nil {
-					if d, ok := v.DocumentOK(); ok {
-						if f, bad := reservedTopLevel(d); bad {
-							return f, true
-						}
-					}
+			if f, bad := reservedInStage(sd); bad {
+				return f, true
+			}
+		}
+	}
+	return "", false
+}
+
+// reservedInStage reads one aggregation stage for a reserved field it writes.
+//
+// $project is here because it can introduce a field as much as $set can, and
+// $unset is not because in a pipeline it removes one.
+func reservedInStage(sd bson.Raw) (string, bool) {
+	for _, op := range []string{"$set", "$addFields", "$replaceWith", "$replaceRoot", "$project"} {
+		if v, err := sd.LookupErr(op); err == nil {
+			if d, ok := v.DocumentOK(); ok {
+				if f, bad := reservedTopLevel(d); bad {
+					return f, true
 				}
 			}
 		}
@@ -138,14 +164,8 @@ func reservedInStages(stages []bson.RawValue) (string, bool) {
 		if !ok {
 			continue
 		}
-		for _, op := range []string{"$set", "$addFields", "$replaceWith", "$replaceRoot"} {
-			if v, err := sd.LookupErr(op); err == nil {
-				if d, ok := v.DocumentOK(); ok {
-					if f, bad := reservedTopLevel(d); bad {
-						return f, true
-					}
-				}
-			}
+		if f, bad := reservedInStage(sd); bad {
+			return f, true
 		}
 	}
 	return "", false

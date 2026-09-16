@@ -1062,6 +1062,19 @@ chk "and findAndModify"                                "REFUSED" \
 # The controls matter as much as the refusals. A guard that turned down ordinary
 # writes, or writes to collections this system does not tier, would be this
 # proxy inventing a rule about data it does not touch.
+# Every operator that names the field, not a list of the likely ones. The
+# predicate that hides a document is {$exists: false}, so a field of any type
+# hides it: measured against the first version of this guard, $currentDate and
+# $min each wrote the mark and were accepted.
+chk "and \$currentDate onto it"                         "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$currentDate:{_tcDeletedAt:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "and \$min onto it"                                 "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$min:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+# $unset is the one that must stay allowed: it is how an operator takes the
+# field off a document that has one.
+chk "but \$unset of it is allowed"                      "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$unset:{_tcDeletedAt:''}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")"
+
 # A pipeline writes documents too, and the two paths are read differently: a
 # tiered $out is performed by the router, which reads each document as it
 # passes, while a $merge the fast tier can answer alone is forwarded for mongod
