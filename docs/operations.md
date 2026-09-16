@@ -4,6 +4,22 @@ Backups, restores and logs.
 
 Part of [Thermocline](../README.md).
 
+## The supported shape
+
+**Replica sets on both tiers, running the same MongoDB release and the same
+feature compatibility version.** That is what every suite runs against and the
+only shape these numbers describe.
+
+A sharded or standalone archive is *not* refused, because both work: nothing
+tails the archive, so it needs no oplog. Every daemon says so at startup and
+that warning is the notice, not a formality. "Not refused" is not "supported":
+there is no suite for either shape, so a defect there would be found by whoever
+is running it rather than here. A sharded fast tier *is* refused, because the
+feeder tails it.
+
+If you need one of those shapes, the work is a suite that keeps it honest, not a
+change to the code. See `docs/limitations.md`.
+
 ### Backups
 
 The archive is the complete copy, so it is the one to back up. That is the whole

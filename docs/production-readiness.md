@@ -48,7 +48,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks.
+This is the whole list. Nothing else blocks. **Five of six remain.**
 
 - [ ] **1. Decide `terminate_auth`.** It is off by default and
   `docs/limitations.md` calls it a judgement call rather than a finished
@@ -57,10 +57,13 @@ This is the whole list. Nothing else blocks.
   of read preference and connection pooling. Shipping with it on needs its
   authorisation gate reviewed by somebody who did not write it.
 
-- [ ] **2. Refuse, or accept in writing, an archive that is not a replica set.**
-  A sharded or standalone archive is warned about and not refused, and nothing
-  is tested against either. "Not refused" reads as "supported" from outside.
-  Either refuse it or state that it is unsupported in the deploy guide.
+- [x] **2. Refuse, or accept in writing, an archive that is not a replica set.**
+  Closed by decision on 2026-09-16: accepted in writing rather than refused,
+  because both shapes work and refusing would break a deployment that is running
+  on one. `docs/operations.md` now opens with the supported shape and says
+  plainly that "not refused" is not "supported": there is no suite for either,
+  so a defect there is found by whoever runs it. The startup warning every
+  daemon already prints is the notice.
 
 - [ ] **3. Close or accept the one open lead.** A change stream delivered 23 of
   24 events in one sweep on 2026-09-16. The mechanism the code suggested was
