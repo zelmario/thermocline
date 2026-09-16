@@ -49,19 +49,27 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Four of seven remain.**
+This is the whole list. Nothing else blocks. **Three of seven remain.**
 
-- [ ] **1. Decide `terminate_auth`.** It is off by default and
-  `docs/limitations.md` calls it a judgement call rather than a finished
-  feature. Two of the three steady-state defects found on 2026-09-15 live only
-  in that mode. **Shipping with it off closes this item outright**, at the cost
-  of read preference and connection pooling. Shipping with it on needs its
-  authorisation gate reviewed by somebody who did not write it.
+- [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
+  Authentication is proxied, mongod judges every command against the account the
+  client authenticated as, and this router cannot grant what mongod would
+  refuse. Two of the three steady-state defects found on 2026-09-15 live only in
+  the other mode, and they leave the product with it.
 
-  The decision is still Zelmar's, but it is no longer a silent one: the startup
-  line carries `auth=proxied` or `auth=terminated`, and turning it on prints a
-  WARN every start saying that the router's own gate is then the only thing
-  between a client and somebody else's data. It said nothing at all before.
+  What the decision costs, measured rather than asserted, and now written where
+  an operator reads it in `docs/operations.md`: one upstream connection per
+  client, with a line at a thousand; read preference not honoured, so
+  `secondary`, `secondaryPreferred` and `nearest` all land on the primary, which
+  means sizing the primary for the whole read load; and a command in flight
+  during a step-down failing rather than blocking, with nothing applied twice.
+
+  `terminate_auth: true` stays in the product, tested and unsupported. It has 56
+  checks and a clean pilot behind it, and that is not the claim that matters:
+  with it on this router's own gate is the only thing between a client and
+  somebody else's data, and nobody who did not write that gate has reviewed it.
+  What would reopen this item is that review, not more traffic through it. The
+  startup line says which mode is running, and turning it on warns every start.
 
 - [x] **2. Refuse, or accept in writing, an archive that is not a replica set.**
   Closed by decision on 2026-09-16: accepted in writing rather than refused,

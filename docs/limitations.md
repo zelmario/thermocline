@@ -1039,8 +1039,17 @@ Part of [Thermocline](../README.md).
   than failing, because replaying a drop is exactly how one accident on the fast
   tier would destroy the archive. Removing archived documents is deliberately a
   separate act.
-- **`terminate_auth` is a judgement call rather than a finished feature**, and it
-  is off by default.
+- **`terminate_auth` is off, and that is the shipped configuration.** Decided on
+  2026-09-16 rather than left as a default nobody had ruled on. What proxied
+  authentication costs is in `docs/operations.md` under the supported shape: one
+  upstream connection per client, read preference not honoured, and a command in
+  flight during a step-down failing rather than blocking. Those are the terms of
+  the decision, not defects.
+
+  The mode stays in the product, tested and **not supported**. What would make it
+  supported is a review of its authorisation gate by somebody who did not write
+  it, and not more traffic through it. The rest of this entry is what it has met,
+  which is considerable and is still not that review.
 
   What it has met, in order. Harness traffic first: a three hour soak of 490
   rounds through mongosh, and two shops writing at once for 19,253 commands.

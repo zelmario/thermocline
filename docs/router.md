@@ -57,8 +57,11 @@ Range queries are governed by the watermark below.
   owns. That lifts all three limitations below at once, and it moves the
   decision about who may read what from the fast tier into this process, where
   Authorisation is then the only thing between a client and somebody else's
-  data. **It is off by default and should stay off until it has run somewhere
-  real.**
+  data. **It ships off, decided on 2026-09-16, and proxied authentication is the
+  supported configuration.** What that costs is in `docs/operations.md`. Turning
+  it on is a decision about your own risk: the gate has not been reviewed by
+  anybody who did not write it, and the router warns at every start that you
+  have taken it.
 
   Proxied, which is the default: each client gets its own
   connection to the fast tier, so SCRAM works, at the cost of one upstream

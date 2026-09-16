@@ -20,6 +20,33 @@ feeder tails it.
 If you need one of those shapes, the work is a suite that keeps it honest, not a
 change to the code. See `docs/limitations.md`.
 
+**Authentication is proxied, and that is the shipped configuration.** Decided on
+2026-09-16: `router.terminate_auth` stays off. Each client gets its own upstream
+connection to the fast tier, mongod judges every command against the account the
+client authenticated as, and this router cannot grant what mongod would refuse.
+
+Three things come with that, all measured, and an operator plans around them
+rather than discovering them:
+
+- **One upstream connection per client.** The router says so once at a thousand
+  open clients. The wall is mongod's rather than this proxy's.
+- **Read preference is not honoured.** `secondary`, `secondaryPreferred` and
+  `nearest` all land on the primary, measured with the profiler recording on all
+  three members. Each connection warns the first time it asks, and
+  `thermocline_primary_only_reads_total` counts them. Size the primary for the
+  whole read load.
+- **A command in flight when the primary steps down fails**, and the client
+  retries it, where a driver talking to the replica set directly would block in
+  server selection. Nothing is applied twice; `testfailover.sh` checks that.
+
+`router.terminate_auth: true` lifts all three and is **not supported**. It works
+and has 56 checks behind it, it has carried the whole pilot over data nobody
+here wrote, and that is still not the claim that matters: with it on, this
+router's own authorisation gate is the only thing between a client and somebody
+else's data, and that gate has not been reviewed by anybody who did not write
+it. Turning it on is a decision about your own risk, and the router warns at
+every start that you have taken it.
+
 ### Backups
 
 The archive is the complete copy, so it is the one to back up. That is the whole
