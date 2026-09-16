@@ -849,6 +849,49 @@ chk "  while the duplicate is now refused"               "11000" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:98,sku:'x'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
 kill $RPB 2>/dev/null
 
+echo "== a document the archive refused, and what reads do afterwards =="
+# The feeder gives up on a document the archive's unique index refuses, because
+# no retry of it can succeed, and the evictor then never removes it. That is the
+# half that works: the document is not lost.
+#
+# What reads do afterwards is easy to miss. The archive is the superset by
+# assumption, so a read the fast tier cannot claim is answered there, and there
+# is the one place this document is not. Measured: the archive refused one of
+# two documents sharing a unique value, a sweep kept it and removed the others,
+# and a client counted two where three exist. A lookup by _id still found it,
+# because a point read asks both tiers, so the collection answers differently
+# depending on how it is asked.
+FNS=tkrefused
+pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null; sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null
+rm -f $LOGDIR/refused_f.log
+cline feeder --config $CFG --log-file $LOGDIR/refused_f.log & FRP=$!
+sleep 3
+# Straight at the fast tier, which has no such index and takes both.
+H "const c=db.getSiblingDB(process.env.TC_DB).$FNS;
+   c.insertOne({_id:1,code:'A',what:'the first'});
+   c.insertOne({_id:2,code:'A',what:'the duplicate'});
+   c.insertOne({_id:3,code:'B',what:'an ordinary one'});" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")" = "2" ] && break
+  sleep 1
+done
+kill $FRP 2>/dev/null; wait $FRP 2>/dev/null
+chk "the archive refused one of them"                  "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
+chk "and said so at ERROR"                             "true" \
+    "$(grep -q 'the archive refuses a document the fast tier accepted' $LOGDIR/refused_f.log && echo true || echo false)"
+# The line has to name what reads will do, because that is the part an operator
+# would otherwise find out from an application.
+chk "naming what reads that fall through will do"      "true" \
+    "$(grep -q 'every read that falls through to the archive is short by it' $LOGDIR/refused_f.log && echo true || echo false)"
+chk "the fast tier still holds all three"              "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
+H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"

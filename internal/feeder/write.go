@@ -666,7 +666,9 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 				"id", dup.id.String(),
 				"err", dup.msg,
 				"reason", "another live document in the archive already holds this unique value",
-				"effect", "the archive does not hold this document, and the evictor will not remove it from the fast tier",
+				"effect", "the archive does not hold this document, and the evictor will not remove it "+
+					"from the fast tier; every read that falls through to the archive is short by it, "+
+					"while a lookup by _id still finds it on the fast tier",
 				"action", "resolve the duplicate, then re-run the write; see cline keys --rebuild",
 				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
 			f.counters.unmirrorable++

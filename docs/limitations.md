@@ -57,6 +57,26 @@ Part of [Thermocline](../README.md).
   The protection is still operational: only the router should hold credentials
   that can write to the fast tier's application databases.
 
+- **A document the archive refuses stays on the fast tier, and every read that
+  falls through is short by it.** The feeder gives up on a document the archive's
+  unique index refuses, because no retry of it can ever succeed, and says so at
+  ERROR. The evictor then never removes it, which is the half that works: the
+  document is not lost.
+
+  What is easy to miss is what reads do afterwards. The archive is the superset
+  by assumption, so a read the fast tier cannot claim is answered there, and
+  there is the one place this document is not. Measured with a unique index on
+  the archive alone and two documents sharing its value written at the fast
+  tier: the archive refused one, an eviction sweep correctly kept it and removed
+  the other two, and a client then counted two where three documents exist. A
+  lookup by `_id` still found it, because a point read asks both tiers, which
+  makes the collection answer differently depending on how it is asked.
+
+  There is no repair inside this system: the value belongs to another live
+  document in the archive and nothing here can choose which should keep it.
+  `thermocline_daemon_documents_total{outcome="unmirrorable"}` counts them and
+  has a page rule, and `cline keys --rebuild` reports the duplicates.
+
 - **A completeness claim records which field it was measured in, because
   changing that field re-reads every claim in a dimension it was never made in.**
   "The fast tier holds every live document newer than this instant" is only a
