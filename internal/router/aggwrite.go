@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -144,6 +145,19 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 // leaves the target holding some of it. Saying so is the difference between an
 // operator re-running the aggregation and an operator wondering why a report is
 // short.
+// reservedWriteError is a refusal about the write itself rather than about this
+// router having had to perform the aggregation.
+//
+// The wrapper below explains that the router performed the pipeline and that
+// something about reading its input or writing its result failed, which is the
+// right frame for a failure and the wrong one for a refusal: it put "reading
+// its input from the archive failed" in front of a message about a field name,
+// and an operator reading that looks at the archive. So a refusal is returned
+// as it stands.
+type reservedWriteError struct{ msg string }
+
+func (e reservedWriteError) Error() string { return e.msg }
+
 func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, half bool, err error) (*wire.Message, bool) {
 	c.r.Stats.Refused.Add(1)
 	c.cls = ClassRefused
@@ -153,6 +167,10 @@ func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, ha
 	text := "thermocline: this aggregation was performed by the router rather than forwarded, because " +
 		"its input reaches past what the fast tier holds or its target is tiered, and " + what + ": " +
 		err.Error()
+	var rw reservedWriteError
+	if errors.As(err, &rw) {
+		text = rw.msg
+	}
 	if half {
 		text += ". The target may hold part of the result: it is cleared on both tiers before the " +
 			"result is moved in, and that last step cannot be the rename mongod would use, because a " +
@@ -377,12 +395,12 @@ func (s *writeSink) write(ctx context.Context, batch []any) error {
 				continue
 			}
 			if f, bad := reservedTopLevel(raw); bad {
-				return fmt.Errorf("thermocline: refusing this write to %s because a document it "+
+				return reservedWriteError{fmt.Sprintf("thermocline: refusing this write to %s because a document it "+
 					"writes sets %s, which is the field this system marks archived documents "+
 					"deleted with. A document carrying it is written to both tiers and is then "+
 					"invisible to every read that falls through to the archive, and a fast tier "+
 					"rebuilt from the archive does not have it at all. Rename the field; it is "+
-					"reserved only in collections this system tiers", s.target, f)
+					"reserved only in collections this system tiers", s.target, f)}
 			}
 		}
 	}

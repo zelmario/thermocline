@@ -1046,19 +1046,19 @@ fresh $RNS
 R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:1,v:'ordinary'})" >/dev/null
 res() { case "$1" in *"refusing this write"*) echo REFUSED ;; *) echo "$1" ;; esac; }
 chk "an insert carrying the mark is refused"           "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:2,_tcDeletedAt:new Date()});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:2,_tcDeletedAt:new Date()});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a set of it"                                  "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a replacement document carrying it"           "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.replaceOne({_id:1},{_tcDeletedAt:new Date(),v:'x'});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.replaceOne({_id:1},{_tcDeletedAt:new Date(),v:'x'});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 # A rename names its target in the value rather than the key, which is the one
 # operator that writes a field the keys never mention.
 chk "and a rename onto it"                             "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$rename:{'v':'_tcDeletedAt'}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$rename:{'v':'_tcDeletedAt'}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a pipeline update setting it"                 "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$set:{_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$set:{_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and findAndModify"                                "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findOneAndUpdate({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findOneAndUpdate({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 # The controls matter as much as the refusals. A guard that turned down ordinary
 # writes, or writes to collections this system does not tier, would be this
 # proxy inventing a rule about data it does not touch.
@@ -1067,7 +1067,7 @@ chk "and findAndModify"                                "REFUSED" \
 # the command that once reopened every write protection through a side door, so
 # it gets the same rule asked of it directly.
 chk "and the bulkWrite command"                        "REFUSED" \
-    "$(res "$(R "try{db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:90, _tcDeletedAt:new Date()}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:90, _tcDeletedAt:new Date()}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "while an ordinary bulkWrite still works"          "1" \
     "$(R "db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:91, n:1}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:91}))")"
 
@@ -1076,13 +1076,13 @@ chk "while an ordinary bulkWrite still works"          "1" \
 # hides it: measured against the first version of this guard, $currentDate and
 # $min each wrote the mark and were accepted.
 chk "and \$currentDate onto it"                         "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$currentDate:{_tcDeletedAt:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$currentDate:{_tcDeletedAt:true}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and \$min onto it"                                 "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$min:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$min:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 # $unset is the one that must stay allowed: it is how an operator takes the
 # field off a document that has one.
 chk "but \$unset of it is allowed"                      "ACCEPTED" \
-    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$unset:{_tcDeletedAt:''}});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")"
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$unset:{_tcDeletedAt:''}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")"
 
 # A pipeline writes documents too, and the two paths are read differently: a
 # tiered $out is performed by the router, which reads each document as it
@@ -1090,9 +1090,9 @@ chk "but \$unset of it is allowed"                      "ACCEPTED" \
 # to perform, where the stages are all there is to read. Both were accepted
 # before this, and two live documents on the fast tier ended up wearing the mark.
 chk "and a \$out into a tiered collection"              "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a \$merge into one"                            "REFUSED" \
-    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "an ordinary write is untouched"                   "1" \
 
     "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:3,n:7}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:3}))")"
