@@ -276,6 +276,9 @@ feeder:
     - "shop.tns.dotted"
     - "shop.tevdim"
     - "shop.tkrefused"
+    - "shop.tnat"
+    - "shop.tpre"
+    - "shop.tseq"
     # testindexes.sh
     - "shop.tidx"
     # testindexes.sh again, for what `cline indexes` reports and what it

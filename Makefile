@@ -27,6 +27,9 @@ build:
 install: build
 	docker cp $(BIN) $(NODE):/usr/local/bin/cline
 	@docker exec $(NODE) chmod +x /usr/local/bin/cline
+	@CGO_ENABLED=0 go build -buildvcs=false -o bin/seqwrite ./test/seqwrite
+	@docker cp bin/seqwrite $(NODE):/root/seqwrite >/dev/null
+	@docker exec $(NODE) chmod +x /root/seqwrite
 	@echo "installed into $(NODE)"
 
 ## check-installed answers one question before a sweep: is the node running this

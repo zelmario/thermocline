@@ -849,6 +849,41 @@ chk "  while the duplicate is now refused"               "11000" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).$ANS.insertOne({_id:98,sku:'x'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
 kill $RPB 2>/dev/null
 
+echo "== a write sent as a document sequence, which is how a driver sends one =="
+# Every guard reads its statements through wire.AllOf, which takes both the
+# inline array and the kind 1 section a driver actually sends, and there is a
+# unit test for the parsing. What that does not say is whether a guard fires for
+# the sequenced form end to end.
+#
+# mongosh cannot be relied on to produce it, so this uses a small program built
+# against the official Go driver, which batches an insertMany into a document
+# sequence. Measured: refused through the router with a duplicate key, accepted
+# straight at the fast tier, which is what makes the check able to see a
+# difference at all.
+SNS=tseq
+if [ ! -x /root/seqwrite ]; then
+  echo "      SKIP  /root/seqwrite is not built; make install builds and copies it (2 checks)"
+else
+  H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$SNS.insertOne({_id:'archived',v:'precious'})" >/dev/null
+  rm -f $LOGDIR/seq_r.log
+  cline router --config $CFG --log-file $LOGDIR/seq_r.log & SRP=$!
+  for _ in $(seq 1 30); do
+    mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+    sleep 1
+  done
+  SEQOUT=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" "$SNS" 2>&1 | tail -1)
+  kill $SRP 2>/dev/null; wait $SRP 2>/dev/null
+  chk "a sequenced insert of an archived _id is refused" "true" \
+      "$(grep -q 'REFUSED with a duplicate key' <<<"$SEQOUT" && echo true || echo "false ($SEQOUT)")"
+  chk "and the archived document is untouched"           "precious" \
+      "$(C "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOne({_id:'archived'}); print(d?d.v:'MISSING')")"
+  H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+fi
+
 echo "== a document the archive refused, and what reads do afterwards =="
 # The feeder gives up on a document the archive's unique index refuses, because
 # no retry of it can succeed, and the evictor then never removes it. That is the

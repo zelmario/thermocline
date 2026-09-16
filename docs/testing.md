@@ -2,6 +2,26 @@
 
 Part of [Thermocline](../README.md).
 
+
+### Wire shapes a shell cannot send
+
+`test/seqwrite` writes through the official Go driver, which batches an
+`insertMany` into an OP_MSG **document sequence** rather than an inline array in
+the command document. Every guard here reads its statements through
+`wire.AllOf`, which takes both, and the parsing has a unit test; what that does
+not say is whether a guard fires for the sequenced form end to end.
+
+It earns its place by distinguishing: refused with a duplicate key through the
+router, accepted straight at the fast tier. A check that cannot tell those apart
+would pass against a router that had stopped guarding sequenced writes
+altogether.
+
+`make install` builds it and copies it beside `cline`, and `testkeys.sh` skips
+the section with a line when it is not there rather than passing quietly.
+
+`test/unackread` and `test/exhaust` are the same idea one level lower: raw
+sockets, for flags a driver will not set.
+
 ## Testing on a realistic timescale
 
 Nothing assumes days. The tier boundary is entirely config, so `older_than: 3m`
