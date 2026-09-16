@@ -11,9 +11,20 @@
 # Each shop checks its own five invariants, and the run fails if either does.
 # Between them a warm and an evictor move both shops' documents, so neither is
 # reading a tier that stands still.
+#
+# Item 6 of docs/production-readiness.md asks for this shape running for hours,
+# not for minutes, so the length is a duration rather than a round count:
+#
+#   FOR=4h bash test/store/two.sh
+#
+# A round count cannot express it. A round costs more as the archive grows and
+# as the evictor moves documents under it, so the number that runs for twenty
+# minutes at the start of a run runs for an hour at the end of it.
 NODE=${NODE:-thermocline-zelmar-node0}
 ORDERS=${ORDERS:-8000}
 ROUNDS=${ROUNDS:-300}
+FOR=${FOR:-}
+BEAT=${BEAT:-5m}
 CONC=${CONC:-6}
 CFG=/root/two.yaml
 # terminate_auth moves the decision about who may read what out of mongod and
@@ -30,6 +41,23 @@ CFG=/root/two.yaml
 # connection was authenticated.
 if [ -n "${TERMINATE_AUTH:-}" ]; then CFG=/root/two_ta.yaml; fi
 ROUTER=${ROUTER:-'mongodb://dba:secret@127.0.0.1:27600/?authSource=admin'}
+
+# Two things need the length: the shops, in Go duration form, and the churn
+# loop, in seconds. The churn's own cap is the one that matters if this script
+# is interrupted, so it is derived here rather than left to a cleanup that an
+# interrupt never reaches.
+if [ -n "$FOR" ]; then
+  RUNARG="-for $FOR -heartbeat $BEAT"
+  CHURN_SECS=$(python3 -c "
+import re,sys
+d=sys.argv[1]; u={'h':3600,'m':60,'s':1}; t=0
+for n,s in re.findall(r'([0-9.]+)([hms])', d): t += float(n)*u[s]
+print(int(t)+600 if t else 0)" "$FOR") || CHURN_SECS=0
+  [ "$CHURN_SECS" -gt 0 ] 2>/dev/null || { echo "FOR=$FOR is not a duration this understands (4h, 90m, 30s)"; exit 2; }
+else
+  RUNARG="-rounds $ROUNDS"
+  CHURN_SECS=3600
+fi
 
 N() { docker exec "$NODE" bash -c "$1"; }
 ND() { docker exec -d "$NODE" bash -c "$1"; }
@@ -109,16 +137,29 @@ docker exec "$NODE" mongosh "$ROUTER" --quiet --eval 'db.adminCommand({ping:1})'
 
 # A warm and an evictor looping underneath both shops for as long as the run
 # lasts, so neither application is reading a tier that stands still.
+#
+# Two stopping conditions, and the run needs both. The sentinel is removed when
+# the shops finish, so the churn does not outlive them; the deadline is what
+# stops it when this script is interrupted and never gets to remove anything. A
+# churn left behind moves documents under whatever runs next, and that has been
+# read as a product defect here before.
+#
+# What it must not do is kill the feeder and the router on the way out. It did,
+# by matching every process carrying this config, which was invisible while the
+# churn always outlasted the shops and is a run that loses its daemons halfway
+# as soon as the shops run for hours.
 cat > /tmp/two_churn.sh <<CH
 #!/bin/bash
-trap 'for p in \$(pgrep -f "config /root/tw[o]" | grep -v \$\$); do kill -9 \$p 2>/dev/null; done' EXIT
-for i in \$(seq 1 40); do
+trap 'for p in \$(pgrep -f "cline (warmer|evictor) --config /root/tw[o]"); do kill -9 \$p 2>/dev/null; done' EXIT
+deadline=\$(( \$(date +%s) + $CHURN_SECS ))
+while [ -f /root/two_churn.run ] && [ \$(date +%s) -lt \$deadline ]; do
   cline warmer --config $CFG >/dev/null 2>&1
   cline evictor --config $CFG --once >/dev/null 2>&1
   sleep 5
 done
 CH
 docker cp /tmp/two_churn.sh "$NODE":/root/two_churn.sh >/dev/null
+N "touch /root/two_churn.run"
 ND "bash /root/two_churn.sh"
 
 echo "== both shops open at once =="
@@ -126,16 +167,18 @@ echo "== both shops open at once =="
 # are the result and the output is the explanation.
 pids=()
 for shop in shopA shopB; do
-  docker exec "$NODE" bash -c "store -uri '$ROUTER' -db $shop -rounds $ROUNDS -conc $CONC -skip-seed \
+  docker exec "$NODE" bash -c "store -uri '$ROUTER' -db $shop $RUNARG -conc $CONC -skip-seed \
       -snapshot http://127.0.0.1:27610/api/snapshot > /root/twolog/$shop.out 2>&1" &
   pids+=($!)
 done
 rc=0
 for p in "${pids[@]}"; do wait "$p" || rc=1; done
+N "rm -f /root/two_churn.run"
 
 for shop in shopA shopB; do
   echo "-- $shop --"
-  N "tail -12 /root/twolog/$shop.out"
+  N "grep VIOLATION /root/twolog/$shop.out | head -5"
+  N "tail -30 /root/twolog/$shop.out"
 done
 
 echo "== what the router did while both were writing =="
@@ -149,5 +192,5 @@ for k in ('commands','read_misses','write_misses','copied_up','from_archive','in
     print('  %-16s %s' % (k, c.get(k)))
 " 2>/dev/null
 
-N "for p in \$(pgrep -f 'config /root/tw[o]'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
+N "rm -f /root/two_churn.run; for p in \$(pgrep -f 'config /root/tw[o]'; pgrep -f 'two_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
 exit $rc

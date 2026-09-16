@@ -72,6 +72,13 @@ type shop struct {
 	// run of this tool reported twenty-one of them.
 	months []window
 
+	// until is when a timed run stops, and it is zero when the run is counted
+	// in rounds instead. A run of hours cannot be expressed as a round count:
+	// a round's cost changes as the archive grows and as the evictor moves
+	// documents under it, so the same number is twenty minutes at the start of
+	// a run and an hour at the end.
+	until time.Time
+
 	mu   sync.Mutex
 	lat  map[string][]time.Duration
 	said map[string]int64 // a report's answer, so a later look can disagree with it
@@ -93,6 +100,8 @@ func main() {
 	custs := flag.Int("customers", 5000, "customers")
 	prods := flag.Int("products", 1000, "products")
 	rounds := flag.Int("rounds", 400, "shopping rounds per worker")
+	runFor := flag.Duration("for", 0, "shop for this long instead, ignoring -rounds")
+	beat := flag.Duration("heartbeat", 0, "print a progress line this often")
 	conc := flag.Int("conc", 8, "concurrent shoppers")
 	seedOnly := flag.Bool("seed-only", false, "load the shop and stop")
 	skipSeed := flag.Bool("skip-seed", false, "shop against what is already there")
@@ -155,19 +164,38 @@ func main() {
 		die("the shop holds no month old enough to report on")
 	}
 
-	fmt.Printf("opening: %d shoppers, %s rounds each\n", *conc, commas(*rounds))
+	// A timed run and a counted run are the same shop; only the stopping
+	// condition differs, and -for wins when both are given.
+	perWorker := *rounds
+	if *runFor > 0 {
+		perWorker = 0
+		fmt.Printf("opening: %d shoppers, shopping for %s\n", *conc, *runFor)
+	} else if perWorker > 0 {
+		fmt.Printf("opening: %d shoppers, %s rounds each\n", *conc, commas(*rounds))
+	} else {
+		die("give -rounds or -for; without either this shop never closes")
+	}
 	before := readClasses(*snapshot)
 	began := time.Now()
+	if *runFor > 0 {
+		s.until = began.Add(*runFor)
+	}
+
+	done := make(chan struct{})
+	if *beat > 0 {
+		go s.heartbeat(*beat, began, done)
+	}
 
 	var wg sync.WaitGroup
 	for w := 0; w < *conc; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			s.shop(ctx, rand.New(rand.NewSource(*seed+int64(w))), *rounds, w, *conc)
+			s.shop(ctx, rand.New(rand.NewSource(*seed+int64(w))), perWorker, w, *conc)
 		}(w)
 	}
 	wg.Wait()
+	close(done)
 	elapsed := time.Since(began)
 	after := readClasses(*snapshot)
 
@@ -192,7 +220,12 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 		k := rng.Intn((s.nCustomers-w+conc-1)/conc)*conc + w
 		return fmt.Sprintf("c%06d", k)
 	}
-	for i := 0; i < rounds; i++ {
+	// rounds of zero means "until the deadline", which main only passes with
+	// s.until set.
+	for i := 0; rounds <= 0 || i < rounds; i++ {
+		if !s.until.IsZero() && time.Now().After(s.until) {
+			return
+		}
 		switch n := rng.Float64(); {
 		case n < 0.40:
 			s.browse(ctx, rng)
@@ -460,9 +493,39 @@ func (s *shop) violation(f string, a ...any) {
 	s.violations.Add(1)
 	s.mu.Lock()
 	if len(s.bad) < 20 {
-		s.bad = append(s.bad, fmt.Sprintf(f, a...))
+		msg := fmt.Sprintf(f, a...)
+		s.bad = append(s.bad, msg)
+		// Printed now, not only in the report. A run of hours that keeps its
+		// first violation until the end says nothing about when the system
+		// went wrong, and the daemons' logs beside it are what would say why.
+		fmt.Printf("[%s] VIOLATION %s\n", time.Now().Format("15:04:05"), msg)
 	}
 	s.mu.Unlock()
+}
+
+// heartbeat is what makes a run of hours readable while it runs. The report at
+// the end says what happened; it does not say it at the second hour, which is
+// where a run long enough to be worth doing spends most of its time.
+func (s *shop) heartbeat(every time.Duration, began time.Time, done <-chan struct{}) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			s.mu.Lock()
+			ops := 0
+			for _, v := range s.lat {
+				ops += len(v)
+			}
+			s.mu.Unlock()
+			in := time.Since(began)
+			fmt.Printf("[%s] %s in: %s operations, %.0f/s, %d errors, %d violations\n",
+				time.Now().Format("15:04:05"), in.Round(time.Second), commas(ops),
+				float64(ops)/in.Seconds(), s.errs.Load(), s.violations.Load())
+		}
+	}
 }
 
 func (s *shop) report(elapsed time.Duration) {
