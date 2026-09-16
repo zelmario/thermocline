@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -204,6 +205,7 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 		return fmt.Errorf("dashboard listen on %s: %w", addr, err)
 	}
 	r.log.Info("dashboard listening", "addr", ln.Addr().String())
+	warnDashboardReach(r.log, addr)
 
 	r.goSafely("shutting the dashboard down", func() {
 		<-ctx.Done()
@@ -216,4 +218,40 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 		return err
 	}
 	return nil
+}
+
+// warnDashboardReach says so when the dashboard is reachable from anywhere.
+//
+// The page has no authentication of its own, which is written down, and the
+// advice that goes with it is to bind it to an operator network rather than to
+// the address the application dials. Nothing checked, and the difference between
+// following that advice and not is one character in a config file.
+//
+// What is on the page is not a secret in the cryptographic sense and is plenty
+// in the ordinary one: every collection this deployment tiers, by name, how much
+// of each is hot, the commands per second by how they were served, and the
+// refusals. `/api/snapshot` is the same thing as JSON.
+//
+// A wildcard bind only. An explicit address is somebody's decision and gets no
+// line, because a warning on a deliberate choice is a warning nobody reads.
+func warnDashboardReach(log *slog.Logger, addr string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+	default:
+		return
+	}
+	log.Warn("the dashboard is bound to every interface and has no authentication",
+		"addr", addr,
+		"meaning", "anyone who can reach this port gets every collection this deployment tiers "+
+			"by name, how much of each is hot, and the traffic against them, as a page and as "+
+			"JSON at /api/snapshot",
+		"action", "bind it to an operator network or to 127.0.0.1, or put it behind something "+
+			"that authenticates; router.dashboard is deliberately a separate address from "+
+			"router.listen for this reason",
+		"why", "the page names collections and reports traffic, and it belongs on an operator "+
+			"network rather than wherever the application already connects")
 }

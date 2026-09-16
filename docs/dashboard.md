@@ -33,6 +33,12 @@ The page has no authentication of its own. It names collections and reports
 traffic, so bind it to an operator network rather than to the address the
 application dials.
 
+**The router says so when it is bound to every interface**, because the
+difference between following that advice and not is one character in a config
+file. A wildcard address gets one WARN naming what is on the page; an explicit
+address is somebody's decision and gets nothing, since a warning on a deliberate
+choice is a warning nobody reads.
+
 `test/traffic.sh` drives representative traffic down every path if you want to
 see it with something on it, and `test/load.sh` keeps it running.
 

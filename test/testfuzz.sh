@@ -56,7 +56,17 @@ startFeeder() {
   echo "  WARN  the feeder never wrote a checkpoint"
 }
 startRouter() {
-  cline router --config $CFG --log-file $LOGDIR/fuzz_r.log &
+  # -v, for one line only: "hiding an insert as a promotion" names the document,
+  # when it was promoted, whether an echo was still pending, and the event's own
+  # time. A stream disagreement without that is a count, and the streams section
+  # below prints those lines for whatever went missing.
+  #
+  # On 2026-09-16 a sweep lost one insert event out of twenty four and the same
+  # seed then passed three times running. The mechanism guessed from the code was
+  # measured and refuted: an application re-inserting an _id the archive still
+  # holds live is refused with E11000, not suppressed. So the next occurrence
+  # needs evidence rather than another guess.
+  cline router --config $CFG -v --log-file $LOGDIR/fuzz_r.log &
   for _ in $(seq 1 30); do
     mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
@@ -391,6 +401,14 @@ SLINE=$(echo "$SOUT" | grep -m1 '^AGREED ')
 echo "  $SLINE"
 set -- $SLINE
 chk "streams: no disagreement"     "0" "${8:-none}"
+# What the router decided about every insert it hid, printed only when something
+# disagreed. One of these lines is what says whether a missing event was
+# suppressed on purpose and by which rule, or never reached the filter at all.
+if [ "${8:-0}" != "0" ]; then
+  echo "  what the router hid, and why:"
+  grep -F 'hiding an insert as a promotion' $LOGDIR/fuzz_r.log | tail -12 | sed 's/^/    /'
+  grep -F 'hiding this system' $LOGDIR/fuzz_r.log | tail -4 | sed 's/^/    /'
+fi
 # Two shapes, not one: the tiered collection against the untiered reference, and
 # the same collection's own stream against a database-level one. The second
 # needs no reference at all, and it is the one that catches a filter that was

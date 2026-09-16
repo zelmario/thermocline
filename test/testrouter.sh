@@ -421,6 +421,37 @@ chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
+echo "== the dashboard, which has no authentication of its own =="
+# Written down since the dashboard existed, and nothing checked. The page names
+# every collection this deployment tiers, how much of each is hot, and the
+# traffic against them, and /api/snapshot is the same thing as JSON. The
+# difference between binding it to an operator network and to everything is one
+# character.
+#
+# A wildcard bind only. An explicit address is somebody's decision and gets no
+# line, because a warning on a deliberate choice is a warning nobody reads.
+rm -f $LOGDIR/dashwide_r.log
+cline router --config $CFG --log-file $LOGDIR/dashwide_r.log & DWP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $DWP 2>/dev/null; wait $DWP 2>/dev/null
+chk "a wildcard bind is named"                         "true" \
+    "$(grep -q 'the dashboard is bound to every interface and has no authentication' $LOGDIR/dashwide_r.log && echo true || echo false)"
+sed "s|^  dashboard: .*|  dashboard: \"127.0.0.1:$((PDASH+3))\"|" $CFG > $WDIR/cline_dashlocal.yaml
+rm -f $LOGDIR/dashlocal_r.log
+cline router --config $WDIR/cline_dashlocal.yaml --log-file $LOGDIR/dashlocal_r.log & DLP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+kill $DLP 2>/dev/null; wait $DLP 2>/dev/null
+chk "and an address somebody chose is not"             "false" \
+    "$(grep -q 'bound to every interface' $LOGDIR/dashlocal_r.log && echo true || echo false)"
+
 echo "== an archive with no record of this deployment mirroring into it =="
 # The archive holds the checkpoint, so the archive is what remembers that this
 # deployment has ever mirrored into it. A fast tier holding tiered data against
