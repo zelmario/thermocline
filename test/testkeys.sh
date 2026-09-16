@@ -1062,6 +1062,15 @@ chk "and findAndModify"                                "REFUSED" \
 # The controls matter as much as the refusals. A guard that turned down ordinary
 # writes, or writes to collections this system does not tier, would be this
 # proxy inventing a rule about data it does not touch.
+# The 8.0 bulkWrite command, spelled out rather than through mongosh's
+# bulkWrite() helper, which sends ordinary insert and update commands. This is
+# the command that once reopened every write protection through a side door, so
+# it gets the same rule asked of it directly.
+chk "and the bulkWrite command"                        "REFUSED" \
+    "$(res "$(R "try{db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:90, _tcDeletedAt:new Date()}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]});print('ACCEPTED')}catch(e){print(e.message.substring(0,45))}")")"
+chk "while an ordinary bulkWrite still works"          "1" \
+    "$(R "db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:91, n:1}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:91}))")"
+
 # Every operator that names the field, not a list of the likely ones. The
 # predicate that hides a document is {$exists: false}, so a field of any type
 # hides it: measured against the first version of this guard, $currentDate and

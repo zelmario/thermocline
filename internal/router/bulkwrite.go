@@ -170,6 +170,50 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		return nil, false
 	}
 
+	// The same rule as every other write path, asked of the ops rather than of
+	// a command shape this one does not have. See reserved.go: a document
+	// carrying this system's own mark is written to both tiers and is then
+	// invisible to every read that falls through.
+	//
+	// NOT YET MEASURED end to end: bulkWrite is an 8.0 command and the
+	// throwaway host pair these were measured on is 6.0, so this one is the
+	// same two pure functions the other paths use, reached from here by
+	// reading. It is checked by testkeys.sh against the 8.0 cluster.
+	for _, op := range ops {
+		if !c.r.cfg.Manages(op.ns) {
+			continue
+		}
+		var field string
+		switch op.kind {
+		case "insert":
+			if f, bad := reservedTopLevel(op.doc); bad {
+				field = f
+			}
+		case "update":
+			if f, bad := reservedInUpdate(op.stmt.update); bad {
+				field = f
+			}
+		}
+		if field == "" {
+			continue
+		}
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a bulkWrite that would put this system's own mark on a document",
+			"ns", op.ns, "field", field)
+		out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this bulkWrite because an operation on "+op.ns+" sets "+field+
+				", which is the field this system marks archived documents deleted with. A document "+
+				"carrying it is written to both tiers and is then invisible to every read that "+
+				"falls through to the archive, and a fast tier rebuilt from the archive does not "+
+				"have it at all. Rename the field; it is reserved only in collections this system "+
+				"tiers.")
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+
 	_, inTxn := txnOf(cmd)
 
 	// Documents the write has to be able to see have to be here before it runs.
