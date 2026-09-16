@@ -21,7 +21,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Differential fuzzer, 10 rounds × 200 operations | 3,464 agreed, 0 disagreed |
 | Pilot: MongoDB's sample datasets adopted as an archive, 425,367 documents | 199 questions, 0 disagreements |
 | Pilot write, change stream and transaction batteries | 22, 5 and 15 checks, 0 failed |
-| Pilot soak, three hours | 0 disagreements, 0 stale reads, 0 panics, flat memory |
+| Pilot soak, 691 rounds | 0 disagreements, 0 stale reads, 0 panics, flat memory |
 | Rolling upgrade under traffic, both orders, against an equal-version control | 25 checks, 0 failed |
 | Router startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
 
