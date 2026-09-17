@@ -153,6 +153,13 @@ Part of [Thermocline](../README.md).
   tiered collection rather than forwarding the ones the fast tier can answer,
   which is a large cost for a narrow case.
 
+  It is not silent, though, and that is the difference between a path nothing
+  covers and a path nothing reports. Measured on exactly that shape, two
+  documents carrying the field merged in from an untiered collection: the router
+  accepted it and the feeder named it as it mirrored, once for the collection,
+  with the effect in the line. The guard catches what it can see and the feeder
+  catches what reaches the archive.
+
   What is not closed is the door every out-of-band write uses. A document
   carrying one of these names, written straight at the fast tier's mongod, is
   mirrored and the archive's copy reads as deleted, the same way a write made
