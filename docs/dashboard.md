@@ -351,3 +351,20 @@ The cost is one indexed lookup on the fast tier per upsert, and only on a
 collection whose watermark does not already claim all of history. A fully warmed
 collection has nothing archived that is not also on the fast tier, so the guard
 returns immediately and costs nothing.
+
+## Namespaces short
+
+One tile is about the deployment rather than about traffic. **namespaces short**
+counts the namespaces the archive is missing documents of, because its unique
+index refused them and mirroring gave up rather than retrying for ever.
+
+While it is above zero, every read of those namespaces that the fast tier cannot
+answer in full is refused rather than answered short, so an application is seeing
+errors and will go on seeing them until somebody resolves the duplicate values.
+It is red for that reason: unlike the counters beside it, which record things
+that have happened, this one describes a condition that is still true.
+
+`cline preflight` lists them, namespace by namespace, with the index and the
+colliding key. The same number leaves the router as
+`thermocline_not_superset_namespaces`, which pages.
+

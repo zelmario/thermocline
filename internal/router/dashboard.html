@@ -612,6 +612,14 @@ function drawCounters(s) {
     {k: "unauthorized",    v: c.unauthorized,   hint: "archive answers refused because the fast tier would not have served that client", alert: c.unauthorized > 0},
     {k: "primary-only reads", v: c.primary_only_reads, hint: "reads that asked for a secondary and were served by the primary: correct and fresher, but the load stays on the primary", warn: c.primary_only_reads > 0},
     {k: "clients",         v: c.clients_open,   hint: "connections open now"},
+    // A state rather than a count, and the only tile here that is about the
+    // deployment rather than about traffic. While it is above zero the archive
+    // is missing documents the fast tier holds, so reads of those namespaces
+    // that fall through are refused rather than answered short, and it stays up
+    // until somebody resolves the duplicate values. cline preflight lists them.
+    {k: "namespaces short", v: (s.inventory && s.inventory.notSuperset) || 0,
+     hint: "namespaces the archive is missing documents of: reads of them that fall through are refused; cline preflight lists them",
+     alert: !!(s.inventory && s.inventory.notSuperset > 0)},
   ];
   const wrap = $("counters");
   wrap.innerHTML = "";
