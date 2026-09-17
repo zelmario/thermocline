@@ -15,7 +15,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 
 | Evidence | Result |
 |---|---|
-| In-node suites, 36 of them | 1,832 checks, 0 failed |
+| In-node suites, 36 of them | 1,843 checks, 0 failed |
 | Host suites, 10 of them | 195 checks, 0 failed |
 | The same suites with the query cache on | 1,768 checks, 0 failed |
 | Differential fuzzer, 10 rounds × 200 operations | 3,464 agreed, 0 disagreed |
@@ -25,6 +25,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Rolling upgrade under traffic, both orders, against an equal-version control | 25 checks, 0 failed |
 | Router startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
 | Two applications writing through one router for four hours | 2,830,950 operations, 0 errors, 0 violations |
+| The same two, 45 minutes against the guards added since | 637,747 operations, 0 violations, 0 refusals |
 | The fuzzer's change streams, 20 rounds under three other suites | 365 minutes, 0 disagreements |
 
 ## What is accepted, and needs no work
