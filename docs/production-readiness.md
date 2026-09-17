@@ -25,6 +25,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Rolling upgrade under traffic, both orders, against an equal-version control | 25 checks, 0 failed |
 | Router startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
 | Two applications writing through one router for four hours | 2,830,950 operations, 0 errors, 0 violations |
+| The fuzzer's change streams, 20 rounds under three other suites | 365 minutes, 0 disagreements |
 
 ## What is accepted, and needs no work
 
@@ -49,7 +50,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Three of eight remain.**
+This is the whole list. Nothing else blocks. **Two of eight remain, and neither is code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -79,21 +80,27 @@ This is the whole list. Nothing else blocks. **Three of eight remain.**
   so a defect there is found by whoever runs it. The startup warning every
   daemon already prints is the notice.
 
-- [ ] **3. Close or accept the one open lead.** A change stream delivered 23 of
-  24 events in one sweep on 2026-09-16. The mechanism the code suggested was
-  measured and refuted; the same seed then passed three times. The suite now
-  captures the line that would name the document. Needs either a reproduction or
-  a decision to accept it as unreproduced after N clean runs.
+- [x] **3. The one open lead, accepted as unreproduced.** Closed on 2026-09-16
+  by the bar this file set before the answer was wanted: 20 contended rounds,
+  0 disagreements.
 
-  **N is 20, and the runs have to be the right shape.** It appeared during a
-  parallel sweep, not a quiet run, so `test/streamsoak.sh` runs `testfuzz` with
-  three other suites driving the same six mongods beside it, about eighteen
-  minutes a round. Twenty quiet rounds would prove much less than twenty
-  contended ones, and saying it loudly would be worse than saying nothing. On a
-  disagreement the round's router log is kept, with the "hiding an insert as a
-  promotion" lines that name the document; read those before anything else,
-  because a count cannot be worked back to a document and a guess at the
-  mechanism has already been refuted once.
+  A change stream delivered 23 of 24 events in one sweep on 2026-09-16. The
+  mechanism the code suggested was measured and refuted, and the same seed then
+  passed three times, so the suite was given the evidence it would need instead
+  of a guess: the router runs with `-v` there, for the one line that names the
+  document it hid and why.
+
+  `test/streamsoak.sh` then ran `testfuzz` twenty times with three other suites
+  driving the same six mongods beside it, because the lead appeared during a
+  parallel sweep and twenty quiet runs would have proved much less. **365
+  minutes of contended running, every round's streams section agreeing, every
+  `testfuzz` exiting zero.** N was written into this file before the runs
+  started, which is what stops the bar moving to fit the result.
+
+  It is accepted rather than explained, and that is the honest word for it. If
+  it happens again the evidence is captured: read the lines the suite prints
+  first, because a count cannot be worked back to a document, and the guess
+  from the code has already been refuted once.
 
 - [ ] **4. Measure off this box.** Every number above is six mongods on one
   WSL2 host. Throughput, mirroring rate and failover timing are the ones that
