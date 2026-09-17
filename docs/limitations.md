@@ -153,6 +153,21 @@ Part of [Thermocline](../README.md).
   like the claim check, because the field is not indexed and this is a scan,
   which is also why it is not on a router's startup path.
 
+  **A batch carrying one is refused whole**, where a batch carrying a duplicate
+  key is not. Measured on both, through the router, with `ordered: false`: an
+  insert of three documents where one duplicates an archived `_id` wrote the
+  other two and reported the one failure, the way mongod does; the same batch
+  with one document carrying `_tcDeletedAt` wrote none of the three.
+
+  The difference is deliberate now that it has been measured, and the reason is
+  what the two conditions are. A duplicate key is an ordinary outcome of
+  ordinary data, two people choosing one email address, and an application that
+  loads a thousand documents expects the other nine hundred and ninety-nine to
+  land. A reserved field name is not a data condition at all: it is the
+  application's schema colliding with this system's, it will recur on every
+  batch until the field is renamed, and a partial success would let a bulk load
+  report progress while quietly dropping the same document every time.
+
   **One path is not covered**, and it follows from that split: a `$merge` into a
   tiered collection, of documents that already carry the field, taken from a
   collection where carrying it is allowed because nothing tiers it. No stage
