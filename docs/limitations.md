@@ -430,6 +430,30 @@ Part of [Thermocline](../README.md).
   where the same pipeline at depth 9 was refused. The limit is mongod's now and
   reaching it refuses rather than returning a list known to be short.
 
+- **`filemd5` is refused for a GridFS file the fast tier does not hold whole.**
+  A bucket stores a file as a row in `<root>.files` and a row per chunk in
+  `<root>.chunks`, and a collection of file chunks that only grows and is read
+  rarely is exactly what this system tiers. `filemd5` hashes one file's chunks
+  in order, on whichever tier runs it.
+
+  Measured on a four chunk file with two chunks evicted and both still live in
+  the archive: `3b5d3c7d...` over 4 chunks while it was all resident, and
+  `70bc8f4b...` over 2 chunks afterwards, `ok` on both. An application verifying
+  a file it had stored would read that as the file being corrupt, which is the
+  worst answer a verification command can give and the same one `dbHash` is
+  refused for.
+
+  So it is refused on the same terms, by asking the question the tiers can
+  answer: whether the archive holds chunks of this file the fast tier does not.
+  Two counts bounded by `files_id`, which every bucket indexes, on a command an
+  application sends rarely. A file whose chunks are all resident still answers,
+  and a bucket nothing tiers is untouched.
+
+  Nothing else about GridFS is special here, and that is worth saying because
+  nothing had looked: the chunks are ordinary documents, mirroring them is
+  ordinary work, and a read of a file whose chunks span both tiers falls through
+  to the archive and gets all of them.
+
 - **`dbHash` is refused for a collection the fast tier does not hold in full,
   and `validate` describes one tier.** Both read every document, and neither can
   be corrected the way a count can.

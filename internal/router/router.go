@@ -1093,6 +1093,14 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 
+	// filemd5 is the same thing for one GridFS file's chunks, and a bucket of
+	// file chunks is exactly the shape this system tiers. See filemd5.go.
+	if nameErr == nil && !msg.MoreToCome() && name == "filemd5" {
+		if out, done := c.guardFileMD5(ctx, msg, db); done {
+			return c.answer(msg, out)
+		}
+	}
+
 	// dbHash reads every document and returns one hash, which cannot be
 	// corrected across two tiers. See dbhash.go.
 	if nameErr == nil && !msg.MoreToCome() && (name == "dbHash" || name == "dbhash") {
