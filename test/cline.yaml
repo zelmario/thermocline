@@ -53,6 +53,11 @@ feeder:
     # check what a router already running says about it. The feeder refuses to
     # start against this pair, which is why the suite starts its own router and
     # not a feeder.
+    # testops.sh: a GridFS bucket, because a collection of file chunks that only
+    # grows and is read rarely is exactly what this tiers, and filemd5 hashes
+    # one file's chunks on whichever tier runs it.
+    - "shop.fs.chunks"
+    - "shop.fs.files"
     - "shop.trcapped"
     - "shop.tkreserved"
     - "shop.tidxtext"

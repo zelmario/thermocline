@@ -337,6 +337,58 @@ C "db.getSiblingDB(process.env.TC_DB).$DHNS.drop()" >/dev/null
 cline watermark --config $CFG --ns $DB.$DHNS --clear >/dev/null 2>&1
 kill $DHRP 2>/dev/null; wait $DHRP 2>/dev/null
 
+echo "== filemd5 over a GridFS file the fast tier is short of =="
+# The same defect as dbHash with a file instead of a collection, and GridFS is
+# exactly the shape this system tiers: a bucket stores a file as a row per chunk
+# in <root>.chunks, that collection only grows, and old files are read rarely,
+# so an old file's chunks are the ones the evictor moves.
+#
+# Measured on a four chunk file with two evicted and both still live in the
+# archive: 3b5d3c7d... over 4 chunks while it was all resident, 70bc8f4b... over
+# 2 chunks afterwards, ok on both. An application verifying a file it stored
+# reads the second as the file being corrupt.
+FMNS=fs.chunks
+H "db.getSiblingDB(process.env.TC_DB).fs.chunks.drop(); db.getSiblingDB(process.env.TC_DB).fs.files.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).fs.chunks.drop(); db.getSiblingDB(process.env.TC_DB).fs.files.drop()" >/dev/null
+# The fast tier holds two of the file's four chunks, the archive all four, which
+# is a file half evicted. Written at each tier directly, so no feeder is needed
+# and the state is exactly the one being asked about.
+FID=$(H "const oid=ObjectId(); const d=db.getSiblingDB(process.env.TC_DB);
+   d.fs.files.insertOne({_id:oid,length:1024,chunkSize:256,uploadDate:new Date(),filename:'f.bin'});
+   for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
+   d.fs.chunks.createIndex({files_id:1,n:1});
+   print(oid.valueOf())")
+C "const oid=ObjectId('$FID'); const d=db.getSiblingDB(process.env.TC_DB);
+   d.fs.files.insertOne({_id:oid,length:1024,chunkSize:256,uploadDate:new Date(),filename:'f.bin'});
+   for (let n=0;n<4;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
+   d.fs.chunks.createIndex({files_id:1,n:1})" >/dev/null
+cline router --config $CFG --log-file $LOGDIR/ops_filemd5_r.log & FMRP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "a router is up for this section"         "1" \
+    "$(R 'print(db.adminCommand({ping:1}).ok)')"
+chk "the fast tier holds two of four chunks"  "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).fs.chunks.countDocuments({files_id:ObjectId('$FID')}))")"
+chk "filemd5 on the half file is refused"     "REFUSED" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({filemd5:ObjectId('$FID'),root:'fs'}); print(r.ok===1?'ANSWERED':'ANSWERED')" 2>&1 | grep -q 'refusing this filemd5' && echo REFUSED || echo ANSWERED)"
+# And the control, which decides whether the guard is worth having: a file whose
+# chunks are all on the fast tier still hashes, and its hash is the file's.
+FID2=$(H "const oid=ObjectId(); const d=db.getSiblingDB(process.env.TC_DB);
+   d.fs.files.insertOne({_id:oid,length:512,chunkSize:256,uploadDate:new Date(),filename:'whole.bin'});
+   for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
+   print(oid.valueOf())")
+C "const oid=ObjectId('$FID2'); const d=db.getSiblingDB(process.env.TC_DB);
+   d.fs.files.insertOne({_id:oid,length:512,chunkSize:256,uploadDate:new Date(),filename:'whole.bin'});
+   for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')})" >/dev/null
+chk "a file with every chunk resident answers" "true" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({filemd5:ObjectId('$FID2'),root:'fs'}); print(r.ok===1 && r.numChunks===2)")"
+kill $FMRP 2>/dev/null; wait $FMRP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).fs.chunks.drop(); db.getSiblingDB(process.env.TC_DB).fs.files.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).fs.chunks.drop(); db.getSiblingDB(process.env.TC_DB).fs.files.drop()" >/dev/null
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
