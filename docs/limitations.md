@@ -82,6 +82,14 @@ Part of [Thermocline](../README.md).
   the document, and `updateMany` still reaches all three, because a write is
   applied at the fast tier after the archive's matches are copied up.
 
+  There are two ways out and the refusal names both. Resolving the duplicate is
+  the real one. The other is warming: a fast tier that holds the namespace in
+  full never falls through, so the archive is never asked and the refusal never
+  applies. Measured with the state standing and a complete claim recorded, a
+  bounded read answered 16 and an unbounded one 3,472, neither refused. That is
+  also the proof the guard does not over-refuse, since it sits only on the path
+  that asks the archive.
+
   **It lifts by itself.** Nobody runs a command here after resolving a duplicate,
   so the write that finally reaches the archive is what clears the row: measured,
   reads answered in full again within seconds of the value being changed, and the

@@ -133,7 +133,9 @@ func (c *conn) refuseIfNotSuperset(ctx context.Context, ns string, requestID, re
 		"because", "the archive refused these documents, so it is not a superset of the fast tier",
 		"effect", "answering from the archive would leave them out and report success",
 		"action", "resolve the duplicate unique value, then write the document again; "+
-			"cline keys --rebuild reports the duplicates")
+			"cline keys --rebuild reports the duplicates",
+		"or", "warm this namespace so the fast tier answers it in full, which stops reads falling "+
+			"through at all; measured, a complete claim answers them while this stands")
 
 	out, err := c.r.commandError(requestID, responseTo,
 		"thermocline: refusing this read of "+ns+" because the archive does not hold "+which+
@@ -141,8 +143,9 @@ func (c *conn) refuseIfNotSuperset(ctx context.Context, ns string, requestID, re
 			"them, and this read is answered from the archive because the fast tier cannot be shown "+
 			"to hold the whole of it. Answering would leave those documents out and say ok. "+
 			"Resolve the duplicate value and write the document again, and this lifts by itself; "+
-			"cline keys --rebuild reports the duplicates. The documents are still on the fast tier "+
-			"and a lookup by _id still returns them.")
+			"cline keys --rebuild reports the duplicates. Warming this namespace also answers these "+
+			"reads, because a fast tier that holds it in full never falls through. The documents are "+
+			"still on the fast tier and a lookup by _id still returns them.")
 	if err != nil {
 		return nil, false
 	}
