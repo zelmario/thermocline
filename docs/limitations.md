@@ -822,6 +822,30 @@ Part of [Thermocline](../README.md).
   at the archive directly, which is the restore path the runbook already
   describes.
 
+- **A read waits for mirroring to catch up, and answers anyway when it does
+  not.** This is the one place the system knowingly returns an answer it cannot
+  vouch for, and it is a deliberate trade rather than an oversight: the
+  alternative is to fail reads whenever the feeder is behind, which turns a
+  feeder that is merely slow into an outage.
+
+  A read that falls through to the archive waits for the feeder to reach the
+  instant the read began, bounded by `router.archive_wait`, and by half the
+  caller's own `maxTimeMS` when it set one, so that neither half can starve the
+  other. Past that bound the archive is asked as it stands.
+
+  Measured with the feeder stopped and a document written through the router a
+  moment before: `countDocuments` on that `_id` answered **0** after 208ms for a
+  document the application had just written successfully. The effect is stated
+  in the warning it logs: the answer may miss a very recent write, or include a
+  very recently deleted document.
+
+  It is counted and it pages. `thermocline_stale_reads_total` above zero is a
+  page-level rule in `docs/monitoring.md`, because in a healthy deployment this
+  is zero: the four-hour two-application run and the 691-round pilot soak each
+  recorded none. A deployment seeing them has a feeder that cannot keep up, and
+  the answer is to fix that rather than to raise `archive_wait`, which only
+  trades the stale answer for a slow one.
+
 - **Two daemons on hosts whose clocks differ are corrected, not required to
   agree.** Several things here are decided by comparing instants read on
   different machines, and none of them can be got from a logical clock.
