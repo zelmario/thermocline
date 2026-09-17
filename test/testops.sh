@@ -353,11 +353,16 @@ C "db.getSiblingDB(process.env.TC_DB).fs.chunks.drop(); db.getSiblingDB(process.
 # The fast tier holds two of the file's four chunks, the archive all four, which
 # is a file half evicted. Written at each tier directly, so no feeder is needed
 # and the state is exactly the one being asked about.
-FID=$(H "const oid=ObjectId(); const d=db.getSiblingDB(process.env.TC_DB);
+# A fixed id rather than one captured from the shell. The first version of this
+# generated one and read it back with print(oid.valueOf()), which mongosh
+# renders as ObjectId('...') rather than the bare hex, so every check after it
+# built ObjectId('ObjectId('...')') and failed on a syntax error. A literal both
+# sides can spell needs no capture at all.
+FID=00000000000000000000fa11
+H "const oid=ObjectId('$FID'); const d=db.getSiblingDB(process.env.TC_DB);
    d.fs.files.insertOne({_id:oid,length:1024,chunkSize:256,uploadDate:new Date(),filename:'f.bin'});
    for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
-   d.fs.chunks.createIndex({files_id:1,n:1});
-   print(oid.valueOf())")
+   d.fs.chunks.createIndex({files_id:1,n:1})" >/dev/null
 C "const oid=ObjectId('$FID'); const d=db.getSiblingDB(process.env.TC_DB);
    d.fs.files.insertOne({_id:oid,length:1024,chunkSize:256,uploadDate:new Date(),filename:'f.bin'});
    for (let n=0;n<4;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
@@ -376,10 +381,10 @@ chk "filemd5 on the half file is refused"     "REFUSED" \
     "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({filemd5:ObjectId('$FID'),root:'fs'}); print(r.ok===1?'ANSWERED':'ANSWERED')" 2>&1 | grep -q 'refusing this filemd5' && echo REFUSED || echo ANSWERED)"
 # And the control, which decides whether the guard is worth having: a file whose
 # chunks are all on the fast tier still hashes, and its hash is the file's.
-FID2=$(H "const oid=ObjectId(); const d=db.getSiblingDB(process.env.TC_DB);
+FID2=00000000000000000000fa22
+H "const oid=ObjectId('$FID2'); const d=db.getSiblingDB(process.env.TC_DB);
    d.fs.files.insertOne({_id:oid,length:512,chunkSize:256,uploadDate:new Date(),filename:'whole.bin'});
-   for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')});
-   print(oid.valueOf())")
+   for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')})" >/dev/null
 C "const oid=ObjectId('$FID2'); const d=db.getSiblingDB(process.env.TC_DB);
    d.fs.files.insertOne({_id:oid,length:512,chunkSize:256,uploadDate:new Date(),filename:'whole.bin'});
    for (let n=0;n<2;n++) d.fs.chunks.insertOne({_id:ObjectId(),files_id:oid,n:n,data:BinData(0,'AAAAAAAAAAAAAAAAAAAAAA==')})" >/dev/null
