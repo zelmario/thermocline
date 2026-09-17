@@ -128,6 +128,15 @@ Part of [Thermocline](../README.md).
   no predicate here reads, and the same field in a collection nothing tiers,
   where it means nothing at all.
 
+  The guard is preventive, and an adoption is the shape this product exists for:
+  the cluster arrives with years of documents in it, written by an application
+  that never heard of this system, and refusing new writes does nothing for a
+  document already there. `cline preflight` counts them, per tiered namespace,
+  on the fast tier: nothing here writes either field there, so a fast tier
+  document carrying one is the application's own. It is bounded by `--count-for`
+  like the claim check, because the field is not indexed and this is a scan,
+  which is also why it is not on a router's startup path.
+
   **One path is not covered**, and it follows from that split: a `$merge` into a
   tiered collection, of documents that already carry the field, taken from a
   collection where carrying it is allowed because nothing tiers it. No stage

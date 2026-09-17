@@ -7,12 +7,15 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/router"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -118,6 +121,7 @@ func runPreflight(args []string) error {
 	}
 
 	verifyClaims(ctx, hot, cold, cfg, *countFor)
+	findReservedFields(ctx, hot, cfg, *countFor)
 
 	fmt.Print(`
 Nothing above refuses a start. Read the warnings: most of them name something an
@@ -144,6 +148,122 @@ nothing has claimed. See docs/adoption.md.
 // claim, so there is one definition of what bears a claim out. It is bounded,
 // and a namespace the budget does not reach is reported as not reached rather
 // than passed over: a claim not checked is a claim that stands.
+// findReservedFields names the application's own documents that carry one of
+// the field names this system writes into archived copies.
+//
+// The router refuses writes that would leave one, on every path. That is
+// preventive, and an adoption is the shape this product exists for: the
+// cluster arrives with years of documents already in it, written by an
+// application that never heard of this system, and nothing about the guard
+// helps a document that is already there.
+//
+// Such a document is invisible to every read that falls through to the archive,
+// because the predicate that excludes deleted copies is {$exists: false} and it
+// cannot tell the two apart. A lookup by _id still returns it, which is what
+// makes it worth naming: the collection answers two different ways about one
+// document and no error is raised either way.
+//
+// Only the fast tier is counted, and that is what makes the answer clean. The
+// archive's live copies and its tombstones both carry the field by design, so a
+// count there says nothing. Nothing writes it to the fast tier: the router
+// never marks anything there, and a copy-up brings up live documents only. So a
+// fast tier document carrying it is the application's own.
+//
+// Bounded, because the field is not indexed and this is a collection scan. It
+// is here rather than in a router's startup for that reason: an operator ran
+// this on purpose and can spend a minute on it, where a router restart during
+// an incident cannot.
+func findReservedFields(ctx context.Context, hot *mongo.Client, cfg config.Config, budget time.Duration) {
+	namespaces := cfg.Feeder.Namespaces
+	if len(namespaces) == 0 {
+		// Everything is tiered, and the fast tier's own collections are the ones
+		// whose documents this is about.
+		found, err := hotNamespaces(ctx, hot)
+		if err != nil {
+			fmt.Printf("\nthe fast tier's collections could not be listed, so none was checked for "+
+				"reserved field names: %v\n", err)
+			return
+		}
+		namespaces = found
+	}
+	if len(namespaces) == 0 {
+		return
+	}
+	sort.Strings(namespaces)
+
+	fmt.Printf("\nChecking %d tiered namespace(s) for documents carrying this system's own field names.\n",
+		len(namespaces))
+	deadline := time.Now().Add(budget)
+	var carrying []string
+	checked := 0
+	for _, ns := range namespaces {
+		if time.Until(deadline) <= 0 {
+			fmt.Printf("  %s: not reached inside %s, so it stands unchecked\n", ns, budget)
+			continue
+		}
+		db, coll, ok := strings.Cut(ns, ".")
+		if !ok {
+			continue
+		}
+		filter := bson.D{{Key: "$or", Value: bson.A{
+			bson.D{{Key: meta.TombstoneField, Value: bson.D{{Key: "$exists", Value: true}}}},
+			bson.D{{Key: meta.BodyDroppedField, Value: bson.D{{Key: "$exists", Value: true}}}},
+		}}}
+		cctx, cancel := context.WithDeadline(ctx, deadline)
+		n, err := hot.Database(db).Collection(coll).CountDocuments(cctx, filter)
+		cancel()
+		if err != nil {
+			fmt.Printf("  %s: %v\n", ns, err)
+			continue
+		}
+		checked++
+		if n > 0 {
+			carrying = append(carrying, fmt.Sprintf("%s (%d)", ns, n))
+		}
+	}
+	switch {
+	case len(carrying) > 0:
+		fmt.Printf("\n%s\n", strings.Join(carrying, "\n"))
+		fmt.Printf("\nThese documents carry a field this system marks archived documents deleted\n" +
+			"with, so every read that falls through to the archive leaves them out and\n" +
+			"reports success, while a lookup by _id still returns them. Rename the field in\n" +
+			"the application and in these documents before tiering them. New writes carrying\n" +
+			"it are refused; these were already here.\n")
+	case checked > 0:
+		fmt.Printf("None of them carries one.\n")
+	}
+}
+
+// hotNamespaces lists the fast tier's application collections, for the
+// deployment that tiers everything by naming nothing.
+func hotNamespaces(ctx context.Context, hot *mongo.Client) ([]string, error) {
+	dbs, err := hot.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, db := range dbs {
+		switch db {
+		case "admin", "local", "config":
+			continue
+		}
+		if isBookkeepingDB(db) {
+			continue
+		}
+		colls, err := hot.Database(db).ListCollectionNames(ctx, bson.D{})
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range colls {
+			if strings.HasPrefix(c, "system.") || meta.IsScratch(c) {
+				continue
+			}
+			out = append(out, db+"."+c)
+		}
+	}
+	return out, nil
+}
+
 func verifyClaims(ctx context.Context, hot, cold *mongo.Client, cfg config.Config, budget time.Duration) {
 	marks, err := watermark.New(cold).All(ctx)
 	if err != nil {

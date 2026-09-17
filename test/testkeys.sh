@@ -1111,6 +1111,20 @@ chk "and a \$out into a tiered collection"              "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a \$merge into one"                            "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# Unacknowledged, which is the shape that has caught this project out before:
+# everything the router repairs on the reply is absent for a w:0 message, and
+# single-document update, delete and findAndModify were once guarded nowhere
+# because of it. This guard runs before the command is forwarded rather than on
+# the way back, so it holds here, and the control beside it is what makes that
+# mean something: an ordinary w:0 write still lands.
+R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:70,_tcDeletedAt:new Date()},{writeConcern:{w:0}})" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:71,n:1},{writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 2
+chk "an unacknowledged write carrying it never lands"  "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:70}))")"
+chk "while an ordinary unacknowledged one does"        "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:71}))")"
+
 # Counted on the fast tier, which is where the write went. Counting through the
 # router asks the archive for a namespace with no completeness claim, so these
 # read 0 for as long as mirroring takes and fail for a reason that has nothing
