@@ -290,6 +290,13 @@ function updateSpec() {
 // necessarily walk the other. Deterministic stages only, for the reason
 // $currentDate is absent from updateSpec: $$NOW is evaluated per server, so the
 // two collections would be given different values and disagree over nothing.
+// Four seeds behind these two, because a generator change that destabilises the
+// harness costs more than it finds: the default through a full sweep, 1,834
+// checks and 0 failed, and 4242, 90210 and 777001 each 35 checks, 0 failed, no
+// disagreement of any kind. 777001 is the seed named further up this file as
+// one that used to stall rounds, which is why it is one of them. And the
+// generator was asked whether it can see its own subject before any of that:
+// 529 $rename draws in 5,000, in line with the other operators.
 function pipelineSpec() {
   switch (ri(3)) {
     case 0: return [{ $set: { opt: 'pipe' + ri(4) } }];
