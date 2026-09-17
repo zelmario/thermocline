@@ -90,6 +90,17 @@ Part of [Thermocline](../README.md).
   also the proof the guard does not over-refuse, since it sits only on the path
   that asks the archive.
 
+  `cline backfill` meets this state too, and until 2026-09-17 it lied about it.
+  The copy is unordered, so the archive applies what it can and refuses the
+  rest; the driver reports that as an error, and the command turned the whole
+  namespace into "could not be copied", counted nothing, and then printed its
+  closing line, which says what was on the fast tier is in the archive now.
+  Measured on three documents with one refused: `Copied 0`, and that sentence.
+  It now copies what it can, names the documents the archive refused with the
+  index and the key, says the namespace is still short by them and that the
+  router refuses those reads, and keeps the old closing line only for the runs
+  where it is true.
+
   **It lifts by itself.** Nobody runs a command here after resolving a duplicate,
   so the write that finally reaches the archive is what clears the row: measured,
   reads answered in full again within seconds of the value being changed, and the

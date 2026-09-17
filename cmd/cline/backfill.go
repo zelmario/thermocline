@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -115,18 +117,27 @@ func runBackfill(args []string) error {
 	fmt.Println()
 
 	marks := watermark.New(cold)
-	var totalCopied, totalMarked int64
+	var totalCopied, totalMarked, totalRefused int64
 	for _, ns := range namespaces {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
 			continue
 		}
-		copied, cerr := backfillDocuments(ctx, hot, cold, db, coll, *apply)
+		copied, refused, refusalWhy, cerr := backfillDocuments(ctx, hot, cold, db, coll, *apply)
 		if cerr != nil {
 			fmt.Printf("  %-40s could not be copied: %v\n", ns, cerr)
 			continue
 		}
 		totalCopied += copied
+		// Documents the archive would not take, named rather than folded into
+		// the count. The namespace is still short by these and the router
+		// refuses the reads that would be short by them, so an operator who
+		// reads only the total would be told this namespace is done.
+		if refused > 0 {
+			totalRefused += refused
+			fmt.Printf("  %-40s %d document(s) the archive refused: %s\n", ns, refused,
+				firstLine(refusalWhy))
+		}
 
 		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
 		totalMarked += marked
@@ -140,7 +151,7 @@ func runBackfill(args []string) error {
 	fmt.Println()
 	if *apply {
 		fmt.Printf("Copied %d document(s) into the archive and marked %d as deleted.\n", totalCopied, totalMarked)
-		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld)
+		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld, totalRefused)
 	}
 	fmt.Printf("Would copy %d document(s) into the archive and mark %d as deleted.\n", totalCopied, totalMarked)
 	fmt.Println("Re-run with --apply to do it.")
@@ -180,26 +191,54 @@ const backfillBatch = 500
 // Upserted by _id, because the fast tier's copy is the newer one: it is what the
 // application wrote during the window, and the archive's is what it looked like
 // before. A document the archive does not have at all is created.
-func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll string, apply bool) (int64, error) {
+func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll string, apply bool) (copied, refusedOut int64, why string, err error) {
 	src := hot.Database(db).Collection(coll)
 	dst := cold.Database(db).Collection(coll)
 
 	cur, err := src.Find(ctx, bson.D{})
 	if err != nil {
-		return 0, err
+		return 0, 0, "", err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	var n int64
+	var n, refused int64
+	var firstRefusal string
 	var models []mongo.WriteModel
+	// Unordered, so the archive applies what it can and refuses the rest one at
+	// a time. The driver reports that as an error even though most of the batch
+	// landed, and this used to return it: one document the archive would not
+	// take made the whole namespace read "could not be copied", with the
+	// documents that were copied uncounted.
+	//
+	// Measured on three documents where the archive's unique index refuses one:
+	// "could not be copied", "Copied 0 document(s)", and then the closing line
+	// telling the operator that what was on the fast tier is in the archive now.
+	// That is a recovery command reporting success for work it did not do, in
+	// the one state where somebody is running it because something is already
+	// wrong.
 	flush := func() error {
 		if len(models) == 0 {
 			return nil
 		}
 		if apply {
-			if _, werr := dst.BulkWrite(ctx, models,
-				options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true)); werr != nil {
-				return werr
+			_, werr := dst.BulkWrite(ctx, models,
+				options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true))
+			if werr != nil {
+				var bwe mongo.BulkWriteException
+				if !errors.As(werr, &bwe) || len(bwe.WriteErrors) == 0 {
+					return werr
+				}
+				// Each write error is one document the archive will not take,
+				// and the rest of the batch is in. A duplicate key here is the
+				// same condition the feeder gives up on: another live archive
+				// document holds that value, and no retry changes it.
+				for _, we := range bwe.WriteErrors {
+					refused++
+					if firstRefusal == "" {
+						firstRefusal = we.Message
+					}
+				}
+				n -= int64(len(bwe.WriteErrors))
 			}
 		}
 		models = models[:0]
@@ -218,14 +257,30 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 		n++
 		if len(models) >= backfillBatch {
 			if ferr := flush(); ferr != nil {
-				return n, ferr
+				return n, refused, firstRefusal, ferr
 			}
 		}
 	}
 	if cerr := cur.Err(); cerr != nil {
-		return n, cerr
+		return n, refused, firstRefusal, cerr
 	}
-	return n, flush()
+	if ferr := flush(); ferr != nil {
+		return n, refused, firstRefusal, ferr
+	}
+	return n, refused, firstRefusal, nil
+}
+
+// firstLine trims a driver's error to something that fits a report line. The
+// whole message carries the index name and the key, which is what an operator
+// needs; the stack of wrappers around it is not.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 140 {
+		s = s[:140] + "..."
+	}
+	return s
 }
 
 // backfillDeletes marks the archive's copies of documents the application
@@ -371,7 +426,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 // Refused outright after --ns for that exact reason. One namespace was copied
 // and the checkpoint is not per namespace.
 func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
-	only string, clear, feederRunning bool) error {
+	only string, clear, feederRunning bool, totalRefused int64) error {
 
 	// Which of the two jobs this was decides what to say next, and saying the
 	// wrong one is worse than saying nothing. A feeder that is running means
@@ -379,9 +434,24 @@ func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
 	// being tiered, and its checkpoint is fine. Telling an operator to clear it
 	// there would restart mirroring from now for every namespace, for no
 	// reason.
+	// Said only when it is true. With documents the archive refused, what was on
+	// the fast tier is precisely not all in the archive now, and this is the
+	// line an operator reads as "the gap is closed".
+	if totalRefused > 0 {
+		fmt.Printf("\n%d document(s) could not be copied, so this namespace is still short by them\n"+
+			"and the router refuses the reads that would be short: the archive already holds\n"+
+			"another live document with the value each of them carries. Resolve those\n"+
+			"duplicates and write the documents again; cline keys --rebuild reports them.\n",
+			totalRefused)
+	}
 	if feederRunning {
-		fmt.Println("The feeder is mirroring, so there is no checkpoint to clear: what was already")
-		fmt.Println("on the fast tier is in the archive now, and what happens next it will carry.")
+		if totalRefused == 0 {
+			fmt.Println("The feeder is mirroring, so there is no checkpoint to clear: what was already")
+			fmt.Println("on the fast tier is in the archive now, and what happens next it will carry.")
+		} else {
+			fmt.Println("The feeder is mirroring, so there is no checkpoint to clear, and it will carry")
+			fmt.Println("what happens next. What it will not carry is the documents above.")
+		}
 		return nil
 	}
 	if !clear {
