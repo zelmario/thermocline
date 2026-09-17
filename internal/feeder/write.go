@@ -705,9 +705,11 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 				"err", dup.msg,
 				"reason", "another live document in the archive already holds this unique value",
 				"effect", "the archive does not hold this document, and the evictor will not remove it "+
-					"from the fast tier; every read that falls through to the archive is short by it, "+
-					"while a lookup by _id still finds it on the fast tier",
-				"action", "resolve the duplicate, then re-run the write; see cline keys --rebuild",
+					"from the fast tier; every read of this namespace that falls through to the "+
+					"archive is refused while this stands, because answering would leave the "+
+					"document out, and a lookup by _id still finds it on the fast tier",
+				"action", "resolve the duplicate, then re-run the write; cline preflight lists every "+
+					"document in this state, with the index and the colliding key",
 				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
 			f.counters.unmirrorable++
 			// Recorded where a reader can see it, not only in this log.

@@ -254,7 +254,8 @@ func (f *Feeder) loadUnmirrored(ctx context.Context) {
 			"ns", ns, "documents", n,
 			"effect", "reads of this namespace that fall through to the archive are refused, "+
 				"because the archive is not a superset of the fast tier while this stands",
-			"action", "resolve the duplicate value, then write the document again; see cline keys --rebuild")
+			"action", "resolve the duplicate value, then write the document again; cline preflight "+
+				"lists them with the index and the colliding key")
 	}
 }
 

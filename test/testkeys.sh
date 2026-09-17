@@ -966,9 +966,12 @@ chk "the archive refused one of them"                  "2" \
 chk "and said so at ERROR"                             "true" \
     "$(grep -q 'the archive refuses a document the fast tier accepted' $LOGDIR/refused_f.log && echo true || echo false)"
 # The line has to name what reads will do, because that is the part an operator
-# would otherwise find out from an application.
+# would otherwise find out from an application. It used to say those reads come
+# back short, which was true until the router started refusing them: a message
+# describing behaviour the product no longer has is worse than no message, and
+# this check pinned the old wording in place.
 chk "naming what reads that fall through will do"      "true" \
-    "$(grep -q 'every read that falls through to the archive is short by it' $LOGDIR/refused_f.log && echo true || echo false)"
+    "$(grep -q 'is refused while this stands' $LOGDIR/refused_f.log && echo true || echo false)"
 chk "the fast tier still holds all three"              "3" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))")"
 
