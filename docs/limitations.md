@@ -350,6 +350,25 @@ Part of [Thermocline](../README.md).
   first run of this named two namespaces left behind by the test suites that
   nobody had noticed.
 
+- **A capped archive collection throws away the history, and the advice for it
+  used to be the worst possible advice.** `convertToCapped` run straight at the
+  archive is out of band the way a write there is, and the feeder refuses to
+  start against such a pair, which is the half that works while it restarts.
+
+  What a running router said was that the two tiers differ in an option, with
+  the action "make the two copies the same, or know why they differ". Making
+  them the same here means capping the fast tier too, which would destroy the
+  recent half as well.
+
+  Measured on eighty mirrored documents: the conversion itself left sixteen and
+  the rest were gone, a later insert through the router mirrored into the capped
+  collection and rolled another away, and an update that grew a document was
+  applied on both tiers without complaint, because mongod stopped refusing those
+  in 4.2. Mirroring never errored, and nothing but that one line named it. It
+  has its own line now, saying that the archive is discarding what it exists to
+  keep and that the remedy is to un-cap the archive's copy rather than to match
+  the fast tier to it.
+
 - **A collection converted to capped while it is being mirrored stops the
   feeder.** The kind check runs at startup and again the first time an event for
   a namespace arrives, and it remembers its answer until the collection is

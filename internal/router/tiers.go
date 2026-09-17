@@ -1045,6 +1045,33 @@ func (r *Router) warnAboutOptionDrift(ctx context.Context) {
 			ns := db + "." + coll
 			r.warnAboutLostConstraint(ctx, ns, db, coll)
 			for _, key := range drifted(c, h) {
+				// A capped archive is not a difference of opinion about an
+				// option, and saying "make the two copies the same" about it is
+				// advice that would destroy the fast tier too. mongod removes
+				// the oldest documents of a capped collection as it fills, and
+				// the archive is where the history this system exists to keep
+				// is kept, so it is thrown away with nothing said and reads
+				// that fall through come back short.
+				//
+				// Measured on 80 mirrored documents with convertToCapped run
+				// straight at the archive: the conversion left 16 and the rest
+				// were gone, mirroring carried on without an error of any kind,
+				// and nothing but this line named it. The feeder refuses to
+				// start against such a pair, which is the other half: this is
+				// what a router says while one keeps running.
+				if key == "capped" && cappedOption(c[key]) {
+					r.log.Warn("the archive's copy of a tiered collection is capped",
+						"ns", ns,
+						"meaning", "a capped collection removes its own oldest documents as it "+
+							"fills, and the archive is where this system keeps the history, so it "+
+							"is being thrown away as new documents arrive and a read that falls "+
+							"through comes back short with no error",
+						"action", "copy the archive's collection into an uncapped one and rename it "+
+							"back, then restart the feeder, which refuses to run against this",
+						"not", "making the fast tier capped as well, which is what matching the two "+
+							"copies would mean here")
+					continue
+				}
 				action := optionAdvice[key]
 				if action == "" {
 					action = "make the two copies the same, or know why they differ"
@@ -1183,6 +1210,18 @@ var serverOwned = map[string]bool{"idIndex": true, "info": true, "uuid": true, "
 // list of the options worth checking silently passes every option nobody
 // thought of, which is the mistake the create path next door had already made
 // once and fixed by inverting its list.
+// cappedOption reads the rendered capped option the way mongod reads the flag
+// itself: a boolean, or a number that is not zero. The create guard had to
+// learn the same latitude, because mongod declares it safeBool and a capped
+// collection can be asked for with capped: 1.
+func cappedOption(rendered string) bool {
+	switch rendered {
+	case "", "false", "0":
+		return false
+	}
+	return !strings.Contains(rendered, `"0"`)
+}
+
 var optionAdvice = map[string]string{
 	"collation": "recreate the fast tier's copy with it, because a collation cannot be added to a " +
 		"collection that already holds documents",
