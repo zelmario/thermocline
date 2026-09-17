@@ -49,7 +49,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Three of seven remain.**
+This is the whole list. Nothing else blocks. **Three of eight remain.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -152,6 +152,32 @@ This is the whole list. Nothing else blocks. **Three of seven remain.**
   reaches every document including this one. The refusal lifts by itself when the
   duplicate is resolved, because the write that finally reaches the archive is
   what clears the row. `testkeys.sh` pins all of it.
+
+- [x] **8. An application writing this system's own mark made its own document
+  invisible.** Found and closed on 2026-09-16, and here rather than in
+  `docs/limitations.md` for the same reason item 7 is: a wrong answer in steady
+  state rather than a boundary.
+
+  The archive marks a deleted document with `_tcDeletedAt` and every read of the
+  archive excludes the documents carrying it. Nothing stopped an application
+  writing a field of that name, and mongod takes it like any other. Measured:
+  both tiers accepted the document, `countDocuments` answered **0** where the
+  same document in an untiered collection answered **1**, and `findOne({_id})`
+  returned it, so one collection answered two ways about one document. A fast
+  tier rebuilt from that archive, which is the documented recovery, would not
+  have the document at all.
+
+  Every write path refuses it now: insert, update by any operator that names the
+  field, a replacement document, `$rename`, a pipeline update, `findAndModify`,
+  `bulkWrite`, and both paths a pipeline writes by. `$unset` stays allowed,
+  because it is how the field is taken off a document that has one. One path is
+  written down as uncovered in `docs/limitations.md`: a `$merge` of documents
+  that already carry the field, from a collection where nothing tiers it.
+
+  Three attempts were needed and each one was found by attacking the last: the
+  first covered the write commands and missed the aggregation ones, the second
+  read an allow-list of three operators where the rule is about a name, and the
+  third returned its refusal wearing a read failure's words.
 
 ## The rule that keeps this list finite
 
