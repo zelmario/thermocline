@@ -1567,6 +1567,22 @@ print('AGREED ' + agreed + '  REFUSED ' + refused + '  SETTLED ' + settled + '  
 // One line naming every shape this round compared, as done/vacuous. A shape
 // missing from it was never generated; a shape whose two numbers are equal
 // compared nothing but error messages.
+//
+// Measured over three long runs, 10 rounds of 200 operations each, on
+// 2026-09-17. Most shapes are near zero, and three are not:
+//
+//     dropIndex     118 done,  47 vacuous, 39%
+//     createIndex   297 done,  93 vacuous, 31%
+//     upsert        214 done,  34 vacuous, 15%
+//
+// A vacuous comparison is not a wasted one, since error parity is worth
+// comparing and a router that turned one side's error into the other's answer
+// would fail here. But a third of the DDL draws never compare an effect, so a
+// round buys less index coverage than its SHAPES line suggests. Anybody
+// widening this generator should spend the effort there rather than on another
+// read shape, and should read this line rather than the count beside it: these
+// two numbers are done and vacuous, and reading the second as disagreements is
+// a mistake already made once.
 print('SHAPES ' + Object.keys(shapes).sort()
   .map(k => k.replace(/ /g, '_') + '=' + shapes[k].n + '/' + shapes[k].vacuous).join(' '));
 for (const [w, op, ref, got] of bugs) {

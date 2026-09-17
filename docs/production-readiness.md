@@ -19,6 +19,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Host suites, 10 of them | 195 checks, 0 failed |
 | The same suites with the query cache on | 1,768 checks, 0 failed |
 | Differential fuzzer, 10 rounds × 200 operations | 3,464 agreed, 0 disagreed |
+| The same, three seeds, after $rename and pipeline updates were added | 0 disagreed |
 | Pilot: MongoDB's sample datasets adopted as an archive, 425,367 documents | 199 questions, 0 disagreements |
 | Pilot write, change stream and transaction batteries | 22, 5 and 15 checks, 0 failed |
 | Pilot soak, 691 rounds | 0 disagreements, 0 stale reads, 0 panics, flat memory |
