@@ -2,6 +2,27 @@
 
 Part of [Thermocline](../README.md).
 
+
+## What the cache will not answer
+
+A cached answer is served before any guard runs, deliberately: deciding
+completeness for it would be deciding about a read that is not happening. There
+is one exception, and it is about the namespace rather than about the read.
+
+While the archive is missing documents the fast tier holds, because its unique
+index refused them and mirroring gave up, every fall-through read of that
+namespace is refused rather than answered short. An answer stored before that
+began is exactly the short answer the refusal exists to prevent, so the cache is
+not consulted for such a namespace at all.
+
+It costs nothing in a healthy deployment: the set is read from the router's own
+cached copy with no round trip, and it is empty. A write to the collection would
+drop the stored answers anyway, and the state does arise from a write, so this
+closes a window rather than a gap that was standing open. It was found by
+reading the order the two run in rather than by seeing it happen: attempts to
+serve a stale answer past the refusal ran into the learned TTL expiring first,
+every time.
+
 ## Which queries are worth caching
 
 The router sees every read and every answer, which is what a cache advisor

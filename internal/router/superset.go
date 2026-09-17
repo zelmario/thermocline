@@ -95,6 +95,20 @@ func (r *Router) notSuperset(ctx context.Context, ns string) int {
 	return byNS[ns]
 }
 
+// notSupersetCached answers from whatever this router last read, without going
+// to the archive.
+//
+// For the hot paths that must not pay a round trip to ask, above all the query
+// cache, which is consulted before any guard on every cacheable read. A stale
+// zero there costs one cached answer of the kind that was already being served
+// before this existed; a round trip would cost every read in every healthy
+// deployment.
+func (r *Router) notSupersetCached(ns string) int {
+	r.unmirrored.mu.RLock()
+	defer r.unmirrored.mu.RUnlock()
+	return r.unmirrored.byNS[ns]
+}
+
 // refuseIfNotSuperset refuses a read that is about to be answered from an
 // archive known to be missing documents of this namespace.
 //

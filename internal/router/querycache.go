@@ -172,6 +172,20 @@ func (c *conn) cacheLookup(ctx context.Context, msg *wire.Message, name, db stri
 	if c.r.cache == nil {
 		return nil, false
 	}
+	// A namespace the archive is not a superset of is one whose fall-through
+	// reads are refused, and an answer stored before that began is exactly the
+	// short answer the refusal exists to prevent. The comment above this call
+	// site says a cached answer is served before any guard runs, which is right
+	// for the guards that decide completeness: those are about a read that is
+	// not happening. This one is not about the read, it is about the namespace
+	// being in a state where no answer of any age is trustworthy.
+	//
+	// Free on the hot path: the set is read from the router's own cached copy
+	// without a round trip, and it is empty in every healthy deployment. See
+	// superset.go.
+	if c.r.notSupersetCached(ns) > 0 {
+		return nil, false
+	}
 	// Below the check above, not before it. Nothing looks a key up when there
 	// is nothing to look it up in, and this is a SHA-256 over the whole command
 	// on every read of the hot path.
