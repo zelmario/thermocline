@@ -82,6 +82,15 @@ Part of [Thermocline](../README.md).
   the document, and `updateMany` still reaches all three, because a write is
   applied at the fast tier after the archive's matches are copied up.
 
+  A transaction is not affected, and the reason is worth following: a
+  transactional read never goes to the archive at all, because reading one tier
+  inside the caller's snapshot and the other outside it is not a transaction any
+  more. The documents are moved to the tier the transaction is already reading
+  and it is replayed, so the answer comes from the fast tier, which is precisely
+  the tier holding the document the archive lacks. Measured with the state
+  standing: a fall-through read refused outside a transaction answered inside
+  one, and the answer was the right one.
+
   There are two ways out and the refusal names both. Resolving the duplicate is
   the real one. The other is warming: a fast tier that holds the namespace in
   full never falls through, so the archive is never asked and the refusal never
