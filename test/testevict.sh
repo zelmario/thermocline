@@ -89,6 +89,47 @@ kill $EP 2>/dev/null; wait $EP 2>/dev/null
 
 ok "dry run never blocks on health" 0 "dry run" -- cline evictor --config $CFG --once --dry-run
 
+echo "== two sweeps at once, which the README promises cannot happen =="
+# The evictor takes its lease per sweep rather than per process, because a sweep
+# is what must not overlap: two of them announce one eviction twice and delete it
+# once, and the count left standing then answers for the application's own delete
+# of that _id whenever it comes. The README says a second --once refuses while a
+# sweep is running, and nothing checked it.
+#
+# This suite has no chk, so the pass and fail are counted the way the rest of it
+# does. The race is made winnable rather than hoped for: the first sweep is given
+# a health timeout long enough to be holding the lease when the second starts.
+cline evictor --config $CFG --once --health-timeout 20s > $LOGDIR/ev_race1.log 2>&1 &
+RACE1=$!
+sleep 0.2
+cline evictor --config $CFG --once > $LOGDIR/ev_race2.log 2>&1
+wait $RACE1 2>/dev/null
+if grep -qiE "another evictor|lease|already running" $LOGDIR/ev_race2.log; then
+  PASS=$((PASS+1)); echo "  PASS  a second sweep is refused while one runs"
+else
+  FAIL=$((FAIL+1)); FAILED+=("second sweep refused")
+  echo "  FAIL  a second sweep is refused while one runs: $(tail -1 $LOGDIR/ev_race2.log | cut -c1-90)"
+fi
+if grep -q "sweep complete" $LOGDIR/ev_race1.log; then
+  PASS=$((PASS+1)); echo "  PASS  and the one holding the lease finishes"
+else
+  FAIL=$((FAIL+1)); FAILED+=("first sweep finishes"); echo "  FAIL  and the one holding the lease finishes"
+fi
+# A dry run announces nothing and removes nothing, so it has nothing to wait for,
+# and the README says it always runs. That is the half that makes the refusal
+# above a lease rather than a lock on the whole command.
+cline evictor --config $CFG --once --health-timeout 20s > $LOGDIR/ev_race3.log 2>&1 &
+RACE3=$!
+sleep 0.2
+cline evictor --config $CFG --once --dry-run > $LOGDIR/ev_race4.log 2>&1
+wait $RACE3 2>/dev/null
+if grep -qE "sweep complete|dry run" $LOGDIR/ev_race4.log; then
+  PASS=$((PASS+1)); echo "  PASS  but a dry run beside a sweep still runs"
+else
+  FAIL=$((FAIL+1)); FAILED+=("dry run beside a sweep")
+  echo "  FAIL  but a dry run beside a sweep still runs: $(tail -1 $LOGDIR/ev_race4.log | cut -c1-90)"
+fi
+
 echo "== a tombstone is not a copy of the document =="
 # The evictor removes a document once the archive is confirmed to hold it, and
 # a tombstoned copy is not that. It is a record that the application deleted the
