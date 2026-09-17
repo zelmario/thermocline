@@ -266,7 +266,35 @@ function updateSpec() {
     case 6: return { $push:  { tags: 'p' + ri(4) } };
     case 7: return { $pull:  { tags: pick(['t1', 't2', 'common']) } };
     case 8: return { $addToSet: { tags: 'a' + ri(3) } };
+    // $rename, which is the one operator that writes a field the keys never
+    // mention: its target is named in the value. Everything that reads an
+    // update to decide something -- which unique keys it touches, whether it
+    // writes a field this system reserves -- has to read it there, and nothing
+    // generated here ever produced one.
+    //
+    // Between two scalar fields neither indexed nor inside an array, because a
+    // $rename whose source path crosses an array fails per document, and an
+    // updateMany that fails partway leaves the two collections holding
+    // different things for the rest of the round. That is the trap multiSafe
+    // exists for and it is cheaper to not generate it.
+    case 9: return ri(2) ? { $rename: { opt: 'opt2' } } : { $rename: { opt2: 'opt' } };
     default: return { $set: { [f.p]: setValue(f) }, $inc: { n: 1 } };
+  }
+}
+
+// pipelineSpec is an aggregation-pipeline update, which mongod has taken since
+// 4.2 and which nothing here generated.
+//
+// It is a different reading of the same instruction: a $set inside a pipeline
+// stage is not the $set of an update document, and code that walks one does not
+// necessarily walk the other. Deterministic stages only, for the reason
+// $currentDate is absent from updateSpec: $$NOW is evaluated per server, so the
+// two collections would be given different values and disagree over nothing.
+function pipelineSpec() {
+  switch (ri(3)) {
+    case 0: return [{ $set: { opt: 'pipe' + ri(4) } }];
+    case 1: return [{ $set: { n: { $add: ['$n', 1] } } }];
+    default: return [{ $unset: 'opt' }];
   }
 }
 
@@ -885,7 +913,7 @@ function oneOp(i) {
   // its ten branches, and a defect has already come out of one of them. At an
   // even weight a round of fifty operations generated two joins.
   const READS = [0, 1, 2, 3, 3, 3, 4, 5, 3, 4];
-  const WRITES = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16];
+  const WRITES = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16];
   // DDL is its own draw rather than a member of WRITES, because it is rare in
   // an application and every one of these changes what the router has cached
   // about the namespace for the operations that follow. Too many and a round
@@ -1034,6 +1062,26 @@ function oneOp(i) {
     case 14: {
       const op = 'findOneAndDelete ' + ser(F) + ' by ' + ser(S);
       if (ask('findOneAndDelete', op, c => c.findOneAndDelete(F, { sort: S }), 'seq')) contentsMatch('contents after findOneAndDelete', op);
+      break;
+    }
+    case 15: {
+      // An aggregation-pipeline update, which mongod has taken since 4.2 and
+      // which nothing here generated. It is a different reading of the same
+      // instruction: a $set inside a pipeline stage is not the $set of an
+      // update document, and code that walks one does not necessarily walk the
+      // other. A guard written in this repository read one and not the other as
+      // recently as yesterday.
+      //
+      // updateOne rather than updateMany, so a stage that fails on one document
+      // fails atomically instead of leaving the two collections holding
+      // different things for the rest of the round. See multiSafe.
+      const PU = pipelineSpec();
+      const f = { _id: anId };
+      const op = 'pipeline update ' + ser(f) + ' ' + ser(PU);
+      if (ask('pipelineUpdate', op,
+              c => { const r = c.updateOne(f, PU); return [r.matchedCount, r.modifiedCount]; }, 'seq')) {
+        contentsMatch('contents after a pipeline update', op);
+      }
       break;
     }
     case 16: {

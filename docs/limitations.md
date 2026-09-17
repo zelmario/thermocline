@@ -128,6 +128,14 @@ Part of [Thermocline](../README.md).
   no predicate here reads, and the same field in a collection nothing tiers,
   where it means nothing at all.
 
+  The hazard was known before the guard: the feeder warns once per collection
+  when it mirrors a document carrying one of these names, and the warning says
+  what it costs in the same words this entry does. A warning is not a refusal,
+  which is what was missing, but it is why an operator may have seen this
+  already. It still has work to do, and it is now exactly the right work: it
+  fires for the documents the guard cannot reach, which are the ones written
+  straight at the fast tier and the ones an adoption arrived with.
+
   The guard is preventive, and an adoption is the shape this product exists for:
   the cluster arrives with years of documents in it, written by an application
   that never heard of this system, and refusing new writes does nothing for a

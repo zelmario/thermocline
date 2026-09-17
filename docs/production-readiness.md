@@ -174,6 +174,10 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
   tier rebuilt from that archive, which is the documented recovery, would not
   have the document at all.
 
+  It was not unknown: the feeder has warned once per collection when it mirrors
+  such a document since an earlier commit, in the same words. What was missing
+  was the refusal, and the way to find the documents already there.
+
   Every write path refuses it now: insert, update by any operator that names the
   field, a replacement document, `$rename`, a pipeline update, `findAndModify`,
   `bulkWrite`, and both paths a pipeline writes by. `$unset` stays allowed,
