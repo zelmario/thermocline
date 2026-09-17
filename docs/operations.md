@@ -63,6 +63,22 @@ What to take, and where each piece lives:
   mirroring checkpoints and positions, residency holds, the eviction and warming
   notices, the singleton markers. Restoring documents without these leaves a
   system whose claims describe a fast tier that no longer matches.
+- **A snapshot backup holds mirroring while it runs, and nothing is lost.**
+  `db.fsyncLock()` on the archive, which is what a filesystem or volume snapshot
+  needs, blocks writes rather than failing them, so the feeder simply waits.
+  Measured: two writes made through the router during the lock, the feeder
+  silent throughout with no WARN or ERROR of any kind, and
+  `thermocline_mirroring_lag_seconds` climbing 43, 58, 72 seconds while it was
+  held. On `fsyncUnlock` the lag was back to 0.015s within seconds and both
+  writes were in the archive.
+
+  So the lag gauge is the thing that shows a held lock, and the alert rule on it
+  will fire if the lock outlives the alert's window. That is the right signal
+  and the feeder's own silence is not a defect: a blocked write and a slow one
+  look the same from inside it. What it means for an operator is to expect the
+  lag alert during a snapshot, and to treat one that does not clear afterwards
+  as a lock that was never released.
+
 - **The fast tier's `_thermocline.keys`.** The unique key registry is the one
   piece of bookkeeping that lives on the fast tier, because it constrains the
   data there. It is also the one piece you can rebuild rather than restore, with
