@@ -989,6 +989,46 @@ chk "and that one reads as a claim from its date" "true" \
     "$(cline watermark --config $CFG --ns $DB.tprobe 2>&1 | grep -qc 'newer than 1970-01-01' && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); const s=$WMSAVE; if (s.length) db.getSiblingDB(process.env.TC_META).watermarks.insertMany(s.map(function(r){ if (r.completeFrom) r.completeFrom=new Date(r.completeFrom); if (r.updatedAt) r.updatedAt=new Date(r.updatedAt); return r; }))" >/dev/null
 
+echo "== the archive's copy of a tiered collection, capped out of band =="
+# The feeder refuses to start against this and testtypes.sh checks that. What a
+# router already running says is a different question, and what it used to say
+# was that the two tiers differ in an option, with the action "make the two
+# copies the same, or know why they differ". Making them the same here means
+# capping the fast tier as well.
+#
+# Measured on eighty mirrored documents with convertToCapped run straight at the
+# archive: sixteen survived it, an insert afterwards rolled another away, and
+# mirroring never errored. That one line was the whole of what an operator saw.
+CNS=trcapped
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.insertOne({_id:1,pad:'x'.repeat(200)})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.insertOne({_id:1,pad:'x'.repeat(200)})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).runCommand({convertToCapped:'$CNS', size:4096})" >/dev/null
+rm -f $LOGDIR/rcap.log
+cline router --config $CFG --listen 0.0.0.0:$P2 --log-file $LOGDIR/rcap.log & RCP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+chk "the router came up for this fixture"              "1" \
+    "$(mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet --eval 'print(db.adminCommand({ping:1}).ok)' 2>&1 | tail -1)"
+chk "it says the archive's copy is capped"             "true" \
+    "$(grep -q "the archive's copy of a tiered collection is capped" $LOGDIR/rcap.log && echo true || echo false)"
+# The words are the point of this one. A capped archive is the history being
+# thrown away, not a disagreement about an option, and the remedy must not be
+# the one that caps the fast tier too.
+chk "naming what it costs"                             "true" \
+    "$(grep -q "removes its own oldest documents as it fills" $LOGDIR/rcap.log && echo true || echo false)"
+chk "and saying what not to do"                        "true" \
+    "$(grep -q "making the fast tier capped as well" $LOGDIR/rcap.log && echo true || echo false)"
+chk "and it is not reported as an option to match"     "0" \
+    "$(grep -c "option=capped" $LOGDIR/rcap.log)"
+kill $RCP 2>/dev/null; wait $RCP 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 echo
 echo "================================"

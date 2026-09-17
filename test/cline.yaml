@@ -49,6 +49,11 @@ feeder:
     # testkeys.sh: the collection the reserved field names are checked on. It is
     # tiered because that is the point: those marks mean nothing in a collection
     # nothing mirrors, and the guard deliberately leaves those alone.
+    # testrouter.sh: the collection whose archive copy is capped out of band, to
+    # check what a router already running says about it. The feeder refuses to
+    # start against this pair, which is why the suite starts its own router and
+    # not a feeder.
+    - "shop.trcapped"
     - "shop.tkreserved"
     - "shop.tidxtext"
     # testindexes.sh: a collection deliberately made different on the two tiers,
