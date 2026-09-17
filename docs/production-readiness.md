@@ -15,7 +15,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 
 | Evidence | Result |
 |---|---|
-| In-node suites, 36 of them | 1,792 checks, 0 failed |
+| In-node suites, 36 of them | 1,832 checks, 0 failed |
 | Host suites, 10 of them | 195 checks, 0 failed |
 | The same suites with the query cache on | 1,768 checks, 0 failed |
 | Differential fuzzer, 10 rounds × 200 operations | 3,464 agreed, 0 disagreed |
