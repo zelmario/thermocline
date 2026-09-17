@@ -48,9 +48,21 @@ It looks like a hang. Lower it in any test profile.
 ```
 make dev                # two single-node replica sets on 28017 and 28018
 make check              # fmt, vet, unit tests
+make race               # the same unit tests under the race detector
 make check-integration  # adds the tests that need a live pair
 make dev-down
 ```
+
+`make race` is separate because it is several times slower. Run it before a
+release and after anything that adds shared state to the router, which holds a
+claim cache, an index cache, a bracket cache and the set of namespaces the
+archive is not a superset of: every one of those is read by every connection and
+written by one.
+
+What it does not cover is worth knowing. It sees the races the unit tests reach,
+and the unit tests do not open two hundred client connections. The suites do
+that, against a binary, where the detector is not looking. A clean run is a
+floor rather than a guarantee.
 
 Some invariants cannot be tested without a database, because they live in update
 filters so that two daemons racing cannot both win. Those tests skip unless

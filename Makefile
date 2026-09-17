@@ -4,7 +4,7 @@ NODE    ?= thermocline-zelmar-node0
 HOT_PORT  := 28017
 COLD_PORT := 28018
 
-.PHONY: build test check fmt clean dev dev-down dev-status install check-installed
+.PHONY: build test check race fmt clean dev dev-down dev-status install check-installed
 
 # CGO_ENABLED=0 because the binary is built here and run in the test containers,
 # which carry an older glibc. A dynamically linked build fails there at exec with
@@ -56,6 +56,21 @@ test:
 check: fmt
 	go vet ./...
 	go test ./...
+
+## race runs the same unit tests under the race detector.
+##
+## Separate from check because it is several times slower, and worth running
+## before a release and after anything that adds shared state to the router: it
+## holds a claim cache, an index cache, a bracket cache and a set of namespaces
+## the archive is not a superset of, and every one of those is read by every
+## connection and written by one.
+##
+## What it does not cover is worth saying. It sees the races the unit tests
+## reach, and the unit tests do not open two hundred client connections; the
+## suites do that and they run against a binary, where the detector is not
+## looking. A clean run here is a floor rather than a guarantee.
+race:
+	go test -race ./...
 
 fmt:
 	gofmt -w .
