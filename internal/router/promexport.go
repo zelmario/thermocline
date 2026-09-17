@@ -78,6 +78,25 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			"against the data it constrains rather than against a threshold.",
 		float64(snap.KeyRegistryRows))
 
+	// The one state in which the archive is not a superset of the fast tier,
+	// published as a state rather than left to the feeder's event counter.
+	//
+	// The feeder counts each document it gives up, so an alert on that fires
+	// when it happens and goes quiet fifteen minutes later. What it leaves out
+	// is that the deployment is still in that condition, and since the router
+	// began refusing the reads that would be short by those documents, that
+	// condition is an application seeing errors. This is what stays above zero
+	// until somebody resolves it.
+	inv := r.InventorySnapshot()
+	gauge("not_superset_namespaces",
+		"Namespaces the archive is missing documents of, because it refused them and mirroring "+
+			"gave up. Above zero, every read of those namespaces the fast tier cannot answer in "+
+			"full is refused, and it stays above zero until the duplicate values are resolved.",
+		float64(inv.NotSuperset))
+	gauge("not_superset_documents",
+		"Documents behind not_superset_namespaces, which is the list an operator works through.",
+		float64(inv.NotSupersetDocuments))
+
 	// The query cache, and only when it is on.
 	//
 	// Nothing here for a cache nobody enabled: a hit rate of zero published for

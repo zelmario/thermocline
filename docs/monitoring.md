@@ -112,6 +112,16 @@ application's own and the document is lost from both tiers. The config refuses
 the combination that would allow it, so this alert is about the lag getting
 there. Warn at a minute, page at ten.
 
+**3b. `thermocline_not_superset_namespaces` above zero. Page.** The archive is
+missing documents the fast tier holds, because its unique index refused them and
+mirroring gave up rather than retrying for ever. While that stands, the archive
+is not the superset every fall-through read rests on, so those reads are refused
+instead of being answered short. `thermocline_not_superset_documents` is the
+list to work through, the feeder's log names each one, and `cline keys --rebuild`
+reports the duplicates. This is a state, where the unmirrorable counter beside it
+is an event: that one fires when a document is given up and goes quiet, this one
+stays up until somebody resolves it.
+
 **4. `thermocline_refused_total` rising. Investigate, do not page.** The router
 would not answer a command, and every refusal names its reason in the log. A
 steady trickle is an application asking for something this system does not do; a
@@ -256,6 +266,18 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "the archive refused a document the fast tier holds; see the feeder's log for which and why"
+      - alert: ThermoclineArchiveNotSuperset
+        # The state the alert above reports the start of. A document the archive
+        # refused is one the fast tier holds and the archive never will, so the
+        # archive stops being the superset every fall-through read depends on,
+        # and the router refuses those reads rather than answering them short.
+        # The counter above is an increase and goes quiet; this stays up for as
+        # long as the deployment is in that condition, which is the whole time
+        # an application is seeing those refusals.
+        expr: thermocline_not_superset_namespaces > 0
+        labels: {severity: page}
+        annotations:
+          summary: "reads of {{ $value }} namespace(s) are being refused: the archive is missing documents the fast tier holds; see cline keys --rebuild"
       - alert: ThermoclineMemberNotReadable
         # A member of the fast tier is in the set and refusing reads, which is
         # what a resync, an initial sync or a maintenance window looks like from

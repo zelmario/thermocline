@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // The dashboard's most useful single fact is the shape of the split: how little
@@ -60,6 +62,22 @@ type Inventory struct {
 	// own: what matters is this climbing while the data it constrains does not,
 	// and only somebody who knows the application can say that.
 	KeyRegistryRows int64 `json:"keyRegistryRows"`
+
+	// NotSuperset is how many namespaces the archive is missing documents of,
+	// because it refused them and the feeder gave up. See superset.go: while
+	// this is above zero, every read of those namespaces that the fast tier
+	// cannot answer in full is refused.
+	//
+	// A state rather than an event, and that is the whole reason it is here.
+	// The feeder's counter says when a document was given up, so the alert on
+	// it fires once and goes quiet; this says the deployment is still in that
+	// condition, which is what somebody paged at three in the morning needs to
+	// know, and it is what the reads are being refused for.
+	NotSuperset int64 `json:"notSuperset"`
+
+	// NotSupersetDocuments is how many documents that is across them, which is
+	// the number an operator works through.
+	NotSupersetDocuments int64 `json:"notSupersetDocuments"`
 }
 
 type inventoryCache struct {
@@ -101,6 +119,16 @@ func (r *Router) readInventory(ctx context.Context) {
 		Namespaces:  make([]NamespaceSize, 0, len(managed)),
 		UpdatedUnix: time.Now().Unix(),
 	}
+	// One read of a collection that is empty in every healthy deployment, on
+	// the same timer, so the state is reported for as long as it lasts rather
+	// than only when it starts.
+	if byNS, err := meta.UnmirroredNamespaces(ctx, r.cold); err == nil {
+		out.NotSuperset = int64(len(byNS))
+		for _, n := range byNS {
+			out.NotSupersetDocuments += int64(n)
+		}
+	}
+
 	// An estimate, from collection metadata rather than a scan: the registry is
 	// the largest collection this system writes and counting it exactly on a
 	// timer would be the dashboard hurting the tier it reports on.
