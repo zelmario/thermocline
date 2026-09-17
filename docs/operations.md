@@ -214,6 +214,16 @@ one run beside each other exactly as two new ones cannot. Stop the old one and
 wait for it to exit before starting the new one, which is the order you would
 use anyway.
 
+**The same goes for the newer protections, and in the same direction.** A feeder
+records the documents the archive refuses, and a router reads those records to
+refuse the reads that would be short by them. During an upgrade the halves are
+apart: an old feeder records nothing, so a new router has nothing to read and
+answers as everything did before; a new feeder records them and an old router
+ignores the records and answers short, which is what every version did until
+this one. Neither is worse than the version it replaces, and the protection is
+whole once both ends are upgraded. Upgrade the routers last, so the feeder has
+already recorded what the routers are about to start acting on.
+
 The evictor's lease is per sweep rather than per process, because a sweep is
 what must not overlap: two evictors taking turns are two ordinary sweeps. So
 `cline evictor --once` run while the daemon is mid-sweep refuses and says so,
