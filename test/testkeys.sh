@@ -1069,7 +1069,7 @@ chk "and findAndModify"                                "REFUSED" \
 chk "and the bulkWrite command"                        "REFUSED" \
     "$(res "$(R "try{db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:90, _tcDeletedAt:new Date()}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "while an ordinary bulkWrite still works"          "1" \
-    "$(R "db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:91, n:1}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:91}))")"
+    "$(R "db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:91, n:1}}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]})" >/dev/null; H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:91}))")"
 
 # Every operator that names the field, not a list of the likely ones. The
 # predicate that hides a document is {$exists: false}, so a field of any type
@@ -1089,19 +1089,43 @@ chk "but \$unset of it is allowed"                      "ACCEPTED" \
 # passes, while a $merge the fast tier can answer alone is forwarded for mongod
 # to perform, where the stages are all there is to read. Both were accepted
 # before this, and two live documents on the fast tier ended up wearing the mark.
+#
+# Waited for, and this is the whole reason these two checks were wrong once. The
+# namespace carries no completeness claim, so a read of it falls through to the
+# archive, and until mirroring catches up the archive answers nothing. A $out
+# whose input is empty writes no documents, so no document carries the mark and
+# accepting it is correct: the check was measuring an empty pipeline and calling
+# it a product defect.
+# With a feeder, because the section before this one stops it and nothing here
+# had started another. Without one the archive never receives these documents,
+# a read of a namespace with no completeness claim falls through to it and
+# answers nothing, and the $out below runs over an empty input: it writes no
+# documents, so none carries the mark, and accepting it is correct. The check
+# was measuring an empty pipeline and reporting a product defect.
+cline feeder --config $CFG --log-file $LOGDIR/reserved_f.log & RFP=$!
+sleep 2
+# Two by now: the document this section opened with, and the one the ordinary
+# bulkWrite control wrote.
+waitMirrored $RNS 2
 chk "and a \$out into a tiered collection"              "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a \$merge into one"                            "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# Counted on the fast tier, which is where the write went. Counting through the
+# router asks the archive for a namespace with no completeness claim, so these
+# read 0 for as long as mirroring takes and fail for a reason that has nothing
+# to do with the guard.
 chk "an ordinary write is untouched"                   "1" \
-
-    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:3,n:7}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:3}))")"
+    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:3,n:7})" >/dev/null; H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:3}))")"
 chk "a nested field of that name is fine"              "1" \
-    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:4,inner:{_tcDeletedAt:1}}); print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:4}))")"
+    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:4,inner:{_tcDeletedAt:1}})" >/dev/null; H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_id:4}))")"
 chk "and so is the field on an untiered collection"    "1" \
     "$(R "db.getSiblingDB(process.env.TC_DB2).tkfree.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.insertOne({_id:1,_tcDeletedAt:new Date()}); print(db.getSiblingDB(process.env.TC_DB2).tkfree.countDocuments({}))")"
 chk "and the collection never took a mark"             "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+chk "and the archive did not either"                   "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+kill $RFP 2>/dev/null; wait $RFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 
