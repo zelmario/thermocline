@@ -482,6 +482,10 @@ Part of [Thermocline](../README.md).
 
   So it is refused on the same terms, by asking the question the tiers can
   answer: whether the archive holds chunks of this file the fast tier does not.
+  It is refused when that question cannot be asked at all, too: with the archive
+  unreachable, forwarding would hash whatever the fast tier holds and call it the
+  file's, and unlike a `find` there is no archive read afterwards to fail and say
+  so.
   Two counts bounded by `files_id`, which every bucket indexes, on a command an
   application sends rarely. A file whose chunks are all resident still answers,
   and a bucket nothing tiers is untouched.

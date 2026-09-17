@@ -57,11 +57,35 @@ func (c *conn) guardFileMD5(ctx context.Context, msg *wire.Message, db string) (
 	}
 
 	hot, cold, ok := c.chunkCounts(ctx, db, root+".chunks", fileID)
-	if !ok || cold <= hot {
-		// Either the question could not be asked, in which case the archive's
-		// own error on the read below says more than a guess here would, or the
-		// fast tier holds every chunk the archive does.
+	if ok && cold <= hot {
+		// The fast tier holds every chunk the archive does, so its hash is the
+		// file's and the command is forwarded untouched.
 		return nil, false
+	}
+	if !ok {
+		// The question could not be asked, which for this command means the
+		// archive is unreachable, and forwarding then answers a hash of
+		// whatever the fast tier happens to hold. That is the defect this guard
+		// exists for, arriving in the one state where nothing else would catch
+		// it: unlike a find, there is no archive read below to fail and say so.
+		//
+		// Written this way after a review of my own guard, which returned false
+		// here and failed open.
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a filemd5 because the archive could not be asked about the file",
+			"ns", ns,
+			"effect", "forwarding it would hash whatever chunks the fast tier holds and call that "+
+				"the file's hash, which is what this guard exists to prevent",
+			"action", "retry once the archive is reachable, or run filemd5 against the archive")
+		out, cerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this filemd5 because the archive could not be asked whether it "+
+				"holds chunks of this file the fast tier does not, so the hash might be of part of "+
+				"the file. Retry once the archive is reachable, or run filemd5 against the archive.")
+		if cerr != nil {
+			return nil, false
+		}
+		return out, true
 	}
 
 	c.r.Stats.Refused.Add(1)
