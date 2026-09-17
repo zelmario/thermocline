@@ -822,6 +822,25 @@ Part of [Thermocline](../README.md).
   at the archive directly, which is the restore path the runbook already
   describes.
 
+- **Write blocking on the archive stops mirroring, and it used to read as a
+  change stream problem.** MongoDB 6.0 added `setUserWriteBlockMode`, and
+  migration tooling turns it on. Pointed at the archive it refuses every write
+  this system makes, with code 371.
+
+  The behaviour is right and is unchanged: the feeder keeps retrying, because
+  unlike a document the archive will never take, this one succeeds the moment
+  the block is lifted. Measured: twenty reopens in twenty seconds while it was
+  held, mirroring catching up on its own afterwards, and the write made during
+  the block reaching the archive.
+
+  What was wrong was what it said. Every one of those lines read "change stream
+  ended, reopening", which is a fast tier framing of an archive problem, and an
+  operator following it goes to the wrong cluster. It is named now, once until a
+  write lands rather than once a second, with the command that turns it off, and
+  the resume is announced too. A feeder *starting* against a blocked archive was
+  already honest: it exits naming `UserWritesBlocked` and the operation, because
+  taking its lease is itself a write.
+
 - **A read waits for mirroring to catch up, and answers anyway when it does
   not.** This is the one place the system knowingly returns an answer it cannot
   vouch for, and it is a deliberate trade rather than an oversight: the

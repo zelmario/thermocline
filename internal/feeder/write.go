@@ -606,6 +606,35 @@ const bsonObjectTooLarge = 10334
 // this value, so no retry of this document can ever succeed.
 const duplicateKey = 11000
 
+// userWritesBlocked is what the archive answers every write with while an
+// operator has turned write blocking on, which MongoDB added in 6.0 and which
+// migration tooling uses. It is not a statement about the document, which is
+// what makes it different from every other refusal handled here: nothing about
+// the batch can be repaired, and the next attempt succeeds the moment the block
+// is lifted.
+const userWritesBlocked = 371
+
+// writesBlocked reports whether an error is the archive refusing every write
+// because an operator has blocked them.
+func writesBlocked(err error) bool {
+	var bwe mongo.BulkWriteException
+	if errors.As(err, &bwe) {
+		for _, we := range bwe.WriteErrors {
+			if we.Code == userWritesBlocked {
+				return true
+			}
+		}
+		if bwe.WriteConcernError != nil && bwe.WriteConcernError.Code == userWritesBlocked {
+			return true
+		}
+	}
+	var ce mongo.CommandError
+	if errors.As(err, &ce) && ce.Code == userWritesBlocked {
+		return true
+	}
+	return false
+}
+
 // writeBatch mirrors one namespace's batch, repairing the one failure it can
 // repair rather than retrying it for ever.
 //
@@ -657,6 +686,14 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 		res, err := c.BulkWrite(ctx, models,
 			options.BulkWrite().SetOrdered(true).SetBypassDocumentValidation(true))
 		if err == nil {
+			// A write landing is the only honest sign that a block has been
+			// lifted: the reopen loop logs a resume on every attempt, including
+			// the ones that are about to fail again.
+			if f.saidWritesBlocked {
+				f.saidWritesBlocked = false
+				f.log.Info("the archive is taking writes again, mirroring has resumed",
+					"ns", ns)
+			}
 			f.noteInsertsOverExisting(ns, ops, res)
 			f.clearUnmirrored(ctx, ns, ops)
 			return res, nil

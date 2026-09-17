@@ -91,6 +91,12 @@ type Feeder struct {
 	// Same goroutine. See recheckKindOnUnannounced.
 	kindRechecked map[string]time.Time
 
+	// saidWritesBlocked stops the line about blocked writes repeating every
+	// second while the block is held. Cleared when a write actually lands,
+	// which is the only honest sign the block is gone: the reopen loop logs a
+	// resume on every attempt, including the ones about to fail again.
+	saidWritesBlocked bool
+
 	// unmirroredNS is the namespaces this feeder has given up a document in,
 	// loaded from the archive at startup so a restart does not forget. Same
 	// goroutine as everything else here.
@@ -464,7 +470,34 @@ func (f *Feeder) Run(ctx context.Context) error {
 			return err
 		}
 
-		f.log.Error("change stream ended, reopening", "err", err)
+		// Naming the cause when it is one whose remedy is not on the fast tier.
+		// The archive refusing every write reads as a change stream problem
+		// otherwise, once a second, and an operator follows that to the wrong
+		// cluster: measured with write blocking turned on at the archive, twenty
+		// reopens in twenty seconds and every line saying "change stream ended".
+		//
+		// Reopening is the right behaviour and it is left alone. Unlike a
+		// document the archive will never take, this one succeeds as soon as the
+		// block is lifted, and it does: measured, mirroring caught up on its own
+		// and the write made during the block reached the archive.
+		if writesBlocked(err) {
+			if !f.saidWritesBlocked {
+				f.saidWritesBlocked = true
+				f.log.Error("the archive is refusing every write, because writes are blocked there",
+					"err", err,
+					"meaning", "an operator or a migration tool has turned on write blocking on the "+
+						"archive, so nothing can be mirrored while it is on and the fast tier is "+
+						"accumulating everything this feeder has not carried",
+					"effect", "mirroring is stopped for every namespace and this will keep retrying, "+
+						"which is right: it resumes on its own the moment the block is lifted",
+					"action", "turn write blocking off on the archive: "+
+						"db.adminCommand({setUserWriteBlockMode: 1, global: false})",
+					"note", "said once until mirroring resumes, because it would otherwise be said "+
+						"every second")
+			}
+		} else {
+			f.log.Error("change stream ended, reopening", "err", err)
+		}
 		select {
 		case <-ctx.Done():
 			return nil
