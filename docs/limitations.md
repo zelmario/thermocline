@@ -110,7 +110,10 @@ Part of [Thermocline](../README.md).
   value belongs to another live document in the archive and nothing here can
   choose which should keep it.
   `thermocline_daemon_documents_total{outcome="unmirrorable"}` counts them and
-  has a page rule, and `cline keys --rebuild` reports the duplicates.
+  has a page rule, and `cline preflight` lists them with the index and the key.
+  `cline keys --rebuild` does not: it reads the fast tier's unique indexes, and in
+  the shape this state arrives in, an adoption whose archive carries an index the
+  fast tier's copy does not, it answers that there is nothing to enforce.
 
 - **Two field names are reserved in a tiered collection, and a write that uses
   one is refused.** `_tcDeletedAt` is how an archived document is marked as one

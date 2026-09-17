@@ -346,6 +346,21 @@ func UnmirroredNamespaces(ctx context.Context, cold *mongo.Client) (map[string]i
 	return out, cur.Err()
 }
 
+// AllUnmirrored lists every such row, for the command that reports what is wrong
+// with a deployment.
+func AllUnmirrored(ctx context.Context, cold *mongo.Client) ([]UnmirroredRecord, error) {
+	cur, err := cold.Database(DB).Collection(Unmirrored).Find(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	var out []UnmirroredRecord
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // UnmirroredIn lists the rows for one namespace, so a refusal can name a
 // document rather than a count.
 func UnmirroredIn(ctx context.Context, cold *mongo.Client, ns string) ([]UnmirroredRecord, error) {

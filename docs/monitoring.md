@@ -117,8 +117,8 @@ missing documents the fast tier holds, because its unique index refused them and
 mirroring gave up rather than retrying for ever. While that stands, the archive
 is not the superset every fall-through read rests on, so those reads are refused
 instead of being answered short. `thermocline_not_superset_documents` is the
-list to work through, the feeder's log names each one, and `cline keys --rebuild`
-reports the duplicates. This is a state, where the unmirrorable counter beside it
+list to work through, the feeder's log names each one as it gives up, and
+`cline preflight` prints them all with the index and the colliding key. This is a state, where the unmirrorable counter beside it
 is an event: that one fires when a document is given up and goes quiet, this one
 stays up until somebody resolves it.
 
@@ -277,7 +277,7 @@ groups:
         expr: thermocline_not_superset_namespaces > 0
         labels: {severity: page}
         annotations:
-          summary: "reads of {{ $value }} namespace(s) are being refused: the archive is missing documents the fast tier holds; see cline keys --rebuild"
+          summary: "reads of {{ $value }} namespace(s) are being refused: the archive is missing documents the fast tier holds; cline preflight lists them"
       - alert: ThermoclineMemberNotReadable
         # A member of the fast tier is in the set and refusing reads, which is
         # what a resync, an initial sync or a maintenance window looks like from

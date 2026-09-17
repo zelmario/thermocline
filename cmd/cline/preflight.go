@@ -122,6 +122,7 @@ func runPreflight(args []string) error {
 
 	verifyClaims(ctx, hot, cold, cfg, *countFor)
 	findReservedFields(ctx, hot, cfg, *countFor)
+	listUnmirrored(ctx, cold)
 
 	fmt.Print(`
 Nothing above refuses a start. Read the warnings: most of them name something an
@@ -148,6 +149,40 @@ nothing has claimed. See docs/adoption.md.
 // claim, so there is one definition of what bears a claim out. It is bounded,
 // and a namespace the budget does not reach is reported as not reached rather
 // than passed over: a claim not checked is a claim that stands.
+// listUnmirrored names the documents the archive refused and the feeder gave up
+// on, which is the list an operator has to work through and had nowhere to read.
+//
+// The router's refusal says how many there are and names cline keys --rebuild.
+// That command reads the fast tier's unique indexes, and in the shape this state
+// arrives in, an adoption whose archive carries an index the fast tier's copy
+// does not, it answers "no unique indexes on any tiered collection, so there is
+// nothing to enforce". Measured, in exactly the state the refusal points it at.
+// So the list is printed here, where somebody asking what is wrong with this
+// deployment will see it: the namespace, the document, and what the archive
+// said.
+func listUnmirrored(ctx context.Context, cold *mongo.Client) {
+	rows, err := meta.AllUnmirrored(ctx, cold)
+	if err != nil {
+		fmt.Printf("\nthe record of documents the archive refused could not be read: %v\n", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Printf("\n%d document(s) the archive refused, which mirroring has given up on:\n", len(rows))
+	for _, r := range rows {
+		fmt.Printf("  %-34s %s\n", r.NS, firstLine(r.Why))
+	}
+	fmt.Print(`
+While these stand, the archive is not a superset of the fast tier for those
+namespaces, so every read of them the fast tier cannot answer in full is
+refused rather than answered short. Each one is a value another live archive
+document already holds: find that document, decide which of the two keeps the
+value, and write the loser again. Mirroring carries it then and the refusals
+lift by themselves.
+`)
+}
+
 // findReservedFields names the application's own documents that carry one of
 // the field names this system writes into archived copies.
 //
