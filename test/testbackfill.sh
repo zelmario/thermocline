@@ -62,6 +62,10 @@ feeder:
   id: "bf"
   namespaces:
     - "shop.orders"
+    # The section on a document the archive will not take, and its control.
+    # Tiered because backfill only copies what this deployment tiers.
+    - "shop.bfrefused"
+    - "shop.bfclean"
   checkpoint_every: 1s
 evictor:
   feeder_id: "bf"
@@ -272,6 +276,56 @@ chk "and does not tell you to clear the checkpoint"   "true" \
 sleep 2
 chk "the client can see all twenty one now"           "21" \
     "$(R 'print(db.getSiblingDB("shop").invoices.countDocuments({}))')"
+echo "== a document the archive will not take, met by the copy =="
+# An operator runs this because something is already wrong, so what it says
+# about what it did has to be true. Measured before this section existed, on
+# three documents with one the archive's unique index refuses: the command said
+# "could not be copied", "Copied 0 document(s)", and then its closing line, that
+# what was on the fast tier is in the archive now. The copy is unordered, so the
+# archive had taken the other two; the driver reports the batch as an error and
+# the command threw away both the successes and the detail.
+# No feeder for this one, so the copy is the only writer and the counts below
+# mean what they say. The section before this leaves one running, and with it up
+# the archive filled itself: the check on what the archive holds passed while
+# backfill was failing to run at all, which is a check passing for a reason that
+# has nothing to do with it.
+pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+M $COLDPORT "db.getSiblingDB('shop').bfrefused.drop();
+             db.getSiblingDB('shop').bfrefused.createIndex({sku:1},{unique:true});
+             db.getSiblingDB('shop').bfrefused.insertOne({_id:9,sku:'DUP',v:'already here'})" >/dev/null
+M $HOTPORT "const c=db.getSiblingDB('shop').bfrefused; c.drop();
+            c.insertMany([{_id:1,sku:'AAA'},{_id:2,sku:'BBB'},{_id:3,sku:'DUP'}])" >/dev/null
+BFOUT=$("$BIN" backfill --config "$DIR/bf.yaml" --ns shop.bfrefused --apply 2>&1)
+chk "it copies the documents the archive will take"    "2" \
+    "$(echo "$BFOUT" | grep -oE 'copied [0-9]+' | head -1 | awk '{print $2}')"
+chk "and names the one it will not"                    "true" \
+    "$(echo "$BFOUT" | grep -q '1 document(s) the archive refused' && echo true || echo false)"
+chk "with the index and the key"                       "true" \
+    "$(echo "$BFOUT" | grep -q 'sku_1 dup key' && echo true || echo false)"
+# The line that mattered most: an operator reading only the end of this used to
+# be told the gap was closed.
+chk "and does not say the gap is closed"               "false" \
+    "$(echo "$BFOUT" | grep -q 'on the fast tier is in the archive now' && echo true || echo false)"
+# The paragraph rather than the closing sentence, because which closing sentence
+# this run gets depends on whether a feeder is publishing and this section stops
+# them. The paragraph is the part that says the namespace is still short, and it
+# is printed either way.
+chk "and says the namespace is still short"            "true" \
+    "$(echo "$BFOUT" | grep -q 'still short by them' && echo true || echo false)"
+chk "and that the reads are refused"                   "true" \
+    "$(echo "$BFOUT" | grep -q 'the router refuses the reads' && echo true || echo false)"
+chk "and the archive holds the two it took"            "3" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').bfrefused.countDocuments({}))")"
+# The control, because a report that is only right when something is wrong is
+# not a report: an ordinary namespace still ends with the original sentence.
+M $COLDPORT "db.getSiblingDB('shop').bfclean.drop()" >/dev/null
+M $HOTPORT "const c=db.getSiblingDB('shop').bfclean; c.drop(); c.insertMany([{_id:1},{_id:2}])" >/dev/null
+BFOK=$("$BIN" backfill --config "$DIR/bf.yaml" --ns shop.bfclean --apply 2>&1)
+chk "an ordinary namespace copies and says so"         "2" \
+    "$(echo "$BFOK" | grep -oE 'copied [0-9]+' | head -1 | awk '{print $2}')"
+chk "and says nothing about documents left behind"     "false" \
+    "$(echo "$BFOK" | grep -q 'still short by them' && echo true || echo false)"
+
 pkill -9 -f "cline.*$DIR" 2>/dev/null
 
 echo
