@@ -474,6 +474,14 @@ Part of [Thermocline](../README.md).
   counts in the same reply that mongod compares it against. Read it as a check
   of the fast tier, and run it against the archive separately.
 
+  `dbCheck` and `validateDBMetadata` are the same kind of thing and get the same
+  answer: each is a statement about the storage and catalogue of the server it
+  runs on, they are forwarded untouched, and what they describe is the fast
+  tier. Run them against the archive separately too. They are named here because
+  the difference between a command that is wrong across two tiers and one that
+  is simply about one of them is not obvious from the outside, and `filemd5`
+  above shows which side of that line the answer can fall on.
+
 - **A tiered `$out` is assembled in a scratch collection inside the
   application's own database.** `$out` into a tiered collection cannot
   end in a rename, so the result is built in
