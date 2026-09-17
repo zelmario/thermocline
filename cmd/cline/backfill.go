@@ -441,7 +441,7 @@ func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
 		fmt.Printf("\n%d document(s) could not be copied, so this namespace is still short by them\n"+
 			"and the router refuses the reads that would be short: the archive already holds\n"+
 			"another live document with the value each of them carries. Resolve those\n"+
-			"duplicates and write the documents again; cline keys --rebuild reports them.\n",
+			"duplicates and write the documents again; cline preflight lists them.\n",
 			totalRefused)
 	}
 	if feederRunning {

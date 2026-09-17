@@ -152,11 +152,13 @@ nothing has claimed. See docs/adoption.md.
 // listUnmirrored names the documents the archive refused and the feeder gave up
 // on, which is the list an operator has to work through and had nowhere to read.
 //
-// The router's refusal says how many there are and names cline keys --rebuild.
-// That command reads the fast tier's unique indexes, and in the shape this state
+// The router's refusal says how many there are and used to name cline keys
+// --rebuild, as did the feeder's two lines, the alert summary, the limitations
+// entry and backfill's own paragraph: five places, all wrong the same way. That
+// command reads the fast tier's unique indexes, and in the shape this state
 // arrives in, an adoption whose archive carries an index the fast tier's copy
 // does not, it answers "no unique indexes on any tiered collection, so there is
-// nothing to enforce". Measured, in exactly the state the refusal points it at.
+// nothing to enforce". Measured, in exactly the state they pointed it at.
 // So the list is printed here, where somebody asking what is wrong with this
 // deployment will see it: the namespace, the document, and what the archive
 // said.
