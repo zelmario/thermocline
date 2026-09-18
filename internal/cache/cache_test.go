@@ -405,3 +405,81 @@ func BenchmarkCacheStoreOverBudget(b *testing.B) {
 		}
 	})
 }
+
+// Get takes the same exclusive lock eviction holds, and
+// BenchmarkCacheStoreOverBudget says a store at the byte budget holds that lock
+// for 87us, or a millisecond when a large answer displaces small ones. A hit is
+// worth 365us against a 720us proxied read, so readers queueing behind that
+// would undo the feature.
+//
+// **Measured, they mostly do not**, and the answer is kept here so the question
+// is not asked again from the shape of the code:
+//
+//	readers alone                     221.4 ns/op
+//	readers with an evicting writer   273.4 ns/op
+//
+// Twenty-three per cent, not a collapse. The reason is worth more than the
+// number: the expensive eviction is a transient, not a steady state. It costs a
+// millisecond only while a large answer is displacing many small ones, and once
+// the cache holds entries of a similar size each store evicts about one. A
+// deployment whose answers vary wildly in size pays it for longer, which is the
+// case to come back to if this ever matters.
+func BenchmarkCacheGetUnderEviction(b *testing.B) {
+	fill := func() (*Cache, *clock) {
+		c := NewWithBytes(1<<20, 1<<20, time.Hour)
+		k := &clock{t: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+		c.now = k.now
+		reply := make([]byte, 4096)
+		for i := 0; i < 260; i++ {
+			key := "fill" + strconv.Itoa(i)
+			c.Observe(key, "shop.orders", reply)
+			k.add(30 * time.Minute) // a long TTL, so these survive the run
+			c.Observe(key, "shop.orders", reply)
+		}
+		return c, k
+	}
+
+	b.Run("readers alone", func(b *testing.B) {
+		c, _ := fill()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				c.Get("fill" + strconv.Itoa(i%260))
+				i++
+			}
+		})
+	})
+
+	b.Run("readers with an evicting writer", func(b *testing.B) {
+		c, k := fill()
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			big := make([]byte, 128*1024)
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				key := "big" + strconv.Itoa(i)
+				c.Observe(key, "shop.orders", big)
+				k.add(10 * time.Millisecond)
+				c.Observe(key, "shop.orders", big)
+			}
+		}()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				c.Get("fill" + strconv.Itoa(i%260))
+				i++
+			}
+		})
+		b.StopTimer()
+		close(stop)
+		<-done
+	})
+}
