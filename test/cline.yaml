@@ -374,6 +374,11 @@ feeder:
     # testkeys.sh: a collated unique index whose match on the archive is created
     # after the router has already asked about it
     - "shop.tkcoll2"
+    # testkeys.sh: collMod as the other door into a unique index. The section
+    # needs the archive to hold a live duplicate, so the namespace has to be
+    # one the feeder mirrors; without this entry the fixture mirrored nothing
+    # and every check read as the guard letting a conversion through.
+    - "shop.tkcollmod"
     # testsingle.sh
     - "shop.tsdel"
     - "shop.tsupd"

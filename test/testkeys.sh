@@ -88,6 +88,15 @@ waitMirrored() {
     [ "$n" = "$2" ] && return 0
     sleep 0.5
   done
+  # Name the cause the timeout usually has. A fixture whose namespace is not in
+  # feeder.namespaces mirrors nothing, and every check below it then reads as
+  # the product letting something through: shop.tkcollmod cost two sessions that
+  # way, once diagnosed as a missing feeder and once as a broken collMod guard.
+  if ! grep -q "\"$DB.$1\"" "$CFG"; then
+    echo "  FATAL $DB.$1 is not in feeder.namespaces in $CFG, so nothing mirrors it"
+    echo "        every check in this section is about an archive that stayed empty"
+    exit 1
+  fi
   echo "  WARN  $DB.$1 never reached $2 mirrored documents, last saw ${n:-none}"
 }
 
