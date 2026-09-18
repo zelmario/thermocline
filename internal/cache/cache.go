@@ -463,6 +463,24 @@ func (c *Cache) ttlFrom(stable []time.Duration) time.Duration {
 // evictForBytes drops held answers, oldest first, until the memory budget is
 // met. The query stays: what was learned about it costs almost nothing, and
 // throwing it away would mean learning it again.
+//
+// A scan per entry dropped, and it was measured and left that way. Replacing it
+// with one scan and a sort, which is what fixed evictShapeIfFull next door, made
+// both shapes slower:
+//
+//	                               scan per entry   scan and sort
+//	uniform 4KB answers                86,977 ns       136,155 ns
+//	a 128KB answer among 4KB ones   1,027,425 ns     1,405,644 ns
+//
+// The two cases look alike and are not. The advisor evicts on every insert once
+// its table is full, so clearing a tenth of it lets the next hundred inserts
+// skip the walk entirely. This returns immediately while under budget, and the
+// usual k is one, so there is nothing to amortise and the sort is pure cost.
+//
+// The numbers above are still worth reading: BenchmarkCacheStoreOverBudget says
+// a store at the budget costs 87us, and a large answer displacing small ones a
+// millisecond, under this lock. That is a real cost for a deployment that turns
+// the cache on with max_bytes set tight, and the fix for it is not this loop.
 func (c *Cache) evictForBytes() {
 	for c.bytes > c.maxBytes {
 		var oldestKey string

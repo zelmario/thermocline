@@ -360,3 +360,48 @@ func BenchmarkObserveSecondSightingCloseBehind(b *testing.B) {
 		c.Observe(k, "shop.orders", reply)
 	}
 }
+
+// evictForBytes picks the oldest entry by scanning every key, and it loops
+// until the budget is met, so evicting k entries costs k scans. Uniform sizes
+// evict one per store; one large answer arriving among small ones evicts many,
+// and that is the shape to watch.
+func BenchmarkCacheStoreOverBudget(b *testing.B) {
+	newFull := func(entry int) (*Cache, *clock, []byte) {
+		c := NewWithBytes(1<<20, 1<<20, time.Hour)
+		k := &clock{t: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+		c.now = k.now
+		reply := make([]byte, entry)
+		for i := 0; i < (1<<20)/entry+20; i++ {
+			key := "fill" + strconv.Itoa(i)
+			c.Observe(key, "shop.orders", reply)
+			k.add(time.Second)
+			c.Observe(key, "shop.orders", reply)
+		}
+		return c, k, reply
+	}
+
+	b.Run("uniform 4KB answers", func(b *testing.B) {
+		c, k, reply := newFull(4096)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			key := "n" + strconv.Itoa(i)
+			c.Observe(key, "shop.orders", reply)
+			k.add(time.Second)
+			c.Observe(key, "shop.orders", reply)
+		}
+	})
+
+	b.Run("a 128KB answer among 4KB ones", func(b *testing.B) {
+		c, k, _ := newFull(4096)
+		big := make([]byte, 128*1024)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			key := "big" + strconv.Itoa(i)
+			c.Observe(key, "shop.orders", big)
+			k.add(time.Second)
+			c.Observe(key, "shop.orders", big)
+		}
+	})
+}
