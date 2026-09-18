@@ -431,7 +431,10 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 	// what it will report is not what the application expects, so say so rather
 	// than let it be discovered in production.
 	if coll, isCS := changeStreamCollection(cmd, db); isCS {
-		if c.r.cfg.Manages(coll) {
+		// streamScope, not Manages, because a database-wide and a
+		// deployment-wide stream both carry events for tiered collections and
+		// both are filtered on the way back. See streamScope.
+		if watching, matters := c.r.streamScope(coll, db); matters {
 			c.r.Stats.ChangeStreams.Add(1)
 			// A resumed stream is worth saying out loud, because the way it
 			// fails is silence. A resume token is a position in one replica
@@ -445,7 +448,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 			// it instead.
 			if from, resumed := changeStreamResumedFrom(cmd); resumed {
 				c.log.Warn("a change stream was resumed from a token or timestamp",
-					"ns", coll, "from", from,
+					"watching", watching, "from", from,
 					"caveat", "a resume token is a position in one replica set's oplog, and this "+
 						"stream is served from the fast tier, so a token minted on the cluster that "+
 						"was adopted names nothing here",
@@ -455,8 +458,8 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 					"action", "start consumers fresh after a cutover, and check this stream is "+
 						"delivering rather than merely open")
 			}
-			c.log.Info("a change stream was opened on a tiered collection",
-				"ns", coll,
+			c.log.Info("a change stream was opened on tiered data",
+				"watching", watching,
 				"note", "eviction and copy-up move documents in and out of the fast tier, and the "+
 					"events for those are hidden from this stream so they cannot be read as "+
 					"application deletes and inserts",

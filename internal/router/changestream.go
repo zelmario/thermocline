@@ -106,6 +106,38 @@ func (reg *changeStreamRegistry) drop(id int64) {
 	delete(reg.ns, id)
 }
 
+// streamScope names what a change stream is watching, and reports whether any
+// event it delivers could be about a collection this system tiers.
+//
+// A change stream on a whole database or the whole deployment sends
+// aggregate: 1 rather than a collection name, so it had no namespace to
+// match against the configuration and was never registered, and nothing it
+// delivered was ever filtered. db.watch() is ordinary: an application
+// follows several collections with one stream. Measured: the collection
+// stream hid a copy-up and the database stream reported it as an insert.
+//
+// Every event carries its own namespace, so the wider kinds are filtered
+// per event instead, and this only has to decide whether any event could
+// be about a collection this system tiers.
+//
+// It lives here, and not inside the sieve, because the guard on the way in has
+// to answer the same question. It did not: it asked Manages("") for the wider
+// forms, which is false for a configured deployment and true for one tiering
+// everything, so the counter and the resume warning covered a db.watch() in
+// one configuration and not the other, while the sieve filtered it in both.
+func (r *Router) streamScope(ns, db string) (string, bool) {
+	switch {
+	case ns != "":
+		return ns, r.cfg.Manages(ns)
+	case db == "admin":
+		// The whole deployment. Which databases it will carry events for is
+		// not knowable here.
+		return "the whole deployment", true
+	default:
+		return db + ", the whole database", r.managesAnythingIn(db)
+	}
+}
+
 // noteChangeStream remembers the cursor an opened change stream returned, so
 // its later batches can be filtered, and filters the batch this reply
 // carries.
@@ -117,31 +149,9 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 	if !isCS {
 		return nil, false
 	}
-	// A change stream on a whole database or the whole deployment sends
-	// aggregate: 1 rather than a collection name, so it had no namespace to
-	// match against the configuration and was never registered, and nothing it
-	// delivered was ever filtered. db.watch() is ordinary: an application
-	// follows several collections with one stream. Measured: the collection
-	// stream hid a copy-up and the database stream reported it as an insert.
-	//
-	// Every event carries its own namespace, so the wider kinds are filtered
-	// per event instead, and this only has to decide whether any event could
-	// be about a collection this system tiers.
-	watching := ns
-	switch {
-	case ns != "":
-		if !c.r.cfg.Manages(ns) {
-			return nil, false
-		}
-	case db == "admin":
-		// The whole deployment. Which databases it will carry events for is
-		// not knowable here.
-		watching = "the whole deployment"
-	default:
-		if !c.r.managesAnythingIn(db) {
-			return nil, false
-		}
-		watching = db + ", the whole database"
+	watching, matters := c.r.streamScope(ns, db)
+	if !matters {
+		return nil, false
 	}
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
