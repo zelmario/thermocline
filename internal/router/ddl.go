@@ -467,6 +467,17 @@ func (c *conn) guardTTL(ctx context.Context, msg *wire.Message, cmd bson.Raw, db
 	return out, true
 }
 
+// isNumericValue reports whether v is one of the four types mongod counts as a
+// number. Decimal128 is the one that is easy to forget, and forgetting it here
+// is a hole in a guard rather than a cosmetic miss.
+func isNumericValue(v bson.RawValue) bool {
+	switch v.Type {
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble, bson.TypeDecimal128:
+		return true
+	}
+	return false
+}
+
 // asksForTTL reports whether a create, createIndexes or collMod would leave a
 // TTL index behind.
 //
@@ -533,11 +544,16 @@ func asksForTTL(cmd bson.Raw, name string) bool {
 			// this system's TTL policy. An operator reading that goes looking
 			// for a policy when the command is simply wrong.
 			//
+			// All four numeric types, measured on 6.0.26 one at a time:
+			// int, double, long and decimal are accepted and stored as a TTL;
+			// bool, string and null are refused. The first version of this
+			// listed three and left NumberDecimal(60) as a hole in the guard
+			// it was narrowing.
+			//
 			// createIndexes only. collMod takes the string "off" to take the
 			// TTL off a clustered collection, so presence is the right test
 			// there and the two are deliberately not shared.
-			switch v.Type {
-			case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+			if isNumericValue(v) {
 				return true
 			}
 		}

@@ -233,6 +233,9 @@ func TestAsksForTTLWantsANumber(t *testing.T) {
 		{"an int", spec(int32(60)), true},
 		{"a long", spec(int64(60)), true},
 		{"a double", spec(60.5), true},
+		// The type the first version of this rule left out, which mongod
+		// accepts and stores as an ordinary TTL.
+		{"a decimal", spec(primitive128("60")), true},
 		{"a string", spec("x"), false},
 		{"a boolean", spec(true), false},
 		{"a document", spec(bson.D{{Key: "a", Value: 1}}), false},
@@ -255,4 +258,14 @@ func TestAsksForTTLWantsANumber(t *testing.T) {
 			}
 		})
 	}
+}
+
+// primitive128 builds a Decimal128 for the table above, and fails the build
+// rather than the test if the driver ever stops parsing this.
+func primitive128(v string) bson.Decimal128 {
+	d, err := bson.ParseDecimal128(v)
+	if err != nil {
+		panic(err)
+	}
+	return d
 }
