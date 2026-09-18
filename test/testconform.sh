@@ -232,6 +232,28 @@ echo "== hints, which are not only about the plan =="
 #
 # These are differential like everything else here, so they say nothing about
 # what the right answer is, only that both collections have to give it.
+# The find options, which are where this suite had a gap. Every one of these is
+# a flag the router reads or has to pass through untouched, and none of them was
+# asked of a collection split across two tiers. returnKey is the interesting one:
+# it answers with index keys rather than documents, so a router that resolves a
+# read by looking documents up by _id has nothing to look up.
+same 'returnKey on an index'   "print(JSON.stringify(COLL.find({n:{\$gt:5}}).returnKey().hint({n:1}).toArray()))"
+same 'returnKey with no index' "print(JSON.stringify(COLL.find({}).returnKey().toArray()))"
+same 'singleBatch with a limit' "print(JSON.stringify(COLL.find({}).limit(3).batchSize(1000)$S"
+# A negative limit and a negative skip are refused by mongod, and its refusal
+# runs to several lines. same() compares the last line of each side, so the
+# message is flattened to its first line here: two different errors would still
+# differ, and a refusal against an answer certainly would.
+same 'a negative limit'        "try{print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},limit:-3,sort:{_id:1}}).cursor.firstBatch))}catch(e){print('ERR '+e.message.split('\n')[0].substring(0,60))}"
+same 'a negative skip'         "try{print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},skip:-1}).cursor.firstBatch))}catch(e){print('ERR '+e.message.split('\n')[0].substring(0,60))}"
+same 'batchSize zero'          "print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},batchSize:0}).cursor.firstBatch))"
+same 'skip past the end'       "print(JSON.stringify(COLL.find({}).skip(1000)$S"
+same 'allowDiskUse on a find'  "print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},allowDiskUse:true,sort:{_id:1}}).cursor.firstBatch.length))"
+same 'tailable on a normal collection' "try{print('n='+d.runCommand({find:c.getName(),filter:{},tailable:true}).cursor.firstBatch.length)}catch(e){print('ERR '+e.message.split('\n')[0].substring(0,60))}"
+# showRecordId's value is a storage engine's own address, so the two collections
+# cannot agree on it and must not be asked to. What has to match is that the
+# field is there at all, on every document, whichever tier answered.
+same 'showRecordId is present' "print(COLL.find({}).showRecordId().toArray().every(x => x.\$recordId !== undefined))"
 same 'hint an ordinary index'  "print(JSON.stringify(COLL.find({n:{\$gt:5}}).hint({n:1})$S"
 same 'hint a sparse index'     "print(JSON.stringify(COLL.find({}).hint('conf_sparse')$S"
 same 'hint a sparse index by key' "print(JSON.stringify(COLL.find({}).hint({opt:1})$S"

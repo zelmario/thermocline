@@ -1185,6 +1185,62 @@ kill $RFP 2>/dev/null; wait $RFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 
+echo "== the other door into a unique index =="
+# createIndexes with unique: true on a tiered collection is walked and claimed,
+# because the fast tier's own build sees only the half of the data that is here.
+# collMod reaches the same state by a different route, and reached none of that:
+#
+#   collMod: NS, index: {keyPattern: {email: 1}, prepareUnique: true}
+#   collMod: NS, index: {keyPattern: {email: 1}, unique: true}
+#
+# Measured before this was guarded, with one live document in the archive
+# duplicating a value the fast tier holds: createIndexes was refused with E11000
+# and both collMods were accepted, leaving a unique index over a value held by
+# two live documents and zero rows in the key registry. Every later insert of
+# that value was accepted too, because the registry is what remembers a value
+# the fast tier cannot see.
+MNS=tkcollmod
+fresh $MNS
+R "db.getSiblingDB(process.env.TC_DB).$MNS.insertMany([{_id:1,email:'a@x'},{_id:2,email:'b@x'}])" >/dev/null
+waitMirrored $MNS 2
+# The archive keeps a live copy of a@x, which is what an eviction leaves.
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).$MNS.deleteOne({_id:1})"
+chk "the archive still holds the evicted one"        "true" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).$MNS.findOne({_id:1}); print(!!d && !d._tcDeletedAt)")"
+# A second live a@x on the fast tier. No unique index yet, so nothing refuses it,
+# and the two halves of the duplicate are now one per tier.
+R "db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:3,email:'a@x'})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1'}]})" >/dev/null
+cm() { case "$1" in *E11000*) echo "REFUSED" ;; *) echo "$1" ;; esac; }
+chk "prepareUnique on its own is allowed"            "ACCEPTED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},prepareUnique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "collMod unique by key pattern is refused"       "REFUSED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "and by index name"                              "REFUSED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{name:'tkem_1',unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "the index is still not unique"                  "false" \
+    "$(H "print(!!db.getSiblingDB(process.env.TC_DB).$MNS.getIndexes().filter(i=>i.name==='tkem_1')[0].unique)")"
+# The claims the walk wrote are given back, or a later create of the same index
+# would find its own keys already taken.
+chk "and the refusal left no claims behind"          "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+# The controls. A guard that refused every collMod would be worse than the hole.
+C "db.getSiblingDB(process.env.TC_DB).$MNS.deleteOne({_id:1})" >/dev/null
+chk "with the duplicate gone it goes through"        "ACCEPTED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "and the index is unique now"                    "true" \
+    "$(H "print(!!db.getSiblingDB(process.env.TC_DB).$MNS.getIndexes().filter(i=>i.name==='tkem_1')[0].unique)")"
+# And it claimed what was already there, which is the whole point of walking.
+# Two live documents, two keys, exactly as createIndexes would have left it.
+chk "and it claimed the keys already there"          "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+chk "a collMod that touches no index still works"    "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',validationLevel:'off'});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
+chk "and one naming an index that is not there"      "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{name:'tknosuch',unique:true}});print('false')}catch(e){print(/cannot find index|not found/i.test(e.message))}")"
+H "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
+
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
 echo
 echo "================================"

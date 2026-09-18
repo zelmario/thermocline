@@ -56,6 +56,18 @@ func (c *conn) guardNewUniqueIndex(ctx context.Context, msg *wire.Message, cmd b
 	if len(idxs) == 0 {
 		return nil, false
 	}
+	return c.claimForUniqueIndex(ctx, msg, ns, idxs)
+}
+
+// claimForUniqueIndex walks both tiers, claims the keys of every document ns
+// already holds under idxs, and refuses when the two tiers between them already
+// break the constraint.
+//
+// Shared by the two doors into the same state. createIndexes with unique: true
+// is the obvious one; a collMod that turns an existing index unique is the
+// other, and it reached none of this until it was measured doing so.
+func (c *conn) claimForUniqueIndex(ctx context.Context, msg *wire.Message, ns string,
+	idxs []uniqueIndex) (*wire.Message, bool) {
 
 	// Its own deadline. The client's context lasts as long as the client is
 	// willing to wait, and abandoning the walk halfway leaves the registry

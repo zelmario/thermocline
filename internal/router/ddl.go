@@ -56,7 +56,11 @@ func (c *conn) guardDDL(ctx context.Context, msg *wire.Message, db, name string)
 			return out, true
 		}
 		if name != "createIndexes" {
-			return nil, false
+			// The other door into a unique index on a tiered collection. See
+			// collmodunique.go: this used to return here, and a collMod that
+			// turned an index unique claimed nothing and was refused by
+			// nothing.
+			return c.guardCollModUnique(ctx, msg, cmd, db)
 		}
 		// After the TTL refusal, because a TTL index is turned down whatever
 		// else it is and walking both tiers first would be a scan for a command
