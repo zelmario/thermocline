@@ -3,12 +3,15 @@ package feeder
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+
+	"github.com/zelmario/thermocline/internal/config"
 )
 
 // Some kinds of collection cannot be mirrored, and mirroring them does damage
@@ -372,4 +375,22 @@ func (f *Feeder) forgetNamespaceKindsIn(db string) {
 			delete(f.kindSeen, ns)
 		}
 	}
+}
+
+// CheckCollectionKinds runs the startup kind check for a caller that is not
+// starting a feeder, and returns the error a feeder start would fail with.
+//
+// It exists because `cline preflight` ended by printing "Nothing above refuses
+// a start" for a deployment where the feeder refuses to start: a capped
+// collection named in feeder.namespaces stops it dead, and preflight ran the
+// router's checks and none of the feeder's. An operator following
+// docs/adoption.md step 0 read a clean report and met the refusal several steps
+// later.
+//
+// A wrapper over the same code rather than a second implementation of it. Two
+// places enforcing one policy is how they drift, and this policy is a list of
+// collection kinds that has grown four times.
+func CheckCollectionKinds(ctx context.Context, hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) error {
+	f := &Feeder{hot: hot, cold: cold, cfg: cfg, log: log}
+	return f.checkCollectionKinds(ctx)
 }

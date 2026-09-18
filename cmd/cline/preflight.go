@@ -15,12 +15,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/feeder"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/router"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
 
-// Everything a starting router would say about a pair, without starting one.
+// Everything a start would say about a pair, without starting anything.
 //
 // The findings a router produces at startup are the ones that decide whether a
 // deployment is fit to tier: collections stranded on the archive, a database
@@ -28,6 +29,12 @@ import (
 // the tiers, a unique index the fast tier is missing, accounts and roles the
 // archive does not have, unclaimed unique keys on an adopted archive, and a
 // version or FCV mismatch that refuses the start outright.
+//
+// And the feeder's own refusal, which was missing until it was noticed that the
+// closing line here said "Nothing above refuses a start" for a deployment whose
+// feeder would not start at all: a capped collection named in feeder.namespaces
+// stops it dead. Preflight is step 0 of docs/adoption.md, so the refusal it
+// missed was met several steps later.
 //
 // Until this existed the only way to see them was to start a router against the
 // cluster, and a starting router is not a reader: it builds the archive's
@@ -47,14 +54,16 @@ Runs the checks a router runs when it starts -- versions and feature
 compatibility, collections and databases the fast tier does not have, collation
 and validator drift, unique indexes the fast tier is missing, accounts and roles
 the archive lacks, write concerns, and whether anything has ever claimed the
-unique keys an adopted archive carries -- and prints what they find.
+unique keys an adopted archive carries -- and the feeder's check that every
+namespace it is told to mirror is a kind that can be mirrored at all. Prints
+what they find.
 
 Nothing is created, built or removed. A real router start additionally builds
 the archive's indexes on the fast tier, mirrors the fast tier's views to the
 archive, and clears leftover scratch collections; none of that happens here.
 
-Exits non-zero when the pair is one a router would refuse to serve, so a rollout
-script can gate on it. Findings that a router only warns about are printed and
+Exits non-zero when the pair is one a router would refuse to serve, or one whose
+feeder would refuse to mirror, so a rollout script can gate on it. Findings that a router only warns about are printed and
 do not change the exit status: they are for a person to read.
 `
 
@@ -117,6 +126,16 @@ func runPreflight(args []string) error {
 		// The pair itself is one a router refuses. Said as an error rather than
 		// a warning because that is what it would be at a real start, and a
 		// rollout script has to be able to stop here.
+		return err
+	}
+
+	// The feeder's own refusal, which this did not run and the closing line
+	// below claimed it had. A capped collection named in feeder.namespaces
+	// stops the feeder dead, and an operator following docs/adoption.md step 0
+	// read "Nothing above refuses a start" and met it several steps later.
+	// Returned rather than warned, for the same reason Survey's errors are: a
+	// rollout script has to be able to stop here.
+	if err := feeder.CheckCollectionKinds(ctx, hot, cold, cfg.Feeder, log); err != nil {
 		return err
 	}
 

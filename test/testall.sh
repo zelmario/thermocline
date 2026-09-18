@@ -172,6 +172,26 @@ ok "preflight runs against the pair"        0 "Nothing will be written" \
    -- cline preflight --config $CFG
 ok "and says nothing refuses a start"       0 "Nothing above refuses a start" \
    -- cline preflight --config $CFG
+# And that line has to be true of the feeder as well as the router, which it was
+# not. preflight ran the router's checks only, so a capped collection named in
+# feeder.namespaces printed a clean report here and stopped the feeder dead
+# several steps into docs/adoption.md. The kind check is the feeder's, and this
+# is where it is proved to be reached.
+PKNS=trcapped
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PKNS.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PKNS.drop()" >/dev/null 2>&1
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).createCollection('$PKNS',{capped:true,size:4096})" >/dev/null 2>&1
+ok "a capped collection in the list refuses" 1 "cannot be mirrored" \
+   -- cline preflight --config $CFG
+ok "and names the collection and the reason" 1 "$PKNS is a capped collection" \
+   -- cline preflight --config $CFG
+mongosh "$HOTU"  --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PKNS.drop()" >/dev/null 2>&1
+mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PKNS.drop()" >/dev/null 2>&1
+# The cleanup is verified rather than assumed: a capped collection left behind
+# here refuses every later preflight in this suite, and the failures would read
+# as the guard firing on nothing.
+ok "and it is quiet again once it is gone"  0 "Nothing above refuses a start" \
+   -- cline preflight --config $CFG
 # The adoption shape, which is the case it exists for and the one it used to be
 # silent about: a tiered collection the archive has and the fast tier has never
 # held. warnAboutOptionDrift skips a collection only one tier has, because by

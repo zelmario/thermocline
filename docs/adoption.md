@@ -25,8 +25,15 @@ comparison a router makes at startup -- versions and feature compatibility,
 collections and databases the fast tier has never held, collation and validator
 drift, unique indexes the fast tier is missing, accounts and roles the archive
 lacks, and whether anything has claimed the unique keys an adopted archive
-carries -- and it also names what a start *would* build on the fast tier, with
-the index counts.
+carries -- plus the feeder's own check that every namespace it is told to mirror
+is a kind that can be mirrored at all, and it also names what a start *would*
+build on the fast tier, with the index counts.
+
+That last check was missing here for longer than it should have been, and the
+shape of the mistake is worth keeping: preflight ran the router's checks, said
+"Nothing above refuses a start", and the feeder then refused to start on a
+capped collection named in `feeder.namespaces`. A report that runs one daemon's
+checks and speaks for all of them is worse than no report.
 
 That last line is the one to read before step 1, because step 1 is not a reader.
 A router start creates each tiered collection on the fast tier the way the
