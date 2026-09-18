@@ -552,32 +552,32 @@ chk "the writes did claim keys in the registry"      "3" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$KNS'}))")"
 # Every database, counted by database, so nothing is discarded before it is seen.
 #
-# Drained with getMore rather than read out of firstBatch. This is a
-# cluster-wide stream, so under a sweep it carries three other workers' writes
-# as well as this one's, and a batch holds 101 events: the three this section
-# made were past the end of the first batch and both sides counted zero. The
-# control is what caught it, which is the whole reason the control is here --
-# "the application saw no bookkeeping" and "there was no bookkeeping to see"
-# print the same 0.
+# Drained, rather than read out of the first batch. This is a cluster-wide
+# stream, so under a sweep it carries three other workers' writes as well as
+# this one's, and a batch holds 101 events: the three this section made were
+# past the end of the first batch and both sides counted zero. The control is
+# what caught it, which is the whole reason the control is here -- "the
+# application saw no bookkeeping" and "there was no bookkeeping to see" print
+# the same 0.
+#
+# Through the driver's own cursor, not a hand-rolled getMore. The first version
+# of this drain sent {getMore, collection: "$cmd.aggregate"} with runCommand,
+# which mongosh issues under a fresh implicit session, and mongod refuses a
+# getMore whose session is not the one that opened the cursor: "Cursor session
+# id is not the same as the operation context\'s session id". tryNext with
+# maxAwaitTimeMS does the same draining and leaves sessions to the driver.
 #
 # The deadline bounds the side that is supposed to find nothing. The other side
 # stops as soon as it has its three.
-KDRAIN="const adm = db.getSiblingDB('admin');
-   const r = adm.runCommand({
-     aggregate: 1,
-     pipeline: [{\$changeStream: {allChangesForCluster: true, startAtOperationTime: Timestamp({t: $KTS, i: 1})}}],
-     cursor: {}});
-   if (!r.ok) { print('FAILED'); } else {
-     let n = 0, id = r.cursor.id, batch = r.cursor.firstBatch;
-     const deadline = Date.now() + 15000;
-     for (;;) {
-       n += batch.filter(e => e.ns && e.ns.db === process.env.TC_META).length;
-       if (n >= 3 || id == 0 || Date.now() > deadline) { break; }
-       const g = adm.runCommand({getMore: id, collection: '\$cmd.aggregate', maxTimeMS: 1500});
-       if (!g.ok) { break; }
-       id = g.cursor.id; batch = g.cursor.nextBatch;
-     }
-     print(n); }"
+KDRAIN="const cs = db.getMongo().watch([], {startAtOperationTime: Timestamp({t: $KTS, i: 1}), maxAwaitTimeMS: 1000});
+   let n = 0;
+   const deadline = Date.now() + 15000;
+   while (Date.now() < deadline && n < 3) {
+     const e = cs.tryNext();
+     if (e && e.ns && e.ns.db === process.env.TC_META) { n++; }
+   }
+   cs.close();
+   print(n);"
 KGOT=$(R "$KDRAIN")
 KCTRL=$(mongosh "$HOT" --quiet --eval "$KDRAIN" 2>&1 | tail -1)
 echo "  the client saw $KGOT bookkeeping events, the fast tier's own stream $KCTRL"
