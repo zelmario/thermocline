@@ -208,3 +208,51 @@ func TestUnmirrorableTarget(t *testing.T) {
 		})
 	}
 }
+
+// A TTL index is one whose expireAfterSeconds is a number. mongod refuses any
+// other type with "TTL index 'expireAfterSeconds' option must be numeric", and
+// reading the field's presence alone had this system answer a malformed
+// createIndexes with a refusal about its own TTL policy, which sends an
+// operator looking for a policy when the command is simply wrong.
+func TestAsksForTTLWantsANumber(t *testing.T) {
+	spec := func(v interface{}) bson.D {
+		return bson.D{
+			{Key: "createIndexes", Value: "t"},
+			{Key: "indexes", Value: bson.A{bson.D{
+				{Key: "key", Value: bson.D{{Key: "d", Value: 1}}},
+				{Key: "name", Value: "d_ttl"},
+				{Key: "expireAfterSeconds", Value: v},
+			}}},
+		}
+	}
+	cases := []struct {
+		name string
+		cmd  bson.D
+		want bool
+	}{
+		{"an int", spec(int32(60)), true},
+		{"a long", spec(int64(60)), true},
+		{"a double", spec(60.5), true},
+		{"a string", spec("x"), false},
+		{"a boolean", spec(true), false},
+		{"a document", spec(bson.D{{Key: "a", Value: 1}}), false},
+		{"no expireAfterSeconds at all", bson.D{
+			{Key: "createIndexes", Value: "t"},
+			{Key: "indexes", Value: bson.A{bson.D{
+				{Key: "key", Value: bson.D{{Key: "d", Value: 1}}},
+				{Key: "name", Value: "d_1"}}}}}, false},
+		{"a non-array indexes", bson.D{
+			{Key: "createIndexes", Value: "t"}, {Key: "indexes", Value: 5}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(c.cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := asksForTTL(raw, "createIndexes"); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

@@ -395,12 +395,27 @@ chk "a \$merge with a non-array on"              "agree" "$(ask "{aggregate:'$NS
 chk "a \$merge with a non-string into"           "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:5}}],cursor:{}}")"
 chk "a \$out with a non-string argument"         "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$out:5}],cursor:{}}")"
 chk "createIndexes with a non-array indexes"     "agree" "$(ask "{createIndexes:'$NS',indexes:5}")"
+# count and distinct read a query the way find reads a filter, and an unreadable
+# one was read as no query at all: `count` with `query: 5` came back with a
+# number where mongod says the field is the wrong type.
+chk "a count whose query is not a document"      "agree" "$(ask "{count:'$NS',query:5}")"
+chk "a distinct whose query is not a document"   "agree" "$(ask "{distinct:'$NS',key:'v',query:5}")"
+# A TTL index is one whose expireAfterSeconds is a number. Reading the field's
+# presence alone answered a malformed createIndexes with a refusal about this
+# system's own TTL policy, which sends an operator looking for a policy.
+chk "a non-numeric expireAfterSeconds"           "agree" \
+    "$(ask "{createIndexes:'$NS',indexes:[{key:{edgettl:1},name:'edgettl_1',expireAfterSeconds:'x'}]}")"
 chk "killCursors with a non-array cursors"       "agree" "$(ask "{killCursors:'$NS',cursors:5}")"
 # The controls: the fix must not be a wider refusal.
 chk "while an ordinary pipeline still agrees"    "agree" "$(ask "{aggregate:'edgefree',pipeline:[{\$match:{_id:'wrongtype'}}],cursor:{}}" "$DB2")"
 chk "and it really did return the document"      "ok:1" \
     "$(R "var r=db.getSiblingDB(process.env.TC_DB2).runCommand({aggregate:'edgefree',pipeline:[{\$match:{_id:'wrongtype'}}],cursor:{}}); print('ok:'+r.cursor.firstBatch.length)")"
 chk "and an ordinary \$merge"                    "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$match:{_id:'no-such'}},{\$merge:{into:'$NS',on:'_id'}}],cursor:{}}")"
+# And a real TTL index is still refused, or the fix above is a hole rather than
+# a narrowing. This one does not agree with mongod on purpose: refusing it is
+# the product decision, and the check is that the refusal is ours.
+chk "while a numeric one is still refused"       "true" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$NS',indexes:[{key:{edgettl:1},name:'edgettl_2',expireAfterSeconds:60}]});print('false')}catch(e){print(/refusing a TTL index/.test(e.message))}")"
 chk "and the router counted no panic"            "${EPANIC0:-0}" \
     "$(curl -s http://127.0.0.1:$PDASH/metrics | awk '/^thermocline_panics_total/ {print $2}')"
 R "db.getSiblingDB(process.env.TC_DB2).edgefree.drop()" >/dev/null

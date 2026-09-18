@@ -521,8 +521,21 @@ func asksForTTL(cmd bson.Raw, name string) bool {
 		if !ok {
 			continue
 		}
-		if _, err := doc.LookupErr("expireAfterSeconds"); err == nil {
-			return true
+		if v, err := doc.LookupErr("expireAfterSeconds"); err == nil {
+			// Numeric, because that is what makes it a TTL index. mongod
+			// refuses anything else with "TTL index 'expireAfterSeconds'
+			// option must be numeric", and reading the field's presence alone
+			// had this answer a malformed createIndexes with a refusal about
+			// this system's TTL policy. An operator reading that goes looking
+			// for a policy when the command is simply wrong.
+			//
+			// createIndexes only. collMod takes the string "off" to take the
+			// TTL off a clustered collection, so presence is the right test
+			// there and the two are deliberately not shared.
+			switch v.Type {
+			case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+				return true
+			}
 		}
 	}
 	return false

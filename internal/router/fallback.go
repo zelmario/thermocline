@@ -1058,6 +1058,18 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	if !ok {
 		return nil, false
 	}
+	// A query this proxy cannot read. mongod refuses it ("BSON field
+	// 'count.query' is the wrong type 'int'") and the router answered it: a
+	// count with query: 5 came back with a number, and a distinct with the same
+	// came back with values. Neither had a query at all as far as this path was
+	// concerned, so both were answered from the archive unbounded. Forwarded,
+	// mongod says what is wrong with it. See unreadableWriteStage for the same
+	// rule on the writing side.
+	if v, qerr := cmd.LookupErr("query"); qerr == nil {
+		if _, isDoc := v.DocumentOK(); !isDoc {
+			return nil, false
+		}
+	}
 	ns := db + "." + coll
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
 
