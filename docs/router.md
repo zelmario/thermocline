@@ -1299,6 +1299,32 @@ answer is a worse failure than the one being prevented. `cline keys --rebuild`
 is still the answer for an index created out of band, for a fast tier rebuilt
 from nothing, and for a cluster adopted with data already in it.
 
+**`collMod` reaches the same state, and goes through the same walk.** An index
+does not have to be created unique to become unique:
+
+```
+db.runCommand({collMod: "orders", index: {keyPattern: {email: 1}, prepareUnique: true}})
+db.runCommand({collMod: "orders", index: {keyPattern: {email: 1}, unique: true}})
+```
+
+Measured on 6.0.26 before this was guarded, with one live document in the
+archive duplicating a value the fast tier holds: `createIndexes` with
+`unique: true` was refused with 11000, and both `collMod`s above were accepted.
+They left a unique index over a value held by two live documents, with **zero
+rows in the key registry**, so every later insert of that value was accepted
+too.
+
+Both spellings of the index are covered, `keyPattern` and `name`. The index is
+read from the fast tier rather than from the command, because a `collMod`
+carries only the change: `sparse`, `partialFilterExpression` and `collation`
+belong to the index as it already exists, and claiming keys without them would
+claim keys for documents the index does not index.
+
+`prepareUnique` on its own is left alone. It stops the fast tier taking new
+duplicates, which is a narrowing rather than a claim, and the conversion is the
+moment the constraint starts being asserted about documents this tier cannot
+see.
+
 **Dropping the index releases the claims it made.** Claims are permanent on
 purpose -- a deleted document leaves its row behind, and the row is resolved
 when something collides with it -- and that reasoning is about documents. For an
