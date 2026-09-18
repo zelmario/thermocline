@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -297,5 +298,65 @@ func TestZeroByteBudgetMeansTheDefault(t *testing.T) {
 	// every value and still pass the cases above.
 	if c := NewWithBytes(100, 4096, time.Minute); c.maxBytes != 4096 {
 		t.Errorf("NewWithBytes(budget=4096) kept maxBytes=%d, want 4096", c.maxBytes)
+	}
+}
+
+// An entry whose TTL is shorter than the work of storing it can never be read,
+// and storing it is pure cost: the whole reply is copied, the byte accounting
+// moves, and evictForBytes may then walk every key in the cache.
+//
+// It happens whenever the second sighting of a query follows the first closely,
+// which two connections of a pool asking the same question at the same moment
+// do by definition. The TTL is derived from how long the answer has been seen
+// to hold, and at that point it has held for the gap between the two reads.
+//
+// Found by a router test that failed once in a few hundred runs with "nothing
+// was cached, so this test proves nothing": under -count it ran fast enough
+// that the gap was a few hundred nanoseconds, and the entry expired between
+// being stored and being read.
+func TestAnEntryTooShortLivedToReadIsNotStored(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	reply := []byte("an answer worth 9 bytes")
+
+	c.Observe("q", "shop.orders", reply)
+	k.add(200 * time.Nanosecond)
+	c.Observe("q", "shop.orders", reply)
+
+	if _, ok := c.Get("q"); ok {
+		t.Error("a 200ns-old answer was served from the cache")
+	}
+	if c.Bytes() != 0 {
+		t.Errorf("the cache is holding %d bytes for an answer nothing can read", c.Bytes())
+	}
+
+	// And the control: the same query with a gap worth caching is held.
+	c2, k2 := newTestCache(10, time.Hour)
+	c2.Observe("q", "shop.orders", reply)
+	k2.add(time.Minute)
+	c2.Observe("q", "shop.orders", reply)
+	if _, ok := c2.Get("q"); !ok {
+		t.Error("an answer that held for a minute was not cached")
+	}
+}
+
+// What the MinTTL floor saves, on the shape that produced it: the second
+// sighting of a query arriving close behind the first, which is what two
+// connections of a pool asking the same question at one moment look like.
+//
+// The real clock on purpose. The gap is whatever the machine makes it, which is
+// the point: below the floor the reply is not copied and the byte accounting
+// and eviction scan do not run.
+func BenchmarkObserveSecondSightingCloseBehind(b *testing.B) {
+	reply := make([]byte, 64*1024)
+	for i := range reply {
+		reply[i] = byte(i)
+	}
+	c := NewWithBytes(1000, 64<<20, time.Hour)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := strconv.Itoa(i)
+		c.Observe(k, "shop.orders", reply)
+		c.Observe(k, "shop.orders", reply)
 	}
 }

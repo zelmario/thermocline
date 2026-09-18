@@ -36,6 +36,22 @@ const Stability = 5
 // half: the cache is deliberately shorter-lived than the evidence for it.
 const safety = 0.9
 
+// MinTTL is the shortest life worth storing an answer for.
+//
+// The TTL is derived from how long the answer has been seen to hold, and the
+// second sighting of a query has only the gap between the two reads behind it.
+// Two connections of a pool asking the same question at the same moment make
+// that gap a few hundred nanoseconds, and the entry was stored anyway: the
+// whole reply copied, the byte accounting moved, and evictForBytes then walking
+// every key in the cache, for an answer that expires before anything can read
+// it. Serving a hit is 365us measured, so a TTL below a millisecond cannot be
+// used even by the request immediately behind.
+//
+// Nothing is lost by the floor. What was learned about the query is kept either
+// way; only the copy is skipped. A query whose answer genuinely holds for less
+// than a millisecond is not one a cache can help.
+const MinTTL = time.Millisecond
+
 // Entry is one cached answer.
 type Entry struct {
 	Reply    []byte
@@ -225,7 +241,8 @@ func (c *Cache) ObserveResultOn(key string, nss []string, reply []byte, h uint64
 		e.ttl = c.ttlFrom([]time.Duration{now.Sub(e.changedAt)})
 	}
 
-	if e.ttl <= 0 {
+	if e.ttl < MinTTL {
+		// Learned from, not held. See MinTTL.
 		return
 	}
 	if len(reply) > MaxEntryBytes {

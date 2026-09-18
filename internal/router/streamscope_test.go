@@ -33,10 +33,19 @@ func TestEveryStreamTheSieveFiltersIsCounted(t *testing.T) {
 		name string
 		db   string
 		cmd  bson.D
+		want int64
 	}{
-		{"one tiered collection", "shop", watch("orders", false)},
-		{"the whole database", "shop", watch(int32(1), false)},
-		{"the whole deployment", "admin", watch(int32(1), false)},
+		{"one tiered collection", "shop", watch("orders", false), 1},
+		{"the whole database", "shop", watch(int32(1), false), 1},
+		{"the whole deployment", "admin", watch(int32(1), false), 1},
+		// And the other side of it. Counting a stream this system has nothing
+		// to do with would be as wrong as missing one it does: the sieve would
+		// register the cursor and judge every event of a database nothing
+		// tiers. Mutation testing found this side untested, by making
+		// streamScope answer true for every database and watching the suite
+		// stay green.
+		{"a collection nothing tiers", "shop", watch("invoices", false), 0},
+		{"a database with nothing tiered", "other", watch(int32(1), false), 0},
 	}
 
 	for _, tc := range cases {
@@ -48,8 +57,8 @@ func TestEveryStreamTheSieveFiltersIsCounted(t *testing.T) {
 				log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 			}
 			c.guardAggregate(context.Background(), msgOf(t, tc.cmd), tc.db)
-			if got := c.r.Stats.ChangeStreams.Load(); got != 1 {
-				t.Errorf("change streams counted = %d, want 1", got)
+			if got := c.r.Stats.ChangeStreams.Load(); got != tc.want {
+				t.Errorf("change streams counted = %d, want %d", got, tc.want)
 			}
 		})
 	}

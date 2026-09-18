@@ -161,6 +161,20 @@ func TestReservedInPipeline(t *testing.T) {
 					{Key: "field", Value: "seen"},
 					{Key: "input", Value: "$$ROOT"},
 					{Key: "value", Value: 1}}}}}}), false},
+		// $literal hands its argument through without evaluating it, so the
+		// document it yields shows its keys exactly as a literal one does.
+		// Mutation testing found this arm untested: removing it left the suite
+		// green.
+		{"a $replaceWith of a $literal document", stages(
+			bson.D{{Key: "$replaceWith", Value: bson.D{
+				{Key: "$literal", Value: bson.D{
+					{Key: "_id", Value: 1},
+					{Key: "_tcDeletedAt", Value: now}}}}}}), true},
+		{"a $replaceWith of an ordinary $literal", stages(
+			bson.D{{Key: "$replaceWith", Value: bson.D{
+				{Key: "$literal", Value: bson.D{
+					{Key: "_id", Value: 1},
+					{Key: "seen", Value: 1}}}}}}), false},
 		// An expression whose keys come from data is not read, and not refused
 		// either. This pins the residue that docs/limitations.md names, so
 		// changing it is a decision rather than an accident.

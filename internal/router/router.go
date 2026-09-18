@@ -318,6 +318,19 @@ func (r *Router) enableCache() {
 		return
 	}
 	r.cache = cache.NewWithBytes(r.cfg.Cache.MaxQueries, r.cfg.Cache.MaxBytes, r.cfg.Cache.MaxTTL.D())
+	// A ceiling below the floor is a cache that is on and holds nothing, and it
+	// would say so nowhere. The same shape as an operator setting max_bytes too
+	// low, which is written up beside the cache metrics in promexport_test.go:
+	// the configuration is accepted, the feature reports itself as on, and the
+	// hit rate is zero for a reason no number names.
+	if ttl := r.cfg.Cache.MaxTTL.D(); ttl > 0 && ttl < cache.MinTTL {
+		r.log.Warn("router.cache.max_ttl is below the shortest life worth storing an answer for",
+			"max_ttl", ttl, "floor", cache.MinTTL,
+			"effect", "every learned TTL is capped below the floor, so nothing is ever stored and "+
+				"the cache reports itself on while holding nothing",
+			"action", "raise max_ttl above "+cache.MinTTL.String()+", or turn the cache off and "+
+				"leave router.cache.measure on to see what caching would be worth")
+	}
 	r.log.Info("query cache on",
 		"max_queries", r.cfg.Cache.MaxQueries,
 		"max_ttl", r.cfg.Cache.MaxTTL.D(),

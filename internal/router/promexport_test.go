@@ -157,7 +157,18 @@ func TestMetricsExportsTheCache(t *testing.T) {
 	}
 	// Two looks at a query that has held still, so there is a hit, a miss and
 	// an entry to report.
+	//
+	// With a gap between them, and this is not decoration. The TTL is derived
+	// from how long the answer has been seen to hold, so two observations in
+	// the same instant earn a TTL of nothing: below cache.MinTTL the answer is
+	// learned from and not stored, and before that floor existed it was stored
+	// with a TTL of a few hundred nanoseconds and expired before the Get below
+	// could read it. That is what made this test fail about once in a few
+	// hundred runs, always under -count, which is the only way it ever ran fast
+	// enough. The gap is a hundred times the floor so that a scheduling delay
+	// between storing and reading cannot close it.
 	r.cache.Observe("q", "shop.orders", []byte("an answer"))
+	time.Sleep(100 * cache.MinTTL)
 	r.cache.Observe("q", "shop.orders", []byte("an answer"))
 	if _, ok := r.cache.Get("q"); !ok {
 		t.Fatal("nothing was cached, so this test proves nothing")
