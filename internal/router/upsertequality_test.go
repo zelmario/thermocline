@@ -112,3 +112,39 @@ func TestEqualityInFilterFindsNestedFields(t *testing.T) {
 		})
 	}
 }
+
+// equalityInFilter runs per unique index per statement on the write path, and
+// it grew two walks today: one down a dotted path and one through $and and $or.
+// The ordinary filter still has to be the fast case, so this measures it rather
+// than assuming it, per the lesson that cost cache.Shape an optimisation.
+func BenchmarkEqualityInFilter(b *testing.B) {
+	mk := func(d bson.D) bson.Raw {
+		raw, err := bson.Marshal(d)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return raw
+	}
+	// The overwhelmingly common shape: the field is named at the top level and
+	// the direct lookup hits before either walk starts.
+	hit := mk(bson.D{{Key: "email", Value: "a@x"}, {Key: "k", Value: 1}})
+	// The worst ordinary case: the field is absent, so both walks run.
+	miss := mk(bson.D{{Key: "k", Value: 1}, {Key: "status", Value: "shipped"}})
+
+	b.Run("present at the top level", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, ok := equalityInFilter(hit, "email"); !ok {
+				b.Fatal("expected a hit")
+			}
+		}
+	})
+	b.Run("absent, both walks run", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, ok := equalityInFilter(miss, "email"); ok {
+				b.Fatal("expected a miss")
+			}
+		}
+	})
+}
