@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -218,5 +219,40 @@ func TestAdvisorIgnoresHousekeeping(t *testing.T) {
 	}
 	if len(rows) == 0 {
 		t.Fatal("the application's query was dropped along with the housekeeping")
+	}
+}
+
+// What the advisor costs once it is full, which is the state a real deployment
+// reaches and no benchmark had measured.
+//
+// evictShapeIfFull picks the oldest shape by scanning every shape it holds, and
+// it runs on every insert once the table is at max_queries. So a workload with
+// more distinct shapes than the cap pays a full scan per cacheable read, and
+// the default cap is 1000. The advisor runs by default, whether or not anything
+// is cached, so this is paid by deployments that never turn the cache on.
+//
+// Run as: a cap of 1000, then observe shapes that are always new.
+func BenchmarkAdvisorObserveWhenFull(b *testing.B) {
+	const cap = 1000
+	a := NewAdvisor(cap, 50, time.Hour)
+	// Fill it, so every Observe below evicts.
+	for i := 0; i < cap; i++ {
+		a.Observe("shape"+strconv.Itoa(i), "shop.orders", uint64(i), uint64(i))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Observe("new"+strconv.Itoa(i), "shop.orders", uint64(i), uint64(i))
+	}
+}
+
+// And the same advisor when it is not full, which is what every existing
+// measurement of this code was taken on.
+func BenchmarkAdvisorObserveWhenNotFull(b *testing.B) {
+	a := NewAdvisor(1<<20, 50, time.Hour)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Observe("new"+strconv.Itoa(i), "shop.orders", uint64(i), uint64(i))
 	}
 }

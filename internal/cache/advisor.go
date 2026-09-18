@@ -318,16 +318,45 @@ func (a *Advisor) Shapes() int {
 }
 
 // evictShapeIfFull forgets the shape nobody has asked for in the longest time.
+// evictShapeIfFull drops the least recently seen shapes once the table is full.
+//
+// In a batch, and that is the whole point. Picking the single oldest costs a
+// scan of every shape, and eviction runs on every insert once the table is at
+// max_queries, so a deployment with more distinct shapes than the cap paid that
+// scan on every cacheable read. Measured at the default cap of 1000:
+//
+//	BenchmarkAdvisorObserveWhenFull      48,199 ns/op
+//	BenchmarkAdvisorObserveWhenNotFull    2,621 ns/op
+//
+// An eighteen-fold cliff, on 48us added to a command whose whole proxy overhead
+// is 130us, paid by a component that runs by default whether or not anything is
+// cached. Nothing in the export would have shown it either.
+//
+// One scan now clears a tenth of the table, so the next hundred inserts do not
+// scan at all. What goes is the same set the one-at-a-time version would have
+// dropped over those hundred inserts, the least recently seen, and the advisor
+// is a bounded sample of recent traffic by construction.
 func (a *Advisor) evictShapeIfFull() {
 	if a.maxShapes <= 0 || len(a.shapes) < a.maxShapes {
 		return
 	}
-	var oldest string
-	var at time.Time
-	for k, s := range a.shapes {
-		if oldest == "" || s.lastSeen.Before(at) {
-			oldest, at = k, s.lastSeen
-		}
+	drop := a.maxShapes / 10
+	if drop < 1 {
+		drop = 1
 	}
-	delete(a.shapes, oldest)
+	type aged struct {
+		key string
+		at  time.Time
+	}
+	all := make([]aged, 0, len(a.shapes))
+	for k, s := range a.shapes {
+		all = append(all, aged{k, s.lastSeen})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	if drop > len(all) {
+		drop = len(all)
+	}
+	for _, e := range all[:drop] {
+		delete(a.shapes, e.key)
+	}
 }
