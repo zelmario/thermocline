@@ -551,12 +551,33 @@ sleep 4
 chk "the writes did claim keys in the registry"      "3" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$KNS'}))")"
 # Every database, counted by database, so nothing is discarded before it is seen.
-KDRAIN="const r = db.getSiblingDB('admin').runCommand({
+#
+# Drained with getMore rather than read out of firstBatch. This is a
+# cluster-wide stream, so under a sweep it carries three other workers' writes
+# as well as this one's, and a batch holds 101 events: the three this section
+# made were past the end of the first batch and both sides counted zero. The
+# control is what caught it, which is the whole reason the control is here --
+# "the application saw no bookkeeping" and "there was no bookkeeping to see"
+# print the same 0.
+#
+# The deadline bounds the side that is supposed to find nothing. The other side
+# stops as soon as it has its three.
+KDRAIN="const adm = db.getSiblingDB('admin');
+   const r = adm.runCommand({
      aggregate: 1,
      pipeline: [{\$changeStream: {allChangesForCluster: true, startAtOperationTime: Timestamp({t: $KTS, i: 1})}}],
      cursor: {}});
    if (!r.ok) { print('FAILED'); } else {
-     print(r.cursor.firstBatch.filter(e => e.ns && e.ns.db === process.env.TC_META).length); }"
+     let n = 0, id = r.cursor.id, batch = r.cursor.firstBatch;
+     const deadline = Date.now() + 15000;
+     for (;;) {
+       n += batch.filter(e => e.ns && e.ns.db === process.env.TC_META).length;
+       if (n >= 3 || id == 0 || Date.now() > deadline) { break; }
+       const g = adm.runCommand({getMore: id, collection: '\$cmd.aggregate', maxTimeMS: 1500});
+       if (!g.ok) { break; }
+       id = g.cursor.id; batch = g.cursor.nextBatch;
+     }
+     print(n); }"
 KGOT=$(R "$KDRAIN")
 KCTRL=$(mongosh "$HOT" --quiet --eval "$KDRAIN" 2>&1 | tail -1)
 echo "  the client saw $KGOT bookkeeping events, the fast tier's own stream $KCTRL"
