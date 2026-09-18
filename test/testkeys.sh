@@ -1069,6 +1069,28 @@ chk "and a rename onto it"                             "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$rename:{'v':'_tcDeletedAt'}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a pipeline update setting it"                 "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$set:{_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# A replacing stage says what the whole document becomes, as an expression
+# rather than as a list of field names, and $replaceRoot wraps that expression
+# in newRoot where $replaceWith takes it directly. Both were read at the same
+# depth, so the documented spelling of the stage went straight through while the
+# name sat in the guard's list looking covered.
+chk "and a pipeline \$replaceWith of it"                "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$replaceWith:{_id:'\$_id',_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+chk "and the \$replaceRoot spelling of the same"        "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$replaceRoot:{newRoot:{_id:'\$_id',_tcDeletedAt:'\$v'}}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# $mergeObjects is how a pipeline adds one field and keeps the rest, which is
+# the shape an application would actually write.
+chk "and a \$mergeObjects adding it to the document"    "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$replaceWith:{\$mergeObjects:['\$\$ROOT',{_tcDeletedAt:'\$v'}]}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# An operator's keys are paths, not names: this creates a top level
+# _tcDeletedAt holding a subdocument, and the predicate that hides a tombstone
+# is {$exists: false}, which a subdocument satisfies as well as a date does.
+chk "and a dotted path under the mark"                 "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$set:{'_tcDeletedAt.x':1}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# And the control for that, because a prefix test that matched here would refuse
+# every field whose name happens to start the same way.
+chk "while a field merely starting the same is fine"   "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},{\$set:{_tcDeletedAtX:1}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
 chk "and findAndModify"                                "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findOneAndUpdate({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 # An upsert's filter is a write path. mongod builds the document it creates from
@@ -1139,9 +1161,12 @@ chk "but \$unset of it is allowed"                      "ACCEPTED" \
 # was measuring an empty pipeline and reporting a product defect.
 cline feeder --config $CFG --log-file $LOGDIR/reserved_f.log & RFP=$!
 sleep 2
-# Two by now: the document this section opened with, and the one the ordinary
-# bulkWrite control wrote.
-waitMirrored $RNS 2
+# Three by now: the document this section opened with, the one the ordinary
+# bulkWrite control wrote, and the one the range-predicate upsert created. That
+# third one arrived with the upsert filter checks and the count here was never
+# moved, so every run of this suite waited the full thirty seconds and warned,
+# which is how a warning stops being read.
+waitMirrored $RNS 3
 chk "and a \$out into a tiered collection"              "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a \$merge into one"                            "REFUSED" \
