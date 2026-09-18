@@ -35,9 +35,9 @@ OPS_NEW = "if f, bad := reservedTopLevel(d); bad {"
 
 MUTANTS = [
  ("reservedPath: drop the dotted-path arm", R,
-  'if key == f || strings.HasPrefix(key, f+".") {', 'if key == f {'),
+  'if relates(key, f) {', 'if key == f {'),
  ("reservedPath: prefix without the dot (a spelling rule)", R,
-  'if key == f || strings.HasPrefix(key, f+".") {', 'if strings.HasPrefix(key, f) {'),
+  'if relates(key, f) {', 'if strings.HasPrefix(key, f) {'),
  ("reservedInNewRoot: drop $mergeObjects", R,
   'case "$mergeObjects":', 'case "$mergeObjectsXX":'),
  ("reservedInNewRoot: drop $setField", R,

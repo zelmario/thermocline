@@ -73,8 +73,12 @@ func reservedTopLevel(doc bson.Raw) (string, bool) {
 // in its name, which the predicate does not read. That is why reservedTopLevel
 // stays as it is rather than growing a prefix test.
 func reservedPath(key string) (string, bool) {
+	// relates, not a prefix test written again here. uniqueupdate.go already
+	// owns the notion "writing path a changes what path b holds", and it is the
+	// same question this is asking. Two copies of one rule is how the index
+	// comparisons drifted apart once already; see the comment on relates.
 	for _, f := range reservedFieldNames {
-		if key == f || strings.HasPrefix(key, f+".") {
+		if relates(key, f) {
 			return f, true
 		}
 	}
