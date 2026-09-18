@@ -121,6 +121,31 @@ chk "and mark the one that was deleted"               "true" \
 chk "and wrote nothing while saying so"               "first" \
     "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:1}); print(d?d.v:"absent")')"
 
+echo "== a document that already wears one of this system's own marks =="
+# The archive's copy of it is a tombstone: invisible to every read that falls
+# through, and counted on the "copied" line as though it had been restored. The
+# router refuses writes that would leave the mark and the feeder warns when it
+# mirrors one, so a document in this state predates the guard or came from a
+# writer that bypassed the router, which is exactly the deployment somebody runs
+# a recovery tool on without running preflight first.
+#
+# Written straight at the fast tier, because through the router it is refused,
+# which is the point.
+M $HOTPORT 'db.getSiblingDB("shop").orders.insertOne({_id:911,v:"wears the mark",_tcDeletedAt:new Date()})' >/dev/null
+MARKED=$("$BIN" backfill --config "$DIR/bf.yaml" 2>&1)
+chk "backfill says the document carries the mark"     "true" \
+    "$(grep -q 'already carry _tcDeletedAt' <<<"$MARKED" && echo true || echo false)"
+chk "and names how many"                              "true" \
+    "$(grep -qE '1 document\(s\) already carry' <<<"$MARKED" && echo true || echo false)"
+chk "and points at the command that lists them"       "true" \
+    "$(grep -q 'cline preflight lists them' <<<"$MARKED" && echo true || echo false)"
+# And the control: with it gone the line does not appear, or the check above
+# would pass on a message that is always printed.
+M $HOTPORT 'db.getSiblingDB("shop").orders.deleteOne({_id:911})' >/dev/null
+CLEAN=$("$BIN" backfill --config "$DIR/bf.yaml" 2>&1)
+chk "and says nothing once it is gone"                "false" \
+    "$(grep -q 'already carry _tcDeletedAt' <<<"$CLEAN" && echo true || echo false)"
+
 echo "== the step after the copy, which had no command behind it =="
 # Refused after --ns, because the checkpoint is not per namespace: clearing it
 # then would restart mirroring from now for every other namespace too, sealing
