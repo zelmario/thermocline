@@ -248,6 +248,29 @@ func (r *Router) noteOpTime(reply *wire.Message) {
 	}
 }
 
+// mirroredThroughCached returns what is already known about mirroring, and
+// never goes and finds out.
+//
+// For callers that must not disturb the read path. mirroredThrough publishes
+// whatever it fetches into the same cache the barrier reads, including a
+// failure, and publish sets fetched either way, so a caller that fetched and
+// failed leaves "nothing is mirroring" in the cache. The poller only runs while
+// reads are waiting on it, so on a router with no fall-through traffic that
+// answer stands until one arrives, and the first one then gives up at once and
+// answers stale.
+//
+// A metrics scrape is exactly such a caller: it runs on a timer whether or not
+// anything is reading, and an archive it cannot reach is the state it most
+// needs to report. Reporting it must not also cause it.
+func (r *Router) mirroredThroughCached() (reading, bool) {
+	r.ckptCache.mu.Lock()
+	defer r.ckptCache.mu.Unlock()
+	if r.ckptCache.fetched.IsZero() {
+		return reading{}, false
+	}
+	return r.ckptCache.last, true
+}
+
 // mirroredThrough returns how far mirroring has got, reusing a recent reading.
 func (r *Router) mirroredThrough(ctx context.Context) reading {
 	r.ckptCache.mu.Lock()

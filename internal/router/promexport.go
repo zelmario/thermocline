@@ -216,7 +216,12 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	// rather than being a packed timestamp nobody can read. Zero is the healthy
 	// value and the one to alert on, the same as its neighbour.
 	if seen := r.seenOpTime.Load(); seen != 0 && r.cfg.FeederID != "" {
-		if got := r.mirroredThrough(ctx); got.known && got.ts.T != 0 {
+		// Cached only. A scrape must not fetch here: mirroredThrough publishes
+		// what it fetches into the cache the freshness barrier reads, so a
+		// scrape that could not reach the archive would leave "nothing is
+		// mirroring" behind and make the next fall-through read answer stale.
+		// Reporting a state must not cause it.
+		if got, ok := r.mirroredThroughCached(); ok && got.known && got.ts.T != 0 {
 			// Through UnpackTS rather than shifting here, so this does not have
 			// to know how a cluster time is packed.
 			behind := float64(0)
