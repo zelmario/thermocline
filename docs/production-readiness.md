@@ -109,19 +109,36 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
   WSL2 host. Throughput, mirroring rate and failover timing are the ones that
   will move.
 
-  The four-hour run on 2026-09-17 is the sharpest illustration so far. It
-  recorded **31 stale reads, all inside one second**, where the same run a day
-  earlier recorded none: mirroring fell behind the freshness barrier for one
-  moment and the router answered from the archive anyway, which is what that
-  trade is for. The feeder logged nothing, because nothing failed. Builds, a
-  full `go test -cover` and benchmarks were running on the same host at the
-  time, and on a box where that competes with the mongods there is no way to
-  tell interference from the system under test. That is the whole of this item.
+  **The four-hour run of 2026-09-18 is the sharpest illustration, because it is
+  the one where the interference broke an invariant and then stopped.**
 
-  What the same run does say, and it is worth as much: the shops noticed nothing
-  wrong through it. 0 violations across 2,494,225 operations, including the
-  check that a report over a closed month never changes, which is the one a
-  stale answer would break.
+      2,649,084 operations over 4h0m, 92/s, 0 errors
+      2,651,911 router commands, 0 refused, 0 duplicate keys, 0 panics
+      86 stale reads, 9 violations
+
+  Every one of the nine violations is at **one instant, 15:57:24**, and all nine
+  are the same shape: "placing one order moved c000784 from 29 to 29", a count
+  read back after a write that did not include it. In the **3 hours 50 minutes
+  after it, across 1.1 million further operations, there were none**, and the
+  stale read counter moved once more and then stood still.
+
+  What was happening at 15:57 was mutation testing and benchmarks, on this host,
+  started by me. The run of 2026-09-17 recorded 31 stale reads and its commit
+  said in as many words that interference from the system under test cannot be
+  ruled out here. This run reproduced that and then demonstrated the converse by
+  going quiet: 1,130 consecutive samples of `mirroring_lag_seconds` at five
+  second intervals with the host idle, maximum **0.116s**, and the only two
+  samples above 0.3s in the whole run fall in the minute after a `go test`.
+
+  So the item is not "is there a defect here". It is that **this box cannot tell
+  one apart from its own load**, and both runs now say so from opposite
+  directions.
+
+  The other number this run produced, which will move off this box and is worth
+  recording before it does: 42.5% of answers came from the archive, and a read
+  that falls through costs **p50 127-135ms** against **1.5ms** for one the fast
+  tier answers alone. That is the shape of the tiering cost on six mongods
+  sharing one disk.
 
 - [ ] **5. Rehearse the four procedures, by a person, against a staging pair.**
   Adoption, rollback, recovery after a feeder stops with a rolled oplog, and a
