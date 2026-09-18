@@ -254,6 +254,16 @@ func (a *Advisor) Report(limit int) []Advice {
 			if a.maxTTL > 0 && suggested > a.maxTTL {
 				suggested = a.maxTTL
 			}
+			if suggested < MinTTL {
+				// Not worth recommending, because the cache would not hold it.
+				// An entry below MinTTL is learned from and dropped: serving a
+				// hit costs 365us, so it would expire before anything could
+				// read it. Advising it would put a row in `cline cache` that
+				// turning the cache on cannot act on, which is worse than a
+				// short list, because the whole purpose of this report is to
+				// decide whether the feature is worth enabling.
+				continue
+			}
 			out = append(out, Advice{
 				Shape:      shape,
 				NS:         s.ns,

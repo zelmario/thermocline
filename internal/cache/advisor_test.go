@@ -207,9 +207,18 @@ func TestAdvisorIgnoresHousekeeping(t *testing.T) {
 	}
 
 	a := NewAdvisor(100, 100, time.Minute)
+	// On a clock this test moves, not the wall clock it used to run on. Ten
+	// observations in a tight loop span microseconds, and since the cache grew
+	// a MinTTL floor the advisor will not recommend a period that short, so the
+	// row this test looks for disappeared for a reason that has nothing to do
+	// with housekeeping. Seconds apart is what an application's repeated query
+	// actually looks like.
+	k := &clock{t: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+	a.now = k.now
 	for i := 0; i < 10; i++ {
 		a.Observe("find config.collections filter={_id:?}", "config.collections", 1, 7)
 		a.Observe("find app.orders filter={customer:?}", "app.orders", 1, 7)
+		k.add(time.Second)
 	}
 	rows := a.Report(10)
 	for _, r := range rows {
@@ -254,5 +263,46 @@ func BenchmarkAdvisorObserveWhenNotFull(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		a.Observe("new"+strconv.Itoa(i), "shop.orders", uint64(i), uint64(i))
+	}
+}
+
+// The advisor must not recommend what the cache would refuse to hold.
+//
+// MinTTL was added to the cache on 2026-09-18: an answer whose observed
+// stability is shorter than a millisecond is learned from and not stored,
+// because serving a hit costs 365us and the entry would expire before anything
+// could read it. The advisor kept suggesting those, so `cline cache` could list
+// a query as worth caching for 180 microseconds, and turning the cache on for
+// it would hold nothing.
+//
+// Two places deciding one thing, which is the shape that drifts.
+func TestAdvisorDoesNotSuggestWhatTheCacheWillNotHold(t *testing.T) {
+	a := NewAdvisor(100, 50, time.Hour)
+	k := &clock{t: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+	a.now = k.now
+
+	// A query that keeps giving the same answer, looked at twice a few hundred
+	// nanoseconds apart: real repetition, far too brief to be worth holding.
+	a.Observe("find shop.orders {a: ?}", "shop.orders", 1, 99)
+	k.add(200 * time.Nanosecond)
+	a.Observe("find shop.orders {a: ?}", "shop.orders", 1, 99)
+
+	for _, adv := range a.Report(10) {
+		if adv.Suggested < MinTTL {
+			t.Errorf("advised caching %q for %v, which is below the cache's own floor of %v",
+				adv.Shape, adv.Suggested, MinTTL)
+		}
+	}
+
+	// The control, in the same advisor: a query stable for a minute is still
+	// advised, or the floor has swallowed the feature.
+	a2 := NewAdvisor(100, 50, time.Hour)
+	k2 := &clock{t: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+	a2.now = k2.now
+	a2.Observe("find shop.totals {}", "shop.totals", 7, 42)
+	k2.add(time.Minute)
+	a2.Observe("find shop.totals {}", "shop.totals", 7, 42)
+	if len(a2.Report(10)) == 0 {
+		t.Error("a query stable for a minute produced no advice at all")
 	}
 }
