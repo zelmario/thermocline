@@ -1200,6 +1200,12 @@ echo "== the other door into a unique index =="
 # that value was accepted too, because the registry is what remembers a value
 # the fast tier cannot see.
 MNS=tkcollmod
+# Its own feeder. The section above this one kills the one it started, so the
+# fixture below mirrored nothing and the archive never held the duplicate the
+# whole section is about: every check read as the guard letting a conversion
+# through when there was nothing to refuse.
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
 fresh $MNS
 R "db.getSiblingDB(process.env.TC_DB).$MNS.insertMany([{_id:1,email:'a@x'},{_id:2,email:'b@x'}])" >/dev/null
 waitMirrored $MNS 2
@@ -1244,6 +1250,7 @@ chk "a collMod that touches no index still works"    "ACCEPTED" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',validationLevel:'off'});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
 chk "and one naming an index that is not there"      "true" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{name:'tknosuch',unique:true}});print('false')}catch(e){print(/cannot find index|not found/i.test(e.message))}")"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
 
