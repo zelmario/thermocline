@@ -400,11 +400,41 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		return
 	}
 	c.r.Stats.StaleReads.Add(1)
+	suppressed, say := c.r.noteStaleRead()
+	if !say {
+		return
+	}
 	c.log.Warn("answering from the archive before mirroring caught up",
 		"ns", ns,
 		"waited", c.r.cfg.ArchiveWait.String(),
+		"suppressed_since_last", suppressed,
 		"effect", "this answer may miss a very recent write, or include a very recently deleted document")
 	c.explainStale(ctx, started)
+}
+
+// noteStaleRead decides whether this stale read gets a log line, and reports how
+// many went unlogged since the last one did.
+//
+// Rate limited because the flood arrives exactly when the log has to stay
+// readable. A feeder that has fallen behind sends every fall-through read down
+// this path, and on the 2026-09-18 run more than eight reads in ten fell
+// through: that is a line per read at the rate of traffic, a few hundred bytes
+// each, gigabytes a day, burying whatever else the router has to say about the
+// outage.
+//
+// Nothing is lost by it. thermocline_stale_reads_total counts every one exactly,
+// which is what an alert reads, and the line now carries how many it stands for.
+// A single stale read on a healthy deployment still logs immediately, because
+// the gate has been open since the last one, and that is the case the warning
+// was written for.
+func (r *Router) noteStaleRead() (suppressed int64, say bool) {
+	now := time.Now().UnixNano()
+	last := r.staleSaidAt.Load()
+	if now-last < int64(explainEvery) || !r.staleSaidAt.CompareAndSwap(last, now) {
+		r.staleSuppressed.Add(1)
+		return 0, false
+	}
+	return r.staleSuppressed.Swap(0), true
 }
 
 // explainEvery bounds how often the line below is written. See explainStale.
@@ -430,16 +460,8 @@ const explainEvery = 10 * time.Second
 // worth seeing: it says the wait ended a moment early rather than the feeder
 // being stopped.
 func (c *conn) explainStale(ctx context.Context, started time.Time) {
-	// Once every explainEvery, for the whole router. The warning above already
-	// fires per stale read, and this one would double it: eleven in a second is
-	// twenty-two lines, and a feeder that has stopped puts every fall-through
-	// read down this path, which is a flood at exactly the moment the log has
-	// to stay readable. One line carries the same diagnosis as a hundred.
-	now := time.Now().UnixNano()
-	last := c.r.staleSaidAt.Load()
-	if now-last < int64(explainEvery) || !c.r.staleSaidAt.CompareAndSwap(last, now) {
-		return
-	}
+	// No gate of its own: noteStaleRead has already claimed this interval for
+	// the pair, so this runs exactly when the warning above does.
 	got := c.r.mirroredThrough(ctx)
 	if !got.known {
 		c.log.Warn("and mirroring has published no position at all",

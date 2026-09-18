@@ -179,10 +179,21 @@ bench('range, 100 documents, from archive', 20, i => c.find({n:{\$gte:(i*7)%($N-
 # archive_wait defaults to 5s as well, so once the checkpoint interval reaches
 # it, some reads give up waiting and answer stale rather than slow. That is the
 # barrier failing quietly, and it is worth counting.
-# grep -c prints 0 and exits 1 when nothing matches, so a `|| echo 0` fallback
-# printed the count and then a second zero underneath it.
-GAVEUP=$(grep -c 'before mirroring caught up' /var/log/cline/bench_r.log 2>/dev/null; true)
-echo "  reads that gave up waiting: ${GAVEUP:-0}"
+# From the counter, not from the log. The warning is rate limited to one line
+# every ten seconds, because a feeder that has fallen behind sends every
+# fall-through read down that path and the log would be the first casualty of
+# the outage it is meant to describe. Counting lines would now undercount by
+# whatever the rate limit swallowed; thermocline_stale_reads_total is exact and
+# is what the alert reads.
+GAVEUP=$(curl -s --max-time 5 "http://127.0.0.1:${PDASH:-27110}/metrics" 2>/dev/null \
+         | awk '/^thermocline_stale_reads_total /{print $2}')
+if [ -z "$GAVEUP" ]; then
+  # Not zero. A scrape that did not answer and a barrier that never fired print
+  # the same 0, and this line exists to report the second one.
+  echo "  reads that gave up waiting: UNKNOWN, the metrics endpoint did not answer"
+else
+  echo "  reads that gave up waiting: $GAVEUP"
+fi
 stopFeeder
 startFeeder
 

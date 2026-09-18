@@ -198,9 +198,11 @@ type Router struct {
 	// counters into a picture of what the fast tier is actually saving.
 	Metrics *Metrics
 
-	// staleSaidAt bounds how often the freshness barrier explains itself, as
-	// unix nanoseconds. See explainStale.
-	staleSaidAt atomic.Int64
+	// staleSaidAt bounds how often the freshness barrier writes to the log, as
+	// unix nanoseconds, and staleSuppressed counts the stale reads that went
+	// unlogged since it last did. See noteStaleRead.
+	staleSaidAt     atomic.Int64
+	staleSuppressed atomic.Int64
 
 	// inv is what each tier is holding, refreshed on a timer.
 	inv     inventoryCache
