@@ -328,8 +328,8 @@ func (c *conn) interceptListDatabases(ctx context.Context, msg *wire.Message, re
 	if err != nil {
 		return reply, nil
 	}
-	listed, err := v.Array().Values()
-	if err != nil {
+	listed, aok := arrayValues(v)
+	if !aok {
 		return reply, nil
 	}
 

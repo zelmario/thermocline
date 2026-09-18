@@ -550,8 +550,8 @@ func stagesJoin(stages []bson.RawValue) bool {
 					return true
 				}
 				for _, f := range fields {
-					inner, ierr := f.Value().Array().Values()
-					if ierr != nil {
+					inner, iok := arrayValues(f.Value())
+					if !iok {
 						return true
 					}
 					if stagesJoin(inner) {

@@ -125,8 +125,8 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 		}
 	case bson.TypeArray:
 		// An aggregation pipeline update.
-		vals, err := u.Array().Values()
-		if err != nil {
+		vals, aok := arrayValues(u)
+		if !aok {
 			return "", false
 		}
 		for _, stage := range vals {

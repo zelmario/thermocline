@@ -147,8 +147,8 @@ func leadsWith(cmd bson.Raw, stages map[string]bool) bool {
 	if err != nil {
 		return false
 	}
-	vals, err := v.Array().Values()
-	if err != nil || len(vals) == 0 {
+	vals, aok := arrayValues(v)
+	if !aok || len(vals) == 0 {
 		return false
 	}
 	stage, ok := vals[0].DocumentOK()

@@ -281,3 +281,75 @@ func TestMatchAfterTheLeadingRunIsNotABound(t *testing.T) {
 		t.Error("a $match behind a $project was read as bounding the scan")
 	}
 }
+
+// A command this proxy cannot read is a command it must not act on. Both of
+// these returned a usable scope before: `pipeline: 5` was read as a pipeline
+// with no stages, and the router answered it with the whole collection where
+// mongod says "'pipeline' option must be specified as an array".
+func TestScopeOfAggregateRefusesAnUnreadablePipeline(t *testing.T) {
+	ageOf := func(string) (string, bool) { return "", false }
+	cases := []struct {
+		name string
+		cmd  bson.D
+		want bool
+	}{
+		{"a pipeline that is a number", bson.D{{Key: "aggregate", Value: "t"}, {Key: "pipeline", Value: 5}}, false},
+		{"a pipeline that is a document", bson.D{{Key: "aggregate", Value: "t"}, {Key: "pipeline", Value: bson.D{{Key: "a", Value: 1}}}}, false},
+		{"a pipeline that is a string", bson.D{{Key: "aggregate", Value: "t"}, {Key: "pipeline", Value: "x"}}, false},
+		{"no pipeline at all", bson.D{{Key: "aggregate", Value: "t"}}, false},
+		{"an empty pipeline", bson.D{{Key: "aggregate", Value: "t"}, {Key: "pipeline", Value: bson.A{}}}, true},
+		{"an ordinary pipeline", bson.D{{Key: "aggregate", Value: "t"},
+			{Key: "pipeline", Value: bson.A{bson.D{{Key: "$match", Value: bson.D{}}}}}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(c.cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := scopeOfAggregate(raw, "db", ageOf); ok != c.want {
+				t.Fatalf("ok=%v, want %v", ok, c.want)
+			}
+		})
+	}
+}
+
+// A writing stage whose destination cannot be read is one mongod refuses at
+// parse time. Performing it instead put mongod's own parse error behind
+// "reading its input from the archive failed", which points at the archive.
+func TestUnreadableWriteStage(t *testing.T) {
+	cases := []struct {
+		name  string
+		stage interface{}
+		want  bool
+	}{
+		{"$merge with a non-array on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: 5}}}}, true},
+		{"$merge with a non-string into", bson.D{{Key: "$merge", Value: bson.D{{Key: "into", Value: 5}}}}, true},
+		{"$merge that is a number", bson.D{{Key: "$merge", Value: 5}}, true},
+		{"$out that is a number", bson.D{{Key: "$out", Value: 5}}, true},
+		{"$merge naming a collection", bson.D{{Key: "$merge", Value: "t"}}, false},
+		{"$merge with a string on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: "_id"}}}}, false},
+		{"$merge with an array on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: bson.A{"_id"}}}}}, false},
+		{"$out naming a collection", bson.D{{Key: "$out", Value: "t"}}, false},
+		{"$out naming both", bson.D{{Key: "$out", Value: bson.D{
+			{Key: "db", Value: "d"}, {Key: "coll", Value: "t"}}}}, false},
+		{"a stage that writes nothing", bson.D{{Key: "$match", Value: bson.D{}}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(bson.D{
+				{Key: "aggregate", Value: "t"},
+				{Key: "pipeline", Value: bson.A{c.stage}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := unreadableWriteStage(raw, "db"); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

@@ -512,8 +512,8 @@ func asksForTTL(cmd bson.Raw, name string) bool {
 	if err != nil {
 		return false
 	}
-	specs, err := v.Array().Values()
-	if err != nil {
+	specs, aok := arrayValues(v)
+	if !aok {
 		return false
 	}
 	for _, spec := range specs {
@@ -729,8 +729,8 @@ func (c *conn) noteIndexDrop(ctx context.Context, cmd bson.Raw, db, coll string)
 			names = append(names, name)
 		}
 	case bson.TypeArray:
-		vals, aerr := v.Array().Values()
-		if aerr != nil {
+		vals, aok := arrayValues(v)
+		if !aok {
 			return
 		}
 		for _, e := range vals {

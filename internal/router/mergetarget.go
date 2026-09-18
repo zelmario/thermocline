@@ -219,7 +219,7 @@ func mergeTarget(v bson.RawValue, db string) (ns string, on []string, ok bool) {
 	if onVal, oerr := doc.LookupErr("on"); oerr == nil {
 		if s, sok := onVal.StringValueOK(); sok {
 			on = []string{s}
-		} else if arr, aerr := onVal.Array().Values(); aerr == nil {
+		} else if arr, aok := arrayValues(onVal); aok {
 			on = on[:0]
 			for _, e := range arr {
 				if s, sok := e.StringValueOK(); sok {
@@ -229,6 +229,15 @@ func mergeTarget(v bson.RawValue, db string) (ns string, on []string, ok bool) {
 			if len(on) == 0 {
 				return "", nil, false
 			}
+		} else {
+			// Present and neither a string nor an array of strings. Falling
+			// through here left `on` at its default of _id, so the router read
+			// a command the client did not send and acted on it: `on: 5` came
+			// back as "E11000 ... the existing document with this key is in the
+			// archive", where mongod says "$merge 'on' field must be either a
+			// string or an array of strings, but found int". Refusing to
+			// understand it forwards the stage and lets mongod say that.
+			return "", nil, false
 		}
 	}
 	return outDB + "." + outColl, on, true

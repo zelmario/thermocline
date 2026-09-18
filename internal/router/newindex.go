@@ -129,8 +129,8 @@ func requestedIndexKeys(cmd bson.Raw) map[string]string {
 	if err != nil {
 		return nil
 	}
-	vals, err := arr.Array().Values()
-	if err != nil {
+	vals, aok := arrayValues(arr)
+	if !aok {
 		return nil
 	}
 	out := map[string]string{}

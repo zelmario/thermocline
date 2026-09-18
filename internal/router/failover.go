@@ -198,8 +198,8 @@ func hasMultiStatement(cmd bson.Raw, name string) bool {
 	if err != nil {
 		return false
 	}
-	vals, err := arr.Array().Values()
-	if err != nil {
+	vals, aok := arrayValues(arr)
+	if !aok {
 		return true
 	}
 	for _, v := range vals {
@@ -224,7 +224,7 @@ func isFailoverReply(doc bson.Raw) bool {
 		return false
 	}
 	if v, err := doc.LookupErr("errorLabels"); err == nil {
-		if vals, aerr := v.Array().Values(); aerr == nil {
+		if vals, aok := arrayValues(v); aok {
 			for _, l := range vals {
 				if s, ok := l.StringValueOK(); ok && s == "RetryableWriteError" {
 					return true

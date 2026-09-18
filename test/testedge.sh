@@ -351,6 +351,60 @@ stopFeeder
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 
+echo "== a command whose field is the wrong type =="
+# Two defects, one shape: a command this proxy could not read, acted on anyway.
+#
+# bson.RawValue.Array panics on anything but an array, so a $merge with `on: 5`,
+# a createIndexes with `indexes: 5` and a killCursors with `cursors: 5` closed
+# the client's connection and counted a panic. thermocline_panics_total is an
+# alerting rule, so a client with a bad query made it fire for a product defect
+# that is not one.
+#
+# The larger one was found by asking mongod the same questions. An aggregate
+# with `pipeline: 5`, which mongod refuses with "'pipeline' option must be
+# specified as an array", was read as a pipeline with no stages and answered by
+# the router with the whole collection. So these check the answer rather than
+# the survival: what comes back has to be what mongod says.
+#
+# The router started at the top outlives every section here, and a second one
+# would fail to bind rather than fail loudly. Started only if it has gone.
+pgrep -f "cline router --config $WDIR/" >/dev/null 2>&1 || startRouter
+EPANIC0=$(curl -s http://127.0.0.1:$PDASH/metrics | awk '/^thermocline_panics_total/ {print $2}')
+# ask WHAT [DB]: run it through the router and through mongod, and print agree
+# when the two answer the same. Every disagreement here was a defect.
+#
+# The control below runs against an untiered collection on purpose. A document
+# just written to a tiered one is on the fast tier and not yet in the archive,
+# and with no feeder running in this section it never will be, so the router
+# answering 0 where the fast tier holds 1 is this system working as documented
+# rather than a disagreement. Asking where both tiers hold the same thing is
+# what makes "still agrees" mean the pipeline was read, not that mirroring won.
+ask() {
+  local via_r via_h edb=${2:-$DB}
+  via_r=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval \
+    "try{var r=db.getSiblingDB('$edb').runCommand($1); print('ok:'+(r.cursor?r.cursor.firstBatch.length:'none'))}catch(e){print(/closed|socket|ECONN/i.test(e.message)?'DROPPED':'err:'+e.message.substring(0,70))}" 2>&1 | tail -1)
+  via_h=$(mongosh "$HOT" --quiet --eval \
+    "try{var r=db.getSiblingDB('$edb').runCommand($1); print('ok:'+(r.cursor?r.cursor.firstBatch.length:'none'))}catch(e){print('err:'+e.message.substring(0,70))}" 2>&1 | tail -1)
+  if [ "$via_r" = "$via_h" ]; then echo "agree"; else echo "router=$via_r mongod=$via_h"; fi
+}
+# One document, in a collection nothing tiers, so both sides see the same one.
+R "db.getSiblingDB(process.env.TC_DB2).edgefree.drop(); db.getSiblingDB(process.env.TC_DB2).edgefree.insertOne({_id:'wrongtype',v:1})" >/dev/null
+chk "an aggregate with a non-array pipeline"     "agree" "$(ask "{aggregate:'$NS',pipeline:5,cursor:{}}")"
+chk "and with the pipeline missing"              "agree" "$(ask "{aggregate:'$NS',cursor:{}}")"
+chk "a \$merge with a non-array on"              "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:'$NS',on:5}}],cursor:{}}")"
+chk "a \$merge with a non-string into"           "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:5}}],cursor:{}}")"
+chk "a \$out with a non-string argument"         "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$out:5}],cursor:{}}")"
+chk "createIndexes with a non-array indexes"     "agree" "$(ask "{createIndexes:'$NS',indexes:5}")"
+chk "killCursors with a non-array cursors"       "agree" "$(ask "{killCursors:'$NS',cursors:5}")"
+# The controls: the fix must not be a wider refusal.
+chk "while an ordinary pipeline still agrees"    "agree" "$(ask "{aggregate:'edgefree',pipeline:[{\$match:{_id:'wrongtype'}}],cursor:{}}" "$DB2")"
+chk "and it really did return the document"      "ok:1" \
+    "$(R "var r=db.getSiblingDB(process.env.TC_DB2).runCommand({aggregate:'edgefree',pipeline:[{\$match:{_id:'wrongtype'}}],cursor:{}}); print('ok:'+r.cursor.firstBatch.length)")"
+chk "and an ordinary \$merge"                    "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$match:{_id:'no-such'}},{\$merge:{into:'$NS',on:'_id'}}],cursor:{}}")"
+chk "and the router counted no panic"            "${EPANIC0:-0}" \
+    "$(curl -s http://127.0.0.1:$PDASH/metrics | awk '/^thermocline_panics_total/ {print $2}')"
+R "db.getSiblingDB(process.env.TC_DB2).edgefree.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

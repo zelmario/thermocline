@@ -343,7 +343,13 @@ func anyStatementUpserts(cmd bson.Raw, field string) bool {
 	if err != nil {
 		return false
 	}
-	vals, err := arr.Array().Values()
+	// ArrayOK, not Array: the field is whatever the client put there, and
+	// .Array() panics on any other type. See arrayValues in the router.
+	raw, isArr := arr.ArrayOK()
+	if !isArr {
+		return false
+	}
+	vals, err := raw.Values()
 	if err != nil {
 		return false
 	}

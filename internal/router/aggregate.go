@@ -70,6 +70,31 @@ type aggScope struct {
 	named map[string]string
 }
 
+// unreadableWriteStage reports whether the pipeline ends in a $merge or $out
+// whose destination this proxy cannot read.
+//
+// Only the last stage, because that is the only place mongod allows either of
+// them, and only the destination: a $merge this router understands well enough
+// to find the target of is one it can decide about.
+func unreadableWriteStage(cmd bson.Raw, db string) bool {
+	stages, ok := pipelineStages(cmd)
+	if !ok || len(stages) == 0 {
+		return false
+	}
+	last := subDoc(stages[len(stages)-1])
+	if v, err := last.LookupErr("$merge"); err == nil {
+		if _, _, ok := mergeTarget(v, db); !ok {
+			return true
+		}
+	}
+	if _, err := last.LookupErr("$out"); err == nil {
+		if _, _, ok := outTarget(last, db); !ok {
+			return true
+		}
+	}
+	return false
+}
+
 // scopeOfAggregate reads an aggregate command into the parts completeness
 // depends on.
 //
@@ -88,15 +113,23 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 
 	pv, err := cmd.LookupErr("pipeline")
 	if err != nil {
-		return s, true
+		// mongod requires it: "BSON field 'aggregate.pipeline' is missing but a
+		// required field". Treating its absence as an empty pipeline had the
+		// router answer with the collection instead.
+		return aggScope{}, false
 	}
 	arr, ok := pv.ArrayOK()
 	if !ok {
-		return s, true
+		// Present and not an array. mongod refuses this with "'pipeline' option
+		// must be specified as an array", and reading it as no stages at all
+		// made the router answer it: `{aggregate: "t", pipeline: 5}` came back
+		// with the whole collection. A command this proxy cannot read is a
+		// command it must not act on, so say so and let mongod answer.
+		return aggScope{}, false
 	}
 	stages, err := arr.Values()
 	if err != nil {
-		return s, true
+		return aggScope{}, false
 	}
 
 	// leading tracks the run of $match stages at the front of the pipeline. A
@@ -291,6 +324,30 @@ func subDoc(val bson.RawValue) bson.Raw {
 	return doc
 }
 
+// arrayValues returns val's elements, or nothing when it is not an array.
+//
+// The point of this is the "not an array" half. bson.RawValue.Array panics on
+// any other type, and the fields this reads are fields a client chooses: a
+// `$merge` with `on: 5`, a `createIndexes` with `indexes: 5`, a `killCursors`
+// with `cursors: 5`. Each of those is a type error mongod answers politely, and
+// each of them closed the client's connection here instead and counted a panic,
+// which is an alerting rule. Four of fourteen probed commands did it.
+//
+// So the rule is that nothing in this proxy calls .Array() on anything a client
+// sent. Calling this instead is what makes that rule enforceable by grep rather
+// than by remembering.
+func arrayValues(val bson.RawValue) ([]bson.RawValue, bool) {
+	arr, ok := val.ArrayOK()
+	if !ok {
+		return nil, false
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return nil, false
+	}
+	return vals, true
+}
+
 // checkAggregate reports why an aggregation cannot be trusted, or ok when it
 // can.
 //
@@ -406,6 +463,19 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 				"caveat", "an event whose announcement cannot be read is passed through rather "+
 					"than dropped, because missing a real delete would be worse than showing an eviction")
 		}
+		return nil, false
+	}
+
+	// A writing stage whose destination cannot be read at all. mongod refuses
+	// these at parse time, so nothing runs whichever way they go, and
+	// forwarding is what gets the client mongod's own words. Performing the
+	// pipeline instead wrapped "$merge 'on' field must be either a string or an
+	// array of strings, but found int" in "reading its input from the archive
+	// failed", which sends an operator to look at a healthy archive.
+	//
+	// Before guardTieredOut, because that is the first thing that decides to
+	// act on a write it has read.
+	if unreadableWriteStage(cmd, db) {
 		return nil, false
 	}
 

@@ -60,8 +60,8 @@ func pipelineWritesOut(cmd bson.Raw) bool {
 	if err != nil {
 		return false
 	}
-	arr, err := val.Array().Values()
-	if err != nil {
+	arr, aok := arrayValues(val)
+	if !aok {
 		// Unreadable means unknown, and unknown goes to the primary.
 		return true
 	}
@@ -213,8 +213,8 @@ func cursorIDFromCommand(msg *wire.Message, name string) (int64, bool) {
 	if lerr != nil {
 		return 0, false
 	}
-	vals, aerr := v.Array().Values()
-	if aerr != nil || len(vals) == 0 {
+	vals, aok := arrayValues(v)
+	if !aok || len(vals) == 0 {
 		return 0, false
 	}
 	id, ok := vals[0].Int64OK()
