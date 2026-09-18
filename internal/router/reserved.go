@@ -1,6 +1,9 @@
 package router
 
 import (
+	"bytes"
+	"strings"
+
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -57,6 +60,68 @@ func reservedTopLevel(doc bson.Raw) (string, bool) {
 	return "", false
 }
 
+// reservedPath reports whether a field path writes a reserved field.
+//
+// A path, not a name. "_tcDeletedAt.x" creates a top level _tcDeletedAt holding
+// a subdocument, and the predicate that hides a tombstone is {$exists: false},
+// so a subdocument hides the document exactly as a date does. Measured: $set of
+// that path was accepted, and the same collection then answered 0 and 1 about
+// one document depending on which tier could answer.
+//
+// The keys of an update operator are paths. The keys of an insert or a
+// replacement are not: {"_tcDeletedAt.x": 1} inserted is one field with a dot
+// in its name, which the predicate does not read. That is why reservedTopLevel
+// stays as it is rather than growing a prefix test.
+func reservedPath(key string) (string, bool) {
+	for _, f := range reservedFieldNames {
+		if key == f || strings.HasPrefix(key, f+".") {
+			return f, true
+		}
+	}
+	return "", false
+}
+
+// reservedCommonPrefix is what every reserved name starts with, as bytes, so a
+// document can be ruled out without being parsed. Computed rather than written
+// down, because the names are meta's to choose.
+var reservedCommonPrefix = func() []byte {
+	if len(reservedFieldNames) == 0 {
+		return nil
+	}
+	p := reservedFieldNames[0]
+	for _, f := range reservedFieldNames[1:] {
+		for !strings.HasPrefix(f, p) {
+			p = p[:len(p)-1]
+		}
+	}
+	return []byte(p)
+}()
+
+// reservedInPaths names a reserved field written by a document whose keys are
+// field paths, which is what an update operator and a $set, $addFields or
+// $project stage carry.
+func reservedInPaths(doc bson.Raw) (string, bool) {
+	// A document that does not contain the names' common prefix anywhere
+	// cannot carry one, and deciding that is a scan of the raw bytes rather
+	// than a parse. Elements() materialises a slice per operator on every
+	// update to a tiered collection: measured, reading the operators by path
+	// instead of by name took BenchmarkReservedInUpdate from 591 ns/op and 7
+	// allocations to 1269 and 15, and this brings it back.
+	if !bytes.Contains(doc, reservedCommonPrefix) {
+		return "", false
+	}
+	elems, err := doc.Elements()
+	if err != nil {
+		return "", false
+	}
+	for _, e := range elems {
+		if f, bad := reservedPath(e.Key()); bad {
+			return f, true
+		}
+	}
+	return "", false
+}
+
 // reservedInUpdate names a reserved field an update would leave on a document.
 //
 // Three shapes, because an update has three. A replacement document is read at
@@ -105,7 +170,10 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 				continue
 			}
 			if d, ok := e.Value().DocumentOK(); ok {
-				if f, bad := reservedTopLevel(d); bad {
+				// Paths, not names: an operator's keys are paths, so
+				// $set of "_tcDeletedAt.x" writes the mark's name at the
+				// top level just as $set of "_tcDeletedAt" does.
+				if f, bad := reservedInPaths(d); bad {
 					return f, true
 				}
 			}
@@ -116,8 +184,12 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 			if d, ok := v.DocumentOK(); ok {
 				if elems, err := d.Elements(); err == nil {
 					for _, e := range elems {
-						if to, ok := e.Value().StringValueOK(); ok && reservedFields[to] {
-							return to, true
+						to, ok := e.Value().StringValueOK()
+						if !ok {
+							continue
+						}
+						if f, bad := reservedPath(to); bad {
+							return f, true
 						}
 					}
 				}
@@ -147,10 +219,31 @@ func reservedInUpdate(u bson.RawValue) (string, bool) {
 // $project is here because it can introduce a field as much as $set can, and
 // $unset is not because in a pipeline it removes one.
 func reservedInStage(sd bson.Raw) (string, bool) {
-	for _, op := range []string{"$set", "$addFields", "$replaceWith", "$replaceRoot", "$project"} {
+	// These name the fields they write, and their keys are paths.
+	for _, op := range []string{"$set", "$addFields", "$project"} {
 		if v, err := sd.LookupErr(op); err == nil {
 			if d, ok := v.DocumentOK(); ok {
-				if f, bad := reservedTopLevel(d); bad {
+				if f, bad := reservedInPaths(d); bad {
+					return f, true
+				}
+			}
+		}
+	}
+	// A replacing stage does not name fields at all: it says what the whole
+	// document becomes, as one expression. $replaceWith takes that expression
+	// directly and $replaceRoot wraps it in newRoot, and both were read at the
+	// same depth, so {$replaceRoot: {newRoot: {_tcDeletedAt: t}}} was looked up
+	// for a reserved key on the wrapper, where the only key is newRoot. The
+	// documented spelling of the stage went straight through.
+	if v, err := sd.LookupErr("$replaceWith"); err == nil {
+		if f, bad := reservedInNewRoot(v); bad {
+			return f, true
+		}
+	}
+	if v, err := sd.LookupErr("$replaceRoot"); err == nil {
+		if d, ok := v.DocumentOK(); ok {
+			if nr, nerr := d.LookupErr("newRoot"); nerr == nil {
+				if f, bad := reservedInNewRoot(nr); bad {
 					return f, true
 				}
 			}
@@ -182,6 +275,74 @@ func reservedInStage(sd bson.Raw) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// reservedInNewRoot names a reserved field the document a replacing stage
+// builds would carry.
+//
+// A literal document shows its keys. $mergeObjects shows the keys of whichever
+// of its arguments are literal, which is how a pipeline adds one field and
+// keeps the rest. $setField is the one expression that writes a field named in
+// a value rather than spelled as a key, the same shape as $rename above.
+//
+// Anything else builds its keys from data: a field path promoting a
+// subdocument, $arrayToObject, a conditional. Those are not read here and are
+// not refused either. It is the same residue as a $merge of documents that
+// already carry the field, and it is in docs/limitations.md for the same
+// reason: refusing every expression that can evaluate to a document would
+// refuse most of the pipelines that legitimately write one.
+func reservedInNewRoot(v bson.RawValue) (string, bool) {
+	d, ok := v.DocumentOK()
+	if !ok {
+		return "", false
+	}
+	elems, err := d.Elements()
+	if err != nil || len(elems) == 0 {
+		return "", false
+	}
+	// A single key beginning with $ is an expression rather than a literal
+	// document. mongod refuses a document that mixes the two, so the first key
+	// settles which this is.
+	if k := elems[0].Key(); len(k) > 0 && k[0] == '$' {
+		arg := elems[0].Value()
+		switch k {
+		case "$mergeObjects":
+			if raw, isArr := arg.ArrayOK(); isArr {
+				vals, verr := raw.Values()
+				if verr != nil {
+					return "", false
+				}
+				for _, a := range vals {
+					if f, bad := reservedInNewRoot(a); bad {
+						return f, true
+					}
+				}
+				return "", false
+			}
+			return reservedInNewRoot(arg)
+		case "$literal":
+			if ld, lok := arg.DocumentOK(); lok {
+				return reservedTopLevel(ld)
+			}
+		case "$setField":
+			sf, sok := arg.DocumentOK()
+			if !sok {
+				return "", false
+			}
+			if fv, ferr := sf.LookupErr("field"); ferr == nil {
+				if name, nok := fv.StringValueOK(); nok && reservedFields[name] {
+					return name, true
+				}
+			}
+			if iv, ierr := sf.LookupErr("input"); ierr == nil {
+				return reservedInNewRoot(iv)
+			}
+		}
+		return "", false
+	}
+	// A literal document. Its keys are names rather than paths, exactly as a
+	// replacement document's are.
+	return reservedTopLevel(d)
 }
 
 // reservedInStages names a reserved field an aggregation pipeline writes.

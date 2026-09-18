@@ -199,6 +199,27 @@ Part of [Thermocline](../README.md).
   tiered collection rather than forwarding the ones the fast tier can answer,
   which is a large cost for a narrow case.
 
+  **A second one has the same shape, one level down.** A replacing stage says
+  what the whole document becomes, as an expression rather than as a list of
+  field names:
+
+  ```
+  {$replaceWith: {$mergeObjects: ["$$ROOT", {_tcDeletedAt: "$$NOW"}]}}   read
+  {$replaceRoot: {newRoot: {_id: "$_id", _tcDeletedAt: "$$NOW"}}}        read
+  {$replaceWith: {$setField: {field: "_tcDeletedAt", input: "$$ROOT", ...}}}  read
+  {$replaceWith: "$sub"}                                                 not read
+  {$replaceWith: {$arrayToObject: "$pairs"}}                             not read
+  ```
+
+  A literal document shows its keys, `$mergeObjects` shows the keys of whichever
+  arguments are literal, and `$setField` names its field in a value. An
+  expression that builds keys from data does not show them to anything but
+  mongod, so a pipeline promoting a subdocument that happens to hold the field,
+  or building one from an array of pairs, goes through. It is the same trade as
+  the `$merge` above: reading the stages is what makes the guard cheap, and
+  refusing every expression that can evaluate to a document would refuse most of
+  the pipelines that legitimately write one.
+
   It is not silent, though, and that is the difference between a path nothing
   covers and a path nothing reports. Measured on exactly that shape, two
   documents carrying the field merged in from an untiered collection: the router

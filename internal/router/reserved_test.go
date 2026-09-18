@@ -68,9 +68,25 @@ func TestReservedInUpdate(t *testing.T) {
 		{"$unset of it", bson.D{{Key: "$unset", Value: bson.D{{Key: "_tcDeletedAt", Value: ""}}}}, false},
 		{"an ordinary $set", bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: "shipped"}}}}, false},
 		{"an ordinary $inc", bson.D{{Key: "$inc", Value: bson.D{{Key: "n", Value: 1}}}}, false},
+		// An operator's keys are paths, so a dotted one writes the mark's own
+		// name at the top level: {"_tcDeletedAt.x": 1} makes _tcDeletedAt a
+		// subdocument, and the predicate that hides a tombstone is
+		// {$exists: false}, which a subdocument satisfies as well as a date.
+		{"$set of a path under it", bson.D{{Key: "$set", Value: bson.D{{Key: "_tcDeletedAt.x", Value: 1}}}}, true},
+		{"$inc of a path under it", bson.D{{Key: "$inc", Value: bson.D{{Key: "_tcDeletedAt.n", Value: 1}}}}, true},
+		{"$rename onto a path under it", bson.D{{Key: "$rename", Value: bson.D{{Key: "v", Value: "_tcDeletedAt.x"}}}}, true},
+		{"$unset of a path under it", bson.D{{Key: "$unset", Value: bson.D{{Key: "_tcDeletedAt.x", Value: ""}}}}, false},
+		// The prefix has to be the whole first path component, or an ordinary
+		// field whose name starts with the same letters is refused.
+		{"a field merely starting the same", bson.D{{Key: "$set", Value: bson.D{{Key: "_tcDeletedAtX", Value: 1}}}}, false},
+		{"an ordinary dotted path", bson.D{{Key: "$set", Value: bson.D{{Key: "meta.x", Value: 1}}}}, false},
 		// A replacement document is read at its top level, like an insert.
 		{"a replacement carrying it", bson.D{{Key: "_id", Value: 1}, {Key: "_tcDeletedAt", Value: now}}, true},
 		{"an ordinary replacement", bson.D{{Key: "_id", Value: 1}, {Key: "n", Value: 2}}, false},
+		// An insert's and a replacement's keys are names, not paths: mongod
+		// stores this as one field with a dot in its name, which the predicate
+		// does not read. Refusing it would be this proxy inventing a rule.
+		{"a replacement with a dotted name", bson.D{{Key: "_id", Value: 1}, {Key: "_tcDeletedAt.x", Value: 1}}, false},
 	}
 	for _, c := range cases {
 		u := bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw(t, c.u)}
@@ -112,6 +128,49 @@ func TestReservedInPipeline(t *testing.T) {
 		{"a later stage carrying it", stages(
 			bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: 1}}}},
 			bson.D{{Key: "$set", Value: bson.D{{Key: "_tcDeletedAt", Value: now}}}}), true},
+		// A replacing stage says what the whole document becomes, so it writes
+		// the field as surely as $set does. The two spellings take their
+		// argument at different depths: $replaceWith takes the document, and
+		// $replaceRoot wraps it in newRoot.
+		{"a pipeline $replaceWith of it", stages(
+			bson.D{{Key: "$replaceWith", Value: bson.D{
+				{Key: "_id", Value: "$_id"},
+				{Key: "_tcDeletedAt", Value: now}}}}), true},
+		{"a pipeline $replaceRoot of it", stages(
+			bson.D{{Key: "$replaceRoot", Value: bson.D{{Key: "newRoot", Value: bson.D{
+				{Key: "_id", Value: "$_id"},
+				{Key: "_tcDeletedAt", Value: now}}}}}}), true},
+		{"an ordinary $replaceRoot", stages(
+			bson.D{{Key: "$replaceRoot", Value: bson.D{{Key: "newRoot", Value: bson.D{
+				{Key: "_id", Value: "$_id"},
+				{Key: "seen", Value: 1}}}}}}), false},
+		// newRoot need not be a literal document: an expression that evaluates
+		// to one is the documented form, and $mergeObjects is how a pipeline
+		// adds a field while keeping the rest.
+		// $setField names the field it writes in a value rather than as a key,
+		// which is the $rename shape again one level down.
+		{"a $replaceWith setting the field by name", stages(
+			bson.D{{Key: "$replaceWith", Value: bson.D{
+				{Key: "$setField", Value: bson.D{
+					{Key: "field", Value: "_tcDeletedAt"},
+					{Key: "input", Value: "$$ROOT"},
+					{Key: "value", Value: now}}}}}}), true},
+		{"a $replaceWith setting an ordinary field", stages(
+			bson.D{{Key: "$replaceWith", Value: bson.D{
+				{Key: "$setField", Value: bson.D{
+					{Key: "field", Value: "seen"},
+					{Key: "input", Value: "$$ROOT"},
+					{Key: "value", Value: 1}}}}}}), false},
+		// An expression whose keys come from data is not read, and not refused
+		// either. This pins the residue that docs/limitations.md names, so
+		// changing it is a decision rather than an accident.
+		{"a $replaceWith of a field path is not read", stages(
+			bson.D{{Key: "$replaceWith", Value: "$sub"}}), false},
+		{"a $replaceRoot merging it in", stages(
+			bson.D{{Key: "$replaceRoot", Value: bson.D{{Key: "newRoot", Value: bson.D{
+				{Key: "$mergeObjects", Value: bson.A{
+					"$$ROOT",
+					bson.D{{Key: "_tcDeletedAt", Value: now}}}}}}}}}), true},
 	}
 	for _, c := range cases {
 		got, bad := reservedInUpdate(c.v)

@@ -59,3 +59,25 @@ func BenchmarkReservedInUpdate(b *testing.B) {
 		}
 	}
 }
+
+// The other side of the pre-filter: an update whose bytes do contain the names'
+// common prefix pays the parse. Ordinary traffic does not look like this, which
+// is why the benchmark above is the one to watch, but a change that makes this
+// path expensive should be visible rather than reasoned about.
+func BenchmarkReservedInUpdateWithThePrefix(b *testing.B) {
+	raw, err := bson.Marshal(bson.D{
+		{Key: "$set", Value: bson.D{{Key: "_tcatalog", Value: "shipped"}, {Key: "shippedAt", Value: time.Now()}}},
+		{Key: "$inc", Value: bson.D{{Key: "version", Value: 1}}},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	u := bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, bad := reservedInUpdate(u); bad {
+			b.Fatal("this update carries no reserved field")
+		}
+	}
+}
