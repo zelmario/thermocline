@@ -969,9 +969,13 @@ Part of [Thermocline](../README.md).
   **What the runs here actually recorded**, because this paragraph claimed they
   recorded none and one of them did not. The 691-round pilot soak: none. The
   four-hour two-application run of 2026-09-17: **31**, all inside one second,
-  with 0 violations, written up in the commit that recorded that run. A second
-  four-hour run on 2026-09-18 recorded 75 in its first twenty minutes and nine
-  violations of read-your-own-writes.
+  with 0 violations, written up in the commit that recorded that run. The
+  four-hour run of 2026-09-18, complete: **86**, and **nine** violations of
+  read-your-own-writes, every one of them at a single instant twenty minutes in.
+  Across the remaining three hours and fifty minutes, 1.1 million further
+  operations produced none of either. Both bursts land in windows when this host
+  was also running builds, benchmarks and mutation tests, which is item 4 of
+  `docs/production-readiness.md` and not a property of the product.
 
   **And the bar a fall-through read waits on is raised by traffic that has
   nothing to do with the tiered collections.** A read clears two bars, and the
