@@ -215,24 +215,42 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	// In seconds of cluster time, so it is comparable with the gauge above
 	// rather than being a packed timestamp nobody can read. Zero is the healthy
 	// value and the one to alert on, the same as its neighbour.
-	if seen := r.seenOpTime.Load(); seen != 0 && r.cfg.FeederID != "" {
-		// Cached only. A scrape must not fetch here: mirroredThrough publishes
-		// what it fetches into the cache the freshness barrier reads, so a
-		// scrape that could not reach the archive would leave "nothing is
-		// mirroring" behind and make the next fall-through read answer stale.
-		// Reporting a state must not cause it.
-		if got, ok := r.mirroredThroughCached(); ok && got.known && got.ts.T != 0 {
+	// Always, when a feeder is configured, because an alert names it and a rule
+	// whose metric is sometimes absent never fires. That is the failure
+	// testalerts exists to catch, and it caught this one: rendering it only
+	// when a reading happened to be cached meant a router serving no
+	// fall-through reads exported nothing for it at all.
+	//
+	// Three states, each with an honest value rather than a convenient one.
+	if r.cfg.FeederID != "" {
+		behindHelp := "Seconds of cluster time the feeder's published position has not yet " +
+			"covered, against the newest operationTime this router has handed a client. This is " +
+			"the bar a fall-through read actually has to clear, and stale_reads_total rises when " +
+			"it does not. Zero is healthy. +Inf means nothing has been mirrored at all, the same " +
+			"as its neighbour above."
+		seen := r.seenOpTime.Load()
+		// Cached only. A scrape must not fetch: mirroredThrough publishes what
+		// it fetches into the cache the freshness barrier reads, so a scrape
+		// that could not reach the archive would leave "nothing is mirroring"
+		// behind and make the next fall-through read answer stale. Reporting a
+		// state must not cause it.
+		got, haveReading := r.mirroredThroughCached()
+		switch {
+		case seen == 0:
+			// This router has forwarded no reply, so it holds no cluster time
+			// to clear and the bar cannot fail. caughtUp says the same: an
+			// untilTS of zero passes. Zero is the fact, not a stand-in for one.
+			gauge("mirroring_cluster_time_behind_seconds", behindHelp, 0)
+		case !haveReading || !got.known || got.ts.T == 0:
+			gauge("mirroring_cluster_time_behind_seconds", behindHelp, math.Inf(1))
+		default:
 			// Through UnpackTS rather than shifting here, so this does not have
 			// to know how a cluster time is packed.
 			behind := float64(0)
 			if seenT := checkpoint.UnpackTS(seen).T; seenT > got.ts.T {
 				behind = float64(seenT - got.ts.T)
 			}
-			gauge("mirroring_cluster_time_behind_seconds",
-				"Seconds of cluster time the feeder's published position has not yet covered, "+
-					"against the newest operationTime this router has handed a client. This is the "+
-					"bar a fall-through read actually has to clear, and stale_reads_total rises "+
-					"when it does not. Zero is healthy.", behind)
+			gauge("mirroring_cluster_time_behind_seconds", behindHelp, behind)
 		}
 	}
 
