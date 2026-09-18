@@ -456,6 +456,13 @@ func pinnedValue(v bson.RawValue) (bson.RawValue, bool) {
 	// So do $in and $all with exactly one value, which is the pair this missed.
 	// More than one pins nothing, and a regex pins nothing even alone: measured,
 	// mongod leaves the field out of the document for both.
+	// Whatever else is in the clause. Restricting this to a clause with nothing
+	// else in it looked like the safe reading and is the wrong one: measured,
+	// {f: {$in: [v], $ne: v}} creates f holding v, and so does
+	// {f: {$all: [v], $gt: "a"}}. mongod builds the document from the equality
+	// clauses and does not care that the result would not match the filter it
+	// came from. Reading only the lone form would leave the key unclaimed,
+	// which is the direction that admits a cross-tier duplicate.
 	for _, op := range []string{"$in", "$all"} {
 		av, aerr := doc.LookupErr(op)
 		if aerr != nil {

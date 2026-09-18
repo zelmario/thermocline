@@ -53,6 +53,16 @@ func TestEqualityInFilterMatchesWhatMongodCarries(t *testing.T) {
 		{"$or with two clauses", bson.D{{Key: "$or", Value: bson.A{
 			bson.D{{Key: "email", Value: "p@x"}}, bson.D{{Key: "email", Value: "q@x"}}}}}, false},
 		{"the field is absent", bson.D{{Key: "k", Value: 1}}, false},
+		// A clause carrying more than the $in still pins it. This looked like
+		// it should not, and was written here as false on that reasoning until
+		// it was run: mongod creates email holding "r@x" for the first of these
+		// even though the document it creates does not match the filter it came
+		// from, and "s@x" for the second. Reading only the lone form would
+		// leave the key unclaimed.
+		{"$in beside a $ne", bson.D{{Key: "email", Value: bson.D{
+			{Key: "$in", Value: bson.A{"r@x"}}, {Key: "$ne", Value: "r@x"}}}}, true},
+		{"$all beside a $gt", bson.D{{Key: "email", Value: bson.D{
+			{Key: "$all", Value: bson.A{"s@x"}}, {Key: "$gt", Value: "a"}}}}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
