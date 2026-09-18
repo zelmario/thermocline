@@ -337,6 +337,15 @@ pkill -f "cline feeder --config $WDIR/fresh_pos" 2>/dev/null
 for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
 # stopDaemons above took the router with it, and the section below reads through
 # it. Leaving it down made a fixture failure look like a refused query.
+#
+# The log goes with it, while nothing holds it open, the same way the sections
+# further down do it. Without this the check below greps a file that has been
+# accumulating since setup, so an earlier section's stale read satisfies it and
+# it cannot fail on its own account: it would report PASS for a barrier that
+# never fired here at all. Removing it with a router running would be worse than
+# not removing it, because the router keeps writing to the unlinked file and the
+# grep then finds nothing whatever happens.
+rm -f $LOGDIR/fresh_r.log
 startFeeder
 startRouter
 
