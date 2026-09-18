@@ -407,6 +407,9 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 	c.explainStale(ctx, started)
 }
 
+// explainEvery bounds how often the line below is written. See explainStale.
+const explainEvery = 10 * time.Second
+
 // explainStale says which of the two bars the wait gave up on.
 //
 // The warning above says "waited 5s" and nothing else, which leaves an operator
@@ -427,6 +430,16 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 // worth seeing: it says the wait ended a moment early rather than the feeder
 // being stopped.
 func (c *conn) explainStale(ctx context.Context, started time.Time) {
+	// Once every explainEvery, for the whole router. The warning above already
+	// fires per stale read, and this one would double it: eleven in a second is
+	// twenty-two lines, and a feeder that has stopped puts every fall-through
+	// read down this path, which is a flood at exactly the moment the log has
+	// to stay readable. One line carries the same diagnosis as a hundred.
+	now := time.Now().UnixNano()
+	last := c.r.staleSaidAt.Load()
+	if now-last < int64(explainEvery) || !c.r.staleSaidAt.CompareAndSwap(last, now) {
+		return
+	}
 	got := c.r.mirroredThrough(ctx)
 	if !got.known {
 		c.log.Warn("and mirroring has published no position at all",
