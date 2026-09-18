@@ -962,11 +962,25 @@ Part of [Thermocline](../README.md).
   very recently deleted document.
 
   It is counted and it pages. `thermocline_stale_reads_total` above zero is a
-  page-level rule in `docs/monitoring.md`, because in a healthy deployment this
-  is zero: the four-hour two-application run and the 691-round pilot soak each
-  recorded none. A deployment seeing them has a feeder that cannot keep up, and
-  the answer is to fix that rather than to raise `archive_wait`, which only
-  trades the stale answer for a slow one.
+  page-level rule in `docs/monitoring.md`. A deployment seeing them has a feeder
+  that cannot keep up, and the answer is to fix that rather than to raise
+  `archive_wait`, which only trades the stale answer for a slow one.
+
+  **What the runs here actually recorded**, because this paragraph claimed they
+  recorded none and one of them did not. The 691-round pilot soak: none. The
+  four-hour two-application run of 2026-09-17: **31**, all inside one second,
+  with 0 violations, written up in the commit that recorded that run. A second
+  four-hour run on 2026-09-18 recorded 75 in its first twenty minutes and nine
+  violations of read-your-own-writes.
+
+  Neither figure was measured on a quiet machine. Both runs shared this host
+  with builds, benchmarks and test loops, and the 2026-09-17 commit says in as
+  many words that interference from the system under test cannot be ruled out
+  here. So the honest statement is the narrow one: **zero is the target and the
+  alert threshold, and it has not yet been demonstrated over four hours on a
+  machine doing nothing else.** Item 4 of `docs/production-readiness.md` is that
+  measurement, and until it is made this limitation is bounded by
+  `archive_wait` and by the counter, not by evidence that it stays at zero.
 
 - **Two daemons on hosts whose clocks differ are corrected, not required to
   agree.** Several things here are decided by comparing instants read on
