@@ -182,6 +182,29 @@ if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
       "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:27114/api/snapshot" 2>/dev/null \
           | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)["counters"]["claim_grace_reads"] > 0 else "false")' 2>/dev/null | tail -1)"
 
+  # The metrics endpoint, in the one state it most has to answer in.
+  #
+  # Two of its gauges read the archive, and it used to run on the scrape's own
+  # context with no bound: the driver waits out server selection, thirty seconds
+  # by default, which is longer than Prometheus's ten second scrape timeout. The
+  # scrape then fails and every metric on this router is lost, panics_total and
+  # stale_reads_total with them. The sharpest part is which one it loses:
+  # mirroring_lag_seconds renders +Inf for exactly this state, and reaching the
+  # archive to find that out is what hung the scrape.
+  #
+  # This is the only place that can test it, for the same reason the insert
+  # above is: the outage has to happen to a router that is already running.
+  MT0=$(date +%s%N)
+  MOUT=$(docker exec $NODE sh -c "curl -s --max-time 20 http://127.0.0.1:27114/metrics" 2>/dev/null)
+  MT1=$(date +%s%N); MMS=$(( (MT1-MT0)/1000000 ))
+  echo "  a metrics scrape during the outage took ${MMS}ms"
+  chk "metrics still answer while the archive is down" "true" \
+      "$(printf '%s' "$MOUT" | grep -q '^thermocline_panics_total ' && echo true || echo false)"
+  chk "inside a Prometheus scrape timeout"            "true" \
+      "$([ "${MMS:-99999}" -lt 9000 ] && echo true || echo false)"
+  chk "and mirroring lag says +Inf rather than nothing" "true" \
+      "$(printf '%s' "$MOUT" | grep -q '^thermocline_mirroring_lag_seconds +Inf' && echo true || echo false)"
+
   # What the grace must not cover, which is how the split between reads and
   # writes was found. A grace that covered everything let an insert through:
   # the archive's duplicate check is skipped when the fast tier claims all of
