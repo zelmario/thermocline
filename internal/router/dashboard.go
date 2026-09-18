@@ -154,6 +154,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"secondary_reads_moved": r.Stats.SecondaryReadsMoved.Load(),
 			"failover_replays":      r.Stats.FailoverReplays.Load(),
 			"unreadable":            r.Stats.Unreadable.Load(),
+			"events_hidden":         r.Stats.EventsHidden.Load(),
 			"stale_reads":           r.Stats.StaleReads.Load(),
 			"claim_grace_reads":     r.Stats.ClaimGraceReads.Load(),
 			"clients_open":          r.Stats.ClientsOpen.Load(),

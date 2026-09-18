@@ -274,3 +274,43 @@ func TestClockSkewFromEveryDaemonLandsInOneFamily(t *testing.T) {
 		t.Errorf("wrote a family with no readings in it:\n%s", empty.String())
 	}
 }
+
+// Every counter the snapshot carries has to reach the export.
+//
+// The list above is hand written, and a hand written list is how three of these
+// went missing: commands, newest_first and warmed_for_txn were readable from
+// the dashboard alone, and events_hidden was counted in two places and read in
+// none. An alert cannot be written against a page somebody has to open, and it
+// certainly cannot be written against a field nothing reads.
+//
+// So this asks the question mechanically instead. A counter that genuinely does
+// not belong in the export has to be named here, which makes leaving it out a
+// decision somebody wrote down rather than an omission.
+func TestEveryCounterInTheSnapshotIsExported(t *testing.T) {
+	r := &Router{
+		cfg:     config.RouterConfig{Completeness: config.Archive},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics: NewMetrics(metricsWindow),
+		started: time.Now(),
+	}
+
+	var b strings.Builder
+	r.writeMetrics(context.Background(), &b)
+	out := b.String()
+
+	// Deliberately not exported, with the reason.
+	skip := map[string]string{}
+
+	for k := range r.SnapshotAll().Counters {
+		if why, ok := skip[k]; ok {
+			t.Logf("%s is not exported on purpose: %s", k, why)
+			continue
+		}
+		// A counter carries the _total suffix, a gauge does not.
+		if strings.Contains(out, "\nthermocline_"+k+"_total ") ||
+			strings.Contains(out, "\nthermocline_"+k+" ") {
+			continue
+		}
+		t.Errorf("the snapshot counts %q and the export does not carry it", k)
+	}
+}

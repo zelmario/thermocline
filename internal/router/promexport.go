@@ -48,6 +48,12 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		fmt.Fprintf(b, "thermocline_%s %s\n", name, strconv.FormatFloat(value, 'f', -1, 64))
 	}
 
+	// On the dashboard alone until now, which means no alert could be written
+	// against them. commands_total above all: it is the denominator that turns
+	// every other counter here into a rate.
+	counter("commands_total", "Client commands the router handled.", snap.Counters["commands"])
+	counter("newest_first_total", "Reads for the newest N the fast tier proved it could answer from its own reply. Each one is an archive round trip that did not happen.", snap.Counters["newest_first"])
+	counter("warmed_for_txn_total", "Documents brought up so a transaction could run against the fast tier alone.", snap.Counters["warmed_for_txn"])
 	counter("read_misses_total", "Point lookups that found the document only in the archive.", snap.Counters["read_misses"])
 	counter("write_misses_total", "Writes that matched nothing on the fast tier and found the document in the archive.", snap.Counters["write_misses"])
 	counter("copied_up_total", "Documents brought back from the archive into the fast tier.", snap.Counters["copied_up"])
@@ -56,7 +62,8 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("refused_total", "Commands the router would not answer.", snap.Counters["refused"])
 	counter("txn_replays_total", "Transactions asked to replay after documents were brought up for them.", snap.Counters["txn_replays"])
 	counter("duplicate_keys_total", "Writes refused because they would duplicate a key held in the archive.", snap.Counters["duplicate_keys"])
-	counter("change_streams_total", "Change streams opened on tiered collections. These report evictions as deletes and copy-ups as inserts.", snap.Counters["change_streams"])
+	counter("change_streams_total", "Change streams opened over tiered data, on a collection, a database or the whole deployment. Tiering events are hidden from these; a consumer further behind than the notice TTL is shown an eviction as a delete and a copy-up as an insert, because the record naming them has expired.", snap.Counters["change_streams"])
+	counter("events_hidden_total", "Tiering events removed from change stream batches. This is the sieve working; read it against change_streams_total, and a stream open with this flat while documents move is worth investigating.", snap.Counters["events_hidden"])
 	counter("unauthorized_total", "Archive answers refused because the fast tier would not have served this client. Any value above zero is a client reading a collection it has no permission for.", snap.Counters["unauthorized"])
 	counter("secondary_reads_total", "Reads that asked for a secondary and were sent to one. With primary_only_reads_total this says how much read load actually moved.", snap.Counters["secondary_reads"])
 	counter("secondary_reads_moved_total", "Reads a secondary refused as neither primary nor secondary, which the primary then answered. Above zero means a member is in the set but not readable.", snap.Counters["secondary_reads_moved"])
