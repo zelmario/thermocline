@@ -64,3 +64,51 @@ func TestEqualityInFilterMatchesWhatMongodCarries(t *testing.T) {
 		})
 	}
 }
+
+// A unique index on a nested field is pinned by four spellings, and mongod
+// creates the field and indexes it for all four. Measured against 8.0 with an
+// index on meta.email: every one of these upserts produced
+// {meta: {email: ...}} and the index held it.
+//
+// Two of them name the path and two name the subdocument, and the reader only
+// ever looked for a literal dotted key. An upsert taking a key by the other two
+// creates the document with nothing claimed, which is the cross-tier duplicate
+// the registry exists to refuse.
+func TestEqualityInFilterFindsNestedFields(t *testing.T) {
+	raw := func(d bson.D) bson.Raw {
+		b, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+	cases := []struct {
+		name   string
+		filter bson.D
+		want   bool
+	}{
+		{"dotted path", bson.D{{Key: "meta.email", Value: "a@x"}}, true},
+		{"subdocument", bson.D{{Key: "meta", Value: bson.D{{Key: "email", Value: "b@x"}}}}, true},
+		{"subdocument via $eq", bson.D{{Key: "meta", Value: bson.D{
+			{Key: "$eq", Value: bson.D{{Key: "email", Value: "c@x"}}}}}}, true},
+		{"dotted path inside $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "meta.email", Value: "d@x"}}, bson.D{{Key: "k", Value: 1}}}}}, true},
+		{"subdocument inside $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "meta", Value: bson.D{{Key: "email", Value: "e@x"}}}}}}}, true},
+
+		// Controls: these pin nothing, and refusing them would be the registry
+		// claiming a key the upsert will not write.
+		{"a range on the parent", bson.D{{Key: "meta", Value: bson.D{
+			{Key: "$gt", Value: bson.D{{Key: "email", Value: "f@x"}}}}}}, false},
+		{"a sibling field only", bson.D{{Key: "meta", Value: bson.D{{Key: "other", Value: 1}}}}, false},
+		{"the parent absent", bson.D{{Key: "k", Value: 1}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, got := equalityInFilter(raw(c.filter), "meta.email")
+			if got != c.want {
+				t.Errorf("equalityInFilter = %v, want %v", got, c.want)
+			}
+		})
+	}
+}

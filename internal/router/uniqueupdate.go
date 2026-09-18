@@ -384,6 +384,32 @@ func equalityInFilterAt(filter bson.Raw, field string, depth int) (bson.RawValue
 	if v, err := filter.LookupErr(field); err == nil {
 		return pinnedValue(v)
 	}
+	// A nested field is pinned by naming the path or by naming the subdocument,
+	// and mongod creates and indexes it either way. Measured against 8.0 with a
+	// unique index on meta.email: {"meta.email": v}, {meta: {email: v}} and
+	// {meta: {$eq: {email: v}}} all upserted a document the index held. Only the
+	// first was being read, so an upsert taking a nested key by one of the other
+	// two created the document with nothing claimed.
+	for at := 0; at < len(field); at++ {
+		if field[at] != '.' {
+			continue
+		}
+		v, err := filter.LookupErr(field[:at])
+		if err != nil {
+			continue
+		}
+		inner, pinned := pinnedValue(v)
+		if !pinned {
+			continue
+		}
+		doc, isDoc := inner.DocumentOK()
+		if !isDoc {
+			continue
+		}
+		if eq, found := equalityInFilterAt(doc, field[at+1:], depth+1); found {
+			return eq, true
+		}
+	}
 	// $and applies every clause, so an equality in any of them reaches the
 	// document. $or applies one of them, so it pins only when there is one.
 	for _, op := range []string{"$and", "$or"} {
