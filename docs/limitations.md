@@ -982,6 +982,13 @@ Part of [Thermocline](../README.md).
   databases nothing tiers. The feeder's position advances only when it processes
   an event for a namespace it mirrors.
 
+  That property is measured, not assumed. A `find` against a database nothing
+  was writing, on the fast tier of the 2026-09-18 run, reported `operationTime`
+  `t=1789753961` and three seconds later `t=1789753964`: three seconds of
+  cluster time advanced by two other databases' writes, on a collection that had
+  not changed. On a busy cluster this bar is therefore always close to "now",
+  and the feeder has to be at the head of the oplog to clear it.
+
   So a fast tier shared with unrelated write traffic pushes that bar ahead
   continuously, and a fall-through read then waits for mirrored traffic to carry
   the feeder past it. With steady mirrored writes that takes milliseconds. With
@@ -989,10 +996,12 @@ Part of [Thermocline](../README.md).
   and the read is answered stale while the feeder is perfectly healthy.
 
   What is measured and what is inferred, kept apart: the eleven stale reads of
-  2026-09-18 are measured, and so is `mirroring_lag_seconds` reading 24ms three
-  seconds before them and 14ms five seconds after, sampled every five seconds
-  throughout. That the cluster-time bar was the one that failed follows from the
-  code rather than from a reading, because nothing exported it at the time.
+  2026-09-18 are measured, `mirroring_lag_seconds` reading 24ms three seconds
+  before them and 14ms five seconds after is measured, and `operationTime`
+  advancing on an untouched database is measured. What remains inferred is only
+  that the cluster-time bar is the one that failed on that occasion, which
+  follows from the code rather than from a reading, because nothing exported it
+  at the time.
   `thermocline_mirroring_cluster_time_behind_seconds` and the router's
   "which bar the freshness wait gave up on" line exist to settle it the next
   time it happens, and until one of them has caught an event this paragraph is a
