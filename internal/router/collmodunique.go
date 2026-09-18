@@ -41,13 +41,8 @@ func (c *conn) guardCollModUnique(ctx context.Context, msg *wire.Message, cmd bs
 	if !c.r.cfg.Manages(ns) {
 		return nil, false
 	}
-	spec, ok := cmd.Lookup("index").DocumentOK()
-	if !ok {
-		return nil, false
-	}
-	if u, err := spec.LookupErr("unique"); err != nil {
-		return nil, false
-	} else if b, bok := u.BooleanOK(); !bok || !b {
+	spec, asks := collModAsksUnique(cmd)
+	if !asks {
 		return nil, false
 	}
 
@@ -59,6 +54,27 @@ func (c *conn) guardCollModUnique(ctx context.Context, msg *wire.Message, cmd bs
 		return nil, false
 	}
 	return c.claimForUniqueIndex(ctx, msg, ns, []uniqueIndex{idx})
+}
+
+// collModAsksUnique reports whether this collMod turns an index unique, and
+// returns the `index` document that says so.
+//
+// unique: false is not this. Taking a constraint away needs no claim, and the
+// registry's rows are about values rather than about the index that made them
+// interesting.
+func collModAsksUnique(cmd bson.Raw) (bson.Raw, bool) {
+	spec, ok := cmd.Lookup("index").DocumentOK()
+	if !ok {
+		return nil, false
+	}
+	u, err := spec.LookupErr("unique")
+	if err != nil {
+		return nil, false
+	}
+	if b, bok := u.BooleanOK(); !bok || !b {
+		return nil, false
+	}
+	return spec, true
 }
 
 // indexNamedBy finds the index a collMod's `index` document refers to, by name

@@ -1049,6 +1049,22 @@ func simpleReadCollection(cmd bson.Raw, name string) (string, bool) {
 
 // guardSimpleRead completeness-checks count and distinct, and answers them from
 // the archive when the fast tier cannot.
+// unreadableQuery reports whether a count or distinct carries a query this
+// proxy cannot read.
+//
+// Absent is not unreadable: a count with no query counts everything, which is a
+// question this path answers. Present and not a document is a command mongod
+// refuses, and reading it as no query at all had the router answer it from the
+// archive unbounded.
+func unreadableQuery(cmd bson.Raw) bool {
+	v, err := cmd.LookupErr("query")
+	if err != nil {
+		return false
+	}
+	_, isDoc := v.DocumentOK()
+	return !isDoc
+}
+
 func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name string) (*wire.Message, bool) {
 	cmd, err := msg.CommandDoc()
 	if err != nil {
@@ -1065,10 +1081,8 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	// concerned, so both were answered from the archive unbounded. Forwarded,
 	// mongod says what is wrong with it. See unreadableWriteStage for the same
 	// rule on the writing side.
-	if v, qerr := cmd.LookupErr("query"); qerr == nil {
-		if _, isDoc := v.DocumentOK(); !isDoc {
-			return nil, false
-		}
+	if unreadableQuery(cmd) {
+		return nil, false
 	}
 	ns := db + "." + coll
 	base, viaView, tiered := c.r.tieredBase(ctx, ns)
