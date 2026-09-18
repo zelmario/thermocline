@@ -1007,6 +1007,20 @@ Part of [Thermocline](../README.md).
   time it happens, and until one of them has caught an event this paragraph is a
   mechanism and not a diagnosis.
 
+  **What could be done about it, and why it is not done here.** The bar could be
+  narrowed to the newest `operationTime` seen on replies for *tiered*
+  namespaces, which is all a fall-through read of a tiered collection actually
+  has to cover. That would stop a busy neighbour holding the barrier up.
+
+  It costs something real, though, and the cost is only visible once you ask
+  what the present bar covers by accident. Because `operationTime` is
+  cluster-wide, today's bar also covers a write made **straight to mongod**,
+  bypassing the router: the feeder mirrors it, and a fall-through read waits for
+  that too. Narrowing to tiered replies gives that up, and a cutover with both
+  kinds of writer in flight is exactly when somebody would notice. So this is a
+  decision about which of two guarantees matters more on a shared cluster, not a
+  defect to be fixed quietly, and it is written here rather than made.
+
   Neither figure was measured on a quiet machine. Both runs shared this host
   with builds, benchmarks and test loops, and the 2026-09-17 commit says in as
   many words that interference from the system under test cannot be ruled out
