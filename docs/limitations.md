@@ -973,6 +973,31 @@ Part of [Thermocline](../README.md).
   four-hour run on 2026-09-18 recorded 75 in its first twenty minutes and nine
   violations of read-your-own-writes.
 
+  **And the bar a fall-through read waits on is raised by traffic that has
+  nothing to do with the tiered collections.** A read clears two bars, and the
+  binding one compares the feeder's published cluster time against the newest
+  `operationTime` this router has handed a client. `operationTime` on a reply is
+  the node's own latest logical time, not that command's position, so it
+  advances with *any* write anywhere on the fast tier cluster, including to
+  databases nothing tiers. The feeder's position advances only when it processes
+  an event for a namespace it mirrors.
+
+  So a fast tier shared with unrelated write traffic pushes that bar ahead
+  continuously, and a fall-through read then waits for mirrored traffic to carry
+  the feeder past it. With steady mirrored writes that takes milliseconds. With
+  sparse mirrored writes beside a busy neighbour it can reach `archive_wait`,
+  and the read is answered stale while the feeder is perfectly healthy.
+
+  What is measured and what is inferred, kept apart: the eleven stale reads of
+  2026-09-18 are measured, and so is `mirroring_lag_seconds` reading 24ms three
+  seconds before them and 14ms five seconds after, sampled every five seconds
+  throughout. That the cluster-time bar was the one that failed follows from the
+  code rather than from a reading, because nothing exported it at the time.
+  `thermocline_mirroring_cluster_time_behind_seconds` and the router's
+  "which bar the freshness wait gave up on" line exist to settle it the next
+  time it happens, and until one of them has caught an event this paragraph is a
+  mechanism and not a diagnosis.
+
   Neither figure was measured on a quiet machine. Both runs shared this host
   with builds, benchmarks and test loops, and the 2026-09-17 commit says in as
   many words that interference from the system under test cannot be ruled out
