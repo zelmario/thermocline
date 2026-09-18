@@ -222,9 +222,15 @@ func mergeTarget(v bson.RawValue, db string) (ns string, on []string, ok bool) {
 		} else if arr, aok := arrayValues(onVal); aok {
 			on = on[:0]
 			for _, e := range arr {
-				if s, sok := e.StringValueOK(); sok {
-					on = append(on, s)
+				s, sok := e.StringValueOK()
+				if !sok {
+					// One bad element, not a shorter list. Keeping the strings
+					// and dropping the rest read on: ["_id", 5] as ["_id"] and
+					// performed the merge on it, where mongod says "$merge 'on'
+					// array elements must be strings, but found int".
+					return "", nil, false
 				}
+				on = append(on, s)
 			}
 			if len(on) == 0 {
 				return "", nil, false

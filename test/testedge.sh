@@ -394,6 +394,11 @@ chk "and with the pipeline missing"              "agree" "$(ask "{aggregate:'$NS
 chk "a \$merge with a non-array on"              "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:'$NS',on:5}}],cursor:{}}")"
 chk "a \$merge with a non-string into"           "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:5}}],cursor:{}}")"
 chk "a \$out with a non-string argument"         "agree" "$(ask "{aggregate:'$NS',pipeline:[{\$out:5}],cursor:{}}")"
+# One bad element in the on array, not a shorter list. ["_id", 5] was read as
+# ["_id"] and the merge performed on it, which is the same defect one line away
+# from the one above.
+chk "a \$merge with a mixed on array"           "agree" \
+    "$(ask "{aggregate:'$NS',pipeline:[{\$merge:{into:'$NS',on:['_id',5]}}],cursor:{}}")"
 chk "createIndexes with a non-array indexes"     "agree" "$(ask "{createIndexes:'$NS',indexes:5}")"
 # count and distinct read a query the way find reads a filter, and an unreadable
 # one was read as no query at all: `count` with `query: 5` came back with a

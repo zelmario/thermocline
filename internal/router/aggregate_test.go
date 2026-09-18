@@ -333,6 +333,14 @@ func TestUnreadableWriteStage(t *testing.T) {
 			{Key: "into", Value: "t"}, {Key: "on", Value: "_id"}}}}, false},
 		{"$merge with an array on", bson.D{{Key: "$merge", Value: bson.D{
 			{Key: "into", Value: "t"}, {Key: "on", Value: bson.A{"_id"}}}}}, false},
+		{"$merge with a compound array on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: bson.A{"a", "b"}}}}}, false},
+		// One bad element, not a shorter list: ["_id", 5] was read as ["_id"]
+		// and merged on it, where mongod refuses the whole stage.
+		{"$merge with a mixed array on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: bson.A{"_id", 5}}}}}, true},
+		{"$merge with an empty array on", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "on", Value: bson.A{}}}}}, true},
 		{"$out naming a collection", bson.D{{Key: "$out", Value: "t"}}, false},
 		{"$out naming both", bson.D{{Key: "$out", Value: bson.D{
 			{Key: "db", Value: "d"}, {Key: "coll", Value: "t"}}}}, false},
