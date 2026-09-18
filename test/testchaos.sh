@@ -74,7 +74,15 @@ if [ -z "$CN" ]; then echo "  SKIP  archive primary not resolved"; else
   docker exec -d $NODE sh -c "mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval \"
     for (let i=0;i<25;i++){ try{ print(db.getSiblingDB('shop').$NS.countDocuments({})); }catch(e){ print('ERR'); } sleep(1000); }\" > /tmp/coldreads.txt 2>&1"
   sleep 4; docker exec $CN systemctl stop mongod; sleep 16; docker exec $CN systemctl start mongod; sleep 12
+  # The sample size as well as the deviations. Counting only lines that are not
+  # 300 means a loop that managed three reads instead of twenty-five passes, and
+  # an empty file passes too: "no bad reads" and "no reads" print the same 0.
+  # The section below this one already reports its own count for that reason.
+  COLDN=$(docker exec $NODE sh -c "wc -l < /tmp/coldreads.txt 2>/dev/null || echo 0" 2>/dev/null | tail -1)
+  echo "  $COLDN reads taken across the archive failover"
   chk "reads survive an archive failover" "0" "$(docker exec $NODE sh -c "grep -cvE '^300\$' /tmp/coldreads.txt || true" 2>/dev/null | tail -1)"
+  chk "and enough of them to mean anything"  "true" \
+      "$([ "${COLDN:-0}" -ge 20 ] 2>/dev/null && echo true || echo false)"
 fi
 
 echo "== fast tier primary killed under write load =="
