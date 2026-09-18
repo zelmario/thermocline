@@ -27,6 +27,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Router startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
 | Two applications writing through one router for four hours | 2,830,950 operations, 0 errors, 0 violations |
 | The same two, 45 minutes against the guards added since | 637,747 operations, 0 violations, 0 refusals |
+| The same two again, four hours, 2026-09-17 | 2,494,225 operations, 0 violations, 0 refusals, 31 stale reads in one second |
 | The fuzzer's change streams, 20 rounds under three other suites | 365 minutes, 0 disagreements |
 
 ## What is accepted, and needs no work
@@ -107,6 +108,20 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
 - [ ] **4. Measure off this box.** Every number above is six mongods on one
   WSL2 host. Throughput, mirroring rate and failover timing are the ones that
   will move.
+
+  The four-hour run on 2026-09-17 is the sharpest illustration so far. It
+  recorded **31 stale reads, all inside one second**, where the same run a day
+  earlier recorded none: mirroring fell behind the freshness barrier for one
+  moment and the router answered from the archive anyway, which is what that
+  trade is for. The feeder logged nothing, because nothing failed. Builds, a
+  full `go test -cover` and benchmarks were running on the same host at the
+  time, and on a box where that competes with the mongods there is no way to
+  tell interference from the system under test. That is the whole of this item.
+
+  What the same run does say, and it is worth as much: the shops noticed nothing
+  wrong through it. 0 violations across 2,494,225 operations, including the
+  check that a report over a closed month never changes, which is the one a
+  stale answer would break.
 
 - [ ] **5. Rehearse the four procedures, by a person, against a staging pair.**
   Adoption, rollback, recovery after a feeder stops with a rolled oplog, and a
