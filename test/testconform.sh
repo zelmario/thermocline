@@ -503,6 +503,25 @@ samew 'deleteOne() by _id'   'const r=COLL.deleteOne({_id:19}); print(r.deletedC
 samew 'deleteOne() by field' 'const r=COLL.deleteOne({name:"user18"}); print(r.deletedCount+"/"+COLL.countDocuments({}))'
 samew 'deleteMany()'         'const r=COLL.deleteMany({n:{$gt:15}}); print(r.deletedCount+"/"+COLL.countDocuments({}))'
 samew 'findOneAndUpdate()'   'print(JSON.stringify(COLL.findOneAndUpdate({_id:13},{$set:{z:1}},{returnDocument:"after"})))'
+# The write options this suite never asked across two tiers. Every one of them
+# is a write the router has to resolve against a document it does not hold, and
+# the ids are in the 11 to 20 range on purpose, which for tcon is the archive
+# alone. A positional operator is the sharp one: it names an array element by
+# where the filter matched, so a router that re-runs the write against a
+# document it fetched separately has to have kept the same match.
+samew 'arrayFilters'         'const r=COLL.updateOne({_id:14},{$set:{"items.$[e].qty":99}},{arrayFilters:[{"e.qty":{$gt:2}}]}); print(r.matchedCount+"/"+r.modifiedCount+"/"+JSON.stringify(COLL.findOne({_id:14}).items))'
+samew 'the positional $'     'const r=COLL.updateOne({_id:14,"items.sku":"s9"},{$set:{"items.$.qty":77}}); print(r.matchedCount+"/"+r.modifiedCount+"/"+JSON.stringify(COLL.findOne({_id:14}).items))'
+samew 'the all-positional $[]' 'const r=COLL.updateOne({_id:15},{$inc:{"items.$[].qty":5}}); print(r.matchedCount+"/"+r.modifiedCount+"/"+JSON.stringify(COLL.findOne({_id:15}).items))'
+samew 'arrayFilters on many' 'const r=COLL.updateMany({n:{$gt:12}},{$set:{"items.$[e].qty":1}},{arrayFilters:[{"e.sku":"s9"}]}); print(r.matchedCount+"/"+r.modifiedCount)'
+samew '$setOnInsert on a hit' 'const r=COLL.updateOne({_id:16},{$setOnInsert:{fresh:true},$set:{v:1}},{upsert:true}); print(r.upsertedCount+"/"+JSON.stringify(COLL.findOne({_id:16}).fresh))'
+samew '$setOnInsert on a miss' 'const r=COLL.updateOne({_id:91},{$setOnInsert:{fresh:true},$set:{v:1}},{upsert:true}); print(r.upsertedCount+"/"+JSON.stringify(COLL.findOne({_id:91})))'
+samew 'an update with a hint' 'const r=COLL.updateMany({n:{$gt:12}},{$inc:{n:1}},{hint:{n:1}}); print(r.matchedCount+"/"+r.modifiedCount)'
+samew 'findAndModify remove with a sort' 'print(JSON.stringify(d.runCommand({findAndModify:c.getName(),query:{n:{$gt:10}},sort:{n:-1},remove:true}).value))'
+samew 'findAndModify with fields' 'print(JSON.stringify(d.runCommand({findAndModify:c.getName(),query:{_id:12},update:{$inc:{n:1}},fields:{n:1},new:true}).value))'
+# A duplicate in the middle of a batch. ordered stops there, unordered carries
+# on, and the count left behind is the difference between the two.
+samew 'ordered insert, duplicate in the middle' 'try{ COLL.insertMany([{_id:81,n:81},{_id:15,n:0},{_id:82,n:82}],{ordered:true}) }catch(e){}; print(COLL.countDocuments({_id:{$in:[81,82]}}))'
+samew 'unordered insert, duplicate in the middle' 'try{ COLL.insertMany([{_id:83,n:83},{_id:15,n:0},{_id:84,n:84}],{ordered:false}) }catch(e){}; print(COLL.countDocuments({_id:{$in:[83,84]}}))'
 samew 'findOneAndReplace()'  'print(JSON.stringify(COLL.findOneAndReplace({_id:13},{_id:13,fresh:1},{returnDocument:"after"})))'
 samew 'findOneAndDelete()'   'print(JSON.stringify(COLL.findOneAndDelete({_id:13}))+"/"+COLL.countDocuments({}))'
 
