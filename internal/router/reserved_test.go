@@ -120,3 +120,99 @@ func TestReservedInPipeline(t *testing.T) {
 		}
 	}
 }
+
+// An upsert's filter is a write path, which is the part the first three
+// versions of this guard all missed: they read the update and nothing else.
+// mongod builds the document an upsert creates from the filter's equality
+// fields, so the rule here is exactly "what survives into that document", and
+// it is the same rule the unique key registry reads a filter by.
+func TestReservedInUpsertFilter(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name   string
+		filter bson.D
+		want   string
+	}{
+		{"an ordinary filter", bson.D{{Key: "k", Value: 1}}, ""},
+		{"equality on the mark", bson.D{{Key: "_tcDeletedAt", Value: now}}, "_tcDeletedAt"},
+		{"equality on the body-dropped mark", bson.D{{Key: "_tcBodyDropped", Value: true}}, "_tcBodyDropped"},
+		{"the $eq spelling", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$eq", Value: now}}}}, "_tcDeletedAt"},
+		{"the mark beside ordinary fields", bson.D{{Key: "k", Value: 1}, {Key: "_tcDeletedAt", Value: now}}, "_tcDeletedAt"},
+		// A range predicate is not carried into the created document, so
+		// refusing it would be the guard asserting more than it guards
+		// against. Proved against mongod: the upsert created {k: 3, a: 1}.
+		{"a range predicate on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$gt", Value: now}}}}, ""},
+		{"an $in on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$in", Value: bson.A{now}}}}}, ""},
+		{"a nested field of that name", bson.D{{Key: "inner", Value: bson.D{{Key: "_tcDeletedAt", Value: now}}}}, ""},
+		{"an empty filter", bson.D{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(c.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, bad := reservedInUpsertFilter(raw)
+			if c.want == "" {
+				if bad {
+					t.Fatalf("refused %v for %s, and mongod does not write that field", c.filter, got)
+				}
+				return
+			}
+			if !bad || got != c.want {
+				t.Fatalf("got %q %v, want %q true", got, bad, c.want)
+			}
+		})
+	}
+}
+
+// $merge's own pipeline. whenMatched is a string in every ordinary merge and a
+// list of stages when somebody wants to decide the update per document, and
+// reading only the outer pipeline's stages saw neither.
+func TestReservedInMergeWhenMatched(t *testing.T) {
+	cases := []struct {
+		name  string
+		stage bson.D
+		want  string
+	}{
+		{"whenMatched merge", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "whenMatched", Value: "merge"}}}}, ""},
+		{"a pipeline setting the mark", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"},
+			{Key: "whenMatched", Value: bson.A{bson.D{{Key: "$set", Value: bson.D{{Key: "_tcDeletedAt", Value: "$$NOW"}}}}}}}}}, "_tcDeletedAt"},
+		{"a pipeline adding the body-dropped mark", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"},
+			{Key: "whenMatched", Value: bson.A{bson.D{{Key: "$addFields", Value: bson.D{{Key: "_tcBodyDropped", Value: true}}}}}}}}}, "_tcBodyDropped"},
+		{"the mark in the second stage of it", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"},
+			{Key: "whenMatched", Value: bson.A{
+				bson.D{{Key: "$set", Value: bson.D{{Key: "ok", Value: 1}}}},
+				bson.D{{Key: "$set", Value: bson.D{{Key: "_tcDeletedAt", Value: "$$NOW"}}}}}}}}}, "_tcDeletedAt"},
+		{"an ordinary pipeline", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"},
+			{Key: "whenMatched", Value: bson.A{bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: true}}}}}}}}}, ""},
+		// whenNotMatched only ever names a mode, and reading a string as a
+		// pipeline is the shape that panics rather than the shape that misses.
+		{"whenNotMatched insert", bson.D{{Key: "$merge", Value: bson.D{
+			{Key: "into", Value: "t"}, {Key: "whenNotMatched", Value: "insert"}}}}, ""},
+		{"a $merge naming its target as a string", bson.D{{Key: "$merge", Value: "t"}}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := bson.Marshal(c.stage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, bad := reservedInStage(raw)
+			if c.want == "" {
+				if bad {
+					t.Fatalf("refused %s, which writes no mark", got)
+				}
+				return
+			}
+			if !bad || got != c.want {
+				t.Fatalf("got %q %v, want %q true", got, bad, c.want)
+			}
+		})
+	}
+}

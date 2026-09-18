@@ -1062,6 +1062,29 @@ chk "and a pipeline update setting it"                 "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:1},[{\$set:{_tcDeletedAt:'\$v'}}]);print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and findAndModify"                                "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findOneAndUpdate({_id:1},{\$set:{_tcDeletedAt:new Date()}});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# An upsert's filter is a write path. mongod builds the document it creates from
+# the filter's equality fields and then applies the update, so a filter alone
+# writes the mark with no update operator naming it. Measured before this was
+# refused: three such statements created three documents on the fast tier and
+# countDocuments through the router then answered 1 of 3.
+chk "and an upsert taking the mark from its filter"    "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_tcDeletedAt:new Date('2020-01-01')},{\$set:{a:1}},{upsert:true});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+chk "and the \$eq spelling of that filter"              "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_tcDeletedAt:{\$eq:new Date('2020-01-01')}},{\$set:{a:1}},{upsert:true});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+chk "and findAndModify upserting from its query"       "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.findAndModify({query:{_tcDeletedAt:new Date('2021-01-01'),k:9},update:{\$set:{b:2}},upsert:true});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+chk "and the bulkWrite upsert form"                    "REFUSED" \
+    "$(res "$(R "try{db.adminCommand({bulkWrite:1, ops:[{update:0, filter:{_tcBodyDropped:true,k:5}, updateMods:{\$set:{a:1}}, upsert:true}], nsInfo:[{ns:process.env.TC_DB+'.$RNS'}]});print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# Equality is the whole rule, so a range predicate on the same field has to go
+# through: mongod does not carry it into the document it creates, and refusing
+# it would be a guard asserting more than the thing it guards against.
+chk "while the same filter without upsert is fine"     "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_tcDeletedAt:new Date('2020-01-01')},{\$set:{a:1}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
+chk "and a range predicate on it, which writes nothing" "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_tcDeletedAt:{\$gt:new Date('2020-01-01')},k:3},{\$set:{a:1}},{upsert:true});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
+chk "and the document it created carries no mark"      "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({k:3,_tcDeletedAt:{\$exists:true}}))")"
+
 # The controls matter as much as the refusals. A guard that turned down ordinary
 # writes, or writes to collections this system does not tier, would be this
 # proxy inventing a rule about data it does not touch.
@@ -1114,6 +1137,22 @@ chk "and a \$out into a tiered collection"              "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$out:'$RNS'}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
 chk "and a \$merge into one"                            "REFUSED" \
     "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$set:{_tcDeletedAt:new Date()}},{\$merge:{into:'$RNS'}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# $merge carries a pipeline of its own: whenMatched can be a list of stages
+# instead of one of the named modes, and those stages run against the document
+# already in the target. Nothing in the outer pipeline mentions the field, so
+# reading the outer stages alone missed it. Measured before this was refused: a
+# live document in a tiered collection came back carrying the tombstone mark.
+chk "and a \$merge whose whenMatched sets it"           "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$match:{_id:1}},{\$merge:{into:'$RNS',on:'_id',whenMatched:[{\$set:{_tcDeletedAt:'\$\$NOW'}}]}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+chk "and the \$addFields spelling of it"                "REFUSED" \
+    "$(res "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$match:{_id:1}},{\$merge:{into:'$RNS',on:'_id',whenMatched:[{\$addFields:{_tcBodyDropped:true}}]}}]).toArray();print('ACCEPTED')}catch(e){print(/refusing this write|refusing this bulkWrite/.test(e.message)?'REFUSED':e.message.substring(0,60))}")")"
+# whenMatched is a string in every ordinary merge, and reading it as a pipeline
+# would panic on that. This control is here for the type as much as the rule.
+chk "while an ordinary whenMatched pipeline works"      "ACCEPTED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.aggregate([{\$match:{_id:1}},{\$merge:{into:'$RNS',on:'_id',whenMatched:[{\$set:{tkseen:true}}]}}]).toArray();print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
+chk "and the collection took no mark from any of it"   "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({\$or:[{_tcDeletedAt:{\$exists:true}},{_tcBodyDropped:{\$exists:true}}]}))")"
+
 # Unacknowledged, which is the shape that has caught this project out before:
 # everything the router repairs on the reply is absent for a w:0 message, and
 # single-document update, delete and findAndModify were once guarded nowhere

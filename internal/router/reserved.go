@@ -156,6 +156,31 @@ func reservedInStage(sd bson.Raw) (string, bool) {
 			}
 		}
 	}
+	// $merge carries a pipeline of its own. whenMatched can be a list of stages
+	// rather than one of the named modes, and those stages run against the
+	// document already in the target collection, so this is a write to a tiered
+	// collection that no stage of the outer pipeline mentions. Measured: a
+	// whenMatched of [{$set: {_tcDeletedAt: "$$NOW"}}] put the mark on a live
+	// document and every read that falls through then skipped it.
+	//
+	// whenNotMatched is not read, because its only values are insert, discard
+	// and fail. The document it inserts is the outer pipeline's output, which
+	// the loop above has already read.
+	if v, err := sd.LookupErr("$merge"); err == nil {
+		if d, ok := v.DocumentOK(); ok {
+			if wm, werr := d.LookupErr("whenMatched"); werr == nil {
+				// ArrayOK rather than Array: whenMatched is a string in every
+				// ordinary merge, and RawValue.Array panics on the wrong type.
+				if raw, isArr := wm.ArrayOK(); isArr {
+					if arr, aerr := raw.Values(); aerr == nil {
+						if f, bad := reservedInStages(arr); bad {
+							return f, true
+						}
+					}
+				}
+			}
+		}
+	}
 	return "", false
 }
 
@@ -170,6 +195,28 @@ func reservedInStages(stages []bson.RawValue) (string, bool) {
 			continue
 		}
 		if f, bad := reservedInStage(sd); bad {
+			return f, true
+		}
+	}
+	return "", false
+}
+
+// reservedInUpsertFilter names a reserved field an upsert would carry from its
+// own filter into the document it creates.
+//
+// A filter is a write path, which is the part that is easy to miss. An upsert
+// that matches nothing builds the new document from the filter's equality
+// fields and then applies the update to it, so `{_tcDeletedAt: t}` with
+// `upsert: true` writes the mark without any update operator naming it.
+// Measured against mongod 6.0 rather than reasoned about: three such statements
+// created three documents and the router's own countDocuments then answered 1.
+//
+// Equality, read with the same function the unique key registry reads a filter
+// by, because it is the same question: what does mongod carry from here into
+// the document. Sharing it is what stops the two drifting apart.
+func reservedInUpsertFilter(filter bson.Raw) (string, bool) {
+	for _, f := range reservedFieldNames {
+		if _, ok := equalityInFilter(filter, f); ok {
 			return f, true
 		}
 	}
@@ -219,6 +266,16 @@ func (c *conn) guardReservedField(msg *wire.Message, db, name string) (*wire.Mes
 		if v, err := cmd.LookupErr("update"); err == nil {
 			if f, bad := reservedInUpdate(v); bad {
 				field = f
+			}
+		}
+	}
+	if field == "" {
+		// The filter of anything that would upsert, after the update itself:
+		// the update is the cheaper read and names the field more often.
+		for _, st := range upsertStatements(msg, cmd, name) {
+			if f, bad := reservedInUpsertFilter(st.filter); bad {
+				field = f
+				break
 			}
 		}
 	}

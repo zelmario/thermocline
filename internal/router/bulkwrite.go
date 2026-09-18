@@ -193,6 +193,13 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			if f, bad := reservedInUpdate(op.stmt.update); bad {
 				field = f
 			}
+			if field == "" && op.stmt.upsert {
+				// An upsert writes its filter's equality fields into the
+				// document it creates, so the filter is a write path here too.
+				if f, bad := reservedInUpsertFilter(op.stmt.filter); bad {
+					field = f
+				}
+			}
 		}
 		if field == "" {
 			continue
