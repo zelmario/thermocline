@@ -404,6 +404,51 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		"ns", ns,
 		"waited", c.r.cfg.ArchiveWait.String(),
 		"effect", "this answer may miss a very recent write, or include a very recently deleted document")
+	c.explainStale(ctx, started)
+}
+
+// explainStale says which of the two bars the wait gave up on.
+//
+// The warning above says "waited 5s" and nothing else, which leaves an operator
+// with two quantities and no way to tell which one moved. They are not
+// interchangeable: caughtUp holds a wall-clock bar and a cluster-time bar, and
+// its own comment says the cluster-time one is the binding bar on any system
+// with traffic. The metric an alert watches, thermocline_mirroring_lag_seconds,
+// is the wall-clock one.
+//
+// Measured on the 2026-09-18 store run: eleven stale reads inside one second
+// while that gauge, sampled every five seconds, read 24ms three seconds before
+// and 14ms five seconds after, and the feeder logged nothing at all. The event
+// was real and no number an operator graphs went anywhere near it.
+//
+// Read after the fact rather than captured inside the wait, so it costs a
+// cached lookup on a path that has already given up and changes nothing about
+// the decision. That the bar has often cleared by the time this runs is itself
+// worth seeing: it says the wait ended a moment early rather than the feeder
+// being stopped.
+func (c *conn) explainStale(ctx context.Context, started time.Time) {
+	got := c.r.mirroredThrough(ctx)
+	if !got.known {
+		c.log.Warn("and mirroring has published no position at all",
+			"note", "nothing is mirroring, so no read can clear the barrier; check the feeder is running")
+		return
+	}
+	seen := c.r.seenOpTime.Load()
+	feeder := checkpoint.PackTS(got.ts)
+	mine, mineKnown := c.r.archiveSkew(ctx)
+	at, until := got.at, started
+	if mineKnown && got.skewKnown {
+		at = at.Add(-got.skew)
+		until = until.Add(-mine)
+	}
+	c.log.Warn("which bar the freshness wait gave up on",
+		"wall_clock_short_by", until.Sub(at).Round(time.Millisecond).String(),
+		"cluster_time_short", seen != 0 && got.ts.T != 0 && feeder < seen,
+		"feeder_ts", feeder, "router_seen_ts", seen,
+		"frames_aligned", mineKnown && got.skewKnown,
+		"note", "a negative wall_clock_short_by with cluster_time_short true is the ordinary "+
+			"shape: the feeder's position is recent but does not yet cover an operationTime this "+
+			"router has already handed a client, and only the cluster-time bar can see that")
 }
 
 // caughtUp decides whether mirroring has reached what this read needs.

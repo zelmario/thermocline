@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -189,6 +190,41 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		gauge("mirroring_lag_seconds", lagHelp, mirroring.lag.Seconds())
 	} else if r.cfg.FeederID != "" {
 		gauge("mirroring_lag_seconds", lagHelp, math.Inf(1))
+	}
+
+	// The other bar, and the one that actually decides.
+	//
+	// A fall-through read clears two: the feeder's published instant against
+	// the instant the read began, and the feeder's published cluster time
+	// against the newest operationTime this router has handed a client.
+	// caughtUp's own comment says the second is the binding one on any system
+	// with traffic, because a busy router always has a fresh operationTime to
+	// clear while a feeder that has fallen behind does not.
+	//
+	// Only the first was exported, and it is the one docs/monitoring.md tells
+	// operators to alert on. Measured on the 2026-09-18 store run: eleven stale
+	// reads inside one second with mirroring_lag_seconds at 24ms three seconds
+	// before and 14ms five seconds after. The barrier that fired was invisible
+	// to every number on the dashboard, so stale_reads_total rose with nothing
+	// to explain it.
+	//
+	// In seconds of cluster time, so it is comparable with the gauge above
+	// rather than being a packed timestamp nobody can read. Zero is the healthy
+	// value and the one to alert on, the same as its neighbour.
+	if seen := r.seenOpTime.Load(); seen != 0 && r.cfg.FeederID != "" {
+		if got := r.mirroredThrough(ctx); got.known && got.ts.T != 0 {
+			// Through UnpackTS rather than shifting here, so this does not have
+			// to know how a cluster time is packed.
+			behind := float64(0)
+			if seenT := checkpoint.UnpackTS(seen).T; seenT > got.ts.T {
+				behind = float64(seenT - got.ts.T)
+			}
+			gauge("mirroring_cluster_time_behind_seconds",
+				"Seconds of cluster time the feeder's published position has not yet covered, "+
+					"against the newest operationTime this router has handed a client. This is the "+
+					"bar a fall-through read actually has to clear, and stale_reads_total rises "+
+					"when it does not. Zero is healthy.", behind)
+		}
 	}
 
 	// The background daemons, which have no listening socket of their own.
