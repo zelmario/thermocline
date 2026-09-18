@@ -123,7 +123,7 @@ func runBackfill(args []string) error {
 		if db == "" || coll == "" {
 			continue
 		}
-		copied, refused, refusalWhy, cerr := backfillDocuments(ctx, hot, cold, db, coll, *apply)
+		copied, refused, alreadyMarked, refusalWhy, cerr := backfillDocuments(ctx, hot, cold, db, coll, *apply)
 		if cerr != nil {
 			fmt.Printf("  %-40s could not be copied: %v\n", ns, cerr)
 			continue
@@ -137,6 +137,13 @@ func runBackfill(args []string) error {
 			totalRefused += refused
 			fmt.Printf("  %-40s %d document(s) the archive refused: %s\n", ns, refused,
 				firstLine(refusalWhy))
+		}
+		// Copied, and invisible once copied. See backfillDocuments.
+		if alreadyMarked > 0 {
+			fmt.Printf("  %-40s %d document(s) already carry %s or %s, so the archive's copy of "+
+				"each reads as one the application deleted and no read that falls through will "+
+				"return it. cline preflight lists them; rename the field on the fast tier and "+
+				"run this again\n", ns, alreadyMarked, meta.TombstoneField, meta.BodyDroppedField)
 		}
 
 		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
@@ -191,17 +198,17 @@ const backfillBatch = 500
 // Upserted by _id, because the fast tier's copy is the newer one: it is what the
 // application wrote during the window, and the archive's is what it looked like
 // before. A document the archive does not have at all is created.
-func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll string, apply bool) (copied, refusedOut int64, why string, err error) {
+func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll string, apply bool) (copied, refusedOut, markedOut int64, why string, err error) {
 	src := hot.Database(db).Collection(coll)
 	dst := cold.Database(db).Collection(coll)
 
 	cur, err := src.Find(ctx, bson.D{})
 	if err != nil {
-		return 0, 0, "", err
+		return 0, 0, 0, "", err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	var n, refused int64
+	var n, refused, marked int64
 	var firstRefusal string
 	var models []mongo.WriteModel
 	// Unordered, so the archive applies what it can and refuses the rest one at
@@ -250,6 +257,23 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 		if lerr != nil {
 			continue
 		}
+		// A fast tier document already wearing one of this system's own marks.
+		// The router refuses writes that would leave one and the feeder warns
+		// when it mirrors one, but this tool copies verbatim, and a copy of a
+		// marked document is a tombstone in the archive: invisible to every
+		// read that falls through, and reported here as copied. It is the state
+		// preflight's findReservedFields exists to find, and a recovery tool is
+		// exactly where nobody has run preflight first.
+		//
+		// Counted and said, not refused. Refusing would stop a backfill part
+		// way through for a document the archive would have taken, and what the
+		// operator needs is to know which documents to look at.
+		for _, f := range []string{meta.TombstoneField, meta.BodyDroppedField} {
+			if _, err := doc.LookupErr(f); err == nil {
+				marked++
+				break
+			}
+		}
 		models = append(models, mongo.NewReplaceOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
 			SetReplacement(doc).
@@ -257,17 +281,17 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 		n++
 		if len(models) >= backfillBatch {
 			if ferr := flush(); ferr != nil {
-				return n, refused, firstRefusal, ferr
+				return n, refused, marked, firstRefusal, ferr
 			}
 		}
 	}
 	if cerr := cur.Err(); cerr != nil {
-		return n, refused, firstRefusal, cerr
+		return n, refused, marked, firstRefusal, cerr
 	}
 	if ferr := flush(); ferr != nil {
-		return n, refused, firstRefusal, ferr
+		return n, refused, marked, firstRefusal, ferr
 	}
-	return n, refused, firstRefusal, nil
+	return n, refused, marked, firstRefusal, nil
 }
 
 // firstLine trims a driver's error to something that fits a report line. The
