@@ -1234,6 +1234,12 @@ chk "and the index is unique now"                    "true" \
 # Two live documents, two keys, exactly as createIndexes would have left it.
 chk "and it claimed the keys already there"          "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+# Issuing it again must change nothing. The walk inserts claim rows, and a
+# second walk that read its own rows as somebody else's would refuse a no-op.
+chk "and issuing the same collMod again is fine"     "ACCEPTED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "and the claims are still the same two"          "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
 chk "a collMod that touches no index still works"    "ACCEPTED" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',validationLevel:'off'});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
 chk "and one naming an index that is not there"      "true" \

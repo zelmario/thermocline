@@ -249,7 +249,11 @@ same 'a negative skip'         "try{print(JSON.stringify(d.runCommand({find:c.ge
 same 'batchSize zero'          "print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},batchSize:0}).cursor.firstBatch))"
 same 'skip past the end'       "print(JSON.stringify(COLL.find({}).skip(1000)$S"
 same 'allowDiskUse on a find'  "print(JSON.stringify(d.runCommand({find:c.getName(),filter:{},allowDiskUse:true,sort:{_id:1}}).cursor.firstBatch.length))"
-same 'tailable on a normal collection' "try{print('n='+d.runCommand({find:c.getName(),filter:{},tailable:true}).cursor.firstBatch.length)}catch(e){print('ERR '+e.message.split('\n')[0].substring(0,60))}"
+# mongod refuses tailable on a collection that is not capped, and says so with
+# the namespace inside the message, which the two collections cannot agree on.
+# So this compares whether it was refused, not the words: asserting the message
+# was this check asserting more than the contract.
+same 'tailable on a normal collection' "try{print('n='+d.runCommand({find:c.getName(),filter:{},tailable:true}).cursor.firstBatch.length)}catch(e){print('REFUSED')}"
 # showRecordId's value is a storage engine's own address, so the two collections
 # cannot agree on it and must not be asked to. What has to match is that the
 # field is there at all, on every document, whichever tier answered.
