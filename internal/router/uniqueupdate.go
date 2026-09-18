@@ -348,29 +348,112 @@ func lookupPath(doc bson.Raw, field string) (bson.RawValue, bool) {
 	return v, true
 }
 
+// filterDepth bounds the walk through $and and $or. Nothing an application
+// writes nests deeper, and the filter comes from a client.
+const filterDepth = 10
+
 // equalityInFilter pulls a field's value out of a filter when the filter pins it
 // to one value, which is what an upsert carries into the document it creates.
+//
+// What counts as pinning is mongod's answer and not ours, so it was measured
+// rather than reasoned: every row of
+// TestEqualityInFilterMatchesWhatMongodCarries was run as an upsert against
+// mongod 8.0 and judged by the document that came back. Four spellings it
+// carries were being read as pinning nothing:
+//
+//	{f: {$in: [v]}}          creates f
+//	{f: {$all: [v]}}         creates f
+//	{$and: [{f: v}, ...]}    creates f, at any nesting
+//	{$or: [{f: v}]}          creates f, with exactly one clause
+//
+// The cost of missing one is paid twice, because this function is shared. The
+// reserved field guard asks it whether an upsert would write _tcDeletedAt, so a
+// missed spelling is a live document wearing a tombstone's mark. The unique key
+// registry asks it which keys the upsert is about to take, so a missed spelling
+// is a cross-tier duplicate admitted with nothing claimed. Sharing the reader
+// was meant to stop the two drifting apart, and it did: they had one hole
+// rather than two.
 func equalityInFilter(filter bson.Raw, field string) (bson.RawValue, bool) {
-	if len(filter) == 0 {
+	return equalityInFilterAt(filter, field, 0)
+}
+
+func equalityInFilterAt(filter bson.Raw, field string, depth int) (bson.RawValue, bool) {
+	if len(filter) == 0 || depth > filterDepth {
 		return bson.RawValue{}, false
 	}
-	v, err := filter.LookupErr(field)
-	if err != nil {
-		return bson.RawValue{}, false
+	if v, err := filter.LookupErr(field); err == nil {
+		return pinnedValue(v)
 	}
-	if doc, ok := v.DocumentOK(); ok {
-		// {field: {$eq: x}} pins it; any other operator does not.
-		if eq, eerr := doc.LookupErr("$eq"); eerr == nil {
-			return eq, true
+	// $and applies every clause, so an equality in any of them reaches the
+	// document. $or applies one of them, so it pins only when there is one.
+	for _, op := range []string{"$and", "$or"} {
+		v, err := filter.LookupErr(op)
+		if err != nil {
+			continue
 		}
-		if elems, eerr := doc.Elements(); eerr == nil {
-			for _, e := range elems {
-				if strings.HasPrefix(e.Key(), "$") {
-					return bson.RawValue{}, false
-				}
+		raw, ok := v.ArrayOK()
+		if !ok {
+			continue
+		}
+		vals, verr := raw.Values()
+		if verr != nil || len(vals) == 0 {
+			continue
+		}
+		if op == "$or" && len(vals) != 1 {
+			continue
+		}
+		for _, cv := range vals {
+			cd, cok := cv.DocumentOK()
+			if !cok {
+				continue
+			}
+			if eq, found := equalityInFilterAt(cd, field, depth+1); found {
+				return eq, true
 			}
 		}
 	}
+	return bson.RawValue{}, false
+}
+
+// pinnedValue reports the one value a field's own clause pins it to.
+func pinnedValue(v bson.RawValue) (bson.RawValue, bool) {
+	doc, ok := v.DocumentOK()
+	if !ok {
+		// A plain value, which includes an array: that is an exact match on the
+		// whole array and mongod creates the field holding it.
+		return v, true
+	}
+	// {field: {$eq: x}} pins it.
+	if eq, eerr := doc.LookupErr("$eq"); eerr == nil {
+		return eq, true
+	}
+	// So do $in and $all with exactly one value, which is the pair this missed.
+	// More than one pins nothing, and a regex pins nothing even alone: measured,
+	// mongod leaves the field out of the document for both.
+	for _, op := range []string{"$in", "$all"} {
+		av, aerr := doc.LookupErr(op)
+		if aerr != nil {
+			continue
+		}
+		raw, arrOK := av.ArrayOK()
+		if !arrOK {
+			return bson.RawValue{}, false
+		}
+		vals, verr := raw.Values()
+		if verr != nil || len(vals) != 1 || vals[0].Type == bson.TypeRegex {
+			return bson.RawValue{}, false
+		}
+		return vals[0], true
+	}
+	if elems, eerr := doc.Elements(); eerr == nil {
+		for _, e := range elems {
+			if strings.HasPrefix(e.Key(), "$") {
+				return bson.RawValue{}, false
+			}
+		}
+	}
+	// A subdocument with no operators in it, which is an exact match on the
+	// whole subdocument.
 	return v, true
 }
 

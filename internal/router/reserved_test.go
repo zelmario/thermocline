@@ -215,7 +215,20 @@ func TestReservedInUpsertFilter(t *testing.T) {
 		// refusing it would be the guard asserting more than it guards
 		// against. Proved against mongod: the upsert created {k: 3, a: 1}.
 		{"a range predicate on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$gt", Value: now}}}}, ""},
-		{"an $in on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$in", Value: bson.A{now}}}}}, ""},
+		// And an $in of one value is not a range predicate, which is what this
+		// case assumed when it sat here expecting "". Measured against mongod
+		// 8.0 the same way the line above was: the upsert created the field,
+		// so the mark went onto a live document and every read that fell
+		// through to the archive then skipped it.
+		{"an $in of one value on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$in", Value: bson.A{now}}}}}, "_tcDeletedAt"},
+		{"an $in of two values on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$in", Value: bson.A{now, now}}}}}, ""},
+		{"an $all of one value on it", bson.D{{Key: "_tcDeletedAt", Value: bson.D{{Key: "$all", Value: bson.A{now}}}}}, "_tcDeletedAt"},
+		// $and is how an ORM writes almost every filter it generates.
+		{"the mark inside an $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "k", Value: 1}},
+			bson.D{{Key: "_tcDeletedAt", Value: now}}}}}, "_tcDeletedAt"},
+		{"an ordinary $and", bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "k", Value: 1}}, bson.D{{Key: "j", Value: 2}}}}}, ""},
 		{"a nested field of that name", bson.D{{Key: "inner", Value: bson.D{{Key: "_tcDeletedAt", Value: now}}}}, ""},
 		{"an empty filter", bson.D{}, ""},
 	}
