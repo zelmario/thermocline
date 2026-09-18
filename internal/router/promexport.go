@@ -34,6 +34,10 @@ func promEscape(v string) string {
 	return r.Replace(v)
 }
 
+// metricsBudget bounds what one scrape may spend reaching the archive. See the
+// /metrics handler.
+const metricsBudget = 3 * time.Second
+
 // writeMetrics renders the whole export.
 func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	snap := r.SnapshotAll()

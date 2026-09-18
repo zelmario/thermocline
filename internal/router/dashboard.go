@@ -187,8 +187,21 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 	// router's, for the same reason the dashboard is: neither belongs on the
 	// address the application dials.
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		// Bounded, because two of the gauges read the archive and the archive
+		// being unreachable is exactly when this endpoint has to answer.
+		// Without it the driver waits out server selection, thirty seconds by
+		// default, which is longer than Prometheus's own ten second scrape
+		// timeout: the scrape fails and *every* metric is lost, including
+		// panics_total and stale_reads_total, and including the +Inf that
+		// mirroring_lag_seconds exists to report for this very state.
+		//
+		// Short on purpose. Every reading that cannot be had in this budget has
+		// an "unknown" rendering already, so the export degrades to the honest
+		// answer rather than to no answer at all.
+		ctx, cancel := context.WithTimeout(req.Context(), metricsBudget)
+		defer cancel()
 		var b strings.Builder
-		r.writeMetrics(req.Context(), &b)
+		r.writeMetrics(ctx, &b)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = io.WriteString(w, b.String())
