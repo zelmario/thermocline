@@ -294,8 +294,15 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 func (r *Router) enableCache() {
 	// The advisor runs by default, whether or not anything is cached: it
 	// answers "what would caching be worth here", which is the question a
-	// decision to turn the cache on should be made from. It costs a hash and a
-	// bounded table, and router.cache.measure turns even that off.
+	// decision to turn the cache on should be made from. router.cache.measure
+	// turns even that off.
+	//
+	// What it costs, measured rather than described as a hash and a table:
+	// 2.7us and 976 bytes per cacheable read, on the shapes BenchmarkShape
+	// builds, against the 130us of proxy overhead a read already carries. About
+	// two per cent, and only on find, count, distinct and aggregate. Worth
+	// knowing before turning it off: the number it buys is what makes the
+	// decision to enable the cache something other than a guess.
 	if r.cfg.Cache.Measuring() {
 		r.advisor = cache.NewAdvisor(r.cfg.Cache.MaxQueries, maxParamsPerShape, r.cfg.Cache.MaxTTL.D())
 	}
