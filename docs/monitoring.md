@@ -12,8 +12,15 @@ stale-read counters, documents and bytes per namespace and tier, and
 
     thermocline_mirroring_lag_seconds
 
-which is the first alert to build. **It is exported by the router rather than by
-the feeder on purpose.** The router already reads the feeder's published
+which is the first alert to build, and beside it
+
+    thermocline_mirroring_cluster_time_behind_seconds
+
+which is the bar a fall-through read actually has to clear. Rule 2b below says
+why the two are not interchangeable.
+
+**`mirroring_lag_seconds` is exported by the router rather than by the feeder on
+purpose.** The router already reads the feeder's published
 position on every fallback read, so it knows the lag continuously, and a gauge
 published by the feeder itself goes silent exactly when the feeder dies, which
 is the moment the number matters. Scraped from the router, a dead feeder reads
@@ -25,6 +32,20 @@ scrape_configs:
     static_configs:
       - targets: ["router-1.internal:27101"]
 ```
+
+#### Change streams
+
+`thermocline_change_streams_total` counts streams opened over tiered data, on a
+collection, a database or the whole deployment. `thermocline_events_hidden_total`
+counts the tiering events removed from their batches: an eviction that would
+have read as the application deleting a document, a copy-up that would have read
+as an insert it never made.
+
+Read them together. Neither pages. A stream open with documents moving
+underneath it and `events_hidden_total` flat is the pair worth looking at,
+because it is what suppression failing would look like, and four defects in that
+sieve have been fixed so far. The counter existed and reached no operator at all
+until 2026-09-18.
 
 #### The query cache
 
@@ -104,6 +125,27 @@ could not, and the next client to ask will hit it too.
 the archive and was answered before mirroring reached the moment the read
 started, so it may miss a write that already returned. Every other counter here
 is about work; this one is about a wrong answer.
+
+**2b. `thermocline_mirroring_cluster_time_behind_seconds` above zero, beside
+rule 2.** This is the bar rule 2 actually fires on, and rule 3 below is not it.
+
+A fall-through read clears two bars: the feeder's published instant against the
+instant the read began, which is what `mirroring_lag_seconds` measures, and the
+feeder's published cluster time against the newest `operationTime` this router
+has already handed a client. The second is the binding one on any deployment
+with traffic, because a busy router always has a fresh `operationTime` to clear
+while a feeder that has fallen behind does not.
+
+Only the first was exported until 2026-09-18, which is what rule 3 watches. So
+`stale_reads_total` could rise with every graph flat. Measured on the four-hour
+two-application run that day: eleven stale reads inside one second while
+`mirroring_lag_seconds`, sampled every five seconds throughout, read 24ms three
+seconds before and 14ms five seconds after, and the feeder logged nothing
+because nothing failed.
+
+Zero is healthy. When rule 2 pages, read this one to tell a feeder that is
+behind from a barrier that fired for another reason, and read the router's
+`which bar the freshness wait gave up on` line, which carries both timestamps.
 
 **3. `thermocline_mirroring_lag_seconds` above the eviction notice's lifetime.
 Page.** Past that point the evictor stops, which is the safe behaviour, and a
@@ -202,6 +244,12 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "an archive read was answered before mirroring caught up"
+      - alert: ThermoclineClusterTimeBehind
+        expr: thermocline_mirroring_cluster_time_behind_seconds > 0
+        for: 2m
+        labels: {severity: warn}
+        annotations:
+          summary: "the feeder has not covered cluster time this router already handed a client, which is the bar a fall-through read has to clear"
       - alert: ThermoclineMirroringBehind
         expr: thermocline_mirroring_lag_seconds > 600
         for: 5m
