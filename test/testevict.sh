@@ -99,9 +99,21 @@ echo "== two sweeps at once, which the README promises cannot happen =="
 # This suite has no chk, so the pass and fail are counted the way the rest of it
 # does. The race is made winnable rather than hoped for: the first sweep is given
 # a health timeout long enough to be holding the lease when the second starts.
-cline evictor --config $CFG --once --health-timeout 20s > $LOGDIR/ev_race1.log 2>&1 &
+# The first sweep has to still be holding the lease when the second asks, and a
+# sweep with nothing to evict is over in about fifty milliseconds: the first
+# version of this slept 0.2s and raced a sweep that had already finished, so it
+# measured nothing and reported the product not refusing.
+#
+# Made deterministic instead. RunOnce takes the lease before it looks at health,
+# so a config whose max_feeder_lag is impossible to satisfy leaves the first
+# sweep waiting inside the lease for the whole of its --health-timeout, which is
+# exactly the window this needs. It exits non-zero afterwards, which is the
+# fixture working rather than a failure.
+sed 's|^  max_feeder_lag:.*|  max_feeder_lag: 1ms|' "$CFG" > "$WDIR/ev_lease.yaml"
+grep -q "max_feeder_lag: 1ms" "$WDIR/ev_lease.yaml" || echo "  WARN  the lease fixture did not take"
+cline evictor --config $WDIR/ev_lease.yaml --once --health-timeout 8s > $LOGDIR/ev_race1.log 2>&1 &
 RACE1=$!
-sleep 0.2
+sleep 1
 cline evictor --config $CFG --once > $LOGDIR/ev_race2.log 2>&1
 wait $RACE1 2>/dev/null
 if grep -qiE "another evictor|lease|already running" $LOGDIR/ev_race2.log; then
@@ -110,17 +122,19 @@ else
   FAIL=$((FAIL+1)); FAILED+=("second sweep refused")
   echo "  FAIL  a second sweep is refused while one runs: $(tail -1 $LOGDIR/ev_race2.log | cut -c1-90)"
 fi
-if grep -q "sweep complete" $LOGDIR/ev_race1.log; then
-  PASS=$((PASS+1)); echo "  PASS  and the one holding the lease finishes"
+# The holder is waiting on health by construction here, so what it has to show
+# is that it held the lease throughout rather than that it swept.
+if grep -qE "not healthy enough to evict|sweep complete" $LOGDIR/ev_race1.log; then
+  PASS=$((PASS+1)); echo "  PASS  and the holder ran to its own end"
 else
-  FAIL=$((FAIL+1)); FAILED+=("first sweep finishes"); echo "  FAIL  and the one holding the lease finishes"
+  FAIL=$((FAIL+1)); FAILED+=("holder ran to its end"); echo "  FAIL  and the holder ran to its own end"
 fi
 # A dry run announces nothing and removes nothing, so it has nothing to wait for,
 # and the README says it always runs. That is the half that makes the refusal
 # above a lease rather than a lock on the whole command.
-cline evictor --config $CFG --once --health-timeout 20s > $LOGDIR/ev_race3.log 2>&1 &
+cline evictor --config $WDIR/ev_lease.yaml --once --health-timeout 8s > $LOGDIR/ev_race3.log 2>&1 &
 RACE3=$!
-sleep 0.2
+sleep 1
 cline evictor --config $CFG --once --dry-run > $LOGDIR/ev_race4.log 2>&1
 wait $RACE3 2>/dev/null
 if grep -qE "sweep complete|dry run" $LOGDIR/ev_race4.log; then
