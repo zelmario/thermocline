@@ -19,6 +19,7 @@
 NODE=${NODE:-thermocline-zelmar-node0}
 NET=${NET:-thermocline-zelmar-anydbver}
 IMAGE=${IMAGE:-prom/prometheus:v2.53.5}
+PORT=${PORT:-27100}
 PDASH=${PDASH:-27110}
 CFG=${CFG:-/root/cline.yaml}
 WORK=$(mktemp -d)
@@ -107,6 +108,46 @@ chk "every rule is loaded and evaluating" "$RULES" \
     "$(PQ rules | python3 -c 'import json,sys; print(sum(len(g["rules"]) for g in json.load(sys.stdin)["data"]["groups"]))' 2>/dev/null)"
 for _ in $(seq 1 20); do [ "$(PQ targets | grep -c '"health":"up"')" -ge 1 ] && break; sleep 2; done
 chk "and scraping the router"             "1" "$(PQ targets | grep -c '"health":"up"')"
+
+echo "== an alert that fires on a number this system reports =="
+# ThermoclineRouterDown, below, fires because the target disappeared. That is
+# Prometheus noticing an absence, and it would fire the same way for a rule
+# written against a metric this router has never heard of. This one is the
+# other kind and the one worth having: the router stays up, publishes a
+# counter, and the rule reads it.
+#
+# A stale read is one command away here. This suite runs a router and no
+# feeder, so mirroring has published no position at all, and a read that falls
+# through to the archive gives up waiting at once and answers anyway. That is
+# exactly what stale_reads_total counts, and it is the one counter in
+# docs/monitoring.md whose text says any value above zero is worth
+# investigating.
+BEFORE=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
+         | awk '/^thermocline_stale_reads_total /{print $2}')
+docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'db.getSiblingDB("shop").tprobe.find({v:{$gt:0}}).limit(5).itcount()' >/dev/null 2>&1
+AFTER=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
+        | awk '/^thermocline_stale_reads_total /{print $2}')
+echo "  stale_reads_total went from ${BEFORE:-?} to ${AFTER:-?}"
+# The premise, checked before the alert is waited for. Without this a rule that
+# never fires and a read that was never stale report the same failure, and the
+# wait below would burn two minutes saying the wrong thing.
+chk "the read was actually counted as stale" "true" \
+    "$([ -n "$AFTER" ] && [ "${AFTER:-0}" -gt "${BEFORE:-0}" ] && echo true || echo false)"
+# A second one, so increase() has two rising samples inside its window rather
+# than one edge.
+docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'db.getSiblingDB("shop").tprobe.find({v:{$gt:1}}).limit(5).itcount()' >/dev/null 2>&1
+for _ in $(seq 1 36); do
+  PQ rules | grep -q '"ThermoclineStaleRead","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineStaleRead fires on a real stale read" "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineStaleRead": print(r.get("state"))' 2>/dev/null)"
 
 echo "== an alert that should fire, does =="
 # The router is stopped, so up{job="thermocline"} goes to 0. Its rule waits two
