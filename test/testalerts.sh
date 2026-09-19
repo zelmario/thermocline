@@ -149,6 +149,33 @@ for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineStaleRead": print(r.get("state"))' 2>/dev/null)"
 
+# And the rule added on 2026-09-18, which until now was only checked for being
+# spelled correctly and naming a metric that exists.
+#
+# It fires here on the feeder-down state rather than on a feeder that is merely
+# behind, and the check is named for what it proves rather than for what the
+# rule is for. With no feeder the gauge renders +Inf, which is "this router
+# cannot tell", and the rule treats that as worth a warning. A feeder that is
+# running and behind is the case this does not reach, and producing it needs a
+# feeder held back for two minutes.
+#
+# Worth having anyway: +Inf is a real production state, it is the one an
+# operator meets when a feeder dies, and firing it exercises the gauge, the
+# exporter and the expression together. Measured while writing this, with a
+# router up and no feeder: mirroring_cluster_time_behind_seconds +Inf while
+# mirroring_lag_seconds read 1507, which is the two bars disagreeing exactly as
+# docs/limitations.md describes.
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineClusterTimeBehind fires with no feeder" "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineClusterTimeBehind": print(r.get("state"))' 2>/dev/null)"
+
 echo "== an alert that should fire, does =="
 # The router is stopped, so up{job="thermocline"} goes to 0. Its rule waits two
 # minutes, and waiting for it is the whole point: a rule that only ever gets
