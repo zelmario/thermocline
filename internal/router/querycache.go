@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,14 +119,43 @@ func (c *conn) cacheKey(name, ns string, cmd bson.Raw) string {
 	if err != nil {
 		return ""
 	}
+	// The same fields the advisor's shape ignores, and in the same order.
+	//
+	// These two decide one thing between them: whether two commands are the
+	// same query. The advisor recommends caching a shape and this key is what
+	// has to hit for that recommendation to mean anything, so a field the shape
+	// joins and the key separates is a query the report calls worth caching and
+	// the cache never serves. Measured as a divergence rather than reasoned
+	// about: the key carried comment and maxTimeMS and hashed the fields in
+	// wire order, where cache.Shape drops both and sorts. Every APM agent sets
+	// a distinct comment per request.
+	//
+	// cursor is the one field the shape drops that this keeps, because it
+	// changes the reply rather than the question. Only a reply whose cursor is
+	// already closed is stored, so a stored answer is one that fitted in a
+	// single batch, and handing it to a caller who asked for a smaller
+	// batchSize would put more documents in their first batch than they asked
+	// for.
+	keys := make([]string, 0, len(elems))
+	byKey := make(map[string]bson.RawValue, len(elems))
 	for _, e := range elems {
-		if sessionFields[e.Key()] || e.Key() == "$readPreference" {
+		k := e.Key()
+		if sessionFields[k] || k == "$readPreference" {
 			continue
 		}
-		h.Write([]byte(e.Key()))
+		if cache.SkipInShape(k) && k != "cursor" {
+			continue
+		}
+		keys = append(keys, k)
+		byKey[k] = e.Value()
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := byKey[k]
+		h.Write([]byte(k))
 		h.Write([]byte{0})
-		h.Write(e.Value().Value)
-		h.Write([]byte{byte(e.Value().Type)})
+		h.Write(v.Value)
+		h.Write([]byte{byte(v.Type)})
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

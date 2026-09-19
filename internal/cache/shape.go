@@ -72,6 +72,16 @@ func Shape(name, ns string, cmd bson.Raw) (shape string, params uint64) {
 // skipInShape are the fields that belong to a conversation rather than to the
 // question. Two clients asking the same thing in different sessions are asking
 // the same thing.
+// SkipInShape reports whether a command field is left out when deciding that
+// two commands are the same query.
+//
+// Exported because the router's cache key has to agree with it. The advisor
+// recommends caching a shape; a key that separates what the shape joins makes
+// that recommendation unactionable, and the application most affected is the
+// ordinary one: every APM agent sets a distinct comment per request, and
+// drivers compute a per-call maxTimeMS.
+func SkipInShape(key string) bool { return skipInShape[key] }
+
 var skipInShape = map[string]bool{
 	"lsid": true, "txnNumber": true, "autocommit": true, "startTransaction": true,
 	"$clusterTime": true, "$db": true, "$readPreference": true, "apiVersion": true,
