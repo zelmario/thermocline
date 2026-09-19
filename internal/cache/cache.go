@@ -104,6 +104,18 @@ type Cache struct {
 	Hits     uint64
 	Misses   uint64
 	Learned  uint64
+	// Invalidated counts held answers dropped because something wrote to a
+	// collection they depended on.
+	//
+	// It is the number that explains a hit rate of nothing, and until it
+	// existed an operator had hits, misses and no way to tell a cache that is
+	// useless from a cache that is being emptied. A write-heavy collection
+	// drops every answer it holds on every write: measured on the shop, 8.6
+	// order inserts a second against reports arriving at 1.7 a second, so a
+	// cached report survives about 0.12s and almost nothing is ever served.
+	// That is correct behaviour and it is also the whole reason the feature
+	// does nothing there, which is worth being able to see.
+	Invalidated uint64
 	// Rejected counts answers too large to hold, which is worth knowing: a
 	// cache that looks idle may simply be being handed things it will not keep.
 	Rejected uint64
@@ -366,6 +378,7 @@ func (c *Cache) Invalidate(ns string) int {
 		}
 	}
 	delete(c.byNS, ns)
+	c.Invalidated += uint64(n)
 	return n
 }
 
@@ -377,9 +390,9 @@ func (c *Cache) Invalidate(ns string) int {
 // two of them. It is also the only way the five numbers describe the same
 // moment.
 type Stats struct {
-	Hits, Misses, Learned, Rejected uint64
-	Entries                         int
-	Bytes                           int
+	Hits, Misses, Learned, Rejected, Invalidated uint64
+	Entries                                      int
+	Bytes                                        int
 }
 
 // Stats reports what this cache has done and what it is holding.
@@ -387,12 +400,13 @@ func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Hits:     c.Hits,
-		Misses:   c.Misses,
-		Learned:  c.Learned,
-		Rejected: c.Rejected,
-		Entries:  len(c.byKey),
-		Bytes:    c.bytes,
+		Hits:        c.Hits,
+		Misses:      c.Misses,
+		Learned:     c.Learned,
+		Rejected:    c.Rejected,
+		Invalidated: c.Invalidated,
+		Entries:     len(c.byKey),
+		Bytes:       c.bytes,
 	}
 }
 
@@ -427,6 +441,7 @@ func (c *Cache) InvalidateDatabase(db string) int {
 			n++
 		}
 	}
+	c.Invalidated += uint64(n)
 	return n
 }
 

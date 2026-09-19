@@ -33,6 +33,31 @@ scrape_configs:
       - targets: ["router-1.internal:27101"]
 ```
 
+#### Why a cache can hold nothing
+
+`thermocline_cache_invalidated_total` is the number to read when the hit rate is
+zero and nothing else explains it. **A write to a collection drops every held
+answer that read it**, which is what makes the cache safe to run in front of a
+database people are writing to, and it is also why the feature does nothing on a
+write-heavy collection.
+
+The arithmetic is worth doing before blaming the cache. On the four-hour
+two-application run, the shop placed **8.6 orders a second** and asked for a
+monthly revenue report **1.7 times a second**. A held report therefore survives
+about **0.12 seconds**, and almost every report arrives to find its answer
+already dropped. The measured hit rate on that shape was about 1%, which is what
+those two numbers predict.
+
+So read the three together:
+
+    cache_hits_total        near zero
+    cache_invalidated_total climbing with your write rate   -> the cache is being emptied
+    cache_invalidated_total near zero as well               -> nothing repeats; see cline cache
+
+The first case is not a cache that cannot learn. It is a cache working exactly
+as designed on a workload it cannot help, and the remedy is to cache a
+collection that is read far more than it is written, not to tune anything.
+
 #### Change streams
 
 `thermocline_change_streams_total` counts streams opened over tiered data, on a

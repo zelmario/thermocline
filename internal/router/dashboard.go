@@ -69,10 +69,14 @@ type CacheSnapshot struct {
 	// Entries and Bytes are what the hit rate cannot explain: a cache at its
 	// max_bytes is evicting answers it learned, and one whose entries sit at
 	// max_queries is forgetting a query on every new one.
-	Entries  int           `json:"entries"`
-	Bytes    int           `json:"bytes"`
-	Rejected uint64        `json:"rejected"`
-	Advice   []CacheAdvice `json:"advice"`
+	Entries  int    `json:"entries"`
+	Bytes    int    `json:"bytes"`
+	Rejected uint64 `json:"rejected"`
+	// Invalidated is held answers dropped because something wrote to a
+	// collection they depended on. It is the number that explains a hit rate of
+	// nothing: a write-heavy collection empties its own cache.
+	Invalidated uint64        `json:"invalidated"`
+	Advice      []CacheAdvice `json:"advice"`
 }
 
 // CacheAdvice is one row: a query, how often it is asked, how long its answer
@@ -93,6 +97,7 @@ func (r *Router) cacheSnapshot() CacheSnapshot {
 		cs := r.cache.Stats()
 		out.Hits, out.Misses = cs.Hits, cs.Misses
 		out.Entries, out.Bytes, out.Rejected = cs.Entries, cs.Bytes, cs.Rejected
+		out.Invalidated = cs.Invalidated
 		if total := out.Hits + out.Misses; total > 0 {
 			out.HitRate = float64(out.Hits) / float64(total)
 		}

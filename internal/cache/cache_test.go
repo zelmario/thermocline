@@ -483,3 +483,51 @@ func BenchmarkCacheGetUnderEviction(b *testing.B) {
 		<-done
 	})
 }
+
+// The number that explains a hit rate of nothing.
+//
+// A write-heavy collection empties its own cache: every write to it drops every
+// answer that read it, which is correct and is also the whole reason the
+// feature does nothing there. Measured on the shop, 8.6 order inserts a second
+// against reports arriving at 1.7 a second, so a cached report survives about
+// 0.12s. Before this counter an operator saw hits, misses, and no way to tell a
+// cache that cannot learn from one that is being emptied faster than it fills.
+func TestInvalidationIsCounted(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	reply := []byte("an answer")
+	// Both first sightings, then the clock moves once, then both second
+	// sightings: that way each earns the same TTL and neither has aged when
+	// the Get below runs. Storing them one after the other instead advances the
+	// clock past the first one's TTL while setting up the second.
+	c.Observe("q1", "shop.orders", reply)
+	c.Observe("q2", "shop.orders", reply)
+	k.add(time.Minute)
+	c.Observe("q1", "shop.orders", reply)
+	c.Observe("q2", "shop.orders", reply)
+	if _, ok := c.Get("q1"); !ok {
+		t.Fatal("nothing was cached, so this test proves nothing")
+	}
+	if got := c.Stats().Invalidated; got != 0 {
+		t.Errorf("invalidated = %d before any write, want 0", got)
+	}
+
+	if n := c.Invalidate("shop.orders"); n != 2 {
+		t.Errorf("Invalidate dropped %d entries, want 2", n)
+	}
+	if got := c.Stats().Invalidated; got != 2 {
+		t.Errorf("invalidated = %d, want 2", got)
+	}
+	if _, ok := c.Get("q1"); ok {
+		t.Error("an answer survived a write to the collection it read")
+	}
+
+	// A write to a collection nothing cached drops nothing and counts nothing,
+	// or the number would grow on every write in the deployment and say less
+	// than it does.
+	if n := c.Invalidate("shop.untouched"); n != 0 {
+		t.Errorf("Invalidate of an uncached namespace dropped %d, want 0", n)
+	}
+	if got := c.Stats().Invalidated; got != 2 {
+		t.Errorf("invalidated = %d after an unrelated write, want 2", got)
+	}
+}
