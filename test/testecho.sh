@@ -241,6 +241,57 @@ chk "the one nobody wrote to is untouched"           "old" \
 chk "the warm's notices were spent"                  "0" \
     "$(C "print(db.getSiblingDB(process.env.TC_META).warming.countDocuments({_id:{\$regex:'^'+process.env.TC_DB+'\\.$NS'}}))")"
 
+echo "== a warm is not mirrored back =="
+# The counterpart of "a promotion is not mirrored back" above, which the warm
+# path did not have. What it had was the section before this one: that a warm
+# must not *swallow* the application's own write, which is over-suppression.
+# Nothing checked under-suppression, so a feeder that suppressed no warm echo at
+# all passed every check in this suite but one, and that one noticed only
+# indirectly, by the notices going unspent.
+#
+# Found by breaking warmingActive to return false and running the suites against
+# it: go test passed, testwarm passed all 57, testchange passed all 49, and
+# testecho failed on "the warm's notices were spent". A guard worth having is
+# worth a check that names what it prevents.
+#
+# The mechanism, which is the same trick the promotion section uses: mark the
+# archive's own copy after the warm has copied it up and before the feeder ever
+# sees that copy-up. Suppressed, the feeder drops the echo and the mark stays.
+# Mirrored back, the fast tier's copy overwrites the archive's and takes the
+# mark with it.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).warming.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:40,v:'archived',at:new Date()},{_id:41,v:'archived',at:new Date()}])" >/dev/null
+# The feeder's log goes with the daemons, while nothing holds it open. The
+# section before this one already ran a warmer and started a feeder, so the line
+# the control below greps for is in this file already, and without removing it
+# the control would pass on that one and say nothing about this section. That is
+# the same fault found in testfresh on 2026-09-18, in a suite written long
+# before. Removing it with a feeder running would be worse: the feeder keeps
+# writing to the unlinked file and the grep then finds nothing whatever happens.
+rm -f $LOGDIR/echo_f.log
+# No feeder and no router while the warm runs, so the only writer the fast tier
+# sees is the warmer itself.
+cline warmer --config $WDIR/echo_warm.yaml >/dev/null 2>&1
+chk "the warm copied both up"                        "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:{\$in:[40,41]}}))")"
+# The mark goes on the archive's copy, which the fast tier's copy does not have.
+C "db.getSiblingDB(process.env.TC_DB).$NS.updateMany({_id:{\$in:[40,41]}},{\$set:{marker:'kept'}})" >/dev/null
+startFeeder
+sleep 8
+chk "the warm did not overwrite the archive"         "kept" "$(marker 40)"
+chk "nor the second document"                        "kept" "$(marker 41)"
+chk "and both are still live in the archive"         "true" \
+    "$(C "const a=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:40}); const b=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:41}); print(!!a && !a._tcDeletedAt && !!b && !b._tcDeletedAt)")"
+# The control for the control. If the feeder never noticed a warmer was running
+# then it suppressed nothing and the marks above survived for the wrong reason,
+# which is the way this check would rot: the marker goes stale after
+# markerFresh, so a slow startup here turns a real check into a vacuous one.
+chk "and the feeder suppressed rather than missed it" "true" \
+    "$(grep -q 'warmer detected, suppressing' $LOGDIR/echo_f.log && echo true || echo false)"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
