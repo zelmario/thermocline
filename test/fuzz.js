@@ -109,7 +109,7 @@ const SORTABLE = FIELDS.map(f => f.p);
 // wrong.
 function predicate(f) {
   const v = f.v(), w = f.v();
-  switch (ri(14)) {
+  switch (ri(15)) {
     case 0:  return v;
     case 1:  return { $ne: v };
     case 2:  return { $gt: v };
@@ -119,6 +119,14 @@ function predicate(f) {
     case 6:  return { $in: [v, w] };
     case 7:  return { $nin: [v, w] };
     case 8:  return { $exists: maybe(0.7) };
+    // A regex, which the generator could not produce at all until 2026-09-19.
+    // Only on a string field: against a number it matches nothing on both
+    // sides and the comparison agrees without having asked anything. It is
+    // here because a regex is not a range, so the planner brackets it
+    // differently from every other predicate above, and the archive path has
+    // to bracket it the same way.
+    case 14: return f.t === 'str' ? { $regex: pick(['^user0', '^s', 'a', '[0-9]$']) }
+                                  : { $ne: v };
     // Ordered, because the two values are drawn independently and about half
     // of them came out with the start after the end. An empty range matches
     // nothing on either side, so the operation agreed without having asked
@@ -376,7 +384,7 @@ function facetBranch() {
 function pipeline() {
   const stages = [];
   if (maybe(0.8)) stages.push({ $match: filter(1) });
-  switch (ri(16)) {
+  switch (ri(18)) {
     case 0:
       stages.push({ $group: { _id: '$' + pick(['grp', 'opt', 'meta.active']),
                               c: { $sum: 1 }, s: { $sum: '$n' }, mx: { $max: '$f' } } });
@@ -385,7 +393,12 @@ function pipeline() {
       stages.push({ $unwind: '$tags' }, { $group: { _id: '$tags', c: { $sum: 1 } } });
       break;
     case 2:
-      stages.push({ $sort: sortSpec() }, { $limit: 1 + ri(20) });
+      // With a skip as well as a limit. A skip is applied after the sort and
+      // before the limit, so a tier given half the documents skips past
+      // different ones: the shape where an answer is not short but wrong.
+      // sortSpec always ends in _id, so there are no ties for the skip to
+      // resolve differently on the two sides.
+      stages.push({ $sort: sortSpec() }, { $skip: ri(6) }, { $limit: 1 + ri(20) });
       break;
     case 3:
       stages.push({ $project: { n: 1, grp: 1, dbl: { $multiply: ['$n', 2] } } });
@@ -479,6 +492,27 @@ function pipeline() {
       // because which ones is random and the size is not. It says whether the
       // pool sampled from was the whole collection.
       stages.push({ $sample: { size: 1 + ri(30) } }, { $count: 'c' });
+      break;
+    case 16:
+      // A replacing stage, which says what the whole document becomes rather
+      // than naming fields. The generator could not produce one until
+      // 2026-09-19, and a real defect had been found in exactly this shape the
+      // day before: the reserved field guard read $replaceRoot at the depth
+      // $replaceWith takes its argument, so the documented spelling went
+      // through unread. Grouped afterwards, because a replaced root is
+      // compared by what it contains and not by the order it arrives in.
+      stages.push({ $replaceWith: { $mergeObjects: ['$$ROOT', { band: { $cond: [{ $gt: ['$n', 30] }, 'high', 'low'] } }] } },
+                  { $group: { _id: '$band', c: { $sum: 1 }, s: { $sum: '$n' } } },
+                  { $sort: { _id: 1 } });
+      break;
+    case 17:
+      // The other spelling of the same thing, which is the whole reason both
+      // are here: $replaceWith takes the document and $replaceRoot wraps it in
+      // newRoot, and a reader that handles one and not the other is the defect
+      // this pair exists to catch.
+      stages.push({ $replaceRoot: { newRoot: { g: '$grp', n: '$n' } } },
+                  { $group: { _id: '$g', c: { $sum: 1 }, s: { $sum: '$n' } } },
+                  { $sort: { _id: 1 } });
       break;
     default:
       stages.push({ $sortByCount: '$grp' });
