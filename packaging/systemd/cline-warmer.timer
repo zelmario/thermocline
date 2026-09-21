@@ -1,0 +1,18 @@
+# Hourly, and read cline-warmer.service for why that number is a starting point
+# rather than a recommendation.
+#
+# Persistent=true so a host that was down over the hour warms when it comes
+# back, rather than waiting for the next one. RandomizedDelaySec keeps several
+# routers' hosts from warming the same namespaces at the same instant.
+[Unit]
+Description=Warm the fast tier from the archive, hourly
+Documentation=https://github.com/zelmario/thermocline
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5m
+Unit=cline-warmer.service
+
+[Install]
+WantedBy=timers.target

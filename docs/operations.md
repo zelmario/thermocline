@@ -233,6 +233,72 @@ that fills up. `--dry-run` takes no lease at all: it announces nothing and
 removes nothing, so the one command you reach for to understand the system
 always answers.
 
+### Running them as services
+
+`packaging/systemd/` has a unit for each one, and `packaging/install.sh` puts
+them where they belong:
+
+```
+sudo packaging/install.sh bin/cline
+sudo install -m 0640 -o cline -g cline cline.yaml /etc/cline/cline.yaml
+cline preflight --config /etc/cline/cline.yaml
+sudo systemctl enable --now cline-feeder          # and let it catch up first
+sudo systemctl enable --now cline-router cline-evictor cline-warmer.timer
+```
+
+The installer creates a `cline` system account that owns neither tier, the
+directories, the units and the logrotate file, and it is safe to run again: the
+one thing it never writes is `/etc/cline/cline.yaml`, because the two URIs in it
+are the only thing here nobody can guess and overwriting a working one during an
+upgrade is the kind of help nobody wants. Run over a deployment that is already
+up, it says so and gives the restart order rather than the install one.
+
+The config holds the credentials for both tiers, which is why it is `0640` and
+owned by the account rather than by root.
+
+**Three of them are daemons and the fourth is not.** The feeder, the router and
+the evictor run until they are stopped. `cline warmer` makes one pass, prints
+`warm complete` and exits, so it is a `oneshot` unit driven by
+`cline-warmer.timer` rather than a service with `Restart=`. Written the other
+way it warms the fast tier every ten seconds for ever. The timer ships at
+hourly, which is a starting point and not a recommendation: a warm exists to put
+back what reads are about to ask for, so the cycle belongs to the application's
+reading pattern, and a warm with nothing to do copies nothing.
+
+**Restart=always on the feeder is what makes a standby.** Install the feeder
+unit on two hosts and enable it on both. One mirrors; the other is refused every
+ten seconds by the lease, which says who holds it, and takes over when the
+holder stops: 122 ms after a clean stop, 129 ms after `kill -9`, thirty seconds
+when the host itself is gone. That is why the unit also sets
+`StartLimitIntervalSec=0`. systemd's default gives up after five failures in
+ten seconds, and a feeder waiting out a lease is a feeder doing its job, not one
+failing.
+
+**The router's restart loop is the archive outage procedure.** A router refuses
+to start while the archive is unreachable, on purpose. `Restart=always` turns
+that into "it serves again as soon as the archive is back" rather than "somebody
+has to notice". Nothing orders the router after the feeder: that order belongs
+to the day you adopt a cluster, not to a reboot.
+
+**The router's unit raises `LimitNOFILE`, and it has to.** While authentication
+is proxied, which is the default, each client costs two file descriptors on the
+router: its own socket and the upstream connection carrying its SCRAM identity.
+systemd's default soft limit is 1024, so a router left with it meets "too many
+open files" at about five hundred clients, before the thousand-client warning
+the router itself prints, and well before mongod's connection limit, which is
+where this document says the wall is. The unit sets 65535 so that stays true.
+
+**`ProtectSystem=strict` is why `log.file` has to live under `/var/log/cline`.**
+The units make the whole filesystem read-only and name that one directory as
+writable. Point `log.file` somewhere else and the daemon starts and writes
+nothing, so add the directory to `ReadWritePaths=` in the unit, or leave the
+logs in the journal where the units put them by default.
+
+**A restart does not resume eviction.** `cline pause` writes the pause into the
+archive's bookkeeping, not into the process, so an evictor restarted while the
+archive is being restored comes back paused. `cline resume` is the only thing
+that ends it.
+
 ### Logs
 
 Every daemon logs to stderr by default. Under systemd that is what you want,
@@ -250,7 +316,8 @@ overrides it per process, which is how you keep them in separate files. A
 configured file behaves like mongod's `systemLog.path`: everything goes to the
 file and nothing to the terminal.
 
-Rotation is logrotate's job, and it only works if you signal the process:
+Rotation is logrotate's job, and `packaging/logrotate/cline` is the file. It
+only works if you signal the process:
 
 ```
 /var/log/cline/*.log {

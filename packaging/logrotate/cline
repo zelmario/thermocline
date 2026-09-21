@@ -1,0 +1,19 @@
+# Only needed when log.file sends the daemons to files. Under the units in
+# packaging/systemd they log to the journal, which journald rotates itself.
+#
+# The postrotate line is the part that is not boilerplate. Without the SIGHUP
+# the daemon goes on writing to the renamed inode: the file you are tailing
+# stays empty and the disk fills up behind it.
+/var/log/cline/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 cline cline
+    sharedscripts
+    postrotate
+        pkill -HUP -f '^/usr/local/bin/cline' || true
+    endscript
+}

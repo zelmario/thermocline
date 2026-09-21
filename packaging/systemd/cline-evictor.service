@@ -1,0 +1,47 @@
+# The evictor, as a service.
+#
+# Its lease is per sweep rather than per process, so a restart in the middle of
+# one is safe: the next sweep takes the lease again, and a sweep run by hand
+# with --once while this one is mid-pass is refused rather than overlapped.
+#
+# What a restart does not do is undo `cline pause`. The pause lives in the
+# archive's bookkeeping, not in the process, so an evictor restarted while the
+# archive is being restored comes back paused, which is the whole point of
+# having written it down there. `cline resume` is what ends it.
+[Unit]
+Description=Thermocline evictor (remove documents the archive already holds)
+Documentation=https://github.com/zelmario/thermocline
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cline
+Group=cline
+ExecStart=/usr/local/bin/cline evictor --config /etc/cline/cline.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10s
+# Logs go to the journal, which is what a daemon logging to stderr wants. Set
+# log.file in the config instead if you would rather have files, and give
+# logrotate the SIGHUP line from docs/operations.md.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline-evictor
+# It reads two databases and writes nothing on this host.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# ProtectSystem=strict makes the whole filesystem read-only, so this is the one
+# place a daemon can write. A log.file anywhere else needs its own entry here,
+# and without one the daemon starts, logs nothing and says why to a terminal
+# nobody is watching.
+ReadWritePaths=/var/log/cline
+
+[Install]
+WantedBy=multi-user.target

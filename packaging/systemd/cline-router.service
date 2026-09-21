@@ -1,0 +1,61 @@
+# The router, as a service.
+#
+# This is the address the application connects to, so it is the unit that has to
+# come back by itself. A router refuses to start while the archive is
+# unreachable, which is deliberate and is written up in docs/operations.md: it
+# would rather not serve than serve half a collection. Restart=always with a ten
+# second pause is what turns that refusal into "it starts as soon as the archive
+# is back" instead of "somebody has to notice".
+#
+# Unlike the feeder there is no lease and no limit: run as many routers as the
+# application needs, on as many hosts.
+#
+# Nothing here orders it after the feeder. The order in docs/adoption.md is for
+# the day you adopt a cluster, when the archive has to catch up before anything
+# reads through it. On an ordinary reboot the archive is already the complete
+# copy and the router is what the application is waiting for.
+[Unit]
+Description=Thermocline router (serve both tiers on one address)
+Documentation=https://github.com/zelmario/thermocline
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cline
+Group=cline
+ExecStart=/usr/local/bin/cline router --config /etc/cline/cline.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10s
+# Two file descriptors per client while authentication is proxied: the client's
+# socket, and the upstream connection that carries that client's identity and
+# cannot be shared. systemd's own default soft limit is 1024, so a router left
+# with it meets "too many open files" at about five hundred clients -- before
+# the thousand-client warning it prints, and well before mongod's limit, which
+# is where docs/operations.md says the wall is. Raised here so the wall is the
+# one the document describes.
+LimitNOFILE=65535
+# Logs go to the journal, which is what a daemon logging to stderr wants. Set
+# log.file in the config instead if you would rather have files, and give
+# logrotate the SIGHUP line from docs/operations.md.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline-router
+# It reads two databases and writes nothing on this host.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# ProtectSystem=strict makes the whole filesystem read-only, so this is the one
+# place a daemon can write. A log.file anywhere else needs its own entry here,
+# and without one the daemon starts, logs nothing and says why to a terminal
+# nobody is watching.
+ReadWritePaths=/var/log/cline
+
+[Install]
+WantedBy=multi-user.target

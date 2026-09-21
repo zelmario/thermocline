@@ -86,20 +86,25 @@ why.
 
 ## Using it
 
-Four long-running components. Start the feeder first and let it catch up, then
-the router; the warmer and the evictor are safe to leave until the fast tier has
-something in it. [docs/adoption.md](docs/adoption.md) is the numbered order for
-a cluster that is already serving traffic, and it matters.
+Three long-running components and one that makes a pass and exits. Start the
+feeder first and let it catch up, then the router; the warmer and the evictor
+are safe to leave until the fast tier has something in it.
+[docs/adoption.md](docs/adoption.md) is the numbered order for a cluster that is
+already serving traffic, and it matters.
 
 ```
 cline feeder  --config cline.yaml     # mirror writes from the fast tier into the archive
 cline router  --config cline.yaml     # serve both tiers on one address
-cline warmer  --config cline.yaml     # fill the fast tier from the archive
+cline warmer  --config cline.yaml     # fill the fast tier from the archive, once, then exit
 cline evictor --config cline.yaml     # remove documents the archive already holds
 ```
 
 Point the application's connection string at `router.listen` and nothing in the
 application changes.
+
+`packaging/systemd/` has a unit for each of them, and the warmer's is a timer
+rather than a service for the reason above. See "Running them as services" in
+[docs/operations.md](docs/operations.md).
 
 Then the commands you reach for while it runs:
 

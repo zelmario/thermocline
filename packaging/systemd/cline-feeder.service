@@ -1,0 +1,54 @@
+# The feeder, as a service.
+#
+# Restart=always and a ten second pause are not boilerplate here. A feeder
+# refuses to start while another one holds the lease, and that refusal is the
+# ordinary state during a failover: the replacement retries until the holder's
+# lease expires, which is thirty seconds for a host that vanished and
+# milliseconds for one that stopped. StartLimitIntervalSec=0 turns off systemd's
+# give-up counter for the same reason, because a unit that fails five times
+# while waiting out a lease is a unit doing its job.
+#
+# That makes the pattern worth knowing: install this unit on two hosts and
+# enable it on both. One mirrors, the other is refused every ten seconds and
+# takes over when the first stops. Measured on the test cluster: 122 ms after a
+# clean stop, 129 ms after kill -9, and thirty seconds when the host itself is
+# gone. Two feeders that both believe they are the only one is the case the
+# lease exists to prevent -- see "One of each daemon" in docs/operations.md --
+# and it cannot happen this way.
+[Unit]
+Description=Thermocline feeder (mirror the fast tier into the archive)
+Documentation=https://github.com/zelmario/thermocline
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cline
+Group=cline
+ExecStart=/usr/local/bin/cline feeder --config /etc/cline/cline.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10s
+# Logs go to the journal, which is what a daemon logging to stderr wants. Set
+# log.file in the config instead if you would rather have files, and give
+# logrotate the SIGHUP line from docs/operations.md.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline-feeder
+# It reads two databases and writes nothing on this host.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# ProtectSystem=strict makes the whole filesystem read-only, so this is the one
+# place a daemon can write. A log.file anywhere else needs its own entry here,
+# and without one the daemon starts, logs nothing and says why to a terminal
+# nobody is watching.
+ReadWritePaths=/var/log/cline
+
+[Install]
+WantedBy=multi-user.target

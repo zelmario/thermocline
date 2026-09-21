@@ -1,0 +1,44 @@
+# The warmer, as a service, and it is the one that is not a daemon.
+#
+# `cline warmer` makes one pass and exits, printing "warm complete". The other
+# three run until they are stopped. Written as Type=simple with Restart=always,
+# as the other three are, it would warm the fast tier every ten seconds for
+# ever; hence oneshot here and cline-warmer.timer beside it.
+#
+# How often is a question about the deployment rather than about this unit. A
+# warm exists to put documents back on the fast tier that reads are about to
+# want: after an adoption, after the fast tier is restored, and on whatever
+# cycle the application's reads reach back further than the fast tier holds. The
+# timer ships at hourly because that is a number that cannot do harm -- a warm
+# with nothing to do scans and copies nothing -- and not because it is the right
+# one for anybody in particular.
+#
+# It is also what records the completeness claim for the namespaces it warms,
+# which is why a rule with no date_field is refused rather than claimed. See
+# docs/watermark.md.
+[Unit]
+Description=Thermocline warmer (fill the fast tier from the archive)
+Documentation=https://github.com/zelmario/thermocline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cline
+Group=cline
+ExecStart=/usr/local/bin/cline warmer --config /etc/cline/cline.yaml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline-warmer
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# ProtectSystem=strict makes the whole filesystem read-only, so this is the one
+# place a daemon can write. A log.file anywhere else needs its own entry here,
+# and without one the daemon starts, logs nothing and says why to a terminal
+# nobody is watching.
+ReadWritePaths=/var/log/cline
