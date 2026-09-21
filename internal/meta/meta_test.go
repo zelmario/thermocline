@@ -428,18 +428,25 @@ func field(d bson.D, name string) interface{} {
 // $currentDate is the whole fix. It cannot drift, there is no reading to take
 // and no correction to apply, and it works on every version this supports.
 func TestInstantsOthersJudgeComeFromTheArchive(t *testing.T) {
+	// The announcement became a pipeline when the counter had to be floored
+	// rather than incremented, so it stamps its instant with $$NOW in a $set
+	// instead of with $currentDate. Both are the archive's own clock, which is
+	// the property this test is about, so it accepts either shape rather than
+	// the spelling one of them happened to use.
+	t.Run("an eviction announcement", func(t *testing.T) {
+		set := setStage(t, EvictionAnnouncement())
+		if got := field(set, "at"); got != "$$NOW" {
+			t.Fatalf("at is %#v, want $$NOW: it is expired by the archive's TTL monitor, "+
+				"and an early expiry loses documents from both tiers", got)
+		}
+	})
+
 	cases := []struct {
 		what   string
 		update bson.D
 		field  string
 		why    string
 	}{
-		{
-			what:   "an eviction announcement",
-			update: EvictionAnnouncement(),
-			field:  "at",
-			why:    "expired by the archive's TTL monitor; an early expiry loses documents from both tiers",
-		},
 		{
 			what:   "this system's own DDL",
 			update: OwnDDLAnnouncement(OwnDDLSpan{Tok: "t"}),
@@ -503,4 +510,37 @@ func TestInstantsOthersJudgeComeFromTheArchive(t *testing.T) {
 			t.Errorf("since is %v, want the existing value or the archive's clock", arms)
 		}
 	})
+}
+
+// The announcement counter may never be read down below zero, and an
+// announcement has to lift a damaged row back to a state a notice is seen in.
+//
+// This is the arithmetic behind a measured loss. Two feeders watching one
+// namespace each spend the same notice, which took pending to -1 under $inc.
+// Nothing was lost at that moment. The next eviction of those documents
+// announced them from -1 to 0, a notice counts only above zero, and the feeder
+// read a real eviction as the application deleting the document: 40 of 40
+// tombstoned in the archive and already gone from the fast tier, with the
+// misconfiguration long since corrected. One feeder throughout lost none.
+//
+// So the spend floors at zero and the announcement lifts to at least one. The
+// second is what heals a deployment whose counters are already negative, which
+// flooring the spend cannot do on its own.
+func TestTheEvictionCounterCannotStrandADocument(t *testing.T) {
+	set := setStage(t, EvictionAnnouncement())
+	pending, ok := field(set, "pending").(bson.D)
+	if !ok {
+		t.Fatalf("pending is %#v, want an expression", field(set, "pending"))
+	}
+	arms, ok := field(pending, "$max").(bson.A)
+	if !ok || len(arms) != 2 {
+		t.Fatalf("an announcement sets pending with %#v, want $max over two arms: "+
+			"+1 alone leaves a row that two feeders drove negative below the threshold "+
+			"a notice is seen at, and the next eviction of that document is read as a delete",
+			pending)
+	}
+	if arms[0] != 1 {
+		t.Fatalf("the floor of an announcement is %#v, want 1: an announcement means at least "+
+			"one eviction is pending", arms[0])
+	}
 }

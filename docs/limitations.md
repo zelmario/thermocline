@@ -6,6 +6,16 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **Two feeders with different ids are not refused, and they double the work.**
+  The lease stops two of the same daemon with the same id; two with different
+  ids watching the same namespaces are not detected by anything, because nothing
+  reads another feeder's position. Since 2026-09-21 the harm is bounded: the
+  eviction counter floors at zero, so the state that used to destroy documents
+  later cannot be reached. What is left is doubled mirroring, doubled oplog
+  reading and two checkpoints, which is waste rather than loss. Detection would
+  mean recording the namespace set on the lease and comparing across ids, and
+  nothing does that yet.
+
 - **A warm rule that ages by a date field needs an index on the archive, and
   the obvious one makes it worse.** The warmer reads the archive newest first,
   and for a `date_field` rule that sort is `{field: -1, _id: -1}`. Nothing

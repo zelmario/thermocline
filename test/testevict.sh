@@ -679,6 +679,50 @@ H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 rm -rf $WDIR/restbak
 
+echo "== an announcement counter that went negative must not strand a document =="
+# Measured on 2026-09-21: two feeders watching one namespace each spend the same
+# eviction notice, which drove pending to -1. Nothing was lost at that moment.
+# The next eviction of those documents announced them from -1 to 0, a notice
+# counts only above zero, and the feeder read a real eviction as the application
+# deleting the document: 40 of 40 tombstoned in the archive and already gone
+# from the fast tier, with the misconfiguration long since corrected. One feeder
+# throughout lost none.
+#
+# The spend floors at zero now and an announcement lifts to at least one, which
+# is what heals a deployment already damaged. This drives the row to -1 directly
+# rather than by running a second feeder, because the state is what destroys
+# documents and it outlives whatever produced it.
+NNS=tevneg
+H "db.getSiblingDB(process.env.TC_DB).$NNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NNS.drop()" >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/t_ev_neg.log & NFP=$!
+sleep 3
+H "const old = Math.floor(Date.now()/1000) - 7200, hex = old.toString(16).padStart(8,'0');
+   const d = db.getSiblingDB(process.env.TC_DB).$NNS; const docs = [];
+   for (let i = 0; i < 10; i++) docs.push({_id: ObjectId(hex + i.toString(16).padStart(16,'0')), n: i});
+   d.insertMany(docs)" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NNS.countDocuments({}))")" = "10" ] && break
+  sleep 2
+done
+chkv "the archive has them"                        "10" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NNS.countDocuments({}))")"
+cline evictor --config $CFG --once >/dev/null 2>&1
+sleep 5
+# The damaged state, written where two feeders would have left it.
+C "db.getSiblingDB(process.env.TC_META).evicting.updateMany({_id:{\$regex:'$NNS'}},{\$set:{pending:-1}})" >/dev/null
+IDS=$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$NNS.find({_tcDeletedAt:{\$exists:false}},{_id:1}).toArray().map(d=>d._id.toString())))")
+H "const ids = $IDS; const d = db.getSiblingDB(process.env.TC_DB).$NNS;
+   d.insertMany(ids.map((s,i) => ({_id: ObjectId(s), n: i, back: true})), {ordered:false})" >/dev/null
+sleep 4
+cline evictor --config $CFG --once >/dev/null 2>&1
+sleep 6
+chkv "the documents survive the next eviction"     "10" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chkv "and none was tombstoned"                     "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+kill $NFP 2>/dev/null; wait $NFP 2>/dev/null
+
 echo
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

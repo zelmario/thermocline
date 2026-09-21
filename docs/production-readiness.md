@@ -266,6 +266,36 @@ production deployment gets wrong.
 5. **`warmer.min_free_disk` is a fraction.** Written as a percentage it is
    refused at startup now; before, the warmer backed off for ever.
 
+- [x] **9. An eviction counter that went negative destroyed documents days
+  later.** Found and closed on 2026-09-21, and it is on this list rather than in
+  `docs/limitations.md` because it lost data in steady-state operation.
+
+  The evictor announces every document it is about to remove so the feeder can
+  tell that delete from an application's. The announcement is a count, and the
+  feeder takes one down per delete it applies. The lease stops two feeders with
+  the same id and nothing stops two with different ids, which is one edited
+  config away: each spends the same notice, and `$inc` took the count to -1.
+
+  **Nothing is lost at that moment**, because the repeat carries the same oplog
+  timestamp and is recognised as the same delete. The damage is what it leaves
+  behind. The next eviction of those documents announces them from -1 to 0, a
+  notice counts only above zero, and the feeder reads a real eviction as the
+  application deleting the document: the archive tombstones its copy, the fast
+  tier has already dropped it, and the document is gone from both tiers with
+  nothing said. The misconfiguration is long since corrected by then.
+
+  Measured on 40 documents: two feeders, one eviction, no loss and the counters
+  at -1; then one feeder, restore, evict again, and **40 of 40 tombstoned**. The
+  same sequence with one feeder throughout left the counters at 0 and lost none,
+  which is the control that says the second feeder is what did it.
+
+  The spend floors at zero now and an announcement lifts the count to at least
+  one, which is what heals a deployment whose counters are already negative;
+  flooring the spend alone cannot. Re-measured on the same sequence: 40 live, 0
+  tombstoned, and the same again with the rows forced to -1 by hand.
+  `testevict.sh` pins it, and fails with 10 of 10 tombstoned against the old
+  arithmetic.
+
 ## The rule that keeps this list finite
 
 A new finding goes into **Open** only if it can make an application read or

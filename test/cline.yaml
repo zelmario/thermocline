@@ -173,6 +173,10 @@ feeder:
     # And one for what a unique index the archive lacks costs the write path,
     # which only a tiered namespace is told about.
     - "shop.tkucost"
+    # testevict.sh: the collection whose eviction announcements are driven
+    # negative by hand, because that state destroys documents and outlives
+    # whatever produced it.
+    - "shop.tevneg"
     - "shop.tkfree"
     - "shop.tkcomp"
     - "shop.tknull"
@@ -467,6 +471,8 @@ evictor:
       older_than: 40m
     # testevict.sh: the collection a cursor is held open over while a sweep
     # takes its documents off the fast tier.
+    - ns: "shop.tevneg"
+      older_than: 40m
     - ns: "shop.tevcursor"
       older_than: 40m
       date_field: "when"

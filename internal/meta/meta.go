@@ -731,10 +731,28 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 // copy and the document is lost from both tiers, with nothing said anywhere.
 // $currentDate takes the reading where it is judged, so there is nothing left
 // to correct for and nothing to measure.
-func EvictionAnnouncement() bson.D {
-	return bson.D{
-		{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}},
-		{Key: "$currentDate", Value: bson.D{{Key: "at", Value: true}}},
+func EvictionAnnouncement() mongo.Pipeline {
+	return mongo.Pipeline{
+		{{Key: "$set", Value: bson.D{
+			// At least one, not simply one more.
+			//
+			// Flooring the spend at zero stops a counter going negative from
+			// here on, and does nothing for a deployment whose counters are
+			// already negative: a row left at -1 by two feeders would be
+			// announced up to 0, and a notice counts only above zero, so the
+			// next real eviction of that document would still be read as the
+			// application deleting it. An announcement means at least one
+			// eviction is pending, so saying that heals the row at the moment
+			// it matters, and says the same thing as +1 for every row that was
+			// never damaged.
+			{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
+				1,
+				bson.D{{Key: "$add", Value: bson.A{
+					bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 1,
+				}}},
+			}}}},
+			{Key: "at", Value: "$$NOW"},
+		}}},
 	}
 }
 
@@ -798,14 +816,45 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 		if n == 0 {
 			continue
 		}
+		// Floored at zero, and that is not tidiness: a counter that goes
+		// negative destroys documents later, with the thing that made it
+		// negative long since put right.
+		//
+		// $inc took it below zero whenever one eviction was spent twice, and
+		// two feeders watching one namespace do exactly that. The lease stops
+		// two feeders with the same id and nothing stops two with different
+		// ids, which is one edited config away. Nothing is lost at that moment,
+		// because the repeat carries the same oplog timestamp and is recognised
+		// as the same delete. The damage is what it leaves behind: pending at
+		// -1, so the *next* eviction of that document announces it to 0, a
+		// notice counts only above zero, and the feeder reads a real eviction
+		// as the application deleting the document and tombstones the archive's
+		// copy. Gone from both tiers with nothing said, which is the outcome
+		// the announcement channel exists to prevent.
+		//
+		// Measured on 40 documents: two feeders, one eviction, no loss and
+		// pending at -1; then one feeder, restore, evict again, and all 40 were
+		// tombstoned. The same sequence with one feeder throughout left pending
+		// at 0 and lost none.
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(bson.D{
-				{Key: "$inc", Value: bson.D{{Key: "pending", Value: -n}}},
-				{Key: "$push", Value: bson.D{{Key: "spent", Value: bson.D{
-					{Key: "$each", Value: at},
-					{Key: "$slice", Value: -MaxSpentRecorded},
-				}}}},
+			SetUpdate(mongo.Pipeline{
+				{{Key: "$set", Value: bson.D{
+					{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
+						0,
+						bson.D{{Key: "$subtract", Value: bson.A{
+							bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}},
+							n,
+						}}},
+					}}}},
+					{Key: "spent", Value: bson.D{{Key: "$slice", Value: bson.A{
+						bson.D{{Key: "$concatArrays", Value: bson.A{
+							bson.D{{Key: "$ifNull", Value: bson.A{"$spent", bson.A{}}}},
+							at,
+						}}},
+						-MaxSpentRecorded,
+					}}}},
+				}}},
 			}))
 	}
 	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
