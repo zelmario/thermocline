@@ -807,6 +807,10 @@ func (c Config) validateRulesAreTiered() error {
 }
 
 // Validate reports the first problem that would stop the router from running.
+// maxAdvisorShapes is the largest router.cache.max_queries this accepts. See
+// RouterConfig.Validate for the measurement behind the number.
+const maxAdvisorShapes = 100000
+
 func (r RouterConfig) Validate() error {
 	if r.Listen == "" {
 		return errors.New("router.listen is required")
@@ -827,6 +831,33 @@ func (r RouterConfig) Validate() error {
 		// refuse rather than fall through, so the grace would silently do
 		// nothing and look like protection that is in place.
 		return fmt.Errorf("router.claim_grace only applies to completeness: archive, not %q", r.Completeness)
+	}
+	// The advisor watches up to max_queries distinct shapes and, once full,
+	// evicts by building a slice of every one of them and sorting it, holding
+	// its own lock while every cacheable read waits behind it. Measured on this
+	// machine, per eviction:
+	//
+	//	max_queries      1,000       89us
+	//	max_queries     10,000      823us
+	//	max_queries    100,000     14.2ms
+	//	max_queries  1,000,000      154ms
+	//
+	// Batching means one eviction covers the next max_queries/10 inserts, so
+	// the amortised cost is fine at any of these. The stall is not: 154ms on a
+	// proxy whose whole overhead is 130us is an outage for whoever is behind
+	// it, and "cache more" is the obvious thing to type. Refused above a
+	// hundred thousand, which is the last row that stays in milliseconds.
+	//
+	// Bounding the work instead of the table would lift this, by sampling a
+	// fixed number of shapes rather than sorting all of them, at the cost of
+	// evicting approximately rather than exactly. Not done: the advisor's
+	// recommendations are the thing being protected here, and nothing has asked
+	// for a cap this large.
+	if r.Cache.MaxQueries > maxAdvisorShapes {
+		return fmt.Errorf("router.cache.max_queries is %d, and above %d one eviction holds the "+
+			"advisor's lock for over ten milliseconds while every cacheable read waits: "+
+			"measured at 14.2ms for %d and 154ms for a million",
+			r.Cache.MaxQueries, maxAdvisorShapes, maxAdvisorShapes)
 	}
 	if r.Dashboard != "" && samePort(r.Dashboard, r.Listen) {
 		// Both would bind it and one would lose, leaving either no dashboard or
@@ -959,6 +990,10 @@ type CacheConfig struct {
 	// thing in this system that can answer without asking.
 	Enabled bool `yaml:"enabled"`
 	// MaxQueries bounds how many distinct queries are watched at once.
+	//
+	// Bounded above by maxAdvisorShapes, because the eviction that keeps it at
+	// this size is a sort of the whole table under a lock every read waits on.
+	// See RouterConfig.Validate for the measurements.
 	MaxQueries int `yaml:"max_queries"`
 	// MaxTTL is the ceiling on a learned TTL. A query that has not changed
 	// since the router started is not proof that it never will.

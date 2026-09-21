@@ -114,6 +114,24 @@ which of those it is. A single answer larger than 256 KB is learned from and
 never held, since a large result is both less likely to repeat and more
 expensive to be wrong about.
 
+**`max_queries` is capped at 100,000, and the reason is a pause rather than
+memory.** Once the advisor's table is full, every insert past it evicts, and an
+eviction builds a slice of every shape and sorts it while holding the lock each
+cacheable read waits on. Measured per eviction:
+
+| `max_queries` | one eviction |
+|---|---|
+| 1,000, the default | 89us |
+| 10,000 | 823us |
+| 100,000 | 14.2ms |
+| 1,000,000 | 154ms |
+
+A batch clears a tenth of the table, so the amortised cost is small at every one
+of those rows. The stall is what matters: 154ms on a proxy whose whole overhead
+is 130us is an outage for whoever is behind it, and "cache more" is the obvious
+thing to type. Anything above the last row that stays in milliseconds is refused
+at startup, with those numbers in the message.
+
 **Nothing is learned from an answer the cache produced itself.** The reply goes
 back through the same funnel every answer does, and that funnel learns from what
 it sends, so every hit was being recorded as a fresh observation of the same

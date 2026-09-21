@@ -640,3 +640,40 @@ router:
 		t.Error("an empty list stopped meaning every namespace")
 	}
 }
+
+// The advisor's table is bounded, because the eviction that keeps it at size is
+// a sort of the whole table under a lock every cacheable read waits behind.
+//
+// Measured with BenchmarkAdvisorEvictionPause, per eviction: 89us at the
+// default 1,000, 823us at 10,000, 14.2ms at 100,000 and 154ms at a million.
+// The amortised cost is fine at every one of those, because a batch covers the
+// next tenth of a table's worth of inserts. The stall is not, and "cache more"
+// is the obvious thing for an operator to type.
+func TestAdvisorTableIsBounded(t *testing.T) {
+	cases := []struct {
+		name string
+		max  int
+		want string
+	}{
+		{"the default", 1000, ""},
+		{"ten thousand", 10000, ""},
+		{"the last row that stays in milliseconds", maxAdvisorShapes, ""},
+		{"one past it", maxAdvisorShapes + 1, "max_queries"},
+		{"a million, which is the 154ms one", 1000000, "154ms"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := valid()
+			cfg.Router.Cache.MaxQueries = c.max
+			err := cfg.Validate()
+			switch {
+			case c.want == "" && err != nil:
+				t.Fatalf("refused %d: %v", c.max, err)
+			case c.want != "" && err == nil:
+				t.Fatalf("accepted %d, want a refusal naming %q", c.max, c.want)
+			case c.want != "" && !strings.Contains(err.Error(), c.want):
+				t.Fatalf("refused with %q, which does not name %q", err, c.want)
+			}
+		})
+	}
+}

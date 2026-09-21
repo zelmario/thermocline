@@ -306,3 +306,42 @@ func TestAdvisorDoesNotSuggestWhatTheCacheWillNotHold(t *testing.T) {
 		t.Error("a query stable for a minute produced no advice at all")
 	}
 }
+
+// What one eviction costs, as the cap grows. The other two benchmarks measure
+// the average over many inserts, which is the throughput question and is fine:
+// a batch clears a tenth of the table, so a hundred inserts pay one scan.
+//
+// This is the other question, and it is the one an operator creates. Eviction
+// builds a slice of every shape and sorts it, holding the advisor's lock, and
+// every read on the router waits behind that. `router.cache.max_queries` is a
+// number in a file with no upper bound on it, and "cache more" is the obvious
+// thing to type.
+//
+// So this times the single Observe that evicts, with the refill outside the
+// timer, at caps an operator might actually write.
+func BenchmarkAdvisorEvictionPause(b *testing.B) {
+	for _, cap := range []int{1000, 10000, 100000, 1000000} {
+		b.Run(strconv.Itoa(cap), func(b *testing.B) {
+			a := NewAdvisor(cap, 50, time.Hour)
+			for i := 0; i < cap; i++ {
+				a.Observe("shape"+strconv.Itoa(i), "shop.orders", uint64(i), uint64(i))
+			}
+			seq := cap
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// The eviction dropped a tenth, so put a tenth back before
+				// timing the insert that fills it again. Outside the timer,
+				// because the refill is not what is being measured.
+				b.StopTimer()
+				for len(a.shapes) < cap-1 {
+					seq++
+					a.Observe("fill"+strconv.Itoa(seq), "shop.orders", uint64(seq), uint64(seq))
+				}
+				seq++
+				b.StartTimer()
+				a.Observe("evict"+strconv.Itoa(seq), "shop.orders", uint64(seq), uint64(seq))
+			}
+		})
+	}
+}
