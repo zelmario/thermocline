@@ -34,6 +34,11 @@ NODE=${NODE:-thermocline-zelmar-node0}
 CHAOS_BOTH=${CHAOS_BOTH:-1}
 SUITES=${SUITES:-"testrollback testbackfill testfailover testalerts testversion verskew testeverything testtls testsharded testchaos"}
 
+# A suite in neither list is a file nothing runs, and nothing would say so.
+# Refused here rather than warned about, because a sweep that starts is a sweep
+# whose total gets quoted. See test/partition.sh.
+bash "$(dirname "$0")/partition.sh" || exit 2
+
 [ -f test/hostsweep.sh ] || { echo "run this from the repository root"; exit 2; }
 
 # Nothing else may be driving the cluster. An in-node sweep and these suites

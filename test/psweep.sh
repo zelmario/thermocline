@@ -78,6 +78,11 @@ if [ "${CACHE:-0}" = "1" ]; then
   echo "psweep: the query cache is on for every worker in this run"
 fi
 
+# A suite in neither list is a file nothing runs, and nothing would say so.
+# Refused here rather than warned about, because a sweep that starts is a sweep
+# whose total gets quoted. See test/partition.sh.
+bash "$(dirname "$0")/partition.sh" || exit 2
+
 rm -rf "$OUT"; mkdir -p "$OUT"
 printf '%s\n' $SUITES > "$OUT/queue"
 TOTAL=$(wc -l < "$OUT/queue")
