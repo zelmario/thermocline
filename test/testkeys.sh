@@ -185,6 +185,28 @@ chk "the same upsert again is not refused by its own claim" "0" "$(R 'try{print(
 R 'db.getSiblingDB(process.env.TC_DB).tkups.deleteMany({tag:"reuse"})' >/dev/null
 chk "and the key it gave up is usable again" "ok" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkups.insertOne({_id:60,email:"reuse@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== what a unique index the archive lacks costs the write path =="
+# The router already said such an index costs reads. The half it did not say is
+# that it costs writes: establishing that a key is free is a question about every
+# live document, so a write whose key the fast tier does not hold asks the
+# archive, and with no index there that is a collection scan of the tier built to
+# be the big one. Measured at 200,003 archived documents, for a key nobody holds:
+# 38-40ms against 1-10ms with an index over the same field.
+#
+# The answer is right either way, which is why nothing had noticed. What is
+# checked here is that the router says so at the one moment an operator can act
+# on it, and names the unique index rather than lumping it in with the plain ones.
+# Through the router, not with fresh(), which builds the index straight at the
+# fast tier's mongod where no router ever sees the command.
+H "db.getSiblingDB(process.env.TC_DB).tkucost.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tkucost.drop()" >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkucost.createIndex({email:1},{unique:true})' >/dev/null
+sleep 2
+chk "the router names the write cost of a unique index" "true" \
+    "$(grep -q 'costs writes as well as reads' $LOGDIR/keys_r.log && echo true || echo false)"
+chk "and names the index it means"                      "true" \
+    "$(grep -A0 'costs writes as well as reads' $LOGDIR/keys_r.log | grep -q 'email' && echo true || echo false)"
+
 echo "== a \$merge writes documents too, so it claims their keys =="
 # The target guard brings archived documents up so the merge matches them, which
 # settles the fields it matches *on*. It settles nothing about any other unique

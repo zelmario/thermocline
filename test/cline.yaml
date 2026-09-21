@@ -170,6 +170,9 @@ feeder:
     # still enforced under the old one.
     - "shop.tkupd"
     - "shop.tkups"
+    # And one for what a unique index the archive lacks costs the write path,
+    # which only a tiered namespace is told about.
+    - "shop.tkucost"
     - "shop.tkfree"
     - "shop.tkcomp"
     - "shop.tknull"

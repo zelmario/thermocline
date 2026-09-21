@@ -6,6 +6,29 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **A unique index the archive does not have costs writes, not just reads, and
+  the cost is a collection scan of the archive.** Uniqueness is enforced across
+  both tiers, so a write has to establish that no live document already holds
+  its key. When the fast tier holds no such document the archive is asked, and
+  nothing copies an index there, so that question is answered by scanning the
+  tier built to be the big one.
+
+  Measured on an archive copy of 200,003 documents, asking for a key nobody
+  holds, which is the ordinary case for a new value: **38-40ms per write**
+  against **1-10ms** with an index over the same field, and it grows with the
+  archive rather than with the fast tier.
+
+  It is reached by the writes that leave a claim with no owner, and those are
+  ordinary ones: an upsert whose filter carries no `_id`, and an insert that
+  lets mongod name the document. A claim with an owner is re-read by `_id`
+  instead, which is an indexed lookup on both tiers.
+
+  The answer is correct either way, and `test/testkeys.sh` pins that: the
+  duplicate is refused with E11000 exactly as one cluster would refuse it. What
+  is missing is only the index. Build the same unique index on the archive for
+  any tiered collection written by upserts or by inserts without an `_id`; the
+  router says so when the index is created, naming the measurement.
+
 - **A fast tier rebuilt from the archive comes back without the indexes the
   application declared, and for a unique index that is a constraint nobody is
   enforcing.** Nothing copies an index to the archive, on purpose: an index

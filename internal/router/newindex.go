@@ -100,6 +100,42 @@ func (c *conn) noteIndexNotOnTheArchive(ctx context.Context, cmd bson.Raw, db, c
 		return
 	}
 
+	// A unique index the archive does not have costs writes as well as reads,
+	// and that half was not said. Asking whether a key is free is a question
+	// about every live document, so when the fast tier does not hold one the
+	// archive is asked, and without the index that is a collection scan of the
+	// tier built to be the big one. Measured on the archive's copy at 200,003
+	// documents, for a key nobody holds, which is the ordinary case for a new
+	// value: 38-40ms scanning, against 1-10ms with an index over the same
+	// field, and it grows with the archive.
+	//
+	// It is reached by the writes that leave a claim with no owner, which are
+	// the ordinary ones: an upsert whose filter carries no _id, and an insert
+	// that lets mongod name the document. Those claims cannot be checked
+	// against an owner, so the tiers are asked instead.
+	if uniq := requestedUniqueIndexes(cmd); len(uniq) > 0 {
+		var missingUnique []string
+		for _, name := range missing {
+			if uniq[name] {
+				missingUnique = append(missingUnique, name)
+			}
+		}
+		if len(missingUnique) > 0 {
+			c.log.Warn("a unique index was built on the fast tier and the archive does not have one "+
+				"over the same fields, which costs writes as well as reads",
+				"ns", ns, "indexes", missingUnique,
+				"meaning", "uniqueness is enforced across both tiers, so a write whose key the fast "+
+					"tier does not hold asks the archive, and with no index there that is a "+
+					"collection scan on the write path",
+				"measured", "38-40ms per write at 200,000 archived documents, against 1-10ms with "+
+					"an index over the same field, and it grows with the archive",
+				"action", "build the same index on the archive for a collection written by upserts "+
+					"or by inserts that do not carry an _id; those are the writes that leave a "+
+					"claim with no owner, and a claim with no owner is what makes the archive "+
+					"the thing asked")
+		}
+	}
+
 	c.log.Warn("an index was built on the fast tier and the archive does not have one over the same fields",
 		"ns", ns, "indexes", missing,
 		"meaning", "reads this router cannot answer from the fast tier are run on the archive, "+
@@ -124,6 +160,39 @@ func indexTypeNeedsItsIndex(key string) bool {
 
 // requestedIndexKeys reads the name and key of each index a createIndexes asks
 // for, keyed by name.
+// requestedUniqueIndexes names which of the indexes a createIndexes asked for
+// are unique, which requestedIndexKeys drops because it only compares shapes.
+func requestedUniqueIndexes(cmd bson.Raw) map[string]bool {
+	arr, err := cmd.LookupErr("indexes")
+	if err != nil {
+		return nil
+	}
+	vals, aok := arrayValues(arr)
+	if !aok {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, v := range vals {
+		spec, ok := v.DocumentOK()
+		if !ok {
+			continue
+		}
+		if u, uok := spec.Lookup("unique").BooleanOK(); !uok || !u {
+			continue
+		}
+		key, kok := spec.Lookup("key").DocumentOK()
+		if !kok {
+			continue
+		}
+		name, nok := spec.Lookup("name").StringValueOK()
+		if !nok {
+			name = key.String()
+		}
+		out[name] = true
+	}
+	return out
+}
+
 func requestedIndexKeys(cmd bson.Raw) map[string]string {
 	arr, err := cmd.LookupErr("indexes")
 	if err != nil {
