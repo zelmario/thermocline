@@ -206,6 +206,15 @@ chk "the router names the write cost of a unique index" "true" \
     "$(grep -q 'costs writes as well as reads' $LOGDIR/keys_r.log && echo true || echo false)"
 chk "and names the index it means"                      "true" \
     "$(grep -A0 'costs writes as well as reads' $LOGDIR/keys_r.log | grep -q 'email' && echo true || echo false)"
+# Creation time is once, to whoever was reading the log that minute. An operator
+# who built the index months ago and wants to know what it costs has to be able
+# to ask, so the same thing is reported by every router start and by preflight,
+# which is the command the documents tell them to run.
+PRE=$(cline preflight --config $CFG 2>&1)
+chk "preflight says it too, without starting anything" "true" \
+    "$(grep -q 'no index over the fields of a unique index' <<<"$PRE" && echo true || echo false)"
+chk "and names the namespace"                          "true" \
+    "$(grep -q 'tkucost' <<<"$PRE" && echo true || echo false)"
 
 echo "== a \$merge writes documents too, so it claims their keys =="
 # The target guard brings archived documents up so the merge matches them, which

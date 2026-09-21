@@ -129,3 +129,36 @@ func TestSameFields(t *testing.T) {
 		})
 	}
 }
+
+// Whether the archive can answer the question a write asks of it is decided by
+// field names, not by a rendered key document.
+//
+// The first version compared bson.Raw.String() of mongod's stored key against
+// one marshalled here. mongod picks its own numeric type for a direction and Go
+// picks another, so that comparison is about spelling: an index the archive has
+// reads as missing and the operator is told to build what they already have.
+func TestServedByAnArchiveIndex(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields []string
+		have   [][]string
+		want   bool
+	}{
+		{"exactly it", []string{"email"}, [][]string{{"_id"}, {"email"}}, true},
+		{"nothing like it", []string{"email"}, [][]string{{"_id"}, {"name"}}, false},
+		{"no indexes at all", []string{"email"}, nil, false},
+		{"a compound index it leads", []string{"a"}, [][]string{{"a", "b"}}, true},
+		{"a compound index it does not lead", []string{"b"}, [][]string{{"a", "b"}}, false},
+		{"the compound itself", []string{"a", "b"}, [][]string{{"a", "b", "c"}}, true},
+		{"the same fields the other way round, which cannot seek",
+			[]string{"a", "b"}, [][]string{{"b", "a"}}, false},
+		{"longer than anything there", []string{"a", "b"}, [][]string{{"a"}}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := servedByAnArchiveIndex(c.fields, c.have); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

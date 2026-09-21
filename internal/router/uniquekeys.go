@@ -2142,3 +2142,131 @@ func sameFields(live, claimed []string) bool {
 	}
 	return true
 }
+
+// warnAboutUniqueIndexesTheArchiveLacks names the unique constraints the fast
+// tier declares and the archive cannot help enforce.
+//
+// The router already says this when the index is created, in newindex.go. That
+// line is said once, to whoever was reading the log that minute, and never
+// again: a router restarted a month later repeats nothing, and `cline
+// preflight` reports the opposite direction only, a unique index the *fast
+// tier* is missing. So an operator who built the index and moved on has no way
+// to learn what it costs except by running `cline indexes` and knowing to.
+//
+// What it costs is on the write path, which is the part that was not said until
+// it was measured. Uniqueness is enforced across both tiers, so a write has to
+// establish that no live document already holds its key, and when the fast tier
+// holds no such document the archive is asked. Without the index there, that is
+// a collection scan of the tier built to be the big one: 38-40ms per write at
+// 200,003 archived documents against 1-10ms with one, growing with the archive.
+//
+// Reached by the writes that leave a claim with no owner, which are ordinary
+// ones: an upsert whose filter carries no _id, and an insert that lets mongod
+// name the document.
+func (r *Router) warnAboutUniqueIndexesTheArchiveLacks(ctx context.Context) {
+	for _, ns := range r.tieredNamespaces(ctx) {
+		idxs := r.uniqueIndexes(ctx, ns)
+		if len(idxs) == 0 {
+			continue
+		}
+		db, coll := splitNS(ns)
+		have, err := archiveIndexFields(ctx, r.cold, db, coll)
+		if err != nil {
+			// The archive not answering is said elsewhere, loudly.
+			r.log.Debug("could not list the archive's indexes to compare them", "ns", ns, "err", err)
+			continue
+		}
+		var missing []string
+		for _, idx := range idxs {
+			if !servedByAnArchiveIndex(idx.fields, have) {
+				missing = append(missing, idx.name)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		sort.Strings(missing)
+		r.log.Warn("the archive has no index over the fields of a unique index the fast tier enforces",
+			"ns", ns, "indexes", missing,
+			"meaning", "a write whose key the fast tier does not hold asks the archive whether any "+
+				"live document holds it, and with no index there that question is a collection "+
+				"scan on the write path",
+			"measured", "38-40ms per write at 200,000 archived documents, against 1-10ms with an "+
+				"index over the same fields, and it grows with the archive",
+			"action", "build the same index on the archive for a collection written by upserts or "+
+				"by inserts that do not carry an _id, which are the writes that ask")
+	}
+}
+
+// archiveIndexFields reads the field names of every index the archive has for a
+// namespace, in key order.
+//
+// By field name rather than by the rendered key document, which is what the
+// first version compared. A direction is stored by mongod in a type of its
+// choosing and a key built here is whatever Go marshals, so comparing the two
+// renderings compares spelling: an index the archive has would read as missing
+// and an operator would be told to build what they already have. The question
+// this asks is only which fields are indexed, and a direction does not change
+// which values an index treats as equal.
+func archiveIndexFields(ctx context.Context, cold *mongo.Client, db, coll string) ([][]string, error) {
+	cur, err := cold.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		var ce mongo.CommandError
+		if errors.As(err, &ce) && ce.Code == namespaceNotFound {
+			// A collection the archive has never heard of has no indexes, which
+			// is the answer rather than a failure to get one.
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	var out [][]string
+	for cur.Next(ctx) {
+		key, ok := cur.Current.Lookup("key").DocumentOK()
+		if !ok {
+			continue
+		}
+		elems, eerr := key.Elements()
+		if eerr != nil {
+			continue
+		}
+		fields := make([]string, 0, len(elems))
+		for _, e := range elems {
+			fields = append(fields, e.Key())
+		}
+		out = append(out, fields)
+	}
+	return out, cur.Err()
+}
+
+// servedByAnArchiveIndex reports whether any of the archive's indexes begins
+// with exactly these fields, in this order.
+//
+// A prefix is the honest test: the question asked of the archive is an equality
+// on every field of the unique index, and an index whose leading fields are
+// those can seek straight to it. Anything looser would stay quiet about an
+// index that cannot serve the question, which is the failure worth avoiding in
+// the other direction: telling an operator to build what they have is worse
+// than saying nothing, so this errs towards silence only where silence is true.
+func servedByAnArchiveIndex(fields []string, have [][]string) bool {
+	if len(fields) == 0 {
+		return true
+	}
+	for _, idx := range have {
+		if len(idx) < len(fields) {
+			continue
+		}
+		same := true
+		for i, f := range fields {
+			if idx[i] != f {
+				same = false
+				break
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
+}

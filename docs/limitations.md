@@ -29,6 +29,10 @@ Part of [Thermocline](../README.md).
   built on the fast tier and the archive never gets it, which is the moment the
   router warns.
 
+  Every router start and `cline preflight` name the namespaces in this state,
+  not only the moment the index is created, because that line is said once to
+  whoever was reading the log that minute.
+
   The answer is correct either way, and `test/testkeys.sh` pins that: the
   duplicate is refused with E11000 exactly as one cluster would refuse it. What
   is missing is only the index. Build the same unique index on the archive for

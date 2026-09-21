@@ -416,6 +416,10 @@ func (r *Router) Survey(ctx context.Context) error {
 	// And the other direction, which is where a rebuilt fast tier lands: claims
 	// for a constraint no tier declares any more.
 	r.warnAboutStrandedKeyClaims(ctx)
+	// And what such a constraint costs when the archive has no index for the
+	// question it is asked. Said at creation time in newindex.go, which is once
+	// to whoever was reading the log that minute.
+	r.warnAboutUniqueIndexesTheArchiveLacks(ctx)
 
 	// The three writes a start makes, reported rather than made. Together with
 	// the checks above this answers the question the command exists for: what
@@ -604,6 +608,11 @@ func (r *Router) Listen(ctx context.Context) error {
 		// fast tier no longer declares. Here rather than in its own goroutine
 		// because uniqueIndexes caches, so the second pass costs nothing.
 		r.warnAboutStrandedKeyClaims(ctx)
+		// And one listing of the archive's indexes per namespace, which is why
+		// it is here with them rather than before the listener: this is the
+		// same per-namespace cost that delayed a start past the thirty seconds
+		// a suite waits, on a deployment with 139 tiered namespaces.
+		r.warnAboutUniqueIndexesTheArchiveLacks(ctx)
 	})
 	// The advisor publishes one last report as it stops, and that write has to
 	// finish before this function returns or the process exits out from under
