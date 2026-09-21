@@ -35,6 +35,12 @@ chk() {
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-56s got=%s want=%s\n' "$1" "$3" "$2"; fi
 }
 N() { docker exec "$NODE" bash -c "$1"; }
+# ND is N in the background. It is here because a section below needed it and
+# borrowed the name from a sibling suite that has one: bash reports an unknown
+# command on stderr and carries on, so the probe never started and three checks
+# read as the product failing. A helper that exists in the file next door is not
+# a helper this file has.
+ND() { docker exec -d "$NODE" bash -c "$1"; }
 H() { docker exec "$NODE" mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { docker exec "$NODE" mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 R() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval "$1" 2>&1 | tail -1; }
@@ -227,9 +233,19 @@ echo "== SIGHUP, which is what logrotate sends =="
 N "sed -e '/^log:/,+1d' -e 's|^  listen:.*|  listen: \"0.0.0.0:27645\"|' -e 's|^  dashboard:.*|  dashboard: \"\"|' /etc/cline/cline.yaml > /root/nolog.yaml" >/dev/null
 chk "the probe config has no log file"            "0" \
     "$(N "grep -c 'file:' /root/nolog.yaml" | tr -d '\n')"
-ND "cline router --config /root/nolog.yaml > /root/nolog.out 2>&1"
-sleep 8
-HUPPID=$(N "pgrep -f 'config /root/nolog[.]yaml'" | tr -d '\n')
+# exec, so the wrapper shell is replaced rather than left beside the router:
+# pgrep -f matches the wrapper's command line too, and two pids run together by
+# tr became one garbage number that kill could not find. Measured on the first
+# version of this check, which then failed three ways for one reason.
+ND "exec cline router --config /root/nolog.yaml > /root/nolog.out 2>&1"
+# Waited for rather than slept at. A router surveys every tiered namespace
+# before it listens, and under a sweep that takes longer than any number written
+# here.
+for _ in $(seq 1 45); do
+  HUPPID=$(N "pgrep -f 'config /root/nolog[.]yaml'" | tr -d '\n')
+  [ -n "$HUPPID" ] && break
+  sleep 1
+done
 chk "a router is running with no log file"        "true" \
     "$([ -n "$HUPPID" ] && echo true || echo false)"
 N "kill -HUP $HUPPID" >/dev/null 2>&1
