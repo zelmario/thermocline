@@ -817,8 +817,16 @@ archive alone: an update asking for `maxTimeMS: 1` came back in **595 ms**, and
 the same update against an untiered collection came back in **1 ms**. The error
 code was right both times, which is why nothing noticed: what was wrong is that
 the bound meant nothing, and an application sets `maxTimeMS` precisely to shed
-load. The copy-up now carries the caller's budget, and the same command returns
+load. The copy-up now carries half the caller's budget, and the same command returns
 in 10 ms against the control's 2 ms.
+
+Half rather than all of it, which is the same split the barrier above uses,
+turned round. There, spending the whole deadline on the wait would leave the
+archive read nothing to spend. Here, spending it all on the copy-up fails
+nothing but overruns: the client's write is forwarded carrying its original
+`maxTimeMS`, so mongod starts the clock again and the command could take twice
+what was asked for. Half bounds the work this system adds to half the budget and
+leaves the write the client actually sent with its own.
 
 What that changes for a deployment: a write with a deadline too short for the
 copy-up it needs now **fails** with `MaxTimeMSExpired` where it used to succeed

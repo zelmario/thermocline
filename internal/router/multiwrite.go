@@ -251,7 +251,8 @@ func statementIsMulti(st bson.Raw, name string) bool {
 type copyUpOptions struct {
 	let       bson.Raw
 	collation bson.Raw
-	// budget is the caller's own maxTimeMS, or zero when they set none.
+	// budget is the caller's own maxTimeMS, or zero when they set none. The
+	// copy-up is given half of it; see where it is used for why.
 	//
 	// Without it the copy-up is work the client cannot see and did not agree
 	// to. Measured on 3,000 documents held by the archive alone: an update
@@ -331,11 +332,25 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	// rather than zero, for the reason withRemainingTime gives: MongoDB reads
 	// maxTimeMS zero as "no limit", which is the opposite of an expired one.
 	started := time.Now()
+	// Half of it, not all of it, which is the split the read path already
+	// settled on in the freshness barrier and for the same reason turned round.
+	// There, spending the whole deadline on the wait leaves the archive read
+	// nothing and a feeder merely behind becomes failed queries. Here, spending
+	// the whole deadline on the copy-up does not fail anything: the client's own
+	// write is forwarded carrying its original maxTimeMS, so mongod starts the
+	// clock again and the command can take twice what was asked for. Half bounds
+	// the work this system adds to half the caller's budget, and the write it
+	// was added for keeps its own.
+	budget := opts.budget / 2
 	if opts.budget > 0 {
-		find = append(find, bson.E{Key: "maxTimeMS", Value: int64(1)})
-		if ms := opts.budget.Milliseconds(); ms > 1 {
-			find[len(find)-1].Value = ms
+		ms := budget.Milliseconds()
+		if ms < 1 {
+			// Not zero, for the reason withRemainingTime gives: MongoDB reads
+			// maxTimeMS zero as "no limit", which is the opposite of a deadline
+			// too small to divide.
+			ms = 1
 		}
+		find = append(find, bson.E{Key: "maxTimeMS", Value: ms})
 	}
 	cur, err := r.cold.Database(db).RunCommandCursor(ctx, find)
 	if err != nil {
@@ -408,7 +423,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// Checked here as well as on the find, because the copy writes to the
 		// fast tier as it reads and those writes are not covered by the
 		// archive's own deadline.
-		if opts.budget > 0 && time.Since(started) > opts.budget {
+		if opts.budget > 0 && time.Since(started) > budget {
 			return moved, errCopyUpExpired
 		}
 		if copied >= maxCopyUpForWrite {
