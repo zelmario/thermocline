@@ -6,6 +6,29 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **A fast tier rebuilt from the archive comes back without the indexes the
+  application declared, and for a unique index that is a constraint nobody is
+  enforcing.** Nothing copies an index to the archive, on purpose: an index
+  describes the whole collection and carrying every one of them there gives back
+  most of what tiering buys. So the archive can rebuild a collection, its
+  options and its documents, and not its indexes. Uniqueness across the tiers is
+  enforced from the fast tier's own index listing, so once the listing is gone
+  the constraint is enforced by neither tier.
+
+  Measured by `test/testrestore.sh`: a unique index created through the router,
+  200 keys claimed in the registry, the fast tier lost and rebuilt the way
+  `docs/operations.md` prescribes, and the registry restored from its own dump.
+  An insert duplicating a value an archived document held was then accepted, and
+  the archive ended with two documents carrying one key.
+
+  Two things narrow it. A router says "the key registry holds claims for a
+  unique index no tier has" at every start and in `cline preflight`, naming the
+  index, because those rows are the only thing that remembers the constraint.
+  And the backup list in `docs/operations.md` now names the index definitions as
+  something to take, which is what makes the recreation a step rather than an
+  archaeology exercise. Recreating the index through the router walks both tiers
+  and reports the duplicates that got in.
+
 - **`dropIndexes` on a tiered collection is refused when it asks for no
   acknowledgement**, and performed normally otherwise. The archive's copy of the
   index is dropped behind the fast tier's, and only the reply says whether the

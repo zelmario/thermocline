@@ -98,9 +98,39 @@ What to take, and where each piece lives:
   the check to run after a restore rather than the thing to rely on instead of
   taking the backup.
 
-- **The fast tier's documents, optionally.** They are a subset of the archive
-  except for anything the feeder never mirrored, which the daemons name at
-  startup as documents "the archive has none of". Warming refills the rest.
+- **Every collection on the fast tier that nothing tiers, and this one is not
+  optional.** "The archive is the complete copy" is true of what the feeder
+  mirrors and false of everything else: a collection missing from
+  `feeder.namespaces` has lived on the fast tier alone since the cutover and the
+  archive has never held a copy. Take those with `mongodump` of the fast tier.
+
+  Measured by `test/testrestore.sh`, which takes exactly the list above and
+  nothing else, loses the fast tier and puts it back: the orders came back, the
+  tickets came back, and the shop had no customers, no products and no marker,
+  because none of them was ever in the archive to come back from. The daemons
+  name them at every start, as "the archive holds collections the fast tier does
+  not" in the other direction and as collections "nothing tiers" in this one.
+
+- **The fast tier's index definitions.** Not the indexes themselves, the
+  statements that create them: `db.coll.getIndexes()` per tiered collection, or
+  the output of `cline indexes`. Nothing copies an index to the archive on
+  purpose, because an index describes the whole collection and carrying every
+  one of them on the archive gives back most of what tiering buys. The
+  consequence is only visible on the way back: a fast tier rebuilt from the
+  archive comes back with the collections, their options and their documents,
+  and none of the indexes the application declared.
+
+  For a plain index that is a slow query. **For a unique index it is a lost
+  constraint**, because uniqueness across the tiers is enforced from the fast
+  tier's own listing, and an index no tier declares is not enforced by anything.
+  Measured: with the key registry restored and 200 rows in it, an insert
+  duplicating a value an archived document held was accepted. A router says so
+  now, at every start, as "the key registry holds claims for a unique index no
+  tier has", which is the one trace left that the constraint existed.
+
+- **The fast tier's documents, optionally.** The ones the feeder mirrored are a
+  subset of the archive, so warming refills them. What it cannot refill is the
+  two entries above.
 
 Everything else on the fast tier is rebuilt rather than restored, and it is
 worth knowing which is which before an outage rather than during one. Collection

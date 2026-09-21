@@ -32,7 +32,7 @@ NODE=${NODE:-thermocline-zelmar-node0}
 # primary, which is the only thing that exercises that pool during a real
 # election. Set CHAOS_BOTH=0 to run only the default.
 CHAOS_BOTH=${CHAOS_BOTH:-1}
-SUITES=${SUITES:-"testrollback testbackfill testservice testfailover testalerts testversion verskew testeverything testtls testsharded testchaos"}
+SUITES=${SUITES:-"testrollback testbackfill testrestore testservice testfailover testalerts testversion verskew testeverything testtls testsharded testchaos"}
 
 # A suite in neither list is a file nothing runs, and nothing would say so.
 # Refused here rather than warned about, because a sweep that starts is a sweep

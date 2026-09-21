@@ -1954,3 +1954,77 @@ func (r *Router) warnFastTierExpires(ns string, expiring []string) {
 		"action", "drop it on the fast tier, and use an evictor rule for what it was meant to do; "+
 			"documents already tombstoned in the archive are named by cline rollback")
 }
+
+// warnAboutStrandedKeyClaims names the unique indexes the registry still holds
+// claims for and the fast tier no longer has.
+//
+// The other direction of warnAboutUnclaimedUniqueKeys, and the one nothing
+// asked. Uniqueness across the tiers is enforced from the fast tier's own index
+// listing: uniqueIndexes reads that listing and a constraint it does not name is
+// not enforced, which is right when an application drops an index and wrong when
+// the listing is missing for any other reason.
+//
+// The reason that matters is the rebuild. Nothing copies a plain index to the
+// archive on purpose, because an index describes the whole collection and
+// carrying every one of them gives back most of what tiering buys. A unique
+// index is not a plain index: it is a constraint the application declared, and
+// leaving it off the archive means that after the fast tier is restored from the
+// archive, the way docs/operations.md says a fast tier is rebuilt, the
+// constraint is on neither tier. Measured by test/testrestore.sh: the registry
+// was restored with 200 rows for code_1 and an insert duplicating an archived
+// document's code was accepted, because no tier declared the index any more.
+//
+// Nothing could have said so. The comparison that notices an index going away
+// is between one listing and the listing before it, so a router that never saw
+// it cannot miss it, and a fresh start after a rebuild never did. The registry
+// rows are the only thing left that remembers the constraint existed, so they
+// are what this reads.
+//
+// A warning rather than a refusal, for the same reason the vanishing-index
+// warning is one: refusing writes mongod accepts is worse than saying that a
+// guarantee has ended, and the operator's move is to recreate the index.
+func (r *Router) warnAboutStrandedKeyClaims(ctx context.Context) {
+	cur, err := r.keys().Aggregate(ctx, mongo.Pipeline{
+		{{Key: "$group", Value: bson.D{{Key: "_id", Value: bson.D{
+			{Key: "ns", Value: "$ns"}, {Key: "idx", Value: "$idx"}}}}}},
+	})
+	if err != nil {
+		// The registry is on the fast tier and a router that cannot read it has
+		// worse problems, all of which say so elsewhere.
+		r.log.Debug("could not read the key registry to check its claims against the indexes", "err", err)
+		return
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	for cur.Next(ctx) {
+		var row struct {
+			ID struct {
+				NS  string `bson:"ns"`
+				Idx string `bson:"idx"`
+			} `bson:"_id"`
+		}
+		if cur.Decode(&row) != nil || row.ID.NS == "" || row.ID.Idx == "" {
+			continue
+		}
+		found := false
+		for _, idx := range r.uniqueIndexes(ctx, row.ID.NS) {
+			if idx.name == row.ID.Idx {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		r.log.Warn("the key registry holds claims for a unique index no tier has",
+			"ns", row.ID.NS, "index", row.ID.Idx,
+			"meaning", "the application declared this constraint and nothing is enforcing it now, "+
+				"so a write duplicating a value an archived document holds is accepted",
+			"why", "a unique index lives on the fast tier alone, because nothing copies an index to "+
+				"the archive, so rebuilding the fast tier from the archive leaves the constraint "+
+				"on neither tier and these rows are all that remembers it",
+			"action", "recreate the index through the router, which walks both tiers and reports "+
+				"any duplicates that got in; or drop these claims with cline keys --rebuild if "+
+				"the index was meant to go")
+	}
+}

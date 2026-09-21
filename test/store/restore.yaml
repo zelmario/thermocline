@@ -1,0 +1,58 @@
+# One shop, for the rehearsal of losing the fast tier and building it back.
+#
+# Its own databases, its own bookkeeping and its own ports, because the suite
+# drops the fast tier's copy of everything it names and a shared database would
+# take another suite's fixture with it.
+hot:
+  uri: "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin"
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+meta:
+  db: "_thermocline_restore"
+
+feeder:
+  id: "restore"
+  namespaces:
+    - "shopR.orders"
+    - "shopR.order_events"
+    - "shopR.tickets"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 20ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "restore"
+  rate: 2000
+  batch_size: 200
+  max_feeder_lag: 30s
+  rules:
+    - ns: "shopR.orders"
+      older_than: 20m
+    - ns: "shopR.order_events"
+      older_than: 20m
+    - ns: "shopR.tickets"
+      older_than: 20m
+  backoff:
+    min_oplog_window: 1m
+
+warmer:
+  rate: 2000
+  batch_size: 200
+  residency: 2m
+  rules:
+    - ns: "shopR.orders"
+      back: 15m
+  backoff:
+    min_oplog_window: 1m
+
+router:
+  listen: "0.0.0.0:27620"
+  dashboard: "0.0.0.0:27630"
+  completeness: archive
+  residency: 2m
+  archive_wait: 5s

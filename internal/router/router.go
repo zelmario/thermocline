@@ -408,6 +408,9 @@ func (r *Router) Survey(ctx context.Context) error {
 	// the honest answer to "what is true now" and is worth knowing beside the
 	// index report above it.
 	r.warnAboutUnclaimedUniqueKeys(ctx)
+	// And the other direction, which is where a rebuilt fast tier lands: claims
+	// for a constraint no tier declares any more.
+	r.warnAboutStrandedKeyClaims(ctx)
 
 	// The three writes a start makes, reported rather than made. Together with
 	// the checks above this answers the question the command exists for: what
@@ -592,6 +595,10 @@ func (r *Router) Listen(ctx context.Context) error {
 	// Indexer has just built it, and that pass is above, before the listener.
 	r.goSafely("checking whether the archive's unique keys were ever claimed", func() {
 		r.warnAboutUnclaimedUniqueKeys(ctx)
+		// The same listings, read the other way round: a claim for an index the
+		// fast tier no longer declares. Here rather than in its own goroutine
+		// because uniqueIndexes caches, so the second pass costs nothing.
+		r.warnAboutStrandedKeyClaims(ctx)
 	})
 	// The advisor publishes one last report as it stops, and that write has to
 	// finish before this function returns or the process exits out from under
