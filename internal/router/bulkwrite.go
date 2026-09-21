@@ -253,6 +253,11 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			return out, true
 		}
 		if n, cerr := c.r.copyUpMatching(ctx, op.ns, op.stmt.filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}); cerr != nil {
+			// The caller's own deadline, reported the way MongoDB reports it
+			// rather than as a refusal by this router.
+			if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, op.ns, "bulkWrite", cerr); isDeadline {
+				return out, ok
+			}
 			c.r.Stats.Refused.Add(1)
 			c.cls = ClassRefused
 			c.log.Warn("refused a bulkWrite that would only partly apply", "ns", op.ns, "err", cerr)

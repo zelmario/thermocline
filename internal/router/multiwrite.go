@@ -184,17 +184,8 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 
 		// A deadline that ran out is the caller's own answer, not a refusal by
 		// this router, and it is reported as MongoDB reports it.
-		if errors.Is(cerr, errCopyUpExpired) {
-			c.log.Info("a write's own maxTimeMS ran out while bringing archived documents up",
-				"ns", ns, "command", name,
-				"meaning", "the write was not applied, and the caller is told what one cluster "+
-					"would tell it")
-			out, rerr := c.r.commandErrorWithCode(msg.Header.RequestID, msg.Header.RequestID,
-				"operation exceeded time limit", maxTimeMSExpiredCode, "MaxTimeMSExpired")
-			if rerr != nil {
-				return nil, false
-			}
-			return out, true
+		if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, ns, name, cerr); isDeadline {
+			return out, ok
 		}
 
 		c.r.Stats.Refused.Add(1)
@@ -265,6 +256,38 @@ type copyUpOptions struct {
 	// The read path has always done this, in withRemainingTime. This is the
 	// same thing on the other path.
 	budget time.Duration
+}
+
+// deadlineExpired answers a copy-up that ran out of the caller's own time, and
+// says whether that is what happened.
+//
+// Every path that brings archived documents up before a write shares this, and
+// that is the point: the same condition reaching a driver as MaxTimeMSExpired
+// from an update and as CommandFailed from a bulkWrite is a difference the
+// application has to know about this proxy in order to handle. The first
+// version of the deadline taught only the multi-document path, and the other
+// three reported it as a refusal.
+//
+// It is not counted as a refusal either. The caller asked for a bound and got
+// it, which is not this router turning a write down.
+// requestID is the reply's own header id and responseTo is the request it
+// answers. They are taken separately because the paths here do not agree: the
+// $merge reply is built with a zero request id and the write replies with the
+// request's own, and a helper that picked one would quietly change the other.
+func (c *conn) deadlineExpired(requestID, responseTo int32, ns, what string,
+	cerr error) (*wire.Message, bool, bool) {
+	if !errors.Is(cerr, errCopyUpExpired) {
+		return nil, false, false
+	}
+	c.log.Info("a write's own maxTimeMS ran out while bringing archived documents up",
+		"ns", ns, "command", what,
+		"meaning", "the write was not applied, and the caller is told what one cluster would tell it")
+	out, rerr := c.r.commandErrorWithCode(requestID, responseTo,
+		"operation exceeded time limit", maxTimeMSExpiredCode, "MaxTimeMSExpired")
+	if rerr != nil {
+		return nil, true, false
+	}
+	return out, true, true
 }
 
 // errCopyUpExpired says the caller's own deadline ran out while the archive was

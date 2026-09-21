@@ -228,6 +228,18 @@ chk "and the copy-up is what the deadline cut" "true" \
 # multi-document write would be worse than one that means nothing.
 chk "and nothing was half applied"             "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({mt:1}))")"
+# Every write path that brings archived documents up shares the deadline, and
+# they have to answer alike: the same condition reaching a driver as
+# MaxTimeMSExpired from an update and as CommandFailed from a bulkWrite is a
+# difference the application would have to know about this proxy to handle. The
+# first version taught only the multi-document path.
+# The upsert path is a different caller of the same copy-up, so it is the one
+# worth asking. A filter that matches archived documents and would otherwise
+# create a stub over them.
+UPS=$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({update: '$NS',
+    updates: [{q: {grp: 'c', n: {\$gte: 0}}, u: {\$set: {mt3: 1}}, upsert: true}], maxTimeMS: 1});
+    print('accepted') } catch (e) { print(e.code) }")
+chk "the upsert path says the same thing"      "50" "$UPS"
 # And the ordinary case is untouched: no deadline, the copy-up runs, every
 # matching document is reached.
 WANT=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'c'}))")

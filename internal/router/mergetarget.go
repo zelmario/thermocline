@@ -138,6 +138,11 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 
 	n, cerr := c.r.copyUpMatching(ctx, target, keys, copyUpOptions{let: letOf(cmd), collation: docField(cmd, "collation"), budget: maxTimeBudget(cmd)})
 	if cerr != nil {
+		// $merge answers with responseTo rather than the request id; see the
+		// commandError below it.
+		if out, isDeadline, ok := c.deadlineExpired(0, msg.Header.RequestID, target, "$merge", cerr); isDeadline {
+			return out, ok
+		}
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a $merge that could have overwritten archived documents", "ns", target, "err", cerr)
