@@ -32,6 +32,8 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | In-node suites again, 2026-09-21, after a month of guards | 1,920 checks, 0 failed, 34 minutes |
 | The four daemons run as systemd units, against a real systemd | 30 checks, 0 failed |
 | Losing the fast tier and rebuilding it from the archive | 33 checks, 0 failed |
+| In-node suites after the day's second half | 1,932 checks, 0 failed |
+| Host suites after it | 308 checks, 0 failed |
 
 ## What is accepted, and needs no work
 
@@ -236,6 +238,33 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
   first covered the write commands and missed the aggregation ones, the second
   read an allow-list of three operators where the rule is about a name, and the
   third returned its refusal wearing a read failure's words.
+
+## What 2026-09-21 added that an operator has to do
+
+None of these joins **Open**, by the rule below: none makes an application read
+or write wrongly in steady state. Every one of them is a cost or a lifecycle
+fault, and each is now named by the product at the moment it can be acted on.
+They are collected here because they are the shortest list of things a first
+production deployment gets wrong.
+
+1. **Build `{date_field: -1, _id: -1}` on the archive** for every warm rule that
+   ages by a date field. Without it a warm pass costs the square of the
+   collection: 200,000 documents examined per batch at 200,003 archived, against
+   100. An index on the field alone still sorts, at 19,039, so the obvious fix
+   is not the fix.
+2. **Build the unique index on the archive** for any tiered collection written
+   by upserts or by inserts that carry no `_id`. Without it every such write
+   asks the archive a question it has no index for: 38-40ms at 200,003 archived
+   documents against 1-10ms.
+3. **Use the units in `packaging/systemd`.** They carry the descriptor limit the
+   router needs, the warmer as a timer rather than a daemon, and the drain that
+   makes a stop end. Before them, a router with a client connected never
+   stopped: still running 60s after SIGTERM against 1s with none, so every
+   restart waited out `TimeoutStopSec` and ended in SIGKILL.
+4. **Run `cline keys --rebuild` before the evictor**, which is step 7 of
+   `docs/adoption.md` and is what the installer now prints.
+5. **`warmer.min_free_disk` is a fraction.** Written as a percentage it is
+   refused at startup now; before, the warmer backed off for ever.
 
 ## The rule that keeps this list finite
 

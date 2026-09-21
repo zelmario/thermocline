@@ -475,6 +475,31 @@ felt much later by a read that falls through. A text or geospatial index gets a
 different line, because those two the archive needs in order to answer at all
 rather than to answer quickly.
 
+**Two of those divergences cost more than a slow read, and both were measured
+on 2026-09-21.**
+
+A **unique** index the archive lacks costs writes. Uniqueness is enforced across
+both tiers, so a write has to establish that no live document holds its key, and
+when the fast tier holds no such document the archive is asked. With no index
+there that question is a collection scan: 38-40ms per write at 200,003 archived
+documents, against 1-10ms with one. It is reached by the writes that leave a
+claim with no owner, which are the ordinary ones, an upsert whose filter carries
+no `_id` and an insert that lets mongod name the document. Build it on the
+archive for any collection written that way.
+
+A **warm rule that ages by a `date_field`** needs `{field: -1, _id: -1}` on the
+archive, and the obvious index is not it. The warm reads newest first, so
+without a matching index mongod answers every batch by reading the whole
+collection and sorting it, and a pass then costs the square of the collection
+rather than the size of the window: 200,000 documents examined per batch at
+200,003 archived. An index on the field alone still sorts, at 19,039 per batch.
+With the compound one there is no sort stage and 100 are examined. A rule with
+no `date_field` ages by the ObjectId and sorts on `_id`, which is always
+indexed, so nothing is needed.
+
+Both are named by the router: the first at every start and in `cline preflight`,
+the second by the warmer once per rule per pass.
+
 What the router does for you, at startup, for every namespace it manages that
 the archive already holds: it creates the collection on the fast tier the way
 the archive has it, carrying the default collation and the validator, and builds
