@@ -156,7 +156,12 @@ type Router struct {
 	// document is copied up into a namespace. A copy-up is the other way the
 	// fast tier gains documents, and the only way for a namespace no warmer
 	// rule covers. See promote/indexes.go.
-	indexer   *promote.Indexer
+	indexer *promote.Indexer
+
+	// conns is every live client connection, so a stop can end the ones that
+	// are idle instead of waiting on a read that will never return.
+	connsMu   sync.Mutex
+	conns     map[*conn]struct{}
 	collCache collationCache
 	viewCache viewCache
 	// viewMatch remembers whether the archive's copy of a view is defined the
@@ -647,6 +652,17 @@ func (r *Router) Listen(ctx context.Context) error {
 			r.serve(ctx, client)
 		}()
 	}
+	// Nothing new is accepted now. End the connections that are parked on a
+	// read, and give whatever is in flight a bounded grace, or wg.Wait below
+	// waits for clients that will never speak again.
+	idleClosed, cut := r.drainClients(drainGrace)
+	if idleClosed > 0 || cut > 0 {
+		r.log.Info("closed client connections on shutdown",
+			"idle", idleClosed, "still_running", cut,
+			"grace", drainGrace.String(),
+			"meaning", "an idle connection is closed at once and the client reconnects; one with a "+
+				"command in flight is given the grace first, and cut after it")
+	}
 	wg.Wait()
 	r.cursors.closeAll(context.WithoutCancel(ctx))
 	// Bounded, because an archive that cannot be reached must not turn a
@@ -748,6 +764,14 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		log:      r.log,
 		id:       r.nextConnID.Add(1),
 	}
+	// Registered so a shutdown can reach it. Without this a SIGTERM waits on
+	// wg.Wait() for goroutines blocked in wire.Read on sockets an application's
+	// pool holds open for ever: measured, a router with one idle client was
+	// still running 60 seconds after SIGTERM, against one second with none.
+	// systemd then waits out TimeoutStopSec and sends SIGKILL, which is the
+	// ungraceful stop the rolling upgrade exists to avoid.
+	r.track(c)
+	defer r.untrack(c)
 	// A borrowed connection goes back when the client goes away, and one still
 	// holding an open transaction is closed rather than reused: the transaction
 	// is abandoned, and mongod should hear that from the socket rather than wait
@@ -768,8 +792,86 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 	}
 }
 
+// track and untrack keep the set of live client connections, so a shutdown can
+// close them rather than wait for clients that will never speak again.
+func (r *Router) track(c *conn) {
+	r.connsMu.Lock()
+	if r.conns == nil {
+		r.conns = map[*conn]struct{}{}
+	}
+	r.conns[c] = struct{}{}
+	r.connsMu.Unlock()
+}
+
+func (r *Router) untrack(c *conn) {
+	r.connsMu.Lock()
+	delete(r.conns, c)
+	r.connsMu.Unlock()
+}
+
+// drainClients ends the connections a stop is waiting on.
+//
+// Idle ones go at once: a client blocked in a read has nothing in flight, and
+// closing its socket is what the shutdown warning already promises, that the
+// connection closes and the client reconnects. A connection in the middle of a
+// command is left alone for a grace, because cutting it there would tear a
+// reply in half and leave the application unable to tell whether its write
+// applied, which is the one thing worth waiting for.
+//
+// Returns how many were closed idle and how many were still busy at the end.
+func (r *Router) drainClients(grace time.Duration) (idle, cut int) {
+	// Closed already, because untrack only happens when the goroutine unwinds
+	// and that lags the close. Without this the loop below closes the same
+	// connection every 20ms and counts it every time, so the line it logs
+	// reports hundreds of idle clients where there was one.
+	closed := map[*conn]bool{}
+	deadline := time.Now().Add(grace)
+	for {
+		var busy int
+		r.connsMu.Lock()
+		for c := range r.conns {
+			if closed[c] {
+				continue
+			}
+			if c.busy.Load() {
+				busy++
+				continue
+			}
+			_ = c.client.Close()
+			closed[c] = true
+			idle++
+		}
+		r.connsMu.Unlock()
+		if busy == 0 {
+			return idle, cut
+		}
+		if time.Now().After(deadline) {
+			// Whatever is still running has had its grace, and a stop that
+			// never ends is worse than a command that ends badly.
+			r.connsMu.Lock()
+			for c := range r.conns {
+				if closed[c] {
+					continue
+				}
+				_ = c.client.Close()
+				closed[c] = true
+				cut++
+			}
+			r.connsMu.Unlock()
+			return idle, cut
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// drainGrace is how long a stop waits for commands already in flight.
+const drainGrace = 5 * time.Second
+
 // conn is one client and its dedicated fast tier connection.
 type conn struct {
+	// busy is set while a command is being handled, so a stop can tell a
+	// connection with something in flight from one blocked on a read.
+	busy     atomic.Bool
 	r        *Router
 	client   net.Conn
 	upstream net.Conn
@@ -862,10 +964,15 @@ func (c *conn) pump(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		// Cleared here rather than at the end of the body, because the body has
+		// many ways out and only one way in: false is exactly "parked in the
+		// read below", which is what a stop may close.
+		c.busy.Store(false)
 		msg, err := wire.Read(c.client)
 		if err != nil {
 			return err
 		}
+		c.busy.Store(true)
 		c.r.Stats.Commands.Add(1)
 
 		// Nothing should arrive compressed, because the handshake never agrees

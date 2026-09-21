@@ -201,6 +201,33 @@ chk "the router is active"                        "active" "$(active cline-route
 chk "and answers on router.listen"                "2" \
     "$(R "print(db.getSiblingDB('$DB').orders.countDocuments({}))")"
 
+echo "== a restart with a client connected =="
+# The unit says Restart=always and the rolling upgrade says to restart the
+# routers last, one host at a time. Both assume a stop that ends.
+#
+# It did not. A router waits for its connection goroutines, and those are parked
+# in a blocking read on sockets an application's pool holds open for ever:
+# measured, a router with one idle client was still running 60 seconds after
+# SIGTERM, against one second with none. systemd then waits out TimeoutStopSec
+# and sends SIGKILL, so every restart took a minute and a half and ended in the
+# ungraceful stop the procedure exists to avoid.
+#
+# The margin here is large on purpose: prompt is about a second, broken is
+# ninety, so thirty tells them apart on any machine.
+docker exec -d "$NODE" bash -c "mongosh '$ROUTER' --quiet --eval 'db.adminCommand({ping:1}); sleep(120000)' > /root/idleclient.out 2>&1"
+sleep 4
+chk "a client is connected"                       "true" \
+    "$(N "pgrep -f 'mongosh.*27640' >/dev/null && echo true || echo false" | tr -d '\n')"
+T0=$(date +%s)
+N "systemctl restart cline-router" >/dev/null 2>&1
+T1=$(date +%s)
+chk "restarting with a client connected is prompt" "true" \
+    "$([ $((T1-T0)) -lt 30 ] && echo true || echo false)"
+echo "  the restart took $((T1-T0))s"
+for _ in $(seq 1 40); do routerUp && break; sleep 1; done
+chk "and it is serving again"                     "active" "$(active cline-router)"
+N "pkill -f 'mongosh.*2764[0]'" >/dev/null 2>&1
+
 echo "== the warmer is the one that is not a daemon =="
 # The claim the unit is built on. A oneshot that has run is inactive with
 # Result=success and NRestarts=0; the same file written as the other three would

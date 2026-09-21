@@ -324,6 +324,16 @@ writable. Point `log.file` somewhere else and the daemon starts and writes
 nothing, so add the directory to `ReadWritePaths=` in the unit, or leave the
 logs in the journal where the units put them by default.
 
+**A stop closes idle client connections and waits for the ones mid-command.**
+A router holds one goroutine per client, parked in a read, and an application's
+pool holds those sockets open indefinitely, so a stop that waited for them
+waited for ever: measured, a router with one idle client was still running 60
+seconds after SIGTERM against one second with none, and systemd then waited out
+`TimeoutStopSec` and sent SIGKILL. A stop now closes the idle ones at once,
+which is the reconnect the router already warns about, and gives a command in
+flight five seconds before cutting it. Keep `TimeoutStopSec` above that grace,
+which the default 90 seconds comfortably is.
+
 **A restart does not resume eviction.** `cline pause` writes the pause into the
 archive's bookkeeping, not into the process, so an evictor restarted while the
 archive is being restored comes back paused. `cline resume` is the only thing

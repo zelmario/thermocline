@@ -883,6 +883,21 @@ func (w WarmerConfig) Validate() error {
 		return fmt.Errorf("warmer.backoff.max_cache_dirty must be a fraction between 0 and 1, got %v",
 			w.Backoff.MaxCacheDirty)
 	}
+	// A fraction next to a number that reads like a percentage, which is the
+	// mistake worth refusing: min_free_disk: 20 meant as "20%" compares 0.85
+	// against 20 on every pass, so the warmer backs off for ever and the fast
+	// tier is never filled. It says so in the log, as "the fast tier's
+	// filesystem is 85.0% free, limit 2000.0%", and a limit of 2000% is not a
+	// line anybody goes looking for. Refused at load instead, with the units in
+	// the message, the same way max_cache_dirty above is.
+	//
+	// One is refused as well as more: keeping the whole filesystem free is a
+	// warmer that never warms, which is the same outcome by a different route,
+	// and turning it off is what zero is for.
+	if w.MinFreeDisk < 0 || w.MinFreeDisk >= 1 {
+		return fmt.Errorf("warmer.min_free_disk must be a fraction between 0 and 1, got %v: "+
+			"0.2 is twenty per cent, and 0 turns the check off", w.MinFreeDisk)
+	}
 	seen := make(map[string]bool, len(w.Rules))
 	for _, r := range w.Rules {
 		db, coll, ok := strings.Cut(r.NS, ".")

@@ -199,6 +199,10 @@ warmer:
   # evictor cannot make room, because a new replica set's oplog window is its
   # own age. Holding the evictor back on the same signal would stop the one
   # thing that frees space.
+  # A fraction, not a percentage: 0.15 is fifteen per cent, and 0 turns the
+  # check off. Anything at or above 1 is refused at startup, because 20 meant as
+  # "20%" compares the filesystem's 0.85 against 20 on every pass and the warmer
+  # then backs off for ever.
   min_free_disk: 0.15
 
   rules:

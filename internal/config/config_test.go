@@ -677,3 +677,41 @@ func TestAdvisorTableIsBounded(t *testing.T) {
 		})
 	}
 }
+
+// min_free_disk is a fraction sitting next to a number that reads like a
+// percentage, and nothing refused the percentage.
+//
+// Written as 20, meaning twenty per cent, the warmer compares the filesystem's
+// 0.85 against 20 on every pass and backs off for ever: the fast tier is never
+// filled and every read of an aged range falls through to the archive. It is
+// not silent, it logs "limit 2000.0%", and a limit of 2000% is not a line
+// anybody goes looking for.
+func TestMinFreeDiskMustBeAFraction(t *testing.T) {
+	cases := []struct {
+		name string
+		v    float64
+		want string
+	}{
+		{"off", 0, ""},
+		{"a tenth", 0.1, ""},
+		{"most of the disk", 0.9, ""},
+		{"the whole disk, which never warms", 1, "fraction between 0 and 1"},
+		{"twenty, meant as a percentage", 20, "0.2 is twenty per cent"},
+		{"negative", -0.1, "fraction between 0 and 1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := valid()
+			cfg.Warmer.MinFreeDisk = c.v
+			err := cfg.Validate()
+			switch {
+			case c.want == "" && err != nil:
+				t.Fatalf("refused %v: %v", c.v, err)
+			case c.want != "" && err == nil:
+				t.Fatalf("accepted %v, want a refusal naming %q", c.v, c.want)
+			case c.want != "" && !strings.Contains(err.Error(), c.want):
+				t.Fatalf("refused with %q, which does not name %q", err, c.want)
+			}
+		})
+	}
+}
