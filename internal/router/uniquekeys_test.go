@@ -52,3 +52,80 @@ func TestClaimRowWithoutAnOwner(t *testing.T) {
 		t.Errorf("recorded owner %v, want %v", got, owner)
 	}
 }
+
+// The id a claim is written under has to be readable back into the fields it
+// was claimed over, because that is what tells an index of the same name over
+// different fields from the same index.
+//
+// Round-tripped rather than asserted against a literal, so that changing how a
+// key id is built breaks this test instead of quietly turning the check that
+// reads it into one that always says "unknown".
+func TestKeyFieldsRoundTripThroughTheID(t *testing.T) {
+	cases := []struct {
+		name   string
+		idx    uniqueIndex
+		vals   []any
+		fields []string
+	}{
+		{"one field", uniqueIndex{name: "email_1", fields: []string{"email"}},
+			[]any{"a@b.c"}, []string{"email"}},
+		{"compound, in order", uniqueIndex{name: "a_1_b_1", fields: []string{"a", "b"}},
+			[]any{1, "x"}, []string{"a", "b"}},
+		{"a dotted path", uniqueIndex{name: "p_1", fields: []string{"addr.zip"}},
+			[]any{"1000"}, []string{"addr.zip"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			id, ok := keyIDFromValues("shop.orders", c.idx, c.vals)
+			if !ok {
+				t.Fatal("no id was built")
+			}
+			got := keyFieldsOf(id, "shop.orders|"+c.idx.name+"|")
+			if !sameFields(got, c.fields) || len(got) != len(c.fields) {
+				t.Fatalf("read back %v, want %v", got, c.fields)
+			}
+		})
+	}
+}
+
+// A collection name may contain the separator, so the prefix is rebuilt rather
+// than parsed. Measured here rather than reasoned: splitting this id on "|"
+// gives a namespace of "shop.a" and an index of "b".
+func TestKeyFieldsSurviveASeparatorInTheName(t *testing.T) {
+	ns := "shop.a|b"
+	idx := uniqueIndex{name: "email_1", fields: []string{"email"}}
+	id, ok := keyIDFromValues(ns, idx, []any{"a@b.c"})
+	if !ok {
+		t.Fatal("no id was built")
+	}
+	if got := keyFieldsOf(id, ns+"|"+idx.name+"|"); len(got) != 1 || got[0] != "email" {
+		t.Fatalf("read back %v, want [email]", got)
+	}
+	// And the wrong prefix, which is what parsing would produce, does not
+	// decode into a field list that would be believed.
+	if got := keyFieldsOf(id, "shop.a|b|"); len(got) == 1 && got[0] == "email" {
+		t.Fatal("a prefix built by parsing read back the right fields, so this test proves nothing")
+	}
+}
+
+func TestSameFields(t *testing.T) {
+	cases := []struct {
+		name          string
+		live, claimed []string
+		want          bool
+	}{
+		{"the same one", []string{"a"}, []string{"a"}, true},
+		{"a different one", []string{"a"}, []string{"b"}, false},
+		{"reordered, which is a different index to mongod",
+			[]string{"a", "b"}, []string{"b", "a"}, false},
+		{"narrowed", []string{"a"}, []string{"a", "b"}, false},
+		{"unknown, which must not warn", []string{"a"}, nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := sameFields(c.live, c.claimed); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}

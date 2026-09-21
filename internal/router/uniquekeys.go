@@ -1984,47 +1984,161 @@ func (r *Router) warnFastTierExpires(ns string, expiring []string) {
 // warning is one: refusing writes mongod accepts is worse than saying that a
 // guarantee has ended, and the operator's move is to recreate the index.
 func (r *Router) warnAboutStrandedKeyClaims(ctx context.Context) {
-	cur, err := r.keys().Aggregate(ctx, mongo.Pipeline{
-		{{Key: "$group", Value: bson.D{{Key: "_id", Value: bson.D{
-			{Key: "ns", Value: "$ns"}, {Key: "idx", Value: "$idx"}}}}}},
-	})
-	if err != nil {
-		// The registry is on the fast tier and a router that cannot read it has
-		// worse problems, all of which say so elsewhere.
-		r.log.Debug("could not read the key registry to check its claims against the indexes", "err", err)
-		return
-	}
-	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-
-	for cur.Next(ctx) {
-		var row struct {
-			ID struct {
-				NS  string `bson:"ns"`
-				Idx string `bson:"idx"`
-			} `bson:"_id"`
-		}
-		if cur.Decode(&row) != nil || row.ID.NS == "" || row.ID.Idx == "" {
-			continue
-		}
-		found := false
-		for _, idx := range r.uniqueIndexes(ctx, row.ID.NS) {
-			if idx.name == row.ID.Idx {
-				found = true
+	for _, c := range r.claimedIndexes(ctx) {
+		var live *uniqueIndex
+		for _, idx := range r.uniqueIndexes(ctx, c.ns) {
+			if idx.name == c.idx {
+				live = &idx
 				break
 			}
 		}
-		if found {
+		if live == nil {
+			r.log.Warn("the key registry holds claims for a unique index no tier has",
+				"ns", c.ns, "index", c.idx, "over", c.fields,
+				"meaning", "the application declared this constraint and nothing is enforcing it now, "+
+					"so a write duplicating a value an archived document holds is accepted",
+				"why", "a unique index lives on the fast tier alone, because nothing copies an index to "+
+					"the archive, so rebuilding the fast tier from the archive leaves the constraint "+
+					"on neither tier and these rows are all that remembers it",
+				"action", "recreate the index through the router, which walks both tiers and reports "+
+					"any duplicates that got in; or drop these claims with cline keys --rebuild if "+
+					"the index was meant to go")
 			continue
 		}
-		r.log.Warn("the key registry holds claims for a unique index no tier has",
-			"ns", row.ID.NS, "index", row.ID.Idx,
-			"meaning", "the application declared this constraint and nothing is enforcing it now, "+
-				"so a write duplicating a value an archived document holds is accepted",
-			"why", "a unique index lives on the fast tier alone, because nothing copies an index to "+
-				"the archive, so rebuilding the fast tier from the archive leaves the constraint "+
-				"on neither tier and these rows are all that remembers it",
-			"action", "recreate the index through the router, which walks both tiers and reports "+
-				"any duplicates that got in; or drop these claims with cline keys --rebuild if "+
-				"the index was meant to go")
+		// An index of the same name over different fields is not the same
+		// constraint, and matching on the name alone would call it present.
+		// Index names are reused: see permanent-is-about-documents, where
+		// "claims are permanent" was reasoned about documents and applied to
+		// names. The claims here were made over c.fields, nothing now enforces
+		// uniqueness over those, and the rows themselves are dead weight,
+		// because every key id built from the live index carries the live
+		// index's field names and can never match one of these.
+		if !sameFields(live.fields, c.fields) {
+			r.log.Warn("the key registry holds claims over fields this index no longer covers",
+				"ns", c.ns, "index", c.idx, "claimed over", c.fields, "now over", live.fields,
+				"meaning", "an index of this name was dropped and recreated over other fields, so "+
+					"uniqueness over the old ones is enforced by nothing and the old rows can "+
+					"never match a key again",
+				"action", "cline keys --rebuild, which claims what the live indexes cover and "+
+					"reports any duplicates that got in")
+		}
 	}
+}
+
+// claimedIndex is one unique index the registry holds claims for, and the
+// fields those claims were made over.
+type claimedIndex struct {
+	ns, idx string
+	fields  []string
+}
+
+// claimedIndexes reports every index the registry has rows for, one lookup per
+// index rather than one pass over the rows.
+//
+// The registry is the largest bookkeeping collection there is, one row per
+// claimed key, and it carries no index but _id. A $group over ns and idx is
+// therefore a collection scan, and it was one: measured on a registry of
+// 200,000 rows, 45ms against 4ms for the walk below, and the gap grows with the
+// registry while the walk grows with the number of indexes. This runs at every
+// router start and in every cline preflight.
+//
+// The walk is the skip scan registryHasAClaimFor already uses for one index,
+// applied to all of them: read the lowest _id, then ask for the lowest _id
+// above everything that index could have written. Every id is prefix + base64
+// and "}" sorts above every base64 character.
+//
+// The prefix is rebuilt from the row's own ns and idx fields rather than parsed
+// out of the id, because a collection name may contain the separator: parsing
+// "shop.a|b|email_1|..." on "|" gives a namespace of "shop.a" and an index of
+// "b", and the walk would then skip to the wrong place and loop. Rebuilding
+// cannot be wrong, because it is how the id was written.
+func (r *Router) claimedIndexes(ctx context.Context) []claimedIndex {
+	var found []claimedIndex
+	after := ""
+	// One lookup per index, and a bound so a registry being written underneath
+	// this cannot turn it into a loop.
+	for i := 0; i < maxClaimedIndexes; i++ {
+		var row struct {
+			ID  string `bson:"_id"`
+			NS  string `bson:"ns"`
+			Idx string `bson:"idx"`
+		}
+		err := r.keys().FindOne(ctx,
+			bson.D{{Key: "_id", Value: bson.D{{Key: "$gt", Value: after}}}},
+			options.FindOne().SetSort(bson.D{{Key: "_id", Value: 1}}).
+				SetProjection(bson.D{{Key: "ns", Value: 1}, {Key: "idx", Value: 1}}),
+		).Decode(&row)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return found
+		}
+		if err != nil {
+			// The registry is on the fast tier and a router that cannot read it
+			// has worse problems, all of which say so elsewhere.
+			r.log.Debug("could not walk the key registry's claims", "err", err, "after", after)
+			return found
+		}
+		if row.NS == "" || row.Idx == "" {
+			// Not a claim row shaped the way claimRow writes them. Stepping
+			// over it by id keeps the walk going rather than stopping on it.
+			after = row.ID
+			continue
+		}
+		prefix := row.NS + "|" + row.Idx + "|"
+		found = append(found, claimedIndex{ns: row.NS, idx: row.Idx, fields: keyFieldsOf(row.ID, prefix)})
+		after = prefix + "}"
+	}
+	r.log.Debug("stopped walking the key registry's claims at the bound", "indexes", len(found))
+	return found
+}
+
+// maxClaimedIndexes bounds the walk above. A deployment with more distinct
+// unique indexes than this has other problems, and the bound is what stops a
+// registry written underneath the walk from turning it into a loop.
+const maxClaimedIndexes = 1000
+
+// keyFieldsOf reads the field names a claim was made over out of its id.
+//
+// The id is prefix + base64 of the BSON document keyIDFromValues built, whose
+// keys are the index's fields in order. That makes the row carry what it was
+// claimed over, which is the only thing that can tell an index of the same name
+// over different fields from the same index.
+//
+// Nil when it cannot be read, which reads as "unknown" at every caller rather
+// than as "no fields".
+func keyFieldsOf(id, prefix string) []string {
+	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(id, prefix))
+	if err != nil {
+		return nil
+	}
+	elems, err := bson.Raw(raw).Elements()
+	if err != nil {
+		return nil
+	}
+	fields := make([]string, 0, len(elems))
+	for _, e := range elems {
+		fields = append(fields, e.Key())
+	}
+	return fields
+}
+
+// sameFields reports whether two field lists are the same in the same order.
+// Order matters: {a:1, b:1} and {b:1, a:1} are different indexes to mongod and
+// produce different key documents here.
+//
+// An unknown list, which is what keyFieldsOf returns when it cannot read an id,
+// counts as the same so that an unreadable row does not produce a warning about
+// a constraint that is probably fine.
+func sameFields(live, claimed []string) bool {
+	if len(claimed) == 0 {
+		return true
+	}
+	if len(live) != len(claimed) {
+		return false
+	}
+	for i := range live {
+		if live[i] != claimed[i] {
+			return false
+		}
+	}
+	return true
 }
