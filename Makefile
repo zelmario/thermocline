@@ -56,6 +56,7 @@ test:
 check: fmt
 	go vet ./...
 	go test ./...
+	@bash test/partition.sh
 
 ## race runs the same unit tests under the race detector.
 ##

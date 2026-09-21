@@ -23,6 +23,12 @@ Part of [Thermocline](../README.md).
   lets mongod name the document. A claim with an owner is re-read by `_id`
   instead, which is an indexed lookup on both tiers.
 
+  **Who is exposed is narrower than it sounds.** An adopted cluster becomes the
+  archive, so it arrives carrying every index the application had, and those
+  keep answering. The gap is an index created *after* adoption: that one is
+  built on the fast tier and the archive never gets it, which is the moment the
+  router warns.
+
   The answer is correct either way, and `test/testkeys.sh` pins that: the
   duplicate is refused with E11000 exactly as one cluster would refuse it. What
   is missing is only the index. Build the same unique index on the archive for

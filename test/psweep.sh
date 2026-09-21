@@ -78,10 +78,12 @@ if [ "${CACHE:-0}" = "1" ]; then
   echo "psweep: the query cache is on for every worker in this run"
 fi
 
-# A suite in neither list is a file nothing runs, and nothing would say so.
-# Refused here rather than warned about, because a sweep that starts is a sweep
-# whose total gets quoted. See test/partition.sh.
-bash "$(dirname "$0")/partition.sh" || exit 2
+# The partition check is not run here, and that is deliberate. This sweep runs
+# inside node0, where $0 is /root/psweep.sh and the suite files sit beside
+# whatever anyone has ever copied into /root: five stray testX_old.sh from old
+# debugging sessions made it refuse to start, naming them as suites no sweep
+# runs. The partition is a property of the repository, so it is checked where
+# the repository is, by hostsweep.sh and by `make check`.
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 printf '%s\n' $SUITES > "$OUT/queue"
