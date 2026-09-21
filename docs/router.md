@@ -809,6 +809,24 @@ deadline honours it and then reaches the archive with nothing to spend, which
 would turn a feeder that is merely behind into failed queries. That is the one
 thing this barrier exists not to do.
 
+**And a write's deadline bounds the work this system adds to it, which it did
+not until 2026-09-21.** A multi-document write that matches archived documents
+brings them up first, and that copy-up is work the client cannot see and did not
+agree to. It carried no deadline at all. Measured on 3,000 documents held by the
+archive alone: an update asking for `maxTimeMS: 1` came back in **595 ms**, and
+the same update against an untiered collection came back in **1 ms**. The error
+code was right both times, which is why nothing noticed: what was wrong is that
+the bound meant nothing, and an application sets `maxTimeMS` precisely to shed
+load. The copy-up now carries the caller's budget, and the same command returns
+in 10 ms against the control's 2 ms.
+
+What that changes for a deployment: a write with a deadline too short for the
+copy-up it needs now **fails** with `MaxTimeMSExpired` where it used to succeed
+slowly. That is what one cluster does with a deadline it cannot meet, and it is
+reported with MongoDB's own code rather than this router's generic one, so a
+driver can tell a deadline from a refusal. A write with no `maxTimeMS` is
+unchanged and still copies up everything it matches.
+
 A read of something written milliseconds ago is therefore seen, at the cost of
 that wait. A stopped feeder is the one case the barrier cannot hold, and there
 the router answers anyway and warns rather than turning a dead background daemon

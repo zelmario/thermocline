@@ -118,7 +118,7 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 		// An upsert's filter may refer to the command's let variables just as a
 		// multi-document write's may, and this asks the archive that filter.
 		n, cerr := c.r.copyUpMatching(ctx, ns, st.filter,
-			copyUpOptions{let: letOf(cmd), collation: st.collation})
+			copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)})
 		if cerr != nil {
 			// Letting it through would write the stub. Refusing is the honest
 			// answer: the alternative is silent loss of an archived record.

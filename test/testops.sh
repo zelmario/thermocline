@@ -197,6 +197,43 @@ chk "bulkWrite mixed"  "3"  "$(R "const r=db.getSiblingDB(process.env.TC_DB).$NS
 chk "\$inc operator"   "43" "$(R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:4},{\$inc:{n:39}}); print(db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:4}).n)")"
 chk "\$push to array"  "3"  "$(R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:5},{\$push:{tags:'new'}}); print(db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:5}).tags.length)")"
 
+echo "== a write's own maxTimeMS, on the work this system adds =="
+# The copy-up is work the client cannot see and did not agree to, and it used to
+# be unbounded: measured on 3,000 documents held by the archive alone, an update
+# asking for 1ms came back in 595ms and the same update on an untiered
+# collection came back in 1ms. The error code was right both times, which is why
+# the code alone cannot tell this apart: what was wrong was that the deadline
+# meant nothing. The read path had always honoured it, in withRemainingTime.
+#
+# The mechanism is what is checked here rather than the clock, because a timing
+# bound under a parallel sweep measures the box. The router says this line only
+# when the deadline is what ended the copy-up, which cannot happen unless the
+# copy-up is carrying the deadline at all.
+# grep -c prints 0 and exits 1 when nothing matches, so `|| echo 0` makes this
+# two lines and every comparison against it an "integer expression expected".
+BEFORE=$(grep -c "own maxTimeMS ran out" "$LOGDIR/ops_r.log" 2>/dev/null); BEFORE=${BEFORE:-0}
+# Asserted first, because a copy-up that is already done has no deadline to
+# miss and the check below would pass for the wrong reason.
+chk "the fast tier is short of these to begin with" "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'c'}))" | awk '{print ($1+0 < 13) ? "true" : "false"}')"
+EXPIRED=$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({update: '$NS',
+    updates: [{q: {grp: 'c'}, u: {\$set: {mt: 1}}, multi: true}], maxTimeMS: 1});
+    print('accepted') } catch (e) { print(e.code) }")
+chk "a deadlined write says MaxTimeMSExpired"  "50" "$EXPIRED"
+sleep 1
+AFTER=$(grep -c "own maxTimeMS ran out" "$LOGDIR/ops_r.log" 2>/dev/null); AFTER=${AFTER:-0}
+chk "and the copy-up is what the deadline cut" "true" \
+    "$([ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && echo true || echo false)"
+# Nothing applied, because the write never ran: a deadline that stops half a
+# multi-document write would be worse than one that means nothing.
+chk "and nothing was half applied"             "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({mt:1}))")"
+# And the ordinary case is untouched: no deadline, the copy-up runs, every
+# matching document is reached.
+WANT=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'c'}))")
+chk "a write with no deadline still reaches them" "$WANT" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.updateMany({grp:'c'},{\$set:{mt2:1}}).modifiedCount)")"
+
 echo "== metadata commands =="
 MODE="metadata"
 chk "listCollections"  "true" "$(R "print(db.getSiblingDB(process.env.TC_DB).getCollectionNames().includes('$NS'))")"

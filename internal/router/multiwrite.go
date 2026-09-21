@@ -2,9 +2,12 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -169,6 +172,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		n, cerr := c.r.copyUpMatching(ctx, ns, fdoc, copyUpOptions{
 			let:       letOf(cmd),
 			collation: docField(st, "collation"),
+			budget:    maxTimeBudget(cmd),
 		})
 		if cerr == nil {
 			if n > 0 {
@@ -176,6 +180,21 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 					"ns", ns, "command", name, "documents", n)
 			}
 			continue
+		}
+
+		// A deadline that ran out is the caller's own answer, not a refusal by
+		// this router, and it is reported as MongoDB reports it.
+		if errors.Is(cerr, errCopyUpExpired) {
+			c.log.Info("a write's own maxTimeMS ran out while bringing archived documents up",
+				"ns", ns, "command", name,
+				"meaning", "the write was not applied, and the caller is told what one cluster "+
+					"would tell it")
+			out, rerr := c.r.commandErrorWithCode(msg.Header.RequestID, msg.Header.RequestID,
+				"operation exceeded time limit", maxTimeMSExpiredCode, "MaxTimeMSExpired")
+			if rerr != nil {
+				return nil, false
+			}
+			return out, true
 		}
 
 		c.r.Stats.Refused.Add(1)
@@ -232,7 +251,27 @@ func statementIsMulti(st bson.Raw, name string) bool {
 type copyUpOptions struct {
 	let       bson.Raw
 	collation bson.Raw
+	// budget is the caller's own maxTimeMS, or zero when they set none.
+	//
+	// Without it the copy-up is work the client cannot see and did not agree
+	// to. Measured on 3,000 documents held by the archive alone: an update
+	// asking for 1ms came back in 595ms, and the same update on an untiered
+	// collection came back in 1ms. The error was right both times and the
+	// deadline meant nothing on the tiered one, which is the opposite of what
+	// maxTimeMS is for: an application sets it to shed load, and a bound that
+	// is exceeded 595-fold sheds none.
+	//
+	// The read path has always done this, in withRemainingTime. This is the
+	// same thing on the other path.
+	budget time.Duration
 }
+
+// errCopyUpExpired says the caller's own deadline ran out while the archive was
+// being read, so the reply has to be MongoDB's own MaxTimeMSExpired rather than
+// this router's generic refusal: it is the one error code whose retry semantics
+// do apply, and a driver told CommandFailed cannot tell a deadline from a
+// refusal.
+var errCopyUpExpired = errors.New("the caller's maxTimeMS ran out while reading the archive")
 
 // docField returns a document-valued field, or nil when it is absent.
 func docField(doc bson.Raw, key string) bson.Raw {
@@ -288,8 +327,21 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	if len(opts.collation) > 0 {
 		find = append(find, bson.E{Key: "collation", Value: opts.collation})
 	}
+	// The caller's deadline, applied to the work this adds. A millisecond floor
+	// rather than zero, for the reason withRemainingTime gives: MongoDB reads
+	// maxTimeMS zero as "no limit", which is the opposite of an expired one.
+	started := time.Now()
+	if opts.budget > 0 {
+		find = append(find, bson.E{Key: "maxTimeMS", Value: int64(1)})
+		if ms := opts.budget.Milliseconds(); ms > 1 {
+			find[len(find)-1].Value = ms
+		}
+	}
 	cur, err := r.cold.Database(db).RunCommandCursor(ctx, find)
 	if err != nil {
+		if isMaxTimeExpired(err) {
+			return 0, errCopyUpExpired
+		}
 		return 0, fmt.Errorf("read the archive: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
@@ -353,6 +405,12 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	}
 
 	for cur.Next(ctx) {
+		// Checked here as well as on the find, because the copy writes to the
+		// fast tier as it reads and those writes are not covered by the
+		// archive's own deadline.
+		if opts.budget > 0 && time.Since(started) > opts.budget {
+			return moved, errCopyUpExpired
+		}
 		if copied >= maxCopyUpForWrite {
 			return moved, fmt.Errorf("more than %d documents would have to be brought back from the archive; "+
 				"warm that range first, or narrow the filter", maxCopyUpForWrite)
@@ -424,3 +482,23 @@ func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collat
 		c.log.Debug("brought up the document an unacknowledged single-document write names", "ns", ns, "command", name)
 	}
 }
+
+// isMaxTimeExpired reports whether an error is MongoDB's own deadline expiry.
+//
+// By code rather than by message: the text has changed between releases and
+// this decides whether a client is told its deadline ran out or told something
+// generic.
+func isMaxTimeExpired(err error) bool {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return ce.Code == maxTimeMSExpiredCode
+	}
+	var we mongo.WriteException
+	if errors.As(err, &we) && we.WriteConcernError != nil {
+		return we.WriteConcernError.Code == maxTimeMSExpiredCode
+	}
+	return false
+}
+
+// maxTimeMSExpiredCode is MongoDB's MaxTimeMSExpired.
+const maxTimeMSExpiredCode = 50

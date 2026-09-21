@@ -1670,6 +1670,23 @@ func (r *Router) errorReply(msg, reply *wire.Message, errmsg string) (*wire.Mess
 // commandError builds a failed command reply from scratch, so it can also be
 // used for a command that was refused before it ever reached the fast tier and
 // therefore has no reply to borrow a request id from.
+// commandErrorWithCode is commandError with a server code chosen by the caller.
+//
+// commandError's generic 125 is right for a refusal, and wrong for a deadline:
+// MaxTimeMSExpired is the one code whose retry semantics do apply, and a driver
+// told CommandFailed cannot tell "your deadline ran out" from "this router will
+// not do that".
+func (r *Router) commandErrorWithCode(requestID, responseTo int32, errmsg string,
+	code int32, codeName string) (*wire.Message, error) {
+	out := bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: errmsg},
+		{Key: "code", Value: code},
+		{Key: "codeName", Value: codeName},
+	}
+	return wire.NewMsg(requestID, responseTo, out)
+}
+
 func (r *Router) commandError(requestID, responseTo int32, errmsg string) (*wire.Message, error) {
 	out := bson.D{
 		{Key: "ok", Value: 0.0},
