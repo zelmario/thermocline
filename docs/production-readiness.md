@@ -29,6 +29,9 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | The same two, 45 minutes against the guards added since | 637,747 operations, 0 violations, 0 refusals |
 | The same two again, four hours, 2026-09-17 | 2,494,225 operations, 0 violations, 0 refusals, 31 stale reads in one second |
 | The fuzzer's change streams, 20 rounds under three other suites | 365 minutes, 0 disagreements |
+| In-node suites again, 2026-09-21, after a month of guards | 1,920 checks, 0 failed, 34 minutes |
+| The four daemons run as systemd units, against a real systemd | 30 checks, 0 failed |
+| Losing the fast tier and rebuilding it from the archive | 33 checks, 0 failed |
 
 ## What is accepted, and needs no work
 
@@ -148,7 +151,17 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
   Each is walked by a suite now, which is the half that can be automated:
   adoption by `test/pilot/setup.sh` on 425,367 real documents, the rolling
   upgrade by `verskew.sh` in both orders, the feeder gap and the **archive
-  restore** by `testbackfill.sh`, rollback by `testrollback.sh`. The restore was
+  restore** by `testbackfill.sh`, rollback by `testrollback.sh`.
+
+  **Two more were added on 2026-09-21, and the list of four was short.**
+  `testservice.sh` walks installing the daemons as systemd units, which is the
+  first procedure anyone performs and had no units to perform it with.
+  `testrestore.sh` walks the other restore, the one where the *fast* tier is
+  lost and rebuilt from the archive: it took exactly the backup list
+  `docs/operations.md` gave, and the application came back without its catalogue
+  and without the unique constraint it had declared. Both are fixed and both are
+  now checked, and the reason they matter here is that neither was on the list
+  of four. A procedure nobody has walked is not known to be short. The restore was
   the gap worth closing on 2026-09-16: the procedure said mirroring could not
   fetch the writes made after the backup, which was true when it was written and
   is not now. Measured, a client read ten of the fifteen the application had
