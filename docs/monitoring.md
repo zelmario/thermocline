@@ -255,6 +255,18 @@ permission for, refused. The second is a message the router could not inspect,
 which means it was forwarded unguarded; a compressed connection is the cause, and
 the remedy is removing the client's compressors.
 
+**10. `thermocline_eviction_paused_seconds` above an hour. Ticket.** `cline
+pause` is a step in the restore procedure and the fast tier grows for as long as
+it is held: nothing is removed, and the only thing that ends it is `cline
+resume`. A hold that is forgotten is its own outage, and no other signal says
+why, because every daemon is running and reporting healthy passes.
+
+The gauge is read from the archive's own record of when the hold was taken, so
+it survives a router restart and cannot be reset by one. It is exported as zero
+while nothing is held rather than going missing, for the same reason mirroring
+lag reports `+Inf`: a rule cannot watch a series that only appears once the
+thing it warns about has happened.
+
 ```yaml
 groups:
   - name: thermocline
@@ -286,6 +298,11 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "{{ $labels.daemon }} has not finished a pass in ten minutes"
+      - alert: ThermoclineEvictionHeld
+        expr: thermocline_eviction_paused_seconds > 3600
+        labels: {severity: ticket}
+        annotations:
+          summary: "eviction has been held by an operator for an hour; the fast tier is filling up and cline resume is what ends it"
       - alert: ThermoclineRefusalsRising
         expr: increase(thermocline_refused_total[15m]) > 10
         labels: {severity: ticket}

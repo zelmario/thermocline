@@ -251,6 +251,13 @@ cline resume --config $CFG >/dev/null 2>&1
 sleep 2
 chk "resuming lifts it"                                "0" \
     "$(M | awk -F' ' '/^thermocline_eviction_paused /{print $2}')"
+# Present and zero, not absent. ThermoclineEvictionHeld is written against this
+# series, and a rule cannot be written against one that only appears once the
+# thing it warns about has happened: it would have nothing to evaluate until the
+# moment it was needed, which is the same reason mirroring lag reports +Inf
+# rather than going missing.
+chk "and the duration stays exported, at zero"         "0" \
+    "$(M | awk -F' ' '/^thermocline_eviction_paused_seconds /{print $2}')"
 
 echo "== the dashboard inventory still reports every namespace =="
 # Measured concurrently now, so the risk is a lost or duplicated entry rather

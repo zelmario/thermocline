@@ -323,11 +323,19 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			gauge("eviction_paused",
 				"Whether an operator has stopped the evictor removing anything. A hold left on fills the fast tier.",
 				held)
+			// Zero rather than absent when nothing is held, because this is the
+			// series the alert rule is written against and an alert cannot be
+			// written against a series that only exists once the thing has
+			// happened: ThermoclineEvictionHeld would have had nothing to
+			// evaluate until the moment it was needed. The same reason
+			// mirroring lag reports +Inf instead of going missing.
+			seconds := 0.0
 			if paused {
-				gauge("eviction_paused_seconds",
-					"How long eviction has been held. Alert on this being long rather than on it being set.",
-					max(r.archiveNowFallback(ctx).Sub(rec.Since), 0).Seconds())
+				seconds = max(r.archiveNowFallback(ctx).Sub(rec.Since), 0).Seconds()
 			}
+			gauge("eviction_paused_seconds",
+				"How long eviction has been held, zero when it is not. Alert on this being long rather than on it being set.",
+				seconds)
 		}
 	}
 
