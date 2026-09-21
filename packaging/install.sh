@@ -80,10 +80,19 @@ Installed. Then, in this order:
 
   cline preflight --config /etc/cline/cline.yaml     # writes nothing, refuses a bad pair
   systemctl enable --now cline-feeder                # and let it catch up first
-  systemctl enable --now cline-router
+  systemctl enable --now cline-router                # builds the archive's indexes on the fast tier
+  cline keys --rebuild --config /etc/cline/cline.yaml
   systemctl enable --now cline-warmer.timer cline-evictor
 
-docs/adoption.md is the numbered order for a cluster already serving traffic,
-and it matters: the feeder has to be running before anything is seeded, because
-a change stream starts at now.
+The evictor goes last, and after the rebuild, which is step 7 of
+docs/adoption.md: the key registry only protects values it knows about, and a
+cluster adopted with documents already in it starts with none of them claimed.
+Let the evictor remove a document whose key nothing has claimed and the
+constraint stops being enforced against it. The rebuild reads the constraint
+from the fast tier's unique indexes, which a router builds there at startup, so
+it has to run after the router has been up once.
+
+docs/adoption.md is the whole numbered order for a cluster already serving
+traffic, and it matters throughout: the feeder has to be running before anything
+is seeded, because a change stream starts at now.
 NEXT

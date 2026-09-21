@@ -31,7 +31,36 @@ func setupLogging(flagPath string, cfg config.Config, verbose bool) (*slog.Logge
 		path = flagPath
 	}
 	if path == "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})), func() {}, nil
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+		// A daemon must not die of the signal that means "reopen your log".
+		//
+		// Go terminates the process for an unhandled SIGHUP, and the handler
+		// below is only installed when there is a file to reopen, so a daemon
+		// logging to stderr -- which is what the systemd units do, because
+		// journald takes the stream -- was killed by it. Measured: a router
+		// started without --log-file was gone three seconds after kill -HUP.
+		//
+		// It is reachable from the packaging this repository ships. The
+		// logrotate file signals every cline process by name, so a deployment
+		// that gives one daemon a file and leaves the others on the journal
+		// kills the others at the first rotation. systemd restarts them, so the
+		// symptom is daemons restarting nightly for no visible reason, and a
+		// feeder that dies this way does not release its lease, which costs its
+		// replacement the full thirty seconds. An operator's reflex reload,
+		// kill -HUP, does the same thing by hand.
+		//
+		// Drained rather than acted on: there is no file to reopen, and saying
+		// so once is worth more than a line per signal.
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				log.Info("SIGHUP with no log file configured, so there is nothing to reopen",
+					"meaning", "logs are going to stderr, which journald captures and rotates",
+					"action", "nothing; set log.file if you want files and logrotate")
+			}
+		}()
+		return log, func() { signal.Stop(hup); close(hup) }, nil
 	}
 
 	w, err := openLogFile(path)

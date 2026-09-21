@@ -172,6 +172,22 @@ ok "preflight runs against the pair"        0 "Nothing will be written" \
    -- cline preflight --config $CFG
 ok "and says nothing refuses a start"       0 "Nothing above refuses a start" \
    -- cline preflight --config $CFG
+# Both lines above are sentences the command prints. This is the property they
+# claim, which nothing checked: the bookkeeping on both tiers is where a write
+# would land, so it is counted either side of a run and has to be identical.
+# Greping a command's output proves it looks right.
+snapMeta() {
+  mongosh "$1" --quiet --eval '
+    const d = db.getSiblingDB(process.env.TC_META);
+    print(d.getCollectionNames().sort().map(c => c + "=" + d.getCollection(c).countDocuments({})).join(","));' 2>&1 | tail -1
+}
+BEFORE_H=$(snapMeta "$HOTU"); BEFORE_C=$(snapMeta "$COLDU")
+cline preflight --config $CFG >/dev/null 2>&1
+AFTER_H=$(snapMeta "$HOTU"); AFTER_C=$(snapMeta "$COLDU")
+if [ "$BEFORE_H" = "$AFTER_H" ]; then PASS=$((PASS+1)); echo "  PASS  and wrote nothing to the fast tier's bookkeeping"
+else FAIL=$((FAIL+1)); FAILED+=("preflight wrote to the fast tier"); echo "  FAIL  preflight changed the fast tier: $BEFORE_H -> $AFTER_H"; fi
+if [ "$BEFORE_C" = "$AFTER_C" ]; then PASS=$((PASS+1)); echo "  PASS  and wrote nothing to the archive's bookkeeping"
+else FAIL=$((FAIL+1)); FAILED+=("preflight wrote to the archive"); echo "  FAIL  preflight changed the archive: $BEFORE_C -> $AFTER_C"; fi
 # And that line has to be true of the feeder as well as the router, which it was
 # not. preflight ran the router's checks only, so a capped collection named in
 # feeder.namespaces printed a clean report here and stopped the feeder dead

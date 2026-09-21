@@ -66,6 +66,15 @@ chk "and installs the units"                      "5" \
     "$(N "ls /etc/systemd/system/cline-* 2>/dev/null | wc -l" | tr -d '\n')"
 chk "and says the config is the operator's to write" "true" \
     "$(grep -q 'write /etc/cline/cline.yaml next' <<<"$INST" && echo true || echo false)"
+# The order it prints is the one an operator follows, so it has to be the order
+# docs/adoption.md gives. Step 7 there is the key rebuild, before the evictor:
+# the registry only protects values it knows about, and letting the evictor
+# remove a document whose key nothing claimed stops the constraint being
+# enforced against it. The first version of this script left that step out.
+KLINE=$(grep -n 'cline keys --rebuild' <<<"$INST" | head -1 | cut -d: -f1)
+ELINE=$(grep -n 'cline-evictor' <<<"$INST" | head -1 | cut -d: -f1)
+chk "and puts the key rebuild before the evictor"  "true" \
+    "$([ -n "$KLINE" ] && [ -n "$ELINE" ] && [ "$KLINE" -lt "$ELINE" ] && echo true || echo false)"
 # Its own databases and ports, so this suite cannot disturb another one, and
 # log.file set on purpose: a daemon that logs to the journal would never touch
 # the filesystem and ProtectSystem=strict would go untested.
@@ -200,6 +209,36 @@ for _ in $(seq 1 40); do routerUp && break; sleep 1; done
 chk "the router is active"                        "active" "$(active cline-router)"
 chk "and answers on router.listen"                "2" \
     "$(R "print(db.getSiblingDB('$DB').orders.countDocuments({}))")"
+
+echo "== SIGHUP, which is what logrotate sends =="
+# Go terminates the process for an unhandled SIGHUP, and the handler that
+# reopens a log file is only installed when there is a file. The units log to
+# the journal, so they have none: measured, a router started that way was gone
+# three seconds after kill -HUP.
+#
+# It is reachable from this repository's own packaging. The logrotate file
+# signals every cline process by name, so a deployment that gives one daemon a
+# file and leaves the others on the journal kills the others at the first
+# rotation, and an operator's reflex reload does it by hand.
+#
+# Its own config, because the one this suite writes sets log.file on purpose to
+# test ProtectSystem, and with a file the handler is installed and this would
+# pass without proving anything.
+N "sed -e '/^log:/,+1d' -e 's|^  listen:.*|  listen: \"0.0.0.0:27645\"|' -e 's|^  dashboard:.*|  dashboard: \"\"|' /etc/cline/cline.yaml > /root/nolog.yaml" >/dev/null
+chk "the probe config has no log file"            "0" \
+    "$(N "grep -c 'file:' /root/nolog.yaml" | tr -d '\n')"
+ND "cline router --config /root/nolog.yaml > /root/nolog.out 2>&1"
+sleep 8
+HUPPID=$(N "pgrep -f 'config /root/nolog[.]yaml'" | tr -d '\n')
+chk "a router is running with no log file"        "true" \
+    "$([ -n "$HUPPID" ] && echo true || echo false)"
+N "kill -HUP $HUPPID" >/dev/null 2>&1
+sleep 3
+chk "and it survives SIGHUP"                      "true" \
+    "$(N "kill -0 $HUPPID 2>/dev/null && echo true || echo false" | tr -d '\n')"
+chk "and says there is nothing to reopen"         "true" \
+    "$(N "grep -q 'nothing to reopen' /root/nolog.out && echo true || echo false" | tr -d '\n')"
+N "kill -TERM $HUPPID" >/dev/null 2>&1
 
 echo "== a restart with a client connected =="
 # The unit says Restart=always and the rolling upgrade says to restart the

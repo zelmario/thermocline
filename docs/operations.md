@@ -273,8 +273,14 @@ sudo packaging/install.sh bin/cline
 sudo install -m 0640 -o cline -g cline cline.yaml /etc/cline/cline.yaml
 cline preflight --config /etc/cline/cline.yaml
 sudo systemctl enable --now cline-feeder          # and let it catch up first
-sudo systemctl enable --now cline-router cline-evictor cline-warmer.timer
+sudo systemctl enable --now cline-router          # builds the archive's indexes on the fast tier
+cline keys --rebuild --config /etc/cline/cline.yaml
+sudo systemctl enable --now cline-warmer.timer cline-evictor
 ```
+
+The evictor is last and follows the rebuild, which is step 7 of
+[docs/adoption.md](adoption.md): the key registry only protects values it knows
+about, and an adopted cluster starts with none of its keys claimed.
 
 The installer creates a `cline` system account that owns neither tier, the
 directories, the units and the logrotate file, and it is safe to run again: the
@@ -374,6 +380,15 @@ only works if you signal the process:
 
 Without the SIGHUP the daemon keeps writing to the renamed inode, so the file
 you are tailing stays empty while the disk fills up.
+
+**A daemon with no `log.file` ignores SIGHUP rather than dying of it**, which it
+did not until 2026-09-21. Go terminates a process for an unhandled SIGHUP and
+the handler that reopens a file was only installed when there was a file, so a
+daemon logging to the journal was killed by the signal above. That matters
+because the snippet signals every `cline` process by name: a deployment that
+gives one daemon a file and leaves the others on the journal killed the others
+at the first rotation, and systemd restarted them, so the symptom was daemons
+restarting nightly for no reason anybody could see.
 
 Both tiers must be replica sets, since the feeder uses change streams.
 MongoDB 4.2 or newer.
