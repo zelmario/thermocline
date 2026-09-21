@@ -264,7 +264,7 @@ function setValue(f) {
 
 function updateSpec() {
   const f = pick(FIELDS.filter(x => x.p !== '_id'));
-  switch (ri(10)) {
+  switch (ri(14)) {
     case 0: return { $set:   { [f.p]: setValue(f) } };
     case 1: return { $unset: { [f.p]: '' } };
     case 2: return { $inc:   { n: 1 + ri(5) } };
@@ -286,6 +286,24 @@ function updateSpec() {
     // different things for the rest of the round. That is the trap multiSafe
     // exists for and it is cheaper to not generate it.
     case 9: return ri(2) ? { $rename: { opt: 'opt2' } } : { $rename: { opt2: 'opt' } };
+    // Four more array operators, all of them deterministic, which is the only
+    // bar an operator has to clear to belong here: both sides are replayed from
+    // the same seed, so anything that depends on the server's own clock or on
+    // storage order would disagree over nothing. Every document this fuzzer
+    // creates carries tags as an array, so none of these fails per document the
+    // way multiSafe exists to prevent.
+    //
+    // $pop and $pullAll are the two array operators the generator never had.
+    case 10: return { $pop: { tags: ri(2) ? 1 : -1 } };
+    case 11: return { $pullAll: { tags: ['t1', 'common'] } };
+    // $each with $slice and $sort: one operator carrying three modifiers, and a
+    // modifier is a place a reader of an update can stop looking too early.
+    case 12: return { $push: { tags: { $each: ['e' + ri(3), 'e' + ri(3)], $slice: -4, $sort: 1 } } };
+    // The all-positional operator, which names a field by a path no other shape
+    // here produces: "tags.$[]" is the field an update touches, and anything
+    // reading an update to decide which unique keys it moves or whether it
+    // writes a reserved name has to see it in that form.
+    case 13: return { $set: { 'tags.$[]': 'all' + ri(3) } };
     default: return { $set: { [f.p]: setValue(f) }, $inc: { n: 1 } };
   }
 }
@@ -331,8 +349,15 @@ function pipelineSpec() {
 // has to be copied up and applied, and it has to fail the same way there.
 // Rewritten rather than redrawn, so the generated stream is unchanged.
 function multiSafe(u) {
+  // "tags.$[]" belongs here as much as "items." does, and for a sharper reason:
+  // $[] is an error rather than a no-op on a document that has no such field,
+  // and $unset picks its field at random, so a round that has already removed
+  // tags from one document turns the next updateMany into a write that applies
+  // to some documents and fails on one. That leaves the two collections holding
+  // different things for the rest of the round, which reads as a disagreement
+  // this system caused.
   const touchesArray = Object.keys(u).some(op =>
-    Object.keys(u[op]).some(f => f.indexOf('items.') === 0));
+    Object.keys(u[op]).some(f => f.indexOf('items.') === 0 || f.indexOf('.$[') >= 0));
   // opt, because nothing in IDX_SPECS indexes it. The first substitute here was
   // $inc on n, which every one of those specs does index: a constant increment
   // across many documents collides on a unique one and fails partway, which is
