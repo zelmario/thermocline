@@ -50,6 +50,12 @@ echo "== install it the way the document says =="
 cleanup
 # The installer rather than its steps repeated here, so the procedure an
 # operator runs is the one under test. See [[run-the-remedy-you-name]].
+# The config this suite wrote last time is still there, and the installer's
+# first-install branch is the one about to be checked. Measured: testservice
+# passed 30/0 on a machine it had never run on and 29/1 on the next sweep,
+# because install.sh correctly reported a config it had left alone. A suite that
+# only passes the first time is a suite that reports the second run wrong.
+docker exec "$NODE" rm -f /etc/cline/cline.yaml >/dev/null 2>&1
 docker exec "$NODE" rm -rf /root/packaging >/dev/null 2>&1
 docker cp packaging "$NODE":/root/packaging >/dev/null
 INST=$(N "cd /root && bash packaging/install.sh /usr/local/bin/cline 2>&1")
