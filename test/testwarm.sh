@@ -599,6 +599,35 @@ C "db.getSiblingDB(process.env.TC_DB).$DNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$DNS'})" >/dev/null
 
 
+echo "== the order a dated warm reads the archive in =="
+# A rule that ages by a date field sorts the archive {field: -1, _id: -1}, and
+# nothing copies an index there. Without one mongod answers every batch by
+# reading the whole collection and sorting it: measured on 200,003 archived
+# documents with batch_size 200, 200,000 examined per batch, against 100 with
+# {createdAt: -1, _id: -1}. Per batch, so a pass costs the square of the
+# collection rather than the size of the window.
+#
+# The middle case is why the warning names the index rather than the field. An
+# index on the field alone is the obvious fix and still sorts, at 19,039 per
+# batch, so the check below has to see it warn with that one present.
+DNS2=tqbound
+C "db.getSiblingDB(process.env.TC_DB).$DNS2.dropIndex('createdAt_-1__id_-1')" >/dev/null 2>&1
+WARMOUT=$(cline warmer --config $CFG --dry-run 2>&1)
+chk "it warns when the archive cannot sort it"      "true" \
+    "$(grep -q 'no index for the order this warm reads it in' <<<"$WARMOUT" && echo true || echo false)"
+chk "and names the index to build"                  "true" \
+    "$(grep -q "build {createdAt: -1, _id: -1}" <<<"$WARMOUT" && echo true || echo false)"
+C "db.getSiblingDB(process.env.TC_DB).$DNS2.createIndex({createdAt:1})" >/dev/null 2>&1
+WARMOUT=$(cline warmer --config $CFG --dry-run 2>&1)
+chk "the field on its own is not enough"            "true" \
+    "$(grep -q 'no index for the order this warm reads it in' <<<"$WARMOUT" && echo true || echo false)"
+C "db.getSiblingDB(process.env.TC_DB).$DNS2.createIndex({createdAt:-1,_id:-1})" >/dev/null 2>&1
+WARMOUT=$(cline warmer --config $CFG --dry-run 2>&1)
+chk "and quiet once the archive can walk it"        "false" \
+    "$(grep -q "ns=$DB.$DNS2" <<<"$(grep 'no index for the order this warm reads it in' <<<"$WARMOUT")" && echo true || echo false)"
+C "db.getSiblingDB(process.env.TC_DB).$DNS2.dropIndex('createdAt_1')" >/dev/null 2>&1
+C "db.getSiblingDB(process.env.TC_DB).$DNS2.dropIndex('createdAt_-1__id_-1')" >/dev/null 2>&1
+
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
 exit $FAIL

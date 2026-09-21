@@ -6,6 +6,32 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **A warm rule that ages by a date field needs an index on the archive, and
+  the obvious one makes it worse.** The warmer reads the archive newest first,
+  and for a `date_field` rule that sort is `{field: -1, _id: -1}`. Nothing
+  copies an index to the archive, so unless somebody built one there mongod
+  answers *every batch* by reading the whole collection and sorting it. Per
+  batch, not per pass, which is what makes a warm cost the square of the
+  collection rather than the size of the window.
+
+  Measured on 200,003 archived documents with `batch_size: 200`, one pass, from
+  the archive's own profiler:
+
+  | indexes on the archive | plan | documents examined per batch |
+  |---|---|---|
+  | `_id` only | COLLSCAN with a sorting stage | 200,000 |
+  | `{createdAt: 1}` | IXSCAN with a sorting stage | 19,039 |
+  | `{createdAt: -1, _id: -1}` | IXSCAN, no sort | 100 |
+
+  The middle row is the one worth knowing: an index on the field alone is the
+  obvious fix and it is not enough, because the tiebreak on `_id` is not in it
+  and the sort remains. With the compound index the archive spent 36ms across
+  the profiled finds of a whole pass, against 16,750ms with none.
+
+  A rule with no `date_field` ages by the ObjectId's own timestamp, so it sorts
+  on `_id` and every collection indexes that. The warmer names the index to
+  build, once per rule per pass.
+
 - **A unique index the archive does not have costs writes, not just reads, and
   the cost is a collection scan of the archive.** Uniqueness is enforced across
   both tiers, so a write has to establish that no live document already holds
