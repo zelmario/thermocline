@@ -95,7 +95,7 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 			// The copy-up is an ordinary write outside the transaction, so the
 			// caller's snapshot was taken before it landed and the statement
 			// would still match nothing. Replaying is what makes it visible.
-			switch out, res := c.warmForTxn(ctx, ns, st.filter, msg.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, ns, st.filter, copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
 				"the document this transaction upserts"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)

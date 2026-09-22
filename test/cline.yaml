@@ -240,6 +240,9 @@ feeder:
     - "shop.ttxh"
     - "shop.ttxi"
     - "shop.ttxj"
+    # testtxn.sh: a transaction whose read carries its own collation, where the
+    # copy-up that makes the fast tier able to answer has to use the same one.
+    - "shop.ttxk"
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"

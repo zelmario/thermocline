@@ -48,8 +48,25 @@ const (
 // true after a copy-up is narrower and stronger: the archive holds no live
 // document matching this filter that the fast tier lacks. That is completeness
 // for this query, established per query, and it is what these two answers mean.
-func (c *conn) warmForTxn(ctx context.Context, ns string, filter bson.Raw, requestID, responseTo int32, what string) (*wire.Message, txnWarm) {
-	n, err := c.r.copyUpMatching(ctx, ns, filter, copyUpOptions{})
+// opts is the caller's own, and every field of it changes the answer. This
+// copy-up runs the caller's filter against the archive, so it is the same query
+// its sibling copy-up outside a transaction runs and it needs the same three
+// things:
+//
+//   - collation, because a filter means different documents in a different one.
+//     Matching none of them is the bad case rather than the obvious one: the
+//     answer below reads that as completeness and the transaction goes on to
+//     read the fast tier alone, short, with no error on it.
+//   - let, because a filter reading $$variables the archive is not given is a
+//     filter the archive rejects, which refuses a statement that works.
+//   - budget, because the caller's maxTimeMS is a bound on the work they agreed
+//     to and this is work they cannot see.
+//
+// It took copyUpOptions{} for all three. The type is passed whole rather than
+// the fields taken one at a time, so a call site builds it exactly as the
+// copy-up beside it does and the next field added reaches both.
+func (c *conn) warmForTxn(ctx context.Context, ns string, filter bson.Raw, opts copyUpOptions, requestID, responseTo int32, what string) (*wire.Message, txnWarm) {
+	n, err := c.r.copyUpMatching(ctx, ns, filter, opts)
 	if err != nil {
 		c.log.Warn("could not bring this transaction's documents up from the archive, refusing instead",
 			"ns", ns, "err", err)
@@ -111,12 +128,23 @@ func (c *conn) warmScopeForTxn(ctx context.Context, msg *wire.Message, scope agg
 	seen := map[string]bool{}
 	moved := 0
 
+	// An aggregate carries one collation, one let and one maxTimeMS for the
+	// whole pipeline, so every namespace warmed for it is warmed with the same
+	// ones. See warmForTxn for what passing none does.
+	var opts copyUpOptions
+	if cmd, cerr := msg.CommandDoc(); cerr == nil {
+		opts = copyUpOptions{
+			let:       letOf(cmd),
+			collation: docField(cmd, "collation"),
+			budget:    maxTimeBudget(cmd),
+		}
+	}
 	warm := func(ns string, filter bson.Raw) txnWarm {
 		if ns == "" || seen[ns] || !c.r.cfg.Manages(ns) {
 			return txnWarmComplete
 		}
 		seen[ns] = true
-		n, err := c.r.copyUpMatching(ctx, ns, filter, copyUpOptions{})
+		n, err := c.r.copyUpMatching(ctx, ns, filter, opts)
 		if err != nil {
 			c.log.Warn("could not bring this transaction's documents up from the archive, refusing instead",
 				"ns", ns, "err", err)

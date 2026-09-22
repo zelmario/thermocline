@@ -1128,6 +1128,19 @@ the bulkWrite path and the `$merge` target rerun, and the fast tier's own
 pre-flight check for an upsert asks with the collation too. `testconform.sh`
 compares each against the untiered reference.
 
+That list used to have four entries and there were five. The copy-up a
+transaction does, which is how a transaction reads past what the fast tier
+holds, passed none of them. It is the worst place to leave out, because of what
+the answer means: matching nothing reads as the fast tier already holding
+everything the query matches, so the transaction proceeds on the fast tier alone
+and is short, with no error on it. Measured on a document held by the archive
+alone, `{name: "Bob"}`, read inside a transaction as
+`find({name: "bob"}).collation({locale: "en", strength: 2})`: the router
+answered **0** and mongod answered **1** on the same data untiered. The same
+call now takes the caller's `let`, collation and `maxTimeMS` as one value, so a
+field added to it reaches this path too. `testtxn.sh` checks it with mongod as
+the control.
+
 ### An insert the archive cannot be asked about
 
 The check that stops an insert duplicating an `_id` the archive still holds has

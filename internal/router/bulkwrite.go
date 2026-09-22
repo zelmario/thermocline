@@ -234,7 +234,7 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			continue
 		}
 		if inTxn {
-			switch out, res := c.warmForTxn(ctx, op.ns, op.stmt.filter, msg.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, op.ns, op.stmt.filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
 				"the documents this transaction writes"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)

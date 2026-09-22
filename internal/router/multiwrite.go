@@ -142,7 +142,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 			// transaction's snapshot was taken before it landed and repeating
 			// the statement now would still miss. Replaying the whole
 			// transaction is what makes the documents visible to it.
-			switch out, res := c.warmForTxn(ctx, ns, fdoc, msg.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, ns, fdoc, copyUpOptions{let: letOf(cmd), collation: docField(st, "collation"), budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
 				"the documents this transaction writes"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)

@@ -573,7 +573,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// replayed. Only a range too large to move is refused.
 	if cmd, cerr := msg.CommandDoc(); cerr == nil && inTransaction(cmd) {
 		if filter, fok := txnFilter(cmd, "find"); fok {
-			switch out, res := c.warmForTxn(ctx, ns, filter, reply.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, ns, filter, copyUpOptions{let: letOf(cmd), collation: docField(cmd, "collation"), budget: maxTimeBudget(cmd)}, reply.Header.RequestID, msg.Header.RequestID,
 				"the documents this transaction reads"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)

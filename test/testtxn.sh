@@ -292,6 +292,56 @@ chk "one live holder of that key across both tiers"    "1" "$((LIVE_H2 + LIVE_C2
 
 stopDaemons
 echo
+echo "== a transaction whose read carries its own collation =="
+# A transaction cannot read the archive, so the router copies the documents it
+# matches up to the fast tier and asks the driver to replay. That copy-up runs
+# the caller's filter against the archive, and a filter means different
+# documents in a different collation. Every other copy-up path passes the
+# caller's collation through. This one did not, so the copy-up compared by bytes
+# while the replayed read compared by the collation the caller asked for.
+#
+# When it matches nothing the router reports completeness, which is the answer
+# that makes this a wrong answer rather than a refusal: the transaction then
+# reads the fast tier alone and is short.
+#
+# A collection default would not show it, because the server applies a default
+# to a query that names no collation. It takes a query carrying its own.
+#
+# Its own daemons, because the section above this one ends with stopDaemons. The
+# first version of this did not start them: the mirroring wait timed out, every
+# read came back ECONNREFUSED, and both checks read as product failures.
+startFeeder
+startRouter
+chk "the router is up for this section"                 "1" \
+    "$(R "print(db.adminCommand({ping:1}).ok)")"
+fresh ttxk
+R "db.getSiblingDB(process.env.TC_DB).ttxk.insertOne({_id:1,name:'Bob'})" >/dev/null
+waitMirrored ttxk 1
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).ttxk.deleteMany({})"
+chk "the archive holds it and the fast tier does not"   "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).ttxk.countDocuments({_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).ttxk.countDocuments({}))")"
+# withTransaction, because a copy-up lands outside the caller's snapshot and the
+# router asks for a replay to make it visible. A hand-rolled startTransaction
+# never replays: written that way first, this came back WriteConflict from the
+# fixed build and 0 from the broken one, which reads as the fix being worse.
+TXOUT=$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxk;
+  let tries=0, n=-1;
+  s.withTransaction(() => { tries++;
+    n=c.find({name:'bob'}).collation({locale:'en',strength:2}).toArray().length; });
+  print(n+' '+(tries>1));")
+chk "a collated read inside a txn finds the archived document" "1" \
+    "$(echo "$TXOUT" | awk '{print $1}')"
+chk "  and a replay is what made it possible"            "true" \
+    "$(echo "$TXOUT" | awk '{print $2}')"
+# The control, because a check that a read finds one document passes just as
+# well when the collation is doing nothing. Same data, untiered, at mongod.
+H "db.getSiblingDB(process.env.TC_DB).ttxkctl.drop(); db.getSiblingDB(process.env.TC_DB).ttxkctl.insertOne({_id:1,name:'Bob'})" >/dev/null
+chk "  and mongod answers the same read the same way"   "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).ttxkctl.find({name:'bob'}).collation({locale:'en',strength:2}).toArray().length)")"
+chk "  while without the collation it finds nothing"    "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).ttxkctl.find({name:'bob'}).toArray().length)")"
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

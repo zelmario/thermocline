@@ -1144,7 +1144,7 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 
 	if inTransaction(cmd) {
 		if filter, fok := txnFilter(cmd, name); fok {
-			switch out, res := c.warmForTxn(ctx, ns, filter, msg.Header.RequestID, msg.Header.RequestID,
+			switch out, res := c.warmForTxn(ctx, ns, filter, copyUpOptions{let: letOf(cmd), collation: docField(cmd, "collation"), budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
 				"the documents this transaction counts"); res {
 			case txnWarmReplay:
 				c.r.Stats.TxnReplays.Add(1)
