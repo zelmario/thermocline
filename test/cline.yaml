@@ -189,6 +189,9 @@ feeder:
     - "shop.tkcoll"
     - "shop.tkspar"
     - "shop.tkpart"
+    # testkeys.sh: collation crossed with a partial filter, which is where the
+    # two rules meet and where only one of them was being applied.
+    - "shop.tkcollpart"
     - "shop.tkddl"
     - "shop.tkeval"
     - "shop.tkeval2"

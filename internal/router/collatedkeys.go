@@ -41,19 +41,7 @@ func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx unique
 		return false
 	}
 
-	filter := bson.D{meta.NotArchivedDeleted()}
-	for i, f := range idx.fields {
-		// A missing field is indexed as null, exactly as keyID encodes it.
-		if vals[i] == nil {
-			filter = append(filter, bson.E{Key: f, Value: nil})
-			continue
-		}
-		filter = append(filter, bson.E{Key: f, Value: vals[i]})
-	}
-	if !owner.IsZero() {
-		// The document that already holds this value is allowed to keep it.
-		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
-	}
+	filter := collatedClashFilter(idx, vals, owner)
 
 	// More than one, because the archive is behind the fast tier by however
 	// long mirroring takes. A document that has just moved off this value still
@@ -90,6 +78,40 @@ func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx unique
 		}
 	}
 	return false
+}
+
+// collatedClashFilter is what collatedArchiveClash asks the archive: live
+// documents holding this key, other than the one that already owns it, among
+// the documents the index actually indexes.
+//
+// A separate function so the last of those three can be checked without an
+// archive to ask. A partial or sparse index constrains only some documents, and
+// one outside it does not hold the key however plainly it holds the value, in
+// any collation. Written without that, a unique index carrying both a collation
+// and a partialFilterExpression refused an insert mongod takes: measured on
+// {email: 1} unique, en/strength 2, partial on {active: true}, with
+// {_id: 1, email: "Bob@x.com", active: false} archived and off the fast tier, an
+// insert of {email: "bob@x.com", active: true} came back E11000 from the router
+// and was accepted by mongod on an untiered collection carrying the same index.
+func collatedClashFilter(idx uniqueIndex, vals []any, owner bson.RawValue) bson.D {
+	filter := bson.D{meta.NotArchivedDeleted()}
+	for i, f := range idx.fields {
+		// A missing field is indexed as null, exactly as keyID encodes it.
+		if vals[i] == nil {
+			filter = append(filter, bson.E{Key: f, Value: nil})
+			continue
+		}
+		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+	}
+	if !owner.IsZero() {
+		// The document that already holds this value is allowed to keep it.
+		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$ne", Value: owner}}})
+	}
+	// The same narrowing the two byte-key lookups do, from the same function.
+	if scope := indexScope(idx); len(scope) > 0 {
+		filter = append(filter, bson.E{Key: "$and", Value: scope})
+	}
+	return filter
 }
 
 // collatedCandidates bounds how many archived documents one key is compared

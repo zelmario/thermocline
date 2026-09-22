@@ -492,6 +492,44 @@ waitMirrored tkcoll 3
 R 'db.getSiblingDB(process.env.TC_DB).tkcoll.updateOne({_id:5},{$set:{email:"moved@x.com"}})' >/dev/null
 chk "the value it just moved off is free at once"    "ok"    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll.insertOne({_id:6,email:"MOVES@x.com"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== a collation and a partial filter, which is where the two rules meet =="
+# A partial or sparse unique index constrains only some documents, and one
+# outside it does not hold the key however plainly it holds the value. That rule
+# is indexScope, and its own comment says the two places that need it must not
+# drift. The collated archive lookup is a third place that needs it and did not
+# have it, so an archived document the index does not index refused a write.
+#
+# The enforcement case goes first, because it leaves the archive's live count
+# where the next step expects it whether or not the write below is refused.
+fresh tkcollpart
+H 'db.getSiblingDB(process.env.TC_DB).tkcollpart.createIndex({email:1},{unique:true,collation:{locale:"en",strength:2},partialFilterExpression:{active:true}})' >/dev/null
+# The archive needs an index in the same collation or the router cannot ask it,
+# exactly as the section above this one explains.
+C 'db.getSiblingDB(process.env.TC_DB).tkcollpart.createIndex({email:1},{collation:{locale:"en",strength:2}})' >/dev/null
+
+R 'db.getSiblingDB(process.env.TC_DB).tkcollpart.insertOne({_id:3,email:"Carol@x.com",active:true})' >/dev/null
+waitMirrored tkcollpart 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcollpart.deleteOne({_id:3})'
+chk "an archived document the index does index still refuses it" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcollpart.insertOne({_id:4,email:"carol@x.com",active:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
+# active:false, so this one holds the value and is not in the index at all.
+R 'db.getSiblingDB(process.env.TC_DB).tkcollpart.insertOne({_id:1,email:"Bob@x.com",active:false})' >/dev/null
+waitMirrored tkcollpart 2
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcollpart.deleteOne({_id:1})'
+chk "an archived document it does not index is not a clash"      "ok"    \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcollpart.insertOne({_id:2,email:"bob@x.com",active:true});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
+# The control, because a check that a write is accepted passes just as well when
+# nothing is being enforced at all. Same index, untiered, straight at mongod.
+H 'db.getSiblingDB(process.env.TC_DB).tkcpctl.drop()' >/dev/null
+H 'db.getSiblingDB(process.env.TC_DB).tkcpctl.createIndex({email:1},{unique:true,collation:{locale:"en",strength:2},partialFilterExpression:{active:true}})' >/dev/null
+H 'db.getSiblingDB(process.env.TC_DB).tkcpctl.insertOne({_id:1,email:"Bob@x.com",active:false})' >/dev/null
+chk "  and mongod takes the same write on the same index"        "ok"    \
+    "$(H 'try{db.getSiblingDB(process.env.TC_DB).tkcpctl.insertOne({_id:2,email:"bob@x.com",active:true});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and refuses it when the document is in the index"         "11000" \
+    "$(H 'try{db.getSiblingDB(process.env.TC_DB).tkcpctl.insertOne({_id:3,email:"BOB@x.com",active:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== the remedy for a collated index the archive cannot answer =="
 # When the archive has no index in the same collation, the router cannot compare
 # the value the way the index does, so it under-enforces and says so, with an

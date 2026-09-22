@@ -1505,9 +1505,12 @@ func (r *Router) archiveHoldsSomethingIndexedBy(ctx context.Context, ns string, 
 // operator MongoDB allows in a partialFilterExpression is one a find filter
 // takes.
 //
-// One function rather than the same two rules written out twice, because the
-// two places that need them must not drift: whether a value is still held, and
-// whether the archive holds anything an index would index at all.
+// One function rather than the same two rules written out three times, because
+// the places that need them must not drift: whether a value is still held,
+// whether the archive holds anything an index would index at all, and whether
+// an archived document clashes under the index's collation. The third was
+// written without it and refused writes mongod accepts, which is the same
+// defect this function was extracted to stop.
 func indexScope(idx uniqueIndex) bson.A {
 	var scope bson.A
 	if len(idx.partial) > 0 {
