@@ -918,17 +918,22 @@ const IDX_SPECS = [
 // generated operation is only safe when it means the same thing on both sides.
 const TTL_NEVER = 2147483647;
 
+// Each option is rolled on its own rather than one being drawn from a list.
+// This was a switch, so an index carried at most one of them and the generator
+// could not produce a combination at all. The combinations are where the
+// defects have been: the collated cross-tier key check ignored the partial
+// filter, so a unique index with both a collation and a partialFilterExpression
+// answered E11000 to a write mongod accepts, and no round of this file could
+// ever have built that index. optionSuffix already named combinations and
+// legalOptions already existed to remove illegal ones; only the draw was
+// single-valued.
 function indexOptions() {
   const o = {};
   if (maybe(0.25)) o.unique = true;
-  switch (ri(6)) {
-    case 0: o.sparse = true; break;
-    case 1: o.partialFilterExpression = { n: { $gt: 10 } }; break;
-    case 2: o.partialFilterExpression = { grp: 'alpha' }; break;
-    case 3: o.collation = { locale: 'en', strength: 2 }; break;
-    case 4: if (!o.unique && !NO_TTL) o.expireAfterSeconds = TTL_NEVER; break;
-    default: break;
-  }
+  if (maybe(0.20)) o.sparse = true;
+  if (maybe(0.25)) o.partialFilterExpression = maybe(0.5) ? { n: { $gt: 10 } } : { grp: 'alpha' };
+  if (maybe(0.25)) o.collation = { locale: 'en', strength: 2 };
+  if (maybe(0.10) && !o.unique && !NO_TTL) o.expireAfterSeconds = TTL_NEVER;
   return o;
 }
 
@@ -954,6 +959,12 @@ function legalOptions(entry) {
   const o = indexOptions();
   if (o.expireAfterSeconds !== undefined && entry.name !== 'fz_when') {
     delete o.expireAfterSeconds;
+  }
+  // mongod refuses the two together: "Cannot mix "partialFilterExpression" and
+  // "sparse" options". Partial is the one kept, being the stronger statement of
+  // the same idea and the one more shapes hang off.
+  if (o.sparse && o.partialFilterExpression) {
+    delete o.sparse;
   }
   return o;
 }
