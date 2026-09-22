@@ -215,6 +215,14 @@ import json,sys
 for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineArchiveNotSuperset": print(r.get("state"))' 2>/dev/null)"
+# Its own wait, because it is a different shape from the gauge above: an
+# increase over a counter needs two scrapes with a rise between them, so it
+# becomes true a little after the gauge does. Checked without one it passed
+# alone and read inactive under a sweep, which is a check that reports the box.
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineUnmirrorableDocument","state":"firing"' && break
+  sleep 5
+done
 chk "and the counter rule fires too"          "firing" \
     "$(PQ rules | python3 -c '
 import json,sys

@@ -361,7 +361,20 @@ FAST=$(readAcrossStepDown $CNSU "$HOT")
 echo "      the client saw: $FAST"
 chk "a fast tier cursor is not silently truncated"     "true" \
     "$([ "$(verdict "$FAST")" != "TRUNCATED at ${FAST%% *}" ] && echo true || echo false)"
+# What a client is told about this proxy during an election is pinned by a unit
+# test rather than here, and that is worth explaining. The state is real and
+# measured: sampling hello every 150ms on one held connection across a forced
+# step-down gave 153 of 173 replies saying isWritablePrimary=false, still false
+# 25 seconds later, because the reply was the pinned upstream's and that upstream
+# was the demoted node. After the fix the same measurement gave 0 of 161.
+#
+# An end-to-end check of it was written and thrown away: it passed against the
+# defect three times, even with the step-down verified to have moved the primary,
+# because whether it reproduces depends on which member the connection happens to
+# be pinned to and when the pool redials. A check that passes either way is worse
+# than no check. See TestMongosIdentityIsAlwaysWritable.
 waitForPrimary
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
