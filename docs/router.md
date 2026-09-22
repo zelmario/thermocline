@@ -1141,6 +1141,24 @@ call now takes the caller's `let`, collation and `maxTimeMS` as one value, so a
 field added to it reaches this path too. `testtxn.sh` checks it with mongod as
 the control.
 
+And a collation does not have to be in the command at all. A collection carries
+a default one, and then every query that names none is evaluated under it. The
+archive's copy of that collection was created by the feeder's first upsert and
+carries no collation, so a filter sent there without one compares by bytes. The
+read path has looked the default up since it was written; the copy-up behind a
+write had not, so the write could not see documents the read could. Measured on
+a fast tier collection created with `{locale: "en", strength: 2}`, its archived
+copy holding `{name: "ALICE"}` and the fast tier holding nothing:
+
+| asked with no `collation` field | through the router | untiered reference |
+| --- | --- | --- |
+| `countDocuments({name: "alice"})` | 1 | 1 |
+| `updateMany({name: "alice"})` modified | 0 | 1 |
+
+The lookup is inside the copy-up now rather than at its call sites, so all six
+get it and a seventh does not have to remember. `testconform.sh` compares both
+rows against a reference collection carrying the same default.
+
 ### An insert the archive cannot be asked about
 
 The check that stops an insert duplicating an `_id` the archive still holds has

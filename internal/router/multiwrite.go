@@ -350,6 +350,26 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	}
 	if len(opts.collation) > 0 {
 		find = append(find, bson.E{Key: "collation", Value: opts.collation})
+	} else if def, ok := r.defaultCollation(ctx, ns); ok {
+		// The caller sent none, so mongod applied the collection's own to the
+		// fast tier. The archive's copy of that collection was created by the
+		// feeder's first upsert and carries no collation at all, so asking it
+		// without one compares by bytes and matches different documents.
+		//
+		// The read path has looked this up since collation.go was written, and
+		// its comment says the router says the collation out loud on every read
+		// it sends to the archive. This was a read it sends to the archive and
+		// it did not. Measured on a fast tier collection created with
+		// {locale: "en", strength: 2}, its archived copy holding {name: "ALICE"}
+		// and the fast tier holding nothing: updateMany({name: "alice"}) with no
+		// collation field modified 0 through the router and 1 on an untiered
+		// collection with the same default, while countDocuments for the same
+		// filter answered 1 both ways, because that path already asked.
+		//
+		// Here rather than at the six call sites: every one of them is a write
+		// whose filter mongod evaluated under this collation, and a seventh
+		// would have to remember.
+		find = append(find, bson.E{Key: "collation", Value: def})
 	}
 	// The caller's deadline, applied to the work this adds. A millisecond floor
 	// rather than zero, for the reason withRemainingTime gives: MongoDB reads

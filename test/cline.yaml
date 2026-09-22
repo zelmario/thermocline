@@ -370,6 +370,9 @@ feeder:
     - "shop.tupsf"
     # testconform.sh: tcref is deliberately NOT here, it is the untiered reference
     - "shop.tcon"
+    # testconform.sh: a collection whose collation is its own default rather
+    # than a field in the command, which is the half of the rule nothing sent.
+    - "shop.tcondef"
     # testfuzz.sh: same arrangement, tcfuzz is tiered and tcref is the reference
     - "shop.tcfuzz"
     # testfuzz.sh: the second pair, so a generated join can name a collection

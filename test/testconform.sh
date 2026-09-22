@@ -715,6 +715,58 @@ ABORT=$(R "
   print(db.getSiblingDB(process.env.TC_DB).tcon.countDocuments({gone:1}));")
 chk "abortTransaction leaves nothing behind"    "0" "$ABORT"
 
+echo "== a collation that is the collection's, not the command's =="
+# The three collation checks above all put a collation in the command. A
+# collection carries one too, and then the command carries nothing: mongod
+# applies the collection's default to every query that names none.
+#
+# That is the half the copy-up missed. The archive's copy of a collection is
+# created by the feeder's first upsert and carries no collation at all, so a
+# filter sent there without one compares by bytes and matches other documents.
+# The read path has looked the default up since collation.go was written. The
+# copy-up behind a multi-document write had not, so the write never saw the
+# documents the read could see.
+#
+# Its own pair rather than tcon and tcref, because a collation is fixed when a
+# collection is created and these two have to be created with one.
+DEF=tcondef; DEFREF=tcondefref
+H "db.getSiblingDB(process.env.TC_DB).$DEF.drop(); db.getSiblingDB(process.env.TC_DB).$DEFREF.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$DEF.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$DEF',{collation:{locale:'en',strength:2}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$DEFREF',{collation:{locale:'en',strength:2}})" >/dev/null
+# Without one, which is what the feeder's first upsert would have made.
+C "db.getSiblingDB(process.env.TC_DB).createCollection('$DEF')" >/dev/null
+chk "the fast tier's collection has a default collation" "true" \
+    "$(H "print(!!db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$DEF'})[0].options.collation)")"
+chk "  and the archive's copy has none"                   "false" \
+    "$(C "print(!!db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'$DEF'})[0].options.collation)")"
+
+R "db.getSiblingDB(process.env.TC_DB).$DEF.insertOne({_id:1,name:'ALICE'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$DEFREF.insertOne({_id:1,name:'ALICE'})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$DEF.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "1" ] && break
+  sleep 0.5
+done
+# Behind the feeder, so the archive keeps a live copy the fast tier has lost.
+# This suite has startFeeder and stopDaemons and no stopFeeder, so the feeder is
+# stopped here the way stopDaemons stops it, scoped to this worker's config.
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+H "db.getSiblingDB(process.env.TC_DB).$DEF.deleteMany({})" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+chk "the archive holds it and the fast tier does not"      "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$DEF.countDocuments({_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$DEF.countDocuments({}))")"
+
+# The read, which has always been right, as the control: a section where both
+# answers are wrong in the same way would pass on the write alone.
+chk "a read with no collation field agrees with untiered"  \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$DEFREF.countDocuments({name:'alice'}))")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$DEF.countDocuments({name:'alice'}))")"
+chk "and a write with no collation field does too"         \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$DEFREF.updateMany({name:'alice'},{\$set:{hit:1}}).modifiedCount)")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$DEF.updateMany({name:'alice'},{\$set:{hit:1}}).modifiedCount)")"
+
 stopDaemons
 echo
 echo "================================"
