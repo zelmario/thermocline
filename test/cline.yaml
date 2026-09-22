@@ -169,6 +169,9 @@ feeder:
     # unique indexes for a minute, so a name reused with a different index is
     # still enforced under the old one.
     - "shop.tkupd"
+    # testkeys.sh: a statement whose collation is the only reason its filter
+    # matches, which is what decides the keys the registry claims for it.
+    - "shop.tkupdcoll"
     - "shop.tkups"
     # And one for what a unique index the archive lacks costs the write path,
     # which only a tiered namespace is told about.

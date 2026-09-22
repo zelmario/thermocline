@@ -632,6 +632,28 @@ func (c *conn) matchedForStatement(ctx context.Context, ns string, st updateStat
 	if len(st.sort) > 0 {
 		opts.SetSort(st.sort)
 	}
+	// And in the statement's own collation, which is what the field's comment
+	// on updateStatement asks for and this read was not doing. mongod runs the
+	// update under it; this read ran under the collection's default, so the two
+	// picked different documents and the keys of the ones missed here were
+	// never claimed.
+	//
+	// The default is deliberately not filled in when the statement carries
+	// none: this asks the fast tier, whose collection has its own collation,
+	// and mongod applies that to a query that names none. Only the explicit
+	// half is missing, which is the half that overrides it.
+	//
+	// Measured on a unique index over email, the archive alone holding
+	// {_id: 2, email: "taken@x.com"} and the fast tier holding
+	// {_id: 1, name: "ALICE"}: an update of {name: "alice"} setting that same
+	// address, carrying en/strength 2, was accepted by the router and refused
+	// E11000 by an untiered reference. The archive then held taken@x.com on
+	// two live documents.
+	if len(st.collation) > 0 {
+		if c := collationFromSpec(st.collation); c != nil {
+			opts.SetCollation(c)
+		}
+	}
 	filter := st.filter
 	if len(filter) == 0 {
 		filter = bson.Raw{}
@@ -827,6 +849,10 @@ func updateStatements(cmd bson.Raw, msg *wire.Message, name string) (string, []u
 			if v, verr := st.LookupErr("arrayFilters"); verr == nil {
 				s.arrayFilters = v
 			}
+			// Per statement, which is where update carries it. Never read
+			// before, so the field this struct declares for it was always nil
+			// and every read of it below asked the wrong question.
+			s.collation = docField(st, "collation")
 			out = append(out, s)
 		}
 		return coll, out, true
@@ -861,6 +887,8 @@ func updateStatements(cmd bson.Raw, msg *wire.Message, name string) (string, []u
 		if v, verr := cmd.LookupErr("arrayFilters"); verr == nil {
 			s.arrayFilters = v
 		}
+		// Top level, which is where findAndModify carries it, unlike update.
+		s.collation = docField(cmd, "collation")
 		return coll, []updateStatement{s}, true
 	}
 	return "", nil, false

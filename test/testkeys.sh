@@ -322,6 +322,44 @@ chk "the freed value can be taken"    "ok"      "$(R 'try{db.getSiblingDB(proces
 chk "the value it moved to is now held" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkfree.insertOne({_id:3,email:"b@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "rewriting a field to its own value works" "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkfree.updateOne({_id:1},{$set:{email:"b@x.com",seen:1}}).modifiedCount)')"
 
+echo "== a statement whose collation is why its filter matches =="
+# The registry claims the key every document a statement will end up with, and
+# to know which documents those are it reads them from the fast tier with the
+# statement's own filter. mongod runs the statement under the collation the
+# statement carries. That collation was never parsed: updateStatement declares a
+# field for it, with a comment saying anything asking the same filter of the
+# other tier has to ask it the same way, and the parser for update and
+# findAndModify filled in q, upsert, multi, sort and arrayFilters and not that.
+#
+# So the read matched nothing, no key was claimed, and the update moved a
+# document onto an address an archived document already holds. Measured before
+# the fix: accepted by the router, E11000 from an untiered collection carrying
+# the same unique index, and taken@x.com then live on two documents at once.
+fresh tkupdcoll '{email:1}'
+R "db.getSiblingDB(process.env.TC_DB).tkupdcoll.insertMany([
+     {_id:1,name:'ALICE',email:'a@x.com'},{_id:2,name:'zzz',email:'taken@x.com'}])" >/dev/null
+waitMirrored tkupdcoll 2
+# _id 2 leaves the fast tier, so only the archive holds the contested address
+# and the fast tier's own unique index cannot see it.
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tkupdcoll.deleteOne({_id:2})"
+chk "the archive holds the address and the fast tier does not" "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tkupdcoll.countDocuments({email:'taken@x.com',_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).tkupdcoll.countDocuments({email:'taken@x.com'}))")"
+# The filter matches _id 1 only because the collation says ALICE is alice.
+chk "an update matching only under its collation is refused" "11000" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:'tkupdcoll',updates:[
+           {q:{name:'alice'},u:{\$set:{email:'taken@x.com'}},collation:{locale:'en',strength:2}}]});
+         print(r.writeErrors?r.writeErrors[0].code:'ACCEPTED')")"
+chk "  and the address is still held by one document" "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tkupdcoll.countDocuments({email:'taken@x.com',_tcDeletedAt:{\$exists:false}}))")"
+# The control, because a refusal proves nothing if everything is being refused.
+# The same statement moving onto an address nobody holds has to go through.
+chk "the same update onto a free address still works"      "ok" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:'tkupdcoll',updates:[
+           {q:{name:'alice'},u:{\$set:{email:'free@x.com'}},collation:{locale:'en',strength:2}}]});
+         print(r.writeErrors?r.writeErrors[0].code:'ok')")"
+chk "  and it reached the document the collation names"    "free@x.com" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).tkupdcoll.findOne({_id:1}); print(d?d.email:'MISSING')")"
+
 echo "== updates the guard must leave alone =="
 chk "a non-indexed field"             "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkfree.updateOne({_id:2},{$set:{note:"hello"}}).modifiedCount)')"
 chk "an indexed field, value free"    "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkfree.updateOne({_id:2},{$set:{email:"other@x.com"}}).modifiedCount)')"
