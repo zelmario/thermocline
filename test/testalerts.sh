@@ -176,6 +176,94 @@ for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineClusterTimeBehind": print(r.get("state"))' 2>/dev/null)"
 
+echo "== the archive refusing a document the fast tier holds =="
+# Two rules for one condition and both were only ever parsed. The pair is worth
+# firing together because they are deliberately different shapes: the first is
+# an increase over a counter, which reports the moment it happens and then goes
+# quiet, and the second is a gauge that stays up for as long as the deployment
+# is in that state, which is the whole time an application is seeing refusals.
+#
+# The state is built the way testkeys builds it: the unique index on the archive
+# alone, so the fast tier takes both documents and the archive refuses the
+# second.
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+ANS=tkrefdel
+docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.drop(); db.getSiblingDB('_thermocline').unmirrored.deleteMany({})" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null 2>&1
+docker exec -d $NODE cline feeder --config $CFG --log-file /var/log/cline/alerts_f.log
+sleep 4
+docker exec $NODE mongosh "$HOT" --quiet --eval "
+  const c = db.getSiblingDB('shop').$ANS;
+  c.insertOne({_id:1,code:'A'}); c.insertOne({_id:2,code:'A'})" >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | grep -q '^thermocline_not_superset_namespaces 1' && break
+  sleep 3
+done
+chk "the router reports a namespace not a superset" "1" \
+    "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_not_superset_namespaces /{print int($2)}')"
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineArchiveNotSuperset","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineArchiveNotSuperset fires on it" "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineArchiveNotSuperset": print(r.get("state"))' 2>/dev/null)"
+chk "and the counter rule fires too"          "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineUnmirrorableDocument": print(r.get("state"))' 2>/dev/null)"
+# Cleared by deleting the document the archive would not take, which is what
+# testkeys proves lifts the refusal.
+docker exec $NODE mongosh "$HOT" --quiet --eval "db.getSiblingDB('shop').$ANS.deleteOne({_id:2})" >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | grep -q '^thermocline_not_superset_namespaces 0' && break
+  sleep 3
+done
+chk "and it clears when the document goes"    "0" \
+    "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_not_superset_namespaces /{print int($2)}')"
+docker exec $NODE sh -c "pkill -f 'cline feeder --config $CFG'" 2>/dev/null
+docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
+
+echo "== a hold on eviction that nobody lifted =="
+# The rule added on 2026-09-21, fired rather than parsed. It is the one signal
+# whose metric had to be changed to make it alertable at all: the gauge existed
+# only while eviction was paused, so a rule against it had nothing to evaluate
+# until the moment it was needed, and it reports zero the rest of the time now.
+#
+# Backdated rather than waited out, because the rule watches an hour. The gauge
+# is the archive's own reading of when the hold was taken, so moving that
+# instant is the honest way to make an hour-old hold.
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
+docker exec $NODE cline pause --config $CFG --reason "testalerts, an hour ago" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval '
+  print(db.getSiblingDB("_thermocline").markers.updateOne({_id:"evictionPaused"},
+    {$set:{since: new Date(Date.now() - 2*3600*1000)}}).modifiedCount)' >/dev/null 2>&1
+HELD=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_eviction_paused_seconds /{print int($2)}')
+chk "the gauge reads the hold as hours old"   "true" \
+    "$([ "${HELD:-0}" -gt 3600 ] 2>/dev/null && echo true || echo false)"
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineEvictionHeld","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineEvictionHeld fires on it"     "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineEvictionHeld": print(r.get("state"))' 2>/dev/null)"
+docker exec $NODE cline resume --config $CFG >/dev/null 2>&1
+sleep 8
+chk "and resuming takes the gauge back to zero" "0" \
+    "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_eviction_paused_seconds /{print int($2)}')"
+
 echo "== an alert that should fire, does =="
 # The router is stopped, so up{job="thermocline"} goes to 0. Its rule waits two
 # minutes, and waiting for it is the whole point: a rule that only ever gets
