@@ -30,6 +30,8 @@ WORK=$(mktemp -d)
 # zero rules, which the checks below would have called a broken rule file.
 chmod 755 "$WORK"
 PASS=0; FAIL=0; declare -a FAILED
+STARTED=$(date +%s)
+sec() { printf '== %s ==  [%ds in]\n' "$1" "$(( $(date +%s) - STARTED ))"; }
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-52s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-52s got=%s want=%s\n' "$1" "$3" "$2"; fi
@@ -42,7 +44,7 @@ cleanup() {
 trap cleanup EXIT
 
 RULEDOC=${RULEDOC:-docs/monitoring.md}
-echo "== the rules $RULEDOC actually carries =="
+sec "the rules $RULEDOC actually carries"
 python3 - "$WORK/thermocline.rules.yml" "$RULEDOC" <<'PY'
 import re, sys
 s = open(sys.argv[2]).read()
@@ -57,11 +59,11 @@ PY
 chmod 644 "$WORK/thermocline.rules.yml"
 RULES=$(grep -c "^      - alert:" "$WORK/thermocline.rules.yml")
 
-echo "== they are valid PromQL =="
+sec "they are valid PromQL"
 OUT=$(docker run --rm --entrypoint /bin/promtool -v "$WORK":/rules $IMAGE check rules /rules/thermocline.rules.yml 2>&1)
 chk "promtool accepts every rule" "SUCCESS: $RULES rules found" "$(echo "$OUT" | grep -o "SUCCESS: .* rules found")"
 
-echo "== every metric they name is exported =="
+sec "every metric they name is exported"
 # The quiet failure this catches: a counter renamed in promexport.go and not in
 # the document. The rule then evaluates against nothing and never fires.
 docker exec $NODE sh -c "pkill -f 'cline router --config $CFG'" 2>/dev/null; sleep 1
@@ -84,7 +86,7 @@ PY
 )
 chk "no rule names a metric nothing exports" "none" "$MISSING"
 
-echo "== and a real Prometheus loads and evaluates them =="
+sec "and a real Prometheus loads and evaluates them"
 cat > "$WORK/prometheus.yml" <<EOF
 global:
   scrape_interval: 5s
@@ -109,7 +111,7 @@ chk "every rule is loaded and evaluating" "$RULES" \
 for _ in $(seq 1 20); do [ "$(PQ targets | grep -c '"health":"up"')" -ge 1 ] && break; sleep 2; done
 chk "and scraping the router"             "1" "$(PQ targets | grep -c '"health":"up"')"
 
-echo "== an alert that fires on a number this system reports =="
+sec "an alert that fires on a number this system reports"
 # ThermoclineRouterDown, below, fires because the target disappeared. That is
 # Prometheus noticing an absence, and it would fire the same way for a rule
 # written against a metric this router has never heard of. This one is the
@@ -176,7 +178,7 @@ for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineClusterTimeBehind": print(r.get("state"))' 2>/dev/null)"
 
-echo "== the archive refusing a document the fast tier holds =="
+sec "the archive refusing a document the fast tier holds"
 # Two rules for one condition and both were only ever parsed. The pair is worth
 # firing together because they are deliberately different shapes: the first is
 # an increase over a counter, which reports the moment it happens and then goes
@@ -219,6 +221,25 @@ import json,sys
 for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineUnmirrorableDocument": print(r.get("state"))' 2>/dev/null)"
+# And the refusal counter, while the state that produces refusals is up. Eleven
+# reads because the rule wants more than ten in a quarter of an hour: one
+# refused read is a client asking an awkward question and a stream of them is an
+# application failing.
+# One invocation, not eleven: mongosh takes about a second to start on an idle
+# box and over three under a sweep, and that is what suite time is made of.
+docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval "for (let i = 0; i < 11; i++) { try { db.getSiblingDB('shop').$ANS.countDocuments({}) } catch (e) {} }" >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineRefusalsRising","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineRefusalsRising fires on them"  "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineRefusalsRising": print(r.get("state"))' 2>/dev/null)"
+
 # Cleared by deleting the document the archive would not take, which is what
 # testkeys proves lifts the refusal.
 docker exec $NODE mongosh "$HOT" --quiet --eval "db.getSiblingDB('shop').$ANS.deleteOne({_id:2})" >/dev/null 2>&1
@@ -232,7 +253,7 @@ docker exec $NODE sh -c "pkill -f 'cline feeder --config $CFG'" 2>/dev/null
 docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
 docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
 
-echo "== a hold on eviction that nobody lifted =="
+sec "a hold on eviction that nobody lifted"
 # The rule added on 2026-09-21, fired rather than parsed. It is the one signal
 # whose metric had to be changed to make it alertable at all: the gauge existed
 # only while eviction was paused, so a rule against it had nothing to evaluate
@@ -264,7 +285,29 @@ sleep 8
 chk "and resuming takes the gauge back to zero" "0" \
     "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_eviction_paused_seconds /{print int($2)}')"
 
-echo "== an alert that should fire, does =="
+sec "a daemon that has stopped finishing passes"
+# The signal an operator is woken by when a background daemon dies, and it had
+# never been fired. Backdated rather than waited out for the same reason the
+# eviction hold is: the gauge is seconds since the instant the daemon wrote,
+# read in the archive's frame, so moving that instant is the state itself and
+# not a simulation of it.
+docker exec $NODE mongosh "$COLD" --quiet --eval '
+  print(db.getSiblingDB("_thermocline").daemonstats.updateOne({_id:"evictor"},
+    {$set:{at: new Date(Date.now() - 3600*1000)}}, {upsert:true}).modifiedCount)' >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineDaemonStopped","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineDaemonStopped fires on a stale pass" "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineDaemonStopped": print(r.get("state"))' 2>/dev/null)"
+docker exec $NODE mongosh "$COLD" --quiet --eval '
+  db.getSiblingDB("_thermocline").daemonstats.deleteOne({_id:"evictor"})' >/dev/null 2>&1
+
+sec "an alert that should fire, does"
 # The router is stopped, so up{job="thermocline"} goes to 0. Its rule waits two
 # minutes, and waiting for it is the whole point: a rule that only ever gets
 # read is a rule nobody has seen work.

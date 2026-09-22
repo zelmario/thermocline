@@ -393,12 +393,13 @@ against a real Prometheus scraping a real router. They were written down and
 never executed until 2026-09-03, which is a strange thing to leave unproved: a
 rule that does not fire is indistinguishable from a system with nothing wrong.
 
-**Six of the sixteen are driven to `firing` against a real state**, not just
+**Eight of the sixteen are driven to `firing` against a real state**, not just
 loaded: a stale read, a feeder that is not running, the archive refusing a
 document the fast tier holds (which fires two rules of deliberately different
 shapes, an increase that reports the moment and a gauge that stays up while the
-condition lasts), an operator's hold on eviction left for an hour, and the
-router being down. Each of those also has to go back to quiet when the state is
+condition lasts), a stream of refusals in a quarter of an hour, an operator's
+hold on eviction left for an hour, a daemon that has not finished a pass in ten
+minutes, and the router being down. Each of those also has to go back to quiet when the state is
 put right, because a rule that never clears is a rule somebody silences.
 
 It checks the three ways they fail quietly. `promtool` rejects a typo. A metric

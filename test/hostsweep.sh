@@ -103,17 +103,32 @@ why() {
   esac
 }
 
+# budgetFor is how long one suite may take. Thirty minutes suits every suite
+# that drives the cluster, and testalerts is not one of those: it waits out real
+# Prometheus evaluations, including two rules with `for: 2m` and three states
+# whose gauges move on the router's thirty-second inventory cycle. Measured at
+# 1,203 seconds with its sections timestamped, against 731 before three more
+# rules were fired. A budget it can only just meet turns a slow box into a
+# failure that reads like a defect.
+budgetFor() {
+  case "$1" in
+    testalerts) echo "${SUITE_TIMEOUT_ALERTS:-45m}" ;;
+    *)          echo "${SUITE_TIMEOUT:-30m}" ;;
+  esac
+}
+
 # run SUITE LABEL [ENV=VALUE ...]
 run() {
   local s=$1 label=$2; shift 2
-  local log="$OUT/$label.log" start secs rc line
+  local log="$OUT/$label.log" start secs rc line budget
+  budget=$(budgetFor "$s")
   start=$(date +%s)
-  env "$@" timeout --kill-after=60s "${SUITE_TIMEOUT:-30m}" bash "test/$s.sh" > "$log" 2>&1
+  env "$@" timeout --kill-after=60s "$budget" bash "test/$s.sh" > "$log" 2>&1
   rc=$?
   secs=$(( $(date +%s) - start ))
   line=$(grep -E '^PASS [0-9]+ +FAIL [0-9]+' "$log" | tail -1)
   if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
-    line="TIMED OUT after ${SUITE_TIMEOUT:-30m}. ${line:-no tally}"
+    line="TIMED OUT after $budget. ${line:-no tally}"
   elif [ "$rc" = 2 ] && [ -z "$line" ]; then
     # Several of these exit 2 from their own setup check, which is a different
     # thing from a failing check and has to read differently.
