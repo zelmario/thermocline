@@ -256,6 +256,48 @@ for _ in $(seq 1 4); do
   R "db.getSiblingDB(process.env.TC_DB).$NS.find({secpref:'x'}).readPref('secondary').itcount()" >/dev/null
 done
 
+echo "== a namespace nothing can tell us about is never cached =="
+# Two things drop a stored answer and both have a reach. A write through this
+# router drops what was learned for that collection, and the fast tier's change
+# stream covers the writers that go around it. That stream is client-level,
+# which MongoDB does not open on the admin, local or config databases and does
+# not deliver system collections through, and the archive's own bookkeeping sits
+# on the other tier, which no stream of the fast tier's carries.
+#
+# Where neither reaches, the learned TTL is not a bound on how stale an answer
+# can be, it is the whole of the answer's life. So these are not cached at all.
+#
+# What is checked is whether the answers enter the cache, not whether a stale
+# one comes back out. Coming out is a race against the learned TTL and it passed
+# against the defect the first time this was written; going in is the guard
+# itself. Measured before the guard, on the same eighteen reads: 11 misses and
+# 2 stored entries.
+cmiss() { curl -s "127.0.0.1:$PDASH/metrics" 2>/dev/null | awk '/^thermocline_cache_misses_total/{print $2}'; }
+centries() { curl -s "127.0.0.1:$PDASH/metrics" 2>/dev/null | awk '/^thermocline_cache_entries/{print $2}'; }
+chk "the router is publishing its cache counters" "true" \
+    "$([ -n "$(cmiss)" ] && echo true || echo false)"
+MISS0=$(cmiss); ENT0=$(centries)
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  for (let i = 0; i < 6; i++) { db.getSiblingDB('local').oplog.rs.find({}, {ts:1}).sort({\$natural:-1}).limit(1).toArray(); sleep(120); }
+  for (let i = 0; i < 6; i++) { db.getSiblingDB('admin').system.users.countDocuments({}); sleep(120); }
+  for (let i = 0; i < 6; i++) { db.getSiblingDB(process.env.TC_META).watermarks.countDocuments({}); sleep(120); }" >/dev/null 2>&1
+chk "eighteen housekeeping reads are not looked up"  "$MISS0" "$(cmiss)"
+chk "  and store nothing"                            "$ENT0"  "$(centries)"
+
+# The refusal has to be narrow, or it is a cache that has been turned off. The
+# same shape of loop against the application's own collection does reach it.
+MISS1=$(cmiss)
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  for (let i = 0; i < 6; i++) { c.countDocuments({country:'AR'}); sleep(120); }" >/dev/null 2>&1
+chk "and the application's own reads still reach it"  "true" \
+    "$(awk -v a="$MISS1" -v b="$(cmiss)" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
+
+# Where the boundary of that name falls is a unit test rather than a check here:
+# TestNothingCanInvalidate in internal/cache holds shop.systems, shop.system,
+# locality.places and administration.staff on the cacheable side, which is the
+# half a prefix rule gets wrong and the half traffic here would never reach.
+
 echo "== what it learned, and what it suggests =="
 # Enough repeats for a stability to be measured at all.
 for _ in $(seq 1 6); do

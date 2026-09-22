@@ -121,9 +121,10 @@ func NewAdvisor(maxShapes, maxParams int, maxTTL time.Duration) *Advisor {
 // query the operator cannot act on taking a slot in it is a query of theirs
 // that is not measured at all.
 //
-// This is a decision about what to advise on, not about what to cache. Whether
-// an answer to config.collections may be held is the cache's own business and
-// is unchanged.
+// This is a decision about what to advise on. What to cache is a separate
+// decision with a separate reason, and NothingCanInvalidate makes it: these
+// namespaces are also the ones no invalidation of ours reaches, so an answer to
+// config.collections is not held either.
 func Housekeeping(ns string) bool {
 	db, _, found := strings.Cut(ns, ".")
 	if !found {

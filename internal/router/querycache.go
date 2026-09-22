@@ -97,7 +97,15 @@ func cacheableRead(name string, cmd bson.Raw, db string) (ns string, ok bool) {
 		// there is nothing to hang a cached answer from.
 		return "", false
 	}
-	return db + "." + coll, true
+	ns = db + "." + coll
+	// And a namespace nothing can tell us about is the same problem one step
+	// further out: there is a collection to hang the answer from, and no route
+	// by which this router ever hears that it changed. See cache.NothingCanInvalidate
+	// for which ones and for what a lag probe read before this was here.
+	if cache.NothingCanInvalidate(ns) {
+		return "", false
+	}
+	return ns, true
 }
 
 // cacheKey identifies a query, its parameters, and who is asking.

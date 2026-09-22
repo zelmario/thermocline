@@ -23,6 +23,33 @@ reading the order the two run in rather than by seeing it happen: attempts to
 serve a stale answer past the refusal ran into the learned TTL expiring first,
 every time.
 
+The other thing it will not answer is a namespace nothing can tell it about.
+
+Two things drop a stored answer, and both have a reach. A write through the
+router drops everything learned for that collection, and the fast tier's change
+stream covers the writers that go around the router. That stream is a
+client-level one, which MongoDB does not open on the `admin`, `local` or
+`config` databases and does not deliver system collections through, and the
+archive's own bookkeeping database sits on the other tier, so no stream of the
+fast tier's carries it either.
+
+For those the learned TTL is not a bound on how stale an answer can be, it is
+the whole of the answer's life. So they are not stored at all:
+
+- `admin`, `local` and `config`, whole databases
+- any collection whose name begins `system.`, in any database
+- Thermocline's own bookkeeping database, `_thermocline` by default
+
+A collection merely named `systems`, or a database named `configuration` or
+`locality`, is the application's and is cached as usual.
+
+Measured before this rule existed, on a router with the cache on: eighteen reads
+of `local.oplog.rs`, `admin.system.users` and the archive's watermarks were
+looked up 11 times and left 2 entries behind. Whether one of those is then
+served back is a race against the learned TTL, so what the suite checks is that
+nothing goes in. Nothing an application asks lives in these namespaces, so the
+cost of the rule is a slower answer to a question the cache was never there for.
+
 ## Which queries are worth caching
 
 The router sees every read and every answer, which is what a cache advisor
