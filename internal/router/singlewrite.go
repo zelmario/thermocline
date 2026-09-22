@@ -41,7 +41,7 @@ import (
 // It returns the _id to copy up. Everything after that is the path the _id case
 // already takes, which is deliberate: the copy-up, the transaction replay and
 // the retry are all the same problem once the document is named.
-func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort bson.Raw) (bson.RawValue, bool, error) {
+func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
 	// A collection Thermocline does not tier is whole on the fast tier, so its
 	// zero is the truth and no archive lookup is owed.
 	if !c.r.cfg.Manages(ns) {
@@ -61,7 +61,7 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort 
 		}
 	}
 
-	return c.r.oneArchivedMatch(ctx, ns, filter, sort)
+	return c.r.oneArchivedMatch(ctx, ns, filter, sort, collation)
 }
 
 // oneArchivedMatch returns the _id of one live archived document matching
@@ -72,11 +72,27 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort 
 // nothing here, so every document the statement matches is in the archive, and
 // the archive's own first match is therefore the document the statement would
 // have found with nothing tiered underneath it.
-func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort bson.Raw) (bson.RawValue, bool, error) {
+func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
 	db, coll := splitNS(ns)
 	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
 	if len(sort) > 0 {
 		opts.SetSort(sort)
+	}
+	// In the comparison the fast tier already made: the caller's own collation
+	// when the command carried one, the collection's when it did not. See
+	// askingCollation.
+	//
+	// It decides both halves of this lookup and the sort is the sharper one.
+	// The filter decides whether the archive holds a match at all, so getting
+	// it wrong reports a single-document write as matching nothing. The sort
+	// decides which of several matches the caller meant, and a collation is
+	// what orders strings, so getting that wrong does not lose the write, it
+	// puts it on a different document. Two lines above this call the fast tier
+	// was already being asked with the collation, and this was not.
+	if ec, ok := r.askingCollation(ctx, ns, collation); ok {
+		if c := collationFromSpec(ec); c != nil {
+			opts.SetCollation(c)
+		}
 	}
 	var doc bson.Raw
 	err := r.cold.Database(db).Collection(coll).FindOne(ctx, liveOnly(bson.RawValue{
@@ -195,7 +211,7 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 		}
 	}
 
-	id, found, err := c.r.oneArchivedMatch(ctx, ns, fdoc, sortDoc)
+	id, found, err := c.r.oneArchivedMatch(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"))
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this sort means, so the fast tier's answer stands",
 			"ns", ns, "err", err)

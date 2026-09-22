@@ -348,28 +348,21 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	if len(opts.let) > 0 {
 		find = append(find, bson.E{Key: "let", Value: opts.let})
 	}
-	if len(opts.collation) > 0 {
-		find = append(find, bson.E{Key: "collation", Value: opts.collation})
-	} else if def, ok := r.defaultCollation(ctx, ns); ok {
-		// The caller sent none, so mongod applied the collection's own to the
-		// fast tier. The archive's copy of that collection was created by the
-		// feeder's first upsert and carries no collation at all, so asking it
-		// without one compares by bytes and matches different documents.
-		//
-		// The read path has looked this up since collation.go was written, and
-		// its comment says the router says the collation out loud on every read
-		// it sends to the archive. This was a read it sends to the archive and
-		// it did not. Measured on a fast tier collection created with
-		// {locale: "en", strength: 2}, its archived copy holding {name: "ALICE"}
-		// and the fast tier holding nothing: updateMany({name: "alice"}) with no
-		// collation field modified 0 through the router and 1 on an untiered
-		// collection with the same default, while countDocuments for the same
-		// filter answered 1 both ways, because that path already asked.
-		//
-		// Here rather than at the six call sites: every one of them is a write
-		// whose filter mongod evaluated under this collation, and a seventh
-		// would have to remember.
-		find = append(find, bson.E{Key: "collation", Value: def})
+	// The same comparison mongod made on the fast tier, which is the caller's
+	// own collation when the command carried one and the collection's when it
+	// did not. See askingCollation.
+	//
+	// Only the explicit half used to travel. Measured on a fast tier collection
+	// created with {locale: "en", strength: 2}, its archived copy holding
+	// {name: "ALICE"} and the fast tier holding nothing: updateMany with the
+	// filter {name: "alice"} and no collation field modified 0 through the
+	// router and 1 on an untiered collection with the same default, while
+	// countDocuments for that filter answered 1 both ways, because the read
+	// path had asked all along.
+	if coll, ok := r.askingCollation(ctx, ns, opts.collation); ok {
+		if sc := simplifyCollation(coll); len(sc) > 0 {
+			find = append(find, bson.E{Key: "collation", Value: sc})
+		}
 	}
 	// The caller's deadline, applied to the work this adds. A millisecond floor
 	// rather than zero, for the reason withRemainingTime gives: MongoDB reads
@@ -519,7 +512,7 @@ func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collat
 	if has, herr := c.r.fastTierMatches(ctx, ns, fdoc, collation); herr == nil && has {
 		return
 	}
-	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil)
+	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil, collation)
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this unacknowledged write means, so it reaches only the fast tier",
 			"ns", ns, "command", name, "err", err)

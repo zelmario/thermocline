@@ -8,6 +8,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -83,7 +84,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 
 	var n int
 	if fromArchive {
-		n, err = c.streamFromArchive(ctx, db, coll, read, sink.write)
+		n, err = c.streamFromArchive(ctx, db, coll, read, docField(cmd, "collation"), sink.write)
 	} else {
 		aggVal, verr := cmd.LookupErr("aggregate")
 		if verr != nil {
@@ -469,7 +470,7 @@ func splitColl(ns string) string { _, coll := splitNS(ns); return coll }
 
 // streamFromArchive runs the reading part of a pipeline against the archive and
 // hands its output to sink in batches.
-func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bson.Raw, sink func(context.Context, []any) error) (int, error) {
+func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bson.Raw, collation bson.Raw, sink func(context.Context, []any) error) (int, error) {
 	// Tombstoned documents are records the application deleted. Excluding them
 	// first means the pipeline sees the same collection the fast tier would
 	// have shown it.
@@ -489,7 +490,22 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 	// caller's maxTimeMS would trade a slow pipeline for a stale one.
 	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), 0)
 
-	cur, err := c.r.cold.Database(db).Collection(coll).Aggregate(ctx, pipeline)
+	// In the comparison the caller asked for, which is their own collation when
+	// the command carried one and the collection's when it did not. See
+	// askingCollation.
+	//
+	// A pipeline is where a collation reaches furthest: a $match picks
+	// different documents, a $group puts two spellings in one bucket or two,
+	// and a $sort orders them differently. And by the note above, what comes
+	// out of here is not an answer a client can ask again, it is written into
+	// the collection $out or $merge names.
+	aopts := options.Aggregate()
+	if ec, ok := c.r.askingCollation(ctx, db+"."+coll, collation); ok {
+		if col := collationFromSpec(ec); col != nil {
+			aopts.SetCollation(col)
+		}
+	}
+	cur, err := c.r.cold.Database(db).Collection(coll).Aggregate(ctx, pipeline, aopts)
 	if err != nil {
 		return 0, err
 	}

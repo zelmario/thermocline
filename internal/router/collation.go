@@ -116,3 +116,28 @@ func simplifyCollation(c bson.Raw) bson.D {
 	}
 	return out
 }
+
+// askingCollation is the collation a client's filter was already evaluated
+// under on the fast tier, which is the one the archive has to be asked in.
+//
+// There are two ways a comparison acquires one and the router has to reproduce
+// both. An explicit collation travels with the command, so it arrives here. A
+// collection's default does not travel at all: the client sends no collation
+// field because the collection carries it, and the archive's copy of that
+// collection was created by the feeder's first upsert with no collation of its
+// own. Asking the archive with neither compares by bytes.
+//
+// Returned as the archive would store it. The two callers send it differently
+// and each drops the version string its own way: a raw find command through
+// simplifyCollation, the driver's options through collationFromSpec, which
+// decodes the fields a query may carry and so cannot carry that one.
+func (r *Router) askingCollation(ctx context.Context, ns string, explicit bson.Raw) (bson.Raw, bool) {
+	if len(explicit) > 0 {
+		return explicit, true
+	}
+	def, ok := r.defaultCollation(ctx, ns)
+	if !ok || len(def) == 0 {
+		return nil, false
+	}
+	return def, true
+}

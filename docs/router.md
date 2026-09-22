@@ -1159,6 +1159,39 @@ The lookup is inside the copy-up now rather than at its call sites, so all six
 get it and a seventh does not have to remember. `testconform.sh` compares both
 rows against a reference collection carrying the same default.
 
+Two more places asked the archive without it, and both decide more than how many
+documents match.
+
+A single-document write acts on one of the documents it matches, and a sort says
+which. `oneArchivedMatch` is how the archive is asked which one that is, and it
+sent no collation, while the call two lines above it was already asking the fast
+tier with one. A collation is what orders strings: under `en/strength 2` `"a"`
+sorts before `"B"`, and under the simple collation `"B"` is `0x42` and `"a"` is
+`0x61`, so `"B"` comes first. Measured on `{_id: 1, name: "B"}` and
+`{_id: 2, name: "a"}` held by the archive alone, with
+`findAndModify({}, sort: {name: 1})` and that collation:
+
+| | modified |
+| --- | --- |
+| through the router | `_id: 1`, the document named `"B"` |
+| untiered reference | `_id: 2`, the document named `"a"` |
+
+That is not a short answer. It is the write landing on a different record, and
+with `remove: true` it is the deletion of one.
+
+The reading half of an `$out` or `$merge` runs against the archive too, and it
+passed no collation either. A `$group` is where that shows: two spellings go in
+one bucket or two. Measured on `ALICE`, `alice` and `bob` held by the archive
+alone, grouped by name with `en/strength 2`, the router wrote three groups of
+one where the reference wrote `{ALICE: 2}` and `{bob: 1}`. The comment above
+that function already said what makes it the worst of the three: what comes out
+of it is not an answer a client can ask again, it is written into the collection
+`$out` names.
+
+All of them now take the same answer from one function, `askingCollation`: the
+caller's own collation when the command carried one, the collection's when it
+did not.
+
 ### An insert the archive cannot be asked about
 
 The check that stops an insert duplicating an `_id` the archive still holds has

@@ -767,6 +767,64 @@ chk "and a write with no collation field does too"         \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$DEFREF.updateMany({name:'alice'},{\$set:{hit:1}}).modifiedCount)")" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$DEF.updateMany({name:'alice'},{\$set:{hit:1}}).modifiedCount)")"
 
+# A collation reaches further than a filter. It decides which of several matches
+# a sort means, and how a $group buckets two spellings. Both of those ask the
+# archive, and neither was asking in the caller's collation.
+#
+# Its own pair again, and with the collation in the command this time, because
+# what is being checked is the archive lookup rather than where the collation
+# came from.
+SRT=tconsort; SRTREF=tconsortref
+H "const d=db.getSiblingDB(process.env.TC_DB); d.$SRT.drop(); d.$SRTREF.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SRT.drop()" >/dev/null
+# Two fields, because the two checks below need different things of the data and
+# a value that discriminates for one is vacuous for the other.
+#
+# name is for the sort: under en/strength 2 "a" sorts before "B", and under the
+# simple collation "B" is 0x42 and "a" is 0x61 so "B" comes first. Different
+# letters, so no tie either way, and opposite answers.
+#
+# grp is for the $group: "X" and "x" are one bucket under en/strength 2 and two
+# under the simple collation. The first version of the group check reused name,
+# where "B" and "a" are two buckets in either collation, so it compared 2 with 2
+# and would have passed against the defect it is here for.
+# Its own name, not DOCS: that one is the suite's main fixture, which reseed
+# rebuilds the shared pair from.
+SRTDOCS="[{_id:1,name:'B',grp:'X'},{_id:2,name:'a',grp:'x'}]"
+R "db.getSiblingDB(process.env.TC_DB).$SRT.insertMany($SRTDOCS)" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$SRTREF.insertMany($SRTDOCS)" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$SRT.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "2" ] && break
+  sleep 0.5
+done
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+H "db.getSiblingDB(process.env.TC_DB).$SRT.deleteMany({})" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+chk "the archive holds both and the fast tier neither" "2/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$SRT.countDocuments({_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$SRT.countDocuments({}))")"
+# Which document, not how many. A count would pass against the defect: both
+# sides modify exactly one, they just modify a different one.
+FAM='findAndModify:"COLL",query:{},sort:{name:1},update:{$set:{hit:1}},collation:{locale:"en",strength:2}'
+chk "a sorted write picks the document the collation means" \
+    "$(H "const r=db.getSiblingDB(process.env.TC_DB).runCommand({${FAM/COLL/$SRTREF}}); print(r.value?r.value._id:'none')")" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).runCommand({${FAM/COLL/$SRT}}); print(r.value?r.value._id:'none')")"
+
+# And a $group, where getting it wrong is not an answer the client can ask
+# again: it is written into the collection $out names.
+OUTS=tconout; OUTSREF=tconoutref
+H "const d=db.getSiblingDB(process.env.TC_DB); d.$OUTS.drop(); d.$OUTSREF.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$OUTS.drop()" >/dev/null
+PIPE='[{$group:{_id:"$grp",n:{$sum:1}}},{$out:"TARGET"}]'
+R "db.getSiblingDB(process.env.TC_DB).$SRT.aggregate(${PIPE/TARGET/$OUTS},{collation:{locale:'en',strength:2}}).toArray()" >/dev/null 2>&1
+H "db.getSiblingDB(process.env.TC_DB).$SRTREF.aggregate(${PIPE/TARGET/$OUTSREF},{collation:{locale:'en',strength:2}}).toArray()" >/dev/null 2>&1
+# One bucket of two, not two of one. A count of documents would agree either
+# way; what differs is how many rows come out and what n each carries.
+chk "a \$group over the archive buckets the way the caller asked" \
+    "$(H "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$OUTSREF.find({},{_id:1,n:1}).sort({_id:1}).toArray()))")" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$OUTS.find({},{_id:1,n:1}).sort({_id:1}).toArray()))")"
+
 stopDaemons
 echo
 echo "================================"

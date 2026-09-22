@@ -171,7 +171,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 		// what the two write paths below already use, and it costs nothing at
 		// all on a namespace whose claim covers the read.
 		if !filterIsOnlyID(fdoc) {
-			resolved, ok, rerr := c.resolveMissByFilter(ctx, ns, fdoc, nil)
+			resolved, ok, rerr := c.resolveMissByFilter(ctx, ns, fdoc, nil, docField(cmd, "collation"))
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -357,7 +357,7 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 			return reply, nil
 		}
 		var resolved bool
-		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, nil)
+		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, nil, docField(stmt, "collation"))
 		if err != nil {
 			// Reporting zero here is what an erasure request must never be
 			// told, so the honest answer is that the archive could not be
@@ -433,7 +433,7 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 		// that same order or the wrong document comes up. See singlewrite.go.
 		sort, _ := cmd.Lookup("sort").DocumentOK()
 		var resolved bool
-		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, sort)
+		id, resolved, err = c.resolveMissByFilter(ctx, ns, fdoc, sort, docField(cmd, "collation"))
 		if err != nil {
 			return nil, err
 		}
