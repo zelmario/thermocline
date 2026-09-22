@@ -35,6 +35,7 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | In-node suites after the day's second half | 1,932 checks, 0 failed |
 | Host suites after it | 310 checks, 0 failed |
 | Two applications through one router, 30 minutes, after the day's changes | 474,588 commands, 0 refused, 0 stale reads, 0 duplicate keys, 0 panics |
+| A router restarted under both of them writing | stopped in 1s, ready in 1.0-1.1s, every error a refused connection and no invariant broken |
 
 ## What is accepted, and needs no work
 

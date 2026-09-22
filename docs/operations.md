@@ -340,6 +340,20 @@ which is the reconnect the router already warns about, and gives a command in
 flight five seconds before cutting it. Keep `TimeoutStopSec` above that grace,
 which the default 90 seconds comfortably is.
 
+**What a router restart costs the application, measured.** With two shops
+writing through one router at about 115 operations a second each, a `SIGTERM`
+stopped it in **1 second**: the connections parked on a read are closed at once
+and the clients reconnect. Starting again and answering `ping` took **1.0 to
+1.1 seconds** with 176 tiered namespaces, because the listener opens after the
+archive's indexes are built on the fast tier.
+
+So a restart is roughly **two seconds during which that router refuses
+connections**, and an application pointed only at it sees exactly that: every
+error in the run was `connection refused`, none was a wrong answer, and both
+shops' invariants held throughout. Whoever needs no such gap runs more than one
+router and restarts them one at a time, which is step 13 of
+[docs/adoption.md](adoption.md).
+
 **A restart does not resume eviction.** `cline pause` writes the pause into the
 archive's bookkeeping, not into the process, so an evictor restarted while the
 archive is being restored comes back paused. `cline resume` is the only thing
