@@ -304,6 +304,9 @@ feeder:
     - "shop.tns.dotted"
     - "shop.tevdim"
     - "shop.tkrefused"
+    # And its twin, where the duplicate is resolved by deleting the document
+    # rather than by editing it, which is the other thing an operator does.
+    - "shop.tkrefdel"
     - "shop.tnat"
     - "shop.tpre"
     - "shop.tseq"

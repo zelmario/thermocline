@@ -33,7 +33,8 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | The four daemons run as systemd units, against a real systemd | 30 checks, 0 failed |
 | Losing the fast tier and rebuilding it from the archive | 33 checks, 0 failed |
 | In-node suites after the day's second half | 1,932 checks, 0 failed |
-| Host suites after it | 308 checks, 0 failed |
+| Host suites after it | 310 checks, 0 failed |
+| Two applications through one router, 30 minutes, after the day's changes | 474,588 commands, 0 refused, 0 stale reads, 0 duplicate keys, 0 panics |
 
 ## What is accepted, and needs no work
 

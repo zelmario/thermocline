@@ -1067,6 +1067,52 @@ done
 chk "and reads answer in full again"                   "3" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS.countDocuments({}))}catch(e){print('still refused')}")"
 
+# The other way a duplicate is resolved, which nothing checked. Above, the
+# offending document is edited until the archive takes it. An operator may
+# instead decide the document should not exist and delete it, and that has to
+# lift the refusal too: a namespace whose reads stay refused for ever, with the
+# document that caused it already gone, is a deployment that never recovers.
+#
+# The record is cleared by the write that lands rather than by a command, so the
+# question is whether a delete counts as one. Its own namespace, built the same
+# way: the unique index on the archive alone, so the fast tier takes both.
+FNS2=tkrefdel
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null; sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$FNS2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS2.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null
+cline feeder --config $CFG --log-file $LOGDIR/refused_f3.log & FRP3=$!
+sleep 3
+H "const c=db.getSiblingDB(process.env.TC_DB).$FNS2;
+   c.insertOne({_id:1,code:'A',what:'the first'});
+   c.insertOne({_id:2,code:'A',what:'the one to delete'});" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")" = "1" ] && break
+  sleep 1
+done
+chk "a duplicate the archive will not take, recorded"  "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")"
+startRouter
+chk "and reads of it are refused"                      "refused" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS2.countDocuments({}))}catch(e){print(/not a superset|does not hold one document/.test(e.message)?'refused':'other: '+e.message.substring(0,50))}")"
+# The resolution nobody had tried: delete it rather than edit it.
+R "db.getSiblingDB(process.env.TC_DB).$FNS2.deleteOne({_id:2})" >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")" = "0" ] && break
+  sleep 1
+done
+chk "deleting it clears the record too"                "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")"
+for _ in $(seq 1 25); do
+  [ "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS2.countDocuments({}))}catch(e){print('refused')}")" != "refused" ] && break
+  sleep 1
+done
+chk "and reads answer again"                           "1" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS2.countDocuments({}))}catch(e){print('still refused')}")"
+kill $FRP3 2>/dev/null; wait $FRP3 2>/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$FNS2.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$FNS2.drop()" >/dev/null
+
 H "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$FNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_META).unmirrored.deleteMany({})" >/dev/null
