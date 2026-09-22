@@ -401,6 +401,15 @@ echo "== a database nothing tiers is not empty, it is absent =="
 # said nothing at all about five whole databases holding 44,000 documents.
 C "db.getSiblingDB(process.env.TC_LOSTDB).catalogue.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_LOSTDB).catalogue.insertMany([{_id:'k1',name:'a kettle'},{_id:'k2',name:'a toaster'}])" >/dev/null
+# And a view over it, because an adopted cluster carries the application's views
+# as well as its collections and the advice for one cannot be followed for the
+# other: a view holds no documents, so tiering it is meaningless and the feeder
+# refuses it by name. The warning has its own branch and nothing ran it.
+# Measured with a view the archive holds and the fast tier does not: a find
+# through the router answered 0 where the archive answers 2, with ok:1, which is
+# what the line below has to be there to explain.
+C "try{db.getSiblingDB(process.env.TC_LOSTDB).kettles.drop()}catch(e){}" >/dev/null
+C "db.getSiblingDB(process.env.TC_LOSTDB).createView('kettles','catalogue',[])" >/dev/null
 rm -f $LOGDIR/lost_r.log
 cline router --config $CFG --log-file $LOGDIR/lost_r.log & LP=$!
 for _ in $(seq 1 30); do
@@ -414,11 +423,22 @@ chk "and the database is not even listed"       "false" \
     "$(R "print(db.adminCommand({listDatabases:1}).databases.some(function(d){return d.name===process.env.TC_LOSTDB}))")"
 chk "while the archive still holds it"          "2" \
     "$(C "print(db.getSiblingDB(process.env.TC_LOSTDB).catalogue.countDocuments({}))")"
+# Above the kill below, not after it. Put after, this read came back
+# ECONNREFUSED and was counted as a failure of the router rather than of where
+# it was written.
+chk "the view reads empty through the router"   "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_LOSTDB).kettles.countDocuments({}))")"
+chk "  while the archive answers it"            "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_LOSTDB).kettles.countDocuments({}))")"
 kill $LP 2>/dev/null; wait $LP 2>/dev/null
 chk "the router named the stranded collection"  "true" \
     "$(grep -q "$LOSTDB.catalogue" $LOGDIR/lost_r.log && echo true || echo false)"
 chk "and named the database as having no trace" "true" \
     "$(grep "no trace of these databases" $LOGDIR/lost_r.log | grep -q "$LOSTDB" && echo true || echo false)"
+chk "and the router named the view separately"  "true" \
+    "$(grep "the archive holds views the fast tier does not" $LOGDIR/lost_r.log | grep -q "$LOSTDB.kettles" && echo true || echo false)"
+chk "  with the advice for a view, not for a collection" "true" \
+    "$(grep "the archive holds views the fast tier does not" $LOGDIR/lost_r.log | grep -q "createView" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_LOSTDB).dropDatabase()" >/dev/null
 
 echo "== the dashboard, which has no authentication of its own =="
