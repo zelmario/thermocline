@@ -91,7 +91,19 @@ const FIELDS = [
   { p: 'n',           t: 'num',  v: () => ri(70) },
   { p: 'f',           t: 'num',  v: () => ri(200) / 4 },
   { p: 'name',        t: 'str',  v: () => 'user' + String(1 + ri(60)).padStart(2, '0') },
-  { p: 'grp',         t: 'str',  v: () => pick(['alpha', 'beta', 'gamma']) },
+  // Mixed case on purpose, and this is the only field that carries it. Every
+  // string this file generated was lower case, so the collation the read
+  // modifiers have been applying since they were written could not change a
+  // single answer: no stored value differed from another by case alone, and no
+  // generated predicate differed in case from what it was matching. It was a
+  // modifier that travelled and meant nothing, which is the same as not
+  // generating it.
+  //
+  // grp because it is the field the group stages, the sorts, the partial index
+  // filters and the ordinary predicates all reach. Sorts stay total because
+  // sortSpec always ends in _id, so a tie between alpha and Alpha under
+  // strength 2 cannot make the two sides order them differently.
+  { p: 'grp',         t: 'str',  v: () => pick(['alpha', 'Alpha', 'beta', 'gamma']) },
   { p: 'tags',        t: 'arr',  v: () => pick(['t1', 't2', 't3', 'common', 'none']) },
   { p: 'items.qty',   t: 'num',  v: () => ri(70) },
   { p: 'items.sku',   t: 'str',  v: () => pick(['s0', 's1', 's2', 's3', 's9']) },
@@ -230,6 +242,23 @@ function modifiers() {
   if (maybe(0.15)) m.readConcern = pick(['local', 'majority']);
   return m;
 }
+// writeCollation is a collation for a write, which is the half of the rule
+// modifiers() does not reach: it only ever put one on a read.
+//
+// A collation on a write decides which documents the filter matches, which of
+// several a sort means, and therefore which keys the registry has to claim
+// before the write runs. Four defects found by hand on 2026-09-22 needed a
+// write carrying one, and no round of this file could produce that shape.
+//
+// Applied to both sides through ask, so a tier that honours it and a tier that
+// forgets it give different answers, which is the whole method here.
+function writeCollation() {
+  return maybe(0.20) ? { collation: { locale: 'en', strength: 2 } } : undefined;
+}
+// Named in the op string, because a disagreement has to be reproducible from
+// the line that reports it and an option that is invisible there is not.
+function withColl(op, wc) { return wc ? op + ' collated' : op; }
+
 function applyMods(q, m) {
   if (m.hint) q = q.hint(m.hint);
   if (m.collation) q = q.collation(m.collation);
@@ -1069,8 +1098,9 @@ function oneOp(i) {
       // multiSafe, because this one writes many documents and a half-applied
       // failure ends the round. See multiSafe.
       const UM = multiSafe(U);
-      const op = 'updateMany ' + ser(F) + ' ' + ser(UM);
-      if (ask('updateMany', op, c => { const r = c.updateMany(F, UM); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateMany', op);
+      const wc = writeCollation();
+      const op = withColl('updateMany ' + ser(F) + ' ' + ser(UM), wc);
+      if (ask('updateMany', op, c => { const r = c.updateMany(F, UM, wc); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateMany', op);
       break;
     }
     case 7: {
@@ -1081,8 +1111,9 @@ function oneOp(i) {
       // the collection actually holds, which includes the archive-only half, so
       // deleting a document the fast tier does not have is still reached.
       const f = { $and: [ { _id: { $in: someIds(known, 3) } }, F ] };
-      const op = 'deleteMany ' + ser(f);
-      if (ask('deleteMany', op, c => c.deleteMany(f).deletedCount, 'seq')) contentsMatch('contents after deleteMany', op);
+      const wc = writeCollation();
+      const op = withColl('deleteMany ' + ser(f), wc);
+      if (ask('deleteMany', op, c => c.deleteMany(f, wc).deletedCount, 'seq')) contentsMatch('contents after deleteMany', op);
       break;
     }
     case 8: {
@@ -1091,8 +1122,9 @@ function oneOp(i) {
       // independently, and comparing that reports MongoDB disagreeing with
       // itself.
       const f = { _id: anId };
-      const op = 'updateOne ' + ser(f) + ' ' + ser(U);
-      if (ask('updateOne', op, c => { const r = c.updateOne(f, U); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateOne', op);
+      const wc = writeCollation();
+      const op = withColl('updateOne ' + ser(f) + ' ' + ser(U), wc);
+      if (ask('updateOne', op, c => { const r = c.updateOne(f, U, wc); return [r.matchedCount, r.modifiedCount]; }, 'seq')) contentsMatch('contents after updateOne', op);
       break;
     }
     case 9: {
@@ -1123,22 +1155,30 @@ function oneOp(i) {
       // nothing matches is the same document on both sides. Without that each
       // side invents its own ObjectId.
       const f = { _id: 2000 + ri(8), grp: pick(['alpha', 'beta']) };
-      const op = 'upsert ' + ser(f) + ' ' + ser(U);
-      if (ask('upsert', op, c => { const r = c.updateOne(f, U, { upsert: true }); return [r.matchedCount, r.modifiedCount, ser(r.upsertedId)]; }, 'seq')) contentsMatch('contents after upsert', op);
+      const wc = writeCollation();
+      const op = withColl('upsert ' + ser(f) + ' ' + ser(U), wc);
+      if (ask('upsert', op, c => { const r = c.updateOne(f, U, Object.assign({ upsert: true }, wc)); return [r.matchedCount, r.modifiedCount, ser(r.upsertedId)]; }, 'seq')) contentsMatch('contents after upsert', op);
       break;
     }
     case 13: {
       const newDoc = maybe(0.5);
-      const op = 'findOneAndUpdate ' + ser(F) + ' ' + ser(U) + ' by ' + ser(S) + (newDoc ? ' returning new' : '');
+      // The collation belongs on this one most of all. It carries a sort, and
+      // a sort is how the caller says which of several matches it means: a
+      // collation is what orders strings, so dropping it here does not lose the
+      // write, it puts it on a different document.
+      const wc = writeCollation();
+      const op = withColl('findOneAndUpdate ' + ser(F) + ' ' + ser(U) + ' by ' + ser(S) + (newDoc ? ' returning new' : ''), wc);
       if (ask('findOneAndUpdate', op,
-              c => c.findOneAndUpdate(F, U, { sort: S, returnNewDocument: newDoc }), 'seq')) {
+              c => c.findOneAndUpdate(F, U, Object.assign({ sort: S, returnNewDocument: newDoc }, wc)), 'seq')) {
         contentsMatch('contents after findOneAndUpdate', op);
       }
       break;
     }
     case 14: {
-      const op = 'findOneAndDelete ' + ser(F) + ' by ' + ser(S);
-      if (ask('findOneAndDelete', op, c => c.findOneAndDelete(F, { sort: S }), 'seq')) contentsMatch('contents after findOneAndDelete', op);
+      // Sorted too, and the one where picking the wrong document deletes it.
+      const wc = writeCollation();
+      const op = withColl('findOneAndDelete ' + ser(F) + ' by ' + ser(S), wc);
+      if (ask('findOneAndDelete', op, c => c.findOneAndDelete(F, Object.assign({ sort: S }, wc)), 'seq')) contentsMatch('contents after findOneAndDelete', op);
       break;
     }
     case 15: {
