@@ -126,7 +126,7 @@ remove it and a read that falls through will never find it.
 `inserts_over_existing` has no rule, deliberately, because it counts a shape
 rather than a fault. Through the router an insert for an `_id` the archive holds
 live is refused as a duplicate key, so a write straight at the fast tier's
-mongod raises this and nothing else does — except an application that deletes an
+mongod raises this and nothing else does, except an application that deletes an
 `_id` and uses it again, which is legitimate and raises it too. Measured on a
 shop run of 348 mirrored batches with copy-ups and evictions underneath: zero.
 On one write made straight at the fast tier: one. On a delete and re-insert of

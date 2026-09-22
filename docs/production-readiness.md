@@ -52,7 +52,7 @@ product's shape, not an omission.
 tier's mongod, a TTL index created there, a collection dropped there. The router
 is not in that path by definition. Each is measured, written down, and now
 counted or warned: `inserts_over_existing`, the TTL warning, the fast-tier
-watch. The protection is operational — only the router holds credentials that
+watch. The protection is operational: only the router holds credentials that
 can write to the fast tier's application databases.
 
 Adding to this section requires the same standard as the rest of the file: a

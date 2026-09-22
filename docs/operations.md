@@ -93,8 +93,8 @@ What to take, and where each piece lives:
 
   Restore everything else and leave this out and the system is correct and
   unusable: every client gets an ordinary authentication failure naming nothing.
-  The daemons say so at startup — "the archive has accounts the fast tier does
-  not" — and `cline preflight` reports it without starting anything, which is
+  The daemons say so at startup ("the archive has accounts the fast tier does
+  not"), and `cline preflight` reports it without starting anything, which is
   the check to run after a restore rather than the thing to rely on instead of
   taking the backup.
 

@@ -131,8 +131,8 @@ Part of [Thermocline](../README.md).
   six seconds later the archive holds the new document with the old one's fields
   gone. No line in the feeder's log, none in the router's.
 
-  It cannot be refused from here — the router is not in that path by
-  definition — and it cannot be told apart from an application reusing an `_id`
+  It cannot be refused from here (the router is not in that path by
+  definition), and it cannot be told apart from an application reusing an `_id`
   either. It is now counted rather than silent. The feeder publishes
   `inserts_over_existing`: inserts it mirrored onto an `_id` the archive already
   held, which through the router is refused as a duplicate key.
@@ -628,7 +628,7 @@ Part of [Thermocline](../README.md).
   nothing to say it had seen a third of the collection. That is the worst
   possible answer for the command people use to compare two copies of a
   dataset, so it is refused with the collections named, and allowed when the
-  claim covers everything — where it is the collection's hash and equals the
+  claim covers everything, where it is the collection's hash and equals the
   archive's exactly.
 
   `validate` is not corrected, deliberately. It is a physical check of one
@@ -732,7 +732,7 @@ Part of [Thermocline](../README.md).
   It is a refusal rather than an archive answer, and that is not laziness. The
   archive's copies carry tombstones, and a `$lookup` reads a collection of its
   own, so the tombstone predicate the router puts in front of a pipeline never
-  reaches inside a view's definition — which the router cannot rewrite.
+  reaches inside a view's definition, which the router cannot rewrite.
   Answering it there would join deleted documents, which is the defect in
   *Joined collections are read elsewhere* with the sign flipped.
 
@@ -742,7 +742,7 @@ Part of [Thermocline](../README.md).
   answer there is not something a client reads and re-runs, it is something on
   disk. Measured before it was refused: a pipeline reading a view over a tiered
   collection the fast tier was short of wrote one document where the archive
-  holds two. A `$lookup` *naming* a view is not refused — that one resolves to
+  holds two. A `$lookup` *naming* a view is not refused, that one resolves to
   the collection underneath and is read from the archive, whole.
 
 - **Cursors are not shared between routers.** A read answered from the archive
@@ -759,7 +759,7 @@ Part of [Thermocline](../README.md).
   two things it is, because a cursor id says nothing about who minted it:
   measured on PSMDB 8.0, mongod's own ids cover the whole positive int64 range,
   so an id from another router is indistinguishable from an expired one. So it
-  names both, and how to rule one out — name every router in the connection
+  names both, and how to rule one out: name every router in the connection
   string and the driver pins each cursor to the one that made it. The code stays
   43, because a driver decides what to retry from the code rather than from the
   words.
@@ -791,6 +791,55 @@ Part of [Thermocline](../README.md).
   log at WARN, with which option carried it. That does not make a stale token
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
+
+- **The router answers as a mongos and tells the truth about the replica set
+  behind it, so anything that branches on the handshake is looking at a
+  deployment that does not exist.** The handshake is deliberate: a driver uses
+  `hello` for topology discovery, and forwarding the fast tier's real reply lets
+  it read the `hosts` array, connect straight to those members and never send
+  the router another byte. So `hello` answers `{msg: "isdbgrid",
+  isWritablePrimary: true}` with every membership field dropped. Nothing else
+  was changed to match, and the two halves disagree in both directions.
+
+  Measured through a router in front of rsHot, authenticated as a user with
+  `clusterMonitor` and `clusterManager`:
+
+  ```
+  hello                 msg=isdbgrid, isWritablePrimary=true
+  isdbgrid              CommandNotFound
+  listShards            CommandNotFound
+  balancerStatus        CommandNotFound
+  getShardMap           ShardingStateNotInitialized
+  flushRouterConfig     ShardingStateNotInitialized
+  config.shards         0 documents
+  replSetGetStatus      ok:1, set=rsHot, 3 members, first 172.24.0.5:27017
+  replSetGetConfig      ok:1, set=rsHot, 3 members
+  serverStatus          wiredTiger present, repl.setName=rsHot, 3 hosts
+  local.oplog.rs        readable
+  replSetStepDown       ok:1, and the primary moved
+  ```
+
+  A real mongos answers the first block and refuses the second. The router does
+  the opposite of both.
+
+  What it costs. A monitoring agent that reads `msg: "isdbgrid"` and then
+  collects a mongos will collect nothing: `sh.status()` against the router fails
+  outright. An agent that ignores the handshake and asks `replSetGetStatus` gets
+  a true answer about the fast tier, and with it the member addresses the
+  handshake exists to withhold, which is the bypass the handshake is for. And a
+  client with `clusterManager` can move the fast tier's primary through the one
+  address the application uses. That is a privilege an application should not
+  have, but nothing here refuses it.
+
+  What it does not cost. No application read or write goes through any of these.
+  A driver never sends them, and the one thing a driver does branch on for a
+  mongos, the `recoveryToken` a sharded commit carries, is absent from a replica
+  set's commit reply in both directions, so a commit retry has nothing to carry
+  and goes back to the same address.
+
+  Making the second block refuse the way a mongos does would take away an
+  operator's only view of the tier behind the one address they were given, so
+  the fix is not obviously the honest one. Written down rather than changed.
 
 - **Sharded fast tiers are refused, with the reason.** Everything here assumes
   the fast tier is a replica set. The router proxies bytes to one primary
@@ -841,8 +890,8 @@ Part of [Thermocline](../README.md).
   may hold none of it.
 
   Both kinds of cursor. A `find` and an `aggregate` are judged at opposite ends
-  of the command — one on the way back, one before it runs, because a pipeline
-  can end in `$out` — and the aggregation is the easier of the two to reach:
+  of the command (one on the way back, one before it runs, because a pipeline
+  can end in `$out`), and the aggregation is the easier of the two to reach:
   mongod puts 101 documents in an aggregation's first batch and a cursor holds
   the rest, so a pipeline over a collection larger than that leaves one without
   the client asking for a `batchSize` at all. An aggregation is also refused for
@@ -859,7 +908,7 @@ Part of [Thermocline](../README.md).
   It is refused now, with the namespace named and the remedy in the message:
   re-run the query, and it is answered across both tiers and is whole. That
   costs an application one error on a read it can repeat, which is the trade this
-  project makes on purpose — a refusal is a limitation and a wrong answer is a
+  project makes on purpose: a refusal is a limitation and a wrong answer is a
   bug.
 
   It is not corrected, and the reason is worth stating. Continuing the read from
@@ -1250,8 +1299,8 @@ Part of [Thermocline](../README.md).
   It used to hold on to the listing for a minute after a drop, which read like
   protection and was not: the listing expires on its own, so the constraint was
   going to be lost a minute later either way. What that minute did produce was a
-  false refusal. A collection dropped and rebuilt out of band — resetting an
-  environment, restoring a fixture — does not have the old collection's unique
+  false refusal. A collection dropped and rebuilt out of band (resetting an
+  environment, restoring a fixture) does not have the old collection's unique
   index, and the router refused writes on its behalf with a duplicate key error
   naming an index that exists on neither tier. The fuzzer found it after four
   rounds, because its own reseed is that shape.
@@ -1324,8 +1373,8 @@ Part of [Thermocline](../README.md).
   the archive tombstones its copies and discards the history it exists to keep.
 
   That check could only ever see collections that already existed. One created
-  afterwards — which is every collection, in a deployment that leaves
-  `feeder.namespaces` empty to mirror everything — was mirrored. Measured on a
+  afterwards (which is every collection, in a deployment that leaves
+  `feeder.namespaces` empty to mirror everything) was mirrored. Measured on a
   4KB capped collection filled with 400 documents: the fast tier kept the 18 it
   had room for and the archive held tombstones over the rest, marked deleted by
   a collection doing exactly what capped means.
@@ -1377,7 +1426,7 @@ Part of [Thermocline](../README.md).
   The ordering is still reasoned from the exposure: `testversion.sh` measures
   that exposure on a static pair, where a pipeline the archive cannot parse fails
   with the archive's own error, and it is one-directional. What had never been
-  run was the window itself, and `verskew.sh` runs it now — a deployment serving
+  run was the window itself, and `verskew.sh` runs it now: a deployment serving
   traffic while the two tiers are a release apart, in both orders, against an
   equal pair as the control. MongoDB 8.0.26 and 7.0.37, 200 inserts, 100
   updates, 20 deletes and a read whose answer is on both sides of the boundary:
@@ -1425,7 +1474,7 @@ Part of [Thermocline](../README.md).
   Measured before it was excluded, on four documents with one holding
   `[four hours ago, thirty seconds ago]`: the evictor removed it for the old
   element, and a read bounded at the completeness claim still matched it for the
-  new one. The archive answered `1,2,3,9` and the router answered `1,2,3` — a
+  new one. The archive answered `1,2,3,9` and the router answered `1,2,3`, a
   short answer inside the range the claim promises, with no error on it.
 
   So the eviction filter excludes an array outright, which leaves those

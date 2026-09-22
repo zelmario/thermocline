@@ -911,7 +911,7 @@ error.
 collection that the query names nowhere. It is judged the way a `$lookup` the
 client wrote is judged, and the rule is not the primary's: a join reads by key
 rather than by time, so nothing less than the whole collection makes it whole.
-This is asked of any view, not only one over a tiered collection — a small
+This is asked of any view, not only one over a tiered collection. A small
 reference collection nobody tiers, with the tiered history joined to it, is the
 shape reporting most often takes, and it is a view whose base is untiered.
 
@@ -1377,8 +1377,8 @@ second holding `["y","z"]`: the router accepted it, the fast tier accepted it,
 and the archive refused the mirrored insert with `E11000 dup key { tags: "y" }`,
 leaving a document on the fast tier that the archive does not have and the
 evictor will not remove. And a unique index on a path that crosses an array,
-`items.sku`, could not be looked up at all — the driver answers "element not
-found" — so every such document keyed as null, the first one claimed that key for
+`items.sku`, could not be looked up at all (the driver answers "element not
+found"), so every such document keyed as null, the first one claimed that key for
 the namespace, and every insert after it was refused as a duplicate of a document
 it has nothing in common with. A wrong answer and a false refusal from one
 missing idea.

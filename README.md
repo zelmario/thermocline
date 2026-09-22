@@ -155,8 +155,8 @@ one file.
 
 It used to default to the literal `default` instead, so a deployment that named
 its feeder anything else pointed the gate at a checkpoint nothing writes. The
-lag then reads as unknown, which is the safe direction — the evictor pauses
-rather than removing — so nothing was lost and nothing was ever aged, and the
+lag then reads as unknown, which is the safe direction (the evictor pauses
+rather than removing), so nothing was lost and nothing was ever aged, and the
 log said `mirroring lag is unknown` once a minute while the feeder ran
 perfectly. The pause now names the id it went looking for, because a feeder that
 is not running and an id nothing writes look identical from a log line.

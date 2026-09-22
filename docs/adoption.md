@@ -308,7 +308,7 @@ archive anyway.
 
 **That one stays as it is, and it is now a decision rather than an open
 question.** Asked and answered on 2026-09-05: the router goes on refusing, and
-this is the runbook entry for it — do not restart a router during an archive
+this is the runbook entry for it. Do not restart a router during an archive
 outage, and bring the archive back first. A router that has never read a claim
 knows which namespaces are tiered and nothing about what the fast tier holds of
 them, so anything it served would be a guess dressed as an answer. Starting and
