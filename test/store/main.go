@@ -47,6 +47,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// recentOrder is one this worker placed, kept so a cancellation has something
+// of its own to cancel and knows whose count to check afterwards.
+type recentOrder struct {
+	id   bson.ObjectID
+	cust string
+}
+
 type shop struct {
 	db        *mongo.Database
 	orders    *mongo.Collection
@@ -222,6 +229,16 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 		k := rng.Intn((s.nCustomers-w+conc-1)/conc)*conc + w
 		return fmt.Sprintf("c%06d", k)
 	}
+	// What this worker has placed and not yet cancelled. Picking a customer at
+	// random and hoping they have a recent order wasted four cancellations in
+	// five: 51 attempts found 11 orders over half an hour, because a customer
+	// drawn from eight hundred usually has nothing from this run.
+	//
+	// Per worker, and never shared, because each worker owns a disjoint set of
+	// customers and the count checks are per customer. One worker cancelling
+	// another's order would break the other's arithmetic, not the system's.
+	var placed []recentOrder
+
 	// rounds of zero means "until the deadline", which main only passes with
 	// s.until set.
 	for i := 0; rounds <= 0 || i < rounds; i++ {
@@ -236,7 +253,7 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 		case n < 0.34:
 			s.reuseReference(ctx, rng)
 		case n < 0.38:
-			s.cancelOrder(ctx, rng, mine())
+			placed = s.cancelOrder(ctx, placed)
 		case n < 0.40:
 			s.channelReport(ctx, rng, mine())
 		case n < 0.60:
@@ -244,7 +261,9 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 		case n < 0.75:
 			s.orderHistory(ctx, rng)
 		case n < 0.90:
-			s.placeOrder(ctx, rng, mine())
+			if o, ok := s.placeOrder(ctx, rng, mine()); ok {
+				placed = append(placed, o)
+			}
 		case n < 0.97:
 			s.updateStatus(ctx, rng, mine())
 		default:
@@ -345,11 +364,17 @@ func (s *shop) reuseReference(ctx context.Context, rng *rand.Rand) {
 // document this workload removed itself.
 //
 // What a shop would notice: the order is gone, and exactly one order is gone.
-func (s *shop) cancelOrder(ctx context.Context, rng *rand.Rand, cust string) {
+func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOrder {
+	if len(placed) == 0 {
+		return placed
+	}
+	victim := placed[len(placed)-1]
+	placed = placed[:len(placed)-1]
+
 	var before int64
 	counted := false
 	s.timed("count a customer's orders", func() error {
-		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
+		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: victim.cust}})
 		if err != nil {
 			return err
 		}
@@ -357,29 +382,9 @@ func (s *shop) cancelOrder(ctx context.Context, rng *rand.Rand, cust string) {
 		return nil
 	})
 
-	// One of this run's own, named by the field the seeded orders predate.
-	var victim struct {
-		ID bson.ObjectID `bson:"_id"`
-	}
-	found := false
-	s.timed("find a recent order to cancel", func() error {
-		err := s.orders.FindOne(ctx, bson.D{
-			{Key: "customer", Value: cust},
-			{Key: "channel", Value: bson.D{{Key: "$exists", Value: true}}},
-		}).Decode(&victim)
-		if err == mongo.ErrNoDocuments {
-			return nil // nothing of ours to cancel yet
-		}
-		found = err == nil
-		return err
-	})
-	if !found {
-		return
-	}
-
 	deleted := false
 	s.timed("cancel an order", func() error {
-		res, err := s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: victim.ID}})
+		res, err := s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: victim.id}})
 		if err != nil {
 			return err
 		}
@@ -391,13 +396,15 @@ func (s *shop) cancelOrder(ctx context.Context, rng *rand.Rand, cust string) {
 		return nil
 	})
 	if !deleted || !counted {
-		return
+		return placed
 	}
 
+	// It must be gone whichever tier held it, and its archived copy is still
+	// there wearing a mark, which is the path this checks.
 	s.timed("read back a cancelled order", func() error {
-		err := s.orders.FindOne(ctx, bson.D{{Key: "_id", Value: victim.ID}}).Err()
+		err := s.orders.FindOne(ctx, bson.D{{Key: "_id", Value: victim.id}}).Err()
 		if err == nil {
-			s.violation("a cancelled order came back: %s", victim.ID.Hex())
+			s.violation("a cancelled order came back: %s", victim.id.Hex())
 			return nil
 		}
 		if err == mongo.ErrNoDocuments {
@@ -406,15 +413,16 @@ func (s *shop) cancelOrder(ctx context.Context, rng *rand.Rand, cust string) {
 		return err
 	})
 	s.timed("count a customer's orders", func() error {
-		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
+		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: victim.cust}})
 		if err != nil {
 			return err
 		}
 		if n != before-1 {
-			s.violation("cancelling one order moved %s from %d to %d", cust, before, n)
+			s.violation("cancelling one order moved %s from %d to %d", victim.cust, before, n)
 		}
 		return nil
 	})
+	return placed
 }
 
 // channelReport is the report a shop runs after adding a column: how many
@@ -476,7 +484,7 @@ func (s *shop) channelReport(ctx context.Context, rng *rand.Rand, cust string) {
 // placeOrder writes an order and then checks the two things a shop would notice
 // if this system were broken: that the order is there, and that it is there
 // once.
-func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
+func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) (recentOrder, bool) {
 	// Every check below compares one operation's result against another's, so
 	// each one is only asked when the operation it rests on actually happened.
 	// An error is the system saying no, and what follows a no proves nothing:
@@ -541,7 +549,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 	// read back, and an insert whose acknowledgement was lost may have landed
 	// anyway. Neither is this check's answer to give.
 	if !placed {
-		return
+		return recentOrder{}, false
 	}
 	s.timed("read back the new order", func() error {
 		var got struct {
@@ -575,7 +583,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 	// Exactly one more, whichever tier answers the count, and only when there is
 	// a number to compare against.
 	if !countedBefore {
-		return
+		return recentOrder{id: id, cust: cust}, true
 	}
 	s.timed("count a customer's orders", func() error {
 		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
@@ -587,6 +595,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 		}
 		return nil
 	})
+	return recentOrder{id: id, cust: cust}, true
 }
 
 // orderHistory is the listing a customer sees, and the place a duplicate would
