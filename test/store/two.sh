@@ -102,6 +102,20 @@ for shop in shopA shopB; do
   N "store -uri '$HOT' -db $shop -orders $ORDERS -days 120 -customers 800 -products 300 -seed-only" | tail -2
 done
 
+# The archive gets the reference index too, which an adopted one would already
+# have. Without it the router cannot ask the archive whether another spelling of
+# a reference is taken, says so once at WARN, and stops enforcing that
+# constraint across the tiers: the reuse check below would then pass because
+# nothing was being enforced rather than because the constraint held.
+#
+# Not unique there. The archive holds tombstones of deleted documents and a
+# unique index over them refuses the feeder's next write; it only has to serve
+# the lookup.
+for shop in shopA shopB; do
+  docker exec "$NODE" mongosh "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin" \
+    --quiet --eval "db.getSiblingDB('$shop').orders.createIndex({ref:1},{collation:{locale:'en',strength:2}})" >/dev/null
+done
+
 echo "== waiting for mirroring to catch up on both seeds =="
 # The feeder's own position, not a count. Counts move for reasons other than
 # mirroring: an evictor sweep takes documents off the fast tier while this

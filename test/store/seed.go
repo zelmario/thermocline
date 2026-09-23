@@ -14,6 +14,18 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// refCollation is the one comparison the reference is read and written under.
+// en/strength 2 folds case, so Ref000123 and ref000123 are one value: that is
+// what the shop promises a customer who types it back, and what its unique
+// index has to enforce.
+func refCollation() *options.Collation {
+	return &options.Collation{Locale: "en", Strength: 2}
+}
+
+// orderRef is what is printed on the order. Mixed case on purpose: stored one
+// way, typed another, which is the whole point of the collation above.
+func orderRef(n int) string { return fmt.Sprintf("Ref%06d", n) }
+
 // marker records how the shop was stocked, so a later run against the same
 // database asks for customers and products that exist, and reads dates that
 // have orders in them. Without it a second run invents its own ids, every read
@@ -137,6 +149,7 @@ func (s *shop) seed(ctx context.Context, orders int) error {
 		id := idAt(at, i)
 		b.orders = append(b.orders, bson.D{
 			{Key: "_id", Value: id}, {Key: "customer", Value: cust}, {Key: "at", Value: at},
+			{Key: "ref", Value: orderRef(i)},
 			{Key: "lines", Value: lines},
 			{Key: "total", Value: math.Round(total*100) / 100},
 			{Key: "status", Value: []string{"placed", "shipped", "delivered"}[rng.Intn(3)]},
@@ -169,6 +182,21 @@ func (s *shop) seed(ctx context.Context, orders int) error {
 		{Keys: bson.D{{Key: "customer", Value: 1}, {Key: "status", Value: 1}}},
 	}); err != nil {
 		return fmt.Errorf("order indexes: %w", err)
+	}
+	// The reference a customer types to track a parcel, and the index a shop
+	// puts on it: unique, because two orders sharing one is a support call, and
+	// case-insensitive, because nobody types it back the way it was printed.
+	//
+	// It goes on orders rather than on customers deliberately. Orders are the
+	// collection this system tiers and evicts, so this is a unique constraint
+	// whose other holder may be in the archive, which is the only place the key
+	// registry does any work. A collated one is also the shape that hid four
+	// defects until 2026-09-22, none of which this workload could reach.
+	if _, err := s.orders.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "ref", Value: 1}},
+		Options: options.Index().SetUnique(true).SetCollation(refCollation()),
+	}); err != nil {
+		return fmt.Errorf("order reference index: %w", err)
 	}
 	if _, err := s.events.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "order", Value: 1}},

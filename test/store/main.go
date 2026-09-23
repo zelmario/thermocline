@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +56,7 @@ type shop struct {
 
 	nProducts  int
 	nCustomers int
+	nOrders    int
 	start      time.Time
 	period     time.Duration
 
@@ -145,7 +147,7 @@ func main() {
 			die("this database was not stocked by this tool: %v", err)
 		}
 		s.start, s.period = m.Start, time.Duration(m.Days)*24*time.Hour
-		s.nProducts, s.nCustomers = m.Products, m.Customers
+		s.nProducts, s.nCustomers, s.nOrders = m.Products, m.Customers, m.Orders
 		fmt.Printf("shopping in the store stocked at %s\n", m.Start.Format(time.RFC3339))
 	}
 
@@ -227,8 +229,12 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 			return
 		}
 		switch n := rng.Float64(); {
-		case n < 0.40:
+		case n < 0.32:
 			s.browse(ctx, rng)
+		case n < 0.38:
+			s.trackOrder(ctx, rng)
+		case n < 0.40:
+			s.reuseReference(ctx, rng)
 		case n < 0.60:
 			s.readRecentOrder(ctx, rng)
 		case n < 0.75:
@@ -254,6 +260,72 @@ func (s *shop) browse(ctx context.Context, rng *rand.Rand) {
 		err := s.products.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&p)
 		if err == nil && p.Price <= 0 {
 			s.violation("a product came back with no price: %d", id)
+		}
+		return err
+	})
+}
+
+// trackOrder is a customer typing the reference off their confirmation email
+// into the tracking box. They type it in whatever case they like, and the shop
+// has always found it.
+//
+// It is the read this workload was missing. The reference is unique and
+// case-insensitive, and the order it names is usually old enough to have been
+// evicted, so the answer has to come from the archive under the collation the
+// index was built with. Nothing else here asks a question whose answer depends
+// on a comparison rather than on a value.
+func (s *shop) trackOrder(ctx context.Context, rng *rand.Rand) {
+	if s.nOrders <= 0 {
+		return
+	}
+	n := rng.Intn(s.nOrders)
+	typed := strings.ToLower(orderRef(n))
+	s.timed("track an order by its reference", func() error {
+		var got struct {
+			Ref string `bson:"ref"`
+		}
+		err := s.orders.FindOne(ctx, bson.D{{Key: "ref", Value: typed}},
+			options.FindOne().SetCollation(refCollation())).Decode(&got)
+		if err == mongo.ErrNoDocuments {
+			s.violation("an order could not be found by its own reference: typed %s", typed)
+			return nil
+		}
+		if err == nil && !strings.EqualFold(got.Ref, typed) {
+			s.violation("tracking %s returned the order referenced %s", typed, got.Ref)
+		}
+		return err
+	})
+}
+
+// reuseReference is the shop refusing to print a reference twice.
+//
+// A support tool re-issuing a confirmation is where this comes from, and the
+// constraint has to hold whichever tier the first order is on and whatever case
+// it is typed in. Accepting it is how two customers end up tracking one parcel.
+func (s *shop) reuseReference(ctx context.Context, rng *rand.Rand) {
+	if s.nOrders <= 0 {
+		return
+	}
+	n := rng.Intn(s.nOrders)
+	typed := strings.ToLower(orderRef(n))
+	at := time.Now()
+	id := idAt(at, rng.Intn(1<<20))
+	s.timed("refuse a reference already in use", func() error {
+		_, err := s.orders.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: id}, {Key: "customer", Value: "c000000"},
+			{Key: "at", Value: at}, {Key: "ref", Value: typed},
+			{Key: "lines", Value: bson.A{}}, {Key: "total", Value: 0.0},
+			{Key: "status", Value: "placed"},
+		})
+		if err == nil {
+			s.violation("a second order took the reference %s, which order %d already has", typed, n)
+			// Take it back out, or every later tracking of that reference has
+			// two answers and this one violation becomes hundreds.
+			_, _ = s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
+			return nil
+		}
+		if mongo.IsDuplicateKeyError(err) {
+			return nil // The shop said no, which is the whole check.
 		}
 		return err
 	})
@@ -299,6 +371,8 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 	s.timed("place an order", func() error {
 		_, err := s.orders.InsertOne(ctx, bson.D{
 			{Key: "_id", Value: id}, {Key: "customer", Value: cust}, {Key: "at", Value: at},
+			// Unique because the id is, and in the case the printer would use.
+			{Key: "ref", Value: "Ref" + strings.ToUpper(id.Hex()[14:])},
 			{Key: "lines", Value: lines}, {Key: "total", Value: total},
 			{Key: "status", Value: "placed"},
 		})
