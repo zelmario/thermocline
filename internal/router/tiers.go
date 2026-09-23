@@ -1430,6 +1430,102 @@ func defaultConcerns(ctx context.Context, client *mongo.Client) (tierConcerns, e
 	return out, nil
 }
 
+// readDeadlineDefault reads the cluster-wide deadline MongoDB 8.0 applies to a
+// read that names no maxTimeMS of its own. Zero means unset.
+//
+// It is a cluster parameter rather than part of getDefaultRWConcern, which is
+// exactly why the comparison above does not see it: that one asks the command
+// that reports the concerns and this is not reported there. Same family, same
+// remedy, different command.
+//
+// An error is the answer on a server too old to know the parameter, and on an
+// account without the privilege to ask. Both tiers run the same release, so an
+// old pair fails on both sides and nothing is said, which is right.
+func readDeadlineDefault(ctx context.Context, client *mongo.Client) (int64, error) {
+	var raw bson.Raw
+	err := client.Database("admin").
+		RunCommand(ctx, bson.D{{Key: "getClusterParameter", Value: "defaultMaxTimeMS"}}).Decode(&raw)
+	if err != nil {
+		return 0, err
+	}
+	arr, aerr := raw.LookupErr("clusterParameters")
+	if aerr != nil {
+		return 0, nil
+	}
+	vals, ok := arrayValues(arr)
+	if !ok {
+		return 0, nil
+	}
+	for _, v := range vals {
+		doc, dok := v.DocumentOK()
+		if !dok {
+			continue
+		}
+		ro, rerr := doc.LookupErr("readOperations")
+		if rerr != nil {
+			continue
+		}
+		if n, nok := intOf64(ro); nok {
+			return n, nil
+		}
+	}
+	return 0, nil
+}
+
+// readDeadlineBypassed reports whether a cluster-wide read cap is in force
+// anywhere, which is when the warning below is worth making.
+//
+// Pure, so it can be asked without setting anything: setting this parameter
+// changes every read on that cluster for as long as it is set, which is the
+// same reason concernDrift is a function rather than an end-to-end check.
+func readDeadlineBypassed(cold, hot int64) bool { return cold > 0 || hot > 0 }
+
+// warnAboutReadDeadlines says so when a cluster-wide read cap is set on either
+// tier, because it does not bound the reads it is there to bound.
+//
+// defaultMaxTimeMS caps a read that names no maxTimeMS of its own, and an
+// account holding bypassDefaultMaxTimeMS is exempt from it. The built-in root
+// role holds that action and readWrite does not. With terminate_auth off a read
+// the fast tier answers is proxied with the client's own credentials, so an
+// ordinary application account is capped by it. A read that falls through to
+// the archive is not proxied: this router performs it on its own connection,
+// under its own account, and withRemainingTime deliberately adds no maxTimeMS
+// when the caller set none.
+//
+// So the cap applies to the reads that were already fast and not to the ones
+// that go to the archive, which are the slow ones it was set for. Measured on
+// this pair with both tiers capped at 5ms, as a user holding readWrite alone,
+// running the same 19ms self join on each side:
+//
+//	a collection the fast tier answers   MaxTimeMSExpired
+//	a tiered collection the archive has  3000 documents, no error
+//
+// Uncapped, both answered 3000.
+func (r *Router) warnAboutReadDeadlines(ctx context.Context) {
+	cold, cerr := readDeadlineDefault(ctx, r.cold)
+	if cerr != nil {
+		r.log.Debug("could not read the archive's default read deadline", "err", cerr)
+		return
+	}
+	hot, herr := readDeadlineDefault(ctx, r.hot)
+	if herr != nil {
+		r.log.Debug("could not read the fast tier's default read deadline", "err", herr)
+		return
+	}
+	if !readDeadlineBypassed(cold, hot) {
+		return
+	}
+	r.log.Warn("a cluster-wide read cap is set, and it does not reach the reads it is for",
+		"parameter", "defaultMaxTimeMS.readOperations",
+		"archive", cold, "fast_tier", hot,
+		"meaning", "a read the fast tier answers carries the client's own credentials and is "+
+			"capped by it; a read that falls through to the archive is run by this router under "+
+			"its own account, which bypasses the cap if it holds bypassDefaultMaxTimeMS, as root "+
+			"does, so the slow reads are the ones it does not bound",
+		"action", "set maxTimeMS in the application, which travels and is honoured on both tiers, "+
+			"or give the router an account without bypassDefaultMaxTimeMS")
+}
+
 // writeConcernText renders a write concern the way it is written in a config,
 // rather than as the extended JSON the server reports. An operator reading this
 // warning is about to retype it.

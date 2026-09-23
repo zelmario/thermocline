@@ -400,6 +400,7 @@ func (r *Router) Survey(ctx context.Context) error {
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
+	r.warnAboutReadDeadlines(ctx)
 	r.warnAboutOptionDrift(ctx)
 	r.warnAboutClocks(ctx)
 	// Last here, first in Listen's ordering terms: it reads one index listing
@@ -543,6 +544,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnAboutMissingUsers(ctx)
 	r.warnAboutMissingRoles(ctx)
 	r.warnAboutDefaultConcerns(ctx)
+	r.warnAboutReadDeadlines(ctx)
 	r.warnAboutOptionDrift(ctx)
 	r.warnAboutClocks(ctx)
 	// And the litter a router that died mid-aggregation leaves in the

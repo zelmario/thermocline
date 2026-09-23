@@ -792,6 +792,38 @@ Part of [Thermocline](../README.md).
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
 
+- **A cluster-wide `defaultMaxTimeMS` bounds the fast reads and not the slow
+  ones.** MongoDB 8.0 caps a read that names no `maxTimeMS` of its own with the
+  `defaultMaxTimeMS` cluster parameter, and an account holding
+  `bypassDefaultMaxTimeMS` is exempt. The built-in `root` role holds that
+  action; `readWrite` does not.
+
+  With `terminate_auth` off, a read the fast tier answers is proxied with the
+  client's own credentials, so an ordinary application account is capped by it.
+  A read that falls through to the archive is not proxied: the router performs
+  it on its own connection under its own account, and it deliberately adds no
+  `maxTimeMS` of its own when the caller set none.
+
+  So the cap reaches the reads that were already fast and not the ones that go
+  to the archive, which are the slow ones it was set for. Measured on this pair
+  with both tiers capped at 5ms, as a user holding `readWrite` alone, running
+  the same 19ms self join against each:
+
+  ```
+  a collection the fast tier answers   MaxTimeMSExpired
+  a tiered collection the archive has  3000 documents, no error
+  ```
+
+  Uncapped, both answered 3000.
+
+  The router now says so at startup and in `cline preflight` when the parameter
+  is set on either tier. It is not silently honoured instead, because making the
+  archive read carry it would start failing reads that succeed today, and that
+  is the operator's decision rather than an upgrade's. Two ways to get what the
+  setting was for: set `maxTimeMS` in the application, which travels with the
+  command and is honoured on both tiers, or give the router an account without
+  `bypassDefaultMaxTimeMS`.
+
 - **The router answers as a mongos and tells the truth about the replica set
   behind it, so anything that branches on the handshake is looking at a
   deployment that does not exist.** The handshake is deliberate: a driver uses
