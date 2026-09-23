@@ -224,6 +224,175 @@ chk "the archive still holds the evicted document"     "true" \
 chk "a read through the router still finds it"         "old" \
     "$(R "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'MISSING')")"
 
+echo "== many copy-ups at once, because one cannot catch a race =="
+# The section above drives a single copy-up and proves the mechanism works. It
+# cannot prove the mechanism always works: a suppression that fails once in a
+# hundred and forty passes that check every time.
+#
+# Found by a shop tailing its own orders while the tiers moved underneath: one
+# insert reached the consumer for a seeded order, dated a month before the run
+# and carrying none of the fields the run writes, so nothing but a copy-up put
+# it on the fast tier. 274 of those turned out to be the harness recording ids
+# after the write instead of before it; this was the one that survived.
+#
+# So this drives many and asserts none of them is reported. A phantom insert is
+# an order nobody placed, indexed by whatever the application does with its
+# stream.
+MANY=tcsmany
+H "db.getSiblingDB(process.env.TC_DB).$MANY.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$MANY.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$MANY.insertMany(
+     Array.from({length:120},(_,i)=>({_id:i,n:i,v:'x'.repeat(40)})))" >/dev/null
+# waitMirrored only ever watches $NS, so this one waits for its own namespace.
+for _ in $(seq 1 120); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$MANY.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "120" ] && break
+  sleep 0.5
+done
+# Off the fast tier the way an eviction does it, with the feeder blind, so every
+# read below has to fetch from the archive and every fetch is an insert there.
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$MANY.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder
+chk "the archive holds all of them and the fast tier none" "120/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$MANY.countDocuments({_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$MANY.countDocuments({}))")"
+
+rm -f /tmp/cs_many.txt
+# maxAwaitTimeMS low, or each poll with nothing waiting costs a second and the
+# watcher outlives the reads it is supposed to be watching.
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$MANY.watch([],{maxAwaitTimeMS:50});
+  let ins=0, other=0, ids=[];
+  // Bounded by the clock, not by a poll count: 2000 polls at 25ms each
+  // outlived awaitWatcher's own patience and the watcher was killed before it
+  // printed anything, so the section reported the fixture instead of the router.
+  const until=Date.now()+25000;
+  while (Date.now()<until) {
+    const e=cs.tryNext();
+    if (!e) { sleep(25); continue; }
+    if (e.operationType==='insert') { ins++; if (ids.length<5) ids.push(e.documentKey._id); }
+    else other++;
+  }
+  cs.close();
+  print(ins + ' ' + other + ' ' + JSON.stringify(ids));" > /tmp/cs_many.txt 2>&1 &
+MANYW=$!
+sleep 3
+# One point read per document, each of which drags it back up.
+R "const c=db.getSiblingDB(process.env.TC_DB).$MANY;
+   for (let i=0;i<120;i++) c.findOne({_id:i});
+   print('pulled up ' + c.countDocuments({}))" >/dev/null
+MANYOUT=$(awaitWatcher /tmp/cs_many.txt $MANYW)
+echo "  the watcher saw: ${MANYOUT:-nothing}  (inserts, other, first ids)"
+chk "the watcher reported at all"                      "true" \
+    "$(echo "${MANYOUT:-none}" | grep -qiE 'error|refus|none' && echo false || echo true)"
+chk "the fast tier holds them all after the reads"     "120" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$MANY.countDocuments({}))")"
+chk "not one copy-up was reported as an insert"        "0" \
+    "$(echo "${MANYOUT:-1}" | awk '{print $1+0}')"
+
+echo "== a second copy-up of the same document, after an eviction =="
+# The section above drives first copy-ups and they are all suppressed, because a
+# first promotion writes promotedAt and the thirty second floor covers it.
+#
+# A record describes one promotion and outlives several. ResidencyUpdate only
+# refreshes promotedAt when the record is "reopening", which it defines as
+# promotedAt missing or endedAt present, and endedAt is written when the
+# *application* deletes the document. An eviction does not write it. So a
+# document copied up, evicted, and copied up again keeps the first promotion's
+# timestamp, and once that is older than the window every route in isPromotion
+# declines: the floor does not apply, the echo was spent on the first insert and
+# is not re-announced, no echo is recorded for this one, and the final
+# comparison is outside promotionWindow.
+#
+# A completed eviction does write endedAt, through meta.HoldIsOver, so it is the
+# window before that which this holds open: the evictor removes the document
+# first and ends the record second, in an update that only warns if it fails. A
+# read landing in between is this. Removing straight at the fast tier with the
+# feeder blind is that window held still.
+#
+# That is an ordinary steady state, not a rare race. The evictor takes documents
+# off the fast tier continuously and reads pull them back.
+TWICE=tcstwice
+# With a residency hold short enough to lapse during the test. The evictor only
+# ever takes a document whose hold has already lapsed, so a removal while the
+# hold is still active is a state it does not produce: the first version of this
+# section removed the document immediately and was testing something real
+# evictions never do.
+TWCFG=$WDIR/cs_shorthold.yaml
+sed 's/^  residency: .*/  residency: 2s/' $CFG > $TWCFG
+grep -q 'residency: 2s' $TWCFG || echo "  WARN  the short hold config did not take"
+stopDaemons
+cline feeder --config $TWCFG --log-file $LOGDIR/cs_f.log & FP=$!
+for _ in $(seq 1 60); do
+  [ "$(C 'print(!!db.getSiblingDB(process.env.TC_META).checkpoints.findOne({_id:"test"}))')" = "true" ] && break
+  sleep 0.5
+done
+cline router --config $TWCFG --log-file $LOGDIR/cs_r.log & RP=$!
+for _ in $(seq 1 30); do
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
+  sleep 1
+done
+H "db.getSiblingDB(process.env.TC_DB).$TWICE.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$TWICE.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$TWICE.insertMany(
+     Array.from({length:8},(_,i)=>({_id:i,n:i})))" >/dev/null
+for _ in $(seq 1 120); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$TWICE.countDocuments({_tcDeletedAt:{\$exists:false}}))")" = "8" ] && break
+  sleep 0.5
+done
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$TWICE.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder
+# The first copy-up, which writes promotedAt.
+R "const c=db.getSiblingDB(process.env.TC_DB).$TWICE; for (let i=0;i<8;i++) c.findOne({_id:i}); print('up')" >/dev/null
+chk "the first copy-up put them on the fast tier"      "8" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TWICE.countDocuments({}))")"
+# The hold has to lapse first, because that is the only state the evictor takes a
+# document in. Two seconds plus a margin.
+sleep 4
+# Evicted, not deleted: straight at the fast tier with the feeder blind, which is
+# what the evictor's own removal looks like to this record before it gets round
+# to ending it.
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$TWICE.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'})" >/dev/null
+startFeeder
+chk "and an eviction took them off it again"           "0/8" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TWICE.countDocuments({}))")/$(C "print(db.getSiblingDB(process.env.TC_DB).$TWICE.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+# Past the window the floor covers, so the record's own timestamp has to answer.
+sleep 35
+
+rm -f /tmp/cs_twice.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$TWICE.watch([],{maxAwaitTimeMS:50});
+  let ins=0, other=0;
+  const until=Date.now()+20000;
+  while (Date.now()<until) {
+    const e=cs.tryNext();
+    if (!e) { sleep(25); continue; }
+    if (e.operationType==='insert') ins++; else other++;
+  }
+  cs.close();
+  print(ins + ' ' + other);" > /tmp/cs_twice.txt 2>&1 &
+TWICEW=$!
+sleep 3
+R "const c=db.getSiblingDB(process.env.TC_DB).$TWICE; for (let i=0;i<8;i++) c.findOne({_id:i}); print('up again')" >/dev/null
+TWICEOUT=$(awaitWatcher /tmp/cs_twice.txt $TWICEW)
+echo "  the watcher saw: ${TWICEOUT:-nothing}  (inserts, other)"
+chk "the watcher reported at all"                      "true" \
+    "$(echo "${TWICEOUT:-none}" | grep -qiE 'error|refus|none' && echo false || echo true)"
+chk "the second copy-up put them back"                 "8" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$TWICE.countDocuments({}))")"
+chk "a second copy-up is not reported as an insert either" "0" \
+    "$(echo "${TWICEOUT:-1}" | awk '{print $1+0}')"
+# Back to the suite's own config, or every section below this one runs with a two
+# second residency hold and reads that as the router losing documents.
+stopDaemons
+startFeeder
+startRouter
+
 echo "== and the application's own insert of a document it just deleted =="
 # The twin of the section above, and the direction it gets wrong. A copy-up must
 # not look like an insert; an insert must not look like a copy-up.

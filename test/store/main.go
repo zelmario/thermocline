@@ -71,6 +71,16 @@ type shop struct {
 	start  time.Time
 	period time.Duration
 
+	// What the application itself wrote, so a change stream consumer's events
+	// can be judged against it. A shop's search indexer or analytics pipeline
+	// tails this stream, and what it must never see is a document moving
+	// between tiers: a copy-up is an insert on the fast tier and an eviction is
+	// a delete, and neither is anything the application did.
+	wrote      sync.Map // order _id hex -> true, placed by a worker
+	removed    sync.Map // order _id hex -> true, cancelled by a worker
+	seenInsert sync.Map // order _id hex -> true, seen by the consumer
+	seenDelete sync.Map // order _id hex -> true, seen by the consumer
+
 	// Violations are the point of the whole thing. Counted separately from
 	// errors, because an error is the system saying no and a violation is it
 	// saying something untrue.
@@ -202,6 +212,15 @@ func main() {
 		go s.heartbeat(*beat, began, done)
 	}
 
+	// Before any worker, so every order placed during the run is inside the
+	// stream's window. A consumer started afterwards is legitimately short and
+	// the check below would read that as this system losing events.
+	tailDone := make(chan struct{})
+	tailReady := make(chan struct{})
+	tailStopped := make(chan struct{})
+	go func() { s.tail(ctx, tailDone, tailReady); close(tailStopped) }()
+	<-tailReady
+
 	var wg sync.WaitGroup
 	for w := 0; w < *conc; w++ {
 		wg.Add(1)
@@ -212,6 +231,13 @@ func main() {
 	}
 	wg.Wait()
 	close(done)
+	// Let the consumer catch up before judging it. Events are delivered after
+	// the write returns, so a stream cut off the moment the last worker stops
+	// is short for a reason that is not this system's.
+	time.Sleep(3 * time.Second)
+	close(tailDone)
+	<-tailStopped
+	s.checkStream()
 	elapsed := time.Since(began)
 	after := readClasses(*snapshot)
 
@@ -392,6 +418,7 @@ func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust stri
 	id := idAt(at, rng.Intn(1<<20))
 	total := math.Round(float64(100+rng.Intn(9000))) / 100
 
+	s.wrote.Store(id.Hex(), true)
 	committed := false
 	s.timed("place an order and its event in one transaction", func() error {
 		_, terr := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
@@ -421,6 +448,7 @@ func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust stri
 		return terr
 	})
 	if !committed {
+		s.wrote.Delete(id.Hex())
 		// Nothing of it must be there. A transaction that failed and left half
 		// of itself behind is the one thing a transaction promises not to do.
 		s.timed("a transaction that failed left nothing", func() error {
@@ -481,6 +509,7 @@ func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOr
 		return nil
 	})
 
+	s.removed.Store(victim.id.Hex(), true)
 	deleted := false
 	s.timed("cancel an order", func() error {
 		res, err := s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: victim.id}})
@@ -494,6 +523,9 @@ func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOr
 		deleted = true
 		return nil
 	})
+	if !deleted {
+		s.removed.Delete(victim.id.Hex())
+	}
 	if !deleted || !counted {
 		return placed
 	}
@@ -616,6 +648,15 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) (rec
 	at := time.Now()
 	id := idAt(at, rng.Intn(1<<20))
 
+	// Recorded before the write, not after. The consumer sees the event as soon
+	// as the write lands, and this function does three more checks before it
+	// returns: recording afterwards meant the stream had already reported an
+	// order the shop had not yet admitted placing, and every order read as a
+	// phantom. 274 of them in one run, all of them this race.
+	//
+	// Taken back below if the write is refused, because an id recorded for a
+	// write that never happened reads as an event the stream lost.
+	s.wrote.Store(id.Hex(), true)
 	placed := false
 	s.timed("place an order", func() error {
 		_, err := s.orders.InsertOne(ctx, bson.D{
@@ -648,6 +689,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) (rec
 	// read back, and an insert whose acknowledgement was lost may have landed
 	// anyway. Neither is this check's answer to give.
 	if !placed {
+		s.wrote.Delete(id.Hex())
 		return recentOrder{}, false
 	}
 	s.timed("read back the new order", func() error {
@@ -907,6 +949,100 @@ func (s *shop) violation(f string, a ...any) {
 		fmt.Printf("[%s] VIOLATION %s\n", time.Now().Format("15:04:05"), msg)
 	}
 	s.mu.Unlock()
+}
+
+// tail is the consumer a shop runs beside its application: a search indexer, an
+// analytics pipeline, a cache that invalidates itself. It watches the orders
+// collection and has to see what the application did, and only that.
+//
+// The invariant it checks is the one this system is most able to break. Three
+// things move documents without an application asking: a copy-up, when a read
+// reaches past the fast tier; an eviction, when the evictor takes a document
+// off it; and a warm. On the fast tier a copy-up is an insert and an eviction
+// is a delete, so a consumer that is told about them sees orders appear that
+// nobody placed and disappear that nobody cancelled.
+//
+// Phantoms are the hard failure here. A missing event is the other half and is
+// checked at the end, after the stream has been given time to drain, because a
+// consumer stopped mid-flight is short for reasons that are not this system's.
+func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- struct{}) {
+	cur, err := s.orders.Watch(ctx, mongo.Pipeline{}, options.ChangeStream().
+		SetFullDocument(options.UpdateLookup))
+	if err != nil {
+		s.errs.Add(1)
+		close(ready)
+		return
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	close(ready)
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if !cur.TryNext(ctx) {
+			if cur.Err() != nil {
+				s.errs.Add(1)
+				return
+			}
+			continue
+		}
+		var ev struct {
+			OperationType string `bson:"operationType"`
+			DocumentKey   struct {
+				ID bson.ObjectID `bson:"_id"`
+			} `bson:"documentKey"`
+		}
+		if err := cur.Decode(&ev); err != nil {
+			continue
+		}
+		id := ev.DocumentKey.ID.Hex()
+		switch ev.OperationType {
+		case "insert":
+			s.seenInsert.Store(id, true)
+			if _, ours := s.wrote.Load(id); !ours {
+				// Seeded orders are written before the consumer starts, so an
+				// insert for one of those is a document arriving on the fast
+				// tier rather than an order being placed.
+				s.violation("the stream reported an order placed that nobody placed: %s", id)
+			}
+		case "delete":
+			s.seenDelete.Store(id, true)
+			if _, ours := s.removed.Load(id); !ours {
+				s.violation("the stream reported an order cancelled that nobody cancelled: %s", id)
+			}
+		}
+	}
+}
+
+// checkStream is the other half of the consumer's promise, asked once the
+// stream has drained: everything the application did reached it.
+//
+// Phantoms are caught as they arrive, because an event that should not exist is
+// wrong the moment it is delivered. A missing one can only be judged at the
+// end, and only after a wait, which is why it is here.
+func (s *shop) checkStream() {
+	missingIns, missingDel := 0, 0
+	s.wrote.Range(func(k, _ any) bool {
+		if _, ok := s.seenInsert.Load(k); !ok {
+			missingIns++
+		}
+		return true
+	})
+	s.removed.Range(func(k, _ any) bool {
+		if _, ok := s.seenDelete.Load(k); !ok {
+			missingDel++
+		}
+		return true
+	})
+	if missingIns > 0 {
+		s.violation("the stream never reported %d orders the shop placed", missingIns)
+	}
+	if missingDel > 0 {
+		s.violation("the stream never reported %d orders the shop cancelled", missingDel)
+	}
 }
 
 // heartbeat is what makes a run of hours readable while it runs. The report at

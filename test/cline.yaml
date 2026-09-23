@@ -466,6 +466,10 @@ feeder:
     # because turning that option on is a property of the collection and every
     # other section would then be watching one that has it.
     - "shop.tcs6"
+    # testchange.sh: many copy-ups at once, because the single one above cannot
+    # catch a suppression that fails once in a hundred and forty.
+    - "shop.tcsmany"
+    - "shop.tcstwice"
     # testcache.sh
     - "shop.tcache"
     # testcache.sh again, for the cache across an adoption: the archive holds

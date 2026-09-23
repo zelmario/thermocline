@@ -472,9 +472,31 @@ type ResidencyRecord struct {
 func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Duration) mongo.Pipeline {
 	// Missing promotedAt: never promoted, so this is the first. Present
 	// endedAt: the last promotion is over, so this is a new one.
+	//
+	// And a hold that has lapsed, which is the one that was missing. endedAt is
+	// written by whoever took the document off the fast tier, and the evictor
+	// writes it *after* removing the document, in a second update that only
+	// warns if it fails. A read landing in between copies the document back up
+	// while the record still says the first promotion is current, so promotedAt
+	// is not refreshed and echoPending is not re-announced. Every route in
+	// isPromotion then declines once that timestamp is older than
+	// promotionWindow, and the copy-up's insert reaches the application as an
+	// order nobody placed.
+	//
+	// Measured: eight of eight second copy-ups delivered as inserts, and one in
+	// a two-shop run of 142 copy-ups where the evictor was doing the removing
+	// for real. A lapsed hold is exactly the state a document must be in for
+	// the evictor to have taken it, so this asks the record what the evictor
+	// would have asked rather than waiting to be told.
+	//
+	// Safe in the other direction: a read of a document the fast tier still
+	// holds refreshes residency without causing an insert, and the echo this
+	// re-announces is withdrawn by the same path that already withdraws one for
+	// a document found to be present. See WithdrawEchoes.
 	reopening := bson.D{{Key: "$or", Value: bson.A{
 		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$promotedAt"}}, "missing"}}},
 		bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
+		bson.D{{Key: "$lte", Value: bson.A{"$hotUntil", "$$NOW"}}},
 	}}}
 	return mongo.Pipeline{
 		bson.D{{Key: "$set", Value: bson.D{
