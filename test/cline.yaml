@@ -388,6 +388,10 @@ feeder:
     # other than the one it runs against. tcref2 is the untiered reference and
     # is deliberately NOT here.
     - "shop.tcfuzz2"
+    # fuzz.js: the target an $out or a $merge writes into. Tiered, because
+    # writing into a tiered collection is the half of that path the archive
+    # reads for, and the reference target beside it is untiered.
+    - "shop.tcfuzzout"
     # testtxn.sh: a transaction updating one document the fast tier holds and one
     # only the archive has, read back the instant it commits. ttxref is the
     # untiered reference and is deliberately NOT here.

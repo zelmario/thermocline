@@ -792,6 +792,37 @@ Part of [Thermocline](../README.md).
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
 
+- **Deleting a document and immediately re-inserting the same `_id` can be
+  refused, for as long as the delete takes to reach the archive.** Clearing a
+  collection and reloading it is the shape that meets this.
+
+  A delete reaches the fast tier at once and the archive only when the feeder
+  carries it across. In between, the archive still holds that document as live,
+  and the router cannot tell it apart from one that was evicted: both are
+  documents the archive has and the fast tier does not. It treats it as a real
+  conflict, which is the safe direction, because the other choice is letting a
+  second document take an `_id` the archive still holds. `staleArchiveCopy` says
+  so in as many words: when the fast tier does not hold the document, the
+  archive's copy is the only one there is.
+
+  Measured with the feeder stopped, so the window is held open rather than
+  raced: six documents deleted through the router, the archive still holding all
+  six live and the fast tier none.
+
+  ```
+  re-inserting those _ids      E11000, refused by the router
+  an untiered reference        accepted
+  ```
+
+  With a feeder running normally the window is the mirroring lag, milliseconds
+  on this pair, and the same insert is accepted. With a feeder stopped or badly
+  behind it lasts as long as the lag does, which is one more thing a stopped
+  feeder costs. `ThermoclineDaemonStopped` is the alert that names it.
+
+  A `$merge` writing the same `_id`s in the same state is accepted rather than
+  refused. The two paths disagree about one question and one of them is wrong,
+  which is not yet settled and is recorded here rather than claimed.
+
 - **A cluster-wide `defaultMaxTimeMS` bounds the fast reads and not the slow
   ones.** MongoDB 8.0 caps a read that names no `maxTimeMS` of its own with the
   `defaultMaxTimeMS` cluster parameter, and an account holding

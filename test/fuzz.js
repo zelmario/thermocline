@@ -69,6 +69,12 @@ const TIER = d.tcfuzz;
 const REF2  = d.tcref2;
 const TIER2 = d.tcfuzz2;
 function otherOf(c) { return c.getName() === REF.getName() ? REF2.getName() : TIER2.getName(); }
+// And a target pair, for the pipelines that write. The tiered side writes into a
+// tiered collection, which is the half of that path the archive is read for; the
+// reference side writes into an untiered one beside it.
+const OUTREF = 'tcfuzzoutref';
+const OUTTIER = 'tcfuzzout';
+function outOf(c) { return c.getName() === REF.getName() ? OUTREF : OUTTIER; }
 
 // xorshift32, so a seed reproduces a run exactly. Math.random cannot: a
 // disagreement nobody can ask for again is not a bug report.
@@ -1025,8 +1031,13 @@ function oneOp(i) {
   // about the namespace for the operations that follow. Too many and a round
   // spends itself building indexes instead of comparing answers.
   const DDL = [17, 17, 18, 19, 19];
+  // Its own draw rather than a member of WRITES: it rewrites a whole collection
+  // each time, so a round spending many of them measures $out rather than
+  // comparing answers.
+  const WRITEPIPE = [20];
   const choice = RO ? pick(READS)
                     : maybe(0.10) ? pick(DDL)
+                    : maybe(0.06) ? pick(WRITEPIPE)
                     : maybe(0.60) ? pick(READS) : pick(WRITES);
   switch (choice) {
     case 0: {
@@ -1347,6 +1358,72 @@ function oneOp(i) {
                     when: new Date(Date.UTC(2024, ri(12), 1 + ri(27))) };
       const op = 'insert straight after DDL ' + ser(doc);
       if (ask('insertAfterDDL', op, c => String(c.insertOne(doc).insertedId), 'seq')) contentsMatch('contents after an insert following DDL', op);
+      break;
+    }
+    case 20: {
+      // A pipeline that writes its answer down, which this file never
+      // generated: $out and $merge were not in the grammar at all, so the
+      // reading half of that path, which runs against the archive, had no
+      // randomized coverage. It is the expensive half to get wrong, because
+      // what comes out of it is not an answer a client can ask again, it is a
+      // collection.
+      //
+      // The operation returns the contents it wrote rather than a status, so
+      // the two sides are compared on what landed. Each side writes into its
+      // own target: the tiered side into a tiered collection, which is the
+      // shape the archive is read for.
+      //
+      // $group by grp is the shape that matters most here. It is the one field
+      // holding values that differ only by case, so under a collation the two
+      // spellings are one bucket and without it they are two, which is exactly
+      // how a dropped collation shows up in something that has been written
+      // down.
+      const wc = writeCollation();
+      const stage = pick(['group', 'match', 'sorted']);
+      const merge = maybe(0.4);
+      const op = withColl('pipeline writing ' + stage + (merge ? ' by $merge' : ' by $out') +
+                          ' ' + ser(F), wc);
+      ask('pipelineWrite', op, c => {
+        const target = outOf(c);
+        // Both targets emptied first, so this comparison is about this
+        // operation and nothing before it. $merge accumulates and $out
+        // replaces, so without a reset one early divergence makes every later
+        // pipeline write disagree and the first one is the only real signal.
+        //
+        // deleteMany rather than drop: the tiered target is tiered, and
+        // dropping the fast tier's copy is not a delete. The archive would keep
+        // what was there, the read-back would return it, and the tiered side
+        // would differ for a reason this operation did not cause.
+        d.getCollection(target).deleteMany({});
+        // And wait for that delete to reach the archive before writing those
+        // same _ids again. Until it does, the archive still holds them live,
+        // and the router refuses an insert of an _id whose other holder is
+        // there: a real refusal, about a state this reset created rather than
+        // about the operation being compared. Measured with the feeder held
+        // still: archive 6 live, fast tier 0, and an insert of those _ids came
+        // back E11000 while an untiered reference took it.
+        waitForMirroring();
+        // A document to match against, the same on both sides, so whenMatched
+        // is reached rather than every merge being an insert.
+        if (merge) d.getCollection(target).insertOne({ _id: 'seeded', n: -1, grp: 'alpha' });
+        let read;
+        switch (stage) {
+          case 'group':
+            read = [{ $group: { _id: '$grp', n: { $sum: 1 }, top: { $max: '$n' } } }];
+            break;
+          case 'match':
+            read = [{ $match: F }, { $project: { _id: 1, n: 1, grp: 1 } }];
+            break;
+          default:
+            read = [{ $match: F }, { $sort: { _id: 1 } }, { $limit: 5 },
+                    { $project: { _id: 1, n: 1, grp: 1 } }];
+        }
+        const last = merge
+          ? { $merge: { into: target, whenMatched: 'replace', whenNotMatched: 'insert' } }
+          : { $out: target };
+        c.aggregate(read.concat([last]), wc || {}).toArray();
+        return d.getCollection(target).find({}).sort({ _id: 1 }).toArray();
+      }, 'seq');
       break;
     }
     default: {

@@ -189,6 +189,12 @@ reseedComplete() {
   [ "$RC" = "RESEEDED" ] || echo "  WARN  reseedComplete: $RC"
   cline watermark --config $CFG --ns $DB.tcfuzz  --complete-all >/dev/null
   cline watermark --config $CFG --ns $DB.tcfuzz2 --complete-all >/dev/null
+  # The target an $out or a $merge writes into is tiered too, and under
+  # completeness: strict a namespace nothing has claimed is refused. Without
+  # this the strict section reported three refusals that were its own setup
+  # rather than the guard being over-cautious, which is the only thing that
+  # section is there to find.
+  cline watermark --config $CFG --ns $DB.tcfuzzout --complete-all >/dev/null
 }
 
 echo "== setup =="
@@ -481,7 +487,13 @@ chk "a strict router is up"            "isdbgrid" "$(mongosh --port $P1 -u dba -
 chk "and the fast tier holds them all" "60" "$(H "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.countDocuments({}))")"
 SOUT=$(TC_SEED=$((SEED0+4242)) TC_OPS=$OPS TC_NO_TTL=1 mongosh --port $P1 -u dba -p secret \
          --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1)
-echo "$SOUT" | grep -E '^  HARNESS|^DISAGREE|^REFUSAL|^\t' | head -40
+# A real tab, not a backslash-t in single quotes. The grep in the node is GNU
+# 3.1, which does not read \t in a pattern as a tab, so that form dropped every
+# line a REFUSAL or a DISAGREE prints its detail on: this section said that
+# something was refused and never what, and would have said that something
+# disagreed and never what it answered. The two sections above already use
+# printf for exactly this reason.
+echo "$SOUT" | grep -E "^  HARNESS|^DISAGREE|^REFUSAL|^$(printf '\t')" | head -40
 echo "$SOUT" | grep -m1 '^SHAPES ' | fold -s -w 150 | sed 's/^/  /'
 SLINE=$(echo "$SOUT" | grep -m1 '^AGREED ')
 echo "  $SLINE"
