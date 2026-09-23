@@ -229,12 +229,16 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 			return
 		}
 		switch n := rng.Float64(); {
-		case n < 0.32:
+		case n < 0.26:
 			s.browse(ctx, rng)
-		case n < 0.38:
+		case n < 0.32:
 			s.trackOrder(ctx, rng)
-		case n < 0.40:
+		case n < 0.34:
 			s.reuseReference(ctx, rng)
+		case n < 0.38:
+			s.cancelOrder(ctx, rng, mine())
+		case n < 0.40:
+			s.channelReport(ctx, rng, mine())
 		case n < 0.60:
 			s.readRecentOrder(ctx, rng)
 		case n < 0.75:
@@ -331,6 +335,144 @@ func (s *shop) reuseReference(ctx context.Context, rng *rand.Rand) {
 	})
 }
 
+// cancelOrder is a customer cancelling, which is the delete this workload never
+// did. Everything else here only ever added.
+//
+// Only an order this run placed, which a shop would also insist on: you cancel
+// a recent order, not one from last March. It keeps the seeded history intact
+// for trackOrder, which expects every seeded reference to still be findable, and
+// a cancellation of one of those would make that check report a violation for a
+// document this workload removed itself.
+//
+// What a shop would notice: the order is gone, and exactly one order is gone.
+func (s *shop) cancelOrder(ctx context.Context, rng *rand.Rand, cust string) {
+	var before int64
+	counted := false
+	s.timed("count a customer's orders", func() error {
+		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
+		if err != nil {
+			return err
+		}
+		before, counted = n, true
+		return nil
+	})
+
+	// One of this run's own, named by the field the seeded orders predate.
+	var victim struct {
+		ID bson.ObjectID `bson:"_id"`
+	}
+	found := false
+	s.timed("find a recent order to cancel", func() error {
+		err := s.orders.FindOne(ctx, bson.D{
+			{Key: "customer", Value: cust},
+			{Key: "channel", Value: bson.D{{Key: "$exists", Value: true}}},
+		}).Decode(&victim)
+		if err == mongo.ErrNoDocuments {
+			return nil // nothing of ours to cancel yet
+		}
+		found = err == nil
+		return err
+	})
+	if !found {
+		return
+	}
+
+	deleted := false
+	s.timed("cancel an order", func() error {
+		res, err := s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: victim.ID}})
+		if err != nil {
+			return err
+		}
+		if res.DeletedCount != 1 {
+			s.violation("cancelling one order deleted %d", res.DeletedCount)
+			return nil
+		}
+		deleted = true
+		return nil
+	})
+	if !deleted || !counted {
+		return
+	}
+
+	s.timed("read back a cancelled order", func() error {
+		err := s.orders.FindOne(ctx, bson.D{{Key: "_id", Value: victim.ID}}).Err()
+		if err == nil {
+			s.violation("a cancelled order came back: %s", victim.ID.Hex())
+			return nil
+		}
+		if err == mongo.ErrNoDocuments {
+			return nil
+		}
+		return err
+	})
+	s.timed("count a customer's orders", func() error {
+		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
+		if err != nil {
+			return err
+		}
+		if n != before-1 {
+			s.violation("cancelling one order moved %s from %d to %d", cust, before, n)
+		}
+		return nil
+	})
+}
+
+// channelReport is the report a shop runs after adding a column: how many
+// orders came through each channel, with the ones that predate the field
+// counted rather than dropped.
+//
+// The invariant is that the parts add up to the whole. Every order is in
+// exactly one bucket whether or not it carries the field, so the sum of the
+// groups has to equal the count, and it is one aggregation against one count
+// over a customer whose orders are spread across both tiers. A tier that drops
+// documents or hands the same one over twice breaks it, and neither shows up in
+// a report that only ever looks at its own total.
+func (s *shop) channelReport(ctx context.Context, rng *rand.Rand, cust string) {
+	var total int64
+	counted := false
+	s.timed("count a customer's orders", func() error {
+		n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "customer", Value: cust}})
+		if err != nil {
+			return err
+		}
+		total, counted = n, true
+		return nil
+	})
+	if !counted {
+		return
+	}
+	s.timed("a report by channel, over a field half the history lacks", func() error {
+		cur, err := s.orders.Aggregate(ctx, mongo.Pipeline{
+			{{Key: "$match", Value: bson.D{{Key: "customer", Value: cust}}}},
+			{{Key: "$group", Value: bson.D{
+				{Key: "_id", Value: bson.D{{Key: "$ifNull", Value: bson.A{"$channel", "legacy"}}}},
+				{Key: "n", Value: bson.D{{Key: "$sum", Value: 1}}},
+			}}},
+		})
+		if err != nil {
+			return err
+		}
+		defer cur.Close(ctx)
+		var sum int64
+		for cur.Next(ctx) {
+			var row struct {
+				N int64 `bson:"n"`
+			}
+			if err := cur.Decode(&row); err != nil {
+				return err
+			}
+			sum += row.N
+		}
+		if err := cur.Err(); err != nil {
+			return err
+		}
+		if sum != total {
+			s.violation("a channel report for %s counted %d orders where the shop has %d", cust, sum, total)
+		}
+		return nil
+	})
+}
+
 // placeOrder writes an order and then checks the two things a shop would notice
 // if this system were broken: that the order is there, and that it is there
 // once.
@@ -373,6 +515,14 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) {
 			{Key: "_id", Value: id}, {Key: "customer", Value: cust}, {Key: "at", Value: at},
 			// Unique because the id is, and in the case the printer would use.
 			{Key: "ref", Value: "Ref" + strings.ToUpper(id.Hex()[14:])},
+			// Fields the seeded orders predate. A shop adds columns and does
+			// not backfill a year of history, so every query written after the
+			// change meets documents that have never heard of it, and the old
+			// ones are exactly the ones that have been evicted to the archive.
+			// It is also what marks an order as cancellable below: a shop lets
+			// you cancel a recent order, not one from last March.
+			{Key: "channel", Value: []string{"web", "app", "phone"}[rng.Intn(3)]},
+			{Key: "currency", Value: "EUR"},
 			{Key: "lines", Value: lines}, {Key: "total", Value: total},
 			{Key: "status", Value: "placed"},
 		})
