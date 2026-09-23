@@ -64,8 +64,12 @@ type shop struct {
 	nProducts  int
 	nCustomers int
 	nOrders    int
-	start      time.Time
-	period     time.Duration
+	// began is when this run started, and the bound pageHistory scrolls below.
+	// Everything older than it is written once by the seeder and never touched
+	// again, which is what makes a skip stable.
+	began  time.Time
+	start  time.Time
+	period time.Duration
 
 	// Violations are the point of the whole thing. Counted separately from
 	// errors, because an error is the system saying no and a violation is it
@@ -137,6 +141,9 @@ func main() {
 		lat:    map[string][]time.Duration{}, said: map[string]int64{},
 	}
 	s.start = time.Now().Add(-s.period)
+	// Before any of this run's own writes, so pageHistory's bound separates the
+	// seeded history from anything placed or cancelled while it scrolls.
+	s.began = time.Now()
 
 	if !*skipSeed {
 		fmt.Printf("stocking the shop: %s products, %s customers, %s orders over %d days\n",
@@ -246,8 +253,10 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 			return
 		}
 		switch n := rng.Float64(); {
-		case n < 0.26:
+		case n < 0.22:
 			s.browse(ctx, rng)
+		case n < 0.26:
+			s.pageHistory(ctx, rng)
 		case n < 0.32:
 			s.trackOrder(ctx, rng)
 		case n < 0.34:
@@ -260,8 +269,12 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 			s.readRecentOrder(ctx, rng)
 		case n < 0.75:
 			s.orderHistory(ctx, rng)
-		case n < 0.90:
+		case n < 0.84:
 			if o, ok := s.placeOrder(ctx, rng, mine()); ok {
+				placed = append(placed, o)
+			}
+		case n < 0.90:
+			if o, ok := s.orderInTransaction(ctx, rng, mine()); ok {
 				placed = append(placed, o)
 			}
 		case n < 0.97:
@@ -352,6 +365,92 @@ func (s *shop) reuseReference(ctx context.Context, rng *rand.Rand) {
 		}
 		return err
 	})
+}
+
+// orderInTransaction is the same order placed the way a shop that cares about
+// consistency places it: the order and its event together, or neither.
+//
+// It opens with the read a shop does first, how many orders this customer has
+// already placed, which reaches back over a history that is mostly in the
+// archive. A transaction cannot read the archive, because reading one tier
+// inside the caller's snapshot and the other outside it is not a transaction
+// any more, so the router has to bring what the read matches up to the fast
+// tier and ask the driver to replay. Nothing else in this workload makes it do
+// that under load.
+//
+// Both collections are tiered here, so the two writes land in one transaction
+// across two namespaces the feeder mirrors separately.
+func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust string) (recentOrder, bool) {
+	sess, err := s.db.Client().StartSession()
+	if err != nil {
+		s.errs.Add(1)
+		return recentOrder{}, false
+	}
+	defer sess.EndSession(ctx)
+
+	at := time.Now()
+	id := idAt(at, rng.Intn(1<<20))
+	total := math.Round(float64(100+rng.Intn(9000))) / 100
+
+	committed := false
+	s.timed("place an order and its event in one transaction", func() error {
+		_, terr := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+			if _, err := s.orders.CountDocuments(sc, bson.D{{Key: "customer", Value: cust}}); err != nil {
+				return nil, err
+			}
+			if _, err := s.orders.InsertOne(sc, bson.D{
+				{Key: "_id", Value: id}, {Key: "customer", Value: cust}, {Key: "at", Value: at},
+				{Key: "ref", Value: "Ref" + strings.ToUpper(id.Hex()[14:])},
+				{Key: "channel", Value: "web"}, {Key: "currency", Value: "EUR"},
+				{Key: "lines", Value: bson.A{bson.D{
+					{Key: "sku", Value: fmt.Sprintf("s%04d", rng.Intn(s.nProducts))},
+					{Key: "qty", Value: 1}, {Key: "price", Value: total},
+				}}},
+				{Key: "total", Value: total}, {Key: "status", Value: "placed"},
+			}); err != nil {
+				return nil, err
+			}
+			_, err := s.events.InsertOne(sc, bson.D{
+				{Key: "order", Value: id}, {Key: "at", Value: at}, {Key: "kind", Value: "placed"},
+			})
+			return nil, err
+		})
+		if terr == nil {
+			committed = true
+		}
+		return terr
+	})
+	if !committed {
+		// Nothing of it must be there. A transaction that failed and left half
+		// of itself behind is the one thing a transaction promises not to do.
+		s.timed("a transaction that failed left nothing", func() error {
+			n, err := s.orders.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+			if err != nil {
+				return err
+			}
+			if n != 0 {
+				s.violation("a transaction that did not commit left its order behind: %s", id.Hex())
+			}
+			return nil
+		})
+		return recentOrder{}, false
+	}
+
+	s.timed("read back a transaction's order and its event", func() error {
+		o, err := s.orders.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+		if err != nil {
+			return err
+		}
+		e, err := s.events.CountDocuments(ctx, bson.D{{Key: "order", Value: id}})
+		if err != nil {
+			return err
+		}
+		if o != 1 || e < 1 {
+			s.violation("a committed transaction left %d orders and %d events for %s", o, e, id.Hex())
+		}
+		return nil
+	})
+	return recentOrder{id: id, cust: cust}, true
 }
 
 // cancelOrder is a customer cancelling, which is the delete this workload never
@@ -625,6 +724,80 @@ func (s *shop) orderHistory(ctx context.Context, rng *rand.Rand) {
 		}
 		return cur.Err()
 	})
+}
+
+// pageHistory is the order list a customer scrolls, read a page at a time, which
+// is how every list view in every shop works and is the one thing this workload
+// never did: it read ten and stopped.
+//
+// Paging is where a tiered system can be wrong in a way a single read cannot.
+// Each page is a separate query, decided separately, and between two of them the
+// evictor and warmer move documents across the tiers underneath. A document seen
+// on two pages is a duplicate the customer can see; one on neither is an order
+// that has vanished from their history.
+//
+// Over a stable slice on purpose: only orders placed before this run started,
+// sorted by _id, which nothing writes to. Concurrent inserts would shift the
+// pages under a skip and produce duplicates that are the pagination's fault
+// rather than the router's, and cancellations only ever remove orders this run
+// placed, which are all newer than the bound.
+func (s *shop) pageHistory(ctx context.Context, rng *rand.Rand) {
+	cust := fmt.Sprintf("c%06d", rng.Intn(s.nCustomers))
+	before := bson.D{
+		{Key: "customer", Value: cust},
+		{Key: "at", Value: bson.D{{Key: "$lt", Value: s.began}}},
+	}
+
+	var total int64
+	counted := false
+	s.timed("count the history a customer can scroll", func() error {
+		n, err := s.orders.CountDocuments(ctx, before)
+		if err != nil {
+			return err
+		}
+		total, counted = n, true
+		return nil
+	})
+	if !counted || total == 0 {
+		return
+	}
+
+	const page = 7
+	seen := map[string]bool{}
+	var read int64
+	s.timed("scroll a customer's history a page at a time", func() error {
+		for skip := int64(0); skip < total; skip += page {
+			cur, err := s.orders.Find(ctx, before, options.Find().
+				SetSort(bson.D{{Key: "_id", Value: 1}}).
+				SetSkip(skip).SetLimit(page))
+			if err != nil {
+				return err
+			}
+			for cur.Next(ctx) {
+				var o struct {
+					ID bson.ObjectID `bson:"_id"`
+				}
+				if err := cur.Decode(&o); err != nil {
+					_ = cur.Close(ctx)
+					return err
+				}
+				if seen[o.ID.Hex()] {
+					s.violation("order %s appeared on two pages of %s's history", o.ID.Hex(), cust)
+				}
+				seen[o.ID.Hex()] = true
+				read++
+			}
+			if err := cur.Err(); err != nil {
+				_ = cur.Close(ctx)
+				return err
+			}
+			_ = cur.Close(ctx)
+		}
+		return nil
+	})
+	if read != total {
+		s.violation("scrolling %s's history saw %d orders where the count says %d", cust, read, total)
+	}
 }
 
 // readRecentOrder reads one order, weighted towards recent ones the way a real

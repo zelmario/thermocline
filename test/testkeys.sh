@@ -322,6 +322,42 @@ chk "the freed value can be taken"    "ok"      "$(R 'try{db.getSiblingDB(proces
 chk "the value it moved to is now held" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkfree.insertOne({_id:3,email:"b@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "rewriting a field to its own value works" "1" "$(R 'print(db.getSiblingDB(process.env.TC_DB).tkfree.updateOne({_id:1},{$set:{email:"b@x.com",seen:1}}).modifiedCount)')"
 
+echo "== a key a deleted document held must become reusable =="
+# The other way a value stops being held, and the one an application reaches by
+# cancelling something. The helper at the top of this file says a delete through
+# the router tombstones the archive copy "which frees the key correctly", and
+# avoids that path on purpose so the eviction case can be tested. Nothing then
+# checked the sentence.
+#
+# It matters because a claim is permanent by design: evicting a document takes
+# its index entry off the fast tier and the claim is what remembers the value
+# was taken. A delete has to be told apart from that, or a cancelled order's
+# reference is refused for ever and the registry is the only thing that knows.
+fresh tkdel '{ref:1}'
+R "db.getSiblingDB(process.env.TC_DB).tkdel.insertOne({_id:1,ref:'Ref000001'})" >/dev/null
+waitMirrored tkdel 1
+# Archive-only, so the fast tier's own index cannot see the holder and the
+# registry is what refuses the next one.
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tkdel.deleteOne({_id:1})"
+chk "the archive holds it and the fast tier does not" "1/0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tkdel.countDocuments({ref:'Ref000001',_tcDeletedAt:{\$exists:false}}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).tkdel.countDocuments({ref:'Ref000001'}))")"
+chk "a second document cannot take it while it is held" "11000" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tkdel.insertOne({_id:2,ref:'Ref000001'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
+# The application cancels it. This goes through the router, which marks the
+# archive's copy deleted rather than removing it.
+R "db.getSiblingDB(process.env.TC_DB).tkdel.deleteOne({_id:1})" >/dev/null
+sleep 2
+chk "  and afterwards no live copy holds it"      "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tkdel.countDocuments({ref:'Ref000001',_tcDeletedAt:{\$exists:false}}))")"
+chk "  while the claim row is still there, on purpose" "true" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.tkdel'}) > 0)")"
+chk "the reference can be issued again"           "ok" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tkdel.insertOne({_id:3,ref:'Ref000001'});print('ok')}catch(e){print(e.code||e.message.substring(0,40))}")"
+# And it is still a unique index afterwards, so this is not a claim that was
+# simply forgotten.
+chk "  and a fourth document is refused it"       "11000" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).tkdel.insertOne({_id:4,ref:'Ref000001'});print('ACCEPTED')}catch(e){print(e.code||e.message.substring(0,40))}")"
+
 echo "== a statement whose collation is why its filter matches =="
 # The registry claims the key every document a statement will end up with, and
 # to know which documents those are it reads them from the fast tier with the

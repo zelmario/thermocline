@@ -181,6 +181,9 @@ feeder:
     # whatever produced it.
     - "shop.tevneg"
     - "shop.tkfree"
+    # testkeys.sh: the key a deleted document held, which is the other way a
+    # value stops being held and the one a cancellation reaches.
+    - "shop.tkdel"
     - "shop.tkcomp"
     - "shop.tknull"
     - "shop.tklate"
