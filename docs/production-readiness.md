@@ -36,6 +36,55 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Host suites after it | 310 checks, 0 failed |
 | Two applications through one router, 30 minutes, after the day's changes | 474,588 commands, 0 refused, 0 stale reads, 0 duplicate keys, 0 panics |
 | A router restarted under both of them writing | stopped in 1s, ready in 1.0-1.1s, every error a refused connection and no invariant broken |
+| In-node suites, 2026-09-23, after the collation audit and the residency fix | 1,990 checks, 0 failed, 32 minutes |
+| The same with the query cache on | 1,975 checks, 0 failed |
+| Host suites, 12 of them | 322 checks, 0 failed |
+| Two applications through one router, 30 minutes, with a change stream consumer tailing | 8,375 commands, 1,440 copy-ups, 0 phantom events, 0 violations |
+| The fuzzer with pipelines that write their answer down | 489 compared, 0 disagreed |
+
+## What the last two days found, and what that says
+
+Eight defects on 2026-09-22 and 23, all measured against an untiered mongod and
+all fixed. **Five were silent wrong answers to an application**, and two of
+those wrote or deleted the wrong record:
+
+| | |
+|---|---|
+| a sorted single-document write acted on the wrong document | wrong record |
+| a collated update created a duplicate unique key across tiers | wrong record |
+| `$out` and `$merge` persisted a wrong `$group` | written down |
+| a transaction's read answered short, with no error | short answer |
+| a write could not see what a read of the same filter could | short answer |
+| a copy-up reached a change stream as an order nobody placed | phantom event |
+| a collated unique index refused writes mongod accepts | false refusal |
+| the cache held answers nothing could tell it had changed | stale answer |
+
+That is not a flattering number and it belongs here rather than in a commit
+message nobody re-reads.
+
+**The reading that cuts the other way.** Six of the eight came from one question
+asked systematically: does a query this router builds against the other tier
+reproduce the comparison mongod already made? A collation arrives two ways and
+only the explicit one travels with the command, so the read path had been right
+since it was written and the write paths never were. That audit is finished and
+its boundaries are written down in `docs/router.md`, including the two places
+that must **not** carry a collation, `_id` and `files_id`. It was not a random
+sample of unknown territory.
+
+**What they say about the tests, which is the actionable part.** Every one was
+reachable only because the workload gained something an ordinary application
+does and this one did not: a case-insensitive unique index on the collection
+that actually gets evicted, deletes, fields that half the history predates,
+paging, a transaction spanning two mirrored namespaces, and a consumer tailing a
+change stream while the tiers moved underneath. Before that, every question the
+shop asked had an answer that depended on a *value*, never on a comparison, an
+ordering, or an event.
+
+The eighth is the clearest case. A shop's search indexer tails its orders all
+day; nothing here did, and within one run a copy-up arrived as an order nobody
+placed. The gap was in what the tests **do**, not in how many checks they run,
+and that is worth more to the two items still open below than another thousand
+assertions would be.
 
 ## What is accepted, and needs no work
 
