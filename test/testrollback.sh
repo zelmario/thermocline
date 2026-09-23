@@ -82,10 +82,16 @@ chk "the fast tier no longer holds it all"     "true" \
     "$(python3 -c "print('true' if $(H "print(db.getSiblingDB('$SHOP').orders.countDocuments({}))") < $(C "print(db.getSiblingDB('$SHOP').orders.countDocuments({_tcDeletedAt:{\$exists:false}}))") else 'false')" 2>/dev/null)"
 
 echo "== the application cancels some orders =="
-# The store never deletes, and a delete is the one thing that makes the archive
-# differ from what the application was told: it is mirrored as a mark, not a
-# removal. Without one this rehearsal would not touch the reason rollback needs
-# a step at all.
+# A delete is the one thing that makes the archive differ from what the
+# application was told: it is mirrored as a mark, not a removal. Without one
+# this rehearsal would not touch the reason rollback needs a step at all.
+#
+# The shop cancels orders of its own now, so the marks this section makes are
+# not the only ones there. Counted rather than assumed: this said "the store
+# never deletes" and expected exactly CANCEL marks, and when the workload gained
+# cancellations it reported 58 where it wanted 40, which reads as rollback
+# clearing too much rather than as the fixture having moved.
+MARKSBEFORE=$(C "print(db.getSiblingDB('$SHOP').orders.countDocuments({_tcDeletedAt:{\$exists:true}}))")
 CANCELLED=$(R "const c=db.getSiblingDB('$SHOP').orders;
   const ids = c.find({}, {_id:1}).limit($CANCEL).toArray().map(d=>d._id);
   print(c.deleteMany({_id:{\$in:ids}}).deletedCount)")
@@ -96,7 +102,7 @@ chk "and the router answers without them"      "true" "$([ "$SAW" -gt 0 ] 2>/dev
 # The state that makes rollback necessary: the archive physically holds more
 # than the application was ever shown.
 RAW=$(C "print(db.getSiblingDB('$SHOP').orders.countDocuments({}))")
-chk "while the archive still holds the marks"  "$((SAW + CANCEL))" "$RAW"
+chk "while the archive still holds the marks"  "$((SAW + CANCEL + MARKSBEFORE))" "$RAW"
 
 echo "== stop everything, then clear the marks =="
 # The documented order. A delete that reaches the archive after the clear writes
@@ -124,9 +130,9 @@ for _ in $(seq 1 40); do
 done
 [ "$SAFE" = "yes" ] || echo "  WARN  the feeder still looks like it is publishing, so the clear will refuse"
 COUNTED=$(N "cline rollback --config $CFG --ns $SHOP.orders" 2>&1 | grep -oE '[0-9]+ marked deleted' | grep -oE '^[0-9]+')
-chk "rollback counts exactly what was deleted" "$CANCEL" "$COUNTED"
+chk "rollback counts exactly what was deleted" "$((CANCEL + MARKSBEFORE))" "$COUNTED"
 CLEARED=$(N "cline rollback --config $CFG --ns $SHOP.orders --clear" 2>&1 | grep -oE 'cleared [0-9]+' | grep -oE '[0-9]+')
-chk "and clears them"                          "$CANCEL" "$CLEARED"
+chk "and clears them"                          "$((CANCEL + MARKSBEFORE))" "$CLEARED"
 
 echo "== the archive is now what the application was told =="
 # The claim the whole procedure rests on, and the only one that matters to
