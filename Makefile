@@ -4,7 +4,7 @@ NODE    ?= thermocline-zelmar-node0
 HOT_PORT  := 28017
 COLD_PORT := 28018
 
-.PHONY: build test check race fmt clean dev dev-down dev-status install check-installed
+.PHONY: build store test check race fmt clean dev dev-down dev-status install check-installed
 
 # CGO_ENABLED=0 because the binary is built here and run in the test containers,
 # which carry an older glibc. A dynamically linked build fails there at exec with
@@ -18,6 +18,19 @@ build:
 	@mkdir -p bin
 	CGO_ENABLED=0 go build -buildvcs=false -o $(BIN) ./cmd/cline
 	@echo "built $(BIN)"
+
+## store builds the shop the host-side suites drive.
+##
+## It needs CGO_ENABLED=0 for the same reason `build` does, and getting it wrong
+## costs more here, because nothing downstream says so. testrollback copies this
+## into the node and runs the seed with output suppressed, so a binary that
+## cannot exec there leaves an empty fixture: on 2026-09-24 a plain
+## `go build -o bin/store` produced ten failures reading as rollback clearing
+## more than it should, when nothing had been seeded at all.
+store:
+	@mkdir -p bin
+	CGO_ENABLED=0 go build -buildvcs=false -o bin/store ./test/store
+	@echo "built bin/store"
 
 ## install puts this working tree's binary where the suites look for it.
 ##

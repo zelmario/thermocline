@@ -72,7 +72,20 @@ haveImage() { docker image inspect "$1" >/dev/null 2>&1; }
 why() {
   case $1 in
     testrollback)
-      [ -x bin/store ] || { echo "bin/store is not built: go build -o bin/store ./test/store"; return; }
+      # `make store`, not `go build`: this binary runs inside the node, whose
+      # glibc is older than the host's, and a dynamically linked one fails at
+      # exec there with a GLIBC version error. testrollback seeds with its
+      # output suppressed, so that failure arrives as an empty fixture and ten
+      # checks reading as rollback clearing more than it should. It cost a run
+      # on 2026-09-24, from the command this line used to print.
+      [ -x bin/store ] || { echo "bin/store is not built: make store"; return; }
+      # Asked of the binary rather than by running it in the node, because this
+      # function decides whether a suite can run and should not be copying
+      # files to do it, and because the answer is the same with the node down.
+      # CGO_ENABLED is recorded in the build settings, which is how
+      # check-installed tells two builds of one commit apart.
+      go version -m bin/store 2>/dev/null | grep -q 'CGO_ENABLED=0' ||
+        { echo "bin/store is linked against this host's glibc and cannot exec in $NODE, so the seed would leave an empty fixture: make store"; return; }
       [ -x bin/cline ] || echo "bin/cline is not built: make build" ;;
     testfailover|testchaos)
       docker inspect -f '{{.State.Running}}' "$NODE" 2>/dev/null | grep -q true \
