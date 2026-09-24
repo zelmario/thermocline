@@ -131,6 +131,32 @@ for _ in $(seq 1 300); do
 done
 [ "$lag" -lt 5 ] 2>/dev/null || { echo "  FATAL mirroring is ${lag}s behind, so the archive cannot answer for the past"; exit 2; }
 echo "  mirroring is ${lag}s behind, which is the bar this waited for"
+
+# And the feeder's published position, which is a different collection and the
+# one the router actually gates on.
+#
+# The wait above reads checkpoints, which says how far the feeder has processed.
+# The router's freshness barrier reads positions, which says mirroring is alive.
+# Waiting on the first and starting the shops proves nothing about the second,
+# and when the position had not landed yet the router logged "mirroring has
+# published no position at all", gave up waiting and answered from the archive.
+# The shops then reported a cancelled order coming back and counts that did not
+# move: this workload's own writes, read before mirroring could account for
+# them, arriving as violations of the system.
+#
+# Measured on 2026-09-24: nine violations in one shop and eight in the other,
+# every one of them stamped with the same instant, 21 seconds after the feeder
+# started and with no error in its log.
+pos=9999
+for _ in $(seq 1 120); do
+  pos=$(docker exec "$NODE" mongosh "$COLD" --quiet --eval \
+    'const p=db.getSiblingDB("_thermocline_two").positions.findOne({_id:"two"});
+     print(p && p.savedAt ? Math.round((Date.now()-p.savedAt.getTime())/1000) : 9999)' 2>/dev/null | tail -1)
+  [ "$pos" -lt 5 ] 2>/dev/null && break
+  sleep 1
+done
+[ "$pos" -lt 5 ] 2>/dev/null || { echo "  FATAL the feeder has published no position, so every fall-through read starts stale"; exit 2; }
+echo "  the feeder published its position ${pos}s ago, which is what the router's barrier reads"
 # Printed as information, and the two numbers are allowed to differ. The bar
 # above is the feeder's own position, so up to that many seconds of the seed can
 # still be in flight when these are read. Sitting under a line that says
@@ -176,16 +202,66 @@ docker cp /tmp/two_churn.sh "$NODE":/root/two_churn.sh >/dev/null
 N "touch /root/two_churn.run"
 ND "bash /root/two_churn.sh"
 
+# A second application with credentials of its own.
+#
+# Both shops have always connected as dba, a superuser on both tiers, so this
+# workload had never once run as the kind of account an application actually
+# gets. What that leaves untested is the decision the router makes on every
+# read: a fall-through is served on the router's OWN archive connection, not the
+# client's, so "the archive answered it" must never quietly become "the archive
+# answered it for a client that could not have asked".
+#
+# The account is made on the fast tier because that is where the router sends
+# the authentication conversation with terminate_auth off. With it on the router
+# verifies against the same stored keys and loads this user's privileges to
+# check each command against, so TERMINATE_AUTH=1 runs the whole workload
+# through the router's own authorisation as a non-superuser, which nothing else
+# here does.
+SHOPB_USER=${SHOPB_USER:-shopb_app}
+SHOPB_PW=${SHOPB_PW:-shopbpw}
+docker exec "$NODE" mongosh "$HOT" --quiet --eval "
+  const a = db.getSiblingDB('admin');
+  try { a.dropUser('$SHOPB_USER') } catch (e) {}
+  a.createUser({user:'$SHOPB_USER', pwd:'$SHOPB_PW',
+                roles:[{role:'readWrite', db:'shopB'}]})" >/dev/null 2>&1
+SHOPB_URI="mongodb://$SHOPB_USER:$SHOPB_PW@127.0.0.1:27600/?authSource=admin"
+
+# Credentials that stop nothing are not credentials, and a run where the second
+# application silently kept superuser rights would pass every check below while
+# testing nothing new. Asked before the shops start, so it fails in a second
+# rather than after the run.
+AUTHFAIL=0
+ownread=$(docker exec "$NODE" mongosh "$SHOPB_URI" --quiet --eval "
+  try { db.getSiblingDB('shopB').orders.findOne({}); print('allowed') }
+  catch (e) { print('refused:' + e.codeName) }" 2>&1 | tail -1)
+crossread=$(docker exec "$NODE" mongosh "$SHOPB_URI" --quiet --eval "
+  try { db.getSiblingDB('shopA').orders.findOne({}); print('allowed') }
+  catch (e) { print(e.codeName == 'Unauthorized' ? 'refused' : 'other:' + e.codeName) }" 2>&1 | tail -1)
+echo "  shopB's own account on shopB: $ownread, on shopA: $crossread"
+if [ "$ownread" != "allowed" ]; then
+  echo "  FATAL shopB's account cannot read its own database, so the run below would prove nothing"
+  AUTHFAIL=1
+fi
+if [ "$crossread" != "refused" ]; then
+  echo "  FAIL shopB's account could read shopA through the router"
+  AUTHFAIL=1
+fi
+
 echo "== both shops open at once =="
 # The store exits non-zero when it notices something wrong, so the exit codes
 # are the result and the output is the explanation.
 pids=()
 for shop in shopA shopB; do
-  docker exec "$NODE" bash -c "store -uri '$ROUTER' -db $shop $RUNARG -conc $CONC -skip-seed \
+  # shopA stays dba and shopB runs as itself, so one run covers both the
+  # superuser path everything here has always used and the least-privilege one
+  # an application is actually given.
+  uri=$ROUTER
+  [ "$shop" = shopB ] && uri=$SHOPB_URI
+  docker exec "$NODE" bash -c "store -uri '$uri' -db $shop $RUNARG -conc $CONC -skip-seed \
       -snapshot http://127.0.0.1:27610/api/snapshot > /root/twolog/$shop.out 2>&1" &
   pids+=($!)
 done
-rc=0
+rc=$AUTHFAIL
 for p in "${pids[@]}"; do wait "$p" || rc=1; done
 N "rm -f /root/two_churn.run"
 
