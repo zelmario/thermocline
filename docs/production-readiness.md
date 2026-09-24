@@ -86,6 +86,32 @@ placed. The gap was in what the tests **do**, not in how many checks they run,
 and that is worth more to the two items still open below than another thousand
 assertions would be.
 
+## 2026-09-24: the ninth, and it was the procedure again
+
+The rehearsal that had never been run to the end ran to the end, and the
+application repointed at the archive accepted three duplicate order references
+in sixty rounds.
+
+Nothing copies an index to the archive, on purpose, and that reasoning is sound
+while the router is in front of it. Rollback takes the router away. Uniqueness
+across the tiers is enforced by the key registry, which lives on the fast tier
+this procedure switches off, so the constraint the application declared was
+enforced by nothing and MongoDB reported each duplicate as an ordinary
+successful insert. `cline rollback` named the accounts, the views and the
+collections the archive had never held, and said nothing about the indexes.
+
+It names them now, constraints listed separately from optimisations, with the
+`createIndex` calls and the collation carried along, and the rehearsal runs
+those commands rather than reading them: `test/testrollback.sh`, 22 checks.
+
+**Why it is here and not in the table above.** It is the same shape as the
+catalogue defect of 2026-09-03 and it was found the same way, by walking the
+procedure rather than testing the command. Both were reachable only once the
+shop declared a constraint of its own, which is the point already made above
+about what the tests *do*. This is the second thing the rollback procedure lost
+that the rollback command was happy about, and that is the number worth
+watching: two of the four walked procedures have now been short twice.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

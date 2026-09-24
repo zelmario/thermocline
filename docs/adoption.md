@@ -249,6 +249,38 @@ to copy them across, and it no longer calls the archive ready while anything is
 listed above. Rehearsed end to end after that: the same shop runs against the
 archive with no errors and none of its five invariants broken.
 
+**The third thing in the way is the indexes, and one of them is a constraint.**
+Nothing copies an index to the archive, on purpose: an index describes the whole
+collection, and carrying every one of them on the cheap tier gives back most of
+what tiering buys. That reasoning holds while the router is in front of the
+archive. This procedure takes the router away, and then those are the
+application's own indexes and they are gone.
+
+A plain index costs speed, and the archive is the tier with the most documents
+in it. A **unique** index is not a speed matter. Uniqueness across the tiers is
+enforced by the key registry, which lives on the **fast tier** that this
+procedure switches off, so after the cutover the constraint the application
+declared is enforced by nothing at all and the next duplicate is accepted by a
+cluster that looks healthy.
+
+Measured on 2026-09-24, the rehearsal repointed at an archive holding `_id_` and
+nothing else: three duplicate order references accepted in sixty rounds, on a
+collection whose fast tier copy carries `{ref: 1}` unique with a case-insensitive
+collation.
+
+`cline rollback` lists them now, constraints separately from the rest, with the
+`createIndex` calls to build them and the collation and partial filter carried
+along. Build the unique ones **before any application writes**. A build that
+fails is naming two documents that already share a value, which is a duplicate
+the constraint was supposed to prevent and did not, because the registry
+protects the values it knows about and an adoption's history predates it: settle
+those documents before the cutover rather than after.
+
+A TTL index is listed and deliberately not turned into a command. The archive
+holds history the fast tier stopped holding, and expiring it on the schedule the
+application set for a collection that was only ever recent is a decision about
+retention, not a step in a rollback.
+
 **13. Run more than one router by naming them all, not by hiding them.** A read
 the fast tier cannot answer is served from a cursor the router owns in its own
 memory, holding an open connection to the archive, so it cannot be shared with

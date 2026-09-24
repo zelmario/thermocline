@@ -99,7 +99,7 @@ func runRollback(args []string) error {
 	// is the half an operator cannot fix afterwards: an application repointed at
 	// an archive without its accounts cannot log in at all, and MongoDB answers
 	// that with an ordinary authentication failure naming nothing.
-	gaps := reportArchiveGaps(ctx, cfg, log)
+	gaps := reportArchiveGaps(ctx, cfg, namespaces, log)
 
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
 	if *clear && alive && !*force {
@@ -287,7 +287,7 @@ func archiveNamespaces(ctx context.Context, cold *mongo.Client) ([]string, error
 //
 // Best effort throughout. This runs during an incident, the fast tier may be the
 // thing that is broken, and a rollback must not depend on it being reachable.
-func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger) bool {
+func reportArchiveGaps(ctx context.Context, cfg config.Config, namespaces []string, log *slog.Logger) bool {
 	hot, err := connect(ctx, cfg.Hot.URI, "hot")
 	if err != nil {
 		fmt.Printf("Could not reach the fast tier to compare it: %v\n", err)
@@ -305,7 +305,15 @@ func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger)
 	users := missingAccounts(ctx, hot, cold)
 	views := missingViews(ctx, hot, cold)
 	colls := missingCollections(ctx, hot, cold)
-	if len(users) == 0 && len(views) == 0 && len(colls) == 0 {
+	// The collections the archive has never held are not asked about again for
+	// their indexes: they are named below on their own line, and an index gap
+	// under a collection that is wholly missing reads as two problems.
+	absent := map[string]bool{}
+	for _, ns := range colls {
+		absent[ns] = true
+	}
+	idx := missingIndexes(ctx, hot, cold, namespaces, absent)
+	if len(users) == 0 && len(views) == 0 && len(colls) == 0 && len(idx) == 0 {
 		return false
 	}
 
@@ -328,6 +336,9 @@ func reportArchiveGaps(ctx context.Context, cfg config.Config, log *slog.Logger)
 		fmt.Println("               Copy them across first:")
 		fmt.Println("                 mongodump --uri=<hot> --db=DB --collection=COLL -o /tmp/back")
 		fmt.Println("                 mongorestore --uri=<cold> /tmp/back")
+	}
+	if len(idx) > 0 {
+		printIndexGaps(idx)
 	}
 	fmt.Println()
 	return true
@@ -525,4 +536,222 @@ func viewsIn(ctx context.Context, client *mongo.Client) (map[string]bool, error)
 		}
 	}
 	return out, nil
+}
+
+// indexGap is one tiered collection's indexes that an application repointed at
+// the archive would not have.
+//
+// Two lists rather than one, because "the archive does not have it" and "the
+// archive has one that does not enforce the same thing" are different states
+// with the same consequence, and only the first is visible to a comparison that
+// matches on names and keys. See lostUniqueConstraints in indexes.go, which is
+// this question asked in the other direction and was wrong in exactly this way
+// before anybody tabulated both sides.
+type indexGap struct {
+	ns      string
+	missing []indexInfo // no counterpart on the archive at all
+	weaker  []indexInfo // a counterpart exists and does not enforce the same constraint
+}
+
+// missingIndexes compares the two tiers' indexes for the collections that tier.
+//
+// `cline indexes` already answers this question and answers it for a different
+// purpose: while the router is in front, an index the archive lacks is a
+// fall-through read that scans, and its unique flag is deliberately not carried
+// across because the key registry enforces uniqueness between the tiers and a
+// unique index on the archive can refuse a write the feeder has to make.
+//
+// Rollback is the one case where that reasoning inverts. The router is being
+// taken away and the key registry lives on the fast tier, so after the cutover
+// a constraint the application declared is enforced by nothing at all, and the
+// next duplicate is accepted silently by a cluster that looks healthy.
+//
+// Measured on the shop, 2026-09-24, and it is the reason this exists: the
+// rehearsal ended with the application running against the archive and three
+// duplicate order references accepted, on a collection whose fast tier copy
+// carries {ref: 1} unique with a case-insensitive collation. The archive held
+// _id_ and nothing else. Twelve of the shop's own checks passed and the
+// constraint was gone.
+//
+// Collections the archive has never held are left out: they are reported above
+// as collections, and an index on a collection that is not there is noise under
+// a line that already says the whole thing is missing.
+func missingIndexes(ctx context.Context, hot, cold *mongo.Client, namespaces []string, absent map[string]bool) []indexGap {
+	var out []indexGap
+	for _, ns := range namespaces {
+		if absent[ns] {
+			continue
+		}
+		db, coll := splitNS(ns)
+		if db == "" || coll == "" {
+			continue
+		}
+		h, err := indexesOf(ctx, hot, db, coll)
+		if err != nil {
+			continue
+		}
+		c, err := indexesOf(ctx, cold, db, coll)
+		if err != nil {
+			continue
+		}
+		gap := indexGapFor(ns, h, c)
+		if len(gap.missing) > 0 || len(gap.weaker) > 0 {
+			out = append(out, gap)
+		}
+	}
+	return out
+}
+
+// indexGapFor compares one collection's two listings.
+//
+// Split out from missingIndexes so that the comparison a test can reach is the
+// comparison the command makes. A test that rebuilds this loop over its own
+// fixtures asserts that the fixture agrees with itself.
+func indexGapFor(ns string, hot, cold map[string]indexInfo) indexGap {
+	gap := indexGap{ns: ns}
+	gap.missing = append(gap.missing, absentFrom(hot, cold)...)
+	// The other half of the same question. An index the archive carries under
+	// the same name and keys with unique gone enforces nothing, and absentFrom
+	// calls it present.
+	for _, f := range hot {
+		if f.name == "_id_" || !f.unique {
+			continue
+		}
+		a, ok := counterpartOf(f, cold)
+		if !ok {
+			continue // Already in missing, above.
+		}
+		if !a.enforcesSameAs(f) {
+			gap.weaker = append(gap.weaker, f)
+		}
+	}
+	sort.Slice(gap.missing, func(i, j int) bool { return gap.missing[i].name < gap.missing[j].name })
+	sort.Slice(gap.weaker, func(i, j int) bool { return gap.weaker[i].name < gap.weaker[j].name })
+	return gap
+}
+
+// printIndexGaps says what the application loses and what to run to get it back.
+//
+// Constraints first and separately from the rest. An index that is only an
+// optimisation costs the application speed and the operator can measure it
+// afterwards; a unique index is a guarantee the application was written to rely
+// on, and nothing measures its absence until two customers are tracking one
+// parcel. They are the same object to MongoDB and they are not the same risk,
+// so they are not printed in one list.
+//
+// Sorted into the three buckets once and printed from them, rather than
+// counted by one rule and printed by another. The first version of this counted
+// a unique TTL index as expiring and emitted a createIndex for it under
+// constraints, so the number at the top and the list below it described
+// different sets. See [[count-the-list-in-the-prose]]: a count is a claim about
+// the list under it.
+func printIndexGaps(gaps []indexGap) {
+	type placed struct {
+		ns string
+		ix indexInfo
+	}
+	var constraints, plain, expiring []placed
+	for _, g := range gaps {
+		// A TTL index goes to the expiring list whatever else it is. It is the
+		// one kind whose remedy is a decision rather than a command, and a
+		// unique one is still an index whose job is to delete the history the
+		// archive exists to keep.
+		for _, m := range g.weaker {
+			if m.ttl {
+				expiring = append(expiring, placed{g.ns, m})
+				continue
+			}
+			constraints = append(constraints, placed{g.ns, m})
+		}
+		for _, m := range g.missing {
+			switch {
+			case m.ttl:
+				expiring = append(expiring, placed{g.ns, m})
+			case m.unique:
+				constraints = append(constraints, placed{g.ns, m})
+			default:
+				plain = append(plain, placed{g.ns, m})
+			}
+		}
+	}
+
+	fmt.Printf("  indexes   %d the archive does not have, on collections that do tier.\n",
+		len(constraints)+len(plain)+len(expiring))
+	fmt.Println("            Nothing copies an index to the archive, which is right while the")
+	fmt.Println("            router is in front of it and is not once it is taken away: after")
+	fmt.Println("            the cutover these are the application's own indexes, gone.")
+
+	if len(constraints) > 0 {
+		fmt.Printf("\n  %d of them are unique, which is a constraint and not a speed matter.\n", len(constraints))
+		fmt.Print(`  Uniqueness across the tiers is enforced by the key registry on the FAST TIER,
+  which this procedure switches off. Recreate these before any application
+  writes, or the first duplicate is accepted by a cluster that looks healthy.
+
+`)
+		for _, p := range constraints {
+			db, coll := splitNamespace(p.ns)
+			fmt.Printf("    db.getSiblingDB(%q).%s.createIndex(%s, %s)\n",
+				db, coll, p.ix.keyJSON, createOptions(p.ix))
+		}
+		fmt.Print(`
+  A build that fails names two documents already sharing a value. That is a
+  duplicate the constraint was supposed to prevent and did not, because the
+  registry protects values it knows about and an adoption's history predates it.
+  Settle those documents before the cutover, not afterwards.
+`)
+	}
+
+	if len(plain) > 0 {
+		fmt.Printf("\n  %d are plain indexes. The application's queries ran with them and will\n", len(plain))
+		fmt.Println("  scan the archive without them, on the tier that holds the most documents.")
+		fmt.Print("\n")
+		for _, p := range plain {
+			db, coll := splitNamespace(p.ns)
+			fmt.Printf("    db.getSiblingDB(%q).%s.createIndex(%s, %s)\n",
+				db, coll, p.ix.keyJSON, createOptions(p.ix))
+		}
+	}
+
+	if len(expiring) > 0 {
+		fmt.Printf("\n  %d expire documents, and copying one across is a decision rather than a\n", len(expiring))
+		fmt.Print(`  step. The archive holds history the fast tier stopped holding, and a TTL
+  index built there deletes it on the schedule the application set for a
+  collection that was only ever recent. Decide what that retention should mean
+  for the whole history before building it, and nothing reports what it removes.
+
+`)
+		for _, p := range expiring {
+			db, coll := splitNamespace(p.ns)
+			fmt.Printf("    %s.%s  %s  expireAfterSeconds: %g\n", db, coll, p.ix.spec, p.ix.ttlSecs)
+		}
+	}
+}
+
+// createOptions writes one index's options the way createIndex takes them back.
+//
+// unique is carried here and is deliberately left off by printCreateCommands in
+// indexes.go. The same index, the same two tiers, opposite answers, because the
+// question is different: that one is arming an archive that a router still
+// fronts, where a unique index can refuse a write the feeder must make, and this
+// one is handing the archive to the application as its only cluster.
+//
+// partialFilterExpression, collation and sparse come along for the reason they
+// do there: they say which documents the constraint covers and which values it
+// treats as the same, and an index built without them enforces something the
+// application never asked for.
+func createOptions(m indexInfo) string {
+	opts := fmt.Sprintf("{name: %q", m.name)
+	if m.unique {
+		opts += ", unique: true"
+	}
+	if m.sparse {
+		opts += ", sparse: true"
+	}
+	if m.partial != "" {
+		opts += ", partialFilterExpression: " + m.partial
+	}
+	if m.collation != "" {
+		opts += ", collation: " + m.collation
+	}
+	return opts + "}"
 }

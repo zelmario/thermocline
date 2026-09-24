@@ -26,6 +26,7 @@ CANCEL=${CANCEL:-40}
 HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
 COLD='mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'
 ROUTER='mongodb://dba:secret@127.0.0.1:27600/?authSource=admin'
+TMPJS=$(mktemp /tmp/rbidx.XXXXXX.js)
 PASS=0; FAIL=0; declare -a FAILED
 chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-52s %s\n' "$1" "$3"
@@ -49,7 +50,7 @@ R() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval "$1" 2>&1 | tail -1; 
 routerUp() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 H() { docker exec "$NODE" mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { docker exec "$NODE" mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
-stopAll() { N "for p in \$(pgrep -f 'config /root/tw[o]'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1; }
+stopAll() { N "for p in \$(pgrep -f 'config /root/tw[o]'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1; rm -f "$TMPJS"; }
 trap stopAll EXIT
 
 echo "== a shop running on the tiers =="
@@ -169,6 +170,49 @@ N "rm -rf /root/rbdump && mongodump --uri='$HOT' --db $SHOP --collection custome
    mongorestore --uri='$COLD' /root/rbdump --quiet" >/dev/null 2>&1
 chk "the archive has the catalogue now"        "true" \
     "$([ "$(C "print(db.getSiblingDB('$SHOP').products.countDocuments({}))")" -gt 0 ] 2>/dev/null && echo true || echo false)"
+
+echo "== and the indexes the application declared =="
+# The half the 2026-09-03 rehearsal could not reach, because the shop had no
+# constraint of its own then and every question it asked had an answer that
+# depended on a value.
+#
+# Nothing copies an index to the archive, on purpose, and that reasoning holds
+# only while the router is in front of it. This procedure takes the router away.
+# Uniqueness across the tiers is enforced by the key registry on the fast tier,
+# so after the cutover a constraint the application declared is enforced by
+# nothing, and MongoDB reports that as an ordinary successful insert.
+#
+# Measured on 2026-09-24 before rollback said anything about it: the shop
+# repointed at the archive accepted three duplicate order references, and the
+# nine violations it reported were that one cause twice over, because it takes
+# the duplicate back out and the change stream consumer then sees an order
+# placed and cancelled that nobody placed or cancelled.
+IDX=$(N "cline rollback --config $CFG --ns $SHOP.orders" 2>&1)
+chk "rollback names the unique index"          "true" \
+    "$(grep -q 'ref_1' <<<"$IDX" && echo true || echo false)"
+chk "and says it is a constraint"              "true" \
+    "$(grep -q 'unique, which is a constraint' <<<"$IDX" && echo true || echo false)"
+
+# Run what it prints, rather than reading it. A createIndex carrying a collation
+# copied out of listIndexes is the shape mongod has refused to read back before,
+# and grepping the output proves only that the text looks right.
+CMDS=$(grep -E '^[[:space:]]+db\.getSiblingDB' <<<"$IDX")
+chk "and prints a command for every one"       "true" \
+    "$([ "$(grep -c . <<<"$CMDS")" -ge 4 ] 2>/dev/null && echo true || echo false)"
+printf '%s\n' "$CMDS" > "$TMPJS"
+docker cp "$TMPJS" "$NODE":/root/rbidx.js >/dev/null
+N "mongosh '$COLD' --quiet --file /root/rbidx.js" >/dev/null 2>&1
+chk "the commands it prints build the index"   "true" \
+    "$(C "print(db.getSiblingDB('$SHOP').orders.getIndexes().some(i=>i.name=='ref_1'&&i.unique))")"
+
+# The constraint itself, asked of the archive directly, because an index that
+# exists and an index that refuses are different claims.
+DUP=$(C "const c=db.getSiblingDB('$SHOP').orders;
+  const one=c.findOne({ref:{\$exists:true}});
+  if(!one){print('no-ref')}else{
+    try{c.insertOne({_id:new ObjectId(),customer:'c000000',at:new Date(),ref:one.ref.toUpperCase(),lines:[],total:0,status:'placed'});print('accepted')}
+    catch(e){print(e.code==11000?'refused':'other:'+e.code)}}")
+chk "and the archive now refuses a duplicate"  "refused" "$DUP"
 
 echo "== and the application keeps working on it =="
 # Repointed: the same shop, the same invariants, against a cluster that has
