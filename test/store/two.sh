@@ -195,6 +195,28 @@ for shop in shopA shopB; do
   N "tail -30 /root/twolog/$shop.out"
 done
 
+# A consumer that never resumed is a run that proved nothing about resuming, and
+# it looks exactly like a run that resumed and found nothing.
+#
+# The resumed stream is the only thing here that makes the aggregate's own
+# firstBatch carry events: a stream opened on a live collection comes back with
+# an empty one, so a router filtering getMore alone passes every test that opens
+# a stream and then writes. That batch reached applications unfiltered once.
+#
+# Only asked of a timed run. A round count can finish inside one resume
+# interval, and failing a short run for that would be failing it for its length.
+if [ -n "$FOR" ]; then
+  for shop in shopA shopB; do
+    r=$(N "grep -oE 'consumer: [0-9]+ resume' /root/twolog/$shop.out | grep -oE '[0-9]+' | tail -1")
+    if [ "${r:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  $shop: the consumer resumed $r time(s) from a stored token"
+    else
+      echo "  $shop: FAIL the consumer never resumed, so nothing here read a resumed stream's first batch"
+      rc=1
+    fi
+  done
+fi
+
 echo "== what the router did while both were writing =="
 N "grep -E 'level=ERROR|panic' /root/twolog/router.log | head -3"
 N "curl -s http://127.0.0.1:27610/api/snapshot" 2>/dev/null | python3 -c "

@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -81,6 +82,36 @@ type shop struct {
 	seenInsert sync.Map // order _id hex -> true, seen by the consumer
 	seenDelete sync.Map // order _id hex -> true, seen by the consumer
 
+	// resumeEvery is how often the consumer restarts from the token it stored,
+	// and checkpointEvery is how many events it processes between stores. Both
+	// describe an ordinary consumer rather than a test: a search indexer
+	// records where it got to, is restarted by a deploy or a crash, and comes
+	// back to the position it wrote down.
+	//
+	// They matter here for a reason that is specific to this system. A stream
+	// opened on a live collection comes back with an empty first batch, so
+	// everything it ever delivers arrives in a getMore, and a router that
+	// filters getMore alone looks complete. A consumer resuming from a stored
+	// token is the only thing that makes the aggregate's own firstBatch carry
+	// events, and that batch used to reach the application unfiltered.
+	//
+	// checkpointEvery is deliberately not 1. A consumer that stores a token
+	// after every event replays nothing, and the replay is where this system
+	// has to hide the same tiering event twice: the copy-up whose residency
+	// record it read the first time may have been tidied away by the second.
+	resumeEvery     time.Duration
+	checkpointEvery int
+	// resumes and replayed are reported rather than asserted on. A run that
+	// never resumed proves nothing about resuming, and that has to be visible
+	// rather than inferred from the absence of a violation.
+	resumes  atomic.Int64
+	replayed atomic.Int64
+	// lostHistory counts a resume the oplog could no longer serve. It is not a
+	// violation: a token older than the oplog window is a deployment's business
+	// and this box's oplog is minutes long under load. It is counted so a run
+	// that resumed by starting fresh cannot pass as a run that resumed.
+	lostHistory atomic.Int64
+
 	// Violations are the point of the whole thing. Counted separately from
 	// errors, because an error is the system saying no and a violation is it
 	// saying something untrue.
@@ -130,6 +161,10 @@ func main() {
 	skipSeed := flag.Bool("skip-seed", false, "shop against what is already there")
 	snapshot := flag.String("snapshot", "", "the router's dashboard api, to attribute reads")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
+	resumeEvery := flag.Duration("resume-every", 20*time.Second,
+		"restart the stream consumer from its stored token this often; 0 never restarts")
+	checkpointEvery := flag.Int("checkpoint-every", 10,
+		"events the consumer processes between storing its resume token")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -147,6 +182,7 @@ func main() {
 		db: d, orders: d.Collection("orders"), events: d.Collection("order_events"),
 		products: d.Collection("products"), customers: d.Collection("customers"),
 		nProducts: *prods, nCustomers: *custs,
+		resumeEvery: *resumeEvery, checkpointEvery: *checkpointEvery,
 		period: time.Duration(*days) * 24 * time.Hour,
 		lat:    map[string][]time.Duration{}, said: map[string]int64{},
 	}
@@ -966,31 +1002,97 @@ func (s *shop) violation(f string, a ...any) {
 // checked at the end, after the stream has been given time to drain, because a
 // consumer stopped mid-flight is short for reasons that are not this system's.
 func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- struct{}) {
-	cur, err := s.orders.Watch(ctx, mongo.Pipeline{}, options.ChangeStream().
-		SetFullDocument(options.UpdateLookup))
-	if err != nil {
-		s.errs.Add(1)
-		close(ready)
-		return
-	}
-	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-	close(ready)
-
+	announced := false
 	for {
 		select {
 		case <-done:
 			return
 		default:
 		}
+		// The first attempt always starts live, whatever is stored.
+		//
+		// A token left behind by an earlier run names a position before this
+		// run's own bookkeeping existed, so resuming from it delivers orders
+		// this process never placed and every one of them is reported as a
+		// phantom. That is the harness accusing the system of the harness's
+		// own state, which has cost two wrong diagnoses here already.
+		if !announced {
+			s.clearToken(ctx)
+		}
+		// Reloaded from the collection on every attempt, not carried in a
+		// variable, because that is what a consumer restarted by a deploy
+		// does: the process it had the token in is gone.
+		token, have := s.loadToken(ctx)
+		opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
+		if have {
+			opts.SetStartAfter(token)
+		}
+		cur, err := s.orders.Watch(ctx, mongo.Pipeline{}, opts)
+		if err != nil {
+			if !announced {
+				s.errs.Add(1)
+				close(ready)
+				return
+			}
+			// A token the oplog can no longer serve. Counted and started
+			// fresh, because the alternative is a harness that stops checking
+			// anything the moment the box gets busy.
+			if isHistoryLost(err) {
+				s.lostHistory.Add(1)
+				s.clearToken(ctx)
+				continue
+			}
+			s.errs.Add(1)
+			return
+		}
+		if !announced {
+			close(ready)
+			announced = true
+		} else {
+			s.resumes.Add(1)
+		}
+		restart := s.consume(ctx, cur, done)
+		_ = cur.Close(context.WithoutCancel(ctx))
+		if !restart {
+			return
+		}
+	}
+}
+
+// consume reads one cursor until it is time to stop or to restart.
+//
+// It reports whether the caller should reopen the stream. Split out from tail
+// so that the restart is one decision in one place: a loop that both reads
+// events and reopens its own cursor had two exits and took the wrong one on a
+// cursor error, which reads as a consumer that silently stopped checking.
+func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan struct{}) bool {
+	since := time.Now()
+	n := 0
+	// stored says this cursor has written a token that a restart could come
+	// back to. Without one, reopening starts the stream live and everything
+	// written between the close and the reopen is never delivered, which this
+	// harness would report at the end as the system losing events. A consumer
+	// with nothing written down does not restart: it keeps reading.
+	stored := false
+	for {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+		if s.resumeEvery > 0 && stored && time.Since(since) >= s.resumeEvery {
+			return true
+		}
 		if !cur.TryNext(ctx) {
 			if cur.Err() != nil {
 				s.errs.Add(1)
-				return
+				return false
 			}
 			continue
 		}
 		var ev struct {
-			OperationType string `bson:"operationType"`
+			ID            bson.Raw `bson:"_id"`
+			OperationType string   `bson:"operationType"`
 			DocumentKey   struct {
 				ID bson.ObjectID `bson:"_id"`
 			} `bson:"documentKey"`
@@ -1001,6 +1103,13 @@ func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- stru
 		id := ev.DocumentKey.ID.Hex()
 		switch ev.OperationType {
 		case "insert":
+			if _, again := s.seenInsert.Load(id); again {
+				// A replay, which is what at-least-once delivery means and is
+				// not a fault. Counted rather than reported: asserting that an
+				// event arrives exactly once asserts more than a change stream
+				// promises, and this harness has failed that way before.
+				s.replayed.Add(1)
+			}
 			s.seenInsert.Store(id, true)
 			if _, ours := s.wrote.Load(id); !ours {
 				// Seeded orders are written before the consumer starts, so an
@@ -1009,12 +1118,69 @@ func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- stru
 				s.violation("the stream reported an order placed that nobody placed: %s", id)
 			}
 		case "delete":
+			if _, again := s.seenDelete.Load(id); again {
+				s.replayed.Add(1)
+			}
 			s.seenDelete.Store(id, true)
 			if _, ours := s.removed.Load(id); !ours {
 				s.violation("the stream reported an order cancelled that nobody cancelled: %s", id)
 			}
 		}
+		n++
+		// The token of an event this consumer has finished with, which is the
+		// only position it is safe to come back to. Stored every few events
+		// rather than every one, so a restart replays the handful in between:
+		// see the note on checkpointEvery.
+		if s.checkpointEvery > 0 && n%s.checkpointEvery == 0 && len(ev.ID) > 0 {
+			s.saveToken(ctx, ev.ID)
+			stored = true
+		}
 	}
+}
+
+// loadToken, saveToken and clearToken are the consumer's own bookkeeping, in a
+// collection of its own on the cluster it is reading.
+//
+// Deliberately a collection nothing tiers. A consumer stores its position
+// beside its own state, not in the application's tiered data, and this way the
+// token survives on the fast tier alone, which is one more thing an archive
+// repointed to has never held.
+func (s *shop) loadToken(ctx context.Context) (bson.Raw, bool) {
+	var doc struct {
+		Token bson.Raw `bson:"token"`
+	}
+	err := s.db.Collection("stream_state").FindOne(ctx,
+		bson.D{{Key: "_id", Value: "indexer"}}).Decode(&doc)
+	if err != nil || len(doc.Token) == 0 {
+		return nil, false
+	}
+	return doc.Token, true
+}
+
+func (s *shop) saveToken(ctx context.Context, token bson.Raw) {
+	_, err := s.db.Collection("stream_state").UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: "indexer"}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "token", Value: token}, {Key: "at", Value: time.Now()}}}},
+		options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		s.errs.Add(1)
+	}
+}
+
+func (s *shop) clearToken(ctx context.Context) {
+	_, _ = s.db.Collection("stream_state").DeleteOne(ctx,
+		bson.D{{Key: "_id", Value: "indexer"}})
+}
+
+// isHistoryLost says the resume token names a position the oplog no longer
+// holds, which MongoDB reports as ChangeStreamHistoryLost (286).
+func isHistoryLost(err error) bool {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) {
+		return ce.Code == 286 || ce.HasErrorLabel("NonResumableChangeStreamError")
+	}
+	return false
 }
 
 // checkStream is the other half of the consumer's promise, asked once the
@@ -1091,6 +1257,15 @@ func (s *shop) report(elapsed time.Duration) {
 		fmt.Printf("  %-28s %7s %10s %10s %10s\n", n, commas(len(d)),
 			round(d[len(d)/2]), round(d[len(d)*95/100]), round(d[len(d)*99/100]))
 	}
+
+	// Printed whatever it says, because a run that never resumed proves nothing
+	// about resuming and the absence of a violation would read as proof.
+	fmt.Printf("\nconsumer: %d resume(s) from a stored token, %d replayed event(s)",
+		s.resumes.Load(), s.replayed.Load())
+	if lost := s.lostHistory.Load(); lost > 0 {
+		fmt.Printf(", %d token(s) older than the oplog", lost)
+	}
+	fmt.Print("\n")
 
 	fmt.Printf("\nerrors: %d\n", s.errs.Load())
 	if v := s.violations.Load(); v == 0 {
