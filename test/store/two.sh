@@ -64,6 +64,21 @@ ND() { docker exec -d "$NODE" bash -c "$1"; }
 
 echo "== installing =="
 docker cp test/store/two.yaml "$NODE":/root/two.yaml >/dev/null
+# The terminate_auth config is derived here rather than kept as a second file.
+#
+# It used to be a /root/two_ta.yaml that no longer existed in this repository at
+# all: the copy this box ran was dated 2026-09-14 and survived only because
+# nobody had cleaned the container. It happened still to match, which is luck
+# rather than a property, and every edit to two.yaml since would have been
+# silently missing from the one run that exercises the router's own
+# authorisation. The same reasoning as psweep's CACHE=1, which derives its
+# config for the same reason and asserts the derivation took.
+if [ -n "${TERMINATE_AUTH:-}" ]; then
+  N "sed 's|^  completeness:|  terminate_auth: true\n  completeness:|' /root/two.yaml > /root/two_ta.yaml"
+  N "grep -q 'terminate_auth: true' /root/two_ta.yaml" || {
+    echo "FATAL could not turn terminate_auth on, so this run would quietly be the ordinary one"; exit 2; }
+  echo "  terminate_auth is on: the router owns its upstream connections and checks every command itself"
+fi
 if [ "$CFG" != /root/two.yaml ]; then
   N "sed 's|^  listen:|  terminate_auth: true\n  listen:|' /root/two.yaml > $CFG"
   echo "  terminate_auth on, from $CFG"
