@@ -327,8 +327,10 @@ func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
 			placed = s.cancelOrder(ctx, placed)
 		case n < 0.40:
 			s.channelReport(ctx, rng, mine())
-		case n < 0.60:
+		case n < 0.58:
 			s.readRecentOrder(ctx, rng)
+		case n < 0.60:
+			s.activityReport(ctx, rng)
 		case n < 0.75:
 			s.orderHistory(ctx, rng)
 		case n < 0.84:
@@ -543,6 +545,18 @@ func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOr
 		}
 		before, counted = n, true
 		return nil
+	})
+
+	// The order's events go first, and the order after, which is the ordering a
+	// shop would choose anyway and is what makes the activity report below
+	// checkable. A report joining events to their orders is racy the other way
+	// round: between deleting the order and deleting its events there is an
+	// instant where an event has no order, and a reader in that window would
+	// report this workload's own two writes as a violation. See the note on
+	// reading between two writes that belong to one act.
+	s.timed("delete a cancelled order's events", func() error {
+		_, err := s.events.DeleteMany(ctx, bson.D{{Key: "order", Value: victim.id}})
+		return err
 	})
 
 	s.removed.Store(victim.id.Hex(), true)
@@ -955,6 +969,79 @@ func (s *shop) monthlyReport(ctx context.Context, rng *rand.Rand) {
 		if seen && prev != n {
 			s.violation("a report for %s said %d and later said %d, and nothing writes to the past",
 				key, prev, n)
+		}
+		return cur.Err()
+	})
+}
+
+// activityReport is the read a shop's operations page makes: what happened
+// lately, with the order each event belongs to attached.
+//
+// It exists because every other read here names one collection. A $lookup is
+// the shape where a second collection is read *inside* a pipeline, and the
+// router has to reach the right tiers for a namespace the query never names in
+// its $match. A filter in front of a pipeline does not reach the joined side,
+// so the joined collection is read on whatever tier the plan lands on.
+//
+// The invariant is one a shop would state plainly: every event it can see
+// belongs to an order it can see. The shop deletes an order's events before it
+// deletes the order, so an event without an order is never a state this
+// workload produces, whatever instant the report is taken at. An event that
+// comes back with no order is either a tombstoned copy joined out of the
+// archive, or an order the join could not see on the tier it looked at.
+//
+// Bounded to this run's own events. The seeded history has none, and an event
+// this process did not write is not one whose order it can reason about.
+func (s *shop) activityReport(ctx context.Context, rng *rand.Rand) {
+	s.timed("an activity report joining events to orders", func() error {
+		cur, err := s.events.Aggregate(ctx, mongo.Pipeline{
+			bson.D{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: s.began}}}}}},
+			bson.D{{Key: "$sort", Value: bson.D{{Key: "at", Value: -1}}}},
+			bson.D{{Key: "$limit", Value: 25}},
+			bson.D{{Key: "$lookup", Value: bson.D{
+				{Key: "from", Value: "orders"},
+				{Key: "localField", Value: "order"},
+				{Key: "foreignField", Value: "_id"},
+				{Key: "as", Value: "o"},
+			}}},
+		})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+		for cur.Next(ctx) {
+			var row struct {
+				Order  bson.ObjectID `bson:"order"`
+				Orders []struct {
+					ID bson.ObjectID `bson:"_id"`
+				} `bson:"o"`
+			}
+			if cur.Decode(&row) != nil {
+				continue
+			}
+			id := row.Order.Hex()
+			// Only this process's own events can be judged. Another shop
+			// running against the same database has orders this one knows
+			// nothing about.
+			if _, ours := s.wrote.Load(id); !ours {
+				continue
+			}
+			// An order this run cancelled has had its events deleted first, so
+			// an event of it surviving is the thing being looked for; but a
+			// report taken while the cancellation is in flight can legitimately
+			// see neither. Judged only for orders still live.
+			if _, gone := s.removed.Load(id); gone {
+				continue
+			}
+			switch {
+			case len(row.Orders) == 0:
+				s.violation("an activity report showed an event whose order it could not find: %s", id)
+			case len(row.Orders) > 1:
+				s.violation("an activity report joined %d orders to one event: %s", len(row.Orders), id)
+			case row.Orders[0].ID != row.Order:
+				s.violation("an activity report attached order %s to an event of %s",
+					row.Orders[0].ID.Hex(), id)
+			}
 		}
 		return cur.Err()
 	})
