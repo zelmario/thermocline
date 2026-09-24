@@ -124,13 +124,49 @@ sec "an alert that fires on a number this system reports"
 # exactly what stale_reads_total counts, and it is the one counter in
 # docs/monitoring.md whose text says any value above zero is worth
 # investigating.
+# The namespace this reads, built here rather than inherited.
+#
+# This suite is the only one that uses shop.tprobe without creating it: every
+# other one sets NS=tprobe and builds its own. So what this read met depended on
+# which suite ran before it, and on 2026-09-24 testchaos ran immediately before
+# and drops it on the way out.
+#
+# It stays shop.tprobe rather than taking a name of its own, because a stale
+# read needs a namespace feeder.namespaces actually tiers: a name this config
+# does not list is not managed, the read never falls through, and the counter
+# cannot move. The archive alone holds it, which is what makes the read fall
+# through at all.
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').tprobe.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').tprobe.drop();
+  db.getSiblingDB('shop').tprobe.insertMany(Array.from({length:20},(_,i)=>({_id:i,v:i+1})))" >/dev/null 2>&1
+# And nothing claiming the fast tier holds it all, or the read is answered there
+# and never reaches the archive.
+docker exec $NODE cline watermark --config $CFG --ns shop.tprobe --clear >/dev/null 2>&1
+
 BEFORE=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
          | awk '/^thermocline_stale_reads_total /{print $2}')
-docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
-  --eval 'db.getSiblingDB("shop").tprobe.find({v:{$gt:0}}).limit(5).itcount()' >/dev/null 2>&1
+# The read's own answer, not just its effect on a counter.
+#
+# This used to be thrown away, and that is what made the failure of 2026-09-24
+# unreadable. "the read was actually counted as stale got=false" is reported by
+# three different states: the read fell through and was not judged stale, the
+# read was answered by the fast tier and never fell through, and the read never
+# happened at all because mongosh could not connect to a router that had just
+# been restarted under it. Only the first is about this system.
+#
+# Measured while fixing this, on an idle box: the read counts as stale with the
+# collection present, with it absent, and with a freshly published feeder
+# position, so none of those explains that run. Whatever it was, the next
+# failure will say which of the three it is rather than leaving it to be
+# guessed at.
+READ=$(docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'print(db.getSiblingDB("shop").tprobe.find({v:{$gt:0}}).limit(5).itcount())' 2>&1 | tail -1)
 AFTER=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
         | awk '/^thermocline_stale_reads_total /{print $2}')
-echo "  stale_reads_total went from ${BEFORE:-?} to ${AFTER:-?}"
+echo "  stale_reads_total went from ${BEFORE:-?} to ${AFTER:-?}, the read returned ${READ:-nothing}"
+chk "the read this rests on returned its rows" "5" "$READ"
 # The premise, checked before the alert is waited for. Without this a rule that
 # never fires and a read that was never stale report the same failure, and the
 # wait below would burn two minutes saying the wrong thing.
@@ -177,6 +213,11 @@ import json,sys
 for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineClusterTimeBehind": print(r.get("state"))' 2>/dev/null)"
+
+# Dropped on both tiers, so nothing downstream inherits this suite's fixture the
+# way this suite used to inherit everyone else's.
+docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').tprobe.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').tprobe.drop()" >/dev/null 2>&1
 
 sec "the archive refusing a document the fast tier holds"
 # Two rules for one condition and both were only ever parsed. The pair is worth
