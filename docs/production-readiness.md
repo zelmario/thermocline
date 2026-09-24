@@ -112,6 +112,33 @@ about what the tests *do*. This is the second thing the rollback procedure lost
 that the rollback command was happy about, and that is the number worth
 watching: two of the four walked procedures have now been short twice.
 
+## 2026-09-24: the tenth, and the workload found it rather than a probe
+
+A shop tailing its own orders was told an order had been placed that nobody
+placed. The document was a seeded one, two months old, living in the archive: a
+copy-up delivered to the application as its own insert. The fifth defect of this
+family and the first that a standing test found on its own.
+
+`endedAt` on a residency record has two writers. The feeder writes it when the
+application deletes the document. The evictor writes it as it evicts,
+deliberately, so the row outlives the hold for a change stream to read. The
+sieve's first question was whether the insert happened after the record ended
+and it assumed the first meaning, so a copy-up whose hold the evictor ended 73
+milliseconds earlier arrived as somebody else's write.
+
+**What is worth taking from it.** The fix is one line moved, and finding it took
+a log line that did not exist: the sieve said when it hid an insert and said
+nothing when it let one through, so a phantom reaching a consumer left no trace
+on this side at all. The only evidence was an application noticing, and nothing
+in this deployment was an application until the shop gained a consumer that
+tails while the tiers move.
+
+**And what it says about the count above.** The discovery rate has not fallen.
+Nine and ten came on the same day, from the two things added that day: walking a
+procedure to its end, and a workload doing one more thing a real application
+does. Neither was a new kind of test. Both were the existing tests asked to
+finish the job.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
