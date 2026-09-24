@@ -395,6 +395,34 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 				"eventAt", eventTime(ev).Format(time.RFC3339Nano))
 			dropped++
 		default:
+			// An insert this system has a residency record for, handed to the
+			// application anyway. Either the application is writing an _id it
+			// deleted earlier, which is its own news, or this is a copy-up
+			// arriving as an insert nobody made.
+			//
+			// Logged because nothing said which. The sieve says when it hides
+			// an insert and says nothing when it lets one through, so a phantom
+			// reaching a consumer left no trace on this side at all and the
+			// only evidence was the application noticing. Measured on
+			// 2026-09-24: the shop reported an order placed that nobody placed,
+			// and the record that should have accounted for it was there, with
+			// a promotedAt from a later promotion of the same document.
+			//
+			// Only when a record exists, which is what keeps this off the path
+			// every ordinary insert takes.
+			if kinds[i] == "insert" && docIDs[i] != "" {
+				if p, have := promoted[docIDs[i]]; have {
+					r.log.Info("letting an insert through although this system has a residency record for it",
+						"doc", docIDs[i],
+						"promotedAt", p.at.Format(time.RFC3339Nano),
+						"endedAt", p.ended.Format(time.RFC3339Nano),
+						"echoPending", p.pending,
+						"echoes", len(p.echoed),
+						"eventAt", eventTime(ev).Format(time.RFC3339Nano),
+						"eventPos", eventPosition(ev),
+						"note", "an application rewriting an _id it deleted looks like this too")
+				}
+			}
 			keep = append(keep, ev)
 		}
 	}
@@ -580,19 +608,6 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 	if !ok {
 		return false
 	}
-	// The application has deleted the document since, and this insert happened
-	// after that, so it is the application writing the _id again and not this
-	// promotion. Checked before everything below, including the echo: a record
-	// that has ended describes a promotion that is over.
-	//
-	// Ending the record rather than deleting it is what makes the other half of
-	// this work. Deleting it took away the only evidence that the copy-up's own
-	// insert was a promotion, and a consumer that had not caught up was then
-	// shown an insert of a document it never inserted: measured as exactly that,
-	// insert then delete, for a document only the archive held.
-	if !p.ended.IsZero() && !at.IsZero() && at.After(p.ended) {
-		return false
-	}
 	// Announced and not yet spent, which means the insert this record was
 	// written to precede has not been seen. The way an unclaimed eviction
 	// announcement is, and for the same reason: while nobody has accounted for
@@ -601,8 +616,41 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 	//
 	// Bounded, though, by the same window the feeder spends notices in. See
 	// echoOutstanding.
+	//
+	// ABOVE the ended check, and that ordering is the fix rather than a detail.
+	// It used to be below, on the stated grounds that "a record that has ended
+	// describes a promotion that is over". A record that has ended describes a
+	// promotion whose *hold* is over, which is not the same thing: the insert
+	// that promotion caused can still be in flight, and while its echo is
+	// outstanding nobody has accounted for it.
+	//
+	// endedAt has two writers and the check below reads only one of them. The
+	// feeder writes it when the application deletes the document, which is the
+	// case that check is for. The evictor writes it as it evicts, deliberately,
+	// so the row outlives the hold for a change stream to read. Measured on
+	// 2026-09-24 with the sieve instrumented: promotedAt 14:15:43.160, the
+	// evictor ending the hold at 14:15:43.233, the copy-up's own insert reaching
+	// the sieve at 14:15:43.238 with echoPending true and no echo spent, and the
+	// shop reporting an order placed that nobody placed.
+	//
+	// An application deleting a document and writing the _id again is still
+	// shown, because by the time that second insert exists the copy-up's insert
+	// has already been through here and the feeder has spent its echo, so
+	// pending is false and this branch does not fire.
 	if p.pending && !p.at.IsZero() && time.Since(p.at) <= echoOutstanding {
 		return true
+	}
+	// The application has deleted the document since, and this insert happened
+	// after that, so it is the application writing the _id again and not this
+	// promotion.
+	//
+	// Ending the record rather than deleting it is what makes the other half of
+	// this work. Deleting it took away the only evidence that the copy-up's own
+	// insert was a promotion, and a consumer that had not caught up was then
+	// shown an insert of a document it never inserted: measured as exactly that,
+	// insert then delete, for a document only the archive held.
+	if !p.ended.IsZero() && !at.IsZero() && at.After(p.ended) {
+		return false
 	}
 	if p.at.After(recent) {
 		return true

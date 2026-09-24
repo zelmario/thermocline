@@ -182,6 +182,62 @@ func TestAnInsertAfterTheRecordEndedIsTheApplicationsOwn(t *testing.T) {
 	}
 }
 
+// The evictor ends a hold while the copy-up it belongs to is still in flight.
+//
+// endedAt has two writers. The feeder writes it when the application deletes
+// the document, which is what the check above is for. The evictor writes it as
+// it evicts, on purpose, so the row outlives the hold for a change stream to
+// read. A record ended by the evictor describes a promotion whose *hold* is
+// over, not one whose insert has been accounted for.
+//
+// The numbers are the measured ones, from the sieve instrumented on 2026-09-24
+// during a two-shop run: residency recorded at T, the evictor ending the hold
+// 73ms later, and the copy-up's own insert reaching the sieve 5ms after that
+// with its echo still outstanding and nothing spent. The shop reported it as an
+// order placed that nobody placed.
+func TestAHoldEndedByTheEvictorDoesNotUnmaskItsOwnCopyUp(t *testing.T) {
+	promotedAt := time.Now().Add(-500 * time.Millisecond)
+	ended := promotedAt.Add(73 * time.Millisecond)
+	eventAt := ended.Add(5 * time.Millisecond)
+	promoted := map[string]promotion{
+		"shop.orders|x": {
+			at:      promotedAt,
+			ended:   ended,
+			pending: true,
+			// Nothing spent yet, which is the state that makes this the
+			// copy-up's own insert and not a later one.
+			echoed: nil,
+		},
+	}
+	if !isPromotion(promoted, "shop.orders|x", eventAt, bson.Timestamp{T: 1790259343, I: 15},
+		time.Now().Add(-promotionWindow)) {
+		t.Error("a copy-up whose hold the evictor ended first was delivered as an insert nobody made")
+	}
+}
+
+// And the other direction still holds: once the echo is spent, an insert after
+// the record ended is the application writing that _id again.
+//
+// This is what the reordering had to keep. The ended check moved below the echo
+// check, so the guard against hiding an application's own insert is now that
+// the copy-up has been accounted for, which it has by the time a later insert
+// of the same _id can exist.
+func TestASpentEchoStillLetsTheApplicationsReinsertThrough(t *testing.T) {
+	ended := time.Now().Add(-10 * time.Second)
+	promoted := map[string]promotion{
+		"shop.orders|x": {
+			at:      ended.Add(-5 * time.Second),
+			ended:   ended,
+			pending: false,
+			echoed:  []bson.Timestamp{{T: 1000, I: 1}},
+		},
+	}
+	if isPromotion(promoted, "shop.orders|x", ended.Add(2*time.Second), bson.Timestamp{T: 1100, I: 1},
+		time.Now().Add(-promotionWindow)) {
+		t.Error("an application's own insert after the eviction was hidden as a promotion")
+	}
+}
+
 // The list is capped, because a document can be copied up and evicted all day.
 func TestEchoedPositionsAreCapped(t *testing.T) {
 	rec := meta.ResidencyRecord{}
