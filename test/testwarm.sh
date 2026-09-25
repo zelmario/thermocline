@@ -133,6 +133,13 @@ chk "the claim covers all of history" "true" \
 # without it matches nothing, and nothing is what made this check pass before it
 # was ever right.
 arch() { curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -oE '"from_archive":[[:space:]]*[0-9]+' | grep -oE '[0-9]+'; }
+# The router caches each namespace's claim for watermark.ClaimCacheTTL, five
+# seconds, and it may have read this one before the warm made it. Answering from
+# the archive until then is the safe side and the contract. This check used to
+# get that wait for free: the warmer spent five seconds waiting for the feeder
+# to notice its heartbeat before it copied anything, and that heartbeat is gone.
+# On 2026-09-25 one read in the first second went to the archive.
+sleep 6
 BEFORE=$(arch)
 chk "the router's archive counter is readable" "true" "$([ -n "$BEFORE" ] && echo true || echo false)"
 chk "an unbounded query still finds them all"  "20" \

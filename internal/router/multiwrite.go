@@ -414,7 +414,6 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		if rerr := r.recordResidencyMany(ctx, ns, raw); rerr != nil {
 			r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
 		}
-		r.notePromoting(ctx)
 
 		// Before the insert, for the same reason the single copy-up does it: the
 		// insert is what creates the collection when the fast tier does not hold

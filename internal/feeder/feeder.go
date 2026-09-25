@@ -159,15 +159,6 @@ type Feeder struct {
 	// index put in the state the config asks for. One namespace is one round
 	// trip per feeder run, and only namespaces that actually tombstone.
 	ttlSettled map[string]bool
-
-	// cached view of whether a warmer is running, see echo.go
-	warmActive    bool
-	warmCheckedAt time.Time
-
-	// The same pair for the router's promotions. See promotion echoes in
-	// echo.go for what they are and why suppressing them has to be one-shot.
-	promoteActive    bool
-	promoteCheckedAt time.Time
 }
 
 // withdrawCompleteness drops the fast tier's completeness claim for ns.

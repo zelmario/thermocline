@@ -279,18 +279,24 @@ chk "the warm copied both up"                        "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:{\$in:[40,41]}}))")"
 # The mark goes on the archive's copy, which the fast tier's copy does not have.
 C "db.getSiblingDB(process.env.TC_DB).$NS.updateMany({_id:{\$in:[40,41]}},{\$set:{marker:'kept'}})" >/dev/null
+# Two, or the zero asked for below would be notices never written rather than
+# notices spent.
+chk "the warm left the feeder a notice for each"      "2" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).warming.countDocuments({_id:{\$regex:'^'+process.env.TC_DB+'\\.$NS'}}))")"
 startFeeder
 sleep 8
 chk "the warm did not overwrite the archive"         "kept" "$(marker 40)"
 chk "nor the second document"                        "kept" "$(marker 41)"
 chk "and both are still live in the archive"         "true" \
     "$(C "const a=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:40}); const b=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:41}); print(!!a && !a._tcDeletedAt && !!b && !b._tcDeletedAt)")"
-# The control for the control. If the feeder never noticed a warmer was running
-# then it suppressed nothing and the marks above survived for the wrong reason,
-# which is the way this check would rot: the marker goes stale after
-# markerFresh, so a slow startup here turns a real check into a vacuous one.
-chk "and the feeder suppressed rather than missed it" "true" \
-    "$(grep -q 'warmer detected, suppressing' $LOGDIR/echo_f.log && echo true || echo false)"
+# The control for the control. If the feeder never looked for the warm's echoes
+# then it suppressed nothing and the marks above survived for the wrong reason.
+# It used to grep for the line the feeder printed when it noticed a warmer's
+# heartbeat, and that gate is gone: the feeder asks on every flush that holds an
+# insert, because a cached "no" let copy-ups through (test/echorace). What
+# suppression leaves behind is spent notices, and nothing else spends them.
+chk "and the feeder suppressed rather than missed it" "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).warming.countDocuments({_id:{\$regex:'^'+process.env.TC_DB+'\\.$NS'}}))")"
 
 echo
 echo "================================"

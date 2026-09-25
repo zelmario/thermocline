@@ -290,3 +290,46 @@ func TestAnEchoNobodySpentStopsAnsweringForLaterInserts(t *testing.T) {
 		t.Error("an unspent echo hid an application's own insert made long afterwards")
 	}
 }
+
+// A pending echo that has outlived the outstanding window still says the list
+// of positions is missing the latest promotion, so a miss in it cannot be read
+// as "not ours". The feeder used to look for echoes only while it believed a
+// router was promoting, so an occasional copy-up left exactly this record:
+// the first promotion's position written down, the second's never spent.
+// Measured with test/echorace, a consumer seventy seconds late was shown the
+// second copy-up as an insert, two rounds of two.
+func TestAPendingEchoMakesThePositionListIncomplete(t *testing.T) {
+	first := bson.Timestamp{T: 1000, I: 1}
+	second := bson.Timestamp{T: 1080, I: 4}
+	promotedAt := time.Now().Add(-70 * time.Second)
+	promoted := map[string]promotion{
+		"shop.orders|x": {at: promotedAt, pending: true, echoed: []bson.Timestamp{first}},
+	}
+	recent := time.Now().Add(-promotionWindow)
+	if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(9*time.Millisecond), second, recent) {
+		t.Error("a copy-up whose echo was never spent was delivered as an insert the application never made")
+	}
+	// The application writing the _id again long after is still shown.
+	if isPromotion(promoted, "shop.orders|x", time.Now(), bson.Timestamp{T: 1150, I: 2}, recent) {
+		t.Error("an application's own insert, a minute after the promotion, was hidden")
+	}
+}
+
+// A withdrawn echo makes the list incomplete in the same way. The promoter that
+// withdrew it lost a race to insert, and the winner's insert is the echo it was
+// withdrawing, so the feeder never wrote that position down. Measured with
+// test/echorace, 32 reads across two routers: five rounds of five.
+func TestAWithdrawnEchoMakesThePositionListIncomplete(t *testing.T) {
+	first := bson.Timestamp{T: 1000, I: 1}
+	promotedAt := time.Now().Add(-70 * time.Second)
+	promoted := map[string]promotion{
+		"shop.orders|x": {at: promotedAt, uncertain: true, echoed: []bson.Timestamp{first}},
+	}
+	recent := time.Now().Add(-promotionWindow)
+	if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(12*time.Millisecond), bson.Timestamp{T: 1080, I: 9}, recent) {
+		t.Error("the race winner's copy-up was delivered as an insert the application never made")
+	}
+	if isPromotion(promoted, "shop.orders|x", time.Now(), bson.Timestamp{T: 1150, I: 2}, recent) {
+		t.Error("an application's own insert, a minute after the promotion, was hidden")
+	}
+}

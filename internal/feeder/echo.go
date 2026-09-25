@@ -11,54 +11,6 @@ import (
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
-// markerFresh is how recently the warmer must have checked in for its marker to
-// count. The warmer beats every 5 seconds, so this tolerates a missed beat.
-const markerFresh = 20 * time.Second
-
-// markerCache is how long the feeder trusts its last look at the marker. The
-// answer is almost always "no warmer is running", and this keeps that answer
-// nearly free on the hot path.
-const markerCache = 5 * time.Second
-
-// warmingActive reports whether a warmer is currently copying documents up.
-//
-// A warm inserts into the fast tier, which produces change events the feeder
-// would mirror straight back into the archive those documents came from. That
-// echo is harmless but doubles the write load on the cold tier during exactly
-// the operation that moves the most data.
-//
-// Suppressing it costs a lookup per batch, so it is only paid while a warm is
-// actually running. The rest of the time this is a cached boolean.
-func (f *Feeder) warmingActive(ctx context.Context) bool {
-	if time.Since(f.warmCheckedAt) < markerCache {
-		return f.warmActive
-	}
-	f.warmCheckedAt = time.Now()
-
-	var marker meta.ActiveMarker
-	err := f.cold.Database(meta.DB).Collection(meta.Markers).
-		FindOne(ctx, bson.D{{Key: "_id", Value: meta.WarmerActiveMarker}}).Decode(&marker)
-	if err != nil {
-		f.warmActive = false
-		return false
-	}
-
-	// The archive's frame, because the warmer stamped the mark there and this
-	// process need not be on the warmer's machine. Ahead of it by more than
-	// markerFresh and every warm reads as "no warmer is running", so nothing is
-	// suppressed. See meta.HeartbeatUpdate.
-	active := f.archiveNow(ctx).Sub(marker.Seen) < markerFresh
-	if active != f.warmActive {
-		if active {
-			f.log.Info("warmer detected, suppressing mirrored copies of warmed documents")
-		} else {
-			f.log.Info("warmer finished, resuming normal mirroring")
-		}
-	}
-	f.warmActive = active
-	return active
-}
-
 // suppressWarmEchoes drops buffered upserts that came from the warmer copying
 // archived documents back into the fast tier. It reports how many it removed.
 //
@@ -84,10 +36,9 @@ func (f *Feeder) warmingActive(ctx context.Context) bool {
 // the same one-shot discipline follows: spend the notice, and drop nothing if
 // spending it fails.
 func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
-	if !f.warmingActive(ctx) {
-		return 0, nil
-	}
-
+	// Asked on every flush that holds an insert, not only while a warmer is
+	// known to be running. See suppressPromotionEchoes for why a cached "no"
+	// here was not a saving but a wrong answer.
 	var ids []string
 	// Where each warm's insert sits in the fast tier's oplog, so the residency
 	// record can say afterwards which insert it accounted for. The first upsert
@@ -221,44 +172,23 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 // described has either been mirrored already or is never coming.
 const echoWindow = 60 * time.Second
 
-// promotingActive reports whether the router has copied anything up recently.
-//
-// Same shape as warmingActive and for the same reason: the answer is almost
-// always no, and this keeps the cost of asking near zero on the hot path.
-func (f *Feeder) promotingActive(ctx context.Context) bool {
-	if time.Since(f.promoteCheckedAt) < markerCache {
-		return f.promoteActive
-	}
-	f.promoteCheckedAt = time.Now()
-
-	var marker meta.ActiveMarker
-	err := f.cold.Database(meta.DB).Collection(meta.Markers).
-		FindOne(ctx, bson.D{{Key: "_id", Value: meta.PromotingActiveMarker}}).Decode(&marker)
-	if err != nil {
-		f.promoteActive = false
-		return false
-	}
-
-	// The archive's frame: the mark was stamped there and this process need not
-	// be on the router's machine. See warmingActive above.
-	active := f.archiveNow(ctx).Sub(marker.Seen) < markerFresh
-	if active != f.promoteActive {
-		if active {
-			f.log.Debug("router is promoting documents, suppressing the mirrored copies")
-		} else {
-			f.log.Debug("router has stopped promoting, resuming normal mirroring")
-		}
-	}
-	f.promoteActive = active
-	return active
-}
-
 // suppressPromotionEchoes drops buffered upserts that are the router's own
 // copy-ups coming back. It reports how many it removed.
 func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
-	if !f.promotingActive(ctx) {
-		return 0, nil
-	}
+	// Every flush that holds an insert asks, whether or not a router has been
+	// seen promoting lately.
+	//
+	// It used to ask only while a promotion marker was fresh, and it cached a
+	// "no" for five seconds. An occasional copy-up lands inside a stale "no"
+	// almost every time: its echo was mirrored rather than spent, and the
+	// insert's position was never written down. The router answers a consumer
+	// reading late from exactly that list of positions, so the copy-up reached
+	// it as an insert nobody made. Measured on 2026-09-25 with one reader and one
+	// router, a copy-up every eighty seconds and a consumer seventy seconds
+	// behind: two rounds out of two after the first, test/echorace.
+	//
+	// What it costs is one indexed lookup per flush that holds an insert. A flush
+	// without one returns below before asking anything.
 
 	// Inserts only. A promotion is an insert, always, so an update or a replace
 	// can never be one, and letting them be considered is what allowed a notice

@@ -542,6 +542,9 @@ func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 			// standing it would answer "the application wrote this _id again"
 			// for the copy-up's own insert.
 			{Key: "endedAt", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, "$$REMOVE", "$endedAt"}}}},
+			// A new promotion starts with its own echo announced and nothing
+			// withdrawn yet. See WithdrawEchoes.
+			{Key: "echoUncertain", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, "$$REMOVE", "$echoUncertain"}}}},
 		}}},
 	}
 }
@@ -569,7 +572,18 @@ func WithdrawEchoes(ctx context.Context, cold *mongo.Client, docIDs []string) er
 	}
 	_, err := cold.Database(DB).Collection(Residency).UpdateMany(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		bson.D{{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}}})
+		bson.D{
+			{Key: "$unset", Value: bson.D{{Key: "echoPending", Value: ""}}},
+			// The withdrawal is itself a guess. The duplicate key that prompted it
+			// says the fast tier held the document, not who put it there, and
+			// when two promoters race it was the other one, whose insert is the
+			// echo being withdrawn. The feeder then never writes that insert's
+			// position down, and a change stream consumer reading late would take
+			// the list of positions as complete and be shown the copy-up as an
+			// insert nobody made. This tells the router the list may be short.
+			// A new promotion clears it; see ResidencyUpdate.
+			{Key: "$set", Value: bson.D{{Key: "echoUncertain", Value: true}}},
+		})
 	return err
 }
 

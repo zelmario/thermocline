@@ -676,7 +676,22 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 	// exactly from an incomplete list would let the earlier insert through
 	// where the floor had been catching it. So this can still only ever
 	// suppress more than the old rule did, never less.
-	if known, yes := (meta.ResidencyRecord{Echoed: p.echoed}).EchoedAt(pos); known {
+	//
+	// Not while an echo is still pending, though. Pending means a promotion was
+	// announced and the feeder never wrote its insert down, so the list is
+	// known to be missing the most recent one, and answering "not ours" from it
+	// is exact and wrong. Measured on 2026-09-25, test/echorace: the list held
+	// the first promotion's position, the second's echo was never spent, and a
+	// consumer reading seventy seconds late was shown the second copy-up as an
+	// insert, two rounds of two. The window below then decides, which is what
+	// it did before the list existed.
+	//
+	// And not once an echo has been withdrawn in this promotion, for the same
+	// reason: the promoter that withdrew it lost a race to insert, and cannot
+	// tell whether the winner's insert is the echo it was withdrawing. Measured
+	// the same way with 32 reads across two routers: five rounds of five after
+	// one uncontested promotion had put a position in the list.
+	if known, yes := (meta.ResidencyRecord{Echoed: p.echoed}).EchoedAt(pos); known && (yes || (!p.pending && !p.uncertain)) {
 		return yes
 	}
 	// The event carries no time to judge it by on a server old enough not to
@@ -745,6 +760,10 @@ type promotion struct {
 	// echoed is where each of this document's copy-up inserts sits in the fast
 	// tier's oplog, as the feeder wrote it down. See meta.ResidencyRecord.Echoed.
 	echoed []bson.Timestamp
+	// uncertain says an echo of this promotion was withdrawn by a promoter
+	// that lost a race to insert, so echoed may be missing an insert that did
+	// happen. See meta.WithdrawEchoes.
+	uncertain bool
 }
 
 // promotionTimes reports, for each of these document ids that has a residency
@@ -771,9 +790,10 @@ func (r *Router) promotionTimes(ctx context.Context, ids []string) map[string]pr
 			Pending bool             `bson:"echoPending"`
 			Ended   time.Time        `bson:"endedAt"`
 			Echoed  []bson.Timestamp `bson:"echoed"`
+			Unsure  bool             `bson:"echoUncertain"`
 		}
 		if cur.Decode(&rec) == nil {
-			p := promotion{at: rec.At.UTC(), pending: rec.Pending, echoed: rec.Echoed}
+			p := promotion{at: rec.At.UTC(), pending: rec.Pending, echoed: rec.Echoed, uncertain: rec.Unsure}
 			if !rec.Ended.IsZero() {
 				p.ended = rec.Ended.UTC()
 			}

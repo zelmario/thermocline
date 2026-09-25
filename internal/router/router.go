@@ -95,11 +95,6 @@ type Router struct {
 	// can be answered here rather than forwarded on a shared connection.
 	hello atomic.Value
 
-	// promotedAt throttles the heartbeat that tells the feeder copy-ups are
-	// happening.
-	promoteMu  sync.Mutex
-	promotedAt time.Time
-
 	// creds and grants are how the router decides who a client is and what it
 	// may do, once it terminates authentication rather than proxying it. Both
 	// read from the fast tier, which is where the users are.

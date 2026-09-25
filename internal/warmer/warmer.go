@@ -123,30 +123,12 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 		w.log.Info("dry run, nothing will be copied")
 	}
 
-	// Announce that a warm is in progress so the feeder suppresses the echo.
-	// Without this, every document copied up is mirrored straight back down
-	// into the archive it was just read from.
-	stop := w.startHeartbeat(ctx)
-	defer stop()
-
-	// Wait for the feeder to notice before copying anything.
-	//
-	// The feeder caches its answer to "is a warm running" for a few seconds, so
-	// a warm that starts copying immediately spends that window being mirrored
-	// straight back into the archive it is reading from. Every document moved in
-	// those first seconds costs a redundant cold tier write, during the one
-	// operation that moves the most data.
-	//
-	// Waiting once, here, closes it completely. A warm runs for hours; this
-	// costs it a few seconds at the start, and it is the difference between the
-	// suppression working and the suppression working eventually.
-	if !w.dryRun {
-		select {
-		case <-ctx.Done():
-			return total, ctx.Err()
-		case <-time.After(feederMarkerCache):
-		}
-	}
+	// No announcement and no wait. The feeder used to look for a warm's echoes
+	// only while a heartbeat said a warm was running, so a warm announced
+	// itself and then waited out the feeder's cache before copying anything.
+	// The feeder asks on every flush that holds an insert now, which is what
+	// makes a copy-up it did not know about come out right. See
+	// Feeder.suppressPromotionEchoes.
 
 	for _, rule := range w.cfg.Rules {
 		s, err := w.runRule(ctx, rule)
@@ -161,11 +143,6 @@ func (w *Warmer) Run(ctx context.Context) (Stats, error) {
 	w.publish(ctx, total)
 	return total, nil
 }
-
-// feederMarkerCache is how long the feeder trusts its last look at the warmer's
-// heartbeat. Kept in step with the feeder's own markerCache: if that grows and
-// this does not, the gap this closes reopens silently.
-const feederMarkerCache = 5 * time.Second
 
 // verifyClaim checks that the fast tier still holds everything its watermark
 // says it does, and reports how far short it is.
@@ -737,46 +714,6 @@ func (w *Warmer) announce(ctx context.Context, ns string, docs []sourceDoc) erro
 		return fmt.Errorf("announce warming: %w", err)
 	}
 	return nil
-}
-
-// startHeartbeat keeps the warmer-active marker fresh and returns a stop func.
-func (w *Warmer) startHeartbeat(ctx context.Context) func() {
-	if w.dryRun {
-		return func() {}
-	}
-	markers := w.cold.Database(meta.DB).Collection(meta.Markers)
-	beat := func(c context.Context) {
-		_, _ = markers.UpdateOne(c,
-			bson.D{{Key: "_id", Value: meta.WarmerActiveMarker}},
-			meta.HeartbeatUpdate(),
-			options.UpdateOne().SetUpsert(true))
-	}
-	beat(ctx)
-
-	done := make(chan struct{})
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				beat(ctx)
-			}
-		}
-	}()
-
-	return func() {
-		close(done)
-		// The marker is left to go stale rather than deleted. When a warm
-		// finishes, the feeder is still working through the inserts it just
-		// produced, and clearing the marker now would let that tail be mirrored
-		// back into the archive. Letting it age out keeps suppression in place
-		// for the grace period the feeder needs to catch up.
-	}
 }
 
 func (w *Warmer) waitForHealth(ctx context.Context) (bool, error) {
