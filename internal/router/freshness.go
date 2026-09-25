@@ -142,6 +142,11 @@ type reading struct {
 	// here. See caughtUp.
 	skew      time.Duration
 	skewKnown bool
+	// quiet is set when a position exists and has stopped moving, and says for
+	// how long. known is false then too, and the two states are not the same
+	// thing to an operator: one is a feeder that never published, the other is
+	// one that did and stopped.
+	quiet time.Duration
 }
 
 // waitChan returns the channel that will be closed on the next reading.
@@ -297,8 +302,27 @@ func (r *Router) readPosition(ctx context.Context) reading {
 	var got reading
 	mine, mineKnown := r.archiveSkew(ctx)
 	rec, ok, err := r.positions.At(ctx, r.cfg.FeederID)
+	var alive bool
+	var quiet time.Duration
+	if err == nil && ok {
+		alive, quiet = r.posLive.ObserveQuiet(rec, time.Now(), mine, mineKnown)
+	}
 	switch {
-	case err == nil && ok && r.posLive.Observe(rec, time.Now(), mine, mineKnown):
+	// Quiet for less than a read would wait is a feeder that is behind, not one
+	// that has stopped, and the read waits for it as it would for any feeder
+	// that is behind.
+	//
+	// Stopped means two seconds without a publication, and a read here is
+	// prepared to wait archive_wait, five by default. Giving up at two answered
+	// from the archive a write it did not have yet. Measured on 2026-09-25, two
+	// applications behind two routers: the feeder paused for 2.5 to 2.9
+	// seconds, both routers called it stopped in the same millisecond, and the
+	// shops reported six to nine things wrong, all in that second, placed
+	// orders their counts did not include and a cancelled order that came
+	// back. Waiting costs a feeder that has really stopped one archive_wait,
+	// once: after that its record is older than any read would wait, and every
+	// read answers at once as before.
+	case err == nil && ok && (alive || quiet <= r.cfg.ArchiveWait.D()):
 		got.at, got.ts, got.known, got.everyMS = rec.At, rec.TS, true, rec.EveryMS
 		got.skew, got.skewKnown = rec.Skew()
 	case err == nil && ok:
@@ -314,7 +338,7 @@ func (r *Router) readPosition(ctx context.Context) reading {
 		// every time. Saying "nothing is mirroring" instead answers at once and
 		// warns, which is what the barrier already does when there is no
 		// checkpoint at all.
-		return reading{everyMS: rec.EveryMS}
+		return reading{everyMS: rec.EveryMS, quiet: quiet}
 	default:
 		// No position record at all, which is a feeder too old to publish one
 		// or one with position_every set to zero. Its checkpoint is the only
@@ -486,6 +510,17 @@ func (c *conn) explainStale(ctx context.Context, started time.Time) {
 	// No gate of its own: noteStaleRead has already claimed this interval for
 	// the pair, so this runs exactly when the warning above does.
 	got := c.r.mirroredThrough(ctx)
+	// A position that stopped moving is not a position that was never
+	// published, and saying the second for the first sent a diagnosis on
+	// 2026-09-25 looking for a harness that had not waited for the record to
+	// exist, when the record was there and a feeder paused.
+	if !got.known && got.quiet > 0 {
+		c.log.Warn("and mirroring's published position has stopped moving",
+			"quiet_for", got.quiet.Round(time.Millisecond).String(),
+			"note", "past archive_wait the feeder is taken to have stopped, so reads answer from the "+
+				"archive at once; check the feeder is running and not blocked")
+		return
+	}
 	if !got.known {
 		c.log.Warn("and mirroring has published no position at all",
 			"note", "nothing is mirroring, so no read can clear the barrier; check the feeder is running")

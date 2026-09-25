@@ -255,6 +255,20 @@ const beyondSkew = 5 * time.Minute
 // now is the caller's own clock, used for elapsed time between its own readings
 // and, on first sight with no offsets, for the one case below.
 func (l *Liveness) Observe(rec PositionRecord, now time.Time, mine time.Duration, mineKnown bool) bool {
+	alive, _ := l.ObserveQuiet(rec, now, mine, mineKnown)
+	return alive
+}
+
+// ObserveQuiet is Observe, and also says how long the record has gone without
+// a publication, as well as this reader can tell.
+//
+// Stopped is a judgement made after two seconds, and it is the right one for a
+// caller deciding whether to trust the position at all. It is not the whole
+// question for a read that is prepared to wait: a feeder that has published
+// nothing for less than that read's own wait is behind rather than gone, and a
+// read giving up on it answers from an archive that may not have the write it
+// was asked about. quiet is what lets a caller tell the two apart.
+func (l *Liveness) ObserveQuiet(rec PositionRecord, now time.Time, mine time.Duration, mineKnown bool) (alive bool, quiet time.Duration) {
 	fp := fingerprint(rec)
 
 	l.mu.Lock()
@@ -266,12 +280,12 @@ func (l *Liveness) Observe(rec PositionRecord, now time.Time, mine time.Duration
 		l.seen, l.since, l.have = fp, now, true
 	}
 	if moved {
-		return true
+		return true, 0
 	}
 
 	if theirs, ok := rec.Skew(); ok && mineKnown {
 		age := now.Add(-mine).Sub(rec.SavedAt.Add(-theirs))
-		return age <= staleAfter(rec.EveryMS)
+		return age <= staleAfter(rec.EveryMS), age
 	}
 
 	if first {
@@ -280,12 +294,13 @@ func (l *Liveness) Observe(rec PositionRecord, now time.Time, mine time.Duration
 		// it is stale beyond anything skew explains, which keeps a router
 		// started while the feeder has been down for hours from making the
 		// first read that falls through wait the whole barrier to learn it.
-		return now.Sub(rec.SavedAt) <= beyondSkew
+		age := now.Sub(rec.SavedAt)
+		return age <= beyondSkew, age
 	}
 
 	// It has not moved, and there is no way to date it. That is only evidence
 	// once it has been watched for as long as a publication would have taken.
-	return now.Sub(l.since) <= staleAfter(rec.EveryMS)
+	return now.Sub(l.since) <= staleAfter(rec.EveryMS), now.Sub(l.since)
 }
 
 // staleAfter is how long without a publication means stopped. Four missed
