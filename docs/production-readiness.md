@@ -179,9 +179,9 @@ it found, because "published no position at all" sent the diagnosis looking for
 a harness fault from the day before when the record was there.
 
 **What it says about the count.** Three more, from one more thing a real
-deployment does, and a fourth by reading, in item 9 below. The discovery rate
-has not fallen, and the shape of the finds has not changed: each needed two
-processes that each hold a view of the same state.
+deployment does, and a fourth by reading, item 9 below, which measuring showed
+was two. The discovery rate has not fallen, and the shape of the finds has not
+changed: each needed two processes that each hold a view of the same state.
 
 ## What is accepted, and needs no work
 
@@ -206,7 +206,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Three of nine remain, and one of them is code.**
+This is the whole list. Nothing else blocks. **Two of nine remain, and neither is code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -387,33 +387,40 @@ This is the whole list. Nothing else blocks. **Three of nine remain, and one of 
   read an allow-list of three operators where the rule is about a name, and the
   third returned its refusal wearing a read failure's words.
 
-- [ ] **9. Two copy-ups of one document, and the loser withdraws the winner's
-  echo.** Found on 2026-09-25 by reading, while chasing the two-router defects
-  above, and **not yet observed end to end**, so what follows is the mechanism
-  and not a measurement.
+- [x] **9. A copy-up shown to a late consumer as an insert nobody made.**
+  Opened on 2026-09-25 from reading the code and closed the same day by
+  measuring it, with `test/echorace`: one archived document, evicted and read
+  back each round through two routers, and a change stream opened seventy
+  seconds late from a position before the read. It was two defects, and the
+  second was the one written here first.
 
-  A copy-up records residency, which announces an echo the first time, then
-  inserts. When the insert meets a duplicate key the fast tier already held the
-  document, so no echo is coming, and the promoter withdraws the announcement.
-  Two promoters racing on one archived document break that: two routers, or two
-  reads on one router, because nothing deduplicates copy-ups of the same `_id`.
-  The first records and announces, the second records and announces nothing
-  because the promotion is already open, the first inserts, and the second meets
-  the duplicate and withdraws the first one's echo.
+  **No race was needed.** The feeder looked for a copy-up's echo only while it
+  believed a router was promoting, and cached a "no" for five seconds. An
+  occasional copy-up lands inside a stale "no" almost every time, so its echo
+  was mirrored rather than spent and its position was never written down. The
+  router answers a late consumer from that list of positions, and a list holding
+  only an earlier promotion's position answered "not ours", exactly and wrongly.
+  One reader, one copy-up a round: shown **2 rounds of 2** after the first. The
+  feeder now asks on every flush that holds an insert, and the heartbeats and
+  the warmer's five-second wait that fed the old gate are gone. After: 4 of 4
+  positions written down, 0 shown.
 
-  The feeder then mirrors the copy-up back into the archive, which costs a write
-  and nothing else, and it writes down no position for it. A consumer reading
-  that insert within thirty seconds is fine: the record's `promotedAt` is inside
-  the window and the insert is hidden. One reading it later, which is any
-  consumer resuming after a deploy, is answered from the record's `echoed` list,
-  and if an earlier promotion of that document left a position there the answer
-  is exact and wrong: **the copy-up is delivered as an insert nobody made.**
+  **The race.** When two copy-ups of one `_id` run at once, the one that meets
+  the duplicate key withdraws the echo, and the insert it lost to is that echo.
+  32 simultaneous reads across two routers withdrew it in every round, 8 of 8
+  and 5 of 5. After one uncontested promotion had put a position in the list, a
+  late consumer was shown the copy-up in **5 rounds of 5**. The withdrawal
+  stays, because a flag left standing would swallow an application's own
+  delete-and-reinsert. It now also marks the record `echoUncertain`, and the
+  router does not answer exactly from a list it knows may be short, or from one
+  whose echo is still pending: the thirty-second window decides, as it did
+  before the list existed. After: withdrawn 5 of 5, shown **0**.
 
-  A token per announcement does not close it, because the one that announced can
-  be the one that loses: the second promoter's insert can land first. What the
-  loser needs to know is whether the document was on the fast tier before anyone
-  announced, and neither promoter can tell that cheaply. What closes this item is
-  a reproduction first, then a fix measured against it.
+  What is given up is exactness for that one promotion, never correctness for
+  a consumer reading live: the window is what a live consumer is judged by
+  anyway. `TestAPendingEchoMakesThePositionListIncomplete` and
+  `TestAWithdrawnEchoMakesThePositionListIncomplete` each failed before their
+  change.
 
 ## What 2026-09-21 added that an operator has to do
 
