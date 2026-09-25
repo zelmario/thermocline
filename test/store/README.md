@@ -165,6 +165,43 @@ came out.
   five. A quiet position now waits out `archive_wait` before it is called
   stopped.
 
+## A consumer that falls further behind than the oplog
+
+Every consumer that stores a position eventually resumes from one the oplog no
+longer holds. MongoDB says `ChangeStreamHistoryLost`, and the consumer has to
+start again: note a cluster time, read everything, tail from the time it noted.
+
+    RESYNC_EVERY=45s bash test/store/shared.sh     # the default in both scripts
+    RESYNC_EVERY=0   bash test/store/two.sh        # off
+
+`-resync-every` makes the shop's consumer do exactly that, at that interval and
+once at the start. Falling behind is arranged rather than waited for, because
+this deployment's fast tier keeps 35 days of oplog: the stream is opened at an
+operation time no oplog holds, which the server refuses with the same check and
+the same error as a token that has aged out. Three things are checked.
+
+- **It is told.** A stream that opens anyway has started somewhere other than
+  where it was asked to, and the consumer has no way to know what it missed.
+- **The scan is whole.** One cursor over every order, both tiers, many
+  batches, while the evictor and warmer move documents underneath. An order
+  seen twice is a violation.
+- **What it keeps is the truth.** At the end the consumer's index is compared
+  with the tiers themselves, read directly: every order on the fast tier and
+  every one in the archive without a tombstone. Not with another read through
+  the router, which would compare the router with itself. With two
+  applications, each keeps its consumer reading until both have written a
+  `done:` row in the ledger, or the one that finishes first is judged short.
+
+Control against plain MongoDB, 90 seconds: 5 resyncs, told 5 times, the index
+16,914 against 16,914. Through two routers for six minutes: 9 resyncs each,
+told 9 times, 91,513 orders scanned, the index 12,267 against 12,267.
+
+**What the six-minute run found was elsewhere.** The activity report, a
+`$lookup` from events to orders, showed an event whose order it could not find.
+The feeder wrote each flush a collection at a time, so the archive could hold an
+order's event before the order, for the length of one flush. See
+`test/crossns` and `internal/feeder/atomic.go`.
+
 ## Three ways to write a check that lies
 
 All of these were made here, and all produce failures that look exactly like a

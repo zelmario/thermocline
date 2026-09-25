@@ -112,6 +112,40 @@ type shop struct {
 	// that resumed by starting fresh cannot pass as a run that resumed.
 	lostHistory atomic.Int64
 
+	// resyncEvery is how often the consumer falls further behind than the
+	// oplog, and what it then does about it, which is what every consumer
+	// that stores a position eventually has to do: told ChangeStreamHistoryLost,
+	// it notes a cluster time, reads the whole collection, rebuilds what it
+	// keeps from that, and tails from the time it noted.
+	//
+	// The read is the part nothing else here does. It is one cursor over every
+	// order, both tiers, many batches, while the evictor and the warmer move
+	// documents underneath it, and what it builds is judged at the end against
+	// the tiers themselves rather than against another read through the
+	// router.
+	//
+	// Falling behind is arranged rather than waited for. This deployment's
+	// fast tier keeps weeks of oplog, so the stream is opened at an operation
+	// time the oplog no longer holds, which the server refuses with the same
+	// check and the same error as a resume token that has aged out.
+	resyncEvery time.Duration
+	lastResync  time.Time
+	resyncs     atomic.Int64
+	told        atomic.Int64 // history-lost errors the router passed on
+	scanned     atomic.Int64
+	// index is what the consumer keeps: the orders it believes exist. Built
+	// by each resync and kept by every insert and delete after it.
+	idxMu sync.Mutex
+	index map[string]bool
+	// covered are orders a resync's scan stood in for, so their events may
+	// never arrive: they happened in the stretch the consumer fell behind by.
+	coveredIns sync.Map
+	coveredDel sync.Map
+	// truthHot and truthCold are the tiers themselves, for the judgement at
+	// the end. Straight at them, not through the router, or the check would
+	// compare the router with itself.
+	truthHot, truthCold string
+
 	// part and parts say this process is one of several applications writing
 	// the same collections, and which one. Customers are partitioned across
 	// all of them the way they are across workers within one, so the count
@@ -187,6 +221,10 @@ func main() {
 		"restart the stream consumer from its stored token this often; 0 never restarts")
 	checkpointEvery := flag.Int("checkpoint-every", 10,
 		"events the consumer processes between storing its resume token")
+	resyncEvery := flag.Duration("resync-every", 0,
+		"fall further behind than the oplog this often and resync; 0 never does")
+	truthHot := flag.String("truth-hot", "", "the fast tier itself, to judge the consumer's index against")
+	truthCold := flag.String("truth-cold", "", "the archive itself, likewise")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -205,6 +243,8 @@ func main() {
 		products: d.Collection("products"), customers: d.Collection("customers"),
 		nProducts: *prods, nCustomers: *custs,
 		resumeEvery: *resumeEvery, checkpointEvery: *checkpointEvery,
+		resyncEvery: *resyncEvery, truthHot: *truthHot, truthCold: *truthCold,
+		index:  map[string]bool{},
 		period: time.Duration(*days) * 24 * time.Hour,
 		lat:    map[string][]time.Duration{}, said: map[string]int64{},
 	}
@@ -308,6 +348,10 @@ func main() {
 	}
 	wg.Wait()
 	close(done)
+	// With other applications on the same collection, the consumer keeps
+	// reading until they have all stopped writing too, or the index judged
+	// below would be short by whatever they wrote after this one finished.
+	s.finished(ctx)
 	// Let the consumer catch up before judging it. Events are delivered after
 	// the write returns, so a stream cut off the moment the last worker stops
 	// is short for a reason that is not this system's.
@@ -315,6 +359,7 @@ func main() {
 	close(tailDone)
 	<-tailStopped
 	s.checkStream()
+	s.checkIndex(ctx)
 	elapsed := time.Since(began)
 	after := readClasses(*snapshot)
 
@@ -1161,7 +1206,18 @@ func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- stru
 		// does: the process it had the token in is gone.
 		token, have := s.loadToken(ctx)
 		opts := options.ChangeStream().SetFullDocument(options.UpdateLookup)
-		if have {
+		if s.resyncEvery > 0 && (!announced || time.Since(s.lastResync) >= s.resyncEvery) {
+			t0, ok := s.resync(ctx)
+			if !ok {
+				s.errs.Add(1)
+				if !announced {
+					close(ready)
+				}
+				return
+			}
+			s.clearToken(ctx)
+			opts.SetStartAtOperationTime(&t0)
+		} else if have {
 			opts.SetStartAfter(token)
 		}
 		cur, err := s.orders.Watch(ctx, mongo.Pipeline{}, opts)
@@ -1220,6 +1276,9 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 		if s.resumeEvery > 0 && stored && time.Since(since) >= s.resumeEvery {
 			return true
 		}
+		if s.resyncEvery > 0 && time.Since(s.lastResync) >= s.resyncEvery {
+			return true
+		}
 		if !cur.TryNext(ctx) {
 			if cur.Err() != nil {
 				s.errs.Add(1)
@@ -1248,6 +1307,7 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 				s.replayed.Add(1)
 			}
 			s.seenInsert.Store(id, true)
+			s.keep(id, true)
 			if _, ours := s.wrote.Load(id); !ours && !s.foreign(ctx, "insert", id, &s.foreignIns) {
 				// Seeded orders are written before the consumer starts, so an
 				// insert for one of those is a document arriving on the fast
@@ -1259,6 +1319,7 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 				s.replayed.Add(1)
 			}
 			s.seenDelete.Store(id, true)
+			s.keep(id, false)
 			if _, ours := s.removed.Load(id); !ours && !s.foreign(ctx, "delete", id, &s.foreignDel) {
 				s.violation("the stream reported an order cancelled that nobody cancelled: %s", id)
 			}
@@ -1375,13 +1436,15 @@ func isHistoryLost(err error) bool {
 func (s *shop) checkStream() {
 	missingIns, missingDel := 0, 0
 	s.wrote.Range(func(k, _ any) bool {
-		if _, ok := s.seenInsert.Load(k); !ok {
+		_, covered := s.coveredIns.Load(k)
+		if _, ok := s.seenInsert.Load(k); !ok && !covered {
 			missingIns++
 		}
 		return true
 	})
 	s.removed.Range(func(k, _ any) bool {
-		if _, ok := s.seenDelete.Load(k); !ok {
+		_, covered := s.coveredDel.Load(k)
+		if _, ok := s.seenDelete.Load(k); !ok && !covered {
 			missingDel++
 		}
 		return true
@@ -1449,6 +1512,12 @@ func (s *shop) report(elapsed time.Duration) {
 		fmt.Printf(", %d token(s) older than the oplog", lost)
 	}
 	fmt.Print("\n")
+	// Printed for the same reason again: a run that never fell behind proves
+	// nothing about recovering from it.
+	if s.resyncEvery > 0 {
+		fmt.Printf("resync: fell behind the oplog %d time(s), told so %d time(s), scans read %s orders\n",
+			s.resyncs.Load(), s.told.Load(), commas(int(s.scanned.Load())))
+	}
 	// Printed for the same reason. A shared run whose consumer saw nothing of
 	// the other application proves nothing about sharing a stream.
 	if s.parts > 1 {

@@ -23,6 +23,11 @@ ROUNDS=${ROUNDS:-300}
 FOR=${FOR:-}
 BEAT=${BEAT:-5m}
 CONC=${CONC:-6}
+# The consumer falls further behind than the oplog this often and recovers the
+# way an application does: told history is lost, it reads every order through
+# the router and tails from where it noted. Judged at the end against the tiers
+# themselves. RESYNC_EVERY=0 turns it off.
+RESYNC_EVERY=${RESYNC_EVERY:-45s}
 CFG=/root/shared.yaml
 CFG2=/root/shared2.yaml
 HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
@@ -31,6 +36,10 @@ R1='mongodb://dba:secret@127.0.0.1:27700/?authSource=admin'
 APPB_USER=shopc_app
 APPB_PW=shopcpw
 R2="mongodb://$APPB_USER:$APPB_PW@127.0.0.1:27720/?authSource=admin"
+RESYNC=""
+if [ "$RESYNC_EVERY" != 0 ]; then
+  RESYNC="-resync-every $RESYNC_EVERY -truth-hot 'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin' -truth-cold 'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'"
+fi
 
 if [ -n "$FOR" ]; then
   RUNARG="-for $FOR -heartbeat $BEAT"
@@ -140,7 +149,7 @@ i=0
 for uri in "$R1" "$R2"; do
   snap=http://127.0.0.1:27710/api/snapshot
   [ $i = 1 ] && snap=http://127.0.0.1:27730/api/snapshot
-  docker exec "$NODE" bash -c "store -uri '$uri' -db shopC $RUNARG -conc $CONC -skip-seed \
+  docker exec "$NODE" bash -c "store -uri '$uri' -db shopC $RUNARG -conc $CONC -skip-seed $RESYNC \
       -part $i -parts 2 -began $BEGAN -seed $((1 + 1000*i)) \
       -snapshot $snap > /root/sharedlog/app$i.out 2>&1" &
   pids+=($!)
@@ -152,7 +161,7 @@ N "rm -f /root/shared_churn.run"
 
 for i in 0 1; do
   echo "-- application $i --"
-  N "grep VIOLATION /root/sharedlog/app$i.out | head -8"
+  N "grep VIOLATION /root/sharedlog/app$i.out | head -8; grep ^index: /root/sharedlog/app$i.out"
   N "tail -32 /root/sharedlog/app$i.out"
 done
 

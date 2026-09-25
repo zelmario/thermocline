@@ -26,6 +26,11 @@ ROUNDS=${ROUNDS:-300}
 FOR=${FOR:-}
 BEAT=${BEAT:-5m}
 CONC=${CONC:-6}
+# The consumer falls further behind than the oplog this often and recovers the
+# way an application does: told history is lost, it reads every order through
+# the router and tails from where it noted. Judged at the end against the tiers
+# themselves. RESYNC_EVERY=0 turns it off.
+RESYNC_EVERY=${RESYNC_EVERY:-45s}
 CFG=/root/two.yaml
 # terminate_auth moves the decision about who may read what out of mongod and
 # into this proxy, and it is off by default precisely because it should not ship
@@ -41,6 +46,10 @@ CFG=/root/two.yaml
 # connection was authenticated.
 if [ -n "${TERMINATE_AUTH:-}" ]; then CFG=/root/two_ta.yaml; fi
 ROUTER=${ROUTER:-'mongodb://dba:secret@127.0.0.1:27600/?authSource=admin'}
+RESYNC=""
+if [ "$RESYNC_EVERY" != 0 ]; then
+  RESYNC="-resync-every $RESYNC_EVERY -truth-hot 'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin' -truth-cold 'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'"
+fi
 
 # Two things need the length: the shops, in Go duration form, and the churn
 # loop, in seconds. The churn's own cap is the one that matters if this script
@@ -272,7 +281,7 @@ for shop in shopA shopB; do
   # an application is actually given.
   uri=$ROUTER
   [ "$shop" = shopB ] && uri=$SHOPB_URI
-  docker exec "$NODE" bash -c "store -uri '$uri' -db $shop $RUNARG -conc $CONC -skip-seed \
+  docker exec "$NODE" bash -c "store -uri '$uri' -db $shop $RUNARG -conc $CONC -skip-seed $RESYNC \
       -snapshot http://127.0.0.1:27610/api/snapshot > /root/twolog/$shop.out 2>&1" &
   pids+=($!)
 done
@@ -282,7 +291,7 @@ N "rm -f /root/two_churn.run"
 
 for shop in shopA shopB; do
   echo "-- $shop --"
-  N "grep VIOLATION /root/twolog/$shop.out | head -5"
+  N "grep VIOLATION /root/twolog/$shop.out | head -5; grep ^index: /root/twolog/$shop.out"
   N "tail -30 /root/twolog/$shop.out"
 done
 
