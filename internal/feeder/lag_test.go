@@ -73,3 +73,34 @@ func TestClusterTimeNeverGoesBackwards(t *testing.T) {
 		t.Errorf("a newer increment in the same second did not advance it: %v", f.lastEventTS)
 	}
 }
+
+// A stream that is never quiet still has its buffer written, and so its
+// position published, within a bound of time rather than only once a batch is
+// full. Without the bound the position stood still for as long as a batch took
+// to fill, which at a trickle was over three seconds, and a router reads two
+// seconds without a publication as a feeder that has stopped.
+func TestABusyStreamFlushesWithoutFillingABatch(t *testing.T) {
+	f := testFeeder()
+	f.cfg.BatchSize = 500
+	now := time.Now()
+
+	if f.dueToFlush(now) {
+		t.Fatal("an empty buffer is never due")
+	}
+
+	f.pending = append(f.pending, pendingOp{})
+	f.pendingSince = now
+	if f.dueToFlush(now.Add(busyFlushEvery / 2)) {
+		t.Error("one event, buffered for half the bound, was flushed; a busy feeder would write a batch per event")
+	}
+	if !f.dueToFlush(now.Add(busyFlushEvery)) {
+		t.Error("one event buffered for the whole bound was not flushed; the position stands still until 500 arrive")
+	}
+
+	for len(f.pending) < f.cfg.BatchSize {
+		f.pending = append(f.pending, pendingOp{})
+	}
+	if !f.dueToFlush(now) {
+		t.Error("a full batch was not flushed at once")
+	}
+}

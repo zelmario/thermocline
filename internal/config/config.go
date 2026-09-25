@@ -369,9 +369,12 @@ type FeederConfig struct {
 	CheckpointEvery time.Duration `yaml:"checkpoint_every"`
 	// PositionEvery is how often the feeder publishes how far it has mirrored.
 	//
-	// There is no point setting this slower than MaxAwait: the position can
-	// only advance when a poll finds the stream empty, so pacing publication
-	// below that rate just adds to what every fallback read waits for.
+	// There is no point setting this slower than MaxAwait: the position
+	// advances when a poll finds the stream empty, or on a stream that is
+	// never empty when the buffer is flushed, at most 100ms apart, so pacing
+	// publication below that rate just adds to what every fallback read waits
+	// for. See Feeder.dueToFlush for the stream that is never empty, which is
+	// the one this used to miss.
 	//
 	// This is what a read falling through to the archive waits on, so it sets
 	// that read's floor latency. It is deliberately separate from

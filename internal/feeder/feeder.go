@@ -146,6 +146,9 @@ type Feeder struct {
 	// lastPublished paces the position write, which is far more frequent than
 	// the checkpoint because a fallback read waits on it.
 	lastPublished time.Time
+	// pendingSince is when the oldest event in pending was buffered, and zero
+	// while pending is empty. See dueToFlush.
+	pendingSince time.Time
 
 	// warnedReserved remembers which namespaces have already been reported for
 	// carrying Thermocline's reserved field, so one application doing it does
@@ -659,7 +662,10 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			f.pace.reading += time.Since(readFrom)
 			f.pace.events++
 			f.lastToken = stream.ResumeToken()
-			if len(f.pending) >= f.cfg.BatchSize {
+			if len(f.pending) > 0 && f.pendingSince.IsZero() {
+				f.pendingSince = readFrom
+			}
+			if f.dueToFlush(time.Now()) {
 				writeFrom := time.Now()
 				if err := f.flushAndCheckpoint(ctx); err != nil {
 					return err
@@ -700,6 +706,45 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// busyFlushEvery is the longest an event waits in the buffer while the stream
+// is never quiet. See dueToFlush.
+const busyFlushEvery = 100 * time.Millisecond
+
+// dueToFlush says the buffer should go to the archive now, before the stream
+// has gone quiet.
+//
+// A full batch always goes. What was missing is the other bound. The buffer
+// was otherwise written only when a poll came back empty, and a stream that is
+// never empty for max_await is not an idle one: it is a feeder with work to do
+// and a buffer nothing was flushing. The position is published only after a
+// flush, so it stood still for as long as the batch took to fill, and at a
+// trickle that is seconds.
+//
+// A router reads a position that has not moved for two seconds as a feeder
+// that has stopped, and a stopped feeder turns the freshness barrier off, so
+// every read that fell through to the archive answered at once from an archive
+// that did not yet have the writes it was asked about. Measured on 2026-09-25
+// with a lone feeder and one insert about every fifteen milliseconds: the
+// position unchanged for up to 3,283ms. In a run with two applications behind
+// two routers it was 2,872ms, both routers gave up on the barrier in the same
+// millisecond, and the shops reported nine things wrong, all in that second: an
+// order placed and a count that did not move, a cancelled order that came back,
+// a committed transaction whose event could not be read.
+//
+// A hundred milliseconds is a small fraction of that two seconds and of what a
+// fall-through read is prepared to wait, and it leaves a busy feeder's batches
+// full: at the 2,000 to 3,700 events a second this deployment mirrors, a batch
+// of 500 fills first.
+func (f *Feeder) dueToFlush(now time.Time) bool {
+	if len(f.pending) == 0 {
+		return false
+	}
+	if len(f.pending) >= f.cfg.BatchSize {
+		return true
+	}
+	return !f.pendingSince.IsZero() && now.Sub(f.pendingSince) >= busyFlushEvery
 }
 
 // pipeline restricts the stream to the operations and namespaces we mirror.

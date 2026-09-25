@@ -277,6 +277,7 @@ func (f *Feeder) flush(ctx context.Context) error {
 	f.dropResidency(ctx, deleted)
 
 	f.pending = f.pending[:0]
+	f.pendingSince = time.Time{}
 	return nil
 }
 
