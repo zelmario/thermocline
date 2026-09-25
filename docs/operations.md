@@ -17,6 +17,13 @@ there is no suite for either shape, so a defect there would be found by whoever
 is running it rather than here. A sharded fast tier *is* refused, because the
 feeder tails it.
 
+A standalone archive also loses one guarantee, and the feeder says so the first
+time it matters. Mirroring writes each flush as one transaction on the archive,
+so a reader there never sees a write to one collection without an earlier write
+to another, such as an order's event without the order. A standalone mongod
+cannot run transactions, so there each collection is written on its own and, for
+the length of one flush, it can. A one-member replica set is enough to keep it.
+
 If you need one of those shapes, the work is a suite that keeps it honest, not a
 change to the code. See `docs/limitations.md`.
 

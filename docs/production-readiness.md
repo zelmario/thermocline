@@ -183,6 +183,35 @@ deployment does, and a fourth by reading, item 9 below, which measuring showed
 was two. The discovery rate has not fallen, and the shape of the finds has not
 changed: each needed two processes that each hold a view of the same state.
 
+## 2026-09-25, evening: the next store addition, and a join it did not ask about
+
+The addition was a consumer that falls further behind than the oplog, and
+recovers: told history is lost, it reads every order through the router and
+tails from where it noted, and what it keeps is judged against the tiers
+themselves. It found nothing wrong. Nine resyncs each in a six-minute run
+through two routers, the router passed history-lost every time, and both
+indexes matched the tiers exactly at 12,267 orders.
+
+The same run's activity report did find something. A `$lookup` from events to
+orders showed an event whose order did not exist, once. No state of either tier
+had held that: the shop writes the order first. **The feeder wrote each flush a
+collection at a time**, so for the length of one flush the archive could hold a
+later write to one collection without an earlier write to another, and the
+freshness barrier does not cover it, because it only promises everything up to
+the read's start. `test/crossns` measured it directly: four writers inserting an
+order then its event, the archive polled, **5,438 of 14,132** events seen without
+their order.
+
+Writing each flush in oplog order fixed it and cost 93% of mirroring on
+interleaved writes, 222 documents a second, because batching and a global order
+are at odds. A transaction per flush keeps the batching and removes the partial
+state. After: **0 sightings** in three runs, and mirroring faster rather than
+slower, an interleaved backlog at 10,327 to 11,117 a second against 3,096 to
+3,378 for the build before, because the archive's write concern is waited on
+once per flush instead of once per collection. A standalone archive cannot run
+transactions, so there it falls back and warns; that is written in
+`docs/operations.md`.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
