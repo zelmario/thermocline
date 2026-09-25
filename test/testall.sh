@@ -358,7 +358,12 @@ grep -q "level=DEBUG\|mirroring" $LOGDIR/t_feederv.log && { PASS=$((PASS+1)); ec
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 
 cline router --config $CFG --listen 0.0.0.0:$PALT --log-file $LOGDIR/t_router.log &
-RP=$!; sleep 4
+# Waited on rather than slept. A router's startup reads both tiers' catalogues
+# and says what differs, and under a four-worker sweep that took 4.35 seconds on
+# 2026-09-25, 1.9 of them on the pilot's sample datasets. A fixed four seconds
+# passed or failed by the box's load, not by whether --listen works.
+RP=$!
+for _ in $(seq 1 60); do grep -q "router listening.*:$PALT" $LOGDIR/t_router.log 2>/dev/null && break; sleep 0.5; done
 grep -q "$PALT" $LOGDIR/t_router.log && { PASS=$((PASS+1)); echo "  PASS  router --listen override"; } || { FAIL=$((FAIL+1)); FAILED+=("router --listen"); echo "  FAIL  router --listen override"; }
 mongosh --port $PALT -u dba -p secret --authenticationDatabase admin --quiet --eval 'db.getSiblingDB(process.env.TC_DB).orders.findOne()' >/dev/null 2>&1 \
   && { PASS=$((PASS+1)); echo "  PASS  router serves on the overridden port"; } || { FAIL=$((FAIL+1)); FAILED+=("router override serves"); echo "  FAIL  router serves on the overridden port"; }

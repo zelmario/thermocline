@@ -47,7 +47,12 @@ func TestShortDeleteKeepsTheNoticesItEarned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) }()
+	// A cleanup, not a defer. Deferred calls run when the test function
+	// returns and cleanups run after that, so a deferred disconnect closed the
+	// client every cleanup below was about to use: they failed silently and the
+	// collections stayed in the archive, where every router started since has
+	// warned about them. Registered first, it runs last.
+	t.Cleanup(func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) })
 
 	const ns = "tc_shortdelete.docs"
 	coll := cl.Database("tc_shortdelete").Collection("docs")
@@ -178,7 +183,12 @@ func TestEvictionEndsOnlyTheHoldsItJudged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) }()
+	// A cleanup, not a defer. Deferred calls run when the test function
+	// returns and cleanups run after that, so a deferred disconnect closed the
+	// client every cleanup below was about to use: they failed silently and the
+	// collections stayed in the archive, where every router started since has
+	// warned about them. Registered first, it runs last.
+	t.Cleanup(func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) })
 
 	const ns = "tc_holdend.docs"
 	coll := cl.Database("tc_holdend").Collection("docs")
@@ -188,7 +198,7 @@ func TestEvictionEndsOnlyTheHoldsItJudged(t *testing.T) {
 		c := context.WithoutCancel(ctx)
 		_ = coll.Drop(c)
 		_, _ = residency.DeleteMany(c, bson.D{{Key: "ns", Value: ns}})
-		_, _ = notices.DeleteMany(c, bson.D{})
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
 	})
 	if err := coll.Drop(ctx); err != nil {
 		t.Fatalf("drop: %v", err)
