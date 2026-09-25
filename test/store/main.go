@@ -112,6 +112,24 @@ type shop struct {
 	// that resumed by starting fresh cannot pass as a run that resumed.
 	lostHistory atomic.Int64
 
+	// part and parts say this process is one of several applications writing
+	// the same collections, and which one. Customers are partitioned across
+	// all of them the way they are across workers within one, so the count
+	// checks stay sound, but everything else is shared: the same orders
+	// collection, the same reference index, the same change stream.
+	//
+	// ledger is what makes the stream checkable then. A consumer sees every
+	// application's orders, and without a record of who placed what it would
+	// report the other application's every order as a phantom. Each
+	// application writes down what it is about to do before doing it, in a
+	// collection nothing tiers, so by the time an event arrives the entry that
+	// explains it is already there. An event no application wrote down is the
+	// phantom being looked for.
+	part, parts int
+	ledger      *mongo.Collection
+	foreignIns  atomic.Int64
+	foreignDel  atomic.Int64
+
 	// Violations are the point of the whole thing. Counted separately from
 	// errors, because an error is the system saying no and a violation is it
 	// saying something untrue.
@@ -161,6 +179,10 @@ func main() {
 	skipSeed := flag.Bool("skip-seed", false, "shop against what is already there")
 	snapshot := flag.String("snapshot", "", "the router's dashboard api, to attribute reads")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
+	part := flag.Int("part", 0, "which of -parts applications this is, from 0")
+	parts := flag.Int("parts", 1, "applications writing these same collections at once")
+	beganAt := flag.String("began", "",
+		"RFC 3339 instant every application agrees this run began, when -parts is above 1")
 	resumeEvery := flag.Duration("resume-every", 20*time.Second,
 		"restart the stream consumer from its stored token this often; 0 never restarts")
 	checkpointEvery := flag.Int("checkpoint-every", 10,
@@ -190,6 +212,25 @@ func main() {
 	// Before any of this run's own writes, so pageHistory's bound separates the
 	// seeded history from anything placed or cancelled while it scrolls.
 	s.began = time.Now()
+	if *parts < 1 || *part < 0 || *part >= *parts {
+		die("-part %d of -parts %d names no application", *part, *parts)
+	}
+	s.part, s.parts = *part, *parts
+	if s.parts > 1 {
+		s.ledger = d.Collection("store_ledger")
+		// One bound for every application, or pageHistory's stable slice is
+		// not stable: an application that started earlier places orders
+		// before this one's own start and cancels them after it, and the
+		// pages move under a skip with nothing wrong.
+		if *beganAt == "" {
+			die("-parts %d needs -began, the instant all of them agree the run began", s.parts)
+		}
+		t, err := time.Parse(time.RFC3339Nano, *beganAt)
+		if err != nil {
+			die("-began: %v", err)
+		}
+		s.began = t
+	}
 
 	if !*skipSeed {
 		fmt.Printf("stocking the shop: %s products, %s customers, %s orders over %d days\n",
@@ -294,8 +335,14 @@ func main() {
 // that check fail with nothing wrong. A false alarm here is worse than no
 // alarm, because it would train us to ignore the real ones.
 func (s *shop) shop(ctx context.Context, rng *rand.Rand, rounds, w, conc int) {
+	// Across applications as well as workers: worker w of application p owns
+	// the customers congruent to p*conc+w modulo conc*parts.
+	stride, base := conc*s.parts, s.part*conc+w
+	if base >= s.nCustomers {
+		die("%d customers cannot be shared among %d shoppers", s.nCustomers, stride)
+	}
 	mine := func() string {
-		k := rng.Intn((s.nCustomers-w+conc-1)/conc)*conc + w
+		k := rng.Intn((s.nCustomers-base+stride-1)/stride)*stride + base
 		return fmt.Sprintf("c%06d", k)
 	}
 	// What this worker has placed and not yet cancelled. Picking a customer at
@@ -457,6 +504,7 @@ func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust stri
 	total := math.Round(float64(100+rng.Intn(9000))) / 100
 
 	s.wrote.Store(id.Hex(), true)
+	s.intend(ctx, "insert", id)
 	committed := false
 	s.timed("place an order and its event in one transaction", func() error {
 		_, terr := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
@@ -560,6 +608,7 @@ func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOr
 	})
 
 	s.removed.Store(victim.id.Hex(), true)
+	s.intend(ctx, "delete", victim.id)
 	deleted := false
 	s.timed("cancel an order", func() error {
 		res, err := s.orders.DeleteOne(ctx, bson.D{{Key: "_id", Value: victim.id}})
@@ -707,6 +756,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) (rec
 	// Taken back below if the write is refused, because an id recorded for a
 	// write that never happened reads as an event the stream lost.
 	s.wrote.Store(id.Hex(), true)
+	s.intend(ctx, "insert", id)
 	placed := false
 	s.timed("place an order", func() error {
 		_, err := s.orders.InsertOne(ctx, bson.D{
@@ -1198,7 +1248,7 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 				s.replayed.Add(1)
 			}
 			s.seenInsert.Store(id, true)
-			if _, ours := s.wrote.Load(id); !ours {
+			if _, ours := s.wrote.Load(id); !ours && !s.foreign(ctx, "insert", id, &s.foreignIns) {
 				// Seeded orders are written before the consumer starts, so an
 				// insert for one of those is a document arriving on the fast
 				// tier rather than an order being placed.
@@ -1209,7 +1259,7 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 				s.replayed.Add(1)
 			}
 			s.seenDelete.Store(id, true)
-			if _, ours := s.removed.Load(id); !ours {
+			if _, ours := s.removed.Load(id); !ours && !s.foreign(ctx, "delete", id, &s.foreignDel) {
 				s.violation("the stream reported an order cancelled that nobody cancelled: %s", id)
 			}
 		}
@@ -1237,7 +1287,7 @@ func (s *shop) loadToken(ctx context.Context) (bson.Raw, bool) {
 		Token bson.Raw `bson:"token"`
 	}
 	err := s.db.Collection("stream_state").FindOne(ctx,
-		bson.D{{Key: "_id", Value: "indexer"}}).Decode(&doc)
+		bson.D{{Key: "_id", Value: s.consumerID()}}).Decode(&doc)
 	if err != nil || len(doc.Token) == 0 {
 		return nil, false
 	}
@@ -1246,7 +1296,7 @@ func (s *shop) loadToken(ctx context.Context) (bson.Raw, bool) {
 
 func (s *shop) saveToken(ctx context.Context, token bson.Raw) {
 	_, err := s.db.Collection("stream_state").UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: "indexer"}},
+		bson.D{{Key: "_id", Value: s.consumerID()}},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "token", Value: token}, {Key: "at", Value: time.Now()}}}},
 		options.UpdateOne().SetUpsert(true))
@@ -1257,7 +1307,53 @@ func (s *shop) saveToken(ctx context.Context, token bson.Raw) {
 
 func (s *shop) clearToken(ctx context.Context) {
 	_, _ = s.db.Collection("stream_state").DeleteOne(ctx,
-		bson.D{{Key: "_id", Value: "indexer"}})
+		bson.D{{Key: "_id", Value: s.consumerID()}})
+}
+
+// consumerID is where this application's consumer keeps its token. Each
+// application has a consumer of its own, and two sharing one row would resume
+// from each other's positions.
+func (s *shop) consumerID() string {
+	if s.parts > 1 {
+		return fmt.Sprintf("indexer-%d", s.part)
+	}
+	return "indexer"
+}
+
+// intend writes down what this application is about to do to an order, before
+// doing it, so another application's consumer can tell it from a phantom.
+//
+// Before, and never after: an entry written once the write returns would race
+// the event the write produces, and the other consumer would read that race as
+// a phantom. Left in place if the write then fails, because an entry for
+// something that did not happen can only ever excuse an event that did not
+// arrive, and one that did happen after reporting an error must be excused.
+func (s *shop) intend(ctx context.Context, op string, id bson.ObjectID) {
+	if s.ledger == nil {
+		return
+	}
+	_, err := s.ledger.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: op + ":" + id.Hex()}, {Key: "part", Value: s.part}})
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		s.errs.Add(1)
+	}
+}
+
+// foreign says an event this application did not cause was caused by another
+// one sharing the collection, and counts it.
+func (s *shop) foreign(ctx context.Context, op, id string, n *atomic.Int64) bool {
+	if s.ledger == nil {
+		return false
+	}
+	var e struct {
+		Part int `bson:"part"`
+	}
+	err := s.ledger.FindOne(ctx, bson.D{{Key: "_id", Value: op + ":" + id}}).Decode(&e)
+	if err != nil || e.Part == s.part {
+		return false
+	}
+	n.Add(1)
+	return true
 }
 
 // isHistoryLost says the resume token names a position the oplog no longer
@@ -1353,6 +1449,12 @@ func (s *shop) report(elapsed time.Duration) {
 		fmt.Printf(", %d token(s) older than the oplog", lost)
 	}
 	fmt.Print("\n")
+	// Printed for the same reason. A shared run whose consumer saw nothing of
+	// the other application proves nothing about sharing a stream.
+	if s.parts > 1 {
+		fmt.Printf("shared: application %d of %d, the stream carried %d insert(s) and %d delete(s) of the others'\n",
+			s.part, s.parts, s.foreignIns.Load(), s.foreignDel.Load())
+	}
 
 	fmt.Printf("\nerrors: %d\n", s.errs.Load())
 	if v := s.violations.Load(); v == 0 {

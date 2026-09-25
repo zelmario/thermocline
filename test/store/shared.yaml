@@ -1,0 +1,66 @@
+# Two applications writing the same collections, each through a router of its
+# own, sharing one pair of tiers.
+#
+# two.yaml gives each application its own database, and says why: two writers
+# on one customer's orders would break the count checks by racing them. This is
+# the test it left to whoever wrote it. The shop partitions customers across
+# both applications as it does across workers, so the checks stay sound, and
+# everything else is shared: one orders collection, one reference index, one
+# change stream, and two routers each holding its own claim cache, its own
+# listing of unique indexes and its own copy-ups in flight.
+#
+# The second router is this file with its two ports moved; shared.sh derives it.
+hot:
+  uri: "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin"
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+meta:
+  db: "_thermocline_shared"
+
+feeder:
+  id: "shared"
+  namespaces:
+    - "shopC.orders"
+    - "shopC.order_events"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 20ms
+  unannounced_deletes: tombstone
+
+evictor:
+  feeder_id: "shared"
+  rate: 2000
+  batch_size: 200
+  max_feeder_lag: 30s
+  rules:
+    - ns: "shopC.orders"
+      older_than: 20m
+    - ns: "shopC.order_events"
+      older_than: 20m
+  backoff:
+    min_oplog_window: 1m
+
+warmer:
+  rate: 2000
+  batch_size: 200
+  residency: 2m
+  rules:
+    # Inside the eviction cutoff, not past it. A warm reaching further back than
+    # older_than copies the band between them up and has the evictor take it
+    # away again, indefinitely, and the router says so at startup.
+    - ns: "shopC.orders"
+      back: 15m
+  backoff:
+    min_oplog_window: 1m
+
+router:
+  # Clear of every port the suites and the pilot use.
+  listen: "0.0.0.0:27700"
+  dashboard: "0.0.0.0:27710"
+  completeness: archive
+  residency: 2m
+  archive_wait: 5s
