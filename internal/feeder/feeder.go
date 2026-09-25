@@ -159,6 +159,11 @@ type Feeder struct {
 	// index put in the state the config asks for. One namespace is one round
 	// trip per feeder run, and only namespaces that actually tombstone.
 	ttlSettled map[string]bool
+
+	// noTxn is set once the archive has refused a transaction for not being a
+	// replica set, and flushes are written one namespace at a time from then on.
+	// See writeFlush.
+	noTxn bool
 }
 
 // withdrawCompleteness drops the fast tier's completeness claim for ns.

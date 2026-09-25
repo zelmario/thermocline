@@ -241,11 +241,12 @@ func (f *Feeder) flush(ctx context.Context) error {
 
 	bulkFrom := time.Now()
 	defer func() { f.pace.bulk += time.Since(bulkFrom) }()
+	results, err := f.writeFlush(ctx, order, byNS, opsByNS, now)
+	if err != nil {
+		return err
+	}
 	for _, ns := range order {
-		res, err := f.writeBatch(ctx, ns, byNS[ns], opsByNS[ns], now)
-		if err != nil {
-			return fmt.Errorf("mirror %s: %w", ns, err)
-		}
+		res := results[ns]
 		f.log.Debug("mirrored",
 			"ns", ns,
 			"upserted", res.UpsertedCount,
@@ -700,35 +701,7 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 			return res, nil
 		}
 		if i, dup, ok := refusedByUniqueIndex(err, ops); ok {
-			f.log.Error("the archive refuses a document the fast tier accepted, leaving it unmirrored",
-				"ns", ns,
-				"id", dup.id.String(),
-				"err", dup.msg,
-				"reason", "another live document in the archive already holds this unique value",
-				"effect", "the archive does not hold this document, and the evictor will not remove it "+
-					"from the fast tier; every read of this namespace that falls through to the "+
-					"archive is refused while this stands, because answering would leave the "+
-					"document out, and a lookup by _id still finds it on the fast tier",
-				"action", "resolve the duplicate, then re-run the write; cline preflight lists every "+
-					"document in this state, with the index and the colliding key",
-				"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
-			f.counters.unmirrorable++
-			// Recorded where a reader can see it, not only in this log.
-			//
-			// The archive being a superset of the fast tier is what makes a
-			// fall-through read correct, and this document is the one state in
-			// which it is not. A router reading this row refuses the reads that
-			// would be short by it, rather than answering them short with ok:1.
-			// A failure to write the row is logged and nothing more: mirroring
-			// every other namespace is worth more than this record, and the
-			// next write of the same document tries again.
-			f.noteUnmirrored(ns)
-			if rerr := meta.RecordUnmirrored(ctx, f.cold, ns, dup.id, dup.msg, now); rerr != nil {
-				f.log.Error("could not record the document the archive refuses",
-					"ns", ns, "id", dup.id.String(), "err", rerr,
-					"effect", "a read that falls through to the archive is short by this document "+
-						"and nothing will refuse it")
-			}
+			f.refuse(ctx, ns, dup, now)
 			models = append(models[:i:i], models[i+1:]...)
 			ops = append(ops[:i:i], ops[i+1:]...)
 			if len(models) == 0 {
@@ -764,6 +737,40 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 //
 // It costs nothing in the ordinary case: the set of namespaces with such rows
 // is empty, and this asks only about the ones in it.
+// refuse records a document the archive's unique index will not take, which
+// no retry can fix. See writeBatch.
+func (f *Feeder) refuse(ctx context.Context, ns string, dup refusedDoc, now time.Time) {
+	f.log.Error("the archive refuses a document the fast tier accepted, leaving it unmirrored",
+		"ns", ns,
+		"id", dup.id.String(),
+		"err", dup.msg,
+		"reason", "another live document in the archive already holds this unique value",
+		"effect", "the archive does not hold this document, and the evictor will not remove it "+
+			"from the fast tier; every read of this namespace that falls through to the "+
+			"archive is refused while this stands, because answering would leave the "+
+			"document out, and a lookup by _id still finds it on the fast tier",
+		"action", "resolve the duplicate, then re-run the write; cline preflight lists every "+
+			"document in this state, with the index and the colliding key",
+		"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
+	f.counters.unmirrorable++
+	// Recorded where a reader can see it, not only in this log.
+	//
+	// The archive being a superset of the fast tier is what makes a
+	// fall-through read correct, and this document is the one state in
+	// which it is not. A router reading this row refuses the reads that
+	// would be short by it, rather than answering them short with ok:1.
+	// A failure to write the row is logged and nothing more: mirroring
+	// every other namespace is worth more than this record, and the
+	// next write of the same document tries again.
+	f.noteUnmirrored(ns)
+	if rerr := meta.RecordUnmirrored(ctx, f.cold, ns, dup.id, dup.msg, now); rerr != nil {
+		f.log.Error("could not record the document the archive refuses",
+			"ns", ns, "id", dup.id.String(), "err", rerr,
+			"effect", "a read that falls through to the archive is short by this document "+
+				"and nothing will refuse it")
+	}
+}
+
 func (f *Feeder) clearUnmirrored(ctx context.Context, ns string, ops []pendingOp) {
 	if !f.hasUnmirrored(ns) {
 		return
