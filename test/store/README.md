@@ -123,6 +123,48 @@ the cluster time of the poll's post-batch resume token, which is MongoDB saying
 newest `operationTime` the fast tier has reported. This check is still the one
 that would catch it again, and it is the only thing that ever saw it.
 
+## Two applications, one shop, two routers
+
+`two.sh` gives each application its own database. A deployment with more than
+one app server runs one router per server in front of the same collections, and
+everything a router holds for itself is then something the other cannot see: its
+claim cache, its listing of unique indexes, and the copy-ups it has in flight.
+
+    bash test/store/shared.sh
+    FOR=1h bash test/store/shared.sh
+
+Both applications shop in `shopC`, each through its own router, one of them as a
+`readWrite` account rather than a superuser. Customers are partitioned across
+both with `-part` and `-parts` exactly as they are across the shoppers of one, so
+the count checks stay sound. Each shop writes down what it is about to do in
+`shopC.store_ledger` before doing it, so its stream consumer can tell the other
+application's orders from phantoms, and the run fails if either consumer saw none
+of the other's, because sharing that never happened proves nothing.
+
+**The control, run first, as always.** Both applications straight at the fast
+tier with no router and no tiering: 0 errors and 0 violations, and each consumer
+saw 125 and 135 of the other's orders.
+
+**What the first runs found, on 2026-09-25.** Three things, in the order they
+came out.
+
+- **A busy feeder published nothing.** It wrote its buffer when a batch filled
+  or the stream went quiet for `max_await`, and a stream that is never quiet for
+  20ms had no time bound at all. The position stood still for up to 6,497ms on a
+  lone feeder at about 65 inserts a second, a router reads two seconds as a
+  feeder that has stopped, and a stopped feeder turns the freshness barrier off.
+  Both routers gave up on it in the same millisecond, and each shop reported
+  three placements its own count did not include.
+- **The evictor ended a hold it never judged.** It checks holds when it chooses a
+  batch and ends them after the delete, and a router can place one in between.
+  Ending it told both routers the other's copy-up was the application writing the
+  order again, and both shops were shown two seeded orders as new.
+- **A read gave up on a feeder that was only paused.** This box stops every
+  process in node0 for about 2.6 seconds now and then, the feeder included, and
+  the router judged it stopped at two seconds while its read was prepared to wait
+  five. A quiet position now waits out `archive_wait` before it is called
+  stopped.
+
 ## Three ways to write a check that lies
 
 All of these were made here, and all produce failures that look exactly like a

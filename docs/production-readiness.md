@@ -139,6 +139,50 @@ procedure to its end, and a workload doing one more thing a real application
 does. Neither was a new kind of test. Both were the existing tests asked to
 finish the job.
 
+## 2026-09-25: three more, from a second router
+
+The next store addition had to be chosen rather than taken, and the choice was
+the shape every deployment with two app servers has: two applications writing
+the same collections, each through a router of its own. `test/store/shared.sh`.
+Its control against plain MongoDB was clean. Its first run through the routers
+was not, and neither were the next three. Each defect below was measured before
+it was fixed and measured again after.
+
+**A feeder that is never idle published nothing.** It wrote its buffer when 500
+events had arrived or the stream had been quiet for 20ms. A stream carrying two
+shops, a warmer and an evictor is never quiet for 20ms, so the position stood
+still for as long as a batch took to fill. Measured on a lone feeder at about 65
+inserts a second: gaps of 3,626ms, 4,078ms and 6,497ms in three runs before the
+fix, none over 208ms in four runs after, apart from the pauses of the whole
+node described two paragraphs down. A router calls two seconds without a
+publication a stopped feeder and stops waiting for mirroring, and each shop
+reported three placed orders its own count did not include. The buffer is
+written within 100ms now whatever the stream is doing.
+
+**The evictor ended a hold it had never judged.** It checks holds when it
+chooses a batch and ends them once the delete is done, and a router can place a
+hold in between. The oplog gave the order to the millisecond: a hold at 27.754,
+the eviction at 27.794, the hold ended at 27.822, the other router's copy-up at
+27.833. Both routers then read the copy-up as the application writing the order
+again, and both shops were shown two seeded orders as orders just placed. The
+evictor ends only lapsed holds now, which are the ones its batch was chosen
+under. `TestEvictionEndsOnlyTheHoldsItJudged` failed before the change.
+
+**A read gave up on a feeder that was only paused.** This box stops every
+process in node0 for about 2.6 seconds now and then, and nothing in any mongod
+log says why. The router's read was prepared to wait five seconds and gave up on
+the feeder at two, so a pause shorter than the read's own patience produced six
+wrong answers in one second. A position quiet for less than `archive_wait` is
+now a feeder that is behind, and the read waits for it. A feeder that has really
+stopped costs one `archive_wait`, once. The warning says which of the two states
+it found, because "published no position at all" sent the diagnosis looking for
+a harness fault from the day before when the record was there.
+
+**What it says about the count.** Three more, from one more thing a real
+deployment does, and a fourth by reading, in item 9 below. The discovery rate
+has not fallen, and the shape of the finds has not changed: each needed two
+processes that each hold a view of the same state.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
@@ -162,7 +206,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Two of eight remain, and neither is code.**
+This is the whole list. Nothing else blocks. **Three of nine remain, and one of them is code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -342,6 +386,34 @@ This is the whole list. Nothing else blocks. **Two of eight remain, and neither 
   first covered the write commands and missed the aggregation ones, the second
   read an allow-list of three operators where the rule is about a name, and the
   third returned its refusal wearing a read failure's words.
+
+- [ ] **9. Two copy-ups of one document, and the loser withdraws the winner's
+  echo.** Found on 2026-09-25 by reading, while chasing the two-router defects
+  above, and **not yet observed end to end**, so what follows is the mechanism
+  and not a measurement.
+
+  A copy-up records residency, which announces an echo the first time, then
+  inserts. When the insert meets a duplicate key the fast tier already held the
+  document, so no echo is coming, and the promoter withdraws the announcement.
+  Two promoters racing on one archived document break that: two routers, or two
+  reads on one router, because nothing deduplicates copy-ups of the same `_id`.
+  The first records and announces, the second records and announces nothing
+  because the promotion is already open, the first inserts, and the second meets
+  the duplicate and withdraws the first one's echo.
+
+  The feeder then mirrors the copy-up back into the archive, which costs a write
+  and nothing else, and it writes down no position for it. A consumer reading
+  that insert within thirty seconds is fine: the record's `promotedAt` is inside
+  the window and the insert is hidden. One reading it later, which is any
+  consumer resuming after a deploy, is answered from the record's `echoed` list,
+  and if an earlier promotion of that document left a position there the answer
+  is exact and wrong: **the copy-up is delivered as an insert nobody made.**
+
+  A token per announcement does not close it, because the one that announced can
+  be the one that loses: the second promoter's insert can land first. What the
+  loser needs to know is whether the document was on the fast tier before anyone
+  announced, and neither promoter can tell that cheaply. What closes this item is
+  a reproduction first, then a fix measured against it.
 
 ## What 2026-09-21 added that an operator has to do
 
