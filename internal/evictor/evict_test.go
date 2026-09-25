@@ -150,3 +150,96 @@ func rawIDValue(t *testing.T, id bson.ObjectID) bson.RawValue {
 	}
 	return rv
 }
+
+// An eviction ends only the holds it evicted under, and a hold placed after the
+// batch was chosen is not one of them.
+//
+// The evictor checks holds when it chooses a batch and ends them after the
+// delete, and a router can copy a document up or refresh a lapsed hold in
+// between. Ending that hold says the document left the fast tier before the
+// router's copy-up put it back, so the copy-up's own insert reads as the
+// application writing the _id again and is handed to every change stream as an
+// order nobody placed. Measured on 2026-09-25 with two applications behind two
+// routers: a hold placed at 27.754, the evictor's delete at 27.794 and its end
+// at 27.822, the other router's copy-up at 27.833, and both applications shown
+// two seeded orders as new ones.
+//
+// Called with the batch the scan would have produced, for the reason the test
+// above gives: the window is between the scan and the delete.
+func TestEvictionEndsOnlyTheHoldsItJudged(t *testing.T) {
+	uri := os.Getenv("TC_TEST_COLD")
+	if uri == "" {
+		t.Skip("set TC_TEST_COLD to a tier URI to run the hold test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) }()
+
+	const ns = "tc_holdend.docs"
+	coll := cl.Database("tc_holdend").Collection("docs")
+	residency := cl.Database(meta.DB).Collection(meta.Residency)
+	notices := cl.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = coll.Drop(c)
+		_, _ = residency.DeleteMany(c, bson.D{{Key: "ns", Value: ns}})
+		_, _ = notices.DeleteMany(c, bson.D{})
+	})
+	if err := coll.Drop(ctx); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+
+	// lapsed is what the scan chose it under: a hold that is over. placed is a
+	// hold a router wrote after the scan, a copy-up two minutes long.
+	lapsed, placed := bson.NewObjectID(), bson.NewObjectID()
+	now := time.Now().UTC()
+	hold := map[bson.ObjectID]time.Time{lapsed: now.Add(-time.Minute), placed: now.Add(2 * time.Minute)}
+	var cands []candidate
+	for _, id := range []bson.ObjectID{lapsed, placed} {
+		raw := rawIDValue(t, id)
+		c := candidate{id: raw, docID: meta.DocID(ns, raw)}
+		cands = append(cands, c)
+		if _, err := coll.InsertOne(ctx, bson.D{{Key: "_id", Value: id}}); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if _, err := residency.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: c.docID}, {Key: "ns", Value: ns}, {Key: "doc", Value: id},
+			{Key: "promotedAt", Value: hold[id].Add(-2 * time.Minute)},
+			{Key: "hotUntil", Value: hold[id]},
+			{Key: "expiresAt", Value: hold[id].Add(time.Hour)},
+		}); err != nil {
+			t.Fatalf("residency: %v", err)
+		}
+	}
+
+	e := &Evictor{
+		hot:  cl,
+		cold: cl,
+		cfg:  config.EvictorConfig{FeederID: "test"},
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := e.evict(ctx, ns, coll, cands); err != nil {
+		t.Fatalf("evict: %v", err)
+	}
+
+	ended := func(c candidate) bool {
+		var rec struct {
+			Ended *time.Time `bson:"endedAt"`
+		}
+		if err := residency.FindOne(ctx, bson.D{{Key: "_id", Value: c.docID}}).Decode(&rec); err != nil {
+			t.Fatalf("read residency: %v", err)
+		}
+		return rec.Ended != nil
+	}
+	if !ended(cands[0]) {
+		t.Error("the hold the eviction was chosen under was not ended; a late consumer cannot tell the copy-up's insert from a new one")
+	}
+	if ended(cands[1]) {
+		t.Error("a hold placed after the batch was chosen was ended by the eviction; the copy-up that placed it reaches change streams as an insert nobody made")
+	}
+}

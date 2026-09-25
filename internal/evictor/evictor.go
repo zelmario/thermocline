@@ -623,9 +623,34 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	// is the bound the row already had once the application deleted a document,
 	// and it is a minute where it used to be nothing at all.
 	//
+	// Only the holds that have lapsed, because those are the ones this batch
+	// was chosen under. The holds were checked when the batch was scanned, and
+	// a router can copy one of these documents up, or refresh a lapsed hold,
+	// between that check and here. Its hold is then running, and it is not this
+	// eviction's to end: ending it says the document left the fast tier before
+	// the router's copy-up put it back, so the copy-up's own insert reads as the
+	// application writing that _id again.
+	//
+	// Measured on 2026-09-25 with two applications behind two routers: a hold
+	// placed at 27.754, this delete at 27.794 and this update at 27.822, the
+	// other router's copy-up at 27.833, and both applications' change streams
+	// shown two seeded orders as orders just placed.
+	//
+	// A running hold left open is what the router's copy-up needed. The
+	// document has gone and will be copied up again, which costs a read, and
+	// its insert falls inside the promotion that record describes.
+	//
+	// Judged on the archive's clock, which is the one hotUntil was written in.
+	//
 	// Failing here is untidy rather than dangerous, so it only warns.
 	if _, err := e.cold.Database(meta.DB).Collection(meta.Residency).UpdateMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{
+			{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
+			{Key: "$or", Value: bson.A{
+				bson.D{{Key: "hotUntil", Value: bson.D{{Key: "$exists", Value: false}}}},
+				bson.D{{Key: "$expr", Value: bson.D{{Key: "$lte", Value: bson.A{"$hotUntil", "$$NOW"}}}}},
+			}},
+		},
 		meta.HoldIsOver(time.Now().UTC())); err != nil {
 		e.log.Warn("could not end the residency records of evicted documents", "ns", ns, "err", err)
 	}
