@@ -104,3 +104,24 @@ func TestABusyStreamFlushesWithoutFillingABatch(t *testing.T) {
 		t.Error("a full batch was not flushed at once")
 	}
 }
+
+// A flush is one transaction on the archive, so it is bounded in bytes as well
+// as in count and time. 500 documents could otherwise be gigabytes held in the
+// archive's cache until the commit.
+func TestAFlushIsBoundedInBytes(t *testing.T) {
+	f := testFeeder()
+	f.cfg.BatchSize = 500
+	now := time.Now()
+	f.pendingSince = now
+	big := make(bson.Raw, 16<<20)
+	for i := 0; i < 3; i++ {
+		f.pending = append(f.pending, pendingOp{doc: big})
+	}
+	if f.dueToFlush(now) {
+		t.Fatal("48MB of three documents was flushed before the byte bound")
+	}
+	f.pending = append(f.pending, pendingOp{doc: big})
+	if !f.dueToFlush(now) {
+		t.Error("64MB of four documents waited for more; one transaction would grow without bound")
+	}
+}

@@ -708,6 +708,10 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 // is never quiet. See dueToFlush.
 const busyFlushEvery = 100 * time.Millisecond
 
+// flushBytes is the most document data one flush carries, and so the largest
+// transaction the archive is asked to commit. See writeFlush and dueToFlush.
+const flushBytes = 64 << 20
+
 // dueToFlush says the buffer should go to the archive now, before the stream
 // has gone quiet.
 //
@@ -738,6 +742,21 @@ func (f *Feeder) dueToFlush(now time.Time) bool {
 		return false
 	}
 	if len(f.pending) >= f.cfg.BatchSize {
+		return true
+	}
+	// A size as well as a count, since a flush became one transaction. The
+	// archive has to hold a transaction's writes in its cache until it
+	// commits, and 500 documents can be anything up to 8GB. The time bound
+	// above happens to keep a flush small on this box, where 1.6GB of 4MB
+	// documents mirrored in 26 seconds a few documents per flush, but that is
+	// the box's throughput and not a limit: one getMore hands over 16MB at once.
+	// Summed here rather than kept as a running total, because a buffer of at
+	// most a batch is cheap to walk and a total is one more thing to keep right.
+	size := 0
+	for _, op := range f.pending {
+		size += len(op.doc)
+	}
+	if size >= flushBytes {
 		return true
 	}
 	return !f.pendingSince.IsZero() && now.Sub(f.pendingSince) >= busyFlushEvery
