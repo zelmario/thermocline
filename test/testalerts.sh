@@ -237,6 +237,19 @@ docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.d
 docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null 2>&1
 docker exec -d $NODE cline feeder --config $CFG --log-file /var/log/cline/alerts_f.log
 sleep 4
+# Prometheus has to have seen the counter at zero before the refusal, or the
+# counter rule below has nothing to fire on. increase() measures a rise between
+# two scrapes, and a series whose first scraped value is already 1 has none. The
+# scrape is every five seconds and the feeder was given four, so whether the
+# rule could fire was a coin toss: it read inactive on 2026-09-25 with the gauge
+# rule beside it firing and the router reporting the state. Waited on, not
+# slept, for the reason two.sh waits on positions: wait on what gates you.
+UNM='query?query=thermocline_daemon_documents_total%7Boutcome%3D%22unmirrorable%22%7D'
+for _ in $(seq 1 30); do
+  PQ "$UNM" | grep -q '"value":\[[0-9.]*,"0"\]' && break
+  sleep 2
+done
+PQ "$UNM" | grep -q '"value":\[[0-9.]*,"0"\]' || echo "      (Prometheus never saw the feeder's unmirrorable counter at zero; the counter rule below cannot fire)"
 docker exec $NODE mongosh "$HOT" --quiet --eval "
   const c = db.getSiblingDB('shop').$ANS;
   c.insertOne({_id:1,code:'A'}); c.insertOne({_id:2,code:'A'})" >/dev/null 2>&1
