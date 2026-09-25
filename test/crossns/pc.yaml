@@ -1,0 +1,22 @@
+# test/crossns: a feeder of its own, nothing else.
+hot:
+  uri: "mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin"
+cold:
+  uri: "mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin"
+
+log:
+  file: ""
+
+meta:
+  db: "_thermocline_pc"
+
+feeder:
+  id: "pc"
+  namespaces:
+    - "probecross.orders"
+    - "probecross.events"
+  checkpoint_every: 1s
+  batch_size: 500
+  max_await: 20ms
+  unannounced_deletes: tombstone
+
