@@ -242,6 +242,33 @@ indexes exact against the tiers at 13,475 orders.
 defects, both about the same claim: what the archive is allowed to be assumed
 to hold. The discovery rate has not fallen.
 
+## 2026-09-26, early: every reader of the archive, not only the reads
+
+The copy-up defect of the night before was one reader of the archive missing
+the freshness barrier. So every place the router reads application documents
+from the archive was listed and asked the same question, and four more were
+deciding something from an archive that had not yet been told about a delete.
+Each was measured through a router against MongoDB's answer, before and after:
+
+| decision | before | after |
+|---|---|---|
+| an `_id` or unique value re-used after its delete, refused | 20/20 | 0/20 |
+| a case-insensitive unique value re-used, refused | 15/15 | 0/15 |
+| a delete by filter, leaving the wrong document | 15/15 | 0/15 |
+| an update event's document older than the update | 13/20 | 0/20 |
+| a warm copying back documents deleted while mirroring lagged | 25/25 | 0/25 |
+
+The waits are only on the paths that needed them: before a refusal, when the
+fast tier matched nothing, when its lookup came back null. The warmer waits per
+batch, and had skipped the check on the grounds that "it only adds to the fast
+tier"; with no feeder it now stops rather than warm, and `--without-feeder` is
+the explicit override for a fast tier refilled with nothing deleting. Each has a check in
+`testfresh` or `testchange` that fails on the build before.
+
+**What it says.** Six of the day's defects were one missing guard in six
+places. The list of places that read the archive is now written down in the
+commit, and a new one has to be added to it.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
