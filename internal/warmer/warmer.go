@@ -476,7 +476,7 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 				"effect", "this rule stops here for this run and resumes on the next one")
 			return stats, nil
 		}
-		docs, err := w.read(ctx, rule.NS, filter, scanSort(rule))
+		docs, cut, err := w.read(ctx, rule.NS, filter, scanSort(rule))
 		if err != nil {
 			return stats, err
 		}
@@ -542,7 +542,8 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 				"target", floor.UTC().Format(time.RFC3339))
 		}
 
-		if len(docs) < w.cfg.BatchSize {
+		// Short and not cut for size: the range has run out. See read.
+		if len(docs) < w.cfg.BatchSize && !cut {
 			if !w.dryRun {
 				if err := w.claimComplete(ctx, rule, floor); err != nil {
 					return stats, err
@@ -562,33 +563,52 @@ type sourceDoc struct {
 }
 
 // read pulls one batch out of the archive, newest first.
-func (w *Warmer) read(ctx context.Context, ns string, filter bson.D, sort bson.D) ([]sourceDoc, error) {
+// warmBatchBytes bounds how much document data one batch holds. See read.
+const warmBatchBytes = 32 << 20
+
+// read fetches one batch from the archive, and reports whether it stopped
+// early because the batch reached warmBatchBytes rather than because the range
+// ran out.
+//
+// A batch was batch_size documents whatever their size, and all of it was held
+// at once. Measured on 2026-09-26: warming 60 documents of 12MB peaked at
+// 1,874MB, and the default batch of 200 near the 16MB limit is several times
+// that. Stopping early is only safe because the caller is told: the range is
+// exhausted when a batch comes back short, and a batch cut short by bytes is
+// not the end of anything. Read as the end, it would claim the fast tier
+// complete over documents never copied.
+func (w *Warmer) read(ctx context.Context, ns string, filter bson.D, sort bson.D) ([]sourceDoc, bool, error) {
 	db, coll := splitNS(ns)
 	cur, err := w.cold.Database(db).Collection(coll).Find(ctx, filter,
 		options.Find().
 			SetSort(sort).
 			SetLimit(int64(w.cfg.BatchSize)))
 	if err != nil {
-		return nil, fmt.Errorf("read archive %s: %w", ns, err)
+		return nil, false, fmt.Errorf("read archive %s: %w", ns, err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	var docs []sourceDoc
+	held := 0
 	for cur.Next(ctx) {
 		raw := append(bson.Raw(nil), cur.Current...)
 		id, err := raw.LookupErr("_id")
 		if err != nil {
-			return nil, fmt.Errorf("read archive %s: document without _id", ns)
+			return nil, false, fmt.Errorf("read archive %s: document without _id", ns)
 		}
 		docs = append(docs, sourceDoc{
 			id:  bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)},
 			raw: raw,
 		})
+		held += len(raw)
+		if held >= warmBatchBytes && len(docs) < w.cfg.BatchSize {
+			return docs, true, nil
+		}
 	}
 	if err := cur.Err(); err != nil {
-		return nil, fmt.Errorf("read archive %s: %w", ns, err)
+		return nil, false, fmt.Errorf("read archive %s: %w", ns, err)
 	}
-	return docs, nil
+	return docs, false, nil
 }
 
 // write copies a batch into the fast tier and records residency for it.
