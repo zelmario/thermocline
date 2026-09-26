@@ -561,6 +561,66 @@ stopDaemons
 stopGhost
 C "db.getSiblingDB(process.env.TC_META).positions.deleteOne({_id:'${FID}ghost'})" >/dev/null
 
+
+echo "== a copy-up waits for the delete it follows =="
+export COLD_URI="$COLD"
+# Every copy-up reads the archive, and none of them waited for mirroring the
+# way a read does. A document the application has just deleted is gone from the
+# fast tier at once and still live in the archive until its tombstone lands, so
+# an update of it by _id missed on the fast tier, copied the archive's copy up
+# and matched it: the delete was undone. Measured on 2026-09-25, forty of forty,
+# where MongoDB matches nothing. The two-router store run found it first, as a
+# transaction's warm putting back an order its own application had cancelled.
+stopDaemons
+startFeeder
+startRouter
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^cu-/})" >/dev/null
+OUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cold=new Mongo(process.env.COLD_URI).getDB(process.env.TC_DB).$NS;
+  let held=0, matched=0, back=0;
+  for (let i=0;i<20;i++) {
+    const id='cu-'+i;
+    c.insertOne({_id:id, v:1});
+    for (let k=0;k<100 && !cold.findOne({_id:id}); k++) sleep(20);
+    if (cold.findOne({_id:id, _tcDeletedAt:{\$exists:false}})) held++;
+    c.deleteOne({_id:id});
+    if (c.updateOne({_id:id},{\$set:{v:2}}).matchedCount > 0) matched++;
+    if (c.findOne({_id:id})) back++;
+  }
+  print(held+'/'+matched+'/'+back)")
+# The control first: each document was live in the archive when it was deleted,
+# which is the state a copy-up races. Without it the two zeros below prove
+# nothing.
+chk "the archive held each document live before its delete" "20" "${OUT%%/*}"
+chk "an update after a delete matches nothing"              "0"  "$(echo "$OUT" | cut -d/ -f2)"
+chk "and the deleted document stays deleted"                "0"  "$(echo "$OUT" | cut -d/ -f3)"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^cu-/})" >/dev/null
+
+echo "== a transaction bigger than one flush is claimed only when it is whole =="
+# Every operation of a transaction carries the commit's cluster time, and the
+# feeder used to claim an event's own time the moment it had written it. A flush
+# falling inside a transaction, at the 500-event batch limit here, then claimed
+# the commit with part of the transaction still unwritten, and a read waiting on
+# that commit cleared the barrier and answered from half of it. Measured on
+# 2026-09-25: 499 of 600 events, five rounds of five. The feeder's own position
+# is read here, because it is exactly the claim the router's barrier trusts.
+TXOUT=$(H "const s=db.getMongo().startSession();
+  const c=s.getDatabase(process.env.TC_DB).$NS;
+  const cold=new Mongo(process.env.COLD_URI);
+  const pos=cold.getDB(process.env.TC_META).positions;
+  let whole=0;
+  for (let r=0;r<3;r++) {
+    s.startTransaction();
+    for (let i=0;i<600;i++) c.insertOne({_id:'tx-'+r+'-'+i});
+    s.commitTransaction();
+    const t=s.getOperationTime();
+    for (let k=0;k<1000;k++) { const p=pos.findOne({_id:'test'}); if (p && p.ts && (p.ts.t>t.t || (p.ts.t==t.t && p.ts.i>=t.i))) break; sleep(5); }
+    if (cold.getDB(process.env.TC_DB).$NS.countDocuments({_id:{\$regex:'^tx-'+r+'-'}})==600) whole++;
+  }
+  print(whole)")
+chk "each time the position reached the commit, all 600 were in the archive" "3" "$TXOUT"
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^tx-/})" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

@@ -459,6 +459,47 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 	c.explainStale(ctx, started)
 }
 
+// copyUpIsFresh is the freshness barrier for a copy-up, which reads the
+// archive exactly as a fall-through read does and had never waited.
+//
+// A copy-up puts on the fast tier what the archive holds. A document the
+// application has just deleted is gone from the fast tier at once and still
+// live in the archive until the feeder writes its tombstone, so a copy-up in
+// between finds it, puts it back, and the delete is undone. Measured on
+// 2026-09-25: a document deleted through the router and then updated by _id,
+// forty times, and the update matched the deleted document forty times of
+// forty and brought it back, where MongoDB matches nothing. In the two-router
+// store run a transaction's warm did the same to an order its own application
+// had cancelled a second earlier, and the fast tier held a live order the
+// archive held tombstoned.
+//
+// The wait is the one a read makes, to the router's cluster time as the
+// copy-up begins, which covers every write already acknowledged through this
+// router, the delete included. Half the caller's own deadline at most, as for
+// a read, and on a timeout the copy-up goes ahead and is counted as a stale
+// read, because refusing the client's write over a slow feeder turns lag into
+// failures.
+func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Duration) {
+	if budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget/2)
+		defer cancel()
+	}
+	if r.waitForArchive(ctx, time.Now()) {
+		return
+	}
+	r.Stats.StaleReads.Add(1)
+	suppressed, say := r.noteStaleRead()
+	if !say {
+		return
+	}
+	r.log.Warn("copying up from the archive before mirroring caught up",
+		"ns", ns,
+		"waited", r.cfg.ArchiveWait.String(),
+		"suppressed_since_last", suppressed,
+		"effect", "a document deleted in the last moments may be copied back to the fast tier")
+}
+
 // noteStaleRead decides whether this stale read gets a log line, and reports how
 // many went unlogged since the last one did.
 //

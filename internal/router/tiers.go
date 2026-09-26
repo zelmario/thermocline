@@ -50,6 +50,7 @@ func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue, 
 // copyUp moves one document from the archive into the fast tier and protects it
 // from the next eviction sweep. It reports whether the document existed.
 func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool, error) {
+	r.copyUpIsFresh(ctx, ns, 0)
 	doc, found, err := r.readArchived(ctx, ns, id, "")
 	if err != nil || !found {
 		return false, err
