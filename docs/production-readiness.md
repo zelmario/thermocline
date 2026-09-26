@@ -269,6 +269,29 @@ the explicit override for a fast tier refilled with nothing deleting. Each has a
 places. The list of places that read the archive is now written down in the
 commit, and a new one has to be added to it.
 
+## 2026-09-26, morning: the evictor lost acknowledged writes
+
+The same question asked of the evictor, the one daemon that removes data from
+the fast tier: what does it prove before removing a document? That the archive
+holds the `_id`. A document updated a moment earlier has the previous version
+in the archive until the feeder mirrors the update, and evicting it removed the
+only copy of the new one. The feeder's lookup for the update came back empty
+and was skipped, because a delete was coming, and the delete that came was the
+eviction. **Twenty updates acknowledged to the client, one sweep, and the router
+answered the old value for all twenty.** The window in production is the
+mirroring lag the evictor tolerates, up to `max_feeder_lag`, 30 seconds.
+
+It evicts only a document whose archived copy is byte for byte the one on the
+fast tier now, and each delete insists on that document. After: all twenty
+kept. The sweep's own count said "evicted 20" for a sweep that had removed
+nothing, and counts what it removed now.
+
+**What it says.** The worst defect of the day, data loss rather than a wrong
+answer, and it sat in the daemon whose one job is to be safe about removing
+things. It was found by asking the question of the reader audit the other way
+round: not "does this read wait for the archive", but "what does this removal
+assume the archive already has".
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

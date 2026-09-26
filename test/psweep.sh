@@ -153,6 +153,16 @@ worker() {
       pkill -f "bash /root/$s.sh" 2>/dev/null
     fi
     [ -z "$line" ] && line="(no tally, rc=$rc)"
+    # A failed suite keeps its daemons' logs. They live in the worker's own
+    # directory and the next suite on that worker writes over them, so the
+    # evidence for a failure that does not reproduce was gone by the time
+    # anybody looked: testconform failed one check in a sweep on 2026-09-26,
+    # passed alone, under load and as a probe, and its router log had already
+    # been replaced. Copied, not moved, and only on failure.
+    if [ "$rc" != 0 ] && [ -d "$LOGDIR" ]; then
+      rm -rf "$OUT/$s.daemonlogs"
+      cp -r "$LOGDIR" "$OUT/$s.daemonlogs" 2>/dev/null
+    fi
     # One append per suite, and every line is written by a single printf, so the
     # writes are small enough that the kernel does not interleave them.
     printf '%-18s w%-2s rc=%-3s %4ss  %s\n' "$s" "$n" "$rc" "$secs" "$line" >> "$OUT/summary.txt"
