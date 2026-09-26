@@ -212,6 +212,36 @@ once per flush instead of once per collection. A standalone archive cannot run
 transactions, so there it falls back and warns; that is written in
 `docs/operations.md`.
 
+## 2026-09-25, night: the evictor and warmer at once
+
+Every store run had driven the warmer and one evictor sweep in turn from a
+single loop, which is not a shape any deployment has: the evictor is a resident
+daemon and the warmer an hourly timer beside it. Run that way, the first
+eight-minute two-router run found two defects, both silent wrong answers, and
+both measured before and after.
+
+**A copy-up undid a delete.** Every copy-up reads the archive, and none waited
+for mirroring the way a read does, so one landing between an application's
+delete and its tombstone found the document live and put it back. The store saw
+a cancelled order live on the fast tier a second later. Deleting a document
+through the router and then updating it by `_id` matched the deleted document
+**40 times of 40**, where MongoDB matches nothing. Copy-ups clear the read
+barrier now: 0 of 40.
+
+**The feeder claimed a transaction mirrored when half of it was.** Every
+operation of a transaction carries the commit's cluster time, the feeder
+claimed an event's own time as soon as it had written it, and a flush can fall
+inside a transaction. The barrier cleared on the commit's time with **499 of
+600** events in the archive, five rounds of five. An event now proves only the
+time before it: 600 of 600.
+
+After both, the same run: 0 violations in either application, both consumers'
+indexes exact against the tiers at 13,475 orders.
+
+**What it says.** One more thing the deployment really does, and two more
+defects, both about the same claim: what the archive is allowed to be assumed
+to hold. The discovery rate has not fallen.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
