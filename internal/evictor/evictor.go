@@ -11,6 +11,7 @@
 package evictor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -399,10 +400,14 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 		}
 
 		if len(out.evict) > 0 {
-			if err := e.evict(ctx, rule.NS, hotColl, out.evict); err != nil {
+			removed, err := e.evict(ctx, rule.NS, hotColl, out.evict)
+			if err != nil {
 				return stats, err
 			}
-			stats.Evicted += len(out.evict)
+			// What was removed, not what was offered: a document changed since it
+			// was mirrored is offered and stays, and counting it here reported
+			// twenty evicted by a sweep that had removed nothing.
+			stats.Evicted += removed
 			e.limiter.spend(ctx, len(out.evict))
 		}
 
@@ -539,10 +544,10 @@ func (e *Evictor) archived(ctx context.Context, ns string, cands []candidate, id
 // before the delete reaches the fast tier, so by the time the feeder observes
 // the delete the notice is already there to explain it. Reverse the two and
 // every eviction looks like an application delete.
-func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) error {
+func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) (int, error) {
 	if e.dryRun {
 		e.log.Info("would evict", "ns", ns, "count", len(docs))
-		return nil
+		return 0, nil
 	}
 
 	// Announce only what is actually there, so the announcements and the
@@ -557,13 +562,27 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	// two collections on the pilot, by the fix meant to stop exactly that.
 	present, err := e.presentOnFastTier(ctx, hotColl, docs)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(present) == 0 {
-		return nil
+		return 0, nil
+	}
+	current, err := e.currentInArchive(ctx, ns, present)
+	if err != nil {
+		return 0, err
+	}
+	if changed := len(present) - len(current); changed > 0 {
+		e.log.Info("not evicting documents changed since they were mirrored",
+			"ns", ns, "count", changed,
+			"reason", "the archive does not yet hold the version the fast tier does",
+			"effect", "they stay on the fast tier until a later sweep finds the archive caught up")
+	}
+	present = current
+	if len(present) == 0 {
+		return 0, nil
 	}
 	if err := e.announce(ctx, present); err != nil {
-		return err
+		return 0, err
 	}
 
 	ids := make([]bson.RawValue, len(present))
@@ -572,9 +591,21 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		ids[i] = d.id
 		docIDs[i] = d.docID
 	}
-	res, err := hotColl.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	// Each delete insists on the exact document the archive was compared
+	// against, so one changed in the moment since then is left alone rather
+	// than removed with only its older version archived. $literal because the
+	// document is the application's and a string in it starting with $ would
+	// otherwise be read as a field path.
+	models := make([]mongo.WriteModel, len(present))
+	for i, d := range present {
+		models[i] = mongo.NewDeleteOneModel().SetFilter(bson.D{
+			{Key: "_id", Value: d.id},
+			{Key: "$expr", Value: bson.D{{Key: "$eq", Value: bson.A{"$$ROOT", bson.D{{Key: "$literal", Value: d.doc}}}}}},
+		})
+	}
+	res, err := hotColl.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	if err != nil {
-		return fmt.Errorf("delete from fast tier %s: %w", ns, err)
+		return 0, fmt.Errorf("delete from fast tier %s: %w", ns, err)
 	}
 	e.log.Debug("evicted", "ns", ns, "deleted", res.DeletedCount)
 	if int(res.DeletedCount) < len(present) {
@@ -654,7 +685,7 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		meta.HoldIsOver(time.Now().UTC())); err != nil {
 		e.log.Warn("could not end the residency records of evicted documents", "ns", ns, "err", err)
 	}
-	return nil
+	return int(res.DeletedCount), nil
 }
 
 // presentOnFastTier narrows a batch to the documents the fast tier still holds.
@@ -666,22 +697,23 @@ func (e *Evictor) presentOnFastTier(ctx context.Context, hotColl *mongo.Collecti
 	for i, d := range docs {
 		ids[i] = d.id
 	}
+	// Whole documents, not only the _id: what the fast tier holds is what the
+	// archive's copy has to equal. See currentInArchive.
 	cur, err := hotColl.Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
 	if err != nil {
 		return nil, fmt.Errorf("check the fast tier before evicting: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	here := make(map[string]struct{}, len(docs))
+	here := make(map[string]bson.Raw, len(docs))
 	for cur.Next(ctx) {
 		id, derr := cur.Current.LookupErr("_id")
 		if derr != nil {
 			continue
 		}
 		raw := bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)}
-		here[meta.DocID(e.nsOf(docs), raw)] = struct{}{}
+		here[meta.DocID(e.nsOf(docs), raw)] = bson.Raw(append([]byte(nil), cur.Current...))
 	}
 	if err := cur.Err(); err != nil {
 		return nil, fmt.Errorf("check the fast tier before evicting: %w", err)
@@ -689,7 +721,58 @@ func (e *Evictor) presentOnFastTier(ctx context.Context, hotColl *mongo.Collecti
 
 	out := docs[:0:0]
 	for _, d := range docs {
-		if _, ok := here[d.docID]; ok {
+		if doc, ok := here[d.docID]; ok {
+			d.doc = doc
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+// currentInArchive narrows a batch to the documents whose archived copy is the
+// one the fast tier holds now, byte for byte.
+//
+// Confirming the archive holds a document by _id was not enough. A document
+// updated a moment ago has an older version in the archive until the feeder
+// mirrors the update, and evicting it then removed the only copy of the new
+// version: the feeder's lookup for the update event came back empty, it
+// skipped the event on the grounds that a delete was coming, and the delete
+// that came was the announced eviction. Measured on 2026-09-25 with the feeder
+// held back: twenty old documents each updated once through the router, one
+// sweep, and afterwards the router answered the old value for all twenty.
+// Twenty acknowledged writes, lost.
+//
+// Byte for byte because the archive's copy is the fast tier's document
+// replaced verbatim, so equal bytes are the same version, and anything else is
+// a version this eviction cannot prove the archive has. Those stay, and a
+// later sweep takes them once mirroring has caught up.
+func (e *Evictor) currentInArchive(ctx context.Context, ns string, docs []candidate) ([]candidate, error) {
+	db, coll := splitNS(ns)
+	ids := make([]bson.RawValue, len(docs))
+	for i, d := range docs {
+		ids[i] = d.id
+	}
+	cur, err := e.cold.Database(db).Collection(coll).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}, meta.NotArchivedDeleted()})
+	if err != nil {
+		return nil, fmt.Errorf("read the archive's copies before evicting: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	archived := make(map[string]bson.Raw, len(docs))
+	for cur.Next(ctx) {
+		id, derr := cur.Current.LookupErr("_id")
+		if derr != nil {
+			continue
+		}
+		raw := bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)}
+		archived[meta.DocID(ns, raw)] = bson.Raw(append([]byte(nil), cur.Current...))
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("read the archive's copies before evicting: %w", err)
+	}
+	out := docs[:0:0]
+	for _, d := range docs {
+		if a, ok := archived[d.docID]; ok && bytes.Equal(a, d.doc) {
 			out = append(out, d)
 		}
 	}

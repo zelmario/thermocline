@@ -102,7 +102,7 @@ func TestShortDeleteKeepsTheNoticesItEarned(t *testing.T) {
 		cfg:  config.EvictorConfig{FeederID: "test"},
 		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	if err := e.evict(ctx, ns, coll, cands); err != nil {
+	if _, err := e.evict(ctx, ns, coll, cands); err != nil {
 		t.Fatalf("evict: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestEvictionEndsOnlyTheHoldsItJudged(t *testing.T) {
 		cfg:  config.EvictorConfig{FeederID: "test"},
 		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	if err := e.evict(ctx, ns, coll, cands); err != nil {
+	if _, err := e.evict(ctx, ns, coll, cands); err != nil {
 		t.Fatalf("evict: %v", err)
 	}
 
@@ -251,5 +251,84 @@ func TestEvictionEndsOnlyTheHoldsItJudged(t *testing.T) {
 	}
 	if ended(cands[1]) {
 		t.Error("a hold placed after the batch was chosen was ended by the eviction; the copy-up that placed it reaches change streams as an insert nobody made")
+	}
+}
+
+// A document changed since it was mirrored stays on the fast tier, because the
+// archive does not yet hold the version it would be evicting.
+//
+// Confirming the archive held the _id was the whole check, and a document
+// updated a moment before its eviction lost the update: the fast tier's copy
+// went, the feeder's lookup for the update came back empty and was skipped,
+// and the archive kept the version from before. Measured on 2026-09-25, twenty
+// acknowledged updates lost to one sweep.
+//
+// Needs the two tiers to be different clusters, which the tests above do not.
+func TestEvictionLeavesADocumentChangedSinceMirrored(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two tiers to run the changed-document test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatalf("connect hot: %v", err)
+	}
+	t.Cleanup(func() { _ = hot.Disconnect(context.WithoutCancel(ctx)) })
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect cold: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_changed.docs"
+	hc := hot.Database("tc_changed").Collection("docs")
+	cc := cold.Database("tc_changed").Collection("docs")
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = hc.Drop(c)
+		_ = cc.Drop(c)
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+	_ = hc.Drop(ctx)
+	_ = cc.Drop(ctx)
+
+	same, changed := bson.NewObjectID(), bson.NewObjectID()
+	for _, d := range []struct {
+		id      bson.ObjectID
+		hot, cd string
+	}{{same, "as mirrored", "as mirrored"}, {changed, "after", "before"}} {
+		if _, err := hc.InsertOne(ctx, bson.D{{Key: "_id", Value: d.id}, {Key: "v", Value: d.hot}}); err != nil {
+			t.Fatalf("insert hot: %v", err)
+		}
+		if _, err := cc.InsertOne(ctx, bson.D{{Key: "_id", Value: d.id}, {Key: "v", Value: d.cd}}); err != nil {
+			t.Fatalf("insert cold: %v", err)
+		}
+	}
+	var cands []candidate
+	for _, id := range []bson.ObjectID{same, changed} {
+		raw := rawIDValue(t, id)
+		cands = append(cands, candidate{id: raw, docID: meta.DocID(ns, raw)})
+	}
+
+	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "test"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	removed, err := e.evict(ctx, ns, hc, cands)
+	if err != nil {
+		t.Fatalf("evict: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("evict removed %d, want 1: only the document the archive holds as it is", removed)
+	}
+	if n, _ := hc.CountDocuments(ctx, bson.D{{Key: "_id", Value: changed}}); n != 1 {
+		t.Error("a document changed since it was mirrored was evicted; its only current copy is gone")
+	}
+	if n, _ := hc.CountDocuments(ctx, bson.D{{Key: "_id", Value: same}}); n != 0 {
+		t.Error("a document identical to its archived copy was not evicted")
+	}
+	if n, _ := notices.CountDocuments(ctx, bson.D{{Key: "_id", Value: cands[1].docID}}); n != 0 {
+		t.Error("the changed document was announced as evicted, and the notice would answer for its next delete")
 	}
 }

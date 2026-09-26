@@ -14,6 +14,9 @@ import (
 type candidate struct {
 	id    bson.RawValue
 	docID string
+	// doc is the fast tier's copy, read at eviction time. See evict: it is
+	// what the archive's copy has to equal, and what the delete insists on.
+	doc bson.Raw
 }
 
 // candidateFilter builds the query that selects removable documents.
