@@ -40,6 +40,18 @@ import (
 // tier's own _id index is the whole answer and would have raised the error
 // itself.
 func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.Raw) ([]keyClash, error) {
+	out, err := r.archivedIDClashesNow(ctx, ns, docs)
+	if err != nil || len(out) == 0 {
+		return out, err
+	}
+	// About to refuse. Asked again once mirroring has caught up, because an _id
+	// deleted a moment ago is still live in the archive. See clashIsFresh.
+	r.clashIsFresh(ctx, ns)
+	return r.archivedIDClashesNow(ctx, ns, docs)
+}
+
+// archivedIDClashesNow is archivedIDClashes asked of the archive as it stands.
+func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bson.Raw) ([]keyClash, error) {
 	if mark, known := r.completeness(ctx, ns); known && mark.Claimed && mark.CoversAll() {
 		return nil, nil
 	}

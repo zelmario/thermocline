@@ -480,6 +480,35 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 // read, because refusing the client's write over a slow feeder turns lag into
 // failures.
 func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Duration) {
+	r.archiveIsFresh(ctx, ns, budget, "copying up from the archive before mirroring caught up",
+		"a document deleted in the last moments may be copied back to the fast tier")
+}
+
+// clashIsFresh is the same barrier for a write about to be refused because the
+// archive says its key is taken.
+//
+// The archive is asked whether an _id or a unique value is already held, and a
+// document the application deleted a moment ago is still live there until its
+// tombstone lands. Refusing on that answer turns a delete followed by a write
+// of the same key, which MongoDB accepts, into a duplicate key error. Measured
+// on 2026-09-25: a document deleted through the router and inserted again with
+// the same _id, refused twenty times of twenty, and the same for a unique value
+// re-used after its holder was deleted, where MongoDB refused neither once.
+//
+// Only on the way to a refusal, and then the question is asked again. The
+// clash is the rare case, and waiting before every check would put the barrier
+// on every insert into a collection the fast tier does not hold in full.
+func (r *Router) clashIsFresh(ctx context.Context, ns string) {
+	r.archiveIsFresh(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
+		"a key freed by a delete in the last moments may be refused as taken")
+}
+
+// archiveIsFresh waits for mirroring to reach this router's cluster time, the
+// way a fall-through read does, and says so when it gives up. Half the
+// caller's deadline at most; on a timeout the caller goes ahead and it is
+// counted as a stale read, because refusing work over a slow feeder turns lag
+// into failures.
+func (r *Router) archiveIsFresh(ctx context.Context, ns string, budget time.Duration, what, effect string) {
 	if budget > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget/2)
@@ -493,11 +522,11 @@ func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Durat
 	if !say {
 		return
 	}
-	r.log.Warn("copying up from the archive before mirroring caught up",
+	r.log.Warn(what,
 		"ns", ns,
 		"waited", r.cfg.ArchiveWait.String(),
 		"suppressed_since_last", suppressed,
-		"effect", "a document deleted in the last moments may be copied back to the fast tier")
+		"effect", effect)
 }
 
 // noteStaleRead decides whether this stale read gets a log line, and reports how

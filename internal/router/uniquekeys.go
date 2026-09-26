@@ -855,11 +855,21 @@ func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, ki
 		return true, hotErr
 	}
 
-	coldErr := r.cold.Database(db).Collection(coll).
-		FindOne(ctx, bson.D{
-			{Key: "_id", Value: claim.Doc},
-			meta.NotArchivedDeleted(),
-		}).Decode(&owner)
+	coldOwner := func() error {
+		return r.cold.Database(db).Collection(coll).
+			FindOne(ctx, bson.D{
+				{Key: "_id", Value: claim.Doc},
+				meta.NotArchivedDeleted(),
+			}).Decode(&owner)
+	}
+	coldErr := coldOwner()
+	if coldErr == nil {
+		// The owner is gone from the fast tier and live in the archive, which
+		// is also what a delete looks like before its tombstone lands. Asked
+		// again once mirroring has caught up. See clashIsFresh.
+		r.clashIsFresh(ctx, ns)
+		coldErr = coldOwner()
+	}
 	if coldErr == nil {
 		return r.stillHoldsKey(ctx, ns, idx, kid, owner), nil
 	}
@@ -1572,6 +1582,13 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 
 	cold := append(bson.D{meta.NotArchivedDeleted()}, filter...)
 	err = r.cold.Database(db).Collection(coll).FindOne(ctx, cold, opts).Decode(&doc)
+	if err == nil {
+		// Held in the archive and not on the fast tier, which a delete looks
+		// like until its tombstone lands. Asked again once mirroring has
+		// caught up. See clashIsFresh.
+		r.clashIsFresh(ctx, ns)
+		err = r.cold.Database(db).Collection(coll).FindOne(ctx, cold, opts).Decode(&doc)
+	}
 	if err == nil {
 		return true
 	}

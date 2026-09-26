@@ -596,6 +596,37 @@ chk "an update after a delete matches nothing"              "0"  "$(echo "$OUT" 
 chk "and the deleted document stays deleted"                "0"  "$(echo "$OUT" | cut -d/ -f3)"
 R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^cu-/})" >/dev/null
 
+echo "== a key freed by a delete can be written again at once =="
+# The router asks the archive whether an _id or a unique value is taken, and a
+# document deleted a moment ago is still live there until its tombstone lands.
+# Deleting a document and inserting the same _id straight away, or re-using a
+# unique value its deleted holder had, was refused as a duplicate twenty times
+# of twenty on 2026-09-25, where MongoDB accepts both every time. The refusal
+# now waits for mirroring and asks again. The partial index keeps the rest of
+# this suite's documents out of it.
+R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({email:1},{unique:true,name:'fresh_email_u',partialFilterExpression:{email:{\$exists:true}}})" >/dev/null
+KOUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cold=new Mongo(process.env.COLD_URI).getDB(process.env.TC_DB).$NS;
+  let held=0, idRef=0, keyRef=0;
+  for (let i=0;i<10;i++) {
+    const id='rk-'+i, em='rk'+i+'@x';
+    c.insertOne({_id:id, email:em});
+    for (let k=0;k<100 && !cold.findOne({_id:id}); k++) sleep(20);
+    if (cold.findOne({_id:id, _tcDeletedAt:{\$exists:false}})) held++;
+    c.deleteOne({_id:id});
+    try { c.insertOne({_id:id}); } catch(e) { idRef++; }
+    c.deleteOne({_id:id});
+    c.insertOne({_id:id+'a', email:em+'2'});
+    for (let k=0;k<100 && !cold.findOne({_id:id+'a'}); k++) sleep(20);
+    c.deleteOne({_id:id+'a'});
+    try { c.insertOne({_id:id+'b', email:em+'2'}); } catch(e) { keyRef++; }
+  }
+  print(held+'/'+idRef+'/'+keyRef)")
+chk "the archive held each document live before its delete" "10" "${KOUT%%/*}"
+chk "the same _id is accepted again after its delete"       "0"  "$(echo "$KOUT" | cut -d/ -f2)"
+chk "and so is a unique value its deleted holder had"      "0"  "$(echo "$KOUT" | cut -d/ -f3)"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^rk-/}); db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('fresh_email_u')" >/dev/null
+
 echo "== a transaction bigger than one flush is claimed only when it is whole =="
 # Every operation of a transaction carries the commit's cluster time, and the
 # feeder used to claim an event's own time the moment it had written it. A flush
