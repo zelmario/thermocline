@@ -292,6 +292,35 @@ things. It was found by asking the question of the reader audit the other way
 round: not "does this read wait for the archive", but "what does this removal
 assume the archive already has".
 
+## 2026-09-26, afternoon: large documents, and what two of today's fixes cost
+
+Attacking the day's own fixes with large documents found one stall and two
+memory problems, each measured before and after.
+
+**Mirroring stalled on large documents** (848e324). The transactional flush of
+65a0469 was bounded at 64MB, and flushes of 12MB documents were refused by a
+1GB archive cache as `TransactionTooLargeForCache`. The feeder retried the same
+flush for ever: 13 of 60 documents mirrored in two minutes, mirroring five
+minutes behind for every namespace. The first measurement of that bound had
+used 4MB documents, whose flushes never reached it. The bound is 16MB now, and
+a flush the archive still cannot hold is written a collection at a time.
+
+**The evictor and the warmer held whole batches of whole documents.** 2,701MB
+to evict 60 documents of 12MB after 0be762a, 1,874MB to warm them; both work in
+bounded steps now, 406MB and 345MB. The warmer's bound needed care, because it
+reads a short batch as the end of its range and would have claimed documents it
+never copied.
+
+Two suite faults ran only in a certain order of suites on a worker: a claim
+left behind by an earlier warm, and a claim's boundary printed to the second.
+The second was a tool fault as well, and `cline watermark` prints the boundary
+exactly now.
+
+**What it says.** The largest defect of the afternoon was introduced this
+morning, by a fix. Every fix today that bounded something was measured with an
+input that could not reach the bound, until it was measured again with one that
+could.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
