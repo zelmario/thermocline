@@ -73,6 +73,13 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort,
 // the archive's own first match is therefore the document the statement would
 // have found with nothing tiered underneath it.
 func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
+	// Which document the write acts on is decided here, so the archive is
+	// asked once mirroring has caught up, as a read would be. Otherwise its
+	// first match can be a document the application has just deleted, and the
+	// write then matches nothing where MongoDB would have found the next one.
+	// The copy-up that follows waits too, but by then the choice is made.
+	r.archiveIsFresh(ctx, ns, 0, "choosing a document for a write from the archive before mirroring caught up",
+		"a single-document write may act on, or miss because of, a document deleted in the last moments")
 	db, coll := splitNS(ns)
 	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
 	if len(sort) > 0 {

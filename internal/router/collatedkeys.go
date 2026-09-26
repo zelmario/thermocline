@@ -34,6 +34,19 @@ import (
 // unreachable is a visible failure caused by the proxy, and the case this
 // guards is one the fast tier's own index cannot see anyway.
 func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) bool {
+	if !r.collatedArchiveClashNow(ctx, ns, idx, vals, owner) {
+		return false
+	}
+	// About to refuse, so asked again once mirroring has caught up: a document
+	// deleted a moment ago still holds its value in the archive until its
+	// tombstone lands. See clashIsFresh.
+	r.clashIsFresh(ctx, ns)
+	return r.collatedArchiveClashNow(ctx, ns, idx, vals, owner)
+}
+
+// collatedArchiveClashNow is collatedArchiveClash asked of the archive as it
+// stands.
+func (r *Router) collatedArchiveClashNow(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) bool {
 	if len(idx.collation) == 0 || len(vals) != len(idx.fields) {
 		return false
 	}

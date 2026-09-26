@@ -627,6 +627,38 @@ chk "the same _id is accepted again after its delete"       "0"  "$(echo "$KOUT"
 chk "and so is a unique value its deleted holder had"      "0"  "$(echo "$KOUT" | cut -d/ -f3)"
 R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^rk-/}); db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('fresh_email_u')" >/dev/null
 
+echo "== a write that chooses from the archive chooses what is there now =="
+# Two more decisions the router made from an archive that had not yet been told
+# about a delete. A single-document delete by a filter chose the archive's first
+# match, which could be the one the application had just deleted, so it left
+# the next match alone where MongoDB deletes it: 15 of 15 on 2026-09-25. And a
+# case-insensitive unique value re-used after its holder was deleted was refused,
+# 15 of 15, because the collated check is its own lookup. The archive gets the
+# collated index an adopted one would have, or the router cannot ask it.
+C "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({ref:1},{name:'fresh_ref_ci',collation:{locale:'en',strength:2}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({ref:1},{unique:true,name:'fresh_ref_ci',collation:{locale:'en',strength:2},partialFilterExpression:{ref:{\$exists:true}}})" >/dev/null
+sleep 6
+PKOUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cold=new Mongo(process.env.COLD_URI).getDB(process.env.TC_DB).$NS;
+  let wrong=0, refused=0;
+  for (let i=0;i<8;i++) {
+    const g='pk-'+i;
+    cold.insertMany([{_id:g+'a', grp:g},{_id:g+'b', grp:g}]);
+    c.deleteOne({_id:g+'a'});
+    c.deleteOne({grp:g});
+    if (c.findOne({_id:g+'a'}) || c.findOne({_id:g+'b'})) wrong++;
+    const id='pr-'+i;
+    c.insertOne({_id:id, ref:'Ref-'+i});
+    for (let k=0;k<100 && !cold.findOne({_id:id}); k++) sleep(20);
+    c.deleteOne({_id:id});
+    try { c.insertOne({_id:id+'x', ref:'ref-'+i}); } catch(e) { refused++; }
+  }
+  print(wrong+'/'+refused)")
+chk "a delete by filter takes the match that is still there" "0" "${PKOUT%%/*}"
+chk "a case-insensitive value is free once its holder is gone" "0" "${PKOUT##*/}"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^p[kr]-/}); db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('fresh_ref_ci')" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^p[kr]-/}); db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('fresh_ref_ci')" >/dev/null
+
 echo "== a transaction bigger than one flush is claimed only when it is whole =="
 # Every operation of a transaction carries the commit's cluster time, and the
 # feeder used to claim an event's own time the moment it had written it. A flush

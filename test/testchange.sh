@@ -440,7 +440,16 @@ HOTAFTER=$(R "
   const c = db.getSiblingDB(process.env.TC_DB).$NS;
   c.findOne({_id:ObjectId('$OID2')});
   const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
-  const held = hot.$NS.countDocuments({_id:ObjectId('$OID2')});
+  // Waited for, up to three seconds, rather than counted at once. A read
+  // answered from the archive copies the document up behind its reply, and
+  // since 2026-09-25 that copy-up clears the freshness barrier first, which
+  // takes a publication or two. Counted the instant the read returned, it
+  // raced the copy-up and read 0 in two runs of three.
+  let held = 0;
+  for (let k = 0; k < 60 && held === 0; k++) {
+    held = hot.$NS.countDocuments({_id:ObjectId('$OID2')});
+    if (held === 0) sleep(50);
+  }
   c.deleteOne({_id:ObjectId('$OID2')});
   sleep(2000);
   c.insertOne({_id:ObjectId('$OID2'), v:'the application put it back'});
@@ -996,6 +1005,38 @@ chk "no copy-up arrived as an insert"                  "true" \
     "$(echo "$PEVENTS" | grep -q insert && echo false || echo true)"
 H "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$PINS.drop()" >/dev/null 2>&1
+
+echo "== an update's document is never older than the update =="
+# When the fast tier's lookup for an update event comes back null, because the
+# document is no longer there, the router fills it from the archive. It did so
+# without waiting for mirroring, so an update followed at once by a delete, read
+# straight away, carried the archive's copy from before the update: 13 of 20 on
+# 2026-09-25, where MongoDB answered null all 13 times. Null and the update
+# itself are both what MongoDB gives; older than the update never is.
+stopDaemons
+startFeeder
+startRouter
+export COLD_URI="$COLD"
+LKOUT=$(R "const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cold=new Mongo(process.env.COLD_URI).getDB(process.env.TC_DB).$NS;
+  let n=0, older=0;
+  for (let i=0;i<15;i++) {
+    const id='lk-'+i;
+    c.insertOne({_id:id, v:0});
+    for (let k=0;k<100 && !cold.findOne({_id:id}); k++) sleep(20);
+    const cs=c.watch([{\$match:{'documentKey._id':id, operationType:'update'}}],{fullDocument:'updateLookup'});
+    c.updateOne({_id:id},{\$set:{v:1}});
+    c.deleteOne({_id:id});
+    let ev=null;
+    for (let k=0;k<200 && !ev;k++) { ev=cs.tryNext(); if (!ev) sleep(10); }
+    cs.close();
+    if (!ev) continue;
+    n++;
+    if (ev.fullDocument && ev.fullDocument.v < 1) older++;
+  }
+  print(n+'/'+older)")
+chk "every update event was read"                       "15" "${LKOUT%%/*}"
+chk "and none carried a document older than itself"     "0"  "${LKOUT##*/}"
 
 # $NS is dropped in setup and was never dropped at the end, alone among this
 # suite's collections. What it leaves is six documents whose _id values are

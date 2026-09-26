@@ -1003,6 +1003,17 @@ func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
 	for _, w := range want {
 		byNS[w.ns] = append(byNS[w.ns], w.id)
 	}
+	// The archive is asked only after mirroring has caught up, the same
+	// barrier a read clears. A lookup comes back null here because the fast
+	// tier no longer holds the document, and when the application has just
+	// deleted it the archive may not yet have the delete, or even the update
+	// the event describes. Measured on 2026-09-25, an update followed at once
+	// by a delete and read straight away: 13 of 20 events carried a document
+	// older than their own update, where MongoDB answered null all 13 times.
+	// Once per batch, and only on this path, which is the one where the fast
+	// tier had nothing.
+	r.archiveIsFresh(ctx, want[0].ns, 0, "filling a change stream's documents from the archive before mirroring caught up",
+		"an event's fullDocument may be older than the change it describes, or a document already deleted")
 	found := make(map[string]bson.Raw, len(want))
 	for evns, ids := range byNS {
 		db, coll := splitNS(evns)
