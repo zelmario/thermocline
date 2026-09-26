@@ -221,6 +221,24 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		return out, true
 	}
 
+	// And the _id's size, for the same reason as the ordinary paths. See
+	// largeid.go.
+	for _, op := range ops {
+		if !c.r.cfg.Manages(op.ns) {
+			continue
+		}
+		n, bad := 0, false
+		switch op.kind {
+		case "insert":
+			n, bad = largeIDInDoc(op.doc)
+		case "update":
+			n, bad = largeIDInUpdate(op.stmt.update, op.stmt.filter, op.stmt.upsert)
+		}
+		if bad {
+			return c.refuseLargeID(msg, op.ns, n)
+		}
+	}
+
 	_, inTxn := txnOf(cmd)
 
 	// Documents the write has to be able to see have to be here before it runs.

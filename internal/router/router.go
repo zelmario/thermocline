@@ -1353,6 +1353,9 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			if out, done := c.guardReservedField(msg, db, name); done {
 				return c.answer(msg, out)
 			}
+			if out, done := c.guardLargeID(msg, db, name); done {
+				return c.answer(msg, out)
+			}
 		}
 	}
 

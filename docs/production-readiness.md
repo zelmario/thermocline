@@ -345,6 +345,21 @@ the rest for the cursor's next getMores, with the resume token following the
 cut. Resuming in the middle gives 185 after 15 with none twice; a getMore from
 another session or naming another collection is refused as mongod refuses it.
 
+**An _id past about 5KB could stall mirroring for good.** The resume token
+encodes the document key, so an event holds the `_id` three times. A 7MB `_id`,
+which mongod accepts, made an insert event of 29,360,471 bytes, and no reader
+can get past one mongod will not return. The router now refuses an `_id` past
+4,096 bytes on every write path into a tiered collection, and the feeder says
+once what stopped it when a write made straight at the fast tier does it. See
+`docs/limitations.md`, which also has a unique value past about 12MB going
+unchecked against the archive.
+
+One failure in the sweep on ea87c71 is not explained: testchange's "a lookup is
+answered from the archive" saw no update event, with the router log showing
+the stream open 0.9s before the update and no batch rewritten. It passed in a
+rerun under the same load and 20 of 20 times in a loop of that section. Held
+as a lead, not closed.
+
 **A multi-document write held its copy-up by count.** An updateMany over 60
 archived documents of 12MB peaked the router at 2,044MB; bounded at 16MB a
 batch, 393MB.

@@ -6,6 +6,24 @@ Part of [Thermocline](../README.md).
 
 ## What is not handled yet
 
+- **A tiered collection takes an `_id` of at most 4,096 bytes.** Every change
+  stream event holds the `_id` three times, in the resume token (in hex, so
+  twice over), in `documentKey` and in the document, and mongod will not return
+  an event past 16MB plus 16KB. An event it will not return cannot be read past,
+  so it stops mirroring for every namespace: measured with a 7MB `_id`, an event
+  of 29,360,471 bytes and a feeder reopening on it once a second. The router
+  refuses a larger `_id` on every write path into a tiered collection, with the
+  reason. A write made straight at the fast tier is not refused, and the feeder
+  then says once what stopped it and how to recover. MongoDB itself refused any
+  index key past 1,024 bytes, `_id` included, until 4.2.
+
+- **A unique value larger than about 12MB is not enforced across tiers.** The
+  key registry names each claimed key by the key itself, base64 encoded, so a
+  value past about 12MB makes a claim row past 16MB. The router logs "could not
+  check unique keys, letting the insert through" and the write goes on, which
+  is what mongod would do with it; what is lost is only the check against a
+  duplicate that lives in the archive alone. Measured with a 13MB value.
+
 - **Two feeders with different ids are not refused, and they double the work.**
   The lease stops two of the same daemon with the same id; two with different
   ids watching the same namespaces are not detected by anything, because nothing

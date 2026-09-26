@@ -305,10 +305,17 @@ kill $VP 2>/dev/null; wait $VP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
 
+# A router's startup report reads both catalogs, and under a four-worker sweep
+# that took 6.2s where this used to sleep 5: the check then failed on a refused
+# connection rather than on anything the router answered.
+waitListening() { for _ in $(seq 1 60); do
+    mongosh --port $1 -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0; sleep 0.5; done
+  echo "  WARN  the router on $1 never answered"; }
 echo "== completeness: strict =="
 sed 's/completeness: archive/completeness: strict/' $CFG > $WDIR/strict.yaml
 cline router --config $WDIR/strict.yaml --listen 0.0.0.0:$P1 --log-file $LOGDIR/rs.log &
-SP=$!; sleep 5
+SP=$!; waitListening $P1
 S() { mongosh --port $P1 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 chk "strict refuses an incomplete find" "refused" "$(S 'try{db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount(); print("ALLOWED")}catch(e){print(e.message.match(/refusing/)?"refused":"other")}')"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
@@ -321,7 +328,7 @@ sed 's/completeness: archive/completeness: permissive/' $CFG > $WDIR/perm.yaml
 # changed to not write it at all.
 rm -f $LOGDIR/rp.log
 cline router --config $WDIR/perm.yaml --listen 0.0.0.0:$P2 --log-file $LOGDIR/rp.log &
-PP=$!; sleep 5
+PP=$!; waitListening $P2
 P() { mongosh --port $P2 -u dba -p secret --authenticationDatabase admin --quiet --eval "$1" 2>&1 | tail -1; }
 HOTN=$(H 'print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({}))')
 chk "permissive returns the fast tier answer" "$HOTN" "$(P 'print(db.getSiblingDB(process.env.TC_DB).tprobe.find({}).itcount())')"

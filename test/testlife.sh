@@ -292,6 +292,24 @@ chk "the large update reached the archive" "true" \
 chk "and so did the write after it"        "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:780}))")"
 
+echo "== an _id too large for a change stream event =="
+# Every event holds the _id three times, and mongod will not return one past
+# 16MB plus 16KB, so a large enough _id stops mirroring for every namespace.
+# Measured before the guard: a 7MB _id, an event of 29,360,471 bytes, and a
+# feeder reopening on it once a second. A string's _id value is its length plus
+# five bytes, so 4091 characters is exactly the 4096-byte limit.
+BIGID=$(R "try { db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:'i'.repeat(4092), v:1}); print('accepted') } catch (e) { print(e.message.indexOf('_id is 4097 bytes') >= 0 ? 'refused' : e.message.slice(0,120)) }")
+chk "an _id one byte past the limit is refused, with the reason" "refused" "$BIGID"
+UPSID=$(R "try { db.getSiblingDB(process.env.TC_DB).tbig.updateOne({_id:'u'.repeat(4092)}, {\$set:{v:1}}, {upsert:true}); print('accepted') } catch (e) { print(e.message.indexOf('_id is') >= 0 ? 'refused' : e.message.slice(0,120)) }")
+chk "and so is an upsert that would write it from its filter"    "refused" "$UPSID"
+chk "an _id at the limit is accepted" "accepted" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:'i'.repeat(4091), v:1}); print('accepted') } catch (e) { print(e.message.slice(0,120)) }")"
+R "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:781, after:1})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:781}))")" = "1" ] && break; sleep 0.5
+done
+chk "and mirroring carries on past it" "1" "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:781}))")"
+
 echo "== documents the archive will never receive =="
 # A change stream reports changes from now, so whatever the fast tier already
 # holds when the feeder first starts is not mirrored by starting it. In an

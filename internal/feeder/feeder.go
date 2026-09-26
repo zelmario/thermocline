@@ -97,6 +97,10 @@ type Feeder struct {
 	// resume on every attempt, including the ones about to fail again.
 	saidWritesBlocked bool
 
+	// saidEventTooLarge is the same for an event mongod will not return, which
+	// is said once rather than on every reopen. Cleared with the one above.
+	saidEventTooLarge bool
+
 	// unmirroredNS is the namespaces this feeder has given up a document in,
 	// loaded from the archive at startup so a restart does not forget. Same
 	// goroutine as everything else here.
@@ -494,6 +498,27 @@ func (f *Feeder) Run(ctx context.Context) error {
 						"db.adminCommand({setUserWriteBlockMode: 1, global: false})",
 					"note", "said once until mirroring resumes, because it would otherwise be said "+
 						"every second")
+			}
+		} else if eventTooLarge(err) {
+			// mongod will not return the next event, and there is no reading
+			// past an event without reading it, so reopening fails the same way
+			// for ever. Said once, with what caused it, because the line below
+			// once a second names neither. The router refuses the _id sizes
+			// that cause it; this is for a write made straight at the fast
+			// tier, or a document that grew past what an event can carry.
+			if !f.saidEventTooLarge {
+				f.saidEventTooLarge = true
+				at, _, _ := f.cp.EventAt(ctx, f.cfg.ID)
+				f.log.Error("the fast tier will not return the next change stream event, because it is larger than 16MB",
+					"id", f.cfg.ID, "checkpoint", at.UTC().Format(time.RFC3339), "err", err,
+					"meaning", "a write just after the checkpoint made an event mongod cannot send: an _id "+
+						"larger than 4096 bytes, which is held three times in every event, or a document "+
+						"near 16MB with an _id of a few kilobytes",
+					"effect", "mirroring is stopped for every namespace, and retrying cannot get past it",
+					"action", "find that write in the fast tier's oplog after the checkpoint, copy the "+
+						"affected namespaces from the fast tier into the archive with cline backfill, then "+
+						"clear the checkpoint; clearing it on its own makes mirroring start from now and "+
+						"hides the gap instead of closing it")
 			}
 		} else {
 			f.log.Error("change stream ended, reopening", "err", err)

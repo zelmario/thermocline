@@ -411,6 +411,11 @@ func (s *writeSink) write(ctx context.Context, batch []any) error {
 					"rebuilt from the archive does not have it at all. Rename the field; it is "+
 					"reserved only in collections this system tiers", s.target, f)}
 			}
+			// And an _id too large for the change stream to carry. See
+			// largeid.go.
+			if n, bad := largeIDInDoc(raw); bad {
+				return reservedWriteError{largeIDMessage(s.target, n)}
+			}
 		}
 	}
 	if s.outColl != nil {

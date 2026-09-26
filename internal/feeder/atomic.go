@@ -90,6 +90,7 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 			return commit(sc, sess)
 		})
 		if err == nil {
+			f.saidEventTooLarge = false
 			if f.saidWritesBlocked {
 				f.saidWritesBlocked = false
 				f.log.Info("the archive is taking writes again, mirroring has resumed")
@@ -192,6 +193,18 @@ func commit(ctx context.Context, sess *mongo.Session) error {
 // even that does not fit.
 func tooLargeForCache(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "TransactionTooLargeForCache")
+}
+
+// eventTooLarge says the change stream failed because mongod would not return
+// an event past its size limit, as opposed to one of the feeder's own writes
+// being too large, which the write paths deal with themselves.
+func eventTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := err.Error()
+	return strings.Contains(m, "BSONObjectTooLarge") &&
+		(strings.Contains(m, "getMore") || strings.Contains(m, "aggregation"))
 }
 
 // transient says the whole transaction can be tried again as it is.
