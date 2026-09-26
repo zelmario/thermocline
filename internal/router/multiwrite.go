@@ -466,7 +466,14 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 			return moved, fmt.Errorf("more than %d documents would have to be brought back from the archive; "+
 				"warm that range first, or narrow the filter", maxCopyUpForWrite)
 		}
-		doc := bson.Raw(cur.Current)
+		// A copy, because up to 256 of these are held across calls to Next,
+		// and the driver says Current is valid only until the next one. It
+		// happens not to reuse the buffer today: 600 documents copied up over
+		// several batches all matched the archive byte for byte. What it
+		// documents is the contract, and a driver that starts reusing the
+		// buffer would make this write the wrong documents to the fast tier.
+		// The _id below is read from the copy for the same reason.
+		doc := append(bson.Raw(nil), cur.Current...)
 		id, lerr := doc.LookupErr("_id")
 		if lerr != nil {
 			continue
