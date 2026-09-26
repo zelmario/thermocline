@@ -22,6 +22,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -31,12 +32,16 @@ import (
 
 // Warmer copies documents from the archive into the fast tier.
 type Warmer struct {
-	hot    *mongo.Client
-	cold   *mongo.Client
-	cfg    config.WarmerConfig
-	check  *health.Checker
-	log    *slog.Logger
-	dryRun bool
+	hot  *mongo.Client
+	cold *mongo.Client
+	cfg  config.WarmerConfig
+	// feederID and positions are how the warmer knows the archive has been
+	// told everything the fast tier has done. See mirroredToNow.
+	feederID  string
+	positions *checkpoint.Positions
+	check     *health.Checker
+	log       *slog.Logger
+	dryRun    bool
 
 	// unannounced is the feeder's delete policy. Under "ignore" the archive
 	// keeps deleted documents readable, which makes a count comparison between
@@ -101,11 +106,13 @@ func (s Stats) LogArgs() []any {
 }
 
 // New builds a Warmer. It does not contact either cluster.
-func New(hot, cold *mongo.Client, cfg config.WarmerConfig, unannounced config.UnannouncedDeletes, dryRun bool, log *slog.Logger) *Warmer {
+func New(hot, cold *mongo.Client, cfg config.WarmerConfig, unannounced config.UnannouncedDeletes, feederID string, dryRun bool, log *slog.Logger) *Warmer {
 	return &Warmer{
 		hot:         hot,
 		cold:        cold,
 		cfg:         cfg,
+		feederID:    feederID,
+		positions:   checkpoint.NewPositions(cold),
 		unannounced: unannounced,
 		check:       health.New(hot, cold, ""),
 		log:         log,
@@ -460,6 +467,15 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, err
 		}
 
+		if !w.dryRun && !w.mirroredToNow(ctx) {
+			w.log.Warn("not warming while mirroring is behind the fast tier",
+				"ns", rule.NS,
+				"waited", mirroredWait.String(),
+				"why", "the archive may still hold as live a document the application has just deleted, "+
+					"and copying it up would undo the delete",
+				"effect", "this rule stops here for this run and resumes on the next one")
+			return stats, nil
+		}
 		docs, err := w.read(ctx, rule.NS, filter, scanSort(rule))
 		if err != nil {
 			return stats, err
@@ -717,9 +733,12 @@ func (w *Warmer) announce(ctx context.Context, ns string, docs []sourceDoc) erro
 }
 
 func (w *Warmer) waitForHealth(ctx context.Context) (bool, error) {
-	// The warmer only adds to the fast tier, so mirroring lag is irrelevant to
-	// its safety. Passing zero disables that check; the cluster limits still
-	// apply, since a bulk copy can hurt the fast tier just as a bulk delete can.
+	// Mirroring lag is not judged here as a health signal, so zero disables
+	// that check. It is judged per batch instead, and as a question of
+	// correctness rather than load: see mirroredToNow, which exists because
+	// "the warmer only adds to the fast tier, so lag is irrelevant" was wrong.
+	// The cluster limits still apply, since a bulk copy can hurt the fast tier
+	// just as a bulk delete can.
 	const pollEvery = 5 * time.Second
 	var waited bool
 	for {
@@ -1012,4 +1031,56 @@ func sign(n int) int {
 		return -1
 	}
 	return 1
+}
+
+// mirroredWait bounds how long one batch waits for mirroring. See mirroredToNow.
+const mirroredWait = 30 * time.Second
+
+// mirroredToNow waits until the feeder has mirrored everything the fast tier
+// had written when this was called, and reports whether it got there.
+//
+// The warmer copies archived documents the fast tier does not hold, and a
+// document the application deleted a moment ago is exactly that: gone from the
+// fast tier at once, and live in the archive until its tombstone lands. A
+// batch read in between copies it back and the delete is undone. This used to
+// be waived on the grounds that "the warmer only adds to the fast tier, so
+// mirroring lag is irrelevant to its safety", and adding is the harm.
+// Measured on 2026-09-25 with the feeder held back: 25 documents deleted
+// through the router, one warm, and the warm copied all 25 back; the router
+// then answered 25 of 25 documents the application had deleted, where MongoDB
+// answers none. With this, the warm waits, says why, and copies none.
+//
+// The fast tier's own last write is the bar, read here rather than assumed,
+// and the feeder's published cluster time has to reach it. Once per batch, so
+// a long warm is never working from a view older than one batch.
+func (w *Warmer) mirroredToNow(ctx context.Context) bool {
+	if w.feederID == "" {
+		return true
+	}
+	var h struct {
+		LastWrite struct {
+			OpTime struct {
+				TS bson.Timestamp `bson:"ts"`
+			} `bson:"opTime"`
+		} `bson:"lastWrite"`
+	}
+	if err := w.hot.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&h); err != nil {
+		return false
+	}
+	want := checkpoint.PackTS(h.LastWrite.OpTime.TS)
+	deadline := time.Now().Add(mirroredWait)
+	for {
+		rec, ok, err := w.positions.At(ctx, w.feederID)
+		if err == nil && ok && checkpoint.PackTS(rec.TS) >= want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }

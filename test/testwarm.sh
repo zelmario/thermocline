@@ -281,12 +281,12 @@ for span in 20 50; do
 done
 chk "the derived configs name the collection" "2" \
     "$(grep -lc "ns: \"$DB.tdated\"" $WDIR/warm_dated_20.yaml $WDIR/warm_dated_50.yaml | wc -l)"
-cline warmer --config $WDIR/warm_dated_20.yaml >/dev/null 2>&1
+cline warmer --without-feeder --config $WDIR/warm_dated_20.yaml >/dev/null 2>&1
 NARROW=$(H "print(db.getSiblingDB(process.env.TC_DB).tdated.countDocuments({}))")
 chk "the narrow warm filled its window"       "true" \
     "$(awk -v n="$NARROW" 'BEGIN{print (n+0 > 0 && n+0 < 60) ? "true" : "false"}')"
 rm -f $LOGDIR/warm_wide.log
-cline warmer --config $WDIR/warm_dated_50.yaml --log-file $LOGDIR/warm_wide.log >/dev/null 2>&1
+cline warmer --without-feeder --config $WDIR/warm_dated_50.yaml --log-file $LOGDIR/warm_wide.log >/dev/null 2>&1
 chk "widening it scanned the newly exposed slice" "true" \
     "$(grep -qE 'warm complete scanned=0 ' $LOGDIR/warm_wide.log && echo false || echo true)"
 # The invariant, and the only one that matters: everything the claim covers is
@@ -328,7 +328,7 @@ chk "the derived config warms this collection slowly" "true" \
 # Truncated first. --log-file appends, so a line left by an earlier run makes
 # the "it said why" check pass against a binary that never said it.
 rm -f $LOGDIR/warm_shrink.log
-cline warmer --config $WDIR/warm_shrink.yaml --log-file $LOGDIR/warm_shrink.log >/dev/null 2>&1 &
+cline warmer --without-feeder --config $WDIR/warm_shrink.yaml --log-file $LOGDIR/warm_shrink.log >/dev/null 2>&1 &
 WP=$!
 # Wait until it has copied something, then take documents away underneath it,
 # which is exactly what a sweep does.
@@ -408,7 +408,7 @@ PY
 chk "the derived config warms only this one"     "1" \
     "$(grep -c "ns: \"$DB.$UNS\"" $WDIR/unaged.yaml)"
 rm -f $LOGDIR/warm_unaged.log
-cline warmer --config $WDIR/unaged.yaml --log-file $LOGDIR/warm_unaged.log >/dev/null 2>&1
+cline warmer --without-feeder --config $WDIR/unaged.yaml --log-file $LOGDIR/warm_unaged.log >/dev/null 2>&1
 chk "the warm copied only what it could address" "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$UNS.countDocuments({}))")"
 chk "it refuses the claim"                       "true" \
@@ -634,6 +634,34 @@ chk "and quiet once the archive can walk it"        "false" \
     "$(grep -q "ns=$DB.$DNS2" <<<"$(grep 'no index for the order this warm reads it in' <<<"$WARMOUT")" && echo true || echo false)"
 C "db.getSiblingDB(process.env.TC_DB).$DNS2.dropIndex('createdAt_1')" >/dev/null 2>&1
 C "db.getSiblingDB(process.env.TC_DB).$DNS2.dropIndex('createdAt_-1__id_-1')" >/dev/null 2>&1
+
+echo "== a warm does not undo a delete mirroring has not reached yet =="
+# The warmer copies up what the archive holds and the fast tier does not, and a
+# document the application has just deleted is exactly that until its tombstone
+# lands. It used to skip the mirroring check on the grounds that it only adds
+# to the fast tier, and a warm then copied back every document deleted while
+# the feeder was behind: 25 of 25 on 2026-09-25, all of them answered by the
+# router afterwards. The feeder is held back here so the window stays open.
+# The sections above that warm with no feeder at all pass --without-feeder,
+# because they empty the fast tier straight on purpose and a running feeder
+# would tombstone what they delete.
+stopDaemons
+startFeeder
+startRouter
+R "const c=db.getSiblingDB(process.env.TC_DB).$NS; for (let i=0;i<20;i++) c.insertOne({_id:new ObjectId(), wd:i});" >/dev/null
+for _ in $(seq 1 60); do [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({wd:{\$exists:true}}))")" = 20 ] && break; sleep 0.5; done
+chk "the archive holds the twenty before the delete"  "20" "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({wd:{\$exists:true}, _tcDeletedAt:{\$exists:false}}))")"
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null; sleep 1
+chk "ten deleted through the router"                  "10" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({wd:{\$lt:10}}).deletedCount)")"
+timeout 45 cline warmer --config $CFG --log-file $LOGDIR/warm_behind.log >/dev/null 2>&1
+# On the fast tier, which is the only place a warm writes. Through the router
+# the count reaches the archive, which has no tombstones while the feeder is
+# held back, and answers ten whatever the warm did.
+chk "none of them came back"                          "0"  "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({wd:{\$lt:10}}))")"
+chk "and the warmer said why it waited"               "true" "$(grep -q 'not warming while mirroring is behind' $LOGDIR/warm_behind.log && echo true || echo false)"
+startFeeder
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({wd:{\$exists:true}})" >/dev/null
+stopDaemons
 
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

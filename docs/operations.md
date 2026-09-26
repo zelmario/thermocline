@@ -308,6 +308,16 @@ hourly, which is a starting point and not a recommendation: a warm exists to put
 back what reads are about to ask for, so the cycle belongs to the application's
 reading pattern, and a warm with nothing to do copies nothing.
 
+**The warmer needs the feeder running.** Before each batch it waits, up to 30
+seconds, for mirroring to reach what the fast tier has written, because a
+document the application deleted a moment ago is still live in the archive
+until its tombstone lands, and copying it up would undo the delete. With the
+feeder stopped the wait never ends, and the warm stops with `not warming while
+mirroring is behind the fast tier` and resumes on the next run.
+`cline warmer --without-feeder` skips the wait. Use it only when nothing is
+deleting documents, such as a fast tier being refilled with the application
+stopped; it says what it gives up every time it runs.
+
 **Restart=always on the feeder is what makes a standby.** Install the feeder
 unit on two hosts and enable it on both. One mirrors; the other is refused every
 ten seconds by the lease, which says who holds it, and takes over when the

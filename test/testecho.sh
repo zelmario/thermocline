@@ -274,7 +274,9 @@ C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([{_id:40,v:'archived',at:ne
 rm -f $LOGDIR/echo_f.log
 # No feeder and no router while the warm runs, so the only writer the fast tier
 # sees is the warmer itself.
-cline warmer --config $WDIR/echo_warm.yaml >/dev/null 2>&1
+# --without-feeder: this section keeps the feeder away on purpose, and the
+# warmer otherwise waits for mirroring before it copies anything up.
+cline warmer --without-feeder --config $WDIR/echo_warm.yaml >/dev/null 2>&1
 chk "the warm copied both up"                        "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:{\$in:[40,41]}}))")"
 # The mark goes on the archive's copy, which the fast tier's copy does not have.

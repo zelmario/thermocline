@@ -97,7 +97,9 @@ chkv "it removed the document from the fast tier" "0" \
 chkv "and left an announcement for the feeder"   "1" "$(notices "$NOTICE")"
 
 echo "== a warm puts it back and must leave the announcement alone =="
-cline warmer --config $WDIR/notice_wide.yaml >/dev/null 2>&1
+# --without-feeder: the feeder is stopped for this section on purpose, and the
+# warmer otherwise waits for mirroring before it copies anything up.
+cline warmer --without-feeder --config $WDIR/notice_wide.yaml >/dev/null 2>&1
 chkv "the warm copied it back up"                "1" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).orders.countDocuments({_id:ObjectId('$EVID')}))")"
 chkv "the announcement is still there"           "1" "$(notices "$NOTICE")"

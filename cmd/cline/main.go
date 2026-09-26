@@ -259,6 +259,8 @@ func runWarmer(args []string) error {
 	dryRun := fs.Bool("dry-run", false, "report what would be copied, copy nothing")
 	logPath := fs.String("log-file", "", "append logs here instead of stderr, overriding log.file")
 	verbose := fs.Bool("v", false, "log every batch")
+	withoutFeeder := fs.Bool("without-feeder", false,
+		"warm without waiting for mirroring to reach the fast tier; only when nothing is deleting documents")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -298,7 +300,22 @@ func runWarmer(args []string) error {
 		return err
 	}
 
-	w := warmer.New(hot, cold, cfg.Warmer, cfg.Feeder.UnannouncedDeletes, *dryRun, log)
+	// The warmer waits, batch by batch, for mirroring to reach what the fast
+	// tier has written, because a document deleted a moment ago is still live
+	// in the archive and copying it up would undo the delete. With no feeder
+	// running that wait never ends, which is right: a warm with nothing
+	// mirroring deletes can resurrect them. --without-feeder is for the
+	// operator who knows nothing is deleting, a fast tier being refilled with
+	// the application stopped, and it says so every time.
+	feederID := cfg.Feeder.ID
+	if *withoutFeeder {
+		feederID = ""
+		log.Warn("warming without waiting for mirroring",
+			"effect", "a document deleted on the fast tier and not yet tombstoned in the archive "+
+				"will be copied back, undoing the delete",
+			"when", "only with nothing deleting documents, such as a fast tier refilled with the application stopped")
+	}
+	w := warmer.New(hot, cold, cfg.Warmer, cfg.Feeder.UnannouncedDeletes, feederID, *dryRun, log)
 	stats, err := w.Run(ctx)
 	log.Info("warm complete", stats.LogArgs()...)
 	if err != nil {
