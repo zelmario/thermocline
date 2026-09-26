@@ -473,6 +473,21 @@ Part of [Thermocline](../README.md).
   `router.terminate_auth` does not have this at all, because the connections are
   the router's and a re-resolution empties the pool for the old member.
 
+- **With authentication proxied, a single write across a step-down can still
+  fail, on a loaded box.** The driver retries once, and the retry lands only if
+  the router has found the new primary by then. In 4 of the last 7 full host
+  sweeps, 2026-09-25 and 26, `testfailover.sh` saw that write fail after about
+  2.4 seconds with "not primary", and sometimes a write during a window with
+  no primary as well; in 28 runs of the suite outside a full sweep, alone or
+  after the suites that precede it, it never did. The time is nearly constant,
+  2,436 to 2,477ms, which suggests a timer rather than load, and it was not
+  found. cf705b0 stopped the router re-pinning the member that had just
+  refused, which is a real stale answer but was not this.
+
+  It is written down rather than open because it is a refusal, not a wrong
+  answer: the client is told the write failed, and no write is applied twice.
+  `router.terminate_auth` replays the write itself and does not have it.
+
 - **A `$text` query fails on the archive rather than running slowly, and so does
   `$geoNear`.** Every other index is a decision about speed and the two tiers are
   allowed to differ. These two are not: mongod refuses a `$text` query with no
