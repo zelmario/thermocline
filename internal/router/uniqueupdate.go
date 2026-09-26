@@ -39,6 +39,9 @@ import (
 // range on the write path.
 const maxKeyedUpdate = 10000
 
+// maxKeyedUpdateBytes is the same cap in bytes. See matchedForStatement.
+const maxKeyedUpdateBytes = 256 << 20
+
 // updateStatement is one update, however the client packaged it.
 type updateStatement struct {
 	filter bson.Raw
@@ -664,8 +667,14 @@ func (c *conn) matchedForStatement(ctx context.Context, ns string, st updateStat
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
+	held := 0
 	for cur.Next(ctx) {
-		if len(docs) >= maxKeyedUpdate {
+		// In bytes as well as documents: every matched document is held, and
+		// then read back again after the dry run, so ten thousand large ones is
+		// gigabytes twice over. Past either bound the guard steps aside, as it
+		// already does for the count.
+		held += len(cur.Current)
+		if len(docs) >= maxKeyedUpdate || held > maxKeyedUpdateBytes {
 			return nil, nil, true, nil
 		}
 		doc := make(bson.Raw, len(cur.Current))

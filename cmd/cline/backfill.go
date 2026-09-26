@@ -193,6 +193,9 @@ func backfillNamespaces(ctx context.Context, cfg config.Config, cold *mongo.Clie
 // that one batch is not a 16MB message.
 const backfillBatch = 500
 
+// backfillBatchBytes bounds a batch in bytes as well. See the copy loop.
+const backfillBatchBytes = 16 << 20
+
 // backfillDocuments copies every document the fast tier holds into the archive.
 //
 // Upserted by _id, because the fast tier's copy is the newer one: it is what the
@@ -251,8 +254,14 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 		models = models[:0]
 		return nil
 	}
+	held := 0
 	for cur.Next(ctx) {
-		var doc bson.Raw = cur.Current
+		// A copy: these are kept in models until the batch is written, and the
+		// driver says Current is valid only until the next call to Next. The
+		// same fault 415e995 fixed in the router's copy-up, here in the tool
+		// that writes the archive during a recovery.
+		doc := append(bson.Raw(nil), cur.Current...)
+		held += len(doc)
 		id, lerr := doc.LookupErr("_id")
 		if lerr != nil {
 			continue
@@ -279,10 +288,14 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 			SetReplacement(doc).
 			SetUpsert(true))
 		n++
-		if len(models) >= backfillBatch {
+		// In bytes as well as documents, for the reason the feeder's flush and
+		// the warmer's batch are: a batch of large documents is otherwise held
+		// whole, whatever its size.
+		if len(models) >= backfillBatch || held >= backfillBatchBytes {
 			if ferr := flush(); ferr != nil {
 				return n, refused, marked, firstRefusal, ferr
 			}
+			held = 0
 		}
 	}
 	if cerr := cur.Err(); cerr != nil {
@@ -405,7 +418,10 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 		if cerr != nil || n > 0 {
 			continue
 		}
-		candidates = append(candidates, id)
+		// Copied out of Current, which is valid only until the next call to
+		// Next. These ids are marked deleted in the archive below, so a buffer
+		// the driver reused would mark the wrong documents.
+		candidates = append(candidates, bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)})
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return 0, fmt.Sprintf("stopped reading the archive: %v", cerr)

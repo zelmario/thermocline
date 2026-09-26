@@ -48,6 +48,11 @@ import (
 // writeBatch is how many result documents are sent to the fast tier at a time.
 const writeBatch = 1000
 
+// writeBatchBytes bounds a batch in bytes as well. writeBatch alone let a batch
+// of large documents reach gigabytes in the router's memory: a thousand
+// documents near the 16MB limit is 16GB. See the loops that fill a batch.
+const writeBatchBytes = 16 << 20
+
 // runWritePipeline reads a $out or $merge pipeline's input and performs its
 // final stage on the fast tier, and on the archive where the target is tiered.
 //
@@ -358,14 +363,17 @@ func (s *writeSink) fill(ctx context.Context) error {
 		batch = batch[:0]
 		return nil
 	}
+	held := 0
 	for cur.Next(ctx) {
 		doc := make(bson.Raw, len(cur.Current))
 		copy(doc, cur.Current)
 		batch = append(batch, doc)
-		if len(batch) >= writeBatch {
+		held += len(doc)
+		if len(batch) >= writeBatch || held >= writeBatchBytes {
 			if ferr := flush(); ferr != nil {
 				return ferr
 			}
+			held = 0
 		}
 	}
 	if cerr := cur.Err(); cerr != nil {
@@ -513,16 +521,19 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 
 	batch := make([]any, 0, writeBatch)
 	total := 0
+	held := 0
 	for cur.Next(ctx) {
 		doc := make(bson.Raw, len(cur.Current))
 		copy(doc, cur.Current)
 		batch = append(batch, doc)
+		held += len(doc)
 		total++
-		if len(batch) >= writeBatch {
+		if len(batch) >= writeBatch || held >= writeBatchBytes {
 			if err := sink(ctx, batch); err != nil {
 				return total, err
 			}
 			batch = batch[:0]
+			held = 0
 		}
 	}
 	if err := cur.Err(); err != nil {
@@ -608,16 +619,19 @@ func (c *conn) streamFromFastTier(ctx context.Context, db string, aggVal bson.Ra
 
 	batch := make([]any, 0, writeBatch)
 	total := 0
+	held := 0
 	for cur.Next(ctx) {
 		doc := make(bson.Raw, len(cur.Current))
 		copy(doc, cur.Current)
 		batch = append(batch, doc)
+		held += len(doc)
 		total++
-		if len(batch) >= writeBatch {
+		if len(batch) >= writeBatch || held >= writeBatchBytes {
 			if err := sink(ctx, batch); err != nil {
 				return total, err
 			}
 			batch = batch[:0]
+			held = 0
 		}
 	}
 	if err := cur.Err(); err != nil {

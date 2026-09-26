@@ -318,10 +318,20 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 	var clauses bson.A
 	var produced []bson.Raw
 	seen := 0
+	held := 0
 	for cur.Next(ctx) {
 		if seen >= maxCopyUpForWrite {
 			return nil, nil, fmt.Errorf("this $merge would touch more than %d documents; warm the target first",
 				maxCopyUpForWrite)
+		}
+		// In bytes as well as in documents. Every document the pipeline
+		// produces is held until the pass ends, and ten thousand near the
+		// 16MB limit is far beyond any router's memory; refused the same way
+		// the count is, since warming the target is the same answer.
+		held += len(cur.Current)
+		if held > maxMergePassBytes {
+			return nil, nil, fmt.Errorf("this $merge would hold more than %dMB of documents to check; warm the target first",
+				maxMergePassBytes>>20)
 		}
 		doc := make(bson.Raw, len(cur.Current))
 		copy(doc, cur.Current)
@@ -362,3 +372,7 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 	}
 	return filter, produced, nil
 }
+
+// maxMergePassBytes bounds the documents a $merge's pre-pass holds. See the
+// loop that fills produced.
+const maxMergePassBytes = 256 << 20
