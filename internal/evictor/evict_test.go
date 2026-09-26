@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,5 +331,61 @@ func TestEvictionLeavesADocumentChangedSinceMirrored(t *testing.T) {
 	}
 	if n, _ := notices.CountDocuments(ctx, bson.D{{Key: "_id", Value: cands[1].docID}}); n != 0 {
 		t.Error("the changed document was announced as evicted, and the notice would answer for its next delete")
+	}
+}
+
+// A document near the 16MB limit is still evicted. Since each delete insists on
+// the exact document, carrying it whole in the filter made the delete command
+// larger than the limit, and the batch failed on every sweep after: eviction of
+// the namespace stopped. Such a document is deleted by _id after the
+// comparison instead.
+func TestEvictionTakesADocumentNearTheLimit(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two tiers to run the large-document test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatalf("connect hot: %v", err)
+	}
+	t.Cleanup(func() { _ = hot.Disconnect(context.WithoutCancel(ctx)) })
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect cold: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_bigevict.docs"
+	hc := hot.Database("tc_bigevict").Collection("docs")
+	cc := cold.Database("tc_bigevict").Collection("docs")
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = hc.Drop(c)
+		_ = cc.Drop(c)
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+	_ = hc.Drop(ctx)
+	_ = cc.Drop(ctx)
+
+	id := bson.NewObjectID()
+	big := bson.D{{Key: "_id", Value: id}, {Key: "pad", Value: strings.Repeat("x", 16<<20-200)}}
+	if _, err := hc.InsertOne(ctx, big); err != nil {
+		t.Fatalf("insert hot: %v", err)
+	}
+	if _, err := cc.InsertOne(ctx, big); err != nil {
+		t.Fatalf("insert cold: %v", err)
+	}
+	raw := rawIDValue(t, id)
+	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "test"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	removed, err := e.evict(ctx, ns, hc, []candidate{{id: raw, docID: meta.DocID(ns, raw)}})
+	if err != nil {
+		t.Fatalf("evicting a 15MB document failed, and would fail on every sweep: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("a 15MB document identical on both tiers was not evicted: removed %d", removed)
 	}
 }

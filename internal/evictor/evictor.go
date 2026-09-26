@@ -549,6 +549,93 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		e.log.Info("would evict", "ns", ns, "count", len(docs))
 		return 0, nil
 	}
+	chunks, err := e.bySize(ctx, hotColl, docs)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, chunk := range chunks {
+		n, err := e.evictChunk(ctx, ns, hotColl, chunk)
+		removed += n
+		if err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
+}
+
+// evictChunkBytes bounds how much document data one step of an eviction holds.
+// See bySize.
+const evictChunkBytes = 64 << 20
+
+// bySize splits a batch into steps of at most evictChunkBytes of document
+// data, by asking the fast tier for each candidate's size first.
+//
+// Eviction compares every candidate whole on both tiers, since 0be762a, and a
+// batch is up to batch_size documents: at the default 500 and near the 16MB
+// limit that is gigabytes from each tier held at once. The sizes cost one
+// indexed query that returns two small fields a document. A candidate the fast
+// tier no longer holds is dropped here, as presentOnFastTier would drop it.
+func (e *Evictor) bySize(ctx context.Context, hotColl *mongo.Collection, docs []candidate) ([][]candidate, error) {
+	if len(docs) == 0 {
+		return nil, nil
+	}
+	ids := make([]bson.RawValue, len(docs))
+	for i, d := range docs {
+		ids[i] = d.id
+	}
+	cur, err := hotColl.Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		options.Find().SetProjection(bson.D{
+			{Key: "_id", Value: 1},
+			{Key: "s", Value: bson.D{{Key: "$bsonSize", Value: "$$ROOT"}}},
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("size the batch before evicting: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	ns := e.nsOf(docs)
+	size := make(map[string]int64, len(docs))
+	for cur.Next(ctx) {
+		id, derr := cur.Current.LookupErr("_id")
+		if derr != nil {
+			continue
+		}
+		raw := bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)}
+		var n int64
+		if v, lerr := cur.Current.LookupErr("s"); lerr == nil {
+			if i, ok := v.AsInt64OK(); ok {
+				n = i
+			}
+		}
+		size[meta.DocID(ns, raw)] = n
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("size the batch before evicting: %w", err)
+	}
+	var chunks [][]candidate
+	var step []candidate
+	var held int64
+	for _, d := range docs {
+		n, ok := size[d.docID]
+		if !ok {
+			continue
+		}
+		if len(step) > 0 && held+n > evictChunkBytes {
+			chunks = append(chunks, step)
+			step, held = nil, 0
+		}
+		step = append(step, d)
+		held += n
+	}
+	if len(step) > 0 {
+		chunks = append(chunks, step)
+	}
+	return chunks, nil
+}
+
+// evictChunk is one step of evict: confirm, announce, remove.
+func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) (int, error) {
 
 	// Announce only what is actually there, so the announcements and the
 	// deletes cover the same documents.
@@ -598,10 +685,11 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 	// otherwise be read as a field path.
 	models := make([]mongo.WriteModel, len(present))
 	for i, d := range present {
-		models[i] = mongo.NewDeleteOneModel().SetFilter(bson.D{
+		filter := bson.D{
 			{Key: "_id", Value: d.id},
 			{Key: "$expr", Value: bson.D{{Key: "$eq", Value: bson.A{"$$ROOT", bson.D{{Key: "$literal", Value: d.doc}}}}}},
-		})
+		}
+		models[i] = mongo.NewDeleteOneModel().SetFilter(filter)
 	}
 	res, err := hotColl.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	if err != nil {
