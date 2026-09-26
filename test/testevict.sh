@@ -629,14 +629,15 @@ echo "== a restored archive under a live fast tier =="
 # The reason `cline pause` exists, and the reason the backup procedure puts it
 # before the restore rather than mentioning it afterwards.
 #
-# The evictor's per document check is presence only. An archive restored to an
-# older backup still *has* the document, so the check passes and the fast tier's
-# newer copy is removed. The writes made since the backup are then in neither
-# tier: the restore costs them rather than recovering them.
+# The evictor's per document check used to be presence only. An archive
+# restored to an older backup still *has* the document, so the check passed and
+# the fast tier's newer copy was removed: the writes made since the backup were
+# then in neither tier. Measured then: paused, the evictor removed nothing;
+# unpaused, all five newer copies went.
 #
-# Both arms, because the guard is only worth having if the danger is real.
-# Measured: paused, the evictor removes nothing; unpaused, all five newer copies
-# go and the archive holds the older ones.
+# Since 0be762a the evictor compares the version, and the unpaused arm keeps
+# them too. Pausing is still what the procedure asks, because a paused evictor
+# is one less thing moving documents during a restore.
 RNS=trestore
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
@@ -670,11 +671,14 @@ cline evictor --config $WDIR/ev_restore.yaml --once >/dev/null 2>&1
 chkv "paused, the fast tier keeps its newer copies" "5"     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
 cline resume --config $WDIR/ev_restore.yaml >/dev/null 2>&1
 cline evictor --config $WDIR/ev_restore.yaml --once >/dev/null 2>&1
-# The documented loss, pinned deliberately. If this ever stops being true
-# because the evictor learned to compare versions rather than presence, this
-# check should fail and be rewritten on purpose, not quietly pass.
-chkv "unpaused, it removes them: this is the loss" "0"     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
-chkv "and the newer value is in neither tier"      "0"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+# This was the documented loss, pinned so that it would fail on purpose the day
+# the evictor compared versions rather than presence. On 2026-09-26 it did
+# (0be762a): the evictor evicts only a document whose archived copy is the one
+# the fast tier holds, so a restored archive at v1 under a fast tier at v2 no
+# longer costs the writes made since the backup. They stay on the fast tier,
+# and a later sweep takes them once the archive holds them again.
+chkv "unpaused, the fast tier still keeps its newer copies" "5" "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v2'}))")"
+chkv "while the archive holds the restored older ones"      "5" "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({v:'v1'}))")"
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null
 rm -rf $WDIR/restbak

@@ -176,17 +176,18 @@ Restoring the archive under a live fast tier needs eviction held first:
     # restore, then
     cline resume --config cline.yaml
 
-That order is not a formality. The evictor's check is per document and presence
-only, so an archive holding an *older* version of a document confirms it as
-present, and the fast tier's newer copy is removed: the restore would cost you
-the writes made since the backup rather than recovering them.
+Pausing is still the procedure, and the reason for it changed on 2026-09-26.
+The evictor's check used to be presence only, so an archive holding an *older*
+version of a document confirmed it as present and the fast tier's newer copy
+was removed: measured by `test/testevict.sh`, five documents updated after the
+backup went from the fast tier and the newer value was in neither tier.
 
-That is measured now rather than reasoned, in both directions, by
-`test/testevict.sh`. Five documents mirrored at one value, updated to a second,
-the archive restored to the earlier backup underneath a live fast tier: paused,
-the evictor removes nothing and the newer copies survive; unpaused, all five go
-from the fast tier and the newer value is then in neither tier. The guard works
-and the danger it guards against is real.
+The evictor now evicts only a document whose archived copy is byte for byte the
+one on the fast tier, so a restored archive no longer costs the writes the fast
+tier still holds; the same suite measures all five kept with eviction running.
+The pause stays in the procedure because a restore is not the moment for any
+daemon to be moving documents, and because the backfill below is what makes
+those documents evictable again.
 
 **And the limit worth knowing before you need it.** A restored archive is a
 restored past. Documents written after the backup are still on the fast tier if
