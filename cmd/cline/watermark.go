@@ -194,5 +194,10 @@ func describe(m watermark.Mark) string {
 	if m.From.IsZero() {
 		return "complete for all of history"
 	}
-	return "complete for everything newer than " + m.From.Format(time.RFC3339)
+	// To the nanosecond the claim was stored with, not to the second. A boundary
+	// printed in whole seconds is up to a second older than the claim, and
+	// anybody checking coverage from it counts documents the claim does not
+	// cover: testwarm read 51 archived documents in a range whose claim covered
+	// 50, and flagged the fast tier as short when the claim was exact.
+	return "complete for everything newer than " + m.From.UTC().Format(time.RFC3339Nano)
 }

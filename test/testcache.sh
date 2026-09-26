@@ -369,6 +369,15 @@ ANS=tcadopt
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ANS.drop()" >/dev/null
+# And its completeness claim, which a drop straight at the tiers with no feeder
+# running does not reach. The shared config gives the warmer a rule for this
+# collection, so any suite that warms on this worker first claims it complete
+# for all of history while it is empty, which is true then. The documents below
+# go straight into the archive, and the router, trusting the claim, answered
+# the day-one question from the empty fast tier: 0 where the archive holds 10.
+# It failed only when a warming suite had run on the same worker before this
+# one; testwarm then testcache on one worker reproduced it every time.
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id: process.env.TC_DB + '.$ANS'})" >/dev/null
 C "const c=db.getSiblingDB(process.env.TC_DB).$ANS; const now=Date.now(); const d=[];
    // Inside the 40m warm window, so the warm below really does fill the fast
    // tier and the stage that says so is a fact.
