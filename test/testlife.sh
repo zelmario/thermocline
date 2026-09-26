@@ -269,6 +269,29 @@ waitBig2
 chk "a later write still reaches the archive" "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:778}))")"
 
+echo "== an update whose change event is larger than a document =="
+# The feeder asks for updateLookup, so an update event carries the whole
+# document and updateDescription beside it. A $set of a large field on a large
+# document makes an event past 16MB, which mongod refuses to return. Measured
+# before the fix: an 8MB document given a 7.5MB field made an event of
+# 24,117,718 bytes, the feeder reopened on it once a second, and nothing after
+# it reached the archive for any namespace. Sized to end 4KB under the limit.
+H "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:{\$in:[779,780]}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:{\$in:[779,780]}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:779, pad:'x'.repeat(8*1024*1024)})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:779}))")" = "1" ] && break; sleep 0.5
+done
+R "db.getSiblingDB(process.env.TC_DB).tbig.updateOne({_id:779}, {\$set:{pad2:'y'.repeat(16*1024*1024 - 8*1024*1024 - 4096)}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:780, after:1})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:780}))")" = "1" ] && break; sleep 0.5
+done
+chk "the large update reached the archive" "true" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:779}); print(!!(d && d.pad2))")"
+chk "and so did the write after it"        "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:780}))")"
+
 echo "== documents the archive will never receive =="
 # A change stream reports changes from now, so whatever the fast tier already
 # holds when the feeder first starts is not mirrored by starting it. In an

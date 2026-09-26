@@ -706,6 +706,9 @@ func (r *Router) reapCursors(ctx context.Context) {
 			// leaves an entry behind, and mongod reaps its own cursors on a
 			// timer too.
 			r.tiered.reapIdle(cursorIdle)
+			// And change stream events held for a client that never came back
+			// for them. See streamheld.go.
+			r.changeStreams.reapHeld(cursorIdle)
 		}
 	}
 }
@@ -1145,6 +1148,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// follow-ups have to be served here or the driver gets "cursor not found".
 	if nameErr == nil && !msg.MoreToCome() {
 		if handled, err := c.serveOwnCursors(ctx, msg, name); handled {
+			return err
+		}
+		// A change stream with events held back hands those out first. See
+		// streamheld.go.
+		if handled, err := c.serveHeldStream(ctx, msg, name); handled {
 			return err
 		}
 	}

@@ -79,6 +79,9 @@ const echoOutstanding = 60 * time.Second
 type changeStreamRegistry struct {
 	mu sync.RWMutex
 	ns map[int64]string
+	// held is what a cursor was sent and has not yet been given. See
+	// streamheld.go.
+	held map[int64]*heldStream
 }
 
 func (reg *changeStreamRegistry) add(id int64, ns string) {
@@ -104,6 +107,7 @@ func (reg *changeStreamRegistry) drop(id int64) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	delete(reg.ns, id)
+	delete(reg.held, id)
 }
 
 // streamScope names what a change stream is watching, and reports whether any
@@ -188,8 +192,8 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	keep, dropped := c.r.sieveEvents(ctx, events)
-	keep, filled := c.r.fillLookups(ctx, keep)
-	if dropped == 0 && filled == 0 {
+	keep, token, filled := c.cutStreamBatch(ctx, id, rdoc, c.owner(cmd), keep)
+	if dropped == 0 && filled == 0 && token.Type == 0 {
 		return nil, false
 	}
 	if dropped > 0 {
@@ -198,7 +202,7 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 			"watching", watching, "hidden", dropped,
 			"note", "this batch is what a consumer resuming from a stored token reads")
 	}
-	out, berr := replaceBatch(rdoc, "firstBatch", keep, reply.Header.RequestID)
+	out, berr := replaceStreamBatch(rdoc, "firstBatch", keep, token, reply.Header.RequestID)
 	if berr != nil {
 		return nil, false
 	}
@@ -234,12 +238,14 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	if !eok || len(events) == 0 {
 		return nil, false
 	}
+	// The id the reply carries, which is 0 once mongod has closed the cursor.
+	rid, _ := cursorIDOf(rdoc)
 
 	keep, dropped := c.r.sieveEvents(ctx, events)
 	// A lookup the fast tier could not answer is asked of the archive, because
 	// null means deleted and this document is not. See fillLookups.
-	keep, filled := c.r.fillLookups(ctx, keep)
-	if dropped == 0 && filled == 0 {
+	keep, token, filled := c.cutStreamBatch(ctx, rid, rdoc, c.owner(cmd), keep)
+	if dropped == 0 && filled == 0 && token.Type == 0 {
 		return nil, false
 	}
 	if dropped > 0 {
@@ -251,7 +257,7 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 			"watching", watching, "filled", filled)
 	}
 
-	out, berr := replaceBatch(rdoc, "nextBatch", keep, msg.Header.RequestID)
+	out, berr := replaceStreamBatch(rdoc, "nextBatch", keep, token, msg.Header.RequestID)
 	if berr != nil {
 		return nil, false
 	}

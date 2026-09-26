@@ -97,7 +97,9 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		if !ok {
 			continue
 		}
-		clashing = append(clashing, val)
+		// Copied, because val points into Current and is sent to the fast tier
+		// after the loop, when Current is valid no longer.
+		clashing = append(clashing, bson.RawValue{Type: val.Type, Value: append([]byte(nil), val.Value...)})
 		out = append(out, keyClash{doc: i, index: "_id_"})
 	}
 	if cerr := cur.Err(); cerr != nil {

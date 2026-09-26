@@ -38,6 +38,14 @@ import (
 // rather than doing part of the job and calling it success.
 const maxCopyUpForWrite = 10000
 
+// copyUpBatchBytes bounds what copyUpMatching holds before writing it to the
+// fast tier, alongside its count of 256.
+//
+// The count alone held 256 documents whatever their size. Measured on
+// 2026-09-26 with an updateMany over 60 archive-only documents of 12MB: the
+// router peaked at 2,044MB, and 256 of them would have been 3GB.
+const copyUpBatchBytes = 16 << 20
+
 // guardMultiWrite brings archived documents up before a multi-document write.
 //
 // It brings them up for a single-document one too, but only when the write is
@@ -404,6 +412,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 	var raw []bson.RawValue
 	copied := 0
 	moved := 0
+	held := 0
 
 	flush := func() error {
 		if len(docs) == 0 {
@@ -452,6 +461,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		docs = docs[:0]
 		ids = ids[:0]
 		raw = raw[:0]
+		held = 0
 		return nil
 	}
 
@@ -485,7 +495,8 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		ids = append(ids, meta.DocID(ns, id))
 		raw = append(raw, id)
 		copied++
-		if len(docs) >= 256 {
+		held += len(doc)
+		if len(docs) >= 256 || held >= copyUpBatchBytes {
 			if err := flush(); err != nil {
 				return moved, err
 			}

@@ -321,6 +321,34 @@ morning, by a fix. Every fix today that bounded something was measured with an
 input that could not reach the bound, until it was measured again with one that
 could.
 
+## 2026-09-26, evening: what a large document does to a change stream
+
+Three more from the same question, what a large document does, each measured
+before and after.
+
+**One update stopped mirroring for every namespace.** The feeder's stream asks
+for `updateLookup`, so an update event carries the whole document beside
+`updateDescription`. An 8MB document given a 7.5MB field in one `$set` made an
+event of 24,117,718 bytes, which mongod refuses to return. The feeder reopened
+at the same token once a second, and nothing after that update reached the
+archive. The stream now projects only the six fields the feeder reads; a
+document ending 4KB under 16MB mirrors, and so does the write after it.
+
+**A resumed change stream could never be read by the Go driver.** An update
+event whose lookup came back null is a few hundred bytes, so mongod packs up to
+a thousand into a batch, and the router fills each with the archive's copy.
+200 documents of 1MB, updated, evicted, and read from a token taken before the
+updates, came back as one batch of 209,826,801 bytes. The Go driver refuses a
+message past 48MB, retried, was sent the same batch, and gave up after 28
+seconds, on every resume. The router now cuts a filled batch at 16MB and holds
+the rest for the cursor's next getMores, with the resume token following the
+cut. Resuming in the middle gives 185 after 15 with none twice; a getMore from
+another session or naming another collection is refused as mongod refuses it.
+
+**A multi-document write held its copy-up by count.** An updateMany over 60
+archived documents of 12MB peaked the router at 2,044MB; bounded at 16MB a
+batch, 393MB.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

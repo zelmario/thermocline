@@ -1048,6 +1048,47 @@ ADMIT=$(( $(staleReads) - SRB ))
 OLDER=${LKOUT##*/}
 chk "and none carried a document older than itself"     "true" "$([ "${OLDER:-99}" -le "$ADMIT" ] && echo true || echo "$OLDER older, $ADMIT admitted")"
 
+echo "== a batch filled from the archive stays under 16MB =="
+# An update event whose lookup came back null is a few hundred bytes, so mongod
+# packs many into one batch, and filling them from the archive puts a whole
+# document into each. Measured before the fix: 200 documents of 1MB, updated,
+# evicted, read from a token taken before the updates, came back as one batch
+# of 209,826,801 bytes. The Go driver refuses a message past 48MB, dropped the
+# connection, was sent the same reply on its retry, and never got past it.
+# Twenty-four documents of 1MB is enough to need a cut, and the batches are
+# measured here because mongosh reads a batch of any size.
+BIGOIDS=$(for i in $(seq 1 24); do printf "ObjectId('%08x%016x')," $(( $(date +%s) - 7200 )) $((900 + i)); done)
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany([${BIGOIDS%,}].map(id=>({_id:id, cut:1, pad:'x'.repeat(1024*1024)})))" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({cut:1}))")" = "24" ] && break; sleep 0.5
+done
+export CUTTOK=$(R "const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch(); cs.tryNext(); print(EJSON.stringify(cs.getResumeToken()))")
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateMany({cut:1}, {\$set:{u:1}})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({cut:1, u:1}))")" = "24" ] && break; sleep 0.5
+done
+# Off the fast tier the way an eviction leaves it, with the feeder blind to the
+# deletes so the archive keeps all 24 live.
+stopFeeder
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({cut:1})" >/dev/null
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
+startFeeder
+CUT=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const d=db.getSiblingDB(process.env.TC_DB);
+  let r=d.runCommand({aggregate:'$NS', pipeline:[{\$changeStream:{fullDocument:'updateLookup', resumeAfter:EJSON.parse(process.env.CUTTOK)}}], cursor:{batchSize:1000}});
+  let b=r.cursor.firstBatch, upd=0, filled=0, biggest=0, batches=0;
+  for (let i=0;i<20;i++) {
+    batches++; biggest=Math.max(biggest, JSON.stringify(b).length);
+    for (const e of b) if (e.operationType==='update') { upd++; if (e.fullDocument) filled++; }
+    if (upd>=24) break;
+    r=d.runCommand({getMore:r.cursor.id, collection:'$NS', batchSize:1000}); b=r.cursor.nextBatch;
+  }
+  print(upd+'/'+filled+'/'+biggest+'/'+batches)" 2>&1 | tail -1)
+echo "  updates/filled/largest batch/batches: $CUT"
+chk "every update event arrived with its document"      "24/24" "$(echo "$CUT" | cut -d/ -f1-2)"
+chk "and no batch was past 16MB"                         "true" \
+    "$(B=$(echo "$CUT" | cut -d/ -f3); [ -n "$B" ] && [ "$B" -le 16793600 ] 2>/dev/null && echo true || echo "largest ${B:-unknown}")"
+
 # $NS is dropped in setup and was never dropped at the end, alone among this
 # suite's collections. What it leaves is six documents whose _id values are
 # plain integers, and the evictor rule that covers this namespace takes each

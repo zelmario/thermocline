@@ -850,7 +850,26 @@ func (f *Feeder) pipeline() mongo.Pipeline {
 		match = append(match, bson.E{Key: "$or", Value: want})
 	}
 
-	return mongo.Pipeline{{{Key: "$match", Value: match}}}
+	// Only what changeEvent reads, and the resume token, which a change stream
+	// keeps whatever the projection says.
+	//
+	// An update event carries updateDescription beside the fullDocument that
+	// updateLookup adds, and mongod refuses to return an event past 16MB. A
+	// document of 8MB given a 7.5MB field in one $set made an event of
+	// 24,117,718 bytes, measured on 2026-09-26: the stream failed on it, the
+	// feeder reopened at the same token and failed again once a second, and
+	// nothing after that update was mirrored for any namespace. The feeder
+	// never reads updateDescription, because it mirrors an update by replacing
+	// the whole document. Without it an event is one document of at most 16MB
+	// and a few fields, which mongod's limit allows for.
+	project := bson.D{
+		{Key: "operationType", Value: 1},
+		{Key: "ns", Value: 1},
+		{Key: "documentKey", Value: 1},
+		{Key: "fullDocument", Value: 1},
+		{Key: "clusterTime", Value: 1},
+	}
+	return mongo.Pipeline{{{Key: "$match", Value: match}}, {{Key: "$project", Value: project}}}
 }
 
 // justBefore is the latest cluster time an event at ts proves mirrored: the
