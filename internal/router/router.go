@@ -63,6 +63,11 @@ type Router struct {
 	// member that steps down stays up and keeps accepting connections, so the
 	// pinned address is reachable and wrong at the same time.
 	primaryRefused bool
+	// refusedBy is the member that refused, and refusedAt when. For as long as
+	// a step-down can last, a lookup naming that member again is a view that
+	// has not heard yet rather than an answer. See refreshPrimary.
+	refusedBy string
+	refusedAt time.Time
 	// avoidUntil keeps a member out of the secondary rotation until an instant,
 	// because it answered a read saying it is neither primary nor secondary.
 	avoidMu    sync.Mutex
@@ -1880,6 +1885,21 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 	}
 
 	r.primaryMu.Lock()
+	// The member that just refused a write, named again within the window a
+	// step-down lasts, is a member whose view has not caught up rather than an
+	// answer. In the first moments after a step-down the member the driver asks
+	// can still name the old primary, and pinning it sent the reconnecting
+	// client straight back to the member that refused: its one retry was
+	// refused too. Measured in full host sweeps on 2026-09-25 and 26, a write
+	// across a step-down failed after 2.4 seconds and a write while the set had
+	// no primary failed after 7.4, both with "not primary", where a driver
+	// talking to the set would have waited in server selection. It is answered
+	// as an election still running, so every caller keeps asking.
+	if r.namesTheRefuser(addr, time.Now()) {
+		r.primaryMu.Unlock()
+		return errNoPrimaryYet
+	}
+	r.refusedBy = ""
 	changed := r.primary != addr
 	old := r.primary
 	r.primary = addr
@@ -1906,7 +1926,10 @@ const primaryProbeEvery = time.Second
 
 // primaryProbeWait bounds one such lookup. It is generous enough to cross an
 // ordinary election and short enough that a fast tier with no primary at all
-// does not accumulate probes.
+// does not accumulate probes. It also bounds how long a refused client's reply
+// is held before its connection is closed, and ten seconds was measured to be
+// too long: a write while the set had no primary then failed with "Server
+// ended moreToCome unexpectedly" in three runs of four.
 const primaryProbeWait = 5 * time.Second
 
 // primaryMoved re-resolves the pinned fast tier address after a member has said
@@ -1936,6 +1959,9 @@ func (r *Router) primaryMoved() {
 	// whether or not this one is the caller that gets to go and look.
 	r.primaryMu.Lock()
 	r.primaryRefused = true
+	if r.primary != "" {
+		r.refusedBy, r.refusedAt = r.primary, time.Now()
+	}
 	r.primaryMu.Unlock()
 
 	r.primaryProbeMu.Lock()
@@ -1963,7 +1989,7 @@ func (r *Router) primaryMoved() {
 		r.safely("finding the fast tier's primary", func() {
 			ctx, cancel := context.WithTimeout(context.Background(), primaryProbeWait)
 			defer cancel()
-			if err := r.refreshPrimary(ctx); err != nil {
+			if err := r.movedOff(ctx); err != nil {
 				r.log.Warn("the fast tier refused a command as not primary, and which member took over could not be resolved",
 					"pinned", r.currentPrimary(), "err", err)
 			}
@@ -1985,6 +2011,41 @@ func (r *Router) primaryMoved() {
 // already failed, and it is bounded twice over: by the probe's own timeout and
 // by the caller's context. A driver talking straight to the replica set would
 // be blocking in server selection for longer.
+// movedOff re-resolves the primary until a lookup succeeds, or the context
+// ends. A lookup naming the member that just refused does not succeed; see
+// refreshPrimary.
+//
+// One lookup was not enough. It asks whichever member the driver picks who the
+// primary is, and in the first moments after a step-down a member that has not
+// yet heard still names the old one, so the router pinned the member that had
+// just refused. The client's connection was then closed, its driver reconnected
+// to that same member, and its one retry was refused too. Measured in two full
+// host sweeps on 2026-09-25 and 26: a proxied write across a step-down failed
+// after 2.4 seconds, and a write while the set had no primary failed after 7.4,
+// both with "not primary"; nineteen runs of the suite alone never showed it,
+// because an idle box finishes the election before the first lookup.
+//
+// namesTheRefuser says a lookup's answer is the member that refused a write
+// within the last primaryWait, which is a view that has not caught up. The
+// caller holds primaryMu.
+func (r *Router) namesTheRefuser(addr string, now time.Time) bool {
+	return r.refusedBy != "" && addr == r.refusedBy && now.Sub(r.refusedAt) < primaryWait
+}
+
+func (r *Router) movedOff(ctx context.Context) error {
+	for {
+		err := r.refreshPrimary(ctx)
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
 func (r *Router) awaitPrimaryProbe(ctx context.Context) {
 	r.primaryProbeMu.Lock()
 	done := r.primaryProbing
