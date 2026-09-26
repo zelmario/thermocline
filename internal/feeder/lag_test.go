@@ -1,6 +1,7 @@
 package feeder
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -123,5 +124,36 @@ func TestAFlushIsBoundedInBytes(t *testing.T) {
 	f.pending = append(f.pending, pendingOp{doc: big})
 	if !f.dueToFlush(now) {
 		t.Error("64MB of four documents waited for more; one transaction would grow without bound")
+	}
+}
+
+// An event proves mirroring up to just before its own cluster time, because
+// every operation of a transaction shares the commit's. Claiming the event's
+// own time let a router read a transaction half mirrored: 499 of 600 events,
+// five rounds of five.
+func TestAnEventProvesOnlyWhatCameBeforeIt(t *testing.T) {
+	f := testFeeder()
+	raw := event(t, "insert", "shop", "orders", bson.D{
+		{Key: "documentKey", Value: bson.D{{Key: "_id", Value: 1}}},
+		{Key: "fullDocument", Value: bson.D{{Key: "_id", Value: 1}}},
+	})
+	doc := bson.D{}
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for i := range doc {
+		if doc[i].Key == "clusterTime" {
+			doc[i].Value = bson.Timestamp{T: 100, I: 5}
+		}
+	}
+	raw, _ = bson.Marshal(doc)
+	if err := f.handle(context.Background(), raw); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if f.lastEventTS != (bson.Timestamp{T: 100, I: 4}) {
+		t.Errorf("after an event at {100 5} the position claims %v, want {100 4}: the rest of a transaction may share its time", f.lastEventTS)
+	}
+	if justBefore(bson.Timestamp{T: 100, I: 0}) != (bson.Timestamp{T: 99, I: ^uint32(0)}) {
+		t.Error("the time before the first increment of a second is the last increment of the one before")
 	}
 }

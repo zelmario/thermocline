@@ -848,6 +848,35 @@ func (f *Feeder) pipeline() mongo.Pipeline {
 	return mongo.Pipeline{{{Key: "$match", Value: match}}}
 }
 
+// justBefore is the latest cluster time an event at ts proves mirrored: the
+// one before it, not its own.
+//
+// Every operation of a transaction carries the same cluster time, the
+// commit's, so an event at T says everything before T has been seen and not
+// that everything at T has. The position used to claim T, and a flush can fall
+// in the middle of a transaction: at the 500-event batch limit, or at the 100ms
+// bound of a stream that is never quiet. The router's barrier waits for the
+// client's cluster time, which after a commit is exactly T, so it cleared with
+// half the transaction in the archive and the read answered from that half.
+// Measured on 2026-09-25 with one order and 600 events in one transaction: the
+// position reached the commit with 499 of the 600 events in the archive, five
+// rounds of five. The two-router store run met it as a committed transaction
+// whose event could not be read back.
+//
+// T itself is claimed once it is proved: by the next event, which is later,
+// or by an empty poll's resume token, which is MongoDB saying nothing exists up
+// to there. See markCaughtUp. A read waiting on a plain write therefore waits
+// for one of those, which on a quiet stream is the next poll.
+func justBefore(ts bson.Timestamp) bson.Timestamp {
+	switch {
+	case ts.I > 0:
+		return bson.Timestamp{T: ts.T, I: ts.I - 1}
+	case ts.T > 0:
+		return bson.Timestamp{T: ts.T - 1, I: ^uint32(0)}
+	}
+	return ts
+}
+
 // handle decodes one event and buffers the work it implies.
 func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 	var ev changeEvent
@@ -858,7 +887,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		return nil
 	}
 	f.noteEventTime(time.Unix(int64(ev.ClusterTime.T), 0).UTC())
-	f.noteEventTS(ev.ClusterTime)
+	f.noteEventTS(justBefore(ev.ClusterTime))
 
 	ns := ev.NS.DB + "." + ev.NS.Coll
 
