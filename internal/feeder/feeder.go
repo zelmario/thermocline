@@ -710,7 +710,12 @@ const busyFlushEvery = 100 * time.Millisecond
 
 // flushBytes is the most document data one flush carries, and so the largest
 // transaction the archive is asked to commit. See writeFlush and dueToFlush.
-const flushBytes = 64 << 20
+//
+// 16MB, one document at the limit. It was 64MB, and flushes of five 12MB
+// documents were refused by a 1GB archive cache as TransactionTooLargeForCache
+// every time. A flush that holds more than this is one large document arriving
+// with smaller ones, since the check runs as each event is buffered.
+const flushBytes = 16 << 20
 
 // dueToFlush says the buffer should go to the archive now, before the stream
 // has gone quiet.

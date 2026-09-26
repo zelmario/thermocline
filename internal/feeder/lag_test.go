@@ -114,16 +114,13 @@ func TestAFlushIsBoundedInBytes(t *testing.T) {
 	f.cfg.BatchSize = 500
 	now := time.Now()
 	f.pendingSince = now
-	big := make(bson.Raw, 16<<20)
-	for i := 0; i < 3; i++ {
-		f.pending = append(f.pending, pendingOp{doc: big})
-	}
+	f.pending = append(f.pending, pendingOp{doc: make(bson.Raw, 8<<20)})
 	if f.dueToFlush(now) {
-		t.Fatal("48MB of three documents was flushed before the byte bound")
+		t.Fatal("8MB was flushed before the byte bound")
 	}
-	f.pending = append(f.pending, pendingOp{doc: big})
+	f.pending = append(f.pending, pendingOp{doc: make(bson.Raw, 8<<20)})
 	if !f.dueToFlush(now) {
-		t.Error("64MB of four documents waited for more; one transaction would grow without bound")
+		t.Error("16MB waited for more; one transaction would grow past what the archive's cache can hold")
 	}
 }
 

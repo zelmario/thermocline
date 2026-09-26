@@ -111,6 +111,16 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 					"member replica set is enough")
 			return f.writeEach(ctx, order, byNS, opsByNS, now)
 		}
+		// Before the transient check, so a label on it does not retry the same
+		// flush for ever.
+		if tooLargeForCache(err) {
+			f.log.Warn("the archive could not hold this flush in one transaction, writing it a collection at a time",
+				"documents", total, "err", err,
+				"effect", "for the length of this one flush a reader of the archive can see a write to one "+
+					"collection without an earlier write to another",
+				"why", "retrying the same transaction fails the same way, and mirroring would stop for every namespace behind it")
+			return f.writeEach(ctx, order, byNS, opsByNS, now)
+		}
 		if transient(err) {
 			continue
 		}
@@ -169,6 +179,19 @@ func commit(ctx context.Context, sess *mongo.Session) error {
 		}
 		return err
 	}
+}
+
+// tooLargeForCache says the archive's storage engine could not hold the
+// transaction's writes until it committed.
+//
+// Measured on 2026-09-26 with 60 documents of 12MB behind a stopped feeder, on
+// this box's 1GB archive cache: every flush of them failed with it, the feeder
+// reopened its stream and retried the same flush, and in two minutes 13 of the
+// 60 had been mirrored while mirroring fell five minutes behind for everything
+// else. The flush is smaller now, see flushBytes, and this is what remains when
+// even that does not fit.
+func tooLargeForCache(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "TransactionTooLargeForCache")
 }
 
 // transient says the whole transaction can be tried again as it is.
