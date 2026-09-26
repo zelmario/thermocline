@@ -126,13 +126,29 @@ for r in "$R1" "$R2"; do
 done
 echo "  both routers answer"
 
+# How the warmer and the evictor move documents underneath the shops.
+#
+# CHURN=daemons, the default, is the shipped shape: the evictor is a resident
+# daemon, as cline-evictor.service runs it, and the warmer runs beside it on its
+# own schedule, as cline-warmer.timer does, so the two overlap. CHURN=serial is
+# the older loop that ran one and then the other and never both at once, which
+# is not a shape any deployment has.
+CHURN=${CHURN:-daemons}
+if [ "$CHURN" = serial ]; then
+  EVICT_START=""
+  EVICT_STEP="cline evictor --config $CFG --once >/dev/null 2>&1"
+else
+  EVICT_START="cline evictor --config $CFG --every 5s --log-file /root/sharedlog/evictor.log &"
+  EVICT_STEP=":"
+fi
 cat > /tmp/shared_churn.sh <<CH
 #!/bin/bash
 trap 'for p in \$(pgrep -f "cline (warmer|evictor) --config /root/share[d]"); do kill -9 \$p 2>/dev/null; done' EXIT
 deadline=\$(( \$(date +%s) + $CHURN_SECS ))
+$EVICT_START
 while [ -f /root/shared_churn.run ] && [ \$(date +%s) -lt \$deadline ]; do
   cline warmer --config $CFG >/dev/null 2>&1
-  cline evictor --config $CFG --once >/dev/null 2>&1
+  $EVICT_STEP
   sleep 5
 done
 CH
