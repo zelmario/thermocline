@@ -493,7 +493,7 @@ Part of [Thermocline](../README.md).
 
 - **With authentication proxied, a single write across a step-down can still
   fail, on a loaded box.** The driver retries once, and the retry lands only if
-  the router has found the new primary by then. In 4 of the last 7 full host
+  the router has found the new primary by then. In 6 of the last 10 full host
   sweeps, 2026-09-25 and 26, `testfailover.sh` saw that write fail after about
   2.4 seconds with "not primary", and sometimes a write during a window with
   no primary as well; in 28 runs of the suite outside a full sweep, alone or
@@ -501,6 +501,11 @@ Part of [Thermocline](../README.md).
   2,436 to 2,477ms, which suggests a timer rather than load, and it was not
   found. cf705b0 stopped the router re-pinning the member that had just
   refused, which is a real stale answer but was not this.
+
+  On 2026-09-26 it came with a second check once: "a client connecting after it
+  reaches the new primary" timed out on server selection at 2 seconds, in the
+  same sweep and the same window. Both passed in three runs of the suite alone
+  straight after.
 
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
