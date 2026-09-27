@@ -148,6 +148,16 @@ run() {
     line="SETUP FAILED: $(grep -E 'FATAL|not here|never came up' "$log" | tail -1)"
   fi
   printf '%-22s rc=%-3s %5ss  %s\n' "$label" "$rc" "$secs" "${line:-(no tally, rc=$rc)}" >> "$OUT/summary.txt"
+  # A failed suite keeps its log and the node's daemon logs, outside $OUT and
+  # under the time it ran, because the next sweep or a rerun of the suite alone
+  # overwrites both. The testfailover flake failed a new check on 2026-09-26 and
+  # nothing of that run was left to read by the time anyone looked.
+  if [ "$rc" != 0 ]; then
+    local keep="${KEEP:-/tmp/hostsweep-failures}/$(date +%Y%m%d-%H%M%S)-$label"
+    mkdir -p "$keep"
+    cp "$log" "$keep/"
+    docker cp "$NODE:/var/log/cline" "$keep/daemonlogs" >/dev/null 2>&1
+  fi
 }
 
 echo "hostsweep: $(echo $SUITES | wc -w) suites, serial, logs in $OUT" | tee -a "$OUT/summary.txt"
