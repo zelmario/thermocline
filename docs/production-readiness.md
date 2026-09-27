@@ -354,11 +354,14 @@ once what stopped it when a write made straight at the fast tier does it. See
 `docs/limitations.md`, which also has a unique value past about 12MB going
 unchecked against the archive.
 
-One failure in the sweep on ea87c71 is not explained: testchange's "a lookup is
-answered from the archive" saw no update event, with the router log showing
-the stream open 0.9s before the update and no batch rewritten. It passed in a
-rerun under the same load and 20 of 20 times in a loop of that section. Held
-as a lead, not closed.
+One failure in the sweep on ea87c71, testchange's "a lookup is answered from
+the archive", was chased on 2026-09-27 and is not this system's. mongosh's
+`watch()` with no start option calls `tryNext()` once to open the cursor and
+discards what it returns. A wire tap between mongosh and the router showed the
+update delivered to mongosh in that first getMore, 4ms before `watch()`
+returned; against a plain mongod with no router, an insert timed to land there
+was lost 3 times in 20. The suite's watchers that wait for another process's
+write now open at an explicit start, which skips that call.
 
 **A multi-document write held its copy-up by count.** An updateMany over 60
 archived documents of 12MB peaked the router at 2,044MB; bounded at 16MB a

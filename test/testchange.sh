@@ -76,6 +76,15 @@ waitMirrored() {
   echo "  WARN  the archive never reached $1 live documents, last saw ${n:-none}"
 }
 
+# Every watcher that waits for a write made by another process opens at an
+# explicit start, one tick past the current time, rather than at "now". mongosh's
+# watch() with no start option calls tryNext() once to open the cursor and throws
+# the result away, so a write landing in that first getMore is never seen.
+# Measured on 2026-09-27 against a plain mongod with no router: an insert timed
+# to land while watch() was starting was lost 3 times in 20. Under a four-worker
+# sweep it failed "a lookup is answered from the archive" once, with the wire
+# showing the update delivered to mongosh. With a start option that call is
+# skipped, and the watcher still sees everything from the moment it opened.
 echo "== setup =="
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
@@ -118,7 +127,7 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:900})" >/dev/null
 
 echo "== it reports the application's own writes =="
 SEEN=$(R "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:1, v:'a'});
   db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:1},{\$set:{v:'b'}});
   let ops=[];
@@ -173,7 +182,7 @@ awaitWatcher() { # awaitWatcher FILE PID
 
 rm -f /tmp/cs_events.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+(e.documentKey?JSON.stringify(e.documentKey._id):'')); else sleep(250); }
   cs.close();
@@ -204,7 +213,7 @@ echo "== a copy-up must not look like an insert =="
 # new.
 rm -f /tmp/cs_events2.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
   cs.close();
@@ -261,7 +270,7 @@ rm -f /tmp/cs_many.txt
 # maxAwaitTimeMS low, or each poll with nothing waiting costs a second and the
 # watcher outlives the reads it is supposed to be watching.
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$MANY.watch([],{maxAwaitTimeMS:50});
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$MANY.watch([],{maxAwaitTimeMS:50, startAtOperationTime:tcNow()});
   let ins=0, other=0, ids=[];
   // Bounded by the clock, not by a poll count: 2000 polls at 25ms each
   // outlived awaitWatcher's own patience and the watcher was killed before it
@@ -366,7 +375,7 @@ sleep 35
 
 rm -f /tmp/cs_twice.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$TWICE.watch([],{maxAwaitTimeMS:50});
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$TWICE.watch([],{maxAwaitTimeMS:50, startAtOperationTime:tcNow()});
   let ins=0, other=0;
   const until=Date.now()+20000;
   while (Date.now()<until) {
@@ -422,7 +431,7 @@ C "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID2')});
 H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID2')})" >/dev/null
 rm -f /tmp/cs_events2b.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   let ops=[];
   for (let i=0;i<80 && ops.length<2;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
   cs.close();
@@ -476,7 +485,7 @@ echo "== a lookup the fast tier cannot answer =="
 # document through the router returned it.
 rm -f /tmp/cs_events3.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {fullDocument:'updateLookup'});
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {fullDocument:'updateLookup', startAtOperationTime:tcNow()});
   let out='no event';
   for (let i=0;i<60;i++) {
     const e=cs.tryNext();
@@ -520,7 +529,7 @@ done
 
 rm -f /tmp/cs_events5.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   sleep(40000);
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
@@ -560,7 +569,7 @@ chk "an eviction read late is not a delete"            "true" \
 # And the copy-up half of it, on the document that was just evicted.
 rm -f /tmp/cs_events6.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([], {startAtOperationTime:tcNow()});
   sleep(40000);
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
@@ -595,7 +604,7 @@ done
 # The eviction, made by hand for the reason given above.
 rm -f /tmp/cs_events7.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).watch([], {startAtOperationTime:tcNow()});
   let ops=[];
   for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+(e.ns?e.ns.coll:'?')); else sleep(250); }
   cs.close();
@@ -626,7 +635,7 @@ rm -f /tmp/cs_events8.txt
 # that arrives. Grepping for "insert" was satisfied by the copy-up's own insert,
 # so the control passed while reporting the very event it was meant to rule out.
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getSiblingDB(process.env.TC_DB).watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).watch([], {startAtOperationTime:tcNow()});
   let ops=[];
   for (let i=0;i<60;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(250); }
   cs.close();
@@ -659,7 +668,7 @@ rm -f /tmp/cs_events9.txt
 # router that had swallowed an insert. Measured once in a four-worker sweep, and
 # it is the only way this check has ever failed.
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
-  const cs=db.getMongo().watch();
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getMongo().watch([], {startAtOperationTime:tcNow()});
   const want='$NS';
   const until=Date.now()+25000;
   let ops=[];
