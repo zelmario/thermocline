@@ -507,6 +507,15 @@ Part of [Thermocline](../README.md).
   same sweep and the same window. Both passed in three runs of the suite alone
   straight after.
 
+  The first failure with its router log kept, 2026-09-28 (hostsweep now keeps
+  them): the client gave up at 2,383ms with "not primary"; the router's probe
+  for the new primary ran from about 02:39:52.7 until its 5s timeout at
+  57.711 with the set still electing, and the new primary appeared at
+  02:40:01.885, twelve seconds after the step-down on a loaded box. The client's
+  error arrived about when the probe began, not when it ended, so the wait that
+  should hold the refusal until the probe finishes did not hold it. Why is the
+  open question; the log is in /tmp/hostsweep-failures on this box.
+
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
   `router.terminate_auth` replays the write itself and does not have it.
