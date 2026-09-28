@@ -578,6 +578,7 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		return c.claimEvaluated(ctx, ns, idx, after)
 	}
 
+	statement := map[string]string{}
 	for _, doc := range docs {
 		id, _ := doc.LookupErr("_id")
 		if !c.constrainsAfter(ctx, ns, idx, sh, doc, st.filter) {
@@ -586,6 +587,9 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 		// Every key the post-image takes. See multikey.go.
 		kids, tuples := keysFromFieldValues(ns, idx, sh.newKeyValues(idx, doc, st.filter))
 		for k, kid := range kids {
+			if sameStatementHolds(statement, kid, id) {
+				continue
+			}
 			got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, tuples[k])
 			if terr != nil {
 				return false, claimed, terr
@@ -594,6 +598,7 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 				return true, claimed, nil
 			}
 			claimed = append(claimed, kid)
+			statement[kid] = idKey(id)
 		}
 	}
 
@@ -792,6 +797,7 @@ func (c *conn) evaluateUpdate(ctx context.Context, ns, coll string, stmt any, id
 // computed by the fast tier rather than read off the command.
 func (c *conn) claimEvaluated(ctx context.Context, ns string, idx uniqueIndex, docs []bson.Raw) (clash bool, claimed []string, err error) {
 	dbName, _ := splitNS(ns)
+	statement := map[string]string{}
 	for _, doc := range docs {
 		if !c.r.constrains(ctx, dbName, idx, doc) {
 			continue
@@ -799,6 +805,9 @@ func (c *conn) claimEvaluated(ctx context.Context, ns string, idx uniqueIndex, d
 		id, _ := doc.LookupErr("_id")
 		kids, tuples := docKeys(ns, idx, doc)
 		for k, kid := range kids {
+			if sameStatementHolds(statement, kid, id) {
+				continue
+			}
 			got, terr := c.r.tryClaim(ctx, ns, idx, kid, id, tuples[k])
 			if terr != nil {
 				return false, claimed, terr
@@ -807,9 +816,26 @@ func (c *conn) claimEvaluated(ctx context.Context, ns string, idx uniqueIndex, d
 				return true, claimed, nil
 			}
 			claimed = append(claimed, kid)
+			statement[kid] = idKey(id)
 		}
 	}
 	return false, claimed, nil
+}
+
+// sameStatementHolds reports whether an earlier document of the same statement
+// has claimed this key, for a later one that would take the same new value.
+//
+// mongod applies the earlier document and refuses the later one with its own
+// unique index, so the later one is left for mongod to refuse rather than sent
+// to the registry. Sent there it found the earlier document's fresh claim, whose
+// owner does not hold the value yet because the update has not run, read it as
+// stale and took it over, and the document that did take the value was left
+// with a claim pointing at one that never did. Measured on 2026-09-28 with
+// updateMany({g:1}, {$set:{email:"x@x"}}) over two documents: see
+// releaseUnheld for the other half of it.
+func sameStatementHolds(statement map[string]string, kid string, id bson.RawValue) bool {
+	owner, taken := statement[kid]
+	return taken && owner != idKey(id)
 }
 
 // constrainsAfter reports whether idx will index the document once the

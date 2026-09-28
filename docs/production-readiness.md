@@ -442,6 +442,18 @@ archived, a third insert of the value was accepted beside it, ordered and
 unordered alike. A later document of a batch with a key an earlier one claimed
 is now refused at once, as mongod refuses it.
 
+**A write that landed in part lost the claims of what landed.** After any
+write that reported an error the router released every claim the command had
+made. An updateMany that changed its first document and was refused on its
+second, and an unordered insert the fast tier refused one document of, both
+left the documents that had landed with no claim. The same shape is two clients
+inserting one new value at once: the second takes over the first's fresh
+claim, the first lands, and the claim then names the refused one. Measured, 30
+rounds of two concurrent inserts: 4 left the survivor unclaimed before, 0
+after. A claim is now kept when its owner holds the key, moved to the fast tier
+document that holds it when the owner does not, and released only when nothing
+does.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

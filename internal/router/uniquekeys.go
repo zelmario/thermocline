@@ -924,6 +924,130 @@ func (r *Router) stillHoldsKey(ctx context.Context, ns string, idx uniqueIndex, 
 	return false
 }
 
+// releaseUnheld undoes the claims of a write that reported an error, except
+// those whose document landed anyway.
+//
+// A write that reports an error can still have written part of what it was
+// asked: an updateMany stops at the first document the fast tier's own index
+// refuses, having changed the ones before it, and an unordered insert keeps
+// every document but the refused one. Releasing every claim of the command
+// took away the claims of the documents that had landed. Measured on
+// 2026-09-28: updateMany({g:1}, {$set:{email:"x@x"}}) over two documents
+// changed the first and was refused on the second, the registry was left with
+// no row for x@x, and once the first was archived a third x@x was accepted.
+//
+// So each claim is settled on what the fast tier holds after the write. See
+// settleAfterFailedWrite. Anything that cannot be read is kept: a claim whose
+// owner does not hold the key is taken over by the next writer, so keeping one
+// is safe, and it is releasing a live one that loses the constraint.
+func (r *Router) releaseUnheld(ctx context.Context, ids []string) {
+	for _, kid := range ids {
+		r.settleAfterFailedWrite(ctx, kid)
+	}
+}
+
+// settleAfterFailedWrite keeps a claim whose owner holds its key, gives it to
+// the fast tier document that does hold it when the owner does not, and
+// releases it only when nothing holds it.
+//
+// The middle case is two writers with one new value. The second finds the
+// first's claim, owned by a document not written yet, reads it as stale and
+// takes it over; the first write lands and the second is refused by the fast
+// tier's own index. The claim then names the document that was refused, and
+// releasing it left the one that landed with none. That is two clients
+// inserting the same email at once, or two operations of one bulkWrite, or two
+// documents of one $merge. Moving the claim to whoever holds the value repairs
+// all of them without asking how the race was run.
+func (r *Router) settleAfterFailedWrite(ctx context.Context, kid string) {
+	parts := strings.SplitN(kid, "|", 3)
+	if len(parts) != 3 {
+		return
+	}
+	ns, name := parts[0], parts[1]
+	var idx uniqueIndex
+	found := false
+	for _, i := range r.uniqueIndexes(ctx, ns) {
+		if i.name == name {
+			idx, found = i, true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	var claim keyClaim
+	if err := r.keys().FindOne(ctx, bson.D{{Key: "_id", Value: kid}}).Decode(&claim); err != nil {
+		return
+	}
+	if claim.Doc.IsZero() {
+		return
+	}
+	db, coll := splitNS(ns)
+	var owner bson.Raw
+	err := r.hot.Database(db).Collection(coll).FindOne(ctx, bson.D{{Key: "_id", Value: claim.Doc}}).Decode(&owner)
+	switch {
+	case err == nil:
+		if r.stillHoldsKey(ctx, ns, idx, kid, owner) {
+			return
+		}
+	case !errors.Is(err, mongo.ErrNoDocuments):
+		return
+	}
+	vals, ok := valuesFromKeyID(ns, idx, kid)
+	if !ok {
+		return
+	}
+	mine := bson.D{{Key: "_id", Value: kid}, {Key: "doc", Value: claim.Doc}}
+	holder, held, herr := r.fastTierHolderOf(ctx, ns, idx, vals)
+	if herr != nil {
+		return
+	}
+	if held {
+		if _, uerr := r.keys().UpdateOne(ctx, mine, bson.D{{Key: "$set", Value: bson.D{{Key: "doc", Value: holder}}}}); uerr != nil {
+			r.log.Warn("could not move a unique key claim to the document that holds it",
+				"ns", ns, "index", idx.name, "err", uerr)
+		}
+		return
+	}
+	if _, derr := r.keys().DeleteOne(ctx, mine); derr != nil {
+		r.log.Warn("could not release a unique key claim after a failed write",
+			"err", derr, "note", "it will be taken over on the next collision")
+	}
+}
+
+// fastTierHolderOf is the _id of a fast tier document that holds a key, in
+// the index's own comparison and scope.
+func (r *Router) fastTierHolderOf(ctx context.Context, ns string, idx uniqueIndex, vals []any) (bson.RawValue, bool, error) {
+	if len(vals) != len(idx.fields) {
+		return bson.RawValue{}, false, nil
+	}
+	filter := bson.D{}
+	for i, f := range idx.fields {
+		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+	}
+	if scope := indexScope(idx); len(scope) > 0 {
+		filter = append(filter, bson.E{Key: "$and", Value: scope})
+	}
+	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
+	if len(idx.collation) > 0 {
+		opts.SetCollation(collationFromSpec(idx.collation))
+	}
+	db, coll := splitNS(ns)
+	var doc bson.Raw
+	err := r.hot.Database(db).Collection(coll).FindOne(ctx, filter, opts).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return bson.RawValue{}, false, nil
+	}
+	if err != nil {
+		return bson.RawValue{}, false, err
+	}
+	id, lerr := doc.LookupErr("_id")
+	if lerr != nil {
+		return bson.RawValue{}, false, nil
+	}
+	return bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)}, true, nil
+}
+
 // releaseKeys undoes claims after an insert that did not land.
 func (r *Router) releaseKeys(ctx context.Context, ids []string) {
 	if len(ids) == 0 {

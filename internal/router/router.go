@@ -1537,11 +1537,12 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// newuniqueindex.go for why that order.
 	c.releaseIndexKeysIfBuildFailed(ctx, reply)
 
-	// An insert the fast tier rejected never happened, so its key claims have
-	// to go back, or that value is blocked until something else collides.
+	// A write the fast tier rejected, in whole or in part, gives back the claims
+	// of the documents that did not land, and only those: see releaseUnheld
+	// for what releasing all of them cost.
 	if len(c.pendingKeys) > 0 {
 		if rdoc, derr := reply.ReplyDoc(); derr != nil || !replyOK(rdoc) || writeFailed(rdoc) {
-			c.r.releaseKeys(ctx, c.pendingKeys)
+			c.r.releaseUnheld(ctx, c.pendingKeys)
 		}
 		c.pendingKeys = nil
 	}

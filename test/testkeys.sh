@@ -677,6 +677,26 @@ evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteMany({})'
 chk "a third with the value, once the first is archived, is refused" "11000" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:3,email:"x@x"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== a write that lands in part keeps the claims of what landed =="
+# mongod applies an updateMany up to the first document its own unique index
+# refuses, and an unordered insert keeps every document but the refused one. The
+# router released every claim of a write that reported an error, so the
+# documents that had landed lost theirs. Measured before the fix, both shapes:
+# no row left for the value that landed, and a later insert of it accepted once
+# the document was archived.
+fresh tkcoll2 '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll2.insertMany([{_id:1,email:"a@x",g:1},{_id:2,email:"b@x",g:1},{_id:3,email:"r@x"}])' >/dev/null
+R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.updateMany({g:1},{$set:{email:"u@x"}})}catch(e){}' >/dev/null
+R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertMany([{_id:4,email:"p@x"},{_id:3,email:"q@x"}],{ordered:false})}catch(e){}' >/dev/null
+chk "the updateMany changed the first and not the second" "1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkcoll2.countDocuments({email:"u@x"}))')"
+waitMirrored tkcoll2 4
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteMany({})'
+chk "the value an updateMany landed stays taken"      "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:5,email:"u@x"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and so does one a partly refused insert landed"  "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:6,email:"p@x"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a
