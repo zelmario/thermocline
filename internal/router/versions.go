@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/tierver"
 )
 
@@ -16,7 +17,10 @@ import (
 // releases, unless the configuration says to allow it.
 func (r *Router) checkTierVersions(ctx context.Context) error {
 	r.rememberReleases(ctx)
-	return tierver.Check(ctx, r.hot, r.cold, r.cfg.AllowVersionSkew, r.log)
+	if err := tierver.Check(ctx, r.hot, r.cold, r.cfg.AllowVersionSkew, r.log); err != nil {
+		return err
+	}
+	return pairing.Check(ctx, r.hot, r.cold, r.log)
 }
 
 // rememberReleases records the two releases when the archive's is the older one.

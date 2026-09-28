@@ -419,25 +419,19 @@ Part of [Thermocline](../README.md).
   the copy and no marking, and says so, because without a claim there is no
   range in which absence means anything.
 
-- **Nothing records which archive a deployment has been using.** `cold.uri` can
-  be repointed at a different cluster by a typo, a config copied from another
-  environment, or a DNS name that now resolves somewhere else, and the router
-  will serve whatever that cluster happens to hold. Measured on two archives
-  with a collection of the same name in each: ten documents mirrored into the
-  first, then the URI changed to the second. A client counted four and read
-  "another environment" out of a collection its own archive holds ten real
-  documents in.
+- **A deployment pointed at a different archive is refused, not served.**
+  `cold.uri` can be repointed by a typo, a config copied from another
+  environment, or a DNS name that now resolves somewhere else. Measured before
+  this was refused: ten documents mirrored into one archive, the URI changed to
+  a second, and a client counted the four the second held. Every daemon now
+  compares the archive's own id with the one the fast tier recorded and refuses
+  to start when they differ, naming both; `cline pairing --accept` is the way
+  through when the change is meant. See `docs/bookkeeping.md`.
 
-  The checkpoint is the nearest thing to a record of the pairing: it is written
-  by this deployment, into this archive, under this feeder's id. A fast tier
-  holding tiered data against an archive with no checkpoint for that id is a
-  pair that has not been working together, and the router says so at startup,
-  naming the id and the collections. Three things put a deployment in that state
-  and the line names all three: the feeder has never run, `feeder.id` changed, or
-  `cold.uri` points somewhere else.
-
-  It is a warning and not a refusal, because the first of those three is an
-  ordinary first start.
+  What it does not cover: a fast tier that has never recorded an archive, which
+  is what a first start and a rebuilt fast tier both look like, takes whichever
+  archive it is given. The checkpoint warning at startup is still there for that
+  case, and says which of the three causes it could be.
 
 - **`feeder.namespaces` empty tiers everything, and several checks read the list
   rather than asking what that means.** The configuration says so plainly and

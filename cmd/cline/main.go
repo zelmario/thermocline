@@ -29,6 +29,7 @@ import (
 	"github.com/zelmario/thermocline/internal/evictor"
 	"github.com/zelmario/thermocline/internal/feeder"
 	"github.com/zelmario/thermocline/internal/router"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/tierver"
 	"github.com/zelmario/thermocline/internal/warmer"
 )
@@ -121,6 +122,8 @@ func run() error {
 		return runCache(os.Args[2:])
 	case "rollback":
 		return runRollback(os.Args[2:])
+	case "pairing":
+		return runPairing(os.Args[2:])
 	case "backfill":
 		return runBackfill(os.Args[2:])
 	case "version":
@@ -173,6 +176,9 @@ func runFeeder(args []string) error {
 	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
+	if err := pairing.Check(ctx, hot, cold, log); err != nil {
 		return err
 	}
 
@@ -232,6 +238,9 @@ func runEvictor(args []string) error {
 	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
+	if err := pairing.Check(ctx, hot, cold, log); err != nil {
 		return err
 	}
 
@@ -297,6 +306,9 @@ func runWarmer(args []string) error {
 	warnColdShape(log)
 
 	if err := tierver.Check(ctx, hot, cold, cfg.AllowVersionSkew, log); err != nil {
+		return err
+	}
+	if err := pairing.Check(ctx, hot, cold, log); err != nil {
 		return err
 	}
 

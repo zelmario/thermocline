@@ -17,6 +17,14 @@ configurable as `meta.db`:
 | `warming` | Warming announcements, expiring on a TTL index |
 | `watermarks` | How far back the fast tier is complete, one per namespace |
 | `markers` | Daemon heartbeats, the operator's hold on eviction, and one lease per daemon that must not run twice |
+| `identity` | This archive's own id, a random value written the first time any daemon uses it |
+
+And two on the fast tier, in a database of the same name: `keys`, the unique
+key registry, and `pairing`, the id of the archive this fast tier has been
+working with. Every daemon compares `pairing` with the archive's `identity` at
+startup and refuses to start when they differ, because `cold.uri` then points at
+somebody else's archive. `cline pairing --accept` records the archive it points
+at now, for the time that change is meant.
 
 `_tcBodyDropped` marks the second of those, and is described below.
 
