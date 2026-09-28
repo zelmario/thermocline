@@ -516,6 +516,18 @@ Part of [Thermocline](../README.md).
   should hold the refusal until the probe finishes did not hold it. Why is the
   open question; the log is in /tmp/hostsweep-failures on this box.
 
+  The second check is explained, and it is a real difference rather than a
+  timer in this system. With authentication proxied a client's handshake is
+  authenticated against the member its connection is pinned to, so during an
+  election the router holds a new connection's handshake until there is a
+  primary, up to 20 seconds. Connected straight to the replica set the
+  handshake needs no primary, because any member answers it, and only the
+  command waits. mongosh gives its first connection 2 seconds (its setting
+  after connecting is the driver's 30), so a new mongosh during a 12 second
+  election on a loaded box fails with "Server selection timed out after 2000
+  ms" through the router and would connect directly. An application whose
+  driver keeps the default 30 second server selection waits instead.
+
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
   `router.terminate_auth` replays the write itself and does not have it.
