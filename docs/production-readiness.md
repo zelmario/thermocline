@@ -505,7 +505,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Two of nine remain, and neither is code.**
+This is the whole list. Nothing else blocks. **Three of ten remain: two are not code, and one is a decision.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -720,6 +720,19 @@ This is the whole list. Nothing else blocks. **Two of nine remain, and neither i
   anyway. `TestAPendingEchoMakesThePositionListIncomplete` and
   `TestAWithdrawnEchoMakesThePositionListIncomplete` each failed before their
   change.
+
+- [ ] **10. Decide how the `_id` guard trades a retry against an eviction.**
+  When both tiers hold an `_id`, the insert guard hands the insert to mongod,
+  so a driver's retry of an insert that already succeeded is deduplicated by
+  mongod rather than refused by this router. What that costs: an eviction of
+  that exact document between the guard's read and mongod applying the insert
+  lets it land, and the feeder mirrors it over the archived copy. The collated
+  form of that window was met in a thirty-minute shop run on 2026-09-28. The
+  other choice is the router refusing such inserts itself, which is mongod's
+  own answer to a second insert of an `_id` the fast tier holds, and turns a
+  retry that reaches a different router than the first attempt into an error
+  where plain MongoDB returns success. Which of the two is rarer and which is
+  worse for the application is Zelmar's call.
 
 ## What 2026-09-21 added that an operator has to do
 
