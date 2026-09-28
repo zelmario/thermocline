@@ -2,9 +2,11 @@ package router
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -86,11 +88,45 @@ func (r *Router) collatedArchiveClashNow(ctx context.Context, ns string, idx uni
 		if lerr != nil {
 			return true
 		}
-		if !r.fastTierHolds(ctx, ns, id) {
+		// Only a document the fast tier holds with another value is passed
+		// over: its archived copy is stale, and the fast tier's own index has
+		// the current one. A document the fast tier holds with this value used
+		// to be passed over too, as already judged by that index, and the
+		// judgement does not last until the write lands: an eviction sweep can
+		// take that exact document off the fast tier in between, and then
+		// nothing refuses the second spelling. Measured on 2026-09-28 in the
+		// two-application shop, with the evictor sweeping 200 orders at a
+		// time: "ref003955" was accepted beside an archived "Ref003955" whose
+		// fast tier copy the evictor removed that second. Refusing here is the
+		// answer mongod gives while the fast tier holds it, and the only
+		// correct one once it does not.
+		if !r.fastTierMovedOff(ctx, ns, idx, vals, id) {
 			return true
 		}
 	}
 	return false
+}
+
+// fastTierMovedOff reports whether the fast tier holds this document with a
+// value other than vals for the index, which is what makes its archived copy
+// stale. A document it does not hold, one it holds with the value, and a
+// question that could not be asked are all false.
+func (r *Router) fastTierMovedOff(ctx context.Context, ns string, idx uniqueIndex, vals []any, id bson.RawValue) bool {
+	if !r.fastTierHolds(ctx, ns, id) {
+		return false
+	}
+	holds := bson.D{{Key: "_id", Value: id}}
+	for i, f := range idx.fields {
+		holds = append(holds, bson.E{Key: f, Value: vals[i]})
+	}
+	if scope := indexScope(idx); len(scope) > 0 {
+		holds = append(holds, bson.E{Key: "$and", Value: scope})
+	}
+	db, coll := splitNS(ns)
+	err := r.hot.Database(db).Collection(coll).FindOne(ctx, holds,
+		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}).
+			SetCollation(collationFromSpec(idx.collation))).Err()
+	return errors.Is(err, mongo.ErrNoDocuments)
 }
 
 // collatedClashFilter is what collatedArchiveClash asks the archive: live

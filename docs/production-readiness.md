@@ -458,6 +458,30 @@ after. A claim is now kept when its owner holds the key, moved to the fast tier
 document that holds it when the owner does not, and released only when nothing
 does.
 
+## 2026-09-28, evening: a collated key and an eviction in the same second
+
+**The two-application shop found a reference accepted twice.** The shop's
+references are unique under a case-insensitive collation, and "ref003955" was
+accepted beside an archived "Ref003955", once in about 3,000 attempts to reuse a
+reference in 30 minutes. The router asked the archive under the collation, found
+the order, and passed it over because the fast tier held it too, leaving the
+refusal to the fast tier's own index; the evictor, sweeping 200 old orders at a
+time, removed that exact order from the fast tier in the same second, and
+nothing was left to refuse the second spelling. The router now passes over an
+archive match only when the fast tier holds that document with another value,
+which is the stale copy the rule exists for, and refuses otherwise, which is
+mongod's answer while the fast tier holds it and the only right one once it
+does not.
+
+The `_id` guard has the same shape and accepts it on purpose: when both tiers
+hold an `_id` it hands the insert to mongod, so a driver's retry of an insert
+that succeeded is deduplicated rather than refused, and its comment names the
+cost, an eviction of that exact document in between letting the insert land and
+the feeder mirror it over the archived copy. It calls the window a
+millisecond. The shop has now met the collated form of that window in thirty
+minutes, so the estimate is too kind, and which way to trade it is a decision
+listed under Open.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
