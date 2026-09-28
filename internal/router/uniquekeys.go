@@ -621,10 +621,30 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 	var claimedFor []int
 	var clashes []keyClash
 	rejected := map[int]bool{}
+	// Which document of this batch claimed each key. A later document of the
+	// same batch with the same key is one mongod refuses, the first having
+	// taken it, and it is refused here rather than sent to the registry. Sent
+	// there, it found the claim the first document had just made, owned by a
+	// document neither tier holds yet, read that as stale and took it over;
+	// the fast tier then refused it, its claim was released, and the document
+	// that did land was left with no claim at all. Measured on 2026-09-28:
+	// [{_id:1, email:"x@x"}, {_id:2, email:"x@x"}] unordered left no row, and
+	// once the first was archived a third x@x was accepted beside it.
+	//
+	// What this cannot see is the earlier document being refused for another
+	// reason, an archived _id, which is decided beside this: mongod would then
+	// accept the later one, and this refuses it. That needs both clashes in
+	// one batch.
+	inBatch := map[string]int{}
 	for i, cd := range cands {
 		// mongod reports one reason per document, and the first index to reject
 		// it is the one it names.
 		if rejected[cd.doc] {
+			continue
+		}
+		if first, taken := inBatch[cd.kid]; taken && first != cd.doc {
+			clashes = append(clashes, keyClash{doc: cd.doc, index: idxs[cd.idx].name})
+			rejected[cd.doc] = true
 			continue
 		}
 		got := settled[i]
@@ -643,6 +663,7 @@ func (r *Router) claimKeys(ctx context.Context, ns string, docs []bson.Raw, idxs
 		if got {
 			claimed = append(claimed, cd.kid)
 			claimedFor = append(claimedFor, cd.doc)
+			inBatch[cd.kid] = cd.doc
 			continue
 		}
 		clashes = append(clashes, keyClash{doc: cd.doc, index: idxs[cd.idx].name})

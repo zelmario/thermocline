@@ -423,6 +423,25 @@ testkeys section, on a different collection, every time; with the section left
 out that build passes 230/0, which says the duplicate reached further than its
 own collection.
 
+## 2026-09-28: one insert naming a key twice
+
+Two more from reading `archivedIDClashes` and `claimKeys` against what mongod
+does with a batch, both measured before and after.
+
+**An unordered insert naming an archived `_id` twice let the second through.**
+The guard remembered only the first batch position of each `_id`, so only that
+one was refused and the fast tier, holding no copy, took the second: a
+duplicate of the archived document. `[{_id:5},{_id:5},{_id:6}]` inserted two
+where plain mongod inserts one; every position is flagged now.
+
+**Two new documents with one unique value in one batch left the one that
+landed unclaimed.** The second found the first's fresh claim, owned by a
+document no tier held yet, read it as stale and took it over, and its release
+when the fast tier refused it removed the only row. Once the first was
+archived, a third insert of the value was accepted beside it, ordered and
+unordered alike. A later document of a batch with a key an earlier one claimed
+is now refused at once, as mongod refuses it.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

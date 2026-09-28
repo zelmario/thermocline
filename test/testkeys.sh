@@ -659,6 +659,24 @@ chk "and so is one inside a compound _id"                     "11000" \
 chk "an _id the collation keeps apart is still accepted"      "ok" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:"b"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+echo "== one batch naming a new unique value twice =="
+# mongod keeps the first and refuses the second. The router sent the second to
+# the registry, where the first one's fresh claim looked stale because no tier
+# held its document yet, took it over, then released it when the fast tier
+# refused the document: the one that landed had no claim at all. Measured before
+# the fix, ordered and unordered alike: no row left, and once the first was
+# archived a third insert of the value was accepted beside it.
+fresh tkcoll2 '{email:1}'
+R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertMany([{_id:1,email:"x@x"},{_id:2,email:"x@x"}],{ordered:false})}catch(e){}' >/dev/null
+chk "the first of the two landed and the second did not" "1" \
+    "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkcoll2.countDocuments({email:"x@x"}))')"
+chk "and the registry kept a claim for the one that did" "1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.tkcoll2'}))")"
+waitMirrored tkcoll2 1
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteMany({})'
+chk "a third with the value, once the first is archived, is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:3,email:"x@x"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a
