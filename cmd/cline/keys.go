@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/router"
 )
 
@@ -59,6 +60,11 @@ func runKeys(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	// A command that writes checks the pairing the daemons check, because it
+	// writes into whichever archive cold.uri reaches. See internal/pairing.
+	if err := pairing.Check(ctx, hot, cold, log); err != nil {
+		return err
+	}
 
 	// Empty tiers everything, and refusing here left the command the adoption
 	// guide tells you to run unusable on that deployment. The archive holds

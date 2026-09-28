@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -82,6 +83,11 @@ func runBackfill(args []string) error {
 		return err
 	}
 	defer disconnect(cold, log)
+	// A command that writes checks the pairing the daemons check, because it
+	// writes into whichever archive cold.uri reaches. See internal/pairing.
+	if err := pairing.Check(ctx, hot, cold, log); err != nil {
+		return err
+	}
 
 	namespaces, err := backfillNamespaces(ctx, cfg, cold, *nsFlag)
 	if err != nil {

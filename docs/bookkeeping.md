@@ -23,7 +23,10 @@ And two on the fast tier, in a database of the same name: `keys`, the unique
 key registry, and `pairing`, the id of the archive this fast tier has been
 working with. Every daemon compares `pairing` with the archive's `identity` at
 startup and refuses to start when they differ, because `cold.uri` then points at
-somebody else's archive. `cline pairing --accept` records the archive it points
+somebody else's archive. So do the commands that write into the archive or
+from it: `cline backfill`, `cline keys`, and `cline watermark` when it
+declares a claim. `cline rollback` says so rather than refusing, because it
+runs during an incident. `cline pairing --accept` records the archive it points
 at now, for the time that change is meant.
 
 `_tcBodyDropped` marks the second of those, and is described below.

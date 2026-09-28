@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -299,6 +300,13 @@ func reportArchiveGaps(ctx context.Context, cfg config.Config, namespaces []stri
 	cold, err := connect(ctx, cfg.Cold.URI, "cold")
 	if err != nil {
 		return false
+	}
+	// Said, not refused: a rollback runs during an incident and must not
+	// depend on anything but the archive. But an archive the fast tier has not
+	// been working with is one the application is about to be pointed at
+	// without its own data, which is the one thing this section exists to say.
+	if perr := pairing.Check(ctx, hot, cold, log); perr != nil {
+		fmt.Printf("WARNING: %v\n\n", perr)
 	}
 	defer disconnect(cold, log)
 

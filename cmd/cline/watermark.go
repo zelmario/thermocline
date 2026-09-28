@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
 
@@ -86,6 +87,11 @@ func runWatermark(args []string) error {
 			return err
 		}
 		defer disconnect(hot, log)
+		// A declaration is a claim about this fast tier written into this
+		// archive; the pairing the daemons check has to hold for it too.
+		if err := pairing.Check(ctx, hot, cold, log); err != nil {
+			return err
+		}
 	}
 
 	// verify counts both tiers and refuses a claim they contradict. --force
