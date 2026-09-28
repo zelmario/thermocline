@@ -80,7 +80,10 @@ startRouter() {
 # field only some of them carry.
 DOCS='Array.from({length:60},(_,i)=>({
   _id: i+1,
-  n: i+1,
+  // TC_MIXED_NUM=1 stores the same numbers as int, long, double and decimal
+  // in turn, which mongod compares as one and this system compared by bytes in
+  // four places until 2026-09-28.
+  n: process.env.TC_MIXED_NUM ? [i+1, NumberLong(String(i+1)), (i+1)*1.0, NumberDecimal(String(i+1))][i%4] : i+1,
   f: (i+1)/4,
   name: "user" + String(i+1).padStart(2,"0"),
   grp: ["alpha","beta","gamma"][i%3],

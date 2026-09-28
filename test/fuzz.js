@@ -54,6 +54,16 @@ const NO_FEEDER = process.env.TC_NO_FEEDER === '1';
 // Compare what a change stream on each collection delivered for the round's own
 // writes. Off by default because it holds two cursors open for the whole round.
 const STREAM = process.env.TC_STREAM === '1';
+const MIXED_NUM = !!process.env.TC_MIXED_NUM;
+function mixedNum(x) {
+  if (!MIXED_NUM) return x;
+  switch (ri(4)) {
+    case 0: return NumberLong(String(x));
+    case 1: return NumberDecimal(String(x));
+    case 2: return NumberInt(x);
+    default: return x;
+  }
+}
 // Read the same collections through views. Off by default because it creates
 // four of them and drops them again, which is DDL the other sections would
 // otherwise have to work around.
@@ -94,7 +104,9 @@ function maybe(p){ return rnd() < p; }
 // nothing, which tests the comparison and not the router, so predicates are
 // built from the field's own domain and only sometimes from another's.
 const FIELDS = [
-  { p: 'n',           t: 'num',  v: () => ri(70) },
+  // Under TC_MIXED_NUM the values a predicate or an update uses are mixed the
+  // same way the seed is, so a filter of NumberLong(7) meets a stored 7.0.
+  { p: 'n',           t: 'num',  v: () => mixedNum(ri(70)) },
   { p: 'f',           t: 'num',  v: () => ri(200) / 4 },
   { p: 'name',        t: 'str',  v: () => 'user' + String(1 + ri(60)).padStart(2, '0') },
   // Mixed case on purpose, and this is the only field that carries it. Every
