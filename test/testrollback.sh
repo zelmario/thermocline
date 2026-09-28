@@ -221,6 +221,11 @@ OUT=$(N "store -uri '$COLD' -db $SHOP -rounds 60 -conc 4 -skip-seed" 2>&1)
 chk "the shop runs against the archive"        "0" "$(grep -oE 'errors: [0-9]+' <<<"$OUT" | grep -oE '[0-9]+' | tail -1)"
 chk "and notices nothing wrong"                "true" \
     "$(grep -q 'noticed nothing wrong' <<<"$OUT" && echo true || echo false)"
+# What it noticed, when it noticed anything. This failed once in a host sweep on
+# 2026-09-28 and passed three times alone straight after, and the log had
+# nothing to say which invariant the shop found broken, against a cluster that
+# was plain MongoDB by then.
+grep -q 'noticed nothing wrong' <<<"$OUT" || tail -25 <<<"$OUT" | sed 's/^/      store: /'
 
 echo
 echo "================================"
