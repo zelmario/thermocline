@@ -100,7 +100,14 @@ reseed() {
       c.createIndex({'meta.score':1}); c.createIndex({tags:1});
     }
     const all = $DOCS;
-    hot.tcref.drop();
+    // TC_COLL_COLLATION=1 creates every collection with a case-insensitive
+    // default collation, on both sides of the comparison, which is the shape
+    // three defects of 2026-09-27 lived in and nothing generated: a
+    // collection's collation reaches the _id index, \$expr and every filter
+    // that names no collation of its own.
+    const CC = process.env.TC_COLL_COLLATION ? {collation:{locale:'en', strength:2}} : null;
+    const mk = (d, n) => { if (CC) d.createCollection(n, CC); };
+    hot.tcref.drop(); mk(hot, 'tcref');
     hot.tcref.insertMany(all);
     hot.tcref.updateMany({_id:{\$in:$OPT}},{\$set:{opt:'yes'}});
 
@@ -108,17 +115,17 @@ reseed() {
     // values, so a join on grp matches, and its own split so the joined side
     // is short on the fast tier too.
     const other = all.slice(0,40).map(x => Object.assign({}, x, {_id: 1000 + x._id}));
-    hot.tcref2.drop();
+    hot.tcref2.drop(); mk(hot, 'tcref2');
     hot.tcref2.insertMany(other);
-    hot.tcfuzz2.drop();
-    cold.tcfuzz2.drop();
+    hot.tcfuzz2.drop(); mk(hot, 'tcfuzz2');
+    cold.tcfuzz2.drop(); mk(cold, 'tcfuzz2');
     hot.tcfuzz2.insertMany(other.slice(0,20));
     cold.tcfuzz2.bulkWrite(
       other.map(d=>({replaceOne:{filter:{_id:d._id}, replacement:d, upsert:true}})),
       {ordered:false});
 
-    hot.tcfuzz.drop();
-    cold.tcfuzz.drop();
+    hot.tcfuzz.drop(); mk(hot, 'tcfuzz');
+    cold.tcfuzz.drop(); mk(cold, 'tcfuzz');
     // 1 to 30 on both tiers, 31 to 60 only in the archive, which is what an
     // evicted document looks like. Upserts on the archive, not insertMany: a
     // late mirror of the fast tier can put documents there first and an ordered
