@@ -433,6 +433,13 @@ Part of [Thermocline](../README.md).
   archive it is given. The checkpoint warning at startup is still there for that
   case, and says which of the three causes it could be.
 
+  And a copy of an archive carries its id. A staging environment built from a
+  restore of production's archive has production's id, so a staging fast tier
+  pointed by mistake at production's archive is not refused: to this check the
+  two archives are one. Giving a copy its own identity when it is made is the
+  way to keep them apart: `db.getSiblingDB("_thermocline").identity.deleteOne({_id: "archive"})`
+  on the copy, then `cline pairing --accept` against it.
+
 - **`feeder.namespaces` empty tiers everything, and several checks read the list
   rather than asking what that means.** The configuration says so plainly and
   `RouterConfig.Manages` honours it by answering true for every namespace. Nine
