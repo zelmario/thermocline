@@ -404,6 +404,14 @@ now use one canonical form per exact value, and all seven duplicates are
 refused. Claim rows written before this for such values are under the old
 form; `cline keys --rebuild` claims them again under the new one.
 
+The same, one level down: mongod compares what an embedded document or an
+array holds by value too, and keeps field order, so `{a: 1}` and
+`{a: NumberLong(1)}` are one `_id`. The canonical form now reaches inside them.
+Measured with compound `_id`s: `{a: NumberLong("1")}` beside an archived
+`{a: NumberInt(1)}`, `{x: NumberDecimal("0.5")}` beside `{x: 0.5}`, and
+`{u: 1.0, d: [NumberLong("2")]}` beside `{u: 1, d: [NumberInt(2)]}` were all
+accepted, and are all refused now.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

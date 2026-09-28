@@ -151,3 +151,29 @@ func TestIDKeyIsOneKeyPerNumber(t *testing.T) {
 		t.Error("a string that reads as a number is not that number")
 	}
 }
+
+// The same, one level down: mongod compares what an embedded document or an
+// array holds by value, and keeps field order. Measured on 2026-09-27.
+func TestKeysInsideDocumentsCompareByValue(t *testing.T) {
+	val := func(v any) bson.RawValue {
+		ty, b, err := bson.MarshalValue(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bson.RawValue{Type: ty, Value: b}
+	}
+	for _, tc := range []struct {
+		a, b any
+		same bool
+	}{
+		{bson.D{{Key: "a", Value: int32(1)}}, bson.D{{Key: "a", Value: int64(1)}}, true},
+		{bson.D{{Key: "a", Value: 0.5}}, bson.D{{Key: "a", Value: dec(t, "0.5")}}, true},
+		{bson.D{{Key: "a", Value: bson.A{int32(1), int32(2)}}}, bson.D{{Key: "a", Value: bson.A{int64(1), 2.0}}}, true},
+		{bson.D{{Key: "a", Value: int32(1)}, {Key: "b", Value: int32(2)}}, bson.D{{Key: "b", Value: int32(2)}, {Key: "a", Value: int32(1)}}, false},
+		{bson.D{{Key: "a", Value: 0.1}}, bson.D{{Key: "a", Value: dec(t, "0.1")}}, false},
+	} {
+		if got := idKey(val(tc.a)) == idKey(val(tc.b)); got != tc.same {
+			t.Errorf("%v and %v: one key=%v, mongod says %v", tc.a, tc.b, got, tc.same)
+		}
+	}
+}

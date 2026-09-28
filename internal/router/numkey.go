@@ -35,11 +35,44 @@ import (
 // and a decimal NaN into collections whose archive held 0.5, 2.25, Infinity
 // and NaN as doubles, each a duplicate mongod refuses.
 func canonicalKeyValue(v any) any {
+	return canonicalAt(v, 0)
+}
+
+// canonicalAt is canonicalKeyValue at a depth, for the documents and arrays a
+// value can hold.
+//
+// mongod compares the values inside an embedded document or an array the same
+// way, by number rather than by type, and keeps field order. Measured on
+// 2026-09-27: {a: 1} and {a: NumberLong(1)} are one unique key and one _id,
+// {a: 0.5} and {a: NumberDecimal("0.5")} are one _id, [1, 2] and
+// [NumberLong(1), 2.0] inside a document are one key, while {a: 1, b: 2} and
+// {b: 2, a: 1} are two. A compound _id is where this is met most.
+func canonicalAt(v any, depth int) any {
 	rv, ok := v.(bson.RawValue)
 	if !ok {
 		return v
 	}
 	switch rv.Type {
+	case bson.TypeEmbeddedDocument:
+		elems, err := bson.Raw(rv.Value).Elements()
+		if err != nil || depth > 100 {
+			return v
+		}
+		out := make(bson.D, 0, len(elems))
+		for _, e := range elems {
+			out = append(out, bson.E{Key: e.Key(), Value: canonicalAt(e.Value(), depth+1)})
+		}
+		return out
+	case bson.TypeArray:
+		vals, err := bson.Raw(rv.Value).Values()
+		if err != nil || depth > 100 {
+			return v
+		}
+		out := make(bson.A, 0, len(vals))
+		for _, e := range vals {
+			out = append(out, canonicalAt(e, depth+1))
+		}
+		return out
 	case bson.TypeInt32:
 		i, ok := rv.Int32OK()
 		if ok {
