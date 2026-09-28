@@ -59,7 +59,7 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 	}
 
 	ids := make(bson.A, 0, len(docs))
-	at := make(map[string]int, len(docs))
+	at := make(map[string][]int, len(docs))
 	for i, doc := range docs {
 		val, err := doc.LookupErr("_id")
 		if err != nil {
@@ -77,9 +77,14 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		// archived NumberLong(8), 9.0 or 0.5, two documents with one _id.
 		// Measured on 2026-09-27. An ObjectId or a string is its bytes either way.
 		k := idKey(val)
-		if _, seen := at[k]; !seen {
-			at[k] = i
-		}
+		// Every position, not the first: an unordered insert that names one
+		// _id twice has both refused by mongod when the archive holds it, and
+		// flagging only the first let the second through to a fast tier that
+		// does not hold it. Measured on 2026-09-28 with _id 5 archived:
+		// [{_id:5},{_id:5},{_id:6}] unordered inserted two, one a duplicate
+		// of the archived document, where plain mongod inserts one. Keying by
+		// value made it reach [{_id:7},{_id:7.0}] too.
+		at[k] = append(at[k], i)
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -104,7 +109,7 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		if lerr != nil {
 			continue
 		}
-		i, ok := at[idKey(val)]
+		positions, ok := at[idKey(val)]
 		if !ok {
 			unplaced++
 			continue
@@ -112,8 +117,10 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		// Copied, because val points into Current and is sent to the fast tier
 		// after the loop, when Current is valid no longer.
 		clashing = append(clashing, bson.RawValue{Type: val.Type, Value: append([]byte(nil), val.Value...)})
-		out = append(out, keyClash{doc: i, index: "_id_"})
-		placed[i] = true
+		for _, i := range positions {
+			out = append(out, keyClash{doc: i, index: "_id_"})
+			placed[i] = true
+		}
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return nil, cerr
@@ -207,7 +214,7 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 // one document and is only ever used to skip work: this one decides whether a
 // client is told its insert failed, so an error here has to stop the insert
 // rather than be read as "not held".
-func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, at map[string]int) (map[int]bool, error) {
+func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, at map[string][]int) (map[int]bool, error) {
 	db, coll := splitNS(ns)
 	cur, err := r.hot.Database(db).Collection(coll).Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
@@ -223,7 +230,7 @@ func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, 
 		if lerr != nil {
 			continue
 		}
-		if i, ok := at[idKey(val)]; ok {
+		for _, i := range at[idKey(val)] {
 			held[i] = true
 		}
 	}
@@ -273,7 +280,7 @@ func idKey(v bson.RawValue) string {
 // collatedIDClashes asks the archive, one _id at a time and under the
 // collection's default collation, which of the batch positions not yet placed
 // hold an _id a live archived document already has. See archivedIDClashesNow.
-func (r *Router) collatedIDClashes(ctx context.Context, ns string, docs []bson.Raw, at map[string]int, placed map[int]bool) ([]keyClash, error) {
+func (r *Router) collatedIDClashes(ctx context.Context, ns string, docs []bson.Raw, at map[string][]int, placed map[int]bool) ([]keyClash, error) {
 	collation, ok := r.defaultCollation(ctx, ns)
 	if !ok || len(simplifyCollation(collation)) == 0 {
 		return nil, nil
@@ -285,7 +292,8 @@ func (r *Router) collatedIDClashes(ctx context.Context, ns string, docs []bson.R
 	db, coll := splitNS(ns)
 	c := r.cold.Database(db).Collection(coll)
 	var out []keyClash
-	for _, i := range at {
+	for _, positions := range at {
+		i := positions[0]
 		if placed[i] {
 			continue
 		}
@@ -296,7 +304,9 @@ func (r *Router) collatedIDClashes(ctx context.Context, ns string, docs []bson.R
 		ferr := c.FindOne(ctx, bson.D{{Key: "_id", Value: id}, meta.NotArchivedDeleted()},
 			options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetCollation(&co)).Err()
 		if ferr == nil {
-			out = append(out, keyClash{doc: i, index: "_id_"})
+			for _, j := range positions {
+				out = append(out, keyClash{doc: j, index: "_id_"})
+			}
 			continue
 		}
 		if !errors.Is(ferr, mongo.ErrNoDocuments) {
