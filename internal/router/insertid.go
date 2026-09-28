@@ -65,9 +65,16 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 			continue
 		}
 		ids = append(ids, val)
-		// Keyed by the raw bytes of the value, so two spellings of the same
-		// number are not treated as one and an ObjectId is compared as itself.
-		k := string(val.Type) + string(val.Value)
+		// Keyed by the value as mongod's _id index compares it, which is by
+		// number rather than by type: NumberLong(8) and 8.0 are one _id there.
+		// This used to be the raw bytes, on purpose, so that two spellings of
+		// the same number were not treated as one. They are one to mongod, and
+		// the archive's $in below finds them by value, so the answer came back
+		// under bytes no entry here had and was dropped: an insert of 8.0,
+		// NumberDecimal("9") or NumberDecimal("0.5") was accepted beside an
+		// archived NumberLong(8), 9.0 or 0.5, two documents with one _id.
+		// Measured on 2026-09-27. An ObjectId or a string is its bytes either way.
+		k := idKey(val)
 		if _, seen := at[k]; !seen {
 			at[k] = i
 		}
@@ -93,7 +100,7 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		if lerr != nil {
 			continue
 		}
-		i, ok := at[string(val.Type)+string(val.Value)]
+		i, ok := at[idKey(val)]
 		if !ok {
 			continue
 		}
@@ -188,7 +195,7 @@ func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, 
 		if lerr != nil {
 			continue
 		}
-		if i, ok := at[string(val.Type)+string(val.Value)]; ok {
+		if i, ok := at[idKey(val)]; ok {
 			held[i] = true
 		}
 	}
@@ -218,4 +225,19 @@ func mergeClashes(first, second []keyClash) []keyClash {
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].doc < out[b].doc })
 	return out
+}
+
+// idKey is an _id as mongod's _id index compares it, as a map key: one form
+// per number whatever its type, and the bytes of anything else. See
+// canonicalKeyValue.
+func idKey(v bson.RawValue) string {
+	c := canonicalKeyValue(v)
+	if rv, ok := c.(bson.RawValue); ok {
+		return string(rv.Type) + string(rv.Value)
+	}
+	t, b, err := bson.MarshalValue(c)
+	if err != nil {
+		return string(v.Type) + string(v.Value)
+	}
+	return string(t) + string(b)
 }

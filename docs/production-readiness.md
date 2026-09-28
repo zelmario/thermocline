@@ -382,6 +382,28 @@ document keeps the plain replace. `cline backfill` had the same write and uses
 the same helper. testlife's new section fails on the previous build and passes
 on this one.
 
+## 2026-09-27: numbers compared by their bytes
+
+**The router admitted a second document with an `_id` the archive held.** The
+insert guard asked the archive with `$in`, which matches by value, and mapped
+the answer back to the batch by the raw bytes of the value, which a comment
+defended on purpose. mongod's `_id` index compares numbers by value, so
+NumberLong(8) and 8.0 are one `_id`. Measured with the fast tier's copies gone
+as an eviction leaves them: 8.0 beside an archived NumberLong(8),
+NumberDecimal("9") beside 9.0 and NumberDecimal("0.5") beside 0.5, all three
+accepted, two documents with one identity.
+
+**The key registry did the same for unique values that are not whole
+numbers.** It already made one key of a whole number written four ways;
+fractions and special values kept their bytes. NumberDecimal("0.5"),
+NumberDecimal("2.250"), a decimal Infinity and a decimal NaN were each accepted
+beside an archived double equal to it. mongod's rule, measured: a unique index
+compares exact values, so double 0.5 and NumberDecimal("0.5000") are one key,
+double 0.1 and NumberDecimal("0.1") are two, and every NaN is one. Both paths
+now use one canonical form per exact value, and all seven duplicates are
+refused. Claim rows written before this for such values are under the old
+form; `cline keys --rebuild` claims them again under the new one.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
