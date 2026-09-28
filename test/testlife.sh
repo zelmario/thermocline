@@ -310,6 +310,29 @@ for _ in $(seq 1 60); do
 done
 chk "and mirroring carries on past it" "1" "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:781}))")"
 
+echo "== field names that start with \$ or hold a dot =="
+# Legal since 5.0, and an insert of one mirrors like any other. The feeder
+# mirrors an update by replacing the whole document, and mongod refuses a
+# replacement with a top-level $ field. Measured before the fix: {$price: 5}
+# inserted and mirrored, then one $set on another field failed every flush and
+# nothing after it reached the archive for any namespace.
+H "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:{\$in:[790,791,792]}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:{\$in:[790,791,792]}})" >/dev/null
+R "const c=db.getSiblingDB(process.env.TC_DB).tbig;
+   c.insertOne({_id:790, v:0, \$price:5}); c.insertOne({_id:791, v:0, 'a.b':1}); c.insertOne({_id:792, v:0, s:{\$x:1}})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:{\$in:[790,791,792]}}))")" = "3" ] && break; sleep 0.5
+done
+R "const c=db.getSiblingDB(process.env.TC_DB).tbig; for (const id of [790,791,792]) c.updateOne({_id:id}, {\$set:{v:1}});
+   c.insertOne({_id:793, after:1})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:793}))")" = "1" ] && break; sleep 0.5
+done
+chk "the updates to all three reached the archive"  "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:{\$in:[790,791,792]}, v:1}))")"
+chk "and so did the write after them"                "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:793}))")"
+
 echo "== documents the archive will never receive =="
 # A change stream reports changes from now, so whatever the fast tier already
 # holds when the feeder first starts is not mirrored by starting it. In an

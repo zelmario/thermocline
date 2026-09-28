@@ -283,10 +283,7 @@ func backfillDocuments(ctx context.Context, hot, cold *mongo.Client, db, coll st
 				break
 			}
 		}
-		models = append(models, mongo.NewReplaceOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetReplacement(doc).
-			SetUpsert(true))
+		models = append(models, meta.ReplaceModel(bson.D{{Key: "_id", Value: id}}, doc))
 		n++
 		// In bytes as well as documents, for the reason the feeder's flush and
 		// the warmer's batch are: a batch of large documents is otherwise held

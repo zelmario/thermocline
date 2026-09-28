@@ -205,10 +205,8 @@ func (f *Feeder) flush(ctx context.Context) error {
 		switch op.kind {
 		case actionUpsert:
 			f.warnReservedField(op)
-			model = mongo.NewReplaceOneModel().
-				SetFilter(op.key).
-				SetReplacement(op.doc).
-				SetUpsert(true)
+			// See meta.ReplaceModel for the field names a plain replace refuses.
+			model = meta.ReplaceModel(op.key, op.doc)
 		case actionTombstone:
 			// The first tombstone in a namespace is also when its expiry index
 			// is settled, so retention costs nothing on a namespace nothing

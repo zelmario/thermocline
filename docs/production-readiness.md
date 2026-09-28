@@ -367,6 +367,21 @@ write now open at an explicit start, which skips that call.
 archived documents of 12MB peaked the router at 2,044MB; bounded at 16MB a
 batch, 393MB.
 
+## 2026-09-27: a field name mirroring could not replace
+
+**One update to a document with a `$`-prefixed field stopped mirroring for
+every namespace.** Field names that start with `$` or hold a dot are legal
+since 5.0, and an insert of one mirrors like any other. The feeder mirrors an
+update by replacing the whole document, and mongod refuses a replacement with
+a top-level `$` field, so `{$price: 5}` inserted and mirrored, then one `$set`
+on another field failed every flush, once a second, and a later insert never
+reached the archive. Such a document is now written with a pipeline update
+that replaces it with its own literal value, which mongod accepts and which
+stores it byte for byte, so the evictor can still match it; every other
+document keeps the plain replace. `cline backfill` had the same write and uses
+the same helper. testlife's new section fails on the previous build and passes
+on this one.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
