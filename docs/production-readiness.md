@@ -479,8 +479,7 @@ that succeeded is deduplicated rather than refused, and its comment names the
 cost, an eviction of that exact document in between letting the insert land and
 the feeder mirror it over the archived copy. It calls the window a
 millisecond. The shop has now met the collated form of that window in thirty
-minutes, so the estimate is too kind, and which way to trade it is a decision
-listed under Open.
+minutes, so the estimate is too kind. It is closed now; see Open item 10.
 
 ## What is accepted, and needs no work
 
