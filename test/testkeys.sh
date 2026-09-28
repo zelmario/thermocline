@@ -639,6 +639,26 @@ sleep 12
 chk "once the index is there, the third spelling is refused" "11000"   "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:3,email:"ANN@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 chk "  and the archive still holds one live copy"          "1"        "$(C 'print(db.getSiblingDB(process.env.TC_DB).tkcoll2.countDocuments({email:{$exists:true},_tcDeletedAt:{$exists:false}}))')"
 
+echo "== a collection's collation decides which _ids are one =="
+# The _id index takes the collection's default collation, so in a collection
+# created with en/strength 2 "A" and "a" are one _id. The insert guard found
+# the archived "A" with its $in, which ran under that collation, and then placed
+# the answer back into the batch by comparing bytes, where "A" is not "a", so
+# it let the insert through. Measured before the fix: "a" beside an archived
+# "A", and {k:"x"} beside {k:"X"}, both accepted, two documents with one _id.
+fresh tkcoll2
+H "db.getSiblingDB(process.env.TC_DB).createCollection('tkcoll2', {collation:{locale:'en', strength:2}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).createCollection('tkcoll2', {collation:{locale:'en', strength:2}})" >/dev/null
+R 'db.getSiblingDB(process.env.TC_DB).tkcoll2.insertMany([{_id:"A"},{_id:{k:"X"}}])' >/dev/null
+waitMirrored tkcoll2 2
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkcoll2.deleteMany({})'
+chk "an _id the collation calls the archived one is refused" "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:"a"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "and so is one inside a compound _id"                     "11000" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:{k:"x"}});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "an _id the collation keeps apart is still accepted"      "ok" \
+    "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:"b"});print("ok")}catch(e){print(e.code||e.message.substring(0,40))}')"
+
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a

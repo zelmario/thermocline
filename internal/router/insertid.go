@@ -2,9 +2,11 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -95,6 +97,8 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 
 	clashing := make(bson.A, 0, len(ids))
 	var out []keyClash
+	placed := map[int]bool{}
+	unplaced := 0
 	for cur.Next(ctx) {
 		val, lerr := cur.Current.LookupErr("_id")
 		if lerr != nil {
@@ -102,15 +106,39 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 		}
 		i, ok := at[idKey(val)]
 		if !ok {
+			unplaced++
 			continue
 		}
 		// Copied, because val points into Current and is sent to the fast tier
 		// after the loop, when Current is valid no longer.
 		clashing = append(clashing, bson.RawValue{Type: val.Type, Value: append([]byte(nil), val.Value...)})
 		out = append(out, keyClash{doc: i, index: "_id_"})
+		placed[i] = true
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return nil, cerr
+	}
+
+	// An archived _id the $in found that is none of the batch's by value is one
+	// the collection's collation calls equal: a collection created with
+	// {locale: "en", strength: 2} makes "A" and "a" one _id, and the archive's
+	// query ran under that collation while the map above compares bytes.
+	// Measured on 2026-09-27: "a" beside an archived "A" and {k: "x"} beside
+	// {k: "X"} were both accepted, two documents with one _id. There is no
+	// collator here to place the answer, so each batch _id not yet placed is
+	// asked about on its own, under the collection's collation, which is the
+	// comparison mongod will make. Only when the $in found something it could
+	// not place, which an ordinary insert never does.
+	if unplaced > 0 {
+		if extra, err := r.collatedIDClashes(ctx, ns, docs, at, placed); err != nil {
+			return nil, err
+		} else {
+			for _, cl := range extra {
+				id, _ := docs[cl.doc].LookupErr("_id")
+				clashing = append(clashing, id)
+				out = append(out, cl)
+			}
+		}
 	}
 
 	// An _id the fast tier holds too is not this guard's business, and
@@ -240,4 +268,40 @@ func idKey(v bson.RawValue) string {
 		return string(v.Type) + string(v.Value)
 	}
 	return string(t) + string(b)
+}
+
+// collatedIDClashes asks the archive, one _id at a time and under the
+// collection's default collation, which of the batch positions not yet placed
+// hold an _id a live archived document already has. See archivedIDClashesNow.
+func (r *Router) collatedIDClashes(ctx context.Context, ns string, docs []bson.Raw, at map[string]int, placed map[int]bool) ([]keyClash, error) {
+	collation, ok := r.defaultCollation(ctx, ns)
+	if !ok || len(simplifyCollation(collation)) == 0 {
+		return nil, nil
+	}
+	var co options.Collation
+	if err := bson.Unmarshal(collation, &co); err != nil {
+		return nil, nil
+	}
+	db, coll := splitNS(ns)
+	c := r.cold.Database(db).Collection(coll)
+	var out []keyClash
+	for _, i := range at {
+		if placed[i] {
+			continue
+		}
+		id, err := docs[i].LookupErr("_id")
+		if err != nil {
+			continue
+		}
+		ferr := c.FindOne(ctx, bson.D{{Key: "_id", Value: id}, meta.NotArchivedDeleted()},
+			options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetCollation(&co)).Err()
+		if ferr == nil {
+			out = append(out, keyClash{doc: i, index: "_id_"})
+			continue
+		}
+		if !errors.Is(ferr, mongo.ErrNoDocuments) {
+			return nil, ferr
+		}
+	}
+	return out, nil
 }

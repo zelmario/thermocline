@@ -412,6 +412,17 @@ Measured with compound `_id`s: `{a: NumberLong("1")}` beside an archived
 `{u: 1.0, d: [NumberLong("2")]}` beside `{u: 1, d: [NumberInt(2)]}` were all
 accepted, and are all refused now.
 
+And by collation: a collection's `_id` index takes the collection's default
+collation, so under en/strength 2 `"A"` and `"a"` are one `_id`. The guard's
+`$in` ran under that collation and found the archived `"A"`, then placed the
+answer back by bytes and let `"a"` through, and `{k: "x"}` beside `{k: "X"}`
+the same way. There is no collator here, so an answer that cannot be placed now
+sends each unplaced `_id` to the archive on its own, under the collection's
+collation. On the previous build the accepted duplicate also broke the next
+testkeys section, on a different collection, every time; with the section left
+out that build passes 230/0, which says the duplicate reached further than its
+own collection.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
