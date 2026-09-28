@@ -276,7 +276,18 @@ func (r *Router) holdAgainstEviction(ctx context.Context, ns string, held map[in
 		}
 		byDoc[d] = append(byDoc[d], i)
 	}
-	if err := r.recordResidencyMany(ctx, ns, stored); err != nil {
+	// A hold and nothing else. recordResidencyMany is for a copy-up and would
+	// announce an echo for a document that will produce no insert. See
+	// meta.HoldOnly.
+	holds := make([]mongo.WriteModel, 0, len(stored))
+	for _, id := range stored {
+		holds = append(holds, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
+			SetUpdate(meta.HoldOnly(ns, id, r.cfg.Residency.D())).
+			SetUpsert(true))
+	}
+	if _, err := r.cold.Database(meta.DB).Collection(meta.Residency).
+		BulkWrite(ctx, holds, options.BulkWrite().SetOrdered(false)); err != nil {
 		return nil, fmt.Errorf("hold the fast tier's copies against eviction: %w", err)
 	}
 	docIDs := make([]string, 0, len(byDoc))

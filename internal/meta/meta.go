@@ -594,6 +594,31 @@ func after(d time.Duration) bson.D {
 	return bson.D{{Key: "$add", Value: bson.A{"$$NOW", d.Milliseconds()}}}
 }
 
+// HoldOnly keeps a document on the fast tier for at least hold, and says
+// nothing else: no promotion, no echo, no reopening.
+//
+// ResidencyUpdate is for a document about to be copied up, and for a document
+// with no record it announces an echo, the promise that the copy-up's insert
+// is coming. The router's hold against eviction is placed on a document the
+// fast tier already has, which produces no insert, and an echo announced for it
+// is spent on whatever write reaches that document next: that mirror is
+// dropped and the archive keeps the older version. So this sets the hold and
+// the row's expiry, only ever later than they were, and leaves promotedAt,
+// echoPending and endedAt exactly as it found them.
+func HoldOnly(ns string, id bson.RawValue, hold time.Duration) mongo.Pipeline {
+	later := func(field string, d time.Duration) bson.D {
+		return bson.D{{Key: "$max", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$" + field, "$$NOW"}}}, after(d)}}}
+	}
+	return mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "ns", Value: ns},
+			{Key: "doc", Value: bson.D{{Key: "$literal", Value: id}}},
+			{Key: "hotUntil", Value: later("hotUntil", hold)},
+			{Key: "expiresAt", Value: later("expiresAt", hold+NoticeTTL)},
+		}}},
+	}
+}
+
 // HoldIsOver is the update that ends a hold: the document has left the fast
 // tier, so nothing is holding it there any more.
 //
