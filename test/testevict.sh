@@ -105,12 +105,20 @@ echo "== two sweeps at once, which the README promises cannot happen =="
 # measured nothing and reported the product not refusing.
 #
 # Made deterministic instead. RunOnce takes the lease before it looks at health,
-# so a config whose max_feeder_lag is impossible to satisfy leaves the first
-# sweep waiting inside the lease for the whole of its --health-timeout, which is
-# exactly the window this needs. It exits non-zero afterwards, which is the
-# fixture working rather than a failure.
-sed 's|^  max_feeder_lag:.*|  max_feeder_lag: 1ms|' "$CFG" > "$WDIR/ev_lease.yaml"
-grep -q "max_feeder_lag: 1ms" "$WDIR/ev_lease.yaml" || echo "  WARN  the lease fixture did not take"
+# so a config whose health check cannot pass leaves the first sweep waiting
+# inside the lease for the whole of its --health-timeout, which is exactly the
+# window this needs. It exits non-zero afterwards, which is the fixture working
+# rather than a failure.
+#
+# An oplog window no cluster has, rather than a max_feeder_lag of 1ms. The lag
+# of an idle feeder that has caught up reads as zero, so the 1ms version passed
+# its health check at once whenever the box was quiet enough: measured in a
+# sweep on 2026-09-28, the first evictor finished in 0.1s and the second swept
+# too. Not a feeder id nothing publishes under either, which was tried: the
+# evictor's lease is keyed by the feeder id, so that made the two evictors
+# different holders and the second swept without asking.
+sed 's|^    min_oplog_window:.*|    min_oplog_window: 100000h|' "$CFG" > "$WDIR/ev_lease.yaml"
+grep -q "min_oplog_window: 100000h" "$WDIR/ev_lease.yaml" || echo "  WARN  the lease fixture did not take"
 cline evictor --config $WDIR/ev_lease.yaml --once --health-timeout 8s > $LOGDIR/ev_race1.log 2>&1 &
 RACE1=$!
 sleep 1
