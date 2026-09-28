@@ -743,6 +743,11 @@ This is the whole list. Nothing else blocks. **Two of ten remain, and neither is
   eviction and that insert cannot both go ahead. Retries still reach mongod.
   Measured: with an eviction announced, the insert is refused by the router
   rather than handed to mongod; with none, it is handed back with a hold placed.
+  What it costs, on the one insert that pays it, an _id both tiers hold, which
+  mongod refuses as a duplicate: 200 of them through the router, median 8ms
+  before and 11ms after, p90 17ms and 16ms. An insert of a new _id does not
+  reach it, 11ms and 9ms, within noise. An application that inserts and reads
+  E11000 as "already there" pays about 3ms more on each such insert.
 
 ## What 2026-09-21 added that an operator has to do
 
