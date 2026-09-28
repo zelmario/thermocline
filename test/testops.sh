@@ -56,7 +56,10 @@ C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})' >/dev/null
 cline feeder --config $CFG --log-file $LOGDIR/ops_f.log & FP=$!
 cline router --config $CFG --log-file $LOGDIR/ops_r.log & RP=$!
-sleep 6
+# Until it answers, not a fixed six seconds: on 2026-09-28, with other
+# containers loading the host, this router was not listening by then and the
+# seed below went nowhere, which read as 51 failures of everything after it.
+for _ in $(seq 1 60); do routerUp && break; sleep 1; done
 
 # 40 documents with a secondary date field and a few shapes to query on.
 R "
@@ -113,7 +116,10 @@ H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({n:{\$gte:10}})" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
 cline feeder --config $CFG --log-file $LOGDIR/ops_f.log & FP=$!
 cline router --config $CFG --log-file $LOGDIR/ops_r.log & RP=$!
-sleep 6
+# Until it answers, not a fixed six seconds: on 2026-09-28, with other
+# containers loading the host, this router was not listening by then and the
+# seed below went nowhere, which read as 51 failures of everything after it.
+for _ in $(seq 1 60); do routerUp && break; sleep 1; done
 cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
 MODE="incomplete fast tier"
