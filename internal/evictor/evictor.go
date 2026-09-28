@@ -671,6 +671,21 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 	if err := e.announce(ctx, present); err != nil {
 		return 0, err
 	}
+	// And holds asked again, after announcing, for the other half of a
+	// handshake with the router. A router about to let mongod answer an insert
+	// of an _id both tiers hold writes a hold on that document and then looks
+	// for this announcement; this writes the announcement and then looks for
+	// the hold. Whichever is second sees the first, so an eviction and that
+	// insert cannot both go ahead. Without it the router could read the fast
+	// tier's copy, this could delete it, and mongod would then accept the
+	// insert and the feeder mirror it over the archived document. See
+	// router.archivedIDClashesNow.
+	if present, err = e.dropHeldAfterAnnouncing(ctx, ns, present); err != nil {
+		return 0, err
+	}
+	if len(present) == 0 {
+		return 0, nil
+	}
 
 	ids := make([]bson.RawValue, len(present))
 	docIDs := make([]string, len(present))
@@ -1162,3 +1177,37 @@ func (e *Evictor) checkClock(ctx context.Context) {
 // simpleCollation is byte-wise string comparison, for the checks that must see
 // a change of case as a change.
 var simpleCollation = &options.Collation{Locale: "simple"}
+
+// dropHeldAfterAnnouncing takes out of a just-announced batch the documents a
+// hold was placed on since the batch was chosen, and takes their announcements
+// back. Taking one back is right here, unlike after a delete, because these are
+// never deleted: the announcement is withdrawn for exactly the documents left
+// alone.
+func (e *Evictor) dropHeldAfterAnnouncing(ctx context.Context, ns string, present []candidate) ([]candidate, error) {
+	docIDs := make([]string, len(present))
+	for i, d := range present {
+		docIDs[i] = d.docID
+	}
+	held, err := e.residencyHolds(ctx, docIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(held) == 0 {
+		return present, nil
+	}
+	keep := present[:0:0]
+	var back []string
+	for _, d := range present {
+		if held[d.docID] {
+			back = append(back, d.docID)
+			continue
+		}
+		keep = append(keep, d)
+	}
+	if _, err := meta.ConsumeEvictionNotices(ctx, e.cold, back); err != nil {
+		return nil, fmt.Errorf("withdraw announcements for documents held since: %w", err)
+	}
+	e.log.Info("not evicting documents a hold was placed on while the batch was announced",
+		"ns", ns, "count", len(back))
+	return keep, nil
+}

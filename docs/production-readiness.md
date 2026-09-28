@@ -505,7 +505,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Three of ten remain: two are not code, and one is a decision.**
+This is the whole list. Nothing else blocks. **Two of ten remain, and neither is code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -721,7 +721,8 @@ This is the whole list. Nothing else blocks. **Three of ten remain: two are not 
   `TestAWithdrawnEchoMakesThePositionListIncomplete` each failed before their
   change.
 
-- [ ] **10. Decide how the `_id` guard trades a retry against an eviction.**
+- [x] **10. Decide how the `_id` guard trades a retry against an eviction.**
+  Closed on 2026-09-28 without choosing either cost: see the end of this item.
   When both tiers hold an `_id`, the insert guard hands the insert to mongod,
   so a driver's retry of an insert that already succeeded is deduplicated by
   mongod rather than refused by this router. What that costs: an eviction of
@@ -733,6 +734,16 @@ This is the whole list. Nothing else blocks. **Three of ten remain: two are not 
   retry that reaches a different router than the first attempt into an error
   where plain MongoDB returns success. Which of the two is rarer and which is
   worse for the application is Zelmar's call.
+
+  Zelmar said fix it, and it is fixed without giving up either side. Before
+  handing an insert back to mongod the router now places a residency hold on
+  the fast tier's copy and then looks for an eviction announcement; the evictor
+  announces and then looks for holds, dropping any document held since its
+  batch was chosen and taking that announcement back. Both are writes and reads
+  on the archive's primary, so whichever runs second sees the first, and an
+  eviction and that insert cannot both go ahead. Retries still reach mongod.
+  Measured: with an eviction announced, the insert is refused by the router
+  rather than handed to mongod; with none, it is handed back with a hold placed.
 
 ## What 2026-09-21 added that an operator has to do
 

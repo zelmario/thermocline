@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -176,24 +177,40 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 	// own index, with mongod's own error. And an _id only the archive holds is
 	// still this guard's to refuse, because that is the one mongod cannot see.
 	//
-	// What it opens, stated rather than left for somebody to find: between this
-	// reading and mongod applying the insert, one round trip, an eviction sweep
-	// could remove that exact document from the fast tier. mongod would then
-	// accept the insert, and the feeder would mirror it over the archived copy
-	// the eviction had just confirmed. That is the loss this guard exists to
-	// stop, in a window of a millisecond, needing a concurrent eviction of the
-	// one _id being inserted. The alternative is refusing every retry a driver
-	// makes of a write that already succeeded, which needs no coincidence at
-	// all and happens whenever a connection drops.
+	// What it used to open: between this reading and mongod applying the
+	// insert, an eviction sweep could remove that exact document from the fast
+	// tier, mongod would then accept the insert, and the feeder would mirror it
+	// over the archived copy the eviction had just confirmed. That was accepted
+	// as a millisecond's window beside the cost of refusing every retry a
+	// driver makes of a write that succeeded. It is closed now without that
+	// cost, by holding the fast tier's copy against eviction before handing
+	// the insert back: see holdAgainstEviction.
 	if len(clashing) > 0 {
 		held, herr := r.fastTierAlreadyHas(ctx, ns, clashing, at)
 		if herr != nil {
 			return nil, herr
 		}
+		// Handed back only once the fast tier's copies are held against
+		// eviction, and not at all for one an eviction is already under way
+		// for. Without the hold an eviction of that exact document between
+		// this read and mongod applying the insert let the insert land, and
+		// the feeder mirrored it over the archived copy. That window was
+		// accepted here as a millisecond; the collated form of it was met in a
+		// thirty-minute two-application run on 2026-09-28, so it is closed
+		// instead. See holdAgainstEviction.
+		if len(held) > 0 {
+			evicting, eerr := r.holdAgainstEviction(ctx, ns, held)
+			if eerr != nil {
+				return nil, eerr
+			}
+			for i := range evicting {
+				delete(held, i)
+			}
+		}
 		if len(held) > 0 {
 			kept := out[:0]
 			for _, cl := range out {
-				if !held[cl.doc] {
+				if _, h := held[cl.doc]; !h {
 					kept = append(kept, cl)
 				}
 			}
@@ -214,7 +231,7 @@ func (r *Router) archivedIDClashesNow(ctx context.Context, ns string, docs []bso
 // one document and is only ever used to skip work: this one decides whether a
 // client is told its insert failed, so an error here has to stop the insert
 // rather than be read as "not held".
-func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, at map[string][]int) (map[int]bool, error) {
+func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, at map[string][]int) (map[int]bson.RawValue, error) {
 	db, coll := splitNS(ns)
 	cur, err := r.hot.Database(db).Collection(coll).Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
@@ -224,17 +241,66 @@ func (r *Router) fastTierAlreadyHas(ctx context.Context, ns string, ids bson.A, 
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
-	held := map[int]bool{}
+	held := map[int]bson.RawValue{}
 	for cur.Next(ctx) {
 		val, lerr := cur.Current.LookupErr("_id")
 		if lerr != nil {
 			continue
 		}
+		// The fast tier's own spelling of the _id, copied out of Current: the
+		// holds and announcements below are keyed by the stored bytes.
+		stored := bson.RawValue{Type: val.Type, Value: append([]byte(nil), val.Value...)}
 		for _, i := range at[idKey(val)] {
-			held[i] = true
+			held[i] = stored
 		}
 	}
 	return held, cur.Err()
+}
+
+// holdAgainstEviction places a residency hold on the fast tier documents an
+// insert is about to be handed to mongod for, and then reports which of them
+// an eviction has already been announced for. It is the router's half of the
+// handshake in evictor.dropHeldAfterAnnouncing: this writes the hold and reads
+// the announcement, the evictor writes the announcement and reads the hold, so
+// whichever runs second sees the first.
+//
+// An error is returned rather than a guess, and the caller refuses: letting
+// mongod answer without the hold is the window this closes.
+func (r *Router) holdAgainstEviction(ctx context.Context, ns string, held map[int]bson.RawValue) (map[int]bool, error) {
+	stored := make([]bson.RawValue, 0, len(held))
+	byDoc := map[string][]int{}
+	for i, id := range held {
+		d := meta.DocID(ns, id)
+		if _, seen := byDoc[d]; !seen {
+			stored = append(stored, id)
+		}
+		byDoc[d] = append(byDoc[d], i)
+	}
+	if err := r.recordResidencyMany(ctx, ns, stored); err != nil {
+		return nil, fmt.Errorf("hold the fast tier's copies against eviction: %w", err)
+	}
+	docIDs := make([]string, 0, len(byDoc))
+	for d := range byDoc {
+		docIDs = append(docIDs, d)
+	}
+	cur, err := r.cold.Database(meta.DB).Collection(meta.Evicting).Find(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read eviction announcements: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	evicting := map[int]bool{}
+	for cur.Next(ctx) {
+		var n meta.EvictionNotice
+		if cur.Decode(&n) != nil || n.Left() <= 0 {
+			continue
+		}
+		for _, i := range byDoc[n.ID] {
+			evicting[i] = true
+		}
+	}
+	return evicting, cur.Err()
 }
 
 // mergeClashes joins two lists of rejections, keeping one reason per document
