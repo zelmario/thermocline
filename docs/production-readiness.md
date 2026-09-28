@@ -41,6 +41,10 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Host suites, 12 of them | 322 checks, 0 failed |
 | Two applications through one router, 30 minutes, with a change stream consumer tailing | 8,375 commands, 1,440 copy-ups, 0 phantom events, 0 violations |
 | The fuzzer with pipelines that write their answer down | 489 compared, 0 disagreed |
+| In-node suites, 2026-09-28, after the day's key and pairing fixes | 2,025 checks, 0 failed |
+| Host suites, the same build | 328 checks, 0 failed |
+| The fuzzer with collated collections and mixed numeric types, 20 rounds of 150 | 4,777 agreed, 0 disagreed |
+| The same with change streams compared | 39 events on each side, 1,743 agreed, 0 disagreed |
 
 ## What the last two days found, and what that says
 
