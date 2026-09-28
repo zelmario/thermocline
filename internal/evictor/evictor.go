@@ -683,13 +683,21 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 	// than removed with only its older version archived. $literal because the
 	// document is the application's and a string in it starting with $ would
 	// otherwise be read as a field path.
+	//
+	// Under the simple collation, whatever the collection's default. $eq in
+	// $expr compares strings by the collection's collation, so in one created
+	// with {locale: "en", strength: 2} a document the application had changed
+	// from "bob" to "Bob" still equalled the "bob" that was archived, and the
+	// newer version was deleted with only the older one kept. Measured on a
+	// plain mongod: that filter deletes the changed document under the
+	// collection's collation and leaves it under the simple one.
 	models := make([]mongo.WriteModel, len(present))
 	for i, d := range present {
 		filter := bson.D{
 			{Key: "_id", Value: d.id},
 			{Key: "$expr", Value: bson.D{{Key: "$eq", Value: bson.A{"$$ROOT", bson.D{{Key: "$literal", Value: d.doc}}}}}},
 		}
-		models[i] = mongo.NewDeleteOneModel().SetFilter(filter)
+		models[i] = mongo.NewDeleteOneModel().SetFilter(filter).SetCollation(simpleCollation)
 	}
 	res, err := hotColl.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	if err != nil {
@@ -1150,3 +1158,7 @@ func (e *Evictor) checkClock(ctx context.Context) {
 			"action", "run NTP on every host that runs a cline daemon")
 	})
 }
+
+// simpleCollation is byte-wise string comparison, for the checks that must see
+// a change of case as a change.
+var simpleCollation = &options.Collation{Locale: "simple"}
