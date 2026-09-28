@@ -322,13 +322,18 @@ for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 # The router reads once, which is what puts the claim in its cache.
 chkv "the router sees all four"                  "4" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
-cline evictor --config $WDIR/evclaim.yaml --once >/dev/null 2>&1
+cline evictor --config $WDIR/evclaim.yaml --once > $LOGDIR/evclaim_e.log 2>&1
 # Immediately, which is the whole point: no sleep between the sweep and this.
 chkv "and still sees all four straight afterwards" "4" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
 # The control: the sweep really did remove something, or this proves nothing.
 chkv "the sweep did remove the old ones"          "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+# What the sweep said, when it removed nothing. Failed once in a four-worker
+# sweep on 2026-09-28, taking 524s where the suite takes 220, with the output
+# of the one sweep that could say why sent nowhere.
+[ "$(H "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")" = "2" ] || \
+  grep -hE 'sweep complete|paused|not healthy|stopped' $LOGDIR/evclaim_e.log | tail -3 | sed 's/^/      evictor: /'
 chkv "and the archive still holds them all"       "4" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 kill $CRP 2>/dev/null; wait $CRP 2>/dev/null

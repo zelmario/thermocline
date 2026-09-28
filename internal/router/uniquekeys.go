@@ -992,6 +992,22 @@ func (r *Router) settleAfterFailedWrite(ctx context.Context, kid string) {
 		}
 	case !errors.Is(err, mongo.ErrNoDocuments):
 		return
+	default:
+		// Not on the fast tier is not the same as not holding it: an owner the
+		// archive holds live with this key keeps its claim, which is the case
+		// the registry exists for. Every write path copies a document up before
+		// it claims for it, so this is not expected to be reached; it is here
+		// because keeping a claim is the safe answer and this is where one
+		// would otherwise be given away.
+		var archived bson.Raw
+		aerr := r.cold.Database(db).Collection(coll).FindOne(ctx,
+			bson.D{{Key: "_id", Value: claim.Doc}, meta.NotArchivedDeleted()}).Decode(&archived)
+		if aerr == nil && r.stillHoldsKey(ctx, ns, idx, kid, archived) {
+			return
+		}
+		if aerr != nil && !errors.Is(aerr, mongo.ErrNoDocuments) {
+			return
+		}
 	}
 	vals, ok := valuesFromKeyID(ns, idx, kid)
 	if !ok {
