@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,10 @@ type shop struct {
 	nProducts  int
 	nCustomers int
 	nOrders    int
+	// seeded is which of the stocked orders still exist, read at the start of
+	// a run that did not stock the shop itself. Nil means all of them. See
+	// pickSeeded.
+	seeded []int
 	// began is when this run started, and the bound pageHistory scrolls below.
 	// Everything older than it is written once by the seeder and never touched
 	// again, which is what makes a skip stable.
@@ -290,6 +295,9 @@ func main() {
 		s.start, s.period = m.Start, time.Duration(m.Days)*24*time.Hour
 		s.nProducts, s.nCustomers, s.nOrders = m.Products, m.Customers, m.Orders
 		fmt.Printf("shopping in the store stocked at %s\n", m.Start.Format(time.RFC3339))
+		if err := s.readSeeded(ctx); err != nil {
+			die("read which stocked orders are left: %v", err)
+		}
 	}
 
 	// Whole calendar months, none of them the current one, all of them ended
@@ -470,7 +478,10 @@ func (s *shop) trackOrder(ctx context.Context, rng *rand.Rand) {
 	if s.nOrders <= 0 {
 		return
 	}
-	n := rng.Intn(s.nOrders)
+	n, ok := s.pickSeeded(rng)
+	if !ok {
+		return
+	}
 	typed := strings.ToLower(orderRef(n))
 	s.timed("track an order by its reference", func() error {
 		var got struct {
@@ -489,6 +500,61 @@ func (s *shop) trackOrder(ctx context.Context, rng *rand.Rand) {
 	})
 }
 
+// readSeeded records which stocked orders are still there, for a run against a
+// shop somebody else stocked.
+//
+// Something other than this shop can delete them. testrollback cancels forty
+// through the router, and after the rollback they are gone from the archive
+// for good, which is correct. The next run then tracked and re-used references
+// of orders that no longer exist: the archive rightly accepted a reference
+// nobody held, and the shop reported a second order taking it, twice in host
+// sweeps (2026-09-28 and 29), both times a reference between Ref002000 and
+// Ref002039, exactly the forty deleted.
+func (s *shop) readSeeded(ctx context.Context) error {
+	cur, err := s.orders.Find(ctx, bson.D{{Key: "ref", Value: bson.D{{Key: "$regex", Value: "^Ref[0-9]{6}$"}}}},
+		options.Find().SetProjection(bson.D{{Key: "ref", Value: 1}, {Key: "_id", Value: 0}}))
+	if err != nil {
+		return err
+	}
+	defer cur.Close(ctx)
+	have := make([]bool, s.nOrders)
+	for cur.Next(ctx) {
+		var o struct {
+			Ref string `bson:"ref"`
+		}
+		if err := cur.Decode(&o); err != nil {
+			return err
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(o.Ref, "Ref")); err == nil && n >= 0 && n < s.nOrders {
+			have[n] = true
+		}
+	}
+	if err := cur.Err(); err != nil {
+		return err
+	}
+	s.seeded = make([]int, 0, s.nOrders)
+	for n, ok := range have {
+		if ok {
+			s.seeded = append(s.seeded, n)
+		}
+	}
+	if gone := s.nOrders - len(s.seeded); gone > 0 {
+		fmt.Printf("%d of the %d stocked orders are gone, and are not tracked or re-used\n", gone, s.nOrders)
+	}
+	return nil
+}
+
+// pickSeeded picks a stocked order that still exists.
+func (s *shop) pickSeeded(rng *rand.Rand) (int, bool) {
+	if s.seeded == nil {
+		return rng.Intn(s.nOrders), true
+	}
+	if len(s.seeded) == 0 {
+		return 0, false
+	}
+	return s.seeded[rng.Intn(len(s.seeded))], true
+}
+
 // reuseReference is the shop refusing to print a reference twice.
 //
 // A support tool re-issuing a confirmation is where this comes from, and the
@@ -498,7 +564,10 @@ func (s *shop) reuseReference(ctx context.Context, rng *rand.Rand) {
 	if s.nOrders <= 0 {
 		return
 	}
-	n := rng.Intn(s.nOrders)
+	n, ok := s.pickSeeded(rng)
+	if !ok {
+		return
+	}
 	typed := strings.ToLower(orderRef(n))
 	at := time.Now()
 	id := idAt(at, rng.Intn(1<<20))
@@ -619,7 +688,8 @@ func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust stri
 // a recent order, not one from last March. It keeps the seeded history intact
 // for trackOrder, which expects every seeded reference to still be findable, and
 // a cancellation of one of those would make that check report a violation for a
-// document this workload removed itself.
+// document this workload removed itself. The ones something else deleted are
+// left out when the run starts; see readSeeded.
 //
 // What a shop would notice: the order is gone, and exactly one order is gone.
 func (s *shop) cancelOrder(ctx context.Context, placed []recentOrder) []recentOrder {
