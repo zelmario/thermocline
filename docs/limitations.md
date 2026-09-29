@@ -517,6 +517,17 @@ Part of [Thermocline](../README.md).
   should hold the refusal until the probe finishes did not hold it. Why is the
   open question; the log is in /tmp/hostsweep-failures on this box.
 
+  On 2026-09-29 the host sweep failed the no-primary check as well, and the
+  logs showed two defects in this path, both fixed. A late refusal from the old
+  primary, on a sibling connection, was charged to the new one, so every lookup
+  turned the real primary away: a client connecting after the election stalled
+  13 seconds in 4 runs of 8, and in 0 of 15 after. And a member that refused and
+  was then elected again was turned away for 20 seconds, which gave a client up
+  at 18:39:08 while that member had been primary since 18:38:52. Whether either
+  one is the 2.4 second failure is not proven: five runs of the suite alone all
+  passed at 310 to 343ms, which they mostly did before as well. The full host
+  sweep is the test that settles it.
+
   The second check is explained, and it is a real difference rather than a
   timer in this system. With authentication proxied a client's handshake is
   authenticated against the member its connection is pinned to, so during an

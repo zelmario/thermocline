@@ -63,11 +63,12 @@ type Router struct {
 	// member that steps down stays up and keeps accepting connections, so the
 	// pinned address is reachable and wrong at the same time.
 	primaryRefused bool
-	// refusedBy is the member that refused, and refusedAt when. For as long as
-	// a step-down can last, a lookup naming that member again is a view that
-	// has not heard yet rather than an answer. See refreshPrimary.
-	refusedBy string
-	refusedAt time.Time
+	// refusedBy holds each member that refused, and when. For as long as a
+	// step-down can last, a lookup naming one of them again is a view that has
+	// not heard yet rather than an answer. See refreshPrimary. One per member
+	// rather than one in all, because a late refusal from a member the router
+	// had already left would otherwise overwrite the pinned member's own.
+	refusedBy map[string]time.Time
 	// avoidUntil keeps a member out of the secondary rotation until an instant,
 	// because it answered a read saying it is neither primary nor secondary.
 	avoidMu    sync.Mutex
@@ -761,9 +762,10 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 	// With authentication terminated it is borrowed per command from a pool
 	// instead, and an idle client holds nothing upstream. See pool.go.
 	var upstream net.Conn
+	var upstreamAddr string
 	if !r.cfg.TerminateAuth {
 		var err error
-		upstream, err = r.dialPrimary(ctx)
+		upstream, upstreamAddr, err = r.dialPrimary(ctx)
 		if err != nil {
 			r.log.Error("cannot reach the fast tier", "err", err)
 			return
@@ -775,6 +777,7 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 		r:        r,
 		client:   client,
 		upstream: upstream,
+		dialed:   upstreamAddr,
 		log:      r.log,
 		id:       r.nextConnID.Add(1),
 	}
@@ -889,7 +892,11 @@ type conn struct {
 	r        *Router
 	client   net.Conn
 	upstream net.Conn
-	log      *slog.Logger
+	// dialed is the member a proxied connection's own upstream was dialed to.
+	// It never changes, because the connection carries the client's identity
+	// and cannot be moved. See upstreamMember.
+	dialed string
+	log    *slog.Logger
 
 	// cls is how the command in flight was served. Every path that does
 	// something other than hand the command to the fast tier sets it, and pump
@@ -1867,10 +1874,11 @@ var errNoPrimaryYet = errors.New("the fast tier has no primary yet")
 // being permanent.
 func (r *Router) refreshPrimary(ctx context.Context) error {
 	var hello struct {
-		Primary string   `bson:"primary"`
-		Me      string   `bson:"me"`
-		Hosts   []string `bson:"hosts"`
-		SetName string   `bson:"setName"`
+		Primary  string   `bson:"primary"`
+		Me       string   `bson:"me"`
+		Hosts    []string `bson:"hosts"`
+		SetName  string   `bson:"setName"`
+		Writable bool     `bson:"isWritablePrimary"`
 	}
 	err := r.hot.Database("admin").
 		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
@@ -1907,11 +1915,11 @@ func (r *Router) refreshPrimary(ctx context.Context) error {
 	// no primary failed after 7.4, both with "not primary", where a driver
 	// talking to the set would have waited in server selection. It is answered
 	// as an election still running, so every caller keeps asking.
-	if r.namesTheRefuser(addr, time.Now()) {
+	if !r.acceptsPrimary(addr, hello.Me, hello.Writable, time.Now()) {
 		r.primaryMu.Unlock()
 		return errNoPrimaryYet
 	}
-	r.refusedBy = ""
+	r.refusedBy = nil
 	changed := r.primary != addr
 	old := r.primary
 	r.primary = addr
@@ -1966,13 +1974,31 @@ const primaryProbeWait = 5 * time.Second
 // driver tracks the topology continuously but its own view may still be mid
 // election, and waiting for that here would stall a connection that has an
 // answer to deliver.
-func (r *Router) primaryMoved() {
+//
+// by is the member whose reply said "not primary", which is not always the one
+// this router is pinned to. A connection keeps the member it was opened to, so
+// a refusal can arrive from the old primary after the pin has already moved to
+// the new one. Recording the pin as the refuser then turned away the real
+// primary for primaryWait: measured in a host sweep on 2026-09-29, the new
+// primary was writable from 17:11:20.542 and every lookup until 17:11:25.56
+// answered "no primary yet", and the client's retry was closed unanswered.
+func (r *Router) primaryMoved(by string) {
 	// Before the throttle, because every refusal is evidence about the pin
 	// whether or not this one is the caller that gets to go and look.
 	r.primaryMu.Lock()
-	r.primaryRefused = true
-	if r.primary != "" {
-		r.refusedBy, r.refusedAt = r.primary, time.Now()
+	if by == "" {
+		by = r.primary
+	}
+	if by == r.primary {
+		// A refusal from a member the router has already moved off says
+		// nothing about the pin, so only this one marks it doubtful.
+		r.primaryRefused = true
+	}
+	if by != "" {
+		if r.refusedBy == nil {
+			r.refusedBy = map[string]time.Time{}
+		}
+		r.refusedBy[by] = time.Now()
 	}
 	r.primaryMu.Unlock()
 
@@ -2041,7 +2067,26 @@ func (r *Router) primaryMoved() {
 // within the last primaryWait, which is a view that has not caught up. The
 // caller holds primaryMu.
 func (r *Router) namesTheRefuser(addr string, now time.Time) bool {
-	return r.refusedBy != "" && addr == r.refusedBy && now.Sub(r.refusedAt) < primaryWait
+	at, ok := r.refusedBy[addr]
+	return ok && now.Sub(at) < primaryWait
+}
+
+// acceptsPrimary decides whether a lookup's answer may be pinned. The caller
+// holds primaryMu.
+//
+// The member that refused is turned away only while somebody else names it. A
+// member answering for itself that it is the writable primary is not a view
+// that has not caught up, it is the primary, and a refuser can be re-elected:
+// on a three-member set with the other two frozen it is the likeliest winner.
+// Measured in testfailover on 2026-09-29, the member that refused at 18:38:46
+// was elected again at 18:38:52 and stayed primary until 18:39:28, and the
+// router answered "no primary yet" throughout and gave the client up at
+// 18:39:08.
+func (r *Router) acceptsPrimary(addr, me string, writable bool, now time.Time) bool {
+	if writable && me == addr {
+		return true
+	}
+	return !r.namesTheRefuser(addr, now)
 }
 
 func (r *Router) movedOff(ctx context.Context) error {
@@ -2096,7 +2141,7 @@ func (r *Router) primaryKnown() bool {
 	return !r.primaryRefused
 }
 
-func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
+func (r *Router) dialPrimary(ctx context.Context) (net.Conn, string, error) {
 	d := net.Dialer{Timeout: 5 * time.Second}
 	deadline := time.Now().Add(primaryWait)
 
@@ -2121,11 +2166,11 @@ func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 			}
 			lastErr = err
 			if time.Now().After(deadline) || ctx.Err() != nil {
-				return nil, fmt.Errorf("the fast tier has no primary to connect to: %w", lastErr)
+				return nil, "", fmt.Errorf("the fast tier has no primary to connect to: %w", lastErr)
 			}
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
@@ -2134,12 +2179,12 @@ func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 		if err == nil {
 			secured, terr := r.upstreamTLS(conn, addr)
 			if terr != nil {
-				return nil, terr
+				return nil, "", terr
 			}
 			if attempt > 0 {
 				r.log.Info("fast tier reachable again", "addr", addr, "waited", time.Since(deadline.Add(-primaryWait)).Round(time.Second))
 			}
-			return secured, nil
+			return secured, addr, nil
 		}
 		lastErr = err
 
@@ -2148,11 +2193,11 @@ func (r *Router) dialPrimary(ctx context.Context) (net.Conn, error) {
 		_ = r.refreshPrimary(ctx)
 
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return nil, fmt.Errorf("dial %s: %w", addr, lastErr)
+			return nil, "", fmt.Errorf("dial %s: %w", addr, lastErr)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, "", ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -2170,12 +2215,22 @@ func (c *conn) afterFailoverReply(ctx context.Context, msg *wire.Message, name s
 	}
 	// Whether or not this command can be sent again, the address this router is
 	// pinned to is wrong from here on.
-	c.r.primaryMoved()
+	c.r.primaryMoved(c.upstreamMember())
 	if out, replayed := c.replayAfterFailover(ctx, msg, name); replayed {
 		return out
 	}
 	c.endAfterFailover(ctx)
 	return reply
+}
+
+// upstreamMember names the member this connection's primary upstream goes to:
+// the pool's for a borrowed one, the one it was dialed to otherwise. Empty when
+// it holds none.
+func (c *conn) upstreamMember() string {
+	if c.lease != nil {
+		return c.lease.pool.addr
+	}
+	return c.dialed
 }
 
 func isClosed(err error) bool {
