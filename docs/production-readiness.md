@@ -749,6 +749,16 @@ This is the whole list. Nothing else blocks. **Two of ten remain, and neither is
   reach it, 11ms and 9ms, within noise. An application that inserts and reads
   E11000 as "already there" pays about 3ms more on each such insert.
 
+  And its first version lost data, found the same night by asking what the hold
+  meant to the change stream sieve. It was written as a copy-up's residency,
+  which announces an echo for the insert a copy-up makes; the hold's document
+  makes none, and the next insert of that _id was taken for it and not
+  mirrored. A refused duplicate, then a delete and a re-insert, left the archive
+  holding the old document marked deleted (d73ddf8). The hold is now a hold
+  and nothing else, and testlife checks that sequence. Pushed after the eight
+  suites that reach it, ahead of a full sweep, because the defect was already
+  on master: run both sweeps before relying on it.
+
 ## What 2026-09-21 added that an operator has to do
 
 None of these joins **Open**, by the rule below: none makes an application read

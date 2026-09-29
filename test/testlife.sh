@@ -333,6 +333,26 @@ chk "the updates to all three reached the archive"  "3" \
 chk "and so did the write after them"                "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:793}))")"
 
+echo "== a re-insert after a refused duplicate reaches the archive =="
+# The router holds a document against eviction before letting mongod refuse a
+# duplicate of it, and the first version of that hold announced a copy-up that
+# never came. The next insert of that _id was taken for it and not mirrored:
+# measured, a refused duplicate of 800 and then a delete and a re-insert with
+# v:3 left the archive holding the old 800 marked deleted.
+H "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:800})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tbig.deleteMany({_id:800})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tbig.insertOne({_id:800, v:1})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tbig.countDocuments({_id:800}))")" = "1" ] && break; sleep 0.5
+done
+R "const c=db.getSiblingDB(process.env.TC_DB).tbig; try { c.insertOne({_id:800, v:9}) } catch (e) {}
+   c.deleteOne({_id:800}); c.insertOne({_id:800, v:3})" >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:800}); print(d && d.v===3 && !d._tcDeletedAt)")" = "true" ] && break; sleep 0.5
+done
+chk "the archive holds the re-inserted document, live" "3 live" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_DB).tbig.findOne({_id:800}); print(d ? d.v + (d._tcDeletedAt ? ' marked deleted' : ' live') : 'MISSING')")"
+
 echo "== documents the archive will never receive =="
 # A change stream reports changes from now, so whatever the fast tier already
 # holds when the feeder first starts is not mirrored by starting it. In an
