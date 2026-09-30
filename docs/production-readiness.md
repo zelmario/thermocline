@@ -504,7 +504,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Two of ten remain, and neither is code.**
+This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 and 5, which are not code, and item 11, which is.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -758,6 +758,29 @@ This is the whole list. Nothing else blocks. **Two of ten remain, and neither is
   and nothing else, and testlife checks that sequence. Pushed after the eight
   suites that reach it, ahead of a full sweep, because the defect was already
   on master: run both sweeps before relying on it.
+
+- [ ] **11. A copy-up concurrent with a delete puts the deleted document back.**
+  Found on 2026-09-29 by `FOR=2h test/store/shared.sh` on 71b55d3, 1h52m in.
+  Both consumers reported order 6abc4d97000c6ef93715db78 missing, and they were
+  right: the application deleted it at 23:45:29.392, and at 23:45:29.621 a
+  retryable batch insert from a fresh session (txnNumber 1, stmtId 4, the other
+  four statements already present) put the archive's copy back on the fast
+  tier. The feeder had tombstoned the archive at 23:45:29.610. The fast tier
+  holds the cancelled order live, so the router answers it. The batch is the
+  shape of a copy-up, most likely a transaction's warm (txnwarm.go), which
+  inserts a customer's archived orders and skips the ones already there.
+
+  60d19ae made every copy-up wait for mirroring to the router's cluster time as
+  it begins, which covers a delete acknowledged before it. This delete was
+  concurrent: after the copy-up read the archive and before it inserted, from
+  the other router. Nothing covers that window, and re-checking before the
+  insert only narrows it. The direction: after inserting, wait for mirroring to
+  reach the insert's time, re-read the archive for the ids copied, and remove
+  from the fast tier any that are now tombstoned, hidden from change streams as
+  tiering work. Not reproduced on its own yet: the plan is a customer with
+  thousands of archived orders, so the warm's read-to-insert gap is long, and a
+  delete of a recent order through the second router inside it. Logs kept in
+  ~/thermocline-keep/2026-09-29-shared2h on this box.
 
 ## What 2026-09-21 added that an operator has to do
 
