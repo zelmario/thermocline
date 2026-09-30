@@ -614,6 +614,18 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 	if !ok {
 		return false
 	}
+	// An insert the feeder wrote down as a copy-up's echo is one, whatever the
+	// clocks below say, so that is asked first. It used to be asked last, after
+	// the ended check, and wall times do not follow the oplog at this scale:
+	// measured on 2026-09-30, a copy-up's insert committed as a transaction
+	// carried wall time 25.242 and the delete after it 25.220. The application
+	// had deleted the document between the copy-up recording its promotion and
+	// inserting, the feeder ended the record at 25.224, and the copy-up's own
+	// insert was read as the application writing the _id again: an order shown
+	// placed after it was deleted, one round of six.
+	if known, yes := (meta.ResidencyRecord{Echoed: p.echoed}).EchoedAt(pos); known && yes {
+		return true
+	}
 	// Announced and not yet spent, which means the insert this record was
 	// written to precede has not been seen. The way an unclaimed eviction
 	// announcement is, and for the same reason: while nobody has accounted for
@@ -659,6 +671,24 @@ func isPromotion(promoted map[string]promotion, id string, at time.Time, pos bso
 		return false
 	}
 	if p.at.After(recent) {
+		// The window is a floor for one case, a record the TTL removed and a
+		// later promotion wrote again, knowing only the later echo. A record
+		// outlives the last write to it by at least meta.NoticeTTL, so an
+		// insert from less than that before this promotion was never an echo
+		// such a record forgot, and the list is complete for it once the echo
+		// is spent and nothing was withdrawn. Half the TTL, for the two clocks
+		// promotedAt and an event's time come from.
+		//
+		// Without it the window hid the application's own insert of a document
+		// a copy-up then put on the fast tier a moment later. Measured on
+		// 2026-09-30: an order placed, then deleted through another router
+		// while a transaction's warm was moving it, and the order's insert was
+		// missing from a stream read from before it, 6 of 6. The copy-up's own
+		// insert is in the list and stays hidden.
+		if known, yes := (meta.ResidencyRecord{Echoed: p.echoed}).EchoedAt(pos); known && !p.pending && !p.uncertain &&
+			!at.IsZero() && at.After(p.at.Add(-meta.NoticeTTL/2)) {
+			return yes
+		}
 		return true
 	}
 	// Exact, and it answers the question the window cannot.

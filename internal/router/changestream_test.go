@@ -333,3 +333,56 @@ func TestAWithdrawnEchoMakesThePositionListIncomplete(t *testing.T) {
 		t.Error("an application's own insert, a minute after the promotion, was hidden")
 	}
 }
+
+// The window hid the application's own insert of a document that a copy-up put
+// on the fast tier a moment later, because it judged the promotion against now
+// rather than against the event. Inside the TTL the exact list is complete, so
+// the list answers: the application's insert is shown and the copy-up's is not.
+// Measured on 2026-09-30, an order deleted through a second router while a
+// warm was moving it: the order's insert missing from a stream read from before
+// it, 6 of 6.
+func TestAnInsertBeforeARecentPromotionIsShown(t *testing.T) {
+	promotedAt := time.Now().Add(-2 * time.Second)
+	echo := bson.Timestamp{T: 1002, I: 4}
+	own := bson.Timestamp{T: 1000, I: 1}
+	recent := time.Now().Add(-promotionWindow)
+	rec := promotion{at: promotedAt, echoed: []bson.Timestamp{echo}}
+	promoted := map[string]promotion{"shop.orders|x": rec}
+
+	if isPromotion(promoted, "shop.orders|x", promotedAt.Add(-1500*time.Millisecond), own, recent) {
+		t.Error("the application's insert from before the promotion was hidden")
+	}
+	if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(20*time.Millisecond), echo, recent) {
+		t.Error("the copy-up's own insert was delivered as the application's")
+	}
+
+	// The floor still decides wherever the list may be short.
+	for name, p := range map[string]promotion{
+		"withdrawn": {at: promotedAt, echoed: []bson.Timestamp{echo}, uncertain: true},
+		"no list":   {at: promotedAt},
+	} {
+		promoted := map[string]promotion{"shop.orders|x": p}
+		if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(-1500*time.Millisecond), own, recent) {
+			t.Errorf("%s: an insert the list cannot account for was let through inside the window", name)
+		}
+	}
+	// And so does a record the TTL may have cleared between two promotions: an
+	// insert older than the TTL before this one could be an echo it forgot.
+	if !isPromotion(promoted, "shop.orders|x", promotedAt.Add(-2*time.Hour), own, recent) {
+		t.Error("an insert older than a record's lifetime was let through inside the window")
+	}
+}
+
+// An insert the feeder recorded as an echo is a promotion even when the record
+// ended before it by the clocks. Wall times do not follow the oplog at this
+// scale: a copy-up committed as a transaction carried 25.242 and the delete
+// after it 25.220.
+func TestARecordedEchoIsHiddenWhateverTheClocksSay(t *testing.T) {
+	echo := bson.Timestamp{T: 1790789725, I: 2}
+	promotedAt := time.Now().Add(-2 * time.Second)
+	ended := promotedAt.Add(150 * time.Millisecond)
+	promoted := map[string]promotion{"shop.orders|x": {at: promotedAt, ended: ended, echoed: []bson.Timestamp{echo}}}
+	if !isPromotion(promoted, "shop.orders|x", ended.Add(18*time.Millisecond), echo, time.Now().Add(-promotionWindow)) {
+		t.Error("a copy-up the feeder recorded was shown as an insert because its wall time fell after the record's end")
+	}
+}

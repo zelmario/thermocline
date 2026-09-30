@@ -777,10 +777,42 @@ This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 a
   insert only narrows it. The direction: after inserting, wait for mirroring to
   reach the insert's time, re-read the archive for the ids copied, and remove
   from the fast tier any that are now tombstoned, hidden from change streams as
-  tiering work. Not reproduced on its own yet: the plan is a customer with
-  thousands of archived orders, so the warm's read-to-insert gap is long, and a
-  delete of a recent order through the second router inside it. Logs kept in
-  ~/thermocline-keep/2026-09-29-shared2h on this box.
+  tiering work. Logs kept in ~/thermocline-keep/2026-09-29-shared2h on this
+  box.
+
+  **Reproduced and fixed on 2026-09-30.** A customer with 3,000 orders held
+  only by the archive, a transaction through one router counting them, and a
+  recent order deleted through the other router while it ran: 12 of 12 rounds
+  put the order back, stale_reads 0 each time, and the window was about 1.6s
+  wide. The fix is in the feeder rather than the router, because the feeder is
+  the one process that sees the delete and the copy-up's insert in the fast
+  tier's own order. A copy-up only reads documents the archive holds live, so
+  an echo whose archived copy is tombstoned once the flush has landed is a
+  resurrection by construction. The feeder removes it from the fast tier,
+  announced as an eviction so change streams hide it, and counts it as
+  `resurrections_undone`. It covers every copy-up, the warmer's included.
+  After: 0 of 12, then 0 of 6 with the recent order and 0 of 6 with an
+  archive-only one.
+
+  Attacking that fix found a second defect beside it, older and broader. A
+  copy-up recorded a promotion for every document it matched, including those
+  the fast tier already held and the insert then skipped, and the change
+  stream sieve hides any insert of a document promoted in the last 30s. An
+  order placed through the router and passed over by its customer's warm a
+  moment later was missing from a stream read from before it, 4 of 4, with no
+  delete anywhere. Copy-ups now ask the fast tier first and only hold what it
+  already has: 0 of 4.
+
+  With both, the deleted order's own stream still showed only the delete, and
+  once a phantom insert after it. The sieve now asks the feeder's exact list of
+  echo positions before any clock, and defers to it inside its thirty second
+  window where the list is complete: 12 of 12 rounds showed exactly insert,
+  delete. Attacking the repair also found the evictor's own withdrawal was a
+  no-op, a function named for consuming notices that only read them, which left
+  an announcement standing for an hour for a document it never evicted.
+
+  Open until both sweeps and a 2h `shared.sh` run are clean. What is left
+  inside the race itself is written in `docs/limitations.md`.
 
 ## What 2026-09-21 added that an operator has to do
 

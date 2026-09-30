@@ -894,6 +894,38 @@ Part of [Thermocline](../README.md).
   refused. The two paths disagree about one question and one of them is wrong,
   which is not yet settled and is recorded here rather than claimed.
 
+- **A document deleted while a copy-up is moving it comes back for a few
+  milliseconds.** A copy-up reads the archive and then inserts, and a delete
+  landing in between, from another connection or another router, is undone by
+  the insert. The feeder sees the two in the fast tier's order and removes the
+  document again, counted as `resurrections_undone`, so what is left is the time
+  between the insert and the feeder's next flush. A read in that time answers
+  the deleted document.
+
+  Measured on 2026-09-30, a transaction warming 3,000 of one customer's orders
+  through one router while a recent order was deleted through the other:
+
+  ```
+                                    before     after
+  order back on the fast tier        12/12      0/12
+  stream shows insert, delete         0/6      12/12
+  ```
+
+  The stream row took three changes, because the race met the change stream
+  sieve in two places. A copy-up recorded a promotion for documents it only
+  passed over, and the sieve's thirty second window then hid the application's
+  own earlier insert; and wall times do not follow the oplog at millisecond
+  scale, so the copy-up's insert could read as coming after the application's
+  delete had ended the record. A consumer that reads the application's insert
+  while the copy-up's echo is still unspent, the first second or so of the
+  copy-up, is still not shown it.
+
+  One more case the repair leaves alone on purpose: a write that changes the
+  resurrected document before the feeder gets to it makes it the application's,
+  because the repair removes only the exact document the copy-up inserted. That
+  write can only be one that matched a document the application had deleted,
+  and it is mirrored live to both tiers.
+
 - **A cluster-wide `defaultMaxTimeMS` bounds the fast reads and not the slow
   ones.** MongoDB 8.0 caps a read that names no `maxTimeMS` of its own with the
   `defaultMaxTimeMS` cluster parameter, and an account holding
