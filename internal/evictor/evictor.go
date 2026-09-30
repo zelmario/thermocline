@@ -1204,7 +1204,7 @@ func (e *Evictor) dropHeldAfterAnnouncing(ctx context.Context, ns string, presen
 		}
 		keep = append(keep, d)
 	}
-	if _, err := meta.ConsumeEvictionNotices(ctx, e.cold, back); err != nil {
+	if err := meta.WithdrawEviction(ctx, e.cold, back); err != nil {
 		return nil, fmt.Errorf("withdraw announcements for documents held since: %w", err)
 	}
 	e.log.Info("not evicting documents a hold was placed on while the batch was announced",

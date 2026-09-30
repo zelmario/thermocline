@@ -389,3 +389,72 @@ func TestEvictionTakesADocumentNearTheLimit(t *testing.T) {
 		t.Errorf("a 15MB document identical on both tiers was not evicted: removed %d", removed)
 	}
 }
+
+// A document a hold was placed on between the scan and the announcement is left
+// on the fast tier, and its announcement has to go with it.
+//
+// dropHeldAfterAnnouncing took it back by calling what was then named
+// ConsumeEvictionNotices, which
+// only reads the counts: the announcement stood for up to an hour with no
+// eviction coming to answer it, and the application deleting that document in
+// that hour would be read by the feeder as the eviction. The archive keeps the
+// document live and the router answers it again.
+func TestHeldAfterAnnouncingTakesTheAnnouncementBack(t *testing.T) {
+	uri := os.Getenv("TC_TEST_COLD")
+	if uri == "" {
+		t.Skip("set TC_TEST_COLD to a tier URI to run the withdraw test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cl.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_heldwithdraw.docs"
+	residency := cl.Database(meta.DB).Collection(meta.Residency)
+	notices := cl.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_, _ = residency.DeleteMany(c, bson.D{{Key: "ns", Value: ns}})
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+
+	id := bson.NewObjectID()
+	raw := rawIDValue(t, id)
+	c := candidate{id: raw, docID: meta.DocID(ns, raw)}
+	if _, err := residency.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: c.docID}, {Key: "ns", Value: ns}, {Key: "doc", Value: id},
+		{Key: "hotUntil", Value: time.Now().UTC().Add(2 * time.Minute)},
+		{Key: "expiresAt", Value: time.Now().UTC().Add(time.Hour)},
+	}); err != nil {
+		t.Fatalf("residency: %v", err)
+	}
+	if err := meta.AnnounceEviction(ctx, cl, []string{c.docID}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+
+	e := &Evictor{
+		hot:  cl,
+		cold: cl,
+		cfg:  config.EvictorConfig{FeederID: "test"},
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	left, err := e.dropHeldAfterAnnouncing(ctx, ns, []candidate{c})
+	if err != nil {
+		t.Fatalf("dropHeldAfterAnnouncing: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("a held document was kept in the batch: %d left", len(left))
+	}
+	have, err := meta.ReadEvictionNotices(ctx, cl, []string{c.docID})
+	if err != nil {
+		t.Fatalf("read notices: %v", err)
+	}
+	if have[c.docID] != 0 {
+		t.Errorf("the announcement for a document left on the fast tier still stands at %d; "+
+			"the application's next delete of it would be read as an eviction", have[c.docID])
+	}
+}

@@ -376,7 +376,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// A count rather than a flag, because a document can be evicted, warmed back
 	// up and evicted again inside one batch, and the second delete is as
 	// announced as the first.
-	announced, err := meta.ConsumeEvictionNotices(ctx, f.cold, ids)
+	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids)
 	if err != nil {
 		return err
 	}

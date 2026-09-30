@@ -165,7 +165,7 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
-	have, err := ConsumeEvictionNotices(ctx, c, []string{noticeID})
+	have, err := ReadEvictionNotices(ctx, c, []string{noticeID})
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
-	have, _ = ConsumeEvictionNotices(ctx, c, []string{noticeID})
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID})
 	if have[noticeID] != 0 {
 		t.Errorf("the announcement survived being spent, so the next delete of this "+
 			"document would be read as an eviction: %d left", have[noticeID])
@@ -197,7 +197,7 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 			t.Fatalf("announce: %v", err)
 		}
 	}
-	have, _ := ConsumeEvictionNotices(ctx, c, []string{noticeID})
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID})
 	if have[noticeID] != 2 {
 		t.Fatalf("announced twice, the feeder sees %d", have[noticeID])
 	}
@@ -206,7 +206,7 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
-	have, _ = ConsumeEvictionNotices(ctx, c, []string{noticeID})
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID})
 	if have[noticeID] != 1 {
 		t.Errorf("one of two spent leaves %d, so the second delete would be tombstoned",
 			have[noticeID])
@@ -225,7 +225,7 @@ func TestNoticeWithoutACountIsWorthOne(t *testing.T) {
 		bson.D{{Key: "_id", Value: noticeID}, {Key: "at", Value: time.Now().UTC()}}); err != nil {
 		t.Fatalf("insert an old-style notice: %v", err)
 	}
-	have, _ := ConsumeEvictionNotices(ctx, c, []string{noticeID})
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID})
 	if have[noticeID] != 1 {
 		t.Errorf("a notice written before the count existed is worth %d, want 1", have[noticeID])
 	}

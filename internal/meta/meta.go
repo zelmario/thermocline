@@ -780,6 +780,51 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 	return nil
 }
 
+// WithdrawEviction takes back one announcement per document, for a removal that
+// was announced and then found nothing to remove.
+//
+// Only by the process that announced it and only once it knows its own delete
+// matched nothing, so no delete event is coming for the announcement to answer.
+// Anything less exact is the trade AnnounceEviction describes, and there the
+// announcement is left standing.
+//
+// Floored at zero for the reason SpendEvictionNotices gives.
+func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	_, err := cold.Database(DB).Collection(Evicting).UpdateMany(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		mongo.Pipeline{{{Key: "$set", Value: bson.D{
+			{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
+				0,
+				bson.D{{Key: "$add", Value: bson.A{
+					bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 1}}}, -1,
+				}}},
+			}}}},
+		}}}})
+	if err != nil {
+		return fmt.Errorf("withdraw eviction announcement: %w", err)
+	}
+	// A row this left with nothing pending and nothing spent answers for no
+	// delete, and it is not harmless: the router's sieve reads a notice with no
+	// spent positions by the old window, so any delete of the document in the
+	// next thirty seconds was hidden as an eviction. Removed in the same
+	// breath, and only in that state, so a row another announcement or a spent
+	// eviction still stands on is left alone.
+	if _, err := cold.Database(DB).Collection(Evicting).DeleteMany(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}},
+		{Key: "pending", Value: bson.D{{Key: "$lte", Value: 0}}},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "spent", Value: bson.D{{Key: "$exists", Value: false}}}},
+			bson.D{{Key: "spent", Value: bson.D{{Key: "$size", Value: 0}}}},
+		}},
+	}); err != nil {
+		return fmt.Errorf("remove an empty eviction notice: %w", err)
+	}
+	return nil
+}
+
 // EvictionAnnouncement is the write that announces one eviction: another one
 // pending, and the row's life restarted.
 //
@@ -817,10 +862,19 @@ func EvictionAnnouncement() mongo.Pipeline {
 	}
 }
 
-// ConsumeEvictionNotices takes one announcement down for each document whose
-// eviction the feeder has just applied, and removes the notice when none is
-// left. It reports which of docIDs had an announcement to take.
-func ConsumeEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string) (map[string]int, error) {
+// ReadEvictionNotices reports how many announcements each of docIDs has left to
+// claim. It writes nothing: the feeder decides in event order which deletes
+// they answer for and spends them with SpendEvictionNotices once the checkpoint
+// covers those deletes, and a process taking back its own announcement uses
+// WithdrawEviction.
+//
+// It was called ConsumeEvictionNotices and its comment said it took one down,
+// which it had stopped doing when spending moved to the checkpoint. The evictor
+// believed the name: it called this to take back the announcements for
+// documents it then left on the fast tier, and each stood for up to an hour,
+// ready to make the application's next delete of that document read as an
+// eviction.
+func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string) (map[string]int, error) {
 	if len(docIDs) == 0 {
 		return nil, nil
 	}
@@ -927,7 +981,7 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 	// happened. A client that is behind, which is what any client resuming from
 	// a stored token is, then saw a delete for a document the archive still
 	// holds. The notice now lives out its TTL and the feeder ignores it once
-	// spent; see ConsumeEvictionNotices and the sieve in the router.
+	// spent; see ReadEvictionNotices and the sieve in the router.
 	return nil
 }
 
