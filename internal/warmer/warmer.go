@@ -630,10 +630,12 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	for i, d := range docs {
 		ids[i] = d.id
 	}
+	asked := false
 	if have, herr := promote.Held(ctx, hot, ids); herr != nil {
 		w.log.Debug("could not ask the fast tier which documents it holds, warming all of them",
 			"ns", ns, "err", herr)
 	} else {
+		asked = true
 		var present []sourceDoc
 		absent := make([]sourceDoc, 0, len(docs))
 		for i, d := range docs {
@@ -676,7 +678,7 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	// years-old document was just created. Recording first for a warm that then
 	// fails costs nothing: residency for a document that is not there protects
 	// nothing.
-	if err := w.recordResidency(ctx, ns, docs); err != nil {
+	if err := w.recordResidency(ctx, ns, docs, asked); err != nil {
 		return 0, err
 	}
 
@@ -740,13 +742,20 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 // record the archive may have held for years, and the warmer's whole job is
 // moving documents in bulk. meta.ResidencyUpdate writes what the router's own
 // copy-up writes, so both are recognised the same way.
-func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDoc) error {
+//
+// asked says the fast tier was asked and held none of docs, so each is a
+// promotion for certain. See meta.PromotionUpdate.
+func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDoc, asked bool) error {
 	now := time.Now().UTC()
+	update := meta.ResidencyUpdate
+	if asked {
+		update = meta.PromotionUpdate
+	}
 	models := make([]mongo.WriteModel, len(docs))
 	for i, d := range docs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, d.id)}}).
-			SetUpdate(meta.ResidencyUpdate(ns, d.id, now, w.cfg.Residency.D())).
+			SetUpdate(update(ns, d.id, now, w.cfg.Residency.D())).
 			SetUpsert(true)
 	}
 	_, err := w.cold.Database(meta.DB).Collection(meta.Residency).

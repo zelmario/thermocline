@@ -811,6 +811,14 @@ This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 a
   no-op, a function named for consuming notices that only read them, which left
   an announcement standing for an hour for a document it never evicted.
 
+  The first 2h `shared.sh` on those fixes, 801084c, found a regression in
+  them: seven orders reported placed that nobody placed, both applications,
+  by 1h15m. The hold a copy-up now gives a document the fast tier already has
+  kept a record's hold running with no promotion behind it, and the next
+  copy-up after an eviction read the running hold as a promotion in progress
+  and announced nothing. A copy-up that asked the fast tier now always opens a
+  promotion: 5 of 5 phantoms on 801084c, 0 of 5 on e4c78e7 and after.
+
   Open until both sweeps and a 2h `shared.sh` run are clean. What is left
   inside the race itself is written in `docs/limitations.md`.
 

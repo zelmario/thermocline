@@ -65,11 +65,25 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	// application is told a two year old document was just created. Recording
 	// first for a copy-up that then fails costs nothing: a residency record for
 	// a document that is not there protects nothing.
-	if err := r.recordResidency(ctx, ns, id); err != nil {
+	db, coll := splitNS(ns)
+
+	// Asked here too, for the reasons copyUpMatching asks: a document the fast
+	// tier already holds is held and nothing more, and one it does not hold is
+	// a promotion without any guessing. See promote.Held and meta.PromotionUpdate.
+	asked := false
+	if have, herr := promote.Held(ctx, r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil {
+		asked = true
+		if have[0] {
+			if werr := r.holdOnlyMany(ctx, ns, []bson.RawValue{id}); werr != nil {
+				r.log.Warn("could not hold a document the fast tier already has against eviction", "ns", ns, "err", werr)
+			}
+			return true, nil
+		}
+	}
+	if err := r.recordResidency(ctx, ns, id, asked); err != nil {
 		r.log.Warn("could not record residency before copying up", "ns", ns, "err", err)
 	}
 
-	db, coll := splitNS(ns)
 	// Before the insert, because an insert is what creates the collection when
 	// the fast tier does not hold it, and a collection created that way carries
 	// none of the archive's options. A default collation decides which documents
@@ -131,11 +145,14 @@ func (r *Router) copyUpAsync(ns string, id bson.RawValue) {
 // recordResidency keeps a copied-up document in the fast tier for a while.
 // Without it the next eviction sweep removes what was just fetched, and the
 // next read pays for the archive again.
-func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValue) error {
+//
+// asked says the fast tier was asked and did not hold the document, so this is
+// a promotion for certain. See meta.PromotionUpdate.
+func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValue, asked bool) error {
 	now := time.Now().UTC()
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: meta.DocID(ns, id)}},
-		meta.ResidencyUpdate(ns, id, now, r.cfg.Residency.D()),
+		residencyFor(ns, id, now, r.cfg.Residency.D(), asked),
 		options.UpdateOne().SetUpsert(true))
 	return err
 }
@@ -149,7 +166,7 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 // and the 200 residency holds were most of it.
 //
 // The warmer has done it this way all along; this is the same shape.
-func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.RawValue) error {
+func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.RawValue, asked bool) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -158,7 +175,7 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	for _, id := range ids {
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(meta.ResidencyUpdate(ns, id, now, r.cfg.Residency.D())).
+			SetUpdate(residencyFor(ns, id, now, r.cfg.Residency.D(), asked)).
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written
@@ -166,6 +183,15 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).
 		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	return err
+}
+
+// residencyFor is the promotion record for a copy-up: certain when the fast
+// tier was asked, and guessed from the record when it could not be.
+func residencyFor(ns string, id bson.RawValue, now time.Time, hold time.Duration, asked bool) mongo.Pipeline {
+	if asked {
+		return meta.PromotionUpdate(ns, id, now, hold)
+	}
+	return meta.ResidencyUpdate(ns, id, now, hold)
 }
 
 // holdOnlyMany keeps documents the fast tier already holds there for a while,

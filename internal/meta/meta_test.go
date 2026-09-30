@@ -544,3 +544,71 @@ func TestTheEvictionCounterCannotStrandADocument(t *testing.T) {
 			"one eviction is pending", arms[0])
 	}
 }
+
+// A copy-up that asked the fast tier opens a promotion whatever the record says.
+//
+// The record here is the one the two-router shop left behind: a promotion two
+// minutes old with its echo spent, and a hold that a hold-only refresh kept
+// running after the evictor had taken the document. ResidencyUpdate reads the
+// running hold as a promotion still in progress and opens nothing, so the next
+// copy-up's insert had no echo and reached both applications as a new order.
+func TestAPromotionThatAskedAlwaysOpens(t *testing.T) {
+	c, done := testCold(t)
+	defer done()
+	ctx := context.Background()
+	coll := c.Database(DB).Collection(Residency)
+	const id = "tctest.promo|0700"
+	t.Cleanup(func() { _, _ = coll.DeleteOne(context.Background(), bson.D{{Key: "_id", Value: id}}) })
+
+	old := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Millisecond)
+	seed := func() {
+		_, _ = coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
+		if _, err := coll.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: id}, {Key: "promotedAt", Value: old},
+			{Key: "hotUntil", Value: time.Now().UTC().Add(time.Minute)},
+			{Key: "echoed", Value: bson.A{bson.Timestamp{T: 1000, I: 1}}},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	read := func() (time.Time, bool, int) {
+		var rec struct {
+			PromotedAt time.Time        `bson:"promotedAt"`
+			Pending    bool             `bson:"echoPending"`
+			Echoed     []bson.Timestamp `bson:"echoed"`
+		}
+		if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&rec); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return rec.PromotedAt, rec.Pending, len(rec.Echoed)
+	}
+	idv := bson.RawValue{Type: bson.TypeString, Value: bsoncoreString("x")}
+	now := time.Now().UTC()
+
+	seed()
+	if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, ResidencyUpdate("tctest.promo", idv, now, time.Minute)); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if at, pending, _ := read(); !at.Equal(old) || pending {
+		t.Fatalf("the guess changed: promotedAt %v pending %v; this test no longer shows what it was written for", at, pending)
+	}
+
+	seed()
+	if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, PromotionUpdate("tctest.promo", idv, now, time.Minute)); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	at, pending, echoed := read()
+	if at.Equal(old) || !pending {
+		t.Errorf("a copy-up that asked opened no promotion: promotedAt %v, echoPending %v", at, pending)
+	}
+	if echoed != 1 {
+		t.Errorf("the record's earlier echo positions went: %d left", echoed)
+	}
+}
+
+func bsoncoreString(s string) []byte {
+	b := make([]byte, 4, 5+len(s))
+	n := len(s) + 1
+	b[0], b[1], b[2], b[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	return append(append(b, s...), 0)
+}

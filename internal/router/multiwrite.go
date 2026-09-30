@@ -422,10 +422,12 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// more: no promotion recorded and no insert. See promote.Held for the
 		// two wrong answers each of those gave. A fast tier that cannot be
 		// asked leaves the batch whole, which is how this ran before.
+		asked := false
 		if have, herr := promote.Held(ctx, hot, raw); herr != nil {
 			r.log.Debug("could not ask the fast tier which documents it holds, copying all of them",
 				"ns", ns, "err", herr)
 		} else {
+			asked = true
 			var present []bson.RawValue
 			keep := 0
 			for i := range docs {
@@ -450,7 +452,7 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// Residency first, for the same reason copyUp does it first: these
 		// writes are what a client's change stream sees, and it must be able
 		// to tell a promotion from an insert the moment the event arrives.
-		if rerr := r.recordResidencyMany(ctx, ns, raw); rerr != nil {
+		if rerr := r.recordResidencyMany(ctx, ns, raw, asked); rerr != nil {
 			r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
 		}
 

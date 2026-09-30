@@ -498,6 +498,29 @@ func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 		bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
 		bson.D{{Key: "$lte", Value: bson.A{"$hotUntil", "$$NOW"}}},
 	}}}
+	return residencyPipeline(ns, id, now, hold, reopening)
+}
+
+// PromotionUpdate is ResidencyUpdate for a copy-up that knows the fast tier did
+// not hold the document when asked: it always opens a new promotion.
+//
+// The guess above reads the record's state for whether the document is on the
+// fast tier, and one of its inputs stopped meaning what it assumed. A running
+// hold used to mean a promotion was in progress, because only a promotion
+// placed one on a copied document. Since copy-ups ask the fast tier first, a
+// document it already holds gets a hold and nothing else, so a hold can run
+// with no promotion behind it. The evictor then took the document after the
+// hold it was chosen under had lapsed, left the refreshed one running as it
+// should, and the next copy-up found a running hold, opened nothing, and its
+// insert reached both applications in the two-router shop as an order nobody
+// placed: five in an hour on 2026-09-30, each with the record's promotion two
+// minutes older than the insert and no echo pending. A copy-up that asked
+// knows; it does not need to guess.
+func PromotionUpdate(ns string, id bson.RawValue, now time.Time, hold time.Duration) mongo.Pipeline {
+	return residencyPipeline(ns, id, now, hold, true)
+}
+
+func residencyPipeline(ns string, id bson.RawValue, now time.Time, hold time.Duration, reopening any) mongo.Pipeline {
 	return mongo.Pipeline{
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "ns", Value: ns},
