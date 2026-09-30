@@ -118,6 +118,7 @@ The feeder publishes its counters the way the evictor and the warmer do, under
     outcome="tombstoned"             documents marked deleted there
     outcome="unmirrorable"           documents the archive refused and this gave up on
     outcome="inserts_over_existing"  inserts mirrored onto an _id the archive already held
+    outcome="resurrections_undone"   copy-ups that put back a deleted document, removed again
 
 `unmirrorable` has a rule below and should be zero: each one is a document the
 archive will never hold while the fast tier does, so the evictor will never
@@ -133,6 +134,19 @@ On one write made straight at the fast tier: one. On a delete and re-insert of
 the same `_id` through the router: also one. So it is a number to go and look at
 rather than one to be woken by, and a deployment where it climbs without anybody
 reusing `_id`s has a writer that is not going through the router.
+
+`resurrections_undone` counts a race the feeder repairs rather than a fault to
+act on. A copy-up reads the archive and then inserts, and a delete landing in
+between, often from another router, is undone by the insert: the fast tier held
+the deleted document live, and the router answered it, until 2026-09-30. The
+feeder sees the delete and the copy-up's insert in the fast tier's own order, so
+it removes the document again and says so in its log. Measured with a
+transaction warming 3,000 orders while one of them was deleted through a second
+router: 12 of 12 rounds put it back before, and every one was removed after. A
+steady trickle is expected on a deployment that deletes documents a warm or a
+write is copying up. What each one leaves is a few milliseconds in which the
+router answers the deleted document, so a rate that climbs with traffic says
+those windows are adding up.
 
 
 ### What to alert on

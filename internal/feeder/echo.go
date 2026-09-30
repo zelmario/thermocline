@@ -133,6 +133,7 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 		id := meta.DocID(op.ns, op.id)
 		if _, ok := claimed[id]; ok {
 			delete(claimed, id)
+			f.echoes = append(f.echoes, op)
 			f.pending[i].kind = actionSkip
 			dropped++
 		}
@@ -292,6 +293,7 @@ func (f *Feeder) suppressPromotionEchoes(ctx context.Context) (int, error) {
 			id := meta.DocID(op.ns, op.id)
 			if _, ok := claimed[id]; ok {
 				delete(claimed, id)
+				f.echoes = append(f.echoes, op)
 				dropped++
 				continue
 			}

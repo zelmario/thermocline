@@ -75,6 +75,13 @@ type Feeder struct {
 	// buffered work, flushed together
 	pending []pendingOp
 
+	// echoes are the inserts this flush suppressed as this system's own
+	// copy-ups, kept so the flush can ask afterwards whether any of them put
+	// back a document the application had deleted. unresurrected carries the
+	// ones a repair failed on into the next flush. See undoResurrections.
+	echoes        []pendingOp
+	unresurrected []pendingOp
+
 	// How far this host's clock is ahead of the archive's, as last measured,
 	// and when that was. Published with the position: see clockSkew.
 	skew      time.Duration
@@ -285,6 +292,10 @@ type feederCounters struct {
 	// the router: also one, which is why this is a number to look at rather
 	// than a warning to act on.
 	insertsOverExisting int64
+	// resurrectionsUndone counts copy-ups that put back a document the
+	// application had deleted, and that this feeder removed again. See
+	// undoResurrections.
+	resurrectionsUndone int64
 }
 
 type pendingOp struct {

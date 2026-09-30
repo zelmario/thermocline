@@ -178,6 +178,7 @@ func (f *Feeder) flush(ctx context.Context) error {
 	// they are asked once per flush rather than once per event. See reportRate:
 	// this is where the split says the time is going.
 	askedFrom := time.Now()
+	f.echoes = f.echoes[:0]
 	if err := f.resolveDeletes(ctx); err != nil {
 		return err
 	}
@@ -274,6 +275,7 @@ func (f *Feeder) flush(ctx context.Context) error {
 	}
 
 	f.dropResidency(ctx, deleted)
+	f.undoResurrections(ctx, f.lastPositions())
 
 	f.pending = f.pending[:0]
 	f.pendingSince = time.Time{}
@@ -937,6 +939,7 @@ func (f *Feeder) publishCounters(ctx context.Context) {
 		"tombstoned":            f.counters.tombstoned,
 		"unmirrorable":          f.counters.unmirrorable,
 		"inserts_over_existing": f.counters.insertsOverExisting,
+		"resurrections_undone":  f.counters.resurrectionsUndone,
 	}
 	if err := meta.PublishDaemonReport(ctx, f.cold, "feeder:"+f.cfg.ID, false, counters, nil); err != nil {
 		f.log.Debug("could not publish feeder statistics", "err", err)
