@@ -313,15 +313,22 @@ open(wdir + '/evclaim.yaml', 'w').write(head + """evictor:
     min_oplog_window: 1m
 """ % db + tail)
 PY
-NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
-   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
 cline watermark --config $WDIR/evclaim.yaml --ns $DB.$CNS --complete-all >/dev/null 2>&1
 cline router --config $WDIR/evclaim.yaml --log-file $LOGDIR/evclaim_r.log >/dev/null 2>&1 & CRP=$!
 for _ in $(seq 1 30); do routerUp && break; sleep 1; done
 # The router reads once, which is what puts the claim in its cache.
 chkv "the router sees all four"                  "4" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.countDocuments({}))")"
+# A feeder that looks current, stamped here rather than before the router
+# starts. The feeder is stopped, so nothing freshens it, and the evictor pauses
+# for good once it is older than max_feeder_lag. Stamped before the router, a
+# router spending 21s on its startup checks under a four-worker sweep left it
+# 25s old when the evictor began, and the sweep paused and removed nothing:
+# this check failed on 2026-09-28 and again on 2026-09-30, both times with the
+# evictor saying mirroring was past its limit.
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
+   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
 cline evictor --config $WDIR/evclaim.yaml --once > $LOGDIR/evclaim_e.log 2>&1
 # Immediately, which is the whole point: no sleep between the sweep and this.
 chkv "and still sees all four straight afterwards" "4" \
