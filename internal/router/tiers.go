@@ -168,6 +168,27 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 	return err
 }
 
+// holdOnlyMany keeps documents the fast tier already holds there for a while,
+// and says nothing else about them. A copy-up for a write or a transaction
+// needs what it matched to stay until the statement runs, and the ones already
+// there were never copied, so there is no promotion to record. See
+// meta.HoldOnly.
+func (r *Router) holdOnlyMany(ctx context.Context, ns string, ids []bson.RawValue) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	models := make([]mongo.WriteModel, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
+			SetUpdate(meta.HoldOnly(ns, id, r.cfg.Residency.D())).
+			SetUpsert(true))
+	}
+	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	return err
+}
+
 // ensureTieredCollection gives the fast tier the collection the way the archive
 // has it, and builds its indexes when that created it.
 //

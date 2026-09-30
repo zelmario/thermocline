@@ -418,6 +418,35 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		if len(docs) == 0 {
 			return nil
 		}
+		// The documents the fast tier already holds are held there and nothing
+		// more: no promotion recorded and no insert. See promote.Held for the
+		// two wrong answers each of those gave. A fast tier that cannot be
+		// asked leaves the batch whole, which is how this ran before.
+		if have, herr := promote.Held(ctx, hot, raw); herr != nil {
+			r.log.Debug("could not ask the fast tier which documents it holds, copying all of them",
+				"ns", ns, "err", herr)
+		} else {
+			var present []bson.RawValue
+			keep := 0
+			for i := range docs {
+				if have[i] {
+					present = append(present, raw[i])
+					continue
+				}
+				docs[keep], ids[keep], raw[keep] = docs[i], ids[i], raw[i]
+				keep++
+			}
+			docs, ids, raw = docs[:keep], ids[:keep], raw[:keep]
+			if werr := r.holdOnlyMany(ctx, ns, present); werr != nil {
+				r.log.Warn("could not hold documents the fast tier already has against eviction",
+					"ns", ns, "count", len(present), "err", werr)
+			}
+		}
+		if len(docs) == 0 {
+			held = 0
+			return nil
+		}
+
 		// Residency first, for the same reason copyUp does it first: these
 		// writes are what a client's change stream sees, and it must be able
 		// to tell a promotion from an insert the moment the event arrives.

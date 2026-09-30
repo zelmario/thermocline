@@ -619,13 +619,46 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return len(docs), nil
 	}
 
+	db, coll := splitNS(ns)
+	hot := w.hot.Database(db).Collection(coll)
+
+	// The documents the fast tier already holds are held there and nothing more:
+	// no notice, no promotion recorded, no insert. See promote.Held for what
+	// each of those did to a document the warm never copied. A fast tier that
+	// cannot be asked leaves the batch whole, which is how this ran before.
+	ids := make([]bson.RawValue, len(docs))
+	for i, d := range docs {
+		ids[i] = d.id
+	}
+	if have, herr := promote.Held(ctx, hot, ids); herr != nil {
+		w.log.Debug("could not ask the fast tier which documents it holds, warming all of them",
+			"ns", ns, "err", herr)
+	} else {
+		var present []sourceDoc
+		absent := make([]sourceDoc, 0, len(docs))
+		for i, d := range docs {
+			if have[i] {
+				present = append(present, d)
+			} else {
+				absent = append(absent, d)
+			}
+		}
+		if err := w.holdOnly(ctx, ns, present); err != nil {
+			w.log.Warn("could not hold documents the fast tier already has against eviction",
+				"ns", ns, "count", len(present), "err", err)
+		}
+		docs = absent
+		if len(docs) == 0 {
+			return 0, nil
+		}
+	}
+
 	// Announce first, for the same reason the evictor does: the feeder must be
 	// able to recognise the resulting inserts before it sees them.
 	if err := w.announce(ctx, ns, docs); err != nil {
 		return 0, err
 	}
 
-	db, coll := splitNS(ns)
 	// An insert, never a replace. The fast tier is authoritative: if it already
 	// holds this document, its copy is the newer one and the archive's must not
 	// overwrite it, which a duplicate key achieves without rewriting the
@@ -647,7 +680,7 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 		return 0, err
 	}
 
-	inserted, skipped, err := promote.Many(ctx, w.hot.Database(db).Collection(coll), raw)
+	inserted, skipped, err := promote.Many(ctx, hot, raw)
 	if err != nil {
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
 	}
@@ -722,6 +755,24 @@ func (w *Warmer) recordResidency(ctx context.Context, ns string, docs []sourceDo
 		return fmt.Errorf("record residency for %s: %w", ns, err)
 	}
 	return nil
+}
+
+// holdOnly keeps documents the fast tier already holds there for as long as a
+// warmed one would stay, and records nothing else. See meta.HoldOnly.
+func (w *Warmer) holdOnly(ctx context.Context, ns string, docs []sourceDoc) error {
+	if len(docs) == 0 {
+		return nil
+	}
+	models := make([]mongo.WriteModel, len(docs))
+	for i, d := range docs {
+		models[i] = mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, d.id)}}).
+			SetUpdate(meta.HoldOnly(ns, d.id, w.cfg.Residency.D())).
+			SetUpsert(true)
+	}
+	_, err := w.cold.Database(meta.DB).Collection(meta.Residency).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	return err
 }
 
 // announce tells the feeder these inserts are coming, so it does not mirror

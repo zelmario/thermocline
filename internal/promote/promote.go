@@ -123,3 +123,56 @@ func duplicatePositions(err error) ([]int, bool) {
 }
 
 const duplicateKey = 11000
+
+// Held reports which of these _ids the fast tier already holds, position for
+// position.
+//
+// A copy-up asks before it records anything, because what it records is a
+// promotion: a residency record saying this system is about to put the document
+// on the fast tier, which a change stream reader takes as the reason an insert
+// of that _id is not the application's. Recorded for a document the fast tier
+// already held, no insert follows, and the record hides the application's own
+// earlier insert of it from any stream read in the next thirty seconds instead.
+// Measured on 2026-09-30: an order placed through the router, its customer's
+// orders warmed by a transaction a moment later, and the order's insert missing
+// from a stream read from before it, 4 of 4.
+//
+// And the insert is left out for those documents, which is the other half: a
+// document the fast tier held when asked is one the application may delete
+// before the insert runs, and inserting the archive's copy then puts back what
+// it deleted.
+//
+// Matched back by the _id's bytes. An _id the fast tier holds under a
+// different type or case compares equal to mongod and not here, so it is
+// reported absent and inserted, and the duplicate key then leaves it alone as
+// it always has.
+func Held(ctx context.Context, coll *mongo.Collection, ids []bson.RawValue) ([]bool, error) {
+	out := make([]bool, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	cur, err := coll.Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("ask the fast tier which documents it holds: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	have := map[string]bool{}
+	for cur.Next(ctx) {
+		if id, lerr := cur.Current.LookupErr("_id"); lerr == nil {
+			have[heldKey(id)] = true
+		}
+	}
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("ask the fast tier which documents it holds: %w", err)
+	}
+	for i, id := range ids {
+		out[i] = have[heldKey(id)]
+	}
+	return out, nil
+}
+
+func heldKey(id bson.RawValue) string {
+	return string(append([]byte{byte(id.Type)}, id.Value...))
+}
