@@ -641,7 +641,22 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 	if len(token) > 0 {
 		// StartAfter resumes past an invalidate, ResumeAfter does not.
 		opts.SetStartAfter(token)
-		f.log.Info("resuming from checkpoint", "id", f.cfg.ID)
+		// mongod reads its oplog forward to the token before the stream
+		// returns anything, so a checkpoint far behind is minutes of silence
+		// between this line and the next. Measured on 2026-10-02: 44 hours and
+		// 1,433,277 oplog entries (1.0GB) behind took 2m58s to open, and a test
+		// that inserted while it was opening judged a feeder that had not yet
+		// started. Saying how far there is to go is what tells an operator
+		// that silence from a stall. By this host's clock, rounded to the
+		// minute, which is all the comparison needs.
+		args := []any{"id", f.cfg.ID}
+		if at, ok, _ := f.cp.EventAt(ctx, f.cfg.ID); ok && !at.IsZero() {
+			if behind := time.Since(at); behind >= time.Minute {
+				args = append(args, "behind", behind.Round(time.Minute).String(),
+					"note", "the fast tier reads its oplog forward to this checkpoint before the first event, which takes minutes when it is hours behind on a busy tier")
+			}
+		}
+		f.log.Info("resuming from checkpoint", args...)
 	} else {
 		f.log.Warn("no checkpoint, mirroring from now on",
 			"id", f.cfg.ID,

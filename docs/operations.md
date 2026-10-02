@@ -328,6 +328,19 @@ when the host itself is gone. That is why the unit also sets
 ten seconds, and a feeder waiting out a lease is a feeder doing its job, not one
 failing.
 
+**A feeder that was stopped for hours can take minutes to start mirroring.** It
+resumes from its checkpoint, and mongod reads the fast tier's oplog forward to
+that point before the stream returns its first event. Measured on this
+project's test box: a checkpoint 44 hours and 1,433,277 oplog entries (1.0GB)
+behind took 2m58s to open, and 5m45s from the same point an hour later with the
+oplog's pages no longer in cache, against 0.08s for one a few minutes behind. Nothing
+is mirrored in between, so routers report mirroring as stopped and reads past
+`archive_wait` answer from the archive as stale. The startup line says
+`resuming from checkpoint` with `behind=` when the checkpoint is a minute or
+more old, and `mirroring` when the stream is open. Silence between those two is
+the oplog scan, not a hang. The takeover times above are for a standby, whose
+checkpoint the previous holder kept current.
+
 **The router's restart loop is the archive outage procedure.** A router refuses
 to start while the archive is unreachable, on purpose. `Restart=always` turns
 that into "it serves again as soon as the archive is back" rather than "somebody

@@ -235,8 +235,23 @@ ANS=tkrefdel
 docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').$ANS.drop()" >/dev/null 2>&1
 docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.drop(); db.getSiblingDB('_thermocline').unmirrored.deleteMany({})" >/dev/null 2>&1
 docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').$ANS.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null 2>&1
+# The log is appended to across runs, so only lines after this start count.
+FLOGAT=$(docker exec $NODE sh -c 'wc -l < /var/log/cline/alerts_f.log 2>/dev/null || echo 0')
 docker exec -d $NODE cline feeder --config $CFG --log-file /var/log/cline/alerts_f.log
-sleep 4
+# Waited on until the stream is open, not slept. The feeder resumes from the
+# shared `test` checkpoint, which a host sweep last moved hours ago, and mongod
+# reads the oplog forward to it before the first event: 2m58s on 2026-10-02,
+# 44 hours and 1.4 million entries behind, 5m45s an hour later with the oplog
+# pages cold, 0.08s when this suite runs alone.
+# Inserting before that and giving the router two minutes judged a feeder that
+# had not started, and failed the gauge and the counter checks in two host
+# sweeps out of three while passing every time alone.
+for _ in $(seq 1 300); do
+  docker exec $NODE sh -c "tail -n +$((FLOGAT+1)) /var/log/cline/alerts_f.log" | grep -q 'msg=mirroring' && break
+  sleep 3
+done
+docker exec $NODE sh -c "tail -n +$((FLOGAT+1)) /var/log/cline/alerts_f.log" | grep -q 'msg=mirroring' \
+  || echo "      (the feeder never opened its stream in 15 minutes; the checks below judge a feeder that is not mirroring)"
 # Prometheus has to have seen the counter at zero before the refusal, or the
 # counter rule below has nothing to fire on. increase() measures a rise between
 # two scrapes, and a series whose first scraped value is already 1 has none. The
