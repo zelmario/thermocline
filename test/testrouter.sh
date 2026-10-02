@@ -49,6 +49,13 @@ H() { mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 
 H 'db.getSiblingDB(process.env.TC_DB).tprobe_out.drop()' >/dev/null 2>&1
+# A router's startup report reads both catalogs, and under a four-worker sweep
+# that took 6.2s where this used to sleep 5: the check then failed on a refused
+# connection rather than on anything the router answered.
+waitListening() { for _ in $(seq 1 60); do
+    mongosh --port $1 -u dba -p secret --authenticationDatabase admin --quiet \
+      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0; sleep 0.5; done
+  echo "  WARN  the router on $1 never answered"; }
 echo "== setup: clean collections, feeder + router running =="
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"; sleep 2
 H 'db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tacct.drop()' >/dev/null
@@ -59,7 +66,11 @@ cline feeder --config $CFG --log-file $LOGDIR/f.log &
 FP=$!
 cline router --config $CFG --log-file $LOGDIR/r.log &
 RP=$!
-sleep 6
+# Waited on, not slept: the first router took 9.1s to listen in a sweep on
+# 2026-10-02 with swap in use, and the first check failed on a refused
+# connection after the six this used to sleep. The same fault as the strict
+# section's below, fixed there and not here.
+waitListening $PORT
 
 echo "== hello / handshake =="
 chk "presents as mongos (isdbgrid)" "isdbgrid" "$(R 'print(db.hello().msg)')"
@@ -296,7 +307,7 @@ chk "the archive does not have it"        "none" \
 # A router starting is what notices. Its own port, so the one this suite has been
 # using stays up for everything after this.
 cline router --config $CFG --listen 0.0.0.0:$P3 --log-file $LOGDIR/rv.log &
-VP=$!; sleep 6
+VP=$!; waitListening $P3
 chk "a router starting gives it to the archive" "view" \
     "$(C "const c=db.getSiblingDB(process.env.TC_DB).getCollectionInfos({name:'vstart'})[0]; print(c?c.type:'none')")"
 chk "and reads the same collection it did here" "$VNS" \
@@ -305,13 +316,6 @@ kill $VP 2>/dev/null; wait $VP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).vstart.drop()" >/dev/null
 
-# A router's startup report reads both catalogs, and under a four-worker sweep
-# that took 6.2s where this used to sleep 5: the check then failed on a refused
-# connection rather than on anything the router answered.
-waitListening() { for _ in $(seq 1 60); do
-    mongosh --port $1 -u dba -p secret --authenticationDatabase admin --quiet \
-      --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0; sleep 0.5; done
-  echo "  WARN  the router on $1 never answered"; }
 echo "== completeness: strict =="
 sed 's/completeness: archive/completeness: strict/' $CFG > $WDIR/strict.yaml
 cline router --config $WDIR/strict.yaml --listen 0.0.0.0:$P1 --log-file $LOGDIR/rs.log &

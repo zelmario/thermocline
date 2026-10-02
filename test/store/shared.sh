@@ -72,7 +72,7 @@ if [ -n "${TERMINATE_AUTH:-}" ]; then
   echo "  terminate_auth is on in both routers"
 fi
 docker cp bin/store "$NODE":/usr/local/bin/store >/dev/null
-N "for p in \$(pgrep -f 'config /root/share[d]'; pgrep -f 'shared_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
+N "for p in \$(pgrep -f 'config /root/share[d]'; pgrep -f 'shared_[c]hurn'; pgrep -f 'shared_[s]tepdown'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
 sleep 1
 for u in "$HOT" "$COLD"; do
   Q "$u" 'db.getSiblingDB("shopC").dropDatabase(); db.getSiblingDB("_thermocline_shared").dropDatabase()' >/dev/null
@@ -156,6 +156,25 @@ docker cp /tmp/shared_churn.sh "$NODE":/root/shared_churn.sh >/dev/null
 N "touch /root/shared_churn.run"
 ND "bash /root/shared_churn.sh"
 
+# A step-down of the fast tier's primary on a timer, for as long as the shop
+# runs. The failover defect of 2026-10-02 lived where an application's
+# connection pool meets an election: a driver's retry went out on a pooled
+# connection still authenticated against the old primary. No other harness put
+# a pool and a step-down together. STEPDOWN_EVERY=60s turns it on; each
+# step-down is logged in /root/sharedlog/stepdowns.log.
+if [ -n "${STEPDOWN_EVERY:-}" ]; then
+  cat > /tmp/shared_stepdown.sh <<SD
+while [ -f /root/shared_churn.run ]; do
+  sleep $(python3 -c "import re,sys; print(int(sum(float(n)*{'h':3600,'m':60,'s':1}[u] for n,u in re.findall(r'([0-9.]+)([hms])', sys.argv[1]))))" "$STEPDOWN_EVERY")
+  [ -f /root/shared_churn.run ] || break
+  echo "\$(date -u +%H:%M:%S.%3N) \$(mongosh '$HOT' --quiet --eval 'const p=db.hello().primary; try { db.adminCommand({replSetStepDown: 10}) } catch (e) {} print(p)' 2>&1 | tail -1)" >> /root/sharedlog/stepdowns.log
+done
+SD
+  docker cp /tmp/shared_stepdown.sh "$NODE":/root/shared_stepdown.sh >/dev/null
+  ND "bash /root/shared_stepdown.sh"
+  echo "  stepping the fast tier's primary down every $STEPDOWN_EVERY"
+fi
+
 echo "== two applications, one shop, two routers =="
 # One instant for both, so the history pageHistory scrolls is the same stable
 # slice for each of them.
@@ -194,6 +213,11 @@ for i in 0 1; do
   fi
 done
 
+if [ -n "${STEPDOWN_EVERY:-}" ]; then
+  echo "== step-downs =="
+  N "wc -l < /root/sharedlog/stepdowns.log; tail -3 /root/sharedlog/stepdowns.log"
+fi
+
 echo "== what the routers did =="
 for i in 1 2; do
   echo "-- router $i --"
@@ -204,10 +228,10 @@ import json,sys
 try: s=json.load(sys.stdin)
 except Exception: print('  no snapshot'); raise SystemExit
 c=s.get('counters',{})
-for k in ('commands','read_misses','write_misses','copied_up','from_archive','incomplete','refused','stale_reads','duplicate_keys','panics'):
+for k in ('commands','read_misses','write_misses','copied_up','from_archive','incomplete','refused','stale_reads','duplicate_keys','panics','failover_replays','failover_siblings_closed'):
     print('  %-16s %s' % (k, c.get(k)))
 " 2>/dev/null
 done
 
-N "rm -f /root/shared_churn.run; for p in \$(pgrep -f 'config /root/share[d]'; pgrep -f 'shared_[c]hurn'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
+N "rm -f /root/shared_churn.run; for p in \$(pgrep -f 'config /root/share[d]'; pgrep -f 'shared_[c]hurn'; pgrep -f 'shared_[s]tepdown'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1
 exit $rc
