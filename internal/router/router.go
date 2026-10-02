@@ -255,6 +255,10 @@ type Stats struct {
 	// primary underneath them. Any value above zero is an election the clients
 	// did not have to see.
 	FailoverReplays atomic.Int64
+	// FailoverSiblingsClosed counts idle client connections closed because the
+	// member their proxied upstream went to stopped being primary. See
+	// closeIdleSiblings.
+	FailoverSiblingsClosed atomic.Int64
 	// SecondaryReads counts reads that asked for a secondary and were sent to
 	// one. Together with PrimaryOnlyReads it says how much of the read load
 	// actually moved off the primary, which is the only way to tell the feature

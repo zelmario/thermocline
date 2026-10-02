@@ -243,6 +243,28 @@ trap 'unfreezeAll; cleanup' EXIT
 stopRouter
 H "db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$set:{v:200}})" >/dev/null
 startRouter $BASE
+# The client is connected before the primary goes away, the way an application
+# is, and waits for a signal to write. Connecting inside the window instead gave
+# it one connection, and one connection could never show what an application's
+# pool did: the driver's retry went out on a sibling connection still
+# authenticated against the old primary and was refused at once, 0 of 5 rounds
+# on 2026-10-02 against 5 of 5 straight to the set. The router now closes those
+# siblings while they are idle.
+#
+# And with the drivers' own 30 second server selection rather than mongosh's.
+# mongosh gives a single-host connection string 2 seconds for the whole session,
+# which is the router's case, and the drivers' 30 to a replica set string, which
+# is the direct case. An application has the 30 either way; at 2 the write fails
+# through the router and would through any one member alone.
+docker exec $NODE rm -f /root/fo_go
+( docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&retryWrites=true&serverSelectionTimeoutMS=30000" --quiet --eval "
+    const fs = require('fs');
+    db.getSiblingDB('shop').$NS.findOne({_id:1});
+    while (!fs.existsSync('/root/fo_go')) sleep(50);
+    try { const r = db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$inc:{v:1}}); print('matched='+r.matchedCount) }
+    catch (e) { print(e.name + ': ' + e.message) }" 2>&1 | tail -1 > /tmp/fo_np.out ) &
+NPCLIENT=$!
+sleep 4
 # Three goes at it. The section above has just moved the primary, so the first
 # read of who holds it can be a member that no longer does: the freeze then
 # skips the real primary and the stepDown is sent to a secondary, both are
@@ -269,8 +291,10 @@ case "$NOPRIM" in
     ( sleep $NOPRIMFOR; unfreezeAll ) &
     LIFTER=$!
     T0=$(date +%s%N)
-    NPOUT=$(RW "const r=db.getSiblingDB('shop').$NS.updateOne({_id:1},{\$inc:{v:1}}); print('matched='+r.matchedCount)")
+    docker exec $NODE touch /root/fo_go
+    wait $NPCLIENT
     T1=$(date +%s%N)
+    NPOUT=$(cat /tmp/fo_np.out)
     wait $LIFTER
     waitForPrimary
     echo "      no primary for ${NOPRIMFOR}s, the client waited $(( (T1-T0)/1000000 ))ms"
@@ -283,6 +307,8 @@ case "$NOPRIM" in
     ;;
   *)
     unfreezeAll
+    docker exec $NODE touch /root/fo_go
+    wait $NPCLIENT
     waitForPrimary
     echo "      SKIP  the window never opened, primary is $NOPRIM (2 checks)"
     ;;

@@ -73,6 +73,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("secondary_reads_total", "Reads that asked for a secondary and were sent to one. With primary_only_reads_total this says how much read load actually moved.", snap.Counters["secondary_reads"])
 	counter("secondary_reads_moved_total", "Reads a secondary refused as neither primary nor secondary, which the primary then answered. Above zero means a member is in the set but not readable.", snap.Counters["secondary_reads_moved"])
 	counter("failover_replays_total", "Commands re-sent after the fast tier changed primary. Each one is an election a client did not have to see.", snap.Counters["failover_replays"])
+	counter("failover_siblings_closed_total", "Idle client connections closed because the member they were authenticated against stopped being primary, so a driver's retry could not be sent on one.", snap.Counters["failover_siblings_closed"])
 	counter("primary_only_reads_total", "Reads that asked for a secondary and were served by the primary. Answers are correct and fresher than asked for; the read load stays on the primary.", snap.Counters["primary_only_reads"])
 	counter("unreadable_total", "Messages the router could not inspect, which are therefore unguarded. Compressed connections cause these; any value above zero needs the client's compressors removed.", snap.Counters["unreadable"])
 	counter("stale_reads_total", "Archive reads answered before mirroring caught up. Any of these is worth investigating.", snap.Counters["stale_reads"])

@@ -126,11 +126,58 @@ func (c *conn) endAfterFailover(ctx context.Context) {
 	if c.pooledPrimary() {
 		return
 	}
+	// Before anything is delivered, so the driver has seen them go by the time
+	// it retries. A driver's retry takes any connection from its pool, and
+	// through this router there is one server and so one pool: the retry went
+	// out on a sibling connection that was still authenticated against the
+	// member that had just refused, and was refused at once. Straight to the
+	// replica set that cannot happen, because the new primary is a different
+	// server with its own pool. Measured on 2026-10-02 with mongosh connected
+	// before the primary went away and the drivers' 30 second selection: 0 of
+	// 5 writes landed through the router, 5 of 5 straight to the set, and the
+	// router's log had the retry on a second client port never re-dialed.
+	c.r.closeIdleSiblings(c, c.upstreamMember())
 	// Wait for the re-resolution this refusal triggered rather than racing the
 	// client's reconnect to it. See awaitPrimaryProbe for what losing that race
 	// looks like.
 	c.r.awaitPrimaryProbe(ctx)
 	c.closeAfterReply = true
+}
+
+// closeIdleSiblings ends every other client connection whose own upstream goes
+// to member, while it is parked waiting for the client's next command.
+//
+// With authentication proxied such a connection can only ever be refused
+// again: it carries the client's identity to a member that is no longer
+// primary, and this router cannot move it. Closed while idle, a driver drops it
+// at checkout and opens a new one, whose handshake waits in dialPrimary for the
+// new primary. Left open, the next command on it is refused, and when that
+// command is a retry the application's write fails.
+//
+// One that is busy is left alone. Its command is already at the old member,
+// and its own reply takes it through endAfterFailover; cutting it here would
+// turn a clean refusal into a lost reply.
+func (r *Router) closeIdleSiblings(self *conn, member string) int {
+	if member == "" {
+		return 0
+	}
+	n := 0
+	r.connsMu.Lock()
+	for c := range r.conns {
+		if c == self || c.dialed != member || c.busy.Load() {
+			continue
+		}
+		_ = c.client.Close()
+		n++
+	}
+	r.connsMu.Unlock()
+	if n > 0 {
+		r.Stats.FailoverSiblingsClosed.Add(int64(n))
+		r.log.Info("closed idle client connections authenticated against a member that stopped being primary",
+			"member", member, "connections", n,
+			"why", "each would only be refused, and a driver's retry can be sent on any of them")
+	}
+	return n
 }
 
 // replayable reports whether a command can be sent again without the risk of

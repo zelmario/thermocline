@@ -534,11 +534,28 @@ Part of [Thermocline](../README.md).
   election the router holds a new connection's handshake until there is a
   primary, up to 20 seconds. Connected straight to the replica set the
   handshake needs no primary, because any member answers it, and only the
-  command waits. mongosh gives its first connection 2 seconds (its setting
-  after connecting is the driver's 30), so a new mongosh during a 12 second
-  election on a loaded box fails with "Server selection timed out after 2000
-  ms" through the router and would connect directly. An application whose
-  driver keeps the default 30 second server selection waits instead.
+  command waits. mongosh gives a single-host connection string 2 seconds of
+  server selection for the whole session, and a replica set string the
+  drivers' 30. The router is a single host, so a mongosh through it during a
+  12 second election fails with "Server selection timed out after 2000 ms" or
+  "not primary", where one given the set's own string waits. Measured on
+  2026-10-02 by reading the client's options: 2000 through the router, 30000
+  to the set. An application whose driver keeps the default 30 second server
+  selection waits instead, and so does a mongosh given
+  `serverSelectionTimeoutMS=30000`.
+
+  That was true only for a client holding one connection, until 2026-10-02. A
+  driver's retry takes any connection from its pool, and through the router
+  there is one server and so one pool: the retry went out on a sibling
+  connection still authenticated against the member that had just refused, and
+  was refused at once. Straight to the set it cannot, because the new primary is
+  another server with its own pool. With a client connected before the primary
+  went away and the drivers' 30 seconds: 0 of 5 writes landed through the
+  router, 5 of 5 straight to the set. The router now closes every idle client
+  connection authenticated against a member that refuses as not primary, before
+  it delivers the refusal, so the retry opens a new connection and waits for
+  the new primary: 5 of 5 after, each applied once. They are counted as
+  `thermocline_failover_siblings_closed_total`.
 
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
