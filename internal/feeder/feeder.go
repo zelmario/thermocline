@@ -687,6 +687,12 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 	defer func() { _ = stream.Close(context.WithoutCancel(ctx)) }()
 
 	f.log.Info("mirroring", "namespaces", f.namespaceDescription())
+	// Once here as well as on the checkpoint's cadence. That cadence needs an
+	// event, so a restarted feeder left the previous run's report in place and
+	// the router exported its counts as this run's until the first checkpoint:
+	// testalerts waited 60s for a counter at zero after the stream opened and
+	// read the last run's value throughout, on 2026-10-02.
+	f.publishCounters(ctx)
 
 	for {
 		if ctx.Err() != nil {
