@@ -1,0 +1,21 @@
+#cloud-config
+# The router, the daemons and the workload run here. Only the shell is
+# installed; cline is copied in by bootstrap.sh.
+write_files:
+  - path: /root/install-shell.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -y -q gnupg2 curl lsb-release jq
+      curl -fsSL -o /tmp/percona-release.deb https://repo.percona.com/apt/percona-release_latest.generic_all.deb
+      apt-get install -y -q /tmp/percona-release.deb
+      percona-release enable psmdb-80 release
+      apt-get update -q
+      apt-get install -y -q percona-mongodb-mongosh
+      mkdir -p /etc/thermocline /var/log/cline
+      echo "${psmdb_version}" > /root/PSMDB_WANTED
+runcmd:
+  - [bash, /root/install-shell.sh]

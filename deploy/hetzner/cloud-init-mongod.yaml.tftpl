@@ -1,0 +1,58 @@
+#cloud-config
+# One mongod, member of ${set}, listening on its private address and localhost.
+write_files:
+  - path: /etc/mongod.key
+    permissions: "0400"
+    content: ${keyfile}
+  - path: /etc/mongod.conf
+    permissions: "0644"
+    content: |
+      storage:
+        dbPath: /var/lib/mongodb
+      systemLog:
+        destination: file
+        path: /var/log/mongo/mongod.log
+        logAppend: true
+      net:
+        port: 27017
+        bindIp: 127.0.0.1,${private_ip}
+      replication:
+        replSetName: ${set}
+      security:
+        authorization: enabled
+        keyFile: /etc/mongod.key
+      processManagement:
+        fork: false
+  - path: /root/install-psmdb.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Installs exactly the wanted release, or stops and says so: the two
+      # tiers must run the same one, and "the latest" is not the same one on
+      # two days.
+      set -euo pipefail
+      WANT="${psmdb_version}"
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -y -q gnupg2 curl lsb-release
+      curl -fsSL -o /tmp/percona-release.deb https://repo.percona.com/apt/percona-release_latest.generic_all.deb
+      apt-get install -y -q /tmp/percona-release.deb
+      percona-release enable psmdb-80 release
+      apt-get update -q
+      PKG=$(apt-cache madison percona-server-mongodb | awk -v w="$WANT" '$3 ~ "^"w"\\." {print $3; exit}')
+      if [ -z "$PKG" ]; then
+        echo "percona-server-mongodb $WANT is not in the repository; available:" > /root/PSMDB_MISSING
+        apt-cache madison percona-server-mongodb >> /root/PSMDB_MISSING
+        exit 1
+      fi
+      apt-get install -y -q "percona-server-mongodb=$PKG" "percona-server-mongodb-server=$PKG" \
+        "percona-server-mongodb-mongos=$PKG" "percona-server-mongodb-tools=$PKG" percona-mongodb-mongosh
+      apt-mark hold percona-server-mongodb percona-server-mongodb-server percona-server-mongodb-mongos percona-server-mongodb-tools
+      mkdir -p /var/log/mongo
+      chown mongod:mongod /etc/mongod.key /var/log/mongo
+      systemctl enable mongod
+      systemctl restart mongod
+      echo "$PKG" > /root/PSMDB_INSTALLED
+runcmd:
+  - [bash, -c, "sysctl -w vm.swappiness=1 && echo vm.swappiness=1 > /etc/sysctl.d/90-mongod.conf"]
+  - [bash, /root/install-psmdb.sh]
