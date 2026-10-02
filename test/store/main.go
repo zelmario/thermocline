@@ -116,6 +116,9 @@ type shop struct {
 	// and this box's oplog is minutes long under load. It is counted so a run
 	// that resumed by starting fresh cannot pass as a run that resumed.
 	lostHistory atomic.Int64
+	// streamErrors counts a stream that failed and was reopened from the stored
+	// token. Already in errs; kept apart so a run says how often it happened.
+	streamErrors atomic.Int64
 
 	// resyncEvery is how often the consumer falls further behind than the
 	// oplog, and what it then does about it, which is what every consumer
@@ -1022,7 +1025,13 @@ func (s *shop) pageHistory(ctx context.Context, rng *rand.Rand) {
 	const page = 7
 	seen := map[string]bool{}
 	var read int64
-	s.timed("scroll a customer's history a page at a time", func() error {
+	// A scroll that failed is an error, already counted by timed, and what it
+	// read before failing says nothing about the answer. Compared anyway, a
+	// find refused across a step-down was reported twice, once as the error it
+	// was and once as a history "missing" every order after it.
+	scrollFailed := false
+	s.timed("scroll a customer's history a page at a time", func() (err error) {
+		defer func() { scrollFailed = err != nil }()
 		for skip := int64(0); skip < total; skip += page {
 			cur, err := s.orders.Find(ctx, before, options.Find().
 				SetSort(bson.D{{Key: "_id", Value: 1}}).
@@ -1052,7 +1061,7 @@ func (s *shop) pageHistory(ctx context.Context, rng *rand.Rand) {
 		}
 		return nil
 	})
-	if read != total {
+	if !scrollFailed && read != total {
 		s.violation("scrolling %s's history saw %d orders where the count says %d", cust, read, total)
 	}
 }
@@ -1350,9 +1359,18 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 			return true
 		}
 		if !cur.TryNext(ctx) {
-			if cur.Err() != nil {
+			if err := cur.Err(); err != nil {
+				// Reopened from the stored token, which is what a consumer does
+				// with a stream that fails, and counted and said. Ending the
+				// consumer here instead made every check of what the stream
+				// delivered report everything after the error as lost: 1,121
+				// orders "never reported" on 2026-10-02 after one step-down,
+				// for one error the stream had raised honestly.
 				s.errs.Add(1)
-				return false
+				s.streamErrors.Add(1)
+				fmt.Printf("[%s] the consumer's stream failed, reopening from its stored token: %v\n",
+					time.Now().Format("15:04:05"), err)
+				return true
 			}
 			continue
 		}
@@ -1580,6 +1598,9 @@ func (s *shop) report(elapsed time.Duration) {
 		s.resumes.Load(), s.replayed.Load())
 	if lost := s.lostHistory.Load(); lost > 0 {
 		fmt.Printf(", %d token(s) older than the oplog", lost)
+	}
+	if n := s.streamErrors.Load(); n > 0 {
+		fmt.Printf(", %d stream error(s) reopened from the token", n)
 	}
 	fmt.Print("\n")
 	// Printed for the same reason again: a run that never fell behind proves

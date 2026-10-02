@@ -557,6 +557,38 @@ Part of [Thermocline](../README.md).
   the new primary: 5 of 5 after, each applied once. They are counted as
   `thermocline_failover_siblings_closed_total`.
 
+  **What a failover still costs an application, by driver.** Measured on
+  2026-10-02 with the shop (`test/store/shared.sh STEPDOWN_EVERY=60s`, Go
+  driver, two applications, two routers, five step-downs in six minutes):
+
+      before the close              22 and 20 errors
+      with it                       3 and 2, then 3 and 7 errors
+      straight to the replica set   2 errors, both a multi-document delete,
+                                    which MongoDB never retries
+
+  The difference is how a driver treats a connection closed under it. Node's
+  (mongosh) discards a closed idle connection at checkout, so the close is
+  free. Go's does not notice until it sends on it, gets a network error, and
+  clears and pauses its whole pool, and whatever needs a connection in that
+  moment fails with "connection pool was cleared". That reached a change stream
+  in both runs: the consumer has to reopen it from its own stored token, which a
+  consumer of a stream straight from the set did not have to do once in
+  261,342 operations.
+
+  Answering the first refusal as ShutdownInProgress instead, so the driver
+  clears its own pool once and nothing is closed under it, was measured too and
+  is not shipped: the Go shop had 4 and 2 errors, and every mongosh retry
+  failed, 0 of 5, on the pool it had just paused.
+
+  The fix is not a better reply. It is to stop tying a client's connection to
+  one member: a connection left on a member that stepped down could borrow an
+  upstream connection that another connection of the same user authenticated
+  against the new primary, with the same identity and so the same privileges,
+  and mongod ties a cursor to its user rather than its connection. That is a
+  change to how the router holds upstream connections, and it is not made.
+  `router.terminate_auth`, where the router owns the upstream connections and
+  replays the command itself, does not have this cost.
+
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
   `router.terminate_auth` replays the write itself and does not have it.
