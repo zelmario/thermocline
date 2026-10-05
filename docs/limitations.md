@@ -593,6 +593,22 @@ Part of [Thermocline](../README.md).
   answer: the client is told the write failed, and no write is applied twice.
   `router.terminate_auth` replays the write itself and does not have it.
 
+  That held only after 2026-10-05. Before, a write the old primary applied and
+  then stopped waiting on came back `ok: 1` with a write concern error
+  (`InterruptedDueToReplStateChange`), which the router did not read as a
+  failover. The connection stayed on the old member, the driver's retry went
+  out on a sibling still there, and the application was told
+  `NotWritablePrimary` for a write that had landed. Measured with
+  `test/landed/landed.sh` (Go driver, no deadline, 32 workers, a step-down
+  every 20s for 3 minutes): 31 inserts reported an error and 30 of them had
+  landed, 25 as `NotWritablePrimary`; straight to the replica set, 0 errors.
+  Such a reply is now a failover reply, and the same run had 0 errors through
+  the router.
+
+  A driver with a deadline on the operation hides this, which is worth knowing
+  when measuring: Go driver v2 retries a retryable error until the deadline,
+  and the same probe with a 30s deadline had 0 errors on the old build.
+
 - **A `$text` query fails on the archive rather than running slowly, and so does
   `$geoNear`.** Every other index is a decision about speed and the two tiers are
   allowed to differ. These two are not: mongod refuses a `$text` query with no

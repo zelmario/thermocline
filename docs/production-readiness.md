@@ -481,6 +481,42 @@ the feeder mirror it over the archived copy. It calls the window a
 millisecond. The shop has now met the collated form of that window in thirty
 minutes, so the estimate is too kind. It is closed now; see Open item 10.
 
+## 2026-10-05: told it failed, and it had landed
+
+**The shop's "phantom" after a step-down was its own order.** The two
+application shop with a step-down every minute reported an order placed that
+nobody placed, about once in ten step-downs since 2026-10-02. On a 30-minute
+run two of them came 2 and 3 seconds after a step-down, and the ledger showed
+the reporting application had placed both. Its insert had returned an error,
+so the shop forgot the order, and then the insert event arrived. That half was
+the harness, which now keeps an order whose insert failed as uncertain rather
+than forgetting it.
+
+The other half was the router. One of the two errors was `NotWritablePrimary`
+for an insert that had landed. The old primary applied the write, then the
+step-down interrupted its wait for a majority, and the reply was `ok: 1` with
+a write concern error. The router read that as success, so the connection
+stayed on the old member, the driver's retry went out on a sibling still there,
+and the old member, now a secondary, refused it. Straight to the replica set
+the retry reaches the new primary, which knows the transaction number and
+answers success.
+
+`test/landed` measured it on its own, Go driver with no deadline, 32 workers,
+a step-down every 20 seconds for 3 minutes:
+
+    build                     errors   landed anyway   as NotWritablePrimary
+    38545d7, through router       31              30                      25
+    this fix, through router       0               0                       0
+    straight to the set            0               0                       0
+
+A step-down write concern error is now a failover reply, so the connection ends
+after the reply and the retry finds the new primary. With `terminate_auth` the
+router replays the write instead, which the transaction number deduplicates;
+both builds had 0 errors that way. Attacking the fix found the replay would
+also have resent an aggregate ending in `$merge` or `$out` that had already
+run, and so would the existing replay after a broken connection. An aggregate
+that writes is no longer replayed.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
@@ -518,6 +554,8 @@ This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 a
   `secondary`, `secondaryPreferred` and `nearest` all land on the primary, which
   means sizing the primary for the whole read load; and a command in flight
   during a step-down failing rather than blocking, with nothing applied twice.
+  Until 2026-10-05 "failing" included a write that had been applied: see that
+  day's section.
 
   `terminate_auth: true` stays in the product, tested and unsupported. It has 56
   checks and a clean pilot behind it, and that is not the claim that matters:

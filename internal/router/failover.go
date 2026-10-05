@@ -197,6 +197,13 @@ func (c *conn) replayable(msg *wire.Message, name string) bool {
 	if inTransaction(cmd) {
 		return false
 	}
+	// An aggregate that ends in $out or $merge is a write, and not one MongoDB
+	// deduplicates. Sent again it runs again: a $merge whose whenMatched adds
+	// is applied twice. A reply saying it ran, then lost its write concern to
+	// the step-down, reaches here as a failover reply too; see isFailoverReply.
+	if name == "aggregate" && pipelineWritesOut(cmd) {
+		return false
+	}
 	if readsDocuments[name] || name == "listCollections" || name == "listIndexes" {
 		return true
 	}
@@ -266,9 +273,33 @@ func hasMultiStatement(cmd bson.Raw, name string) bool {
 //
 // The error label is checked first because it is what MongoDB tells drivers to
 // act on, and the codes are there for servers and paths that do not attach one.
+//
+// A reply with ok:1 says so too when its write concern error carries one of
+// those codes. That is the write the old primary applied and then stopped
+// waiting on as it stepped down, and the driver retries it. Read as success
+// here, the connection stayed pinned to the old member, the retry went out on
+// a sibling still pinned there, and the client was told NotWritablePrimary
+// for a write that had landed. Straight to the replica set the retry reaches
+// the new primary, which knows the txnNumber and answers success. Measured
+// with test/landed, Go driver, no deadline, 32 workers, step-downs every 20s:
+// 11 of 11 NotWritablePrimary errors were inserts that had landed, 0 errors
+// straight to the set.
 func isFailoverReply(doc bson.Raw) bool {
 	if replyOK(doc) {
-		return false
+		wce, err := doc.LookupErr("writeConcernError")
+		if err != nil {
+			return false
+		}
+		w, ok := wce.DocumentOK()
+		if !ok {
+			return false
+		}
+		v, err := w.LookupErr("code")
+		if err != nil {
+			return false
+		}
+		code, ok := intOf(v)
+		return ok && isStateChangeCode(code)
 	}
 	if v, err := doc.LookupErr("errorLabels"); err == nil {
 		if vals, aok := arrayValues(v); aok {
@@ -284,9 +315,12 @@ func isFailoverReply(doc bson.Raw) bool {
 		return false
 	}
 	code, ok := intOf(v)
-	if !ok {
-		return false
-	}
+	return ok && isStateChangeCode(code)
+}
+
+// isStateChangeCode reports whether an error code means the member that
+// answered stopped being primary, or is about to.
+func isStateChangeCode(code int) bool {
 	switch code {
 	case 10107, // NotWritablePrimary
 		13435, // NotPrimaryNoSecondaryOk
