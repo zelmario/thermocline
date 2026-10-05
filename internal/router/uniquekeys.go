@@ -819,6 +819,8 @@ func (r *Router) tryClaimFresh(ctx context.Context, ns string, idx uniqueIndex, 
 	if live {
 		return false, false, nil
 	}
+	r.log.Debug("taking over a unique key whose recorded owner no longer holds it",
+		"ns", ns, "index", idx.name, "key", kid, "was", claim.Doc.String(), "now", owner.String())
 
 	// Stale. Take it over, unless somebody else just did.
 	filter := bson.D{{Key: "_id", Value: kid}}

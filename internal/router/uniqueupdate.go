@@ -575,6 +575,8 @@ func (c *conn) claimStatement(ctx context.Context, ns string, idx uniqueIndex, s
 				"effect", "a duplicate of an archived document could be created")
 			return false, nil, nil
 		}
+		c.log.Debug("evaluated an update the router cannot read the result of",
+			"ns", ns, "index", idx.name, "matched", len(ids), "evaluated", len(after))
 		return c.claimEvaluated(ctx, ns, idx, after)
 	}
 

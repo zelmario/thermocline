@@ -517,6 +517,30 @@ also have resent an aggregate ending in `$merge` or `$out` that had already
 run, and so would the existing replay after a broken connection. An aggregate
 that writes is no longer replayed.
 
+**The fuzzer found a unique key taken twice, on the build pushed that morning
+too.** Churn round 8 of `testfuzz`, the same operation on four runs and both
+builds: a pipeline update of `{ _id: 19 }` to `n: 20`, refused E11000 by the
+untiered reference and accepted through the router. The router's debug line
+said the guard had matched 0 documents. Both documents were archived. The
+guard asks the fast tier what a statement matches, which was nothing, so it
+claimed nothing; the update then matched nothing either, the miss path copied
+document 19 up, and re-sent the command with no guard. Reproduced without the
+fuzzer, both documents in the archive only and a unique index created through
+the router:
+
+    statement onto the archived key     before                       after
+    pipeline update                     accepted, 2 holders          refused 11000
+    $set                                accepted, 2 holders          refused 11000
+    findOneAndUpdate                    accepted, 2 holders          refused 11000
+    a move to a free key                accepted                     accepted
+
+The miss path now runs the same guard before re-sending an update or a
+findAndModify. The two other paths that copy a document up for a write, a
+sorted findAndModify and an unacknowledged write, run before the guard and
+were already covered. `testkeys` has the case now, with the updated document
+archived as well as the key's holder; every earlier section kept the updated
+document on the fast tier.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

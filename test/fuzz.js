@@ -648,7 +648,8 @@ function ask(what, op, fn, how) {
   // reproducible and the report names the operation that disagreed, but not what
   // ran before it, and a disagreement is usually about state something earlier
   // left behind. Off by default because it is one line per comparison.
-  if (TRACE) print('  op\t' + what + '\t' + op);
+  // With the time, so a line can be found in the daemons' logs.
+  if (TRACE) print('  op\t' + new Date().toISOString().slice(11, 23) + ' ' + what + '\t' + op);
   const norm = how === 'bag' ? bag : ser;
   const a = attempt(fn, REF), b = attempt(fn, TIER);
 

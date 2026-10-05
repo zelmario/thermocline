@@ -390,6 +390,15 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 			"this transaction wrote to a document that had been archived, and it has now been restored to the fast tier")
 	}
 
+	// The unique key guard ran before the first attempt, when this document
+	// was in the archive only, so it matched nothing and claimed nothing. The
+	// retry is the statement's real run and needs the guard the first attempt
+	// had. Without it, an update moved an archived document onto a key another
+	// archived document holds: untiered MongoDB refused it with E11000, the
+	// router accepted it, and both documents held the key. See retryGuarded.
+	if cmdField == "update" {
+		return c.retryGuarded(ctx, msg, db, "update")
+	}
 	return c.retry(msg)
 }
 
@@ -457,6 +466,26 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 		c.log.Debug("replaying a transaction after a copy-up", "ns", ns)
 		return c.r.replayTransaction(reply.Header.RequestID, msg.Header.RequestID,
 			"this transaction acted on a document that had been archived, and it has now been restored to the fast tier")
+	}
+	// The same as an update's retry: the guard has to see the document it now
+	// holds. See retryGuarded.
+	name, _, _ := msg.CommandName()
+	return c.retryGuarded(ctx, msg, db, name)
+}
+
+// retryGuarded re-sends a write after a copy-up, with the unique key guard run
+// first against the document the fast tier now holds.
+//
+// The guard asks the fast tier which documents a statement matches, and before
+// the copy-up the answer was none. Found by the fuzzer on 2026-10-05, on the
+// build pushed then as well: a pipeline update of { _id: 19 } to n: 20 while
+// both documents were archived, accepted through the router and refused E11000
+// by an untiered reference. Reproduced the same way with a $set and a
+// findOneAndUpdate. A refusal here leaves the copy-up in place, which is a
+// read's worth of work and changes nothing the application can see.
+func (c *conn) retryGuarded(ctx context.Context, msg *wire.Message, db, name string) (*wire.Message, error) {
+	if out, done := c.guardUpdateKeys(ctx, msg, db, name); done {
+		return out, nil
 	}
 	return c.retry(msg)
 }

@@ -150,6 +150,35 @@ chk "  the fast tier kept the old value"       "free@x.com" "$(H 'const d=db.get
 chk "  no fast tier document holds it"         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkupd.countDocuments({email:"held@x.com"}))')"
 chk "  exactly one archived document holds it" "1" "$(C 'print(db.getSiblingDB(process.env.TC_DB).tkupd.countDocuments({email:"held@x.com",_tcDeletedAt:{$exists:false}}))')"
 
+echo "== and not when the updated document is archived too =="
+# The section above keeps the updated document on the fast tier. Archived as
+# well, the guard asked the fast tier what the statement matched, heard
+# nothing, and claimed nothing; the router then copied the document up and
+# re-sent the command with no guard at all. The fuzzer found it on 2026-10-05:
+# all three forms below were accepted and two live documents held the key.
+fresh tkupd2 '{email:1}'
+R 'db.getSiblingDB(process.env.TC_DB).tkupd2.insertMany([{_id:1,email:"held@x.com"},{_id:2,email:"free@x.com"}])' >/dev/null
+waitMirrored tkupd2 2
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkupd2.deleteMany({})'
+chk "both are in the archive only" "0 2" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tkupd2.countDocuments({}))') $(C 'print(db.getSiblingDB(process.env.TC_DB).tkupd2.countDocuments({_tcDeletedAt:{$exists:false}}))')"
+# Each form starts from the same state: the refusal leaves the copy-up behind,
+# so the document is evicted again before the next one.
+archivedUpdate() {
+  evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkupd2.deleteOne({_id:2})'
+  chk "$1" "11000" "$(R "try{$2;print(\"ACCEPTED\")}catch(e){print(e.code||e.message.substring(0,40))}")"
+}
+archivedUpdate "a \$set onto the archived key rejected"         'db.getSiblingDB(process.env.TC_DB).tkupd2.updateOne({_id:2},{$set:{email:"held@x.com"}})'
+archivedUpdate "a pipeline update onto it rejected"            'db.getSiblingDB(process.env.TC_DB).tkupd2.updateOne({_id:2},[{$set:{email:"held@x.com"}}])'
+archivedUpdate "a findOneAndUpdate onto it rejected"           'db.getSiblingDB(process.env.TC_DB).tkupd2.findOneAndUpdate({_id:2},{$set:{email:"held@x.com"}})'
+# Distinct _ids, because a document on the fast tier is in the archive too once
+# it is mirrored, and counting both tiers would count it twice.
+# One line each, because H and C keep only the last line mongosh prints.
+holders=$( { H 'print(db.getSiblingDB(process.env.TC_DB).tkupd2.find({email:"held@x.com"}).toArray().map(d=>d._id).join(" "))'
+             C 'print(db.getSiblingDB(process.env.TC_DB).tkupd2.find({email:"held@x.com",_tcDeletedAt:{$exists:false}}).toArray().map(d=>d._id).join(" "))'; } | tr ' ' '\n' | sort -u | grep -c .)
+chk "  exactly one document holds it, across both tiers" "1" "$holders"
+evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tkupd2.deleteOne({_id:2})'
+chk "and a move to a free key still works" "fresh@x.com" "$(R 'db.getSiblingDB(process.env.TC_DB).tkupd2.updateOne({_id:2},{$set:{email:"fresh@x.com"}}); print(db.getSiblingDB(process.env.TC_DB).tkupd2.findOne({_id:2}).email)')"
+
 echo "== an upsert creating a document must claim its key too =="
 fresh tkups '{email:1}'
 R 'db.getSiblingDB(process.env.TC_DB).tkups.insertOne({_id:1,email:"taken@x.com"})' >/dev/null
