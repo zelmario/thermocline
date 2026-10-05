@@ -82,7 +82,12 @@ type shop struct {
 	// tails this stream, and what it must never see is a document moving
 	// between tiers: a copy-up is an insert on the fast tier and an eviction is
 	// a delete, and neither is anything the application did.
-	wrote      sync.Map // order _id hex -> true, placed by a worker
+	wrote sync.Map // order _id hex -> true, placed by a worker
+	// An order whose insert reported an error. It may have landed anyway: a
+	// network error says the outcome is unknown, and a write the old primary
+	// applied can come back as an error after a step-down. Its insert event
+	// is not a phantom, and its absence is not a loss.
+	uncertain  sync.Map // order _id hex -> true
 	removed    sync.Map // order _id hex -> true, cancelled by a worker
 	seenInsert sync.Map // order _id hex -> true, seen by the consumer
 	seenDelete sync.Map // order _id hex -> true, seen by the consumer
@@ -171,6 +176,7 @@ type shop struct {
 	ledger      *mongo.Collection
 	foreignIns  atomic.Int64
 	foreignDel  atomic.Int64
+	ledgerErrs  atomic.Int64
 
 	// Violations are the point of the whole thing. Counted separately from
 	// errors, because an error is the system saying no and a violation is it
@@ -652,6 +658,7 @@ func (s *shop) orderInTransaction(ctx context.Context, rng *rand.Rand, cust stri
 	})
 	if !committed {
 		s.wrote.Delete(id.Hex())
+		s.uncertain.Store(id.Hex(), true)
 		// Nothing of it must be there. A transaction that failed and left half
 		// of itself behind is the one thing a transaction promises not to do.
 		s.timed("a transaction that failed left nothing", func() error {
@@ -908,6 +915,7 @@ func (s *shop) placeOrder(ctx context.Context, rng *rand.Rand, cust string) (rec
 	// anyway. Neither is this check's answer to give.
 	if !placed {
 		s.wrote.Delete(id.Hex())
+		s.uncertain.Store(id.Hex(), true)
 		return recentOrder{}, false
 	}
 	s.timed("read back the new order", func() error {
@@ -1396,7 +1404,12 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 			}
 			s.seenInsert.Store(id, true)
 			s.keep(id, true)
-			if _, ours := s.wrote.Load(id); !ours && !s.foreign(ctx, "insert", id, &s.foreignIns) {
+			// An order this application gave up on can still have landed, so
+			// its insert is this application's, not a phantom. Measured on
+			// 2026-10-05: both "phantoms" in a 30-minute step-down run were
+			// this application's own inserts, reported as failed and applied.
+			_, unsure := s.uncertain.Load(id)
+			if _, ours := s.wrote.Load(id); !ours && !unsure && !s.foreign(ctx, "insert", id, &s.foreignIns) {
 				// Seeded orders are written before the consumer starts, so an
 				// insert for one of those is a document arriving on the fast
 				// tier rather than an order being placed.
@@ -1481,12 +1494,29 @@ func (s *shop) intend(ctx context.Context, op string, id bson.ObjectID) {
 	if s.ledger == nil {
 		return
 	}
-	_, err := s.ledger.InsertOne(ctx, bson.D{
-		{Key: "_id", Value: op + ":" + id.Hex()}, {Key: "part", Value: s.part}})
-	if err != nil && !mongo.IsDuplicateKeyError(err) {
-		s.errs.Add(1)
+	// Retried through an election, because an entry that never landed turns
+	// the other consumer's sight of this order into a phantom, and that would
+	// be the harness's own failure reported as the system's.
+	for deadline := time.Now().Add(ledgerPatience); ; {
+		_, err := s.ledger.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: op + ":" + id.Hex()}, {Key: "part", Value: s.part}})
+		if err == nil || mongo.IsDuplicateKeyError(err) {
+			return
+		}
+		s.ledgerErrs.Add(1)
+		fmt.Printf("[%s] the ledger refused %s:%s, retrying: %v\n",
+			time.Now().Format("15:04:05.000"), op, id.Hex(), err)
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			s.errs.Add(1)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// ledgerPatience is how long either side of the ledger waits out an election.
+// Longer than one here, which takes about 10s with the shop's load on it.
+const ledgerPatience = 30 * time.Second
 
 // foreign says an event this application did not cause was caused by another
 // one sharing the collection, and counts it.
@@ -1497,7 +1527,24 @@ func (s *shop) foreign(ctx context.Context, op, id string, n *atomic.Int64) bool
 	var e struct {
 		Part int `bson:"part"`
 	}
-	err := s.ledger.FindOne(ctx, bson.D{{Key: "_id", Value: op + ":" + id}}).Decode(&e)
+	// A lookup that fails says nothing about who wrote the order, so it is
+	// retried rather than read as "nobody". Read that way, a step-down under
+	// the consumer reports a phantom the system never delivered.
+	var err error
+	for deadline := time.Now().Add(ledgerPatience); ; {
+		err = s.ledger.FindOne(ctx, bson.D{{Key: "_id", Value: op + ":" + id}}).Decode(&e)
+		if err == nil || errors.Is(err, mongo.ErrNoDocuments) {
+			break
+		}
+		s.ledgerErrs.Add(1)
+		fmt.Printf("[%s] the ledger lookup of %s:%s failed, retrying: %v\n",
+			time.Now().Format("15:04:05.000"), op, id, err)
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			s.errs.Add(1)
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if err != nil || e.Part == s.part {
 		return false
 	}
@@ -1614,6 +1661,7 @@ func (s *shop) report(elapsed time.Duration) {
 	if s.parts > 1 {
 		fmt.Printf("shared: application %d of %d, the stream carried %d insert(s) and %d delete(s) of the others'\n",
 			s.part, s.parts, s.foreignIns.Load(), s.foreignDel.Load())
+		fmt.Printf("ledger: %d failed attempt(s), each retried\n", s.ledgerErrs.Load())
 	}
 
 	fmt.Printf("\nerrors: %d\n", s.errs.Load())
