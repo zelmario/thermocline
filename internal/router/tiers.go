@@ -71,13 +71,17 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	// tier already holds is held and nothing more, and one it does not hold is
 	// a promotion without any guessing. See promote.Held and meta.PromotionUpdate.
 	asked := false
-	if have, herr := promote.Held(ctx, r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil {
+	if have, left, herr := r.holdWhatIsThere(ctx, ns, r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil {
 		asked = true
 		if have[0] {
-			if werr := r.holdOnlyMany(ctx, ns, []bson.RawValue{id}); werr != nil {
-				r.log.Warn("could not hold a document the fast tier already has against eviction", "ns", ns, "err", werr)
-			}
 			return true, nil
+		}
+		// An eviction took it while this waited, so the copy read above may be
+		// older than the one the evictor confirmed. See holdWhatIsThere.
+		if len(left) > 0 {
+			if doc, found, err = r.readArchived(ctx, ns, id, ""); err != nil || !found {
+				return false, err
+			}
 		}
 	}
 	if err := r.recordResidency(ctx, ns, id, asked); err != nil {
@@ -194,25 +198,17 @@ func residencyFor(ns string, id bson.RawValue, now time.Time, hold time.Duration
 	return meta.ResidencyUpdate(ns, id, now, hold)
 }
 
-// holdOnlyMany keeps documents the fast tier already holds there for a while,
-// and says nothing else about them. A copy-up for a write or a transaction
-// needs what it matched to stay until the statement runs, and the ones already
-// there were never copied, so there is no promotion to record. See
-// meta.HoldOnly.
-func (r *Router) holdOnlyMany(ctx context.Context, ns string, ids []bson.RawValue) error {
-	if len(ids) == 0 {
-		return nil
+// holdWhatIsThere asks the fast tier which of ids it holds, holds those
+// against eviction, and reports which ones a copy-up may skip. See
+// promote.HoldPresent for the window between asking and holding, and why
+// left's documents are read from the archive again.
+func (r *Router) holdWhatIsThere(ctx context.Context, ns string, hot *mongo.Collection, ids []bson.RawValue) (have []bool, left []int, err error) {
+	have, left, holdErr, err := promote.HoldPresent(ctx, hot, r.cold, ns, ids, r.cfg.Residency.D())
+	if holdErr != nil {
+		r.log.Warn("could not hold documents the fast tier already has against eviction",
+			"ns", ns, "err", holdErr)
 	}
-	models := make([]mongo.WriteModel, 0, len(ids))
-	for _, id := range ids {
-		models = append(models, mongo.NewUpdateOneModel().
-			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(meta.HoldOnly(ns, id, r.cfg.Residency.D())).
-			SetUpsert(true))
-	}
-	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).
-		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
-	return err
+	return have, left, err
 }
 
 // ensureTieredCollection gives the fast tier the collection the way the archive
@@ -1924,4 +1920,27 @@ func (r *Router) warnClaimDimension(ns, was, now string) {
 			"again, which is the answer they would have had before anybody claimed anything",
 		"action", "let the warmer claim it again in the new field, or declare it with "+
 			"cline watermark once you have checked what the fast tier holds")
+}
+
+// rereadArchived replaces docs[i] for each position in left with the archive's
+// current copy, and marks one the archive no longer holds live as held, so the
+// caller leaves it out. See promote.HoldPresent.
+func (r *Router) rereadArchived(ctx context.Context, ns string, docs []bson.Raw, raw []bson.RawValue, left []int, have []bool) error {
+	db, coll := splitNS(ns)
+	want := make([]bson.RawValue, len(left))
+	for j, i := range left {
+		want[j] = raw[i]
+	}
+	found, err := promote.RereadArchived(ctx, r.cold.Database(db).Collection(coll), want)
+	if err != nil {
+		return err
+	}
+	for _, i := range left {
+		if d, ok := found[promote.RawKey(raw[i])]; ok {
+			docs[i] = d
+		} else {
+			have[i] = true
+		}
+	}
+	return nil
 }
