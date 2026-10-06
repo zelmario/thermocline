@@ -240,10 +240,10 @@ func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) 
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("an eviction sweep has held the evictor's lease for two minutes, "+
-				"and a claim cannot be checked while one is removing documents: %w", err)
+				"and this cannot go ahead while one is removing documents: %w", err)
 		}
 		if !said {
-			fmt.Println("waiting for an eviction sweep to finish before checking the claim")
+			fmt.Println("waiting for the eviction sweep in progress to finish")
 			said = true
 		}
 		select {

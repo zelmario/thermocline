@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -57,6 +58,16 @@ func runPause(args []string, on bool) error {
 	if err := meta.PauseEviction(ctx, cold, *reason); err != nil {
 		return fatal(log, "pause", err)
 	}
+	// The hold stops sweeps that start from now on. One already running reads
+	// it before its next batch, and until it has, documents are still leaving
+	// the fast tier. The operator's next step is usually restoring the archive,
+	// so "paused" is said only once no sweep is in progress: the evictor holds
+	// its lease for the whole of a sweep, and taking it here waits that out.
+	release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+	if err != nil {
+		return fatal(log, "pause", fmt.Errorf("the hold is recorded, but a sweep may still be running: %w", err))
+	}
+	release()
 	rec, _, _ := meta.EvictionPaused(ctx, cold)
 	log.Warn("eviction paused, the evictor will remove nothing",
 		"since", rec.Since, "reason", rec.Reason,

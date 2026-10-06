@@ -157,6 +157,9 @@ type Stats struct {
 	Unconfirmed int
 	Backoffs    int
 	DryRun      bool
+	// Paused says the sweep stopped part way because an operator paused
+	// eviction while it ran.
+	Paused bool
 }
 
 // LogArgs returns the sweep summary as slog key-value pairs. The evicted count
@@ -277,6 +280,9 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 		total.Backoffs += s.Backoffs
 		if err != nil {
 			return total, err
+		}
+		if s.Paused {
+			break
 		}
 	}
 	e.publish(ctx, total)
@@ -399,6 +405,21 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 				"ns", rule.NS, "count", out.unconfirmed)
 		}
 
+		// Asked again before every batch, not only when the sweep began. An
+		// operator pauses eviction to restore the archive, and a sweep already
+		// running went on removing documents it had confirmed against the
+		// archive that was about to be replaced. See runPause, which waits for
+		// a sweep in progress to reach this check.
+		if rec, paused, perr := meta.EvictionPaused(ctx, e.cold); perr != nil || paused {
+			if perr != nil {
+				e.log.Warn("could not read the eviction hold, stopping this sweep", "err", perr)
+			} else {
+				e.log.Warn("eviction was paused during this sweep, stopping it",
+					"ns", rule.NS, "since", rec.Since, "reason", rec.Reason)
+			}
+			stats.Paused = true
+			return stats, nil
+		}
 		if len(out.evict) > 0 {
 			removed, err := e.evict(ctx, rule.NS, hotColl, out.evict)
 			if err != nil {

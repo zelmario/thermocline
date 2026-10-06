@@ -214,7 +214,9 @@ walks exactly those steps.
 What it cannot fetch is what the fast tier no longer holds: anything written
 after the backup **and already evicted** is in neither tier, and nothing can
 recover it. That is why the pause comes first, and why the archive's backup
-interval is the real exposure of this system rather than the fast tier's.
+interval is the real exposure of this system rather than the fast tier's. `cline pause` returns only once no sweep is in
+progress: a sweep that was already running stops before its next batch, and
+the command waits for it.
 `cline rollback`, which counts rather than removes unless you pass `--clear`, is
 what tells you what the two tiers disagree about afterwards.
 
