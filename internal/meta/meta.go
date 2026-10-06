@@ -516,9 +516,37 @@ func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 // placed: five in an hour on 2026-09-30, each with the record's promotion two
 // minutes older than the insert and no echo pending. A copy-up that asked
 // knows; it does not need to guess.
+//
+// Except into a promotion another copy-up opened a moment ago and has not ended.
+// Two copy-ups of one document both find the fast tier without it, and both
+// open. When the second one's update lands after the first one's insert, the
+// record says the promotion began after the only insert there was, and its
+// echo bookkeeping starts again from nothing; the second copy-up's insert then
+// meets a duplicate key and withdraws the echo. A consumer reading late was
+// shown the first insert as one nobody made: 7 of 10 rounds of test/echorace,
+// 32 readers through two routers, where every round recorded no echo position
+// at all. Joining keeps the first promotion's instant, which covers the one
+// insert that lands, and its bookkeeping, which the withdrawal then marks
+// uncertain rather than erasing. A promotion older than PromotionJoin, or ended,
+// is opened again, which is the case above.
+//
+// now is this writer's clock and promotedAt another's. Skew can only move a
+// promotion near the edge of the window to the other side of it, and either
+// side is one of the two behaviours this already had.
 func PromotionUpdate(ns string, id bson.RawValue, now time.Time, hold time.Duration) mongo.Pipeline {
-	return residencyPipeline(ns, id, now, hold, true)
+	joining := bson.D{{Key: "$and", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$promotedAt"}}, "date"}}},
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
+		bson.D{{Key: "$gte", Value: bson.A{"$promotedAt", now.Add(-PromotionJoin)}}},
+	}}}
+	return residencyPipeline(ns, id, now, hold, bson.D{{Key: "$not", Value: bson.A{joining}}})
 }
+
+// PromotionJoin is how recently a promotion must have opened for a concurrent
+// copy-up of the same document to join it rather than open its own. Racing
+// copy-ups are milliseconds apart, or as far apart as one waiting out an
+// eviction already announced; see promote.SettleWait.
+const PromotionJoin = 10 * time.Second
 
 func residencyPipeline(ns string, id bson.RawValue, now time.Time, hold time.Duration, reopening any) mongo.Pipeline {
 	return mongo.Pipeline{

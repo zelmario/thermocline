@@ -612,3 +612,60 @@ func bsoncoreString(s string) []byte {
 	b[0], b[1], b[2], b[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
 	return append(append(b, s...), 0)
 }
+
+// Two copy-ups of one document both find the fast tier without it and both open
+// a promotion. The second must join the first rather than move its instant past
+// the only insert that lands; see PromotionUpdate. An older promotion, or an
+// ended one, is opened again.
+func TestARacingPromotionJoinsTheOneJustOpened(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+	coll := c.Database(DB).Collection(Residency)
+	const ns = "tctest.promojoin"
+	typ, b, _ := bson.MarshalValue(int32(1))
+	id := bson.RawValue{Type: typ, Value: b}
+	docID := DocID(ns, id)
+	_, _ = coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: docID}})
+	defer func() { _, _ = coll.DeleteOne(context.Background(), bson.D{{Key: "_id", Value: docID}}) }()
+
+	promote := func(now time.Time) time.Time {
+		t.Helper()
+		if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: docID}},
+			PromotionUpdate(ns, id, now, time.Minute), options.UpdateOne().SetUpsert(true)); err != nil {
+			t.Fatalf("PromotionUpdate: %v", err)
+		}
+		var rec ResidencyRecord
+		if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: docID}}).Decode(&rec); err != nil {
+			t.Fatalf("read record: %v", err)
+		}
+		return rec.PromotedAt
+	}
+
+	first := time.Now().UTC().Truncate(time.Millisecond)
+	if got := promote(first); !got.Equal(first) {
+		t.Fatalf("first promotion at %v, want %v", got, first)
+	}
+	if got := promote(first.Add(50 * time.Millisecond)); !got.Equal(first) {
+		t.Errorf("a copy-up 50ms later moved the promotion to %v; it must join the one opened at %v", got, first)
+	}
+
+	// Two minutes old: the stale record 9fe0346 was about, opened again.
+	if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: docID}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "promotedAt", Value: first.Add(-2 * time.Minute)}}}}); err != nil {
+		t.Fatalf("age the promotion: %v", err)
+	}
+	if got := promote(first); !got.Equal(first) {
+		t.Errorf("a promotion two minutes old was joined, promotedAt %v; it must open again at %v", got, first)
+	}
+
+	// Ended: the document left the fast tier, so this is a new promotion.
+	if _, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: docID}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "endedAt", Value: first}}}}); err != nil {
+		t.Fatalf("end the promotion: %v", err)
+	}
+	later := first.Add(time.Second)
+	if got := promote(later); !got.Equal(later) {
+		t.Errorf("an ended promotion was joined, promotedAt %v; it must open again at %v", got, later)
+	}
+}
