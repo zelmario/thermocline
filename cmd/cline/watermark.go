@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
@@ -92,6 +93,18 @@ func runWatermark(args []string) error {
 		if err := pairing.Check(ctx, hot, cold, log); err != nil {
 			return err
 		}
+		// Held from before the counts until after the write, so no eviction
+		// sweep is in flight across them. A sweep raises the claim to its
+		// cutoff, waits for routers to read it, and then deletes what is older;
+		// a declaration landing in that wait counted documents the sweep was
+		// about to remove and wrote the claim back over them. Measured: three
+		// of three declarations of complete-for-all-history made that way left
+		// the fast tier holding 150 of 300 under the claim.
+		release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+		if err != nil {
+			return err
+		}
+		defer release()
 	}
 
 	// verify counts both tiers and refuses a claim they contradict. --force
@@ -206,4 +219,55 @@ func describe(m watermark.Mark) string {
 	// cover: testwarm read 51 archived documents in a range whose claim covered
 	// 50, and flagged the fast tier as short when the claim was exact.
 	return "complete for everything newer than " + m.From.UTC().Format(time.RFC3339Nano)
+}
+
+// holdEvictorLease takes the evictor's lease for this deployment, waiting up to
+// two minutes for a sweep in progress to finish, and keeps it renewed until
+// the returned release is called. The evictor skips its sweeps while it is
+// held, so a declaration delays eviction by one sweep at most.
+func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) (func(), error) {
+	l := lease.New(cold, "evictor", feederID)
+	deadline := time.Now().Add(2 * time.Minute)
+	said := false
+	for {
+		err := l.Take(ctx)
+		if err == nil {
+			break
+		}
+		var held *lease.ErrHeld
+		if !errors.As(err, &held) {
+			return nil, fmt.Errorf("take the evictor's lease: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("an eviction sweep has held the evictor's lease for two minutes, "+
+				"and a claim cannot be checked while one is removing documents: %w", err)
+		}
+		if !said {
+			fmt.Println("waiting for an eviction sweep to finish before checking the claim")
+			said = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	kctx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-kctx.Done():
+				return
+			case <-time.After(lease.Renew):
+				_ = l.Keep(kctx)
+			}
+		}
+	}()
+	return func() {
+		stop()
+		<-done
+		_ = l.Release(context.WithoutCancel(ctx))
+	}, nil
 }

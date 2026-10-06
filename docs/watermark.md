@@ -137,6 +137,14 @@ this counts what each tier holds and refuses a claim the numbers contradict,
 naming both. `--force` records it anyway, for the case where the operator knows
 something the counts cannot show, such as a warm still running.
 
+**A declaration waits for an eviction sweep in progress.** A sweep raises the
+claim to its cutoff, waits for routers to read it, and only then deletes what is
+older. A declaration counted and written inside that wait describes documents
+the sweep is about to remove, and the counts cannot see it because the deletes
+have not happened yet. So declaring takes the evictor's lease for as long as it
+counts and writes, waiting up to two minutes for a sweep to finish, and the
+evictor skips one sweep if it comes round meanwhile.
+
 Counting is not free on a large collection, so it is bounded, and past the bound
 the claim is recorded **unchecked** rather than refused: blocking a rollout on a
 count would be the worse failure. `--count-for` sets that bound, a minute by
