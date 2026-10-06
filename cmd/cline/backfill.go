@@ -152,7 +152,28 @@ func runBackfill(args []string) error {
 				"run this again\n", ns, alreadyMarked, meta.TombstoneField, meta.BodyDroppedField)
 		}
 
+		// Marking holds the evictor's lease, because a document a sweep evicts
+		// is, to this pass, a document the archive holds live and the fast
+		// tier does not: exactly what a delete looks like. A sweep raises the
+		// claim before it deletes, and this reads the claim once and then
+		// checks each document in turn, so on a namespace big enough for the
+		// checks to outlast the sweep's settle wait the documents it removed
+		// were marked deleted, and gone from both tiers. Measured with --force
+		// and the evictor sweeping every four seconds over 30,000 documents:
+		// 959 and 682 marked in two runs, none of them deleted by anyone. Per
+		// namespace, so a long backfill holds eviction back one namespace at a
+		// time.
+		release := func() {}
+		if *apply && !markingHeld {
+			r, lerr := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+			if lerr != nil {
+				fmt.Printf("  %-40s deletes not marked: %v\n", ns, lerr)
+				continue
+			}
+			release = r
+		}
 		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
+		release()
 		totalMarked += marked
 		verb := "would copy"
 		if *apply {
