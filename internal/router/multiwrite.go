@@ -557,7 +557,7 @@ func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collat
 	// An error here is not a match: it means the fast tier could not be asked,
 	// and going on to the archive costs a lookup while believing it would cost
 	// the write.
-	if has, herr := c.r.fastTierMatches(ctx, ns, fdoc, collation); herr == nil && has {
+	if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, collation); herr == nil && has {
 		return
 	}
 	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil, collation)

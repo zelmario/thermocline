@@ -204,7 +204,7 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	// With a sort the question is which document, not whether there is one, and
 	// the fast tier's own best match is exactly what cannot be trusted.
 	if !sorted {
-		if has, herr := c.r.fastTierMatches(ctx, ns, fdoc, docField(cmd, "collation")); herr == nil && has {
+		if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, docField(cmd, "collation")); herr == nil && has {
 			return nil, false
 		}
 	}
@@ -234,8 +234,17 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	// indexed lookup by _id. It matters because the shape that reaches this
 	// code most is a queue polled in a loop, where every poll is a sorted
 	// findAndModify against the same collection.
-	if c.r.fastTierHolds(ctx, ns, id) {
-		return nil, false
+	//
+	// Held as well as asked. The answer is relied on until mongod runs the
+	// sort, and an eviction sweep can take this document in between: the fast
+	// tier's sort then picks the next one, and the client's command modifies
+	// a record it did not name. holdWhatIsThere holds it, and reports it
+	// absent if an eviction already under way takes it, so it is copied up.
+	{
+		db, coll := splitNS(ns)
+		if have, _, herr := c.r.holdWhatIsThere(ctx, ns, c.r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil && have[0] {
+			return nil, false
+		}
 	}
 
 	copied, cerr := c.r.copyUp(ctx, ns, id)

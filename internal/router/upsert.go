@@ -3,6 +3,8 @@ package router
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -81,7 +83,7 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 		// The fast tier deciding it has a match is the end of it: the update
 		// applies there and no document is created. Asking it first also keeps
 		// the archive out of the common path, where the document is hot.
-		has, herr := c.r.fastTierMatches(ctx, ns, st.filter, st.collation)
+		has, herr := c.r.fastTierMatchesHeld(ctx, ns, st.filter, st.collation)
 		if herr != nil {
 			c.log.Warn("could not check the fast tier before an upsert, letting it through",
 				"ns", ns, "err", herr)
@@ -184,11 +186,89 @@ func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStat
 	return out
 }
 
-// fastTierMatches reports whether the fast tier holds anything the filter
-// selects, which is what decides whether an upsert creates a document.
-func (r *Router) fastTierMatches(ctx context.Context, ns string, filter, collation bson.Raw) (bool, error) {
+// fastTierMatchesHeld reports whether the fast tier holds anything the filter
+// selects, which is what decides whether an upsert creates a document. Every
+// caller lets the statement through on a yes, and so relies on the match still
+// being there when mongod runs it.
+//
+// That answer used to stand alone, with nothing holding the match. An eviction sweep can take the matched document between
+// this answer and the write, and each caller then goes wrong its own way: an
+// upsert matches nothing and creates a document, which the feeder mirrors over
+// the archived record when the filter named its _id; an unacknowledged write
+// misses with no reply for anything to repair; a findAndModify takes another
+// document. The same window holdWhatIsThere closes for a copy-up.
+//
+// Held only when an eviction could reach it. The evictor raises the claim to
+// its cutoff, waits for routers to read it, and then removes only documents
+// older than that cutoff, so a match aged at or after the claim's bound cannot
+// go before this statement runs. That keeps the hold, an archive write and an
+// archive read, off the hot path: a document being upserted is usually recent.
+// A match the age of which cannot be read is held.
+//
+// A no from the hold, the eviction having taken the match while it waited, is
+// reported as no match here, and the caller goes on to the archive as it does
+// for any miss.
+func (r *Router) fastTierMatchesHeld(ctx context.Context, ns string, filter, collation bson.Raw) (bool, error) {
+	match, found, err := r.fastTierMatch(ctx, ns, filter, collation)
+	if err != nil || !found {
+		return found, err
+	}
+	if r.notYetEvictable(ctx, ns, match) {
+		return true, nil
+	}
+	id, lerr := match.LookupErr("_id")
+	if lerr != nil {
+		return true, nil
+	}
 	db, coll := splitNS(ns)
-	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
+	have, _, herr := r.holdWhatIsThere(ctx, ns, r.hot.Database(db).Collection(coll), []bson.RawValue{id})
+	if herr != nil {
+		r.log.Debug("could not hold the fast tier's match against eviction", "ns", ns, "err", herr)
+		return true, nil
+	}
+	return have[0], nil
+}
+
+// notYetEvictable reports whether the claim says no eviction can take this
+// document yet. See fastTierMatchesHeld.
+func (r *Router) notYetEvictable(ctx context.Context, ns string, match bson.Raw) bool {
+	mark, known := r.completeness(ctx, ns)
+	if !known || !mark.Claimed {
+		return false
+	}
+	if mark.CoversAll() {
+		return true
+	}
+	var age time.Time
+	if f, ok := r.ageFieldOf(ns); ok {
+		v, err := match.LookupErr(strings.Split(f, ".")...)
+		if err != nil || v.Type != bson.TypeDateTime {
+			return false
+		}
+		age = v.Time()
+	} else {
+		v, err := match.LookupErr("_id")
+		if err != nil {
+			return false
+		}
+		oid, ok := v.ObjectIDOK()
+		if !ok {
+			return false
+		}
+		age = oid.Timestamp()
+	}
+	return !age.Before(mark.From)
+}
+
+// fastTierMatch returns the _id and age field of one document the fast tier
+// matches for filter.
+func (r *Router) fastTierMatch(ctx context.Context, ns string, filter, collation bson.Raw) (bson.Raw, bool, error) {
+	proj := bson.D{{Key: "_id", Value: 1}}
+	if f, ok := r.ageFieldOf(ns); ok && f != "_id" {
+		proj = append(proj, bson.E{Key: f, Value: 1})
+	}
+	db, coll := splitNS(ns)
+	opts := options.FindOne().SetProjection(proj)
 	if len(collation) > 0 {
 		// The same question the client's own statement will ask, asked the same
 		// way. Without this the fast tier is searched case-sensitively for a
@@ -199,14 +279,15 @@ func (r *Router) fastTierMatches(ctx context.Context, ns string, filter, collati
 			opts = opts.SetCollation(&c)
 		}
 	}
+	var match bson.Raw
 	err := r.hot.Database(db).Collection(coll).
 		FindOne(ctx, filter, opts).
-		Err()
+		Decode(&match)
 	if err == nil {
-		return true, nil
+		return match, true, nil
 	}
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return false, nil
+		return nil, false, nil
 	}
-	return false, err
+	return nil, false, err
 }
