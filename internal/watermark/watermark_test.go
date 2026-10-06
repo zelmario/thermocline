@@ -278,3 +278,39 @@ func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
 		t.Errorf("ClearDatabase on an untouched database: %d, %v", n, err)
 	}
 }
+
+// The warmer lowers the claim batch by batch while the evictor raises it, and a
+// lowering that lands on top of a raise puts the claim back over documents the
+// evictor has removed. LowerFrom writes only over what the warmer last saw.
+func TestLowerFromDoesNotUndoARaise(t *testing.T) {
+	s, cleanup := testStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	first := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 1, 9, 0, 0, 0, 0, time.UTC)
+	raisedTo := time.Date(2026, 1, 20, 0, 0, 0, 0, time.UTC)
+
+	if wrote, err := s.LowerFrom(ctx, testNS, first, "when", time.Time{}, false); err != nil || !wrote {
+		t.Fatalf("first claim: wrote=%v err=%v", wrote, err)
+	}
+	if wrote, err := s.LowerFrom(ctx, testNS, first, "when", time.Time{}, false); err != nil || wrote {
+		t.Fatalf("expecting no claim over an existing one: wrote=%v err=%v, want false", wrote, err)
+	}
+	if wrote, err := s.LowerFrom(ctx, testNS, second, "when", first, true); err != nil || !wrote {
+		t.Fatalf("lowering over its own claim: wrote=%v err=%v", wrote, err)
+	}
+	if _, err := s.RaiseTo(ctx, testNS, raisedTo, "when"); err != nil {
+		t.Fatalf("RaiseTo: %v", err)
+	}
+	if wrote, err := s.LowerFrom(ctx, testNS, second.Add(-24*time.Hour), "when", second, true); err != nil || wrote {
+		t.Fatalf("lowering over the evictor's raise: wrote=%v err=%v, want false", wrote, err)
+	}
+	m, err := s.Load(ctx, testNS)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !m.From.Equal(raisedTo) {
+		t.Errorf("claim is %v, want the evictor's %v", m.From, raisedTo)
+	}
+}

@@ -280,6 +280,46 @@ func (s *Store) Set(ctx context.Context, ns string, from time.Time, dimension st
 	return nil
 }
 
+// LowerFrom moves the claim to from, but only if it still says what the caller
+// last saw: was when claimed is true, or no claim at all when it is false. It
+// reports whether it wrote.
+//
+// For the warmer, which lowers the claim one batch at a time over a run that can
+// last hours, while the evictor raises it to its cutoff on every sweep and then
+// deletes what fell below. A plain Set from the warmer lands on top of a raise,
+// and puts the claim back over documents the evictor has already removed.
+// Measured with a warm reaching past the eviction cutoff: the evictor raised the
+// claim, removed 74 documents, and the warmer's next batch wrote the claim back
+// below them; reads then trusted a claim the fast tier was 74 documents short of
+// until the next sweep raised it again.
+//
+// Compared against the value the caller itself last wrote, not one read at the
+// start of a run, so it fails only when something else has moved the claim since.
+func (s *Store) LowerFrom(ctx context.Context, ns string, from time.Time, dimension string, was time.Time, claimed bool) (bool, error) {
+	filter := bson.D{{Key: "_id", Value: ns}}
+	if claimed {
+		filter = append(filter, bson.E{Key: "completeFrom", Value: was.UTC()})
+	} else {
+		filter = append(filter, bson.E{Key: "completeFrom", Value: bson.D{{Key: "$exists", Value: false}}})
+	}
+	res, err := s.coll.UpdateOne(ctx, filter,
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "completeFrom", Value: from.UTC()},
+			{Key: "dimension", Value: dimension},
+			{Key: "updatedAt", Value: time.Now().UTC()},
+		}}},
+		options.UpdateOne().SetUpsert(!claimed))
+	if err != nil {
+		// No claim expected and one found: the upsert's insert collides with
+		// the row that holds it, which is the same answer as matching nothing.
+		if mongo.IsDuplicateKeyError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lower watermark for %s: %w", ns, err)
+	}
+	return res.MatchedCount > 0 || res.UpsertedCount > 0, nil
+}
+
 // RaiseTo moves the watermark later, never earlier, and reports whether it
 // changed anything.
 //

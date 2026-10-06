@@ -233,17 +233,13 @@ func (w *Warmer) countBothInWindow(ctx context.Context, rule config.WarmRule, fr
 // to, which is the honest description of a tier being emptied. The next warm
 // makes the claim again if it is true by then.
 //
-// What is left is the gap between this answer and the write that follows it, and
-// it is worth saying why that is not closed with a compare and set on the
-// watermark. The evictor narrows the claim, then waits settleClaim, then
-// deletes: the window here would have to span that wait, which is
-// watermark.ClaimCacheTTL and a second, for the fast tier to lose a document
-// between this check passing and the claim being written. A compare and set
-// would have to read the watermark immediately before writing it to be any
-// tighter than that, and getting the expected value from the start of the run
-// instead would refuse to claim on any namespace whose evictor sweeps during a
-// warm, which is all of them. A warmer that never records a claim sends every
-// read to the archive, so that cure is worse than this disease.
+// The gap between this answer and the write that follows it is closed by the
+// write itself: it is a compare and set against the claim as this run last left
+// it, so an evictor that raised the claim in between makes it fail rather than
+// be written over. The expected value is the run's own last write, not the
+// claim read when the run began, so it fails only when something really moved
+// the claim. See watermark.LowerFrom, which was needed for the per-batch writes
+// first: those had no check at all.
 func (w *Warmer) stillHolds(ctx context.Context, rule config.WarmRule, from time.Time) bool {
 	if w.dryRun {
 		return true
@@ -394,6 +390,10 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 
 	start := resumePoint(saved, now)
 
+	// The claim as this run last left it, which is what every write of it below
+	// must still find. See watermark.LowerFrom.
+	claim := saved
+
 	// Before the documents, not after: an index built on an empty collection
 	// costs nothing and one built on a full one costs a scan. See indexes.go
 	// for why a warmed tier has none of its own.
@@ -482,7 +482,7 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		}
 		if len(docs) == 0 {
 			// Nothing older left inside the window, so the whole range is done.
-			if err := w.claimComplete(ctx, rule, floor); err != nil {
+			if err := w.claimComplete(ctx, rule, floor, claim); err != nil {
 				return stats, err
 			}
 			return stats, nil
@@ -513,9 +513,16 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, err
 		}
 		if !w.dryRun {
-			if err := w.marks.Set(ctx, rule.NS, watermarkAfter(oldest), rule.DateField); err != nil {
+			next := watermarkAfter(oldest).UTC().Truncate(time.Millisecond)
+			wrote, err := w.marks.LowerFrom(ctx, rule.NS, next, rule.DateField, claim.From, claim.Claimed)
+			if err != nil {
 				return stats, err
 			}
+			if !wrote {
+				w.claimMoved(rule)
+				return stats, nil
+			}
+			claim = watermark.Mark{From: next, Claimed: true}
 		}
 
 		w.limiter.spend(ctx, len(docs))
@@ -545,7 +552,7 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		// Short and not cut for size: the range has run out. See read.
 		if len(docs) < w.cfg.BatchSize && !cut {
 			if !w.dryRun {
-				if err := w.claimComplete(ctx, rule, floor); err != nil {
+				if err := w.claimComplete(ctx, rule, floor, claim); err != nil {
 					return stats, err
 				}
 			} else {
@@ -887,7 +894,7 @@ func (w *Warmer) waitForHealth(ctx context.Context) (bool, error) {
 // the boundary claim is the honest one and the cost of it is named, because an
 // operator reading "complete" has no other way to learn that unbounded queries
 // are still going to the archive.
-func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor time.Time) error {
+func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor time.Time, claim watermark.Mark) error {
 	older, err := olderThanFilter(rule, floor)
 	if err != nil {
 		return err
@@ -906,8 +913,11 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 		if !w.stillHolds(ctx, rule, time.Time{}) {
 			return nil
 		}
-		if err := w.marks.Set(ctx, rule.NS, time.Time{}, rule.DateField); err != nil {
+		if wrote, err := w.marks.LowerFrom(ctx, rule.NS, time.Time{}, rule.DateField, claim.From, claim.Claimed); err != nil {
 			return err
+		} else if !wrote {
+			w.claimMoved(rule)
+			return nil
 		}
 		w.log.Info("complete for all of history", "ns", rule.NS,
 			"why", "the archive holds no live document older than this warm, so the fast tier holds every one",
@@ -918,8 +928,11 @@ func (w *Warmer) claimComplete(ctx context.Context, rule config.WarmRule, floor 
 	if !w.stillHolds(ctx, rule, floor) {
 		return nil
 	}
-	if err := w.marks.Set(ctx, rule.NS, floor, rule.DateField); err != nil {
+	if wrote, err := w.marks.LowerFrom(ctx, rule.NS, floor, rule.DateField, claim.From, claim.Claimed); err != nil {
 		return err
+	} else if !wrote {
+		w.claimMoved(rule)
+		return nil
 	}
 	w.log.Info("complete", "ns", rule.NS, "complete_from", floor.Format(time.RFC3339),
 		"note", "the archive still holds documents older than this, so a query with no lower time bound "+
@@ -1166,4 +1179,20 @@ func (w *Warmer) mirroredToNow(ctx context.Context) bool {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// claimMoved says that something else moved this namespace's claim during the
+// warm, so the warm stops rather than write over it. See watermark.LowerFrom.
+//
+// It is almost always the evictor raising the claim to its cutoff, which it does
+// before removing what is older, so the range this warm is filling is the range
+// being emptied. Lowering the claim then would describe documents already gone.
+func (w *Warmer) claimMoved(rule config.WarmRule) {
+	w.log.Warn("not lowering a completeness claim something else moved during this warm",
+		"ns", rule.NS,
+		"why", "the evictor raises the claim to its cutoff before it removes what is older, so the "+
+			"documents this warm is filling are the ones being evicted",
+		"effect", "the claim stays where the evictor put it, and this rule stops for this run",
+		"action", "if this repeats every run, warmer.back reaches past evictor.older_than for this "+
+			"namespace, or the warm runs longer than warmer.residency protects what it copies")
 }
