@@ -169,6 +169,7 @@ feeder:
     # unique indexes for a minute, so a name reused with a different index is
     # still enforced under the old one.
     - "shop.tkupd"
+    - "shop.tkupd2"
     # testkeys.sh: a statement whose collation is the only reason its filter
     # matches, which is what decides the keys the registry claims for it.
     - "shop.tkupdcoll"
