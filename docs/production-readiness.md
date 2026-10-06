@@ -541,6 +541,73 @@ were already covered. `testkeys` has the case now, with the updated document
 archived as well as the key's holder; every earlier section kept the updated
 document on the fast tier.
 
+## 2026-10-06: an update that missed a document being evicted
+
+**An `updateMany` reported success and skipped one document.** The sweep on
+2026-10-05 had one disagreement in the fuzzer's churn round 2: an `updateMany`
+with `$inc: { n: 2 }` modified 55 documents through the router and 56 on the
+untiered reference, and both tiers kept document 1006 at the old value. It did
+not come back in 16 more rounds on either build, so it stayed a lead.
+
+The router's log placed it. The update copied one document up, and the sweep
+that ended two seconds before had evicted one. Before a multi-document write
+the router asks the fast tier which matches it already holds, skips those, and
+then writes a hold so the evictor leaves them alone. The evictor's side is to
+announce, read the holds, and delete. A sweep that read the holds before the
+router wrote its own deleted a document the router had just decided not to
+copy, and the statement then ran against a fast tier without it. The insert
+path had the same handshake in the right order all along: write the hold, then
+read the announcement, so whichever side runs second sees the other.
+
+The window is about a millisecond, which is why rounds did not find it again.
+An integration test holds it still, with the evictor's delete placed right
+after the fast tier answers:
+
+    a document announced for eviction, deleted in the window
+                                          before              after
+    reported held, so the copy skips it   yes                 no, copied up
+    an eviction withdrawn after 100ms     held                held, 0.2s
+    an announcement 5 minutes old         held                held, no wait
+
+Both copy-up paths for a write now hold first, then read the announcements.
+A document with an eviction in flight is waited for, up to two seconds, and
+copied up from a fresh read of the archive once it has gone. Only an
+announcement under 30 seconds old counts as in flight, judged by the archive's
+own clock, because one left standing by a delete that matched nothing lasts an
+hour. The warmer still asks first; there it costs a document the warm meant to
+bring up and no statement depends on it.
+
+**The same window, on three paths with no hold at all.** An upsert, an
+unacknowledged write and an unsorted findAndModify each ask the fast tier
+whether it matches anything, and on a yes let the statement through. Nothing
+held the match. A sweep taking it before mongod ran the statement made the
+upsert match nothing and create a document; with the `_id` in its filter, the
+feeder then mirrors that new document over the archived record. A sorted
+findAndModify skipped the hold the same way, and would take the next document
+in the sort. Each now holds what it found, but only when an eviction could
+reach it: the evictor raises the claim to its cutoff before removing anything
+older, so a match aged at or after the claim cannot go first, and the hot path
+of an upsert on a recent document costs nothing more. Measured with the same
+hook: a match an eviction took was reported present before and is now reported
+missing, so the write goes to the archive; a recent match writes no hold, an old
+one and one with no date do.
+
+**The warmer's claim undid the evictor's.** The warmer lowers the completeness
+claim after every batch, with a plain write. The evictor raises it to its
+cutoff on every sweep and then removes what fell below. A batch landing after a
+raise put the claim back over documents already removed, and reads trusted it
+until the next sweep. A probe with a warm reaching past the eviction cutoff,
+sampling the claim against both tiers about every second:
+
+    build      runs   samples   claim wrong   worst
+    before        3        41             6   fast tier 385 of 459 claimed
+    after         3        26             0
+
+The warm's final claim already checked the fast tier first, and still had the
+gap between that check and its write. Every claim the warmer writes is now a
+compare and set against its own last write, so a raise makes it fail, and the
+warm stops for that run with a line saying why.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
