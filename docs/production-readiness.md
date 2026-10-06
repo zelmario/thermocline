@@ -628,6 +628,22 @@ evictor notices. Both commands now hold the evictor's lease while they count,
 write or mark. The backfill probe needed 30,000 documents to show anything: with
 300 or 6,000 the marking pass finished inside the wait.
 
+**`cline pause` returned while a sweep went on.** The restore procedure is pause
+and then restore, and the evictor read the hold only as a sweep began. A sweep
+already running removed 1,000 to 1,050 more documents in the ten seconds after
+pause returned, three rounds of three, each confirmed against the archive about
+to be replaced. The evictor now reads the hold before every batch, and pause
+waits for a sweep in progress to reach that check: 0 in three rounds.
+
+**The probe written for item 9 failed on every build.** Run to close item 11,
+`test/echorace` sends 32 simultaneous reads of one archived document through two
+routers after each eviction and reads the change stream late. A copy-up was
+shown as an insert in 2 of 12 rounds on 38545d7, 4 of 18 on b7cc9e3 and 9 of 22
+on 810a4c6. Two copy-ups both found the document absent and both opened a
+promotion, and the second, landing after the first one's insert, moved the
+promotion's instant past it. A promotion opened in the last ten seconds is now
+joined rather than reopened: 0 of 18.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
