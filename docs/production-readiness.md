@@ -608,6 +608,26 @@ gap between that check and its write. Every claim the warmer writes is now a
 compare and set against its own last write, so a raise makes it fail, and the
 warm stops for that run with a line saying why.
 
+**Two operator commands acted inside the evictor's wait.** The evictor raises
+the claim, waits about six seconds for routers to read it, and then deletes
+what fell below, without reading the claim again. Asking who else writes or
+reads the claim during that wait found two more:
+
+    command                            what landed in the wait        before         after
+    watermark --complete-all           counted, then wrote the claim  3 of 3 wrong:  0 of 3, refused
+                                                                      150 of 300
+    backfill --apply --force           read the claim, then marked    959 and 682    0 and 0
+                                       absent documents deleted       tombstoned
+
+The declaration counted documents the sweep had not removed yet and wrote the
+claim back over them. Backfill's marking pass took an evicted document for one
+the application deleted, and the documents it marked were gone from both tiers.
+The restore procedure in operations.md pauses eviction first and was safe; the
+way round it was `--force`, or the half minute after a feeder stops before the
+evictor notices. Both commands now hold the evictor's lease while they count,
+write or mark. The backfill probe needed 30,000 documents to show anything: with
+300 or 6,000 the marking pass finished inside the wait.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
