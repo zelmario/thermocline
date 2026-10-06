@@ -667,7 +667,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 and 5, which are not code, and item 11, which is.**
+This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and 5, which are not code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -924,7 +924,7 @@ This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 a
   suites that reach it, ahead of a full sweep, because the defect was already
   on master: run both sweeps before relying on it.
 
-- [ ] **11. A copy-up concurrent with a delete puts the deleted document back.**
+- [x] **11. A copy-up concurrent with a delete puts the deleted document back.**
   Found on 2026-09-29 by `FOR=2h test/store/shared.sh` on 71b55d3, 1h52m in.
   Both consumers reported order 6abc4d97000c6ef93715db78 missing, and they were
   right: the application deleted it at 23:45:29.392, and at 23:45:29.621 a
@@ -986,6 +986,16 @@ This is the whole list. Nothing else blocks. **Three of eleven remain: items 4 a
 
   Open until both sweeps and a 2h `shared.sh` run are clean. What is left
   inside the race itself is written in `docs/limitations.md`.
+
+  **Closed on 2026-10-06.** The probe for the two-router promotion race,
+  `test/echorace`, failed on every build when run to close this: a copy-up
+  shown to a late consumer as an insert in 2 of 12 rounds on 38545d7 and 9 of
+  22 on 810a4c6. Fixed in 1fcb003, 0 of 18. Then, on that code, the reached
+  suites 913 passed and 0 failed, and `FOR=2h shared.sh` was clean: both
+  applications 0 errors and nothing wrong, each consumer saw every one of the
+  other application's orders (30,206 and 30,225), both routers 0 stale reads,
+  0 refused and 0 panics across about 658,000 commands and 211,000 copy-ups
+  each. The full in-node sweep was 2032 and 0 on 2ffb17e the same day.
 
 ## What 2026-09-21 added that an operator has to do
 
