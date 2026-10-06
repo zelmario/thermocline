@@ -242,14 +242,25 @@ func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	when := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	// Names of its own. The store is the real bookkeeping database, and the
+	// suites run by hand keep their claims there for a database called shop:
+	// those were counted here as this test's, and withdrawn.
+	names := []string{"tcwmshop.orders", "tcwmshop.events", "tcwmshopping.orders", "tcwmwarehouse.stock"}
+	clear := func() {
+		for _, ns := range names {
+			_, _ = s.coll.DeleteOne(context.Background(), bson.D{{Key: "_id", Value: ns}})
+		}
+	}
+	clear()
+	defer clear()
 
-	for _, ns := range []string{"shop.orders", "shop.events", "shopping.orders", "warehouse.stock"} {
+	for _, ns := range names {
 		if err := s.Set(ctx, ns, when, ""); err != nil {
 			t.Fatalf("Set %s: %v", ns, err)
 		}
 	}
 
-	n, err := s.ClearDatabase(ctx, "shop")
+	n, err := s.ClearDatabase(ctx, "tcwmshop")
 	if err != nil {
 		t.Fatalf("ClearDatabase: %v", err)
 	}
@@ -258,10 +269,10 @@ func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
 	}
 
 	for ns, wantClaimed := range map[string]bool{
-		"shop.orders":     false,
-		"shop.events":     false,
-		"shopping.orders": true,
-		"warehouse.stock": true,
+		"tcwmshop.orders":     false,
+		"tcwmshop.events":     false,
+		"tcwmshopping.orders": true,
+		"tcwmwarehouse.stock": true,
 	} {
 		got, lerr := s.Load(ctx, ns)
 		if lerr != nil {
@@ -274,7 +285,7 @@ func TestClearDatabaseWithdrawsOnlyThatDatabase(t *testing.T) {
 
 	// A database with nothing recorded is not an error, so the feeder can call
 	// this on every dropDatabase it sees.
-	if n, err = s.ClearDatabase(ctx, "nothing"); err != nil || n != 0 {
+	if n, err = s.ClearDatabase(ctx, "tcwmnothing"); err != nil || n != 0 {
 		t.Errorf("ClearDatabase on an untouched database: %d, %v", n, err)
 	}
 }
