@@ -110,8 +110,8 @@ done
 echo "  mirroring ${lag}s behind, position published ${pos}s ago"
 
 echo "== two routers =="
-ND "${ROUTER_ENV:-} cline router --config $CFG --log-file /root/sharedlog/router1.log"
-ND "${ROUTER_ENV:-} cline router --config $CFG2 --log-file /root/sharedlog/router2.log"
+ND "${ROUTER_ENV:-} cline router --config $CFG --log-file /root/sharedlog/router1.log 2>/root/sharedlog/router1.err"
+ND "${ROUTER_ENV:-} cline router --config $CFG2 --log-file /root/sharedlog/router2.log 2>/root/sharedlog/router2.err"
 Q "$HOT" "
   const a = db.getSiblingDB('admin');
   try { a.dropUser('$APPB_USER') } catch (e) {}

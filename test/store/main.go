@@ -37,6 +37,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -124,6 +125,9 @@ type shop struct {
 	// streamErrors counts a stream that failed and was reopened from the stored
 	// token. Already in errs; kept apart so a run says how often it happened.
 	streamErrors atomic.Int64
+	// lastEvent is when the consumer last read an event, in Unix nanoseconds,
+	// for the watchdog that dumps the goroutines when it stops. See watchStream.
+	lastEvent atomic.Int64
 
 	// resyncEvery is how often the consumer falls further behind than the
 	// oplog, and what it then does about it, which is what every consumer
@@ -354,6 +358,8 @@ func main() {
 	tailStopped := make(chan struct{})
 	go func() { s.tail(ctx, tailDone, tailReady); close(tailStopped) }()
 	<-tailReady
+	s.lastEvent.Store(time.Now().UnixNano())
+	go s.watchStream(tailDone, tailStopped)
 
 	var wg sync.WaitGroup
 	for w := 0; w < *conc; w++ {
@@ -1299,8 +1305,16 @@ func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- stru
 				s.errs.Add(1)
 				if !announced {
 					close(ready)
+					return
 				}
-				return
+				// resync has said why. Tried again rather than ending the
+				// consumer, for the reason given where Watch fails below.
+				select {
+				case <-done:
+					return
+				case <-time.After(time.Second):
+				}
+				continue
 			}
 			s.clearToken(ctx)
 			opts.SetStartAtOperationTime(&t0)
@@ -1322,8 +1336,22 @@ func (s *shop) tail(ctx context.Context, done <-chan struct{}, ready chan<- stru
 				s.clearToken(ctx)
 				continue
 			}
+			// Reopened, the same as a stream that fails once it is open (see
+			// consume), and for the same reason. Returning here ended the
+			// consumer without a word: on 2026-10-07 a Watch refused "not
+			// primary" across a step-down stopped one, and the run reported
+			// 1,459 orders the stream "never reported" from a stream nobody
+			// was reading any more.
 			s.errs.Add(1)
-			return
+			s.streamErrors.Add(1)
+			fmt.Printf("[%s] the consumer could not reopen its stream, trying again: %v\n",
+				time.Now().Format("15:04:05"), err)
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Second):
+			}
+			continue
 		}
 		if !announced {
 			close(ready)
@@ -1382,6 +1410,7 @@ func (s *shop) consume(ctx context.Context, cur *mongo.ChangeStream, done <-chan
 			}
 			continue
 		}
+		s.lastEvent.Store(time.Now().UnixNano())
 		var ev struct {
 			ID            bson.Raw `bson:"_id"`
 			OperationType string   `bson:"operationType"`
@@ -1752,5 +1781,38 @@ func reportClasses(before, after map[string]int64) {
 			continue
 		}
 		fmt.Printf("  %-28s %8s  %5.1f%%\n", labels[n], commas(int(d[n])), float64(d[n])/float64(total)*100)
+	}
+}
+
+// watchStream says so, once, when the consumer has read nothing for 90 seconds
+// while the shop is still placing orders, and prints every goroutine's stack.
+//
+// On 2026-10-07 a consumer read nothing for the last eight minutes of a
+// step-down run and said nothing until the end, when 1,459 orders were "never
+// reported". The router's log could not say whether the consumer had stopped
+// asking or the router had stopped answering. A stack taken while it is stuck
+// can: a goroutine blocked reading a reply is waiting on the router, and no
+// consumer goroutine at all means the consumer gave up.
+func (s *shop) watchStream(done, stopped <-chan struct{}) {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-stopped:
+			fmt.Printf("[%s] the consumer stopped while the shop was still running\n",
+				time.Now().Format("15:04:05"))
+			return
+		case <-t.C:
+		}
+		quiet := time.Since(time.Unix(0, s.lastEvent.Load()))
+		if quiet < 90*time.Second {
+			continue
+		}
+		fmt.Printf("[%s] the consumer has read nothing for %s, every goroutine follows\n",
+			time.Now().Format("15:04:05"), quiet.Round(time.Second))
+		_ = pprof.Lookup("goroutine").WriteTo(os.Stdout, 2)
+		return
 	}
 }
