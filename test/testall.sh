@@ -374,6 +374,13 @@ kill $RP 2>/dev/null; wait $RP 2>/dev/null
 # complete" are two of them, so a single sweep already met the bar, and under a
 # four-worker sweep the window closed between those two lines and it failed for
 # saying 1. What it means to assert is that --every comes round again.
+#
+# With a feeder running. Nothing mirrored from the feeder -v check until here,
+# and the evictor pauses once mirroring is 30s behind, which is the guard doing
+# its job. On 2026-10-07 the router check before this one was slow enough under
+# a four-worker sweep that the second sweep began at 29s of lag, paused, and
+# finished at 34.7s: "saw 1 in 30s" from an evictor that was right to wait.
+cline feeder --config $CFG --log-file $LOGDIR/t_evfeeder.log & EVF=$!
 rm -f $LOGDIR/t_evictor.log
 cline evictor --config $CFG --every 2s --log-file $LOGDIR/t_evictor.log &
 EP=$!
@@ -385,6 +392,7 @@ for _ in $(seq 1 60); do
 done
 [ "$N" -ge 2 ] && { PASS=$((PASS+1)); echo "  PASS  evictor --every loops ($N sweeps)"; } || { FAIL=$((FAIL+1)); FAILED+=("evictor --every"); echo "  FAIL  evictor --every loops (saw $N in 30s)"; }
 kill $EP 2>/dev/null; wait $EP 2>/dev/null
+kill $EVF 2>/dev/null; wait $EVF 2>/dev/null
 
 echo "== two of one daemon =="
 # Two feeders with one id watch the same namespaces and both see every delete,

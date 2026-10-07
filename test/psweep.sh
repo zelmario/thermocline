@@ -41,8 +41,13 @@
 #   pgrep -af "[t]est|[c]line" ; ss -ltn | grep 272
 WORKERS=${WORKERS:-4}
 # How long one suite may take before it is killed and reported as a failure.
-# Generous next to testconform, the longest, at about seven minutes.
-SUITE_TIMEOUT=${SUITE_TIMEOUT:-25m}
+#
+# This was 25m when testconform took about seven. Both it and testkeys grew past
+# that under four workers: testconform was killed at the limit in every kept
+# sweep from 2026-09-30 to 2026-10-07, testkeys took 1443s on 2026-09-30 and was
+# killed in the two after. A killed suite reports no tally, so the sweep's total
+# went on looking clean while the end of both suites never ran.
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-45m}
 OUT=${OUT:-/root/psweep}
 SHARED=${SHARED:-/root/cline.yaml}
 SUITES=${SUITES:-"testconform testfuzz testauthterm testkeys testtxn testconcerns

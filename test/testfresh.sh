@@ -303,15 +303,25 @@ echo "== a fallback read waits for mirroring, not for a checkpoint =="
 # hundred milliseconds of noise on a busy machine and has nothing to do with the
 # barrier being measured: it failed at 957 ms on a host that was running a full
 # regression at the time, with the read itself well inside the budget.
-TIMED=$(R "const t=Date.now();
-           const n=db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({});
-           print(n + ' ' + (Date.now()-t));")
-GOT=${TIMED%% *}
-READ_MS=${TIMED##* }
+#
+# The median of five, not one read. The defect cost every fallback read a
+# checkpoint interval, so it moves the median; load slows some reads and not
+# others. On 2026-10-07 one read took 767 ms under a four-worker sweep (load
+# average 14) and 61 ms on the same build alone, and a single sample could not
+# tell that from the defect.
+TIMED=$(R "const ms=[]; let n=-1;
+           for (let i=0; i<5; i++) {
+             const t=Date.now();
+             n=db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({});
+             ms.push(Date.now()-t);
+           }
+           const s=ms.slice().sort((a,b)=>a-b);
+           print(n + ' ' + s[2] + ' ' + ms.join(','));")
+GOT=$(echo "$TIMED" | awk '{print $1}')
+READ_MS=$(echo "$TIMED" | awk '{print $2}')
 chk "the fallback read is still correct"      "10"   "$GOT"
-echo "      the fallback read itself took ${READ_MS} ms"
-chk "and it took well under a second"         "true" "$([ "${READ_MS:-9999}" -lt 700 ] && echo true || echo false)"
-echo "      (fallback read took ${READ_MS} ms)"
+echo "      five fallback reads took $(echo "$TIMED" | awk '{print $3}') ms, median ${READ_MS}"
+chk "and they took well under a second"       "true" "$([ "${READ_MS:-9999}" -lt 700 ] 2>/dev/null && echo true || echo false)"
 
 echo "== the position moves while the checkpoint stands still =="
 # Those are two different questions and they get two different records. A
