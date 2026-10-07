@@ -493,7 +493,9 @@ Part of [Thermocline](../README.md).
   the router's and a re-resolution empties the pool for the old member.
 
 - **With authentication proxied, a single write across a step-down can still
-  fail, on a loaded box.** The driver retries once, and the retry lands only if
+  fail: 4 of 20 on a quiet box on 2026-10-07, with a client that was busy when
+  the primary moved.** The mechanism is measured further down this entry. The
+  history follows. The driver retries once, and the retry lands only if
   the router has found the new primary by then. In 6 of the last 10 full host
   sweeps, 2026-09-25 and 26, `testfailover.sh` saw that write fail after about
   2.4 seconds with "not primary", and sometimes a write during a window with
@@ -567,10 +569,31 @@ Part of [Thermocline](../README.md).
                                     which MongoDB never retries
 
   The difference is how a driver treats a connection closed under it. Node's
-  (mongosh) discards a closed idle connection at checkout, so the close is
-  free. Go's does not notice until it sends on it, gets a network error, and
-  clears and pauses its whole pool, and whatever needs a connection in that
-  moment fails with "connection pool was cleared". That reached a change stream
+  (mongosh) discards a closed idle connection at checkout, so closing an idle
+  sibling is free. Go's does not notice until it sends on it, gets a network
+  error, and clears and pauses its whole pool, and whatever needs a connection
+  in that moment fails with "connection pool was cleared".
+
+  Closing the connection that got the refusal is not free for Node either.
+  Measured on 2026-10-07 on a quiet box, a fresh mongosh writing through the
+  router just after a step-down, 20 rounds with the driver's command and
+  connection logs on (`proxfo.sh`): 16 landed, 4 failed, none applied twice.
+  All four were the same sequence to within milliseconds. mongosh's own
+  startup read went out on a connection still bound to the old member and was
+  refused "not primary". The write was queued waiting for a connection, and
+  Node handed it that one as the refusal checked it in, before it had read the
+  router's close. The write failed `MongoNetworkError: connection 1 closed`,
+  the pool was cleared, and the retry failed on the cleared pool. The router
+  presents itself as a single server, and for that topology Node's server
+  selection returns the server at once rather than waiting for the monitor, so
+  any network error in a failover spends the retry. The new primary was known
+  to the router 14ms after the refusal; the election was never the problem.
+
+  No cheaper reply fixes this. Kept open, the connection is refused again and
+  Node retries on the connection it just checked in. Closed later, the window
+  moves rather than shrinks. ShutdownInProgress clears the pool the retry is
+  about to use. A connection authenticated against the old member cannot do
+  useful work, so the fix is the one below. That reached a change stream
   in both runs: the consumer has to reopen it from its own stored token, which a
   consumer of a stream straight from the set did not have to do once in
   261,342 operations.
