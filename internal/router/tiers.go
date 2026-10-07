@@ -1839,6 +1839,32 @@ func (r *Router) commandError(requestID, responseTo int32, errmsg string) (*wire
 	return wire.NewMsg(requestID, responseTo, out)
 }
 
+// relayedError is a failed command reply for work this router did on the
+// client's behalf, when what failed was mongod refusing the client's own query.
+//
+// commandError's generic 125 is right for a refusal this router makes. It is
+// wrong for an error mongod raised: a $merge whose 'on' field is missing failed
+// 51132 straight to mongod and 125 through the router, found by the fuzzer on
+// 2026-10-07, and a client handling 51132 never saw it. So mongod's code and
+// name are kept, with this router's explanation in front of mongod's message.
+//
+// Not a code that says a member stopped being primary: the client could not
+// retry its way past that here, because the read that failed was this router's,
+// and passing it on would invite exactly the retry the generic code avoids.
+func (r *Router) relayedError(requestID, responseTo int32, errmsg string, err error) (*wire.Message, error) {
+	var ce mongo.CommandError
+	if errors.As(err, &ce) && ce.Code != 0 && !isStateChangeCode(int(ce.Code)) {
+		return r.commandErrorWithCode(requestID, responseTo, errmsg, ce.Code, ce.Name)
+	}
+	var we mongo.WriteException
+	if errors.As(err, &we) && len(we.WriteErrors) > 0 {
+		if c := we.WriteErrors[0].Code; c != 0 && !isStateChangeCode(c) {
+			return r.commandErrorWithCode(requestID, responseTo, errmsg, int32(c), "")
+		}
+	}
+	return r.commandError(requestID, responseTo, errmsg)
+}
+
 // duplicateKeyError is commandError with mongod's own duplicate key code.
 //
 // For the refusals that are not this router announcing a limitation but this

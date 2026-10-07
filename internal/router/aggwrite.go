@@ -182,7 +182,7 @@ func (c *conn) writePipelineError(msg *wire.Message, s aggScope, what string, ha
 			"result is moved in, and that last step cannot be the rename mongod would use, because a " +
 			"rename is not mirrored. Re-run the aggregation once the cause is fixed"
 	}
-	out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID, text)
+	out, rerr := c.r.relayedError(msg.Header.RequestID, msg.Header.RequestID, text, err)
 	if rerr != nil {
 		return nil, false
 	}

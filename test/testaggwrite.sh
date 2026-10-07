@@ -100,6 +100,15 @@ chk "the result is on the fast tier, not only the archive" "10" "$(H "const d=db
 echo "== \$merge runs too =="
 chk "\$merge is accepted"        "ok" "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}},{\$merge:{into:'merged'}}]).toArray();print('ok')}catch(e){print(e.message.substring(0,60))}")"
 chk "it wrote three groups"      "3"  "$(H "print(db.getSiblingDB(process.env.TC_DB).merged.countDocuments({}))")"
+# One mongod refuses, performed here because the input is archived: a null _id
+# cannot be merged on. The router failed it as its own CommandFailed, 125, where
+# mongod says 51132, found by the fuzzer on 2026-10-07. Asked of the fast tier
+# directly with the same pipeline rather than written down, so the check is
+# about the router passing mongod's answer on and not about which code it is.
+BADMERGE="[{\$group:{_id:null,n:{\$sum:1}}},{\$merge:{into:'mergedbad'}}]"
+DIRECT=$(H "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate($BADMERGE).toArray();print('ACCEPTED')}catch(e){print(e.code)}")
+chk "a \$merge mongod refuses keeps mongod's code" "$DIRECT" "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate($BADMERGE).toArray();print('ACCEPTED')}catch(e){print(e.code)}")"
+chk "  which is a refusal, not an acceptance"      "true" "$([ -n "$DIRECT" ] && [ "$DIRECT" != ACCEPTED ] && echo true || echo false)"
 
 echo "== the result mirrors down like any other write =="
 sleep 6

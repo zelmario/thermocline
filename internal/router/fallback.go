@@ -382,8 +382,8 @@ func (c *conn) serveOwnCursors(ctx context.Context, msg *wire.Message, name stri
 	}
 	if err != nil {
 		c.log.Warn("archive getMore failed", "err", err)
-		fail, ferr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-			"thermocline: reading the next batch from the archive failed: "+err.Error())
+		fail, ferr := c.r.relayedError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: reading the next batch from the archive failed: "+err.Error(), err)
 		if ferr != nil {
 			return true, ferr
 		}

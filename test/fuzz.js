@@ -667,7 +667,16 @@ function ask(what, op, fn, how) {
     }
     // Both failed differently. Only interesting when the tiered side is not
     // simply saying no.
-    if (/^thermocline:/.test(b.msg)) { refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return false; }
+    //
+    // Unless the router's message carries mongod's own error inside it, which
+    // the Go driver formats as "(CodeName) message". Then the router performed
+    // the work, mongod refused it, and the client was handed that refusal under
+    // the router's code instead of mongod's. On 2026-10-07 a $merge mongod
+    // refuses 51132 came back 125 and was counted here as a refusal, so the
+    // seed that found it passed.
+    if (/^thermocline:/.test(b.msg) && !/\([A-Z][A-Za-z]*\d*\) /.test(b.msg)) {
+      refused++; note(what, 'real'); refusals.push([what, op, b.msg]); return false;
+    }
     note(what, 'real');
     bugs.push([what, op, 'ref failed ' + a.code + ': ' + a.msg, 'tier failed ' + b.code + ': ' + b.msg]);
     return false;
