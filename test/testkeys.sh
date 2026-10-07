@@ -448,6 +448,15 @@ R 'db.getSiblingDB(process.env.TC_DB).tknull.insertOne({_id:1,other:1})' >/dev/n
 waitMirrored tknull 1
 evictBehindTheFeeder 'db.getSiblingDB(process.env.TC_DB).tknull.deleteOne({_id:1})'
 chk "a second missing-field document rejected" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknull.insertOne({_id:2,other:2});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# An upsert whose update cannot apply is refused by mongod for that reason
+# before any index is consulted: $[] on a path the new document does not have
+# is code 2, "The path 'tags' must exist". The router read the null key off the
+# filter without running the update and answered 11000, found by the fuzzer on
+# 2026-10-07. Both write nothing; the client was told a different thing.
+chk "an upsert that cannot apply gets mongod's own error" "2" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknull.updateOne({_id:3,grp:"a"},{$set:{"tags.$[]":1}},{upsert:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# And the control, without which a guard switched off would pass the line above.
+chk "  while one that applies still takes the null key"   "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tknull.updateOne({_id:4},{$set:{other:4}},{upsert:true});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+chk "  and neither wrote anything"                         "0" "$(H 'print(db.getSiblingDB(process.env.TC_DB).tknull.countDocuments({_id:{$in:[3,4]}}))')"
 
 echo "== a unique index created after the documents were evicted =="
 fresh tklate

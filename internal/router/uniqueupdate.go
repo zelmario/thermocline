@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -531,6 +532,24 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 			claimed = append(claimed, kids...)
 			if clash {
 				c.r.releaseKeys(ctx, claimed)
+				// mongod refuses an update for its own reasons before it ever
+				// reaches an index: $[] on a path that does not exist, $inc on
+				// a string. The key was read off the command without running
+				// it, so a statement that could never have written was answered
+				// E11000 where mongod says "The path 'tags' must exist", found
+				// by the fuzzer on 2026-10-07. A client that reads 11000 as
+				// "taken, pick another" acts on an answer MongoDB never gives.
+				//
+				// So before saying duplicate, the fast tier runs the statement
+				// in a transaction that is thrown away. If it fails on its own,
+				// the command goes through and fails the same way, writing
+				// nothing. One statement only: with more, forwarding would run
+				// the ones around it, and those are not all checked here.
+				if len(stmts) == 1 && c.failsOnItsOwn(ctx, ns, coll, st) {
+					c.log.Debug("an update whose key is taken fails for another reason first, letting mongod say which",
+						"ns", ns, "index", idxs[i].name)
+					return nil, false
+				}
 				c.r.Stats.DuplicateKeys.Add(1)
 				c.log.Debug("update would duplicate an archived document",
 					"ns", ns, "index", idxs[i].name)
@@ -707,6 +726,12 @@ func dryRunStatement(st updateStatement, ids []bson.RawValue) bson.D {
 		if !st.arrayFilters.IsZero() {
 			out = append(out, bson.E{Key: "arrayFilters", Value: st.arrayFilters})
 		}
+		// The filter is the client's own here, so it is matched the client's
+		// way. Not below: there it is an _id list already chosen, and a
+		// collation could widen a string _id to documents nobody matched.
+		if len(st.collation) > 0 {
+			out = append(out, bson.E{Key: "collation", Value: st.collation})
+		}
 		return out
 	}
 	out := bson.D{
@@ -718,6 +743,77 @@ func dryRunStatement(st updateStatement, ids []bson.RawValue) bson.D {
 		out = append(out, bson.E{Key: "arrayFilters", Value: st.arrayFilters})
 	}
 	return out
+}
+
+// failsOnItsOwn reports whether the fast tier refuses this statement for a
+// reason of its own, asked in a transaction that is always aborted. It is the
+// statement as the client sent it, filter, multi and collation included, so the
+// answer is the one the real command would get.
+//
+// Only a write error from the statement counts. A write conflict is about the
+// moment, not the statement, and an error running the dry run at all says
+// nothing either way; both answer false and leave the refusal standing, which
+// is what happened before this was asked.
+func (c *conn) failsOnItsOwn(ctx context.Context, ns, coll string, st updateStatement) bool {
+	dbName, _ := splitNS(ns)
+	stmt := bson.D{
+		{Key: "q", Value: st.filter},
+		{Key: "u", Value: st.update},
+		{Key: "upsert", Value: st.upsert},
+		{Key: "multi", Value: st.multi},
+	}
+	if !st.arrayFilters.IsZero() {
+		stmt = append(stmt, bson.E{Key: "arrayFilters", Value: st.arrayFilters})
+	}
+	if len(st.collation) > 0 {
+		stmt = append(stmt, bson.E{Key: "collation", Value: st.collation})
+	}
+	// findAndModify's, which decides the document it acts on and so whether
+	// the update can apply to it. An update statement takes a sort from 8.0,
+	// the release both tiers are held to.
+	if len(st.sort) > 0 && !st.multi {
+		stmt = append(stmt, bson.E{Key: "sort", Value: st.sort})
+	}
+	sess, err := c.r.hot.StartSession()
+	if err != nil {
+		return false
+	}
+	defer sess.EndSession(context.WithoutCancel(ctx))
+
+	failed := false
+	_ = mongo.WithSession(ctx, sess, func(sc context.Context) error {
+		if serr := sess.StartTransaction(); serr != nil {
+			return serr
+		}
+		defer func() { _ = sess.AbortTransaction(context.WithoutCancel(sc)) }()
+		derr := c.r.hot.Database(dbName).RunCommand(sc, bson.D{
+			{Key: "update", Value: coll},
+			{Key: "updates", Value: bson.A{stmt}},
+		}).Err()
+		if code, ok := dryRunWriteError(derr); ok {
+			failed = code != writeConflictCode
+		}
+		return nil
+	})
+	return failed
+}
+
+// writeConflictCode is WriteConflict, which a dry run in its own transaction can
+// meet for reasons that belong to the moment and not to the statement.
+const writeConflictCode = 112
+
+// dryRunWriteError is the code of the first write error a dry run met.
+//
+// The driver does not return a reply that carries write errors: RunCommand
+// turns them into a WriteException, so they arrive here as an error and never
+// as a reply to read writeErrors from. Measured on 2026-10-07, when the first
+// version of failsOnItsOwn read the reply and so never saw one.
+func dryRunWriteError(err error) (int, bool) {
+	var we mongo.WriteException
+	if !errors.As(err, &we) || len(we.WriteErrors) == 0 {
+		return 0, false
+	}
+	return we.WriteErrors[0].Code, true
 }
 
 // evaluateUpdate works out what a statement will produce, by having the fast
@@ -750,12 +846,15 @@ func (c *conn) evaluateUpdate(ctx context.Context, ns, coll string, stmt any, id
 			{Key: "update", Value: coll},
 			{Key: "updates", Value: bson.A{stmt}},
 		}).Decode(&reply); derr != nil {
+			// A write error in the dry run is the fast tier's own answer, and
+			// the client's command will get the same one. Nothing to check.
+			// It arrives as an error, not in the reply: see dryRunWriteError.
+			// Read from the reply, it never matched, and every such update
+			// was logged as one that "could create a duplicate".
+			if code, ok := dryRunWriteError(derr); ok && code != writeConflictCode {
+				return nil
+			}
 			return derr
-		}
-		// A write error in the dry run is the fast tier's own answer, and the
-		// client's command will get the same one. Nothing to check.
-		if writeFailed(reply) {
-			return nil
 		}
 
 		want := ids

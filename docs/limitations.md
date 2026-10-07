@@ -24,6 +24,18 @@ Part of [Thermocline](../README.md).
   is what mongod would do with it; what is lost is only the check against a
   duplicate that lives in the archive alone. Measured with a 13MB value.
 
+- **In a batch of updates, a key the archive holds is reported before mongod's
+  own reason to refuse.** An update that could never apply, `$[]` on a path the
+  document does not have or `$inc` on a string, is refused by mongod for that
+  reason before any index is consulted. Since 2026-10-07 a single update
+  statement gets mongod's answer: before saying E11000 the router has the fast
+  tier run it in a transaction that is thrown away, and forwards it if mongod
+  refuses it on its own. An update command with several statements, a
+  `bulkWrite`, and an update inside a transaction still get E11000 first,
+  because forwarding one of those would run statements around it that were not
+  checked. Nothing is written either way; the difference is which error the
+  client reads.
+
 - **Two feeders with different ids are not refused, and they double the work.**
   The lease stops two of the same daemon with the same id; two with different
   ids watching the same namespaces are not detected by anything, because nothing
