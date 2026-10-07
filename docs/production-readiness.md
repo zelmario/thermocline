@@ -644,6 +644,41 @@ promotion, and the second, landing after the first one's insert, moved the
 promotion's instant past it. A promotion opened in the last ten seconds is now
 joined rather than reopened: 0 of 18.
 
+## 2026-10-07: what the sweep was not running, and a failover explained
+
+**Two suites never reached their end in a full sweep.** The in-node sweep on
+8adc0c9 reported 1496 passed and 2 failed. Behind that total, testconform and
+testkeys were killed at the 25 minute suite limit and reported no tally.
+testconform had been killed there in every kept sweep since 2026-09-30, so
+every "clean" total since then left the end of both suites unrun. The limit is
+45 minutes now, and both were run to the end on the same build: testconform
+289/0, testkeys 245/0. With the two timing checks below, 8adc0c9 is 2030
+checks and no defect.
+
+**Two checks failed on timing, and neither was the product.** testall's
+evictor check ran with no feeder, so the evictor paused at 30 seconds of
+mirroring lag, which is the guard working. testfresh timed one fallback read
+at 767ms under a load average of 14; the same read took 61ms alone. The first
+runs a feeder now, the second takes the median of five reads, and each was made
+to fail once before it was trusted.
+
+**The proxied failover failure was measured, not explained, and the old
+explanation was wrong.** testfailover's comment blamed an election outlasting
+the router's wait. The router log had the new primary 14ms after the refusal.
+With the Node driver's own logs on, 20 step-downs on a quiet box: 16 writes
+landed, 4 failed, none applied twice, and all four were the same sequence. A
+connection still bound to the old member is refused and ended; a write queued
+for a connection gets it before the driver has read the close; the pool is
+cleared; and because the router is a single server to the driver, the retry
+does not wait and fails on the cleared pool. No cheaper reply avoids it, and
+the full reasoning is in [limitations.md](limitations.md). It is a refusal,
+never a wrong answer, so it stays an accepted limitation with
+`router.terminate_auth` as the way around it. The check now accepts exactly
+that failure and still fails on "not primary" or a timeout.
+
+Nothing joins **Open** today. The two items there still need a person: a
+measurement off this machine and a rehearsal of the procedure.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
