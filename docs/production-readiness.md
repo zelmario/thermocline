@@ -791,6 +791,58 @@ This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and
   tier answers alone. That is the shape of the tiering cost on six mongods
   sharing one disk.
 
+  **Off this box, 2026-10-08.** The Hetzner pair in `deploy/hetzner`: six
+  CCX13 (2 dedicated vCPU) for `rsHot` and `rsCold`, one CCX23 for the router,
+  the daemons and the shop, PSMDB 8.0.26-11, one private network with 0.3 to
+  0.5ms between nodes. The shop of `test/store/two.sh` with one application:
+  8,000 orders over 120 days, 800 customers, 300 products, 6 shoppers, the
+  warmer and the evictor looping underneath.
+
+      straight at the fast tier, 5m      702,309 operations   2,341/s   0 errors
+      through the router, bare archive   84,330 in 30m           47/s   0 errors, 0 violations
+      through the router, indexed        228,317 in 30m         127/s   0 errors, 0 violations
+
+  **The archive's indexes decide the fall-through cost, not the hardware.**
+  With only `_id` and `ref` on the archive, every read by customer or date
+  scanned 77,370 archived orders, 49.3% of answers came from there, and those
+  operations had a p50 of 120 to 145ms: the same as this box, on dedicated
+  CPUs. `cline indexes` named the four missing ones; building them took 412ms,
+  and the same shop went from 47/s to 127/s with archive-backed operations at
+  a p50 of about 42ms. The local runs never built them either, so their
+  fall-through numbers describe a bare archive. The rest of that 42ms is not
+  the archive, which answers a point read in 4ms: it is the freshness barrier
+  waiting for mirroring under write load, and it has not been taken apart yet.
+
+  **Mirroring: 200,000 documents in 19.0s, about 10,500/s**, feeder startup
+  included, written as a backlog with the feeder stopped. This box gives 2,000
+  to 3,700/s.
+
+  **Failover found a defect, and it is open.** Stepping the archive's primary
+  down every 60s under the shop, about one election in six left the feeder
+  silent for 10.5 to 11.2s. Every stall began at the priority takeover about
+  10s after the step-down (`rsCold` has one member at priority 2), not at the
+  step-down itself. The router's `archive_wait` is 5s, so reads stopped
+  waiting for mirroring and answered from an archive that did not hold the
+  client's own write yet: 7 read-your-writes violations in one six-minute run,
+  every one stamped at the moment the feeder resumed. What is known:
+
+  - The archive accepts `w: majority` writes every 100ms straight through both
+    elections, so it is not unavailable.
+  - A SIGQUIT taken 3s into a stall has the feeder's main goroutine in the
+    driver's server selection, under `meta.ReadEvictionNotices` in `flush`.
+  - A driver-only probe, reads every 100ms plus eight `w: majority` writers,
+    did not stall once across twelve step-downs, streaming or polling.
+  - A 1s heartbeat is not the fix. With `heartbeatFrequencyMS=1000` on the
+    URI one run of six step-downs was clean, and with the same default set in
+    code the next run of ten stalled once for 10.7s.
+
+  The logs, the stack dump and the probes are kept. The next step is to
+  reproduce it on this box with one `rsCold` member at priority 2, which costs
+  nothing.
+
+  Fast tier step-downs alternating with archive ones: 10 step-downs, 9 errors
+  the shop saw, 110/s, the one violation above.
+
 - [ ] **5. Rehearse the four procedures, by a person, against a staging pair.**
   Adoption, rollback, recovery after a feeder stops with a rolled oplog, and a
   rolling upgrade. `rehearse-the-procedure` is the lesson here: testing a
