@@ -123,10 +123,16 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
 		c.log.Warn("refused a $merge whose target could not be checked", "ns", target, "err", err)
-		out, rerr := c.r.commandError(0, msg.Header.RequestID,
+		// Relayed rather than generic: mergeKeys runs the client's own pipeline
+		// on the fast tier, so a $match mongod cannot parse fails there with
+		// mongod's code, and 125 hid it. Measured with {n: {$foo: 1}}: 125
+		// through the router, 2 BadValue straight to mongod. Still a refusal,
+		// not a forward, because a failure in the stages appended here would
+		// otherwise let the merge run unchecked.
+		out, rerr := c.r.relayedError(0, msg.Header.RequestID,
 			"thermocline: refusing this $merge because the documents it would match could not be "+
 				"determined, and a $merge that does not find the archived document creates one in its "+
-				"place and overwrites it: "+err.Error())
+				"place and overwrites it: "+err.Error(), err)
 		if rerr != nil {
 			return nil, false
 		}

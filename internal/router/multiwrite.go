@@ -402,6 +402,9 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		if isMaxTimeExpired(err) {
 			return 0, errCopyUpExpired
 		}
+		if r.fastTierRefusesToo(ctx, db, find, err) {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("read the archive: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
@@ -539,6 +542,63 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		return moved, err
 	}
 	return moved, nil
+}
+
+// fastTierRefusesToo reports whether the archive's refusal of a copy-up's find
+// is mongod refusing the client's own filter, by asking the fast tier the same
+// find and getting the same code back.
+//
+// A filter mongod cannot parse matches nothing on either tier, so there is
+// nothing to bring up, and the client's command goes on to the fast tier for
+// mongod's own answer. Measured on an archive-only collection: updateMany with
+// {n: {$foo: 1}} answers ok:1 with write error 2 from mongod, a bad $regex
+// option 51108, an unknown $expr operator 168, and through the router all
+// three were refused with CommandFailed, saying they matched documents the fast
+// tier did not hold. The upsert guard never had this, because it asks the fast
+// tier first and lets a refused filter through.
+//
+// The same code from both, not any error from the fast tier: the archive can
+// fail for its own reasons (a member stepping down, a lost connection), and
+// those leave the refusal standing.
+func (r *Router) fastTierRefusesToo(ctx context.Context, db string, find bson.D, archiveErr error) bool {
+	var ae mongo.CommandError
+	if !errors.As(archiveErr, &ae) || ae.Code == 0 || !aboutTheQuery(int(ae.Code)) {
+		return false
+	}
+	probe := make(bson.D, 0, len(find))
+	for _, e := range find {
+		if e.Key == "limit" {
+			e.Value = int64(1)
+		}
+		probe = append(probe, e)
+	}
+	cur, err := r.hot.Database(db).RunCommandCursor(ctx, probe)
+	if err == nil {
+		_ = cur.Close(context.WithoutCancel(ctx))
+		return false
+	}
+	var he mongo.CommandError
+	return errors.As(err, &he) && he.Code == ae.Code
+}
+
+// aboutTheQuery reports whether an error code can be mongod's verdict on the
+// query itself. The ones it cannot are about who asked, which member answered,
+// or how long it took, and a fast tier refusing the router for one of those is
+// no evidence the filter matches nothing: both tiers refusing this router's own
+// user with Unauthorized would otherwise let a write through to apply to half
+// of what it matches.
+func aboutTheQuery(code int) bool {
+	if isStateChangeCode(code) {
+		return false
+	}
+	switch code {
+	case 6, 7, 89, 9001, // HostUnreachable, HostNotFound, NetworkTimeout, SocketException
+		11600, 11601, // InterruptedAtShutdown, Interrupted
+		13, 18, // Unauthorized, AuthenticationFailed
+		50, 262: // MaxTimeMSExpired, ExceededTimeLimit
+		return false
+	}
+	return true
 }
 
 // bringUpOneForUnacked brings up the one archived document an unacknowledged

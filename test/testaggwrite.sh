@@ -75,7 +75,7 @@ waitMirrored() {
 
 echo "== setup =="
 stopDaemons
-H "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).rollup.drop(); db.getSiblingDB(process.env.TC_DB).merged.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).rollup.drop(); db.getSiblingDB(process.env.TC_DB).merged.drop(); db.getSiblingDB(process.env.TC_DB).perm_out.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC_DB).rollup.drop(); db.getSiblingDB(process.env.TC_DB).merged.drop(); db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})" >/dev/null
 startFeeder
 startRouter
@@ -90,6 +90,30 @@ waitMirrored 30
 cline watermark --config $CFG --ns $DB.$NS --complete-from 2030-01-01T00:00:00Z >/dev/null
 sleep 7
 chk "the fast tier cannot answer this input" "30" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
+
+echo "== a filter mongod refuses gets mongod's answer, not a refusal =="
+# A multi-document write brings archived matches up first, by asking the archive
+# the client's filter. When mongod cannot parse that filter the archive refuses
+# the question, and the router used to refuse the write with CommandFailed,
+# saying it matched documents the fast tier did not hold. mongod answers ok:1
+# with a write error of its own: 2, 51108, 168. Each line compares the router
+# with the fast tier asked directly. All five were 125 on the build before 2026-10-08.
+W() { echo "try{ const r=db.getSiblingDB(process.env.TC_DB).runCommand($1); print(r.ok?('ok we='+(r.writeErrors?r.writeErrors[0].code:'-')):('err '+r.code)) }catch(e){ print('err '+e.code) }"; }
+WT() { echo "try{ const s=db.getMongo().startSession(); s.startTransaction(); let r; try{ r=s.getDatabase(process.env.TC_DB).runCommand($1) } finally { try{s.abortTransaction()}catch(e){} } print(r.ok?('ok we='+(r.writeErrors?r.writeErrors[0].code:'-')):('err '+r.code)) }catch(e){ print('err '+e.code) }"; }
+for q in "{update:'$NS',updates:[{q:{n:{\$foo:1}},u:{\$set:{x:1}},multi:true}]}" \
+         "{update:'$NS',updates:[{q:{grp:{\$regex:'a',\$options:'Q'}},u:{\$set:{x:1}},multi:true}]}" \
+         "{update:'$NS',updates:[{q:{\$expr:{\$nosuch:1}},u:{\$set:{x:1}},multi:true}]}" \
+         "{delete:'$NS',deletes:[{q:{n:{\$in:5}},limit:0}]}"; do
+  chk "  ${q:0:46}" "$(H "$(W "$q")")" "$(R "$(W "$q")")"
+done
+q="{update:'$NS',updates:[{q:{n:{\$foo:1}},u:{\$set:{x:1}},multi:true}]}"
+chk "  the same inside a transaction" "$(H "$(WT "$q")")" "$(R "$(WT "$q")")"
+# A $merge is not forwarded but performed or refused here, after running the
+# client's pipeline on the fast tier to see what it would match. That run fails
+# with mongod's code, and the refusal carries it now instead of 125.
+q="{aggregate:'$NS',pipeline:[{\$match:{n:{\$foo:1}}},{\$merge:{into:'$NS'}}],cursor:{}}"
+chk "  a \$merge whose \$match mongod refuses" "$(H "$(W "$q")")" "$(R "$(W "$q")")"
+chk "  and nothing changed"           "0" "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({x:{\$exists:true}}))")"
 
 echo "== \$out runs instead of being refused =="
 chk "\$out is accepted"          "ok" "$(R "try{db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:'\$grp',n:{\$sum:1}}},{\$out:'rollup'}]).toArray();print('ok')}catch(e){print(e.message.substring(0,60))}")"
