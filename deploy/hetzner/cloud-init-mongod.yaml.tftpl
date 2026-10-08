@@ -1,6 +1,20 @@
 #cloud-config
 # One mongod, member of ${set}, listening on its private address and localhost.
 write_files:
+  # The private network's interface, by DHCP. Hetzner can attach the network
+  # after first boot, and cloud-init only configures what it saw at boot: on
+  # 2026-10-08 four of seven nodes came up with it down, so no member could
+  # reach another. networkd configures a matching interface whenever it appears.
+  - path: /etc/netplan/60-private.yaml
+    permissions: "0600"
+    content: |
+      network:
+        version: 2
+        ethernets:
+          private:
+            match:
+              name: "enp*"
+            dhcp4: true
   - path: /etc/mongod.key
     permissions: "0400"
     content: ${keyfile}
@@ -39,13 +53,19 @@ write_files:
       apt-get install -y -q /tmp/percona-release.deb
       percona-release enable psmdb-80 release
       apt-get update -q
-      PKG=$(apt-cache madison percona-server-mongodb | awk -v w="$WANT" '$3 ~ "^"w"\\." {print $3; exit}')
+      # awk reads to the end rather than exiting at the match: an early exit
+      # leaves apt-cache writing to a closed pipe, and under pipefail its
+      # SIGPIPE stops this script with no message. It did on 2026-10-08, once
+      # the repository listed enough releases to fill the pipe.
+      PKG=$(apt-cache madison percona-server-mongodb | awk -v w="$WANT" '$3 ~ "^"w"\\." && !p {print $3; p=1}')
       if [ -z "$PKG" ]; then
         echo "percona-server-mongodb $WANT is not in the repository; available:" > /root/PSMDB_MISSING
         apt-cache madison percona-server-mongodb >> /root/PSMDB_MISSING
         exit 1
       fi
-      apt-get install -y -q "percona-server-mongodb=$PKG" "percona-server-mongodb-server=$PKG" \
+      # --force-confold: /etc/mongod.conf above is written before the package
+      # lands, and dpkg otherwise stops to ask which one to keep.
+      apt-get install -y -q -o Dpkg::Options::=--force-confold "percona-server-mongodb=$PKG" "percona-server-mongodb-server=$PKG" \
         "percona-server-mongodb-mongos=$PKG" "percona-server-mongodb-tools=$PKG" percona-mongodb-mongosh
       apt-mark hold percona-server-mongodb percona-server-mongodb-server percona-server-mongodb-mongos percona-server-mongodb-tools
       mkdir -p /var/log/mongo
@@ -54,5 +74,6 @@ write_files:
       systemctl restart mongod
       echo "$PKG" > /root/PSMDB_INSTALLED
 runcmd:
+  - [netplan, apply]
   - [bash, -c, "sysctl -w vm.swappiness=1 && echo vm.swappiness=1 > /etc/sysctl.d/90-mongod.conf"]
   - [bash, /root/install-psmdb.sh]

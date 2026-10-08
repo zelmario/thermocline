@@ -65,6 +65,15 @@ resource "hcloud_server" "db" {
   firewall_ids = [hcloud_firewall.ssh_only.id]
   labels       = { project = "thermocline", role = each.value.set }
 
+  # IPv4 only. Hetzner gives every server an IPv6 primary IP as well unless
+  # told not to, and each one counts against the project's Primary IP limit:
+  # seven servers took fourteen, and an apply with ten free stopped at five.
+  # Nothing here uses IPv6.
+  public_net {
+    ipv4_enabled = true
+    ipv6_enabled = false
+  }
+
   network {
     network_id = hcloud_network.net.id
     ip         = each.value.ip
@@ -88,6 +97,15 @@ resource "hcloud_server" "app" {
   ssh_keys     = [hcloud_ssh_key.admin.id]
   firewall_ids = [hcloud_firewall.ssh_only.id]
   labels       = { project = "thermocline", role = "app" }
+
+  # IPv4 only. Hetzner gives every server an IPv6 primary IP as well unless
+  # told not to, and each one counts against the project's Primary IP limit:
+  # seven servers took fourteen, and an apply with ten free stopped at five.
+  # Nothing here uses IPv6.
+  public_net {
+    ipv4_enabled = true
+    ipv6_enabled = false
+  }
 
   network {
     network_id = hcloud_network.net.id

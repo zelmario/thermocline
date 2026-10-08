@@ -2,6 +2,20 @@
 # The router, the daemons and the workload run here. Only the shell is
 # installed; cline is copied in by bootstrap.sh.
 write_files:
+  # The private network's interface, by DHCP. Hetzner can attach the network
+  # after first boot, and cloud-init only configures what it saw at boot: on
+  # 2026-10-08 four of seven nodes came up with it down, so no member could
+  # reach another. networkd configures a matching interface whenever it appears.
+  - path: /etc/netplan/60-private.yaml
+    permissions: "0600"
+    content: |
+      network:
+        version: 2
+        ethernets:
+          private:
+            match:
+              name: "enp*"
+            dhcp4: true
   - path: /root/install-shell.sh
     permissions: "0755"
     content: |
@@ -18,4 +32,5 @@ write_files:
       mkdir -p /etc/thermocline /var/log/cline
       echo "${psmdb_version}" > /root/PSMDB_WANTED
 runcmd:
+  - [netplan, apply]
   - [bash, /root/install-shell.sh]
