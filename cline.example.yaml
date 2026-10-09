@@ -93,11 +93,14 @@ feeder:
   # the read began before answering. This is how often it can find that out, so
   # it sets the floor on such a read's latency.
   #
-  # The write is one small document with no resume token, at w:1, so several a
-  # second cost nothing. Lower it if fallback reads matter; raise it if they are
-  # rare and you would rather have the writes back. Zero turns it off and falls
-  # back to the checkpoint, which is where this information used to live.
-  position_every: 20ms
+  # The write is one small document with no resume token, at w:1, and only while
+  # there is something new to say: up to 200 a second at the default, and none
+  # on an idle stream. On a staging pair under a shop workload, 5ms against 20ms
+  # gave 34% more throughput for about 90 more updates a second on the archive.
+  # Raise it if fallback reads are rare and you would rather have the writes
+  # back. Zero turns it off and falls back to the checkpoint, which is where this
+  # information used to live.
+  position_every: 5ms
 
   # Documents per bulk write to the cold tier.
   batch_size: 500

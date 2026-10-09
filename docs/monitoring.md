@@ -26,8 +26,8 @@ What clearing that bar costs a read is its own histogram:
 It is the time a read that fell through spent waiting for mirroring before the
 archive was asked. The archive class's latency includes it without saying how
 much of it this is, which is the number `feeder.position_every` moves. On the
-Hetzner staging pair under the shop, with the default 20ms, it averaged 27.7ms
-on 2026-10-09.
+Hetzner staging pair under the shop on 2026-10-09 it averaged 16.5ms at the 5ms
+default, and 28.1ms at the old 20ms.
 
 **`mirroring_lag_seconds` is exported by the router rather than by the feeder on
 purpose.** The router already reads the feeder's published

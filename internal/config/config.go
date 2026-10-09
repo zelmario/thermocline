@@ -382,6 +382,10 @@ type FeederConfig struct {
 	// checkpoint costs re-mirrored work after a restart; a stale position costs
 	// every fallback read its wait. Zero publishes nothing and falls back to
 	// the checkpoint, which is what a feeder from before this did.
+	//
+	// 5ms by default since 2026-10-09. On the Hetzner staging pair under the
+	// shop it gave 260 operations a second against 194 at 20ms, and a mean
+	// barrier wait of 16.5ms against 28.1ms. See docs/router.md.
 	PositionEvery time.Duration `yaml:"position_every"`
 	// BatchSize caps documents per bulk write to the cold tier.
 	BatchSize int `yaml:"batch_size"`
@@ -428,7 +432,7 @@ func Default() Config {
 		Feeder: FeederConfig{
 			ID:                 "default",
 			CheckpointEvery:    5 * time.Second,
-			PositionEvery:      20 * time.Millisecond,
+			PositionEvery:      5 * time.Millisecond,
 			BatchSize:          500,
 			MaxAwait:           20 * time.Millisecond,
 			UnannouncedDeletes: Tombstone,

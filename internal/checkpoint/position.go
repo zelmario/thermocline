@@ -192,7 +192,7 @@ func (p *Positions) At(ctx context.Context, id string) (PositionRecord, bool, er
 // perfectly healthy feeder as stopped, and a feeder read as stopped turns the
 // freshness barrier off: every read that falls through to the archive answers
 // at once without waiting for mirroring, counts a stale read and warns about a
-// feeder that is doing its job. With position_every at its default of 20ms the
+// feeder that is doing its job. With position_every at its default of 5ms the
 // window is its two second floor, so three seconds between two hosts is enough,
 // and three seconds is ordinary on machines nobody is keeping in step.
 //

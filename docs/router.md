@@ -702,10 +702,31 @@ measured on a read that falls through to the archive:
 | 5 ms | 17 ms | 41 ms |
 | barrier off, for reference | 4 ms | 12 ms |
 
-A fallback read costs about the cadence plus seven milliseconds. Below 20 ms it
-stops paying for itself: ten buys six milliseconds and makes the tail worse, so
-20 ms is the default and `feeder.max_await` with `feeder.position_every` are
-there for a deployment that would rather spend the round trips.
+A fallback read costs about the cadence plus seven milliseconds. On this box,
+below 20 ms it stopped paying for itself: ten bought six milliseconds and made
+the tail worse.
+
+**Off this box the answer was the opposite, and the default is 5 ms since
+2026-10-09.** On the Hetzner staging pair (six CCX13, PSMDB 8.0.26-11), the
+shop for ten minutes per run, each run from a fresh seed of 8,000 orders, the
+cadences interleaved and each run twice:
+
+| `position_every` | throughput | barrier wait, mean | archive updates |
+|---|---|---|---|
+| 20 ms | 194, 191 /s | 28.1, 28.3 ms | 267, 275 /s |
+| 10 ms | 234, 235 /s | 20.2, 20.1 ms | 318, 334 /s |
+| **5 ms** | **260, 259 /s** | **16.5, 16.4 ms** | 359, 351 /s |
+
+The runs repeat within 2%, so the difference is the setting. The extra writes
+to the archive are about 90 a second, and per shop operation they stay at 1.38
+either way, so most of that rise is the extra traffic the shorter wait let
+through. The local result above was this machine's six mongods and the shop
+competing for one disk, which is what [item 4 of the readiness
+list](production-readiness.md) says it cannot tell apart from the system.
+
+**Reseed between runs.** Without it, the same 20 ms run fell from 198/s to
+110/s over forty minutes as the shop's history grew, and the 10 ms and 5 ms
+runs in between looked worse than 20 ms for it.
 
 **What that is worth to an application**, measured on the shop against a
 5,000,000 order archive with the fast tier empty, so nearly every read falls
