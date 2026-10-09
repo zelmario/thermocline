@@ -22,12 +22,22 @@ write_files:
       #!/bin/bash
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -q
+      # apt-get update with a bound and retries. On 2026-10-09 it hung on two of
+      # seven new servers for 36 minutes, idle, after "Ign" for the Hetzner
+      # mirror's InRelease, and cloud-init with it; the other five were fine.
+      update() {
+        for _ in 1 2 3 4 5; do
+          timeout 120 apt-get update -q -o Acquire::Retries=3 && return 0
+          sleep 10
+        done
+        return 1
+      }
+      update
       apt-get install -y -q gnupg2 curl lsb-release jq
       curl -fsSL -o /tmp/percona-release.deb https://repo.percona.com/apt/percona-release_latest.generic_all.deb
       apt-get install -y -q /tmp/percona-release.deb
       percona-release enable psmdb-80 release
-      apt-get update -q
+      update
       apt-get install -y -q percona-mongodb-mongosh
       mkdir -p /etc/thermocline /var/log/cline
       echo "${psmdb_version}" > /root/PSMDB_WANTED

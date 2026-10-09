@@ -86,6 +86,13 @@ resource "hcloud_server" "db" {
     psmdb_version = var.psmdb_version
   })
 
+  # user_data runs once, at first boot, so an edited template must not replace
+  # a running cluster on the next apply. Changing admin_cidr when the admin's
+  # address moves is an apply too.
+  lifecycle {
+    ignore_changes = [user_data]
+  }
+
   depends_on = [hcloud_network_subnet.sub]
 }
 
@@ -115,6 +122,13 @@ resource "hcloud_server" "app" {
   user_data = templatefile("${path.module}/cloud-init-app.yaml.tftpl", {
     psmdb_version = var.psmdb_version
   })
+
+  # user_data runs once, at first boot, so an edited template must not replace
+  # a running cluster on the next apply. Changing admin_cidr when the admin's
+  # address moves is an apply too.
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   depends_on = [hcloud_network_subnet.sub]
 }

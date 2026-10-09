@@ -30,13 +30,16 @@ echo "  $vers"
 initiate() { # node set m1 m2 m3
   local n=$1 set=$2
   $SSH root@"$(ip $n)" "mongosh --quiet --eval '
-    try { rs.status(); print(\"already initiated\") } catch (e) {
+    if (db.hello().setName) { print(\"already initiated\") } else {
       rs.initiate({_id: \"$set\", members: [
         {_id: 0, host: \"$3:27017\", priority: 2},
         {_id: 1, host: \"$4:27017\"},
         {_id: 2, host: \"$5:27017\"}]}) }
     for (let i = 0; i < 120 && !db.hello().isWritablePrimary; i++) sleep(500);
     print(\"writable primary: \" + db.hello().isWritablePrimary)'"
+  # hello needs no authentication, which is why it is the question above:
+  # rs.status() does once dba exists, so a second run took the catch and tried
+  # to initiate again.
   # The localhost exception: the first user may be created from the node itself,
   # once, before any user exists.
   $SSH root@"$(ip $n)" "mongosh --quiet --eval '
@@ -49,10 +52,16 @@ echo "== rsCold"; initiate cold1 rsCold 10.20.1.21 10.20.1.22 10.20.1.23
 echo "== cline on the app node"
 (cd "$REPO" && CGO_ENABLED=0 go build -buildvcs=false -o bin/cline ./cmd/cline)
 scp -q -o UserKnownHostsFile=$PWD/.known_hosts -o BatchMode=yes "$REPO/bin/cline" root@"$(ip app)":/usr/local/bin/cline
-sed -e "s|^  uri: \"mongodb://rs-fast-1[^\"]*\"|  uri: \"$HOT_URI\"|" \
-    -e "s|^  uri: \"mongodb://rs-cold-1[^\"]*\"|  uri: \"$COLD_URI\"|" \
+# Escaped for the replacement side of sed, where & means the matched text: the
+# URIs carry &authSource, and unescaped each one came out with the example's
+# own uri line pasted into the middle of it. The check below looked for the
+# addresses, which were there, so it said nothing.
+esc() { printf '%s' "$1" | sed 's/[&|\\]/\\&/g'; }
+sed -e "s|^  uri: \"mongodb://rs-fast-1[^\"]*\"|  uri: \"$(esc "$HOT_URI")\"|" \
+    -e "s|^  uri: \"mongodb://rs-cold-1[^\"]*\"|  uri: \"$(esc "$COLD_URI")\"|" \
     "$REPO/cline.example.yaml" > .cline.yaml
-grep -q 10.20.1.11 .cline.yaml && grep -q 10.20.1.21 .cline.yaml || { echo "could not write the URIs into cline.yaml" >&2; exit 1; }
+grep -Fqx "  uri: \"$HOT_URI\"" .cline.yaml && grep -Fqx "  uri: \"$COLD_URI\"" .cline.yaml ||
+  { echo "could not write the URIs into cline.yaml" >&2; exit 1; }
 scp -q -o UserKnownHostsFile=$PWD/.known_hosts -o BatchMode=yes .cline.yaml root@"$(ip app)":/etc/thermocline/cline.yaml
 rm -f .cline.yaml
 $SSH root@"$(ip app)" "chmod 0640 /etc/thermocline/cline.yaml && cline version 2>/dev/null || true
