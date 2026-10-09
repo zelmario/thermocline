@@ -2,11 +2,15 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/health"
@@ -379,6 +383,8 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 	}
 
 	deadline := time.Now().Add(wait)
+	waitBegan := time.Now()
+	sawNoPrimary, regained := false, false
 
 	r.ckptCache.mu.Lock()
 	r.ckptCache.waiters++
@@ -404,11 +410,58 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		// No checkpoint at all means nothing is mirroring. Waiting the full
 		// timeout on every read would turn a stopped feeder into an outage, so
 		// this gives up at once and lets the caller answer and warn.
-		if !got.known {
-			return false
+		//
+		// Except while the archive has no primary, or has only just got one
+		// back. The feeder publishes its position to the archive, so an
+		// archive without a primary silences it, and after archive_wait of
+		// that the position reads as a feeder that has stopped. Measured on
+		// staging with the deadline fix alone: 27 violations down to 3, and
+		// the 3 were a copy-up 57ms after cold1 was elected again, answered
+		// at once because the feeder had not yet published since. Treated as
+		// a stopped feeder only when the archive has a primary and this wait
+		// has not seen it without one.
+		//
+		// A primary back for less than archive_wait counts as well: the
+		// feeder has not had the time a stopped one is judged by.
+		if !got.known && !sawNoPrimary {
+			if !r.archivePrimary.withoutPrimarySince(time.Now().Add(-wait)) && !r.archiveLacksPrimary(ctx) {
+				return false
+			}
+			sawNoPrimary = true
 		}
 		left := time.Until(deadline)
 		if left <= 0 {
+			// Not while the archive has no primary. Giving up then buys no
+			// time: the read that follows goes to the archive's primary and
+			// blocks in server selection until there is one again, and by then
+			// the feeder, which was stopped by the same election, has had no
+			// chance to write what this read is waiting for. Measured on the
+			// staging pair on 2026-10-08: a priority takeover failed its vote
+			// under write load and left rsCold without a primary for 10.6s.
+			// This gave up at 5s, the read answered the instant cold2 was
+			// elected again, 5.6s later, and the feeder's first write after the
+			// stall landed 0.1s after that: two read-your-writes violations,
+			// and the wait had shortened nothing.
+			//
+			// So the deadline moves while there is no primary, and once there
+			// is one again the feeder is given a whole archive_wait to catch
+			// up. A slow feeder beside a healthy archive is untouched and
+			// answers stale at archive_wait as before. noPrimaryCap bounds the
+			// whole wait, so an archive that is gone ends in that same answer.
+			if time.Since(waitBegan) < noPrimaryCap {
+				if r.archiveLacksPrimary(ctx) {
+					sawNoPrimary = true
+					deadline = time.Now().Add(noPrimaryRecheck)
+					continue
+				}
+				// Asked only now, so a window that closed just before this
+				// would go unseen. See PrimaryWatch.
+				if (sawNoPrimary || r.archivePrimary.withoutPrimarySince(waitBegan)) && !regained {
+					regained = true
+					deadline = time.Now().Add(wait)
+					continue
+				}
+			}
 			return false
 		}
 		// Woken by the poller rather than by a timer of its own, so the wait is
@@ -421,9 +474,43 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		case <-next:
 			timer.Stop()
 		case <-timer.C:
-			return false
+			// Round the loop rather than giving up here, so the deadline is
+			// judged in one place, the one that knows an archive with no
+			// primary is not a reason to stop. Returning false here skipped it:
+			// the first build of that check changed nothing on staging, 26
+			// violations against 27, because every wait ended on this timer.
 		}
 	}
+}
+
+// noPrimaryRecheck is how often a wait held open by an archive with no primary
+// asks again, and noPrimaryCap is the most it is held open in all. Thirty
+// seconds is the driver's own server selection timeout: the read after it would
+// fail there anyway, so waiting longer for a primary that is not coming only
+// delays the same answer.
+const (
+	noPrimaryRecheck = 250 * time.Millisecond
+	noPrimaryCap     = 30 * time.Second
+)
+
+// archiveLacksPrimary reports whether the archive has no primary this router
+// can reach right now, which is the one state in which giving up on the
+// freshness wait cannot make the read that follows any sooner.
+//
+// A ping that must go to the primary, given 100ms to find one, and only a
+// failure to select a server counts. A primary that is there but slow to answer
+// is a slow archive, which keeps the ordinary stale answer at archive_wait.
+// Measured on the staging pair with rsCold forced to have no primary: the ping
+// failed with topology.ServerSelectionError after its 100ms throughout the
+// window, and took 7 to 15ms on either side of it. Only asked when a wait has
+// already run out, so a healthy deployment never pays for it.
+func (r *Router) archiveLacksPrimary(ctx context.Context) bool {
+	pctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	err := r.cold.Database("admin").RunCommand(pctx, bson.D{{Key: "ping", Value: 1}},
+		options.RunCmd().SetReadPreference(readpref.Primary())).Err()
+	var sel topology.ServerSelectionError
+	return err != nil && ctx.Err() == nil && errors.As(err, &sel)
 }
 
 // archiveReadIsFresh waits for mirroring and counts what it had to do, so the

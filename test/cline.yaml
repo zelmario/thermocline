@@ -61,6 +61,9 @@ feeder:
     - "shop.trcapped"
     - "shop.tkreserved"
     - "shop.tidxtext"
+    # testfailover.sh: a read that falls through while the archive has no
+    # primary, which needs a feeder mirroring it.
+    - "shop.tfonoprim"
     # testindexes.sh: a collection deliberately made different on the two tiers,
     # to check the router says so.
     - "shop.tdrift"

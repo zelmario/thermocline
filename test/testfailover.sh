@@ -407,6 +407,67 @@ chk "a fast tier cursor is not silently truncated"     "true" \
 # than no check. See TestMongosIdentityIsAlwaysWritable.
 waitForPrimary
 
+
+echo "== a read that falls through while the archive has no primary =="
+# A read the fast tier cannot answer waits for mirroring to reach what this
+# router has already acknowledged, and gives up after archive_wait. That is the
+# documented trade for a slow feeder. It was also what happened when the archive
+# had no primary, where it bought nothing: the read goes to the archive's
+# primary and blocks until there is one, and the feeder, stopped by the same
+# election, has not yet mirrored the write. Found on the Hetzner staging pair on
+# 2026-10-08, where a priority takeover failed its vote under load and left the
+# archive without a primary for 10.6s; a forced 21s window gave 27 violations
+# of read-your-writes on the build before and none after.
+#
+# The insert itself waits for the archive's primary, so the read that follows
+# often starts just after one is back, before the feeder has published again.
+# That is the second way to get it wrong: the position has been quiet for longer
+# than archive_wait and reads as a feeder that has stopped. Asking the archive
+# then finds a primary and does not help; the router remembers when the driver
+# last saw it without one instead. Measured on 2026-10-09, eight runs of this
+# section each: 2 of 8 answered 1 with only the first fix, 0 of 8 with both.
+#
+# One document written through the router inside the window, then read by a
+# query that has to fall through. The answer must include it.
+NPNS=tfonoprim
+CMEMBERS="172.24.0.2:27017 172.24.0.3:27017 172.24.0.4:27017"
+unfreezeCold() { for a in $CMEMBERS; do D $a 'try{rs.freeze(0)}catch(e){}' >/dev/null 2>&1; done; }
+stopFeeder() { docker exec $NODE pkill -9 -f '[c]line feeder' 2>/dev/null; sleep 1; }
+trap 'unfreezeAll; unfreezeCold; stopFeeder; cleanup' EXIT
+RT() { docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" --quiet --eval "$1" 2>&1 | tail -1; }
+coldPrimary() { for a in $CMEMBERS; do p=$(D $a 'print(db.hello().primary || "none")'); [ -n "$p" ] && { echo "$p"; return; }; done; }
+
+stopRouter
+stopFeeder
+H "db.getSiblingDB('shop').$NPNS.drop()" >/dev/null
+C "db.getSiblingDB('shop').$NPNS.drop()" >/dev/null
+docker exec -d $NODE cline feeder --config $BASE --log-file /var/log/cline/fo_f.log
+for _ in $(seq 1 30); do
+  [ "$(C 'const p=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(!!p && Date.now()-p.savedAt.getTime() < 3000)')" = "true" ] && break
+  sleep 1
+done
+startRouter $BASE
+RT "db.getSiblingDB('shop').$NPNS.insertOne({_id:1})" >/dev/null
+for _ in $(seq 1 30); do [ "$(C "print(db.getSiblingDB('shop').$NPNS.countDocuments({}))")" = "1" ] && break; sleep 0.5; done
+docker exec $NODE cline watermark --config $BASE --ns shop.$NPNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+sleep 7
+chk "  a read of it falls through to the archive"       "1" "$(RT "print(db.getSiblingDB('shop').$NPNS.countDocuments({}))")"
+
+# Freeze the secondaries so nobody can be elected, then force the primary down.
+# Twelve seconds plus the election timeout that follows the thaw: about twenty,
+# far past the five a read used to wait and inside the thirty it waits now.
+P=$(coldPrimary)
+for a in $CMEMBERS; do [ "$a" != "$P" ] && D $a 'rs.freeze(12)' >/dev/null; done
+D "$P" 'try{db.adminCommand({replSetStepDown: 30, force: true})}catch(e){}' >/dev/null 2>&1
+chk "  the archive has no primary"                      "none" "$(coldPrimary)"
+OUT=$(RT "const c=db.getSiblingDB('shop').$NPNS; c.insertOne({_id:2});
+  const t=Date.now(); const n=c.countDocuments({}); print(n+' '+Math.round((Date.now()-t)/1000)+'s')")
+echo "      the read answered: $OUT"
+chk "  the write made inside the window is in the answer" "2" "${OUT%% *}"
+unfreezeCold
+for _ in $(seq 1 60); do [ "$(coldPrimary)" != "none" ] && break; sleep 1; done
+stopFeeder
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -370,7 +371,8 @@ func runRouter(args []string) error {
 	}
 	defer disconnect(hot, log)
 
-	cold, err := connect(ctx, cfg.Cold.URI, "cold")
+	primary := router.NewPrimaryWatch()
+	cold, err := connect(ctx, cfg.Cold.URI, "cold", primary.Monitor())
 	if err != nil {
 		return err
 	}
@@ -379,7 +381,7 @@ func runRouter(args []string) error {
 
 	warnIfArchiveReadPreferenceIgnored(cfg.Cold.URI, log)
 
-	r := router.New(hot, cold, cfg.Router, log)
+	r := router.New(hot, cold, cfg.Router, log).WatchArchivePrimary(primary)
 	go reportRouterStats(ctx, r, log)
 	if cfg.Router.Dashboard != "" {
 		go func() {
@@ -472,8 +474,13 @@ func warnIfArchiveReadPreferenceIgnored(uri string, log *slog.Logger) {
 			"miss a write that has already been acknowledged")
 }
 
-func connect(ctx context.Context, uri, name string) (*mongo.Client, error) {
-	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetAppName("cline"))
+// connect takes at most one monitor, which the router uses to watch the archive.
+func connect(ctx context.Context, uri, name string, monitor ...*event.ServerMonitor) (*mongo.Client, error) {
+	opts := options.Client().ApplyURI(uri).SetAppName("cline")
+	if len(monitor) > 0 {
+		opts.SetServerMonitor(monitor[0])
+	}
+	client, err := mongo.Connect(opts)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s tier: %w", name, err)
 	}

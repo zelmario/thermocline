@@ -112,6 +112,10 @@ type Router struct {
 	checkpoints *checkpoint.Store
 	positions   *checkpoint.Positions
 	ckptCache   checkpointCache
+	// archivePrimary is when the archive last had no primary, so a wait that
+	// runs out can tell a stopped feeder from one an election silenced. Nil
+	// unless WatchArchivePrimary was called, which reads as never.
+	archivePrimary *PrimaryWatch
 	// posLive watches the published position move, which is how this decides
 	// whether the feeder is still running. It is a watcher rather than a
 	// reading because the alternative compares this host's clock against the

@@ -1362,6 +1362,30 @@ Part of [Thermocline](../README.md).
   caller's own `maxTimeMS` when it set one, so that neither half can starve the
   other. Past that bound the archive is asked as it stands.
 
+  **Except while the archive has no primary.** Giving up then makes nothing
+  sooner: the read goes to the archive's primary and blocks in server selection
+  until there is one, and the feeder, stopped by the same election, has not
+  mirrored the write yet. So the wait is held open while no primary can be
+  selected, re-checked every 250ms, and once one is back the feeder gets a whole
+  `archive_wait` to catch up. The whole wait is capped at 30 seconds, the
+  driver's own server selection timeout, and the caller's `maxTimeMS` still
+  bounds it. Found on the Hetzner staging pair on 2026-10-08: a priority
+  takeover on the archive failed its vote under write load ("candidate's data
+  is staler than mine") and left it with no primary for 10.6s, the read gave up
+  at 5s and answered the instant a primary returned. With the archive forced to
+  have no primary for about 21s under the shop: 27 violations of
+  read-your-writes on the build before, 0 and 0 in two runs after, and no
+  stale answer logged.
+
+  A primary that came back moments ago counts too. A write made inside the
+  window waits for the archive itself, so the read after it often starts just
+  after the election, before the feeder has published again, and by then the
+  position has been quiet for longer than `archive_wait` and reads as a feeder
+  that has stopped. The router keeps the time the driver last saw the archive
+  without a primary and gives the feeder its `archive_wait` from then. Measured
+  on 2026-10-09 with `testfailover.sh`: 2 wrong answers in 8 runs without it, 0
+  in 8 with it.
+
   Measured with the feeder stopped and a document written through the router a
   moment before: `countDocuments` on that `_id` answered **0** after 208ms for a
   document the application had just written successfully. The effect is stated
