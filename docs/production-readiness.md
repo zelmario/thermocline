@@ -702,7 +702,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and 5, which are not code.**
+This is the whole list. Nothing else blocks. **One of eleven remains: item 5, which is not code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -756,7 +756,9 @@ This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and
   first, because a count cannot be worked back to a document, and the guess
   from the code has already been refuted once.
 
-- [ ] **4. Measure off this box.** Every number above is six mongods on one
+- [x] **4. Measure off this box.** Closed on 2026-10-09 by a two-hour soak on
+  the staging pair, with both tiers stepping down every minute; see the end of
+  this item. Every number above is six mongods on one
   WSL2 host. Throughput, mirroring rate and failover timing are the ones that
   will move.
 
@@ -817,8 +819,9 @@ This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and
   included, written as a backlog with the feeder stopped. This box gives 2,000
   to 3,700/s.
 
-  **Failover found a defect, and it is open.** Stepping the archive's primary
-  down every 60s under the shop, about one election in six left the feeder
+  **Failover found a defect, fixed in e645a01 on 2026-10-09.** Stepping the
+  archive's primary down every 60s under the shop, about one election in six
+  left the feeder
   silent for 10.5 to 11.2s. Every stall began at the priority takeover about
   10s after the step-down (`rsCold` has one member at priority 2), not at the
   step-down itself. The router's `archive_wait` is 5s, so reads stopped
@@ -842,6 +845,40 @@ This is the whole list. Nothing else blocks. **Two of eleven remain: items 4 and
 
   Fast tier step-downs alternating with archive ones: 10 step-downs, 9 errors
   the shop saw, 110/s, the one violation above.
+
+  **What the defect was.** Under write load the priority takeover fails its
+  real vote ("candidate's data is staler than mine"), and `rsCold` has no
+  primary for about 10.5s. The freshness barrier gave up at `archive_wait`
+  either way, and in two ways it gave up on a feeder that had not stopped but
+  had been silenced by the election. It now holds a read open while the archive
+  has no primary, up to 30s, and gives the feeder a whole `archive_wait` once
+  one is back, counting a primary the driver saw come back less than
+  `archive_wait` ago. A forced 21s window under the shop went from 27
+  violations to 0, and `testfailover.sh` has the check.
+
+  **The soak, 2026-10-09.** The same pair, the build of b67e02a with
+  `position_every: 5ms`, which is the default since that day and the only
+  difference from what shipped next with the cache off. A fresh seed of 8,000
+  orders, the four archive indexes `cline indexes` names, the warmer and evictor
+  looping, and a step-down every 60s alternating the fast tier and the archive:
+
+      2,571,517 operations in 2h0m, 357/s, 0 violations
+      120 step-downs, 60 of each tier, every one acknowledged
+      44.6% of answers from the archive
+      freshness barrier: mean 16.1ms over 1,688,723 waits, longest 10.9s
+      66 errors the shop saw
+
+  The errors are the ones MongoDB itself gives here. Every one the shop logged
+  is a `deleteMany` of a cancelled order's events during a step-down: 39
+  `NotWritablePrimary`, 3 write concern errors interrupted by the election, and
+  one connection the router closed on a fast tier step-down. A multi-document
+  delete is not a retryable write, so a client talking straight to mongod sees
+  the same. The longest wait is a read held through an archive election rather
+  than answered without the client's own write, which is the fix doing its job.
+
+  That is three times the 110/s of the night before with the same step-downs,
+  from the 5ms cadence and the indexes together. The local runs never measured
+  either, and their numbers describe a bare archive at 20ms.
 
 - [ ] **5. Rehearse the four procedures, by a person, against a staging pair.**
   Adoption, rollback, recovery after a feeder stops with a rolled oplog, and a
