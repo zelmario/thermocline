@@ -118,8 +118,12 @@ type second struct {
 // already did network round trips, and it keeps a second's worth of counters
 // consistent with each other, which atomics taken separately would not.
 type Metrics struct {
-	mu      sync.Mutex
-	stats   [numClasses]classStat
+	mu    sync.Mutex
+	stats [numClasses]classStat
+	// wait is the time reads spent on the freshness barrier, which is part of
+	// every archive and miss latency above and is reported on its own because
+	// it is the part that is not the archive. See RecordWait.
+	wait    classStat
 	history []second
 	cur     second
 	window  int
@@ -160,6 +164,24 @@ func (m *Metrics) Record(cls Class, d time.Duration) {
 	}
 	m.cur.Count[cls]++
 	m.cur.TotalMS[cls] += ms
+}
+
+// RecordWait files one wait on the freshness barrier.
+//
+// An archive read through the router took 42ms at the median on the staging
+// pair with the archive indexed, and the archive answered the same query in 4ms
+// asked directly. The difference is mostly this wait, which the class latencies
+// fold in with everything else, so it gets a histogram of its own.
+func (m *Metrics) RecordWait(d time.Duration) {
+	ms := float64(d) / float64(time.Millisecond)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.wait.count++
+	m.wait.totalMS += ms
+	if ms > m.wait.maxMS {
+		m.wait.maxMS = ms
+	}
+	m.wait.buckets[bucketOf(ms)]++
 }
 
 // rollLocked closes the current second and starts a new one.
@@ -207,6 +229,8 @@ type MetricsSnapshot struct {
 	Buckets []float64        `json:"bucket_edges"`
 	Classes []ClassSnapshot  `json:"classes"`
 	History []SecondSnapshot `json:"history"`
+	// FreshnessWait is the barrier on its own. See RecordWait.
+	FreshnessWait ClassSnapshot `json:"freshness_wait"`
 }
 
 // Snapshot copies the metrics out for reporting.
@@ -220,22 +244,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		History: make([]SecondSnapshot, 0, len(m.history)+1),
 	}
 	for i := 0; i < int(numClasses); i++ {
-		s := m.stats[i]
-		cs := ClassSnapshot{
-			Name:    ClassNames[i],
-			Count:   s.count,
-			TotalMS: round2(s.totalMS),
-			MaxMS:   round2(s.maxMS),
-			Buckets: append([]int64(nil), s.buckets[:]...),
-		}
-		if s.count > 0 {
-			cs.MeanMS = round2(s.totalMS / float64(s.count))
-		}
-		cs.P50MS = round2(quantile(s.buckets[:], s.count, 0.50, s.maxMS))
-		cs.P95MS = round2(quantile(s.buckets[:], s.count, 0.95, s.maxMS))
-		cs.P99MS = round2(quantile(s.buckets[:], s.count, 0.99, s.maxMS))
-		out.Classes = append(out.Classes, cs)
+		out.Classes = append(out.Classes, m.stats[i].snapshot(ClassNames[i]))
 	}
+	out.FreshnessWait = m.wait.snapshot("freshness_wait")
 
 	hist := append(append([]second(nil), m.history...), m.cur)
 	for _, h := range hist {
@@ -256,6 +267,24 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		out.History = append(out.History, snap)
 	}
 	return out
+}
+
+// snapshot copies one set of totals out under name.
+func (s classStat) snapshot(name string) ClassSnapshot {
+	cs := ClassSnapshot{
+		Name:    name,
+		Count:   s.count,
+		TotalMS: round2(s.totalMS),
+		MaxMS:   round2(s.maxMS),
+		Buckets: append([]int64(nil), s.buckets[:]...),
+	}
+	if s.count > 0 {
+		cs.MeanMS = round2(s.totalMS / float64(s.count))
+	}
+	cs.P50MS = round2(quantile(s.buckets[:], s.count, 0.50, s.maxMS))
+	cs.P95MS = round2(quantile(s.buckets[:], s.count, 0.95, s.maxMS))
+	cs.P99MS = round2(quantile(s.buckets[:], s.count, 0.99, s.maxMS))
+	return cs
 }
 
 // quantile reads a percentile off the histogram.

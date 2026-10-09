@@ -373,6 +373,11 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 	// those.
 	untilTS := r.seenOpTime.Load()
 
+	if r.Metrics != nil {
+		began := time.Now()
+		defer func() { r.Metrics.RecordWait(time.Since(began)) }()
+	}
+
 	deadline := time.Now().Add(wait)
 
 	r.ckptCache.mu.Lock()

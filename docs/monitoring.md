@@ -19,6 +19,16 @@ which is the first alert to build, and beside it
 which is the bar a fall-through read actually has to clear. Rule 2b below says
 why the two are not interchangeable.
 
+What clearing that bar costs a read is its own histogram:
+
+    thermocline_freshness_wait_seconds
+
+It is the time a read that fell through spent waiting for mirroring before the
+archive was asked. The archive class's latency includes it without saying how
+much of it this is, which is the number `feeder.position_every` moves. On the
+Hetzner staging pair under the shop, with the default 20ms, it averaged 27.7ms
+on 2026-10-09.
+
 **`mirroring_lag_seconds` is exported by the router rather than by the feeder on
 purpose.** The router already reads the feeder's published
 position on every fallback read, so it knows the lag continuously, and a gauge

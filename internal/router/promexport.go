@@ -154,6 +154,25 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		fmt.Fprintf(b, "thermocline_command_duration_seconds_count{class=\"%s\"} %d\n", promEscape(c.Name), c.Count)
 	}
 
+	// The freshness barrier on its own, which the archive and miss classes
+	// above include without saying how much of them it is.
+	fw := snap.Metrics.FreshnessWait
+	fmt.Fprintf(b, "# HELP thermocline_freshness_wait_seconds Time a read that fell through to the archive spent waiting for mirroring to reach what this router had acknowledged, before the archive was asked.\n")
+	fmt.Fprintf(b, "# TYPE thermocline_freshness_wait_seconds histogram\n")
+	var wcum int64
+	for i, edge := range snap.Metrics.Buckets {
+		if i < len(fw.Buckets) {
+			wcum += fw.Buckets[i]
+		}
+		fmt.Fprintf(b, "thermocline_freshness_wait_seconds_bucket{le=\"%s\"} %d\n", strconv.FormatFloat(edge/1000, 'f', -1, 64), wcum)
+	}
+	if len(fw.Buckets) > len(snap.Metrics.Buckets) {
+		wcum += fw.Buckets[len(snap.Metrics.Buckets)]
+	}
+	fmt.Fprintf(b, "thermocline_freshness_wait_seconds_bucket{le=\"+Inf\"} %d\n", wcum)
+	fmt.Fprintf(b, "thermocline_freshness_wait_seconds_sum %s\n", strconv.FormatFloat(fw.TotalMS/1000, 'f', -1, 64))
+	fmt.Fprintf(b, "thermocline_freshness_wait_seconds_count %d\n", fw.Count)
+
 	// What each daemon says about its own clock, in one place, because one
 	// alert rule has to cover all of them.
 	//
