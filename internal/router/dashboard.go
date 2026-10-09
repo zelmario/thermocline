@@ -75,8 +75,11 @@ type CacheSnapshot struct {
 	// Invalidated is held answers dropped because something wrote to a
 	// collection they depended on. It is the number that explains a hit rate of
 	// nothing: a write-heavy collection empties its own cache.
-	Invalidated uint64        `json:"invalidated"`
-	Advice      []CacheAdvice `json:"advice"`
+	Invalidated uint64 `json:"invalidated"`
+	// Spared is held answers a write to their collection left in place,
+	// because it could not have changed them.
+	Spared uint64        `json:"spared"`
+	Advice []CacheAdvice `json:"advice"`
 }
 
 // CacheAdvice is one row: a query, how often it is asked, how long its answer
@@ -97,7 +100,7 @@ func (r *Router) cacheSnapshot() CacheSnapshot {
 		cs := r.cache.Stats()
 		out.Hits, out.Misses = cs.Hits, cs.Misses
 		out.Entries, out.Bytes, out.Rejected = cs.Entries, cs.Bytes, cs.Rejected
-		out.Invalidated = cs.Invalidated
+		out.Invalidated, out.Spared = cs.Invalidated, cs.Spared
 		if total := out.Hits + out.Misses; total > 0 {
 			out.HitRate = float64(out.Hits) / float64(total)
 		}

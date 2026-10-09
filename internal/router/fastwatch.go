@@ -8,6 +8,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/cache"
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/tierver"
 )
@@ -163,6 +164,7 @@ func (r *Router) watchFastTier(ctx context.Context) {
 // reports the last position it reached so the next one can carry on from there.
 func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, error) {
 	pipeline := mongo.Pipeline{}
+	modern := r.expandedEventsSupported(ctx)
 
 	// With the cache off, only the DDL is wanted, and saying so server side is
 	// the difference between this costing nothing and this costing a decoded
@@ -184,11 +186,39 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 	// untiered collections alike. Only the namespaces are needed, so the
 	// documents themselves are left behind; `to` comes with them because a
 	// rename is the one event that names two.
-	pipeline = append(pipeline, bson.D{{Key: "$project", Value: bson.D{
+	project := bson.D{
 		{Key: "ns", Value: 1},
 		{Key: "to", Value: 1},
 		{Key: "operationType", Value: 1},
-	}}})
+	}
+	// With the cache on, an insert's document and the names of an update's
+	// fields as well, so a write that cannot change a held answer leaves it in
+	// place. See cache.Reads.
+	//
+	// Not the update's values, and not a document over judgedDocMax. The
+	// projection above is what kept these events small, and this stream does
+	// not survive one over 16MB: it fails on the event, resumes at the same
+	// event and fails again, and from then on nothing anybody else writes
+	// drops a cached answer. An insert too large to send is judged as a write
+	// of unknown effect, which drops what read its collection, as before.
+	//
+	// $bsonSize arrived in 4.4, and an operator this stream cannot parse stops
+	// it opening at all, so below 6.0, where the expanded events are refused
+	// for the same reason, every write stays a write of unknown effect.
+	if r.cache != nil && modern {
+		project = append(project,
+			bson.E{Key: "fullDocument", Value: bson.D{{Key: "$cond", Value: bson.A{
+				bson.D{{Key: "$lte", Value: bson.A{bson.D{{Key: "$bsonSize", Value: "$fullDocument"}}, judgedDocMax}}},
+				"$fullDocument", "$$REMOVE"}}}},
+			bson.E{Key: "updatedKeys", Value: bson.D{{Key: "$map", Value: bson.D{
+				{Key: "input", Value: bson.D{{Key: "$objectToArray", Value: "$updateDescription.updatedFields"}}},
+				{Key: "as", Value: "f"},
+				{Key: "in", Value: "$$f.k"}}}}},
+			bson.E{Key: "updateDescription.removedFields", Value: 1},
+			bson.E{Key: "updateDescription.truncatedArrays.field", Value: 1},
+		)
+	}
+	pipeline = append(pipeline, bson.D{{Key: "$project", Value: project}})
 
 	opts := options.ChangeStream()
 	if after != nil {
@@ -206,7 +236,7 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 	// open -- and that stream is also what drops cached answers and notices a
 	// collection dropped out of band, so losing it to gain this would be a poor
 	// trade. Below 6.0 the minute stands, which is what it has always been.
-	if r.expandedEventsSupported(ctx) {
+	if modern {
 		opts.SetShowExpandedEvents(true)
 	}
 	cs, err := r.hot.Watch(ctx, pipeline, opts)
@@ -227,6 +257,9 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 				DB   string `bson:"db"`
 				Coll string `bson:"coll"`
 			} `bson:"to"`
+			FullDocument      bson.Raw         `bson:"fullDocument"`
+			UpdatedKeys       []string         `bson:"updatedKeys"`
+			UpdateDescription *eventUpdateDesc `bson:"updateDescription"`
 		}
 		// Before the decode, and before anything acts on the event: the token
 		// says this event has been seen, and an event this router cannot decode
@@ -238,7 +271,7 @@ func (r *Router) followChanges(ctx context.Context, after bson.Raw) (bson.Raw, e
 		switch {
 		case ev.NS.Coll != "":
 			ns := ev.NS.DB + "." + ev.NS.Coll
-			r.invalidateFor(ns, ev.OperationType)
+			r.invalidateFor(ns, ev.OperationType, eventWrite(ev.OperationType, ev.FullDocument, ev.UpdatedKeys, ev.UpdateDescription))
 			r.noteFastTierIndexDDL(ns, ev.OperationType)
 			r.noteFastTierDDL(ctx, ns, ev.OperationType)
 			if ev.To.Coll != "" {
@@ -408,12 +441,52 @@ func (r *Router) forgetDropped(ns string) {
 	r.indexer.Forget(ns)
 }
 
-// invalidateFor drops what was cached for one collection.
-func (r *Router) invalidateFor(ns, op string) {
+// judgedDocMax is the largest inserted document the router's change stream is
+// sent to judge against cached answers. See followChanges.
+const judgedDocMax = 1 << 20
+
+// eventUpdateDesc is the part of an update event that names what changed,
+// besides the updated fields' names, which come projected as updatedKeys.
+type eventUpdateDesc struct {
+	RemovedFields   []string `bson:"removedFields"`
+	TruncatedArrays []struct {
+		Field string `bson:"field"`
+	} `bson:"truncatedArrays"`
+}
+
+// eventWrite describes a change event for the cache. An insert without its
+// document, an update without its fields, and every other event are writes of
+// unknown effect.
+func eventWrite(op string, doc bson.Raw, updated []string, ud *eventUpdateDesc) cache.Write {
+	switch op {
+	case "insert":
+		if len(doc) == 0 {
+			return cache.AnyWrite
+		}
+		return cache.Write{Kind: cache.WriteInsert, Inserted: []bson.Raw{doc}}
+	case "update":
+		// Nil, not empty: an update that set nothing still names its removed
+		// fields, and a stream without the projection names nothing at all.
+		if updated == nil || ud == nil {
+			return cache.AnyWrite
+		}
+		w := cache.Write{Kind: cache.WriteUpdate}
+		w.Fields = append(w.Fields, updated...)
+		w.Fields = append(w.Fields, ud.RemovedFields...)
+		for _, t := range ud.TruncatedArrays {
+			w.Fields = append(w.Fields, t.Field)
+		}
+		return w
+	}
+	return cache.AnyWrite
+}
+
+// invalidateFor drops what was cached for one collection that w could change.
+func (r *Router) invalidateFor(ns, op string, w cache.Write) {
 	if r.cache == nil {
 		return
 	}
-	if n := r.cache.Invalidate(ns); n > 0 {
+	if n := r.cache.InvalidateWrite(ns, w); n > 0 {
 		r.log.Debug("a change on the fast tier dropped cached answers",
 			"ns", ns, "entries", n, "event", op)
 	}

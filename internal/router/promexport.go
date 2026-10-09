@@ -128,6 +128,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 		counter("cache_learned_total", "Times a watched query was seen to return something new, which is what the TTL is learned from.", int64(cs.Learned))
 		counter("cache_rejected_total", "Answers too large to hold. A cache with a low hit rate and a rising count here is being handed replies over 256KB, not failing to learn.", int64(cs.Rejected))
 		counter("cache_invalidated_total", "Held answers dropped because something wrote to a collection they depended on. This is the number that explains a hit rate of nothing on a write-heavy collection: every write empties the cache of everything that read it, which is correct and is also why the feature does nothing there. Read it against cache_hits_total before concluding the cache cannot learn.", int64(cs.Invalidated))
+		counter("cache_spared_total", "Held answers a write to their collection left in place because it could not have changed them: an insert none of whose documents passes the answer's filter, or an update to no field the answer read. Against cache_invalidated_total, it says how much of the write traffic the cache now survives.", int64(cs.Spared))
 		gauge("cache_entries", "Queries being watched. At max_queries the least recently seen is forgotten on every new one.", float64(cs.Entries))
 		gauge("cache_bytes", "Memory the held answers occupy. Against max_bytes, this says how close the cache is to evicting to stay inside its budget.", float64(cs.Bytes))
 	}

@@ -239,6 +239,14 @@ func (c *conn) cacheLookup(ctx context.Context, msg *wire.Message, name, db stri
 	c.cacheOf.deps = c.r.cacheDeps(ctx, name, cmd, db, ns)
 	stored, hit := c.r.cache.Get(key)
 	if !hit {
+		// What the answer reads, so a write that cannot change it leaves it in
+		// place. Only on a miss: a hit is not stored again, and a miss is about
+		// to cost a round trip that dwarfs this. Only for an answer that reads
+		// the one collection it names, since what it reads through a view or a
+		// $lookup is not in the command.
+		if len(c.cacheOf.deps) == 0 || (len(c.cacheOf.deps) == 1 && c.cacheOf.deps[0] == ns) {
+			c.cacheOf.reads = cache.ReadsOf(name, cmd)
+		}
 		return nil, false
 	}
 	out, rerr := replyAddressedTo(stored, msg.Header.RequestID)
@@ -296,15 +304,19 @@ func (c *conn) cacheStore(reply *wire.Message) {
 			deps = []string{pending.ns}
 		}
 		c.r.cache.ObserveResultOn(pending.key, deps, reply.Raw, rhash)
+		if pending.reads.Known {
+			c.r.cache.Depends(pending.key, pending.ns, pending.reads)
+		}
 	}
 }
 
 // cacheInvalidate drops what was learned about a collection this command just
 // wrote to.
-func (c *conn) cacheInvalidate(name, db string, cmd bson.Raw) {
+func (c *conn) cacheInvalidate(msg *wire.Message, name, db string, cmd bson.Raw) {
 	if c.r.cache == nil {
 		return
 	}
+	w := writeOf(msg, name)
 	for _, ns := range writtenNamespaces(name, db, cmd) {
 		// A whole database, which is what a dropDatabase and an unreadable
 		// target both come back as: forgetting too much costs a lookup and
@@ -316,10 +328,31 @@ func (c *conn) cacheInvalidate(name, db string, cmd bson.Raw) {
 			}
 			continue
 		}
-		if n := c.r.cache.Invalidate(ns); n > 0 {
+		if n := c.r.cache.InvalidateWrite(ns, w); n > 0 {
 			c.log.Debug("a write dropped cached answers", "ns", ns, "entries", n)
 		}
 	}
+}
+
+// writeOf describes what an insert or an update command does, so a cached
+// answer it cannot change is kept. Anything else, and any batch that cannot be
+// read in full, is a write of unknown effect. See cache.Reads.
+func writeOf(msg *wire.Message, name string) cache.Write {
+	switch name {
+	case "insert":
+		docs := msg.AllOf("documents")
+		if len(docs) == 0 || len(docs) != msg.CountOf("documents") {
+			return cache.AnyWrite
+		}
+		return cache.Write{Kind: cache.WriteInsert, Inserted: docs}
+	case "update":
+		sts := msg.AllOf("updates")
+		if len(sts) == 0 || len(sts) != msg.CountOf("updates") {
+			return cache.AnyWrite
+		}
+		return cache.WriteOfUpdate(sts)
+	}
+	return cache.AnyWrite
 }
 
 // writtenNamespaces lists what a command changes, so the cache can forget
@@ -447,6 +480,8 @@ type cachePending struct {
 	// deps is every collection this answer depends on, which an entry is hung
 	// from so that a change to any of them drops it. See cacheDeps.
 	deps []string
+	// reads is what the answer depends on in ns. See cache.Reads.
+	reads cache.Reads
 }
 
 // publishAdvice records what has been learned, so it can be read long after the

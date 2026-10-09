@@ -313,9 +313,10 @@ router:
   # switch is only about whether the answers are then served from memory.
   #
   # Turn it on against the report rather than in hope. A write through the
-  # router drops what it learned about that collection, so the writer never
-  # reads its own stale answer; a writer that does not come through the router
-  # is bounded by the learned TTL and by max_ttl.
+  # router drops every held answer on that collection it could have changed, so
+  # the writer never reads its own stale answer, and the fast tier's change
+  # stream does the same for writers that do not come through the router. See
+  # docs/caching.md for what "could have changed" covers.
   # cache:
   #   enabled: false
   #   max_queries: 1000

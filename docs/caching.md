@@ -26,8 +26,8 @@ every time.
 The other thing it will not answer is a namespace nothing can tell it about.
 
 Two things drop a stored answer, and both have a reach. A write through the
-router drops everything learned for that collection, and the fast tier's change
-stream covers the writers that go around the router. That stream is a
+router drops what it could have changed in that collection, and the fast tier's
+change stream covers the writers that go around the router. That stream is a
 client-level one, which MongoDB does not open on the `admin`, `local` or
 `config` databases and does not deliver system collections through, and the
 archive's own bookkeeping database sits on the other tier, so no stream of the
@@ -183,12 +183,44 @@ rather than waiting out a timer. That is what makes this correct for the writer
 rather than merely fast: the ordinary pattern of writing and then reading the
 same collection is right immediately.
 
-**And a write by anybody else drops it too.** The fast tier publishes every
-change it makes and this system is built on reading that, so the router follows
-the same change stream and drops the answers a write made stale, whoever made
-it: another application, a migration script, a person in a shell. Measured: a
-client's cached answer of 31 became 32 within a second of another connection
-inserting a document straight into the fast tier, without waiting out the TTL.
+**Only what the write could have changed, since 2026-10-09.** Dropping every
+answer on every write was correct, and on a collection anything writes to it was
+also why the cache served nothing. The shop's monthly report counts a closed
+month, and it was dropped by every order placed today: at 8.6 orders a second a
+held report lived about 0.12s, and 1.3% of reports were served from the cache.
+Now each held answer remembers what it read, and a write is judged against that
+first:
+
+- **An insert** drops an answer only if one of its documents could pass the
+  answer's filter. A document is ruled out only on what the router fully
+  understands: a top-level field holding a number, a date or an ObjectId,
+  compared with `$eq`, `$gt`, `$gte`, `$lt` or `$lte` against a value of the
+  same kind, under `$and`, `$or` or plain conjunction. Strings are left to the
+  collation, arrays to their elements, and anything else counts as passing.
+- **An update** drops an answer only if it changes a field the answer read. That
+  covers the filter, the sort, the projection, and every field a pipeline
+  stage names. A `find` without an inclusion projection returns whole
+  documents, so every field counts as read.
+- **Everything else** drops every answer on the collection, as before: deletes,
+  replacements, upserts, pipeline updates, `findAndModify`, an aggregation with
+  a stage outside `$match`, `$group`, `$count`, `$sortByCount`, `$sort`,
+  `$limit`, `$skip`, `$project`, `$addFields`, `$set` and `$unset`, and an
+  answer read through a view or a `$lookup`.
+
+Every rule errs the same way. Keeping an answer that changed is a wrong answer,
+and dropping one that did not is a lookup. `cache_spared_total` counts the
+answers kept, beside `cache_invalidated_total`.
+
+**And a write by anybody else drops it too, by the same rules.** The fast tier
+publishes every change it makes and this system is built on reading that, so the
+router follows the same change stream and drops the answers a write made stale,
+whoever made it: another application, a migration script, a person in a shell.
+On 6.0 and later the stream brings an insert's document, up to 1MB, and an
+update's field names, so those writes are judged as above. A larger document,
+or any write on an older release, drops everything that read its collection.
+Measured: a client's cached answer of 31 became 32 within a second of another
+connection inserting a document straight into the fast tier, without waiting
+out the TTL.
 That is the difference between a cache that expires and one that is kept honest.
 
 That stream is no longer the cache's own. The router follows the fast tier

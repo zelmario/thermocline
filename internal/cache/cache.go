@@ -76,6 +76,12 @@ type history struct {
 	// was called with and the second swept every namespace there is.
 	nss []string
 
+	// reads is what the answer depended on in readsNS, the collection the
+	// command named. A write anywhere else in nss drops it whatever this says,
+	// because what it read there, through a view or a $lookup, is not known.
+	reads   Reads
+	readsNS string
+
 	entry *Entry
 }
 
@@ -116,6 +122,9 @@ type Cache struct {
 	// That is correct behaviour and it is also the whole reason the feature
 	// does nothing there, which is worth being able to see.
 	Invalidated uint64
+	// Spared counts held answers a write to their collection left in place,
+	// because it could not have changed them. See Reads.
+	Spared uint64
 	// Rejected counts answers too large to hold, which is worth knowing: a
 	// cache that looks idle may simply be being handed things it will not keep.
 	Rejected uint64
@@ -364,6 +373,13 @@ func (c *Cache) TTLOf(key string) time.Duration {
 // The history goes with the entries. A write is evidence that the result
 // changed, so the stability measured before it says nothing about after.
 func (c *Cache) Invalidate(ns string) int {
+	return c.InvalidateWrite(ns, AnyWrite)
+}
+
+// InvalidateWrite is Invalidate for a write that is described: an answer the
+// write could not have changed is kept, along with what was learned about it.
+func (c *Cache) InvalidateWrite(ns string, w Write) int {
+	w = w.Prepared()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Copied first: forget deletes from byNS, including from this very set.
@@ -371,15 +387,34 @@ func (c *Cache) Invalidate(ns string) int {
 	for k := range c.byNS[ns] {
 		keys = append(keys, k)
 	}
-	n := 0
+	n, kept := 0, 0
 	for _, k := range keys {
+		if e := c.byKey[k]; e != nil && e.readsNS == ns && !e.reads.MayChange(w) {
+			kept++
+			if e.entry != nil {
+				c.Spared++
+			}
+			continue
+		}
 		if c.forget(k) {
 			n++
 		}
 	}
-	delete(c.byNS, ns)
+	if kept == 0 {
+		delete(c.byNS, ns)
+	}
 	c.Invalidated += uint64(n)
 	return n
+}
+
+// Depends records what the answers under key read in ns, the collection the
+// command named. Without it, any write to ns drops them.
+func (c *Cache) Depends(key, ns string, r Reads) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e := c.byKey[key]; e != nil {
+		e.reads, e.readsNS = r, ns
+	}
 }
 
 // Stats is everything worth publishing about a running cache, read in one pass
@@ -390,9 +425,9 @@ func (c *Cache) Invalidate(ns string) int {
 // two of them. It is also the only way the five numbers describe the same
 // moment.
 type Stats struct {
-	Hits, Misses, Learned, Rejected, Invalidated uint64
-	Entries                                      int
-	Bytes                                        int
+	Hits, Misses, Learned, Rejected, Invalidated, Spared uint64
+	Entries                                              int
+	Bytes                                                int
 }
 
 // Stats reports what this cache has done and what it is holding.
@@ -405,6 +440,7 @@ func (c *Cache) Stats() Stats {
 		Learned:     c.Learned,
 		Rejected:    c.Rejected,
 		Invalidated: c.Invalidated,
+		Spared:      c.Spared,
 		Entries:     len(c.byKey),
 		Bytes:       c.bytes,
 	}

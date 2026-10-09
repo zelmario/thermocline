@@ -212,6 +212,89 @@ H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:6001})" >/dev/null
 sleep 2
 cline watermark --config $CCFG --ns $DB.$NS --clear >/dev/null 2>&1
 
+echo "== a write that cannot change an answer leaves it =="
+# A write used to drop every answer that read its collection, and on a
+# collection anything writes to that is why the cache served nothing: measured
+# on the shop, a monthly report lived about 0.12s against 8.6 orders a second.
+# Now an insert drops an answer only through a document that passes its filter,
+# and an update only through a field it read. See cache.Reads.
+#
+# Each case is read and written in one session, because an entry has to be
+# held when the write arrives for keeping it to mean anything, and two mongosh
+# startups are longer than the TTL a few reads teach. spared and invalidated
+# say which happened; the fast tier asked directly says what the answer is.
+cmetric() { curl -s "127.0.0.1:$PDASH/metrics" 2>/dev/null | awk -v m="thermocline_cache_$1" '$1==m{print $2}'; }
+cline watermark --config $CCFG --ns $DB.$NS --complete-all >/dev/null 2>&1
+sleep 2
+# Reads n in [10,20) eight times, makes the write it is given, and reads again.
+warmThen() { # write-js
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+    const c = db.getSiblingDB(process.env.TC_DB).$NS;
+    const q = {n: {\$gte: 10, \$lt: 20}};
+    for (let i = 0; i < 8; i++) { c.countDocuments(q); sleep(250); }
+    $1;
+    print(c.countDocuments(q));" 2>&1 | tail -1
+}
+truth() { H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({n: {\$gte: 10, \$lt: 20}}))"; }
+case_() { # name write-js kept-or-dropped
+  local s0 i0 got s1 i1
+  s0=$(cmetric spared_total); i0=$(cmetric invalidated_total)
+  got=$(warmThen "$2")
+  s1=$(cmetric spared_total); i1=$(cmetric invalidated_total)
+  chk "$1"                                   "$(truth)" "$got"
+  if [ "$3" = kept ]; then
+    chk "  the held answer was kept"         "true" "$(awk -v a="${s0:-0}" -v b="${s1:-0}" 'BEGIN{print (b>a)?"true":"false"}')"
+  else
+    chk "  the held answer was dropped"      "true" "$(awk -v a="${i0:-0}" -v b="${i1:-0}" 'BEGIN{print (b>a)?"true":"false"}')"
+  fi
+}
+case_ "an insert outside the range"          "c.insertOne({_id:7001, n:500})" kept
+case_ "an insert inside it"                  "c.insertOne({_id:7002, n:15})" dropped
+case_ "a batch with one document inside it"  "c.insertMany([{_id:7003, n:600},{_id:7004, n:16}])" dropped
+case_ "an update to a field it never reads"  "c.updateOne({_id:12}, {\$set: {tag:'x'}})" kept
+case_ "an update moving a document out"      "c.updateOne({_id:13}, {\$set: {n: 25}})" dropped
+case_ "an upsert, which may insert"          "c.updateOne({_id:7005}, {\$set: {tag:'y'}}, {upsert: true})" dropped
+case_ "a delete"                             "c.deleteOne({_id:11})" dropped
+# Somebody else's writes arrive on the fast tier's change stream instead.
+case_ "a direct insert outside the range"    "new Mongo('$HOT').getDB(process.env.TC_DB).$NS.insertOne({_id:7006, n:700}); sleep(1500)" kept
+case_ "a direct insert inside it"            "new Mongo('$HOT').getDB(process.env.TC_DB).$NS.insertOne({_id:7007, n:17}); sleep(1500)" dropped
+case_ "a direct update to a field it never reads" "new Mongo('$HOT').getDB(process.env.TC_DB).$NS.updateOne({_id:15}, {\$set: {tag:'z'}}); sleep(1500)" kept
+case_ "a direct update moving a document in" "new Mongo('$HOT').getDB(process.env.TC_DB).$NS.updateOne({_id:30}, {\$set: {n: 18}}); sleep(1500)" dropped
+# The watch carries an insert's document now, and a stream that hands over one
+# event too large to send fails on it, resumes at it, and fails again. Nothing
+# anybody else writes would drop a cached answer from then on.
+#
+# It takes a large _id as well as a large document, because the event carries
+# the _id again in its resume token and the server allows 16KB over 16MB.
+# Measured straight against the fast tier with a 20KB _id and a document 10KB
+# under the limit: the old projection and the bounded one both delivered the
+# event, and fullDocument:1 failed the getMore with BSONObjectTooLarge. A 15MB
+# document, and one just under 16MB with a small _id, both fit, and a check
+# written with either passed against the unbounded build.
+#
+# Into a collection nothing tiers. The feeder cannot read past such an event
+# either, which is documented and is why the router refuses an _id over 4096
+# bytes; this suite once wrote it into $NS and stopped mirroring for every
+# suite after it. A feeder's stream filters by namespace and survives the event
+# when filtered out: measured.
+H "db.getSiblingDB(process.env.TC_DB).${NS}big.insertOne({_id:'k'.repeat(20000), pad:'x'.repeat(16*1024*1024-30000)})" >/dev/null
+chk "the document with a 20KB _id near 16MB was written" "1" "$(H "print(db.getSiblingDB(process.env.TC_DB).${NS}big.countDocuments({}))")"
+case_ "after it, a direct insert inside the range" "new Mongo('$HOT').getDB(process.env.TC_DB).$NS.insertOne({_id:7009, n:19}); sleep(1500)" dropped
+# An answer of whole documents reads every field, so no update is safe for it.
+WHOLE=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  for (let i = 0; i < 8; i++) { c.find({_id: 12}).toArray(); sleep(250); }
+  c.updateOne({_id: 12}, {\$set: {tag: 'whole'}});
+  print(c.find({_id: 12}).toArray()[0].tag);" 2>&1 | tail -1)
+chk "a find of whole documents sees any field change" "whole" "$WHOLE"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id: {\$gte: 7000}})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).${NS}big.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateMany({}, {\$unset: {tag: ''}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:13}, {\$set: {n: 13}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:30}, {\$set: {n: 30}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:11, country:'BR', n:11})" >/dev/null
+cline watermark --config $CCFG --ns $DB.$NS --clear >/dev/null 2>&1
+
 echo "== who a cached answer may be given to =="
 # The key carries who is asking, or one client would be served another's
 # documents. With authentication terminated that is the verified user; with it

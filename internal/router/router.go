@@ -1155,7 +1155,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// what makes this cache correct for the writer rather than merely fast.
 	if nameErr == nil {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
-			c.cacheInvalidate(name, db, cmd)
+			c.cacheInvalidate(msg, name, db, cmd)
 		}
 	}
 

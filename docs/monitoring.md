@@ -84,14 +84,16 @@ until 2026-09-18.
 
 #### The query cache
 
-Six series appear only when `router.cache.enabled` is true, because a hit rate
-of zero published for a cache nobody turned on reads as a cache that is not
+Eight series appear only when `router.cache.enabled` is true, because a hit
+rate of zero published for a cache nobody turned on reads as a cache that is not
 working:
 
     thermocline_cache_hits_total
     thermocline_cache_misses_total
     thermocline_cache_learned_total
     thermocline_cache_rejected_total
+    thermocline_cache_invalidated_total
+    thermocline_cache_spared_total
     thermocline_cache_entries
     thermocline_cache_bytes
 
@@ -102,6 +104,15 @@ your `max_bytes` says whether the cache is evicting to stay inside its budget;
 queries. `cache_rejected_total` is the one that catches the surprise: a cache
 handed replies over 256KB learns from them and holds none of them, so it looks
 idle from the hit rate alone and the reason is visible nowhere else.
+
+`cache_invalidated_total` and `cache_spared_total` are what writes do to it. A
+write drops a held answer only when it could have changed it. An insert is
+checked against the answer's filter, and an update against the fields the
+answer read. `invalidated` counts the answers a write dropped, and `spared`
+the ones it left in place. Deletes, replacements, upserts, and any query or
+write the router cannot read completely still drop everything that read the
+collection. So a collection whose writes are mostly deletes shows `invalidated`
+climbing and `spared` flat, and that is the cache working as designed.
 
 There is no alert on any of them, on purpose. A cache that is not paying is a
 tuning question, not a page, and the two things it could get wrong that *are*
