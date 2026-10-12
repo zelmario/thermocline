@@ -1446,73 +1446,138 @@ func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []unique
 		{r.cold, bson.D{meta.NotArchivedDeleted()}, true},
 		{r.hot, bson.D{}, false},
 	} {
-		fromArchive := src.fromArchive
-		cur, ferr := src.client.Database(db).Collection(coll).Find(ctx, src.filter)
-		if ferr != nil {
-			return claimed, conflicts, firstClash, ferr
+		got, clash, first, werr := r.claimWalk(ctx, src.client.Database(db).Collection(coll), src.filter, ns, idxs, src.fromArchive)
+		claimed += got
+		conflicts += clash
+		if firstClash == "" {
+			firstClash = first
 		}
-		for cur.Next(ctx) {
-			doc := bson.Raw(cur.Current)
-			id, _ := doc.LookupErr("_id")
-			for i := range idxs {
-				if !r.constrains(ctx, db, idxs[i], doc) {
-					continue
+		if werr != nil {
+			return claimed, conflicts, firstClash, werr
+		}
+	}
+	return claimed, conflicts, firstClash, nil
+}
+
+// claimWorkers is how many documents one pass of claimExistingKeys claims at
+// once.
+//
+// One at a time, every key costs a lookup on the archive and an insert on the
+// fast tier, back to back. On staging on 2026-10-12 that was 2.5ms a key, and
+// adopting 1,000,000 orders spent 41 minutes in cline keys --rebuild. The
+// verdict for each key does not depend on the order: tryClaimFresh is what the
+// write paths call concurrently, and of two documents sharing a key one claims
+// it and the other is a conflict whichever goes first.
+const claimWorkers = 16
+
+// claimWalk claims the keys of every document one tier returns for filter.
+func (r *Router) claimWalk(ctx context.Context, c *mongo.Collection, filter bson.D, ns string,
+	idxs []uniqueIndex, fromArchive bool) (claimed, conflicts int, firstClash string, err error) {
+	cur, err := c.Find(ctx, filter)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+
+	wctx, stop := context.WithCancel(ctx)
+	defer stop()
+	var (
+		mu   sync.Mutex
+		werr error
+		wg   sync.WaitGroup
+	)
+	docs := make(chan bson.Raw, claimWorkers*4)
+	for w := 0; w < claimWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for doc := range docs {
+				got, clash, first, derr := r.claimDocKeys(wctx, ns, idxs, doc, fromArchive)
+				mu.Lock()
+				claimed += got
+				conflicts += clash
+				if firstClash == "" {
+					firstClash = first
 				}
-				// One row per key, because a field holding an array puts
-				// one entry per element into the index. A rebuild that
-				// claimed one of them left the rest of that document's
-				// values unprotected, which is what --rebuild exists to
-				// stop. See multikey.go.
-				kids, tuples := docKeys(ns, idxs[i], doc)
-				for k, kid := range kids {
-					// tryClaim rather than a bare insert, so this walk reaches
-					// the same verdict the write paths do. A row whose owner
-					// has moved off the value is stale and is taken over; only
-					// an owner that still holds the key is a conflict. Doing
-					// that here by hand was the difference between reporting a
-					// duplicate and reporting a claim nobody had cleaned up.
-					got, fresh, terr := r.tryClaimFresh(ctx, ns, idxs[i], kid, id, tuples[k])
-					if terr != nil {
-						_ = cur.Close(context.WithoutCancel(ctx))
-						return claimed, conflicts, firstClash, terr
-					}
-					if got {
-						// Only a row that was not already this document's. A
-						// second rebuild of an unchanged collection has to
-						// report nothing, which is how an operator tells one
-						// that found something from one that did not.
-						if fresh {
-							claimed++
-						}
-						continue
-					}
-					// One document seen twice is not two documents.
-					//
-					// This walk reads both tiers, and during mirroring lag the
-					// archive's copy of a document can carry a value the
-					// document no longer has. Claiming from it reports a
-					// duplicate against whichever live document really holds
-					// that value. The fast tier is authoritative where it holds
-					// the document, which is the same rule claimIsLive follows,
-					// so an archive copy the fast tier has a newer version of
-					// is skipped and the fast tier's own pass covers it.
-					//
-					// On the conflict path only. It is a read per conflict, and
-					// a walk with no conflicts pays nothing for it.
-					if fromArchive && r.staleArchiveCopy(ctx, ns, idxs[i], kid, id) {
-						continue
-					}
-					conflicts++
-					if firstClash == "" {
-						firstClash = describeKey(idxs[i], doc)
-					}
+				if derr != nil && werr == nil {
+					werr = derr
+					stop()
 				}
+				mu.Unlock()
 			}
+		}()
+	}
+	for wctx.Err() == nil && cur.Next(wctx) {
+		// The cursor reuses its buffer, and a worker reads this after Next.
+		docs <- append(bson.Raw(nil), cur.Current...)
+	}
+	close(docs)
+	wg.Wait()
+	if werr != nil {
+		return claimed, conflicts, firstClash, werr
+	}
+	if cerr := cur.Err(); cerr != nil {
+		return claimed, conflicts, firstClash, cerr
+	}
+	return claimed, conflicts, firstClash, ctx.Err()
+}
+
+// claimDocKeys claims every key one document holds under idxs.
+func (r *Router) claimDocKeys(ctx context.Context, ns string, idxs []uniqueIndex, doc bson.Raw,
+	fromArchive bool) (claimed, conflicts int, firstClash string, err error) {
+	db, _ := splitNS(ns)
+	id, _ := doc.LookupErr("_id")
+	for i := range idxs {
+		if !r.constrains(ctx, db, idxs[i], doc) {
+			continue
 		}
-		cerr := cur.Err()
-		_ = cur.Close(context.WithoutCancel(ctx))
-		if cerr != nil {
-			return claimed, conflicts, firstClash, cerr
+		// One row per key, because a field holding an array puts
+		// one entry per element into the index. A rebuild that
+		// claimed one of them left the rest of that document's
+		// values unprotected, which is what --rebuild exists to
+		// stop. See multikey.go.
+		kids, tuples := docKeys(ns, idxs[i], doc)
+		for k, kid := range kids {
+			// tryClaim rather than a bare insert, so this walk reaches
+			// the same verdict the write paths do. A row whose owner
+			// has moved off the value is stale and is taken over; only
+			// an owner that still holds the key is a conflict. Doing
+			// that here by hand was the difference between reporting a
+			// duplicate and reporting a claim nobody had cleaned up.
+			got, fresh, terr := r.tryClaimFresh(ctx, ns, idxs[i], kid, id, tuples[k])
+			if terr != nil {
+				return claimed, conflicts, firstClash, terr
+			}
+			if got {
+				// Only a row that was not already this document's. A
+				// second rebuild of an unchanged collection has to
+				// report nothing, which is how an operator tells one
+				// that found something from one that did not.
+				if fresh {
+					claimed++
+				}
+				continue
+			}
+			// One document seen twice is not two documents.
+			//
+			// This walk reads both tiers, and during mirroring lag the
+			// archive's copy of a document can carry a value the
+			// document no longer has. Claiming from it reports a
+			// duplicate against whichever live document really holds
+			// that value. The fast tier is authoritative where it holds
+			// the document, which is the same rule claimIsLive follows,
+			// so an archive copy the fast tier has a newer version of
+			// is skipped and the fast tier's own pass covers it.
+			//
+			// On the conflict path only. It is a read per conflict, and
+			// a walk with no conflicts pays nothing for it.
+			if fromArchive && r.staleArchiveCopy(ctx, ns, idxs[i], kid, id) {
+				continue
+			}
+			conflicts++
+			if firstClash == "" {
+				firstClash = describeKey(idxs[i], doc)
+			}
 		}
 	}
 	return claimed, conflicts, firstClash, nil
