@@ -531,3 +531,58 @@ func TestInvalidationIsCounted(t *testing.T) {
 		t.Errorf("invalidated = %d after an unrelated write, want 2", got)
 	}
 }
+
+// A write forgets queries that held no answer yet, and that is counted apart
+// from the held answers it dropped.
+//
+// Invalidated alone said 335 on the staging shop while writes had forgotten
+// 53,842 queries, each of them one sighting from being held. The two numbers
+// have to be different counters or the second one cannot be seen.
+func TestForgettingIsCountedApartFromDropping(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	reply := []byte("an answer")
+	c.Observe("held", "shop.orders", reply)
+	c.Observe("seen-once", "shop.orders", reply)
+	k.add(time.Minute)
+	c.Observe("held", "shop.orders", reply)
+	if _, ok := c.Get("held"); !ok {
+		t.Fatal("nothing was cached, so this test proves nothing")
+	}
+
+	c.Invalidate("shop.orders")
+	s := c.Stats()
+	if s.Invalidated != 1 {
+		t.Errorf("invalidated = %d, want 1: only one answer was held", s.Invalidated)
+	}
+	if s.Forgotten != 2 {
+		t.Errorf("forgotten = %d, want 2: both queries were being watched", s.Forgotten)
+	}
+
+	c.InvalidateDatabase("shop")
+	if got := c.Stats().Forgotten; got != 2 {
+		t.Errorf("forgotten = %d after dropping a database nothing watches any more, want 2", got)
+	}
+}
+
+// Every miss is counted under exactly one reason.
+func TestEveryMissHasAReason(t *testing.T) {
+	c, k := newTestCache(10, time.Hour)
+	reply := []byte("an answer")
+
+	c.Get("never-asked")
+	c.Observe("seen-once", "shop.orders", reply)
+	c.Get("seen-once")
+	c.Observe("expires", "shop.orders", reply)
+	k.add(time.Second)
+	c.Observe("expires", "shop.orders", reply)
+	k.add(time.Minute)
+	c.Get("expires")
+
+	s := c.Stats()
+	if s.MissUnknown != 1 || s.MissEmpty != 1 || s.MissExpired != 1 {
+		t.Errorf("unknown=%d empty=%d expired=%d, want 1 each", s.MissUnknown, s.MissEmpty, s.MissExpired)
+	}
+	if sum := s.MissUnknown + s.MissEmpty + s.MissExpired; sum != s.Misses {
+		t.Errorf("reasons sum to %d and misses are %d", sum, s.Misses)
+	}
+}

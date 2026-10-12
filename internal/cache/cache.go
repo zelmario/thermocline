@@ -128,6 +128,21 @@ type Cache struct {
 	// Rejected counts answers too large to hold, which is worth knowing: a
 	// cache that looks idle may simply be being handed things it will not keep.
 	Rejected uint64
+	// Forgotten counts watched queries a write made this cache forget, whether
+	// or not an answer was held for them.
+	//
+	// Invalidated counts only the held answers, and that hid the real cost.
+	// A query is held from its second sighting, so a write forgets what was
+	// learned from the first one too, and the next asking starts again from
+	// nothing. Measured on the Hetzner staging pair on 2026-10-12, five
+	// minutes of the shop: Invalidated said 335 and writes had forgotten 53,842
+	// queries, which was the whole of why 92% of misses found no query known.
+	Forgotten uint64
+	// Why each miss missed. MissUnknown is a query not being watched: never
+	// asked, forgotten by a write, or evicted at max_queries. MissEmpty is one
+	// being watched with no answer held, because it has been seen once or its
+	// learned TTL is under MinTTL. MissExpired is a held answer past its TTL.
+	MissUnknown, MissEmpty, MissExpired uint64
 }
 
 // New returns a cache holding at most max queries and maxBytes of answers, with
@@ -163,12 +178,19 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	h, ok := c.byKey[key]
-	if !ok || h.entry == nil {
+	if !ok {
 		c.Misses++
+		c.MissUnknown++
+		return nil, false
+	}
+	if h.entry == nil {
+		c.Misses++
+		c.MissEmpty++
 		return nil, false
 	}
 	if c.now().Sub(h.entry.StoredAt) >= h.entry.TTL {
 		c.Misses++
+		c.MissExpired++
 		return nil, false
 	}
 	c.Hits++
@@ -396,6 +418,9 @@ func (c *Cache) InvalidateWrite(ns string, w Write) int {
 			}
 			continue
 		}
+		if _, watched := c.byKey[k]; watched {
+			c.Forgotten++
+		}
 		if c.forget(k) {
 			n++
 		}
@@ -426,6 +451,8 @@ func (c *Cache) Depends(key, ns string, r Reads) {
 // moment.
 type Stats struct {
 	Hits, Misses, Learned, Rejected, Invalidated, Spared uint64
+	Forgotten                                            uint64
+	MissUnknown, MissEmpty, MissExpired                  uint64
 	Entries                                              int
 	Bytes                                                int
 }
@@ -441,6 +468,10 @@ func (c *Cache) Stats() Stats {
 		Rejected:    c.Rejected,
 		Invalidated: c.Invalidated,
 		Spared:      c.Spared,
+		Forgotten:   c.Forgotten,
+		MissUnknown: c.MissUnknown,
+		MissEmpty:   c.MissEmpty,
+		MissExpired: c.MissExpired,
 		Entries:     len(c.byKey),
 		Bytes:       c.bytes,
 	}
@@ -473,6 +504,9 @@ func (c *Cache) InvalidateDatabase(db string) int {
 	}
 	n := 0
 	for _, k := range keys {
+		if _, watched := c.byKey[k]; watched {
+			c.Forgotten++
+		}
 		if c.forget(k) {
 			n++
 		}

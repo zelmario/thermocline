@@ -78,8 +78,15 @@ type CacheSnapshot struct {
 	Invalidated uint64 `json:"invalidated"`
 	// Spared is held answers a write to their collection left in place,
 	// because it could not have changed them.
-	Spared uint64        `json:"spared"`
-	Advice []CacheAdvice `json:"advice"`
+	Spared uint64 `json:"spared"`
+	// Forgotten is watched queries a write made the cache forget, held or
+	// not. Against Invalidated it says how much learning writes are undoing.
+	Forgotten uint64 `json:"forgotten"`
+	// Why the misses missed. See cache.Cache.
+	MissUnknown uint64        `json:"miss_unknown"`
+	MissEmpty   uint64        `json:"miss_empty"`
+	MissExpired uint64        `json:"miss_expired"`
+	Advice      []CacheAdvice `json:"advice"`
 }
 
 // CacheAdvice is one row: a query, how often it is asked, how long its answer
@@ -100,7 +107,8 @@ func (r *Router) cacheSnapshot() CacheSnapshot {
 		cs := r.cache.Stats()
 		out.Hits, out.Misses = cs.Hits, cs.Misses
 		out.Entries, out.Bytes, out.Rejected = cs.Entries, cs.Bytes, cs.Rejected
-		out.Invalidated, out.Spared = cs.Invalidated, cs.Spared
+		out.Invalidated, out.Spared, out.Forgotten = cs.Invalidated, cs.Spared, cs.Forgotten
+		out.MissUnknown, out.MissEmpty, out.MissExpired = cs.MissUnknown, cs.MissEmpty, cs.MissExpired
 		if total := out.Hits + out.Misses; total > 0 {
 			out.HitRate = float64(out.Hits) / float64(total)
 		}

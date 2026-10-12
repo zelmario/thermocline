@@ -234,24 +234,72 @@ whether it is open.
 The learned TTL is what remains: a backstop for the moments before the stream
 catches up, bounded again by `max_ttl`.
 
+### What a write-heavy shop gets from it, measured
+
+On the Hetzner staging pair on 2026-10-12, with `test/store` shopping through
+one router for five minutes per run: 8,000 orders over 120 days, 800 customers,
+300 products, six shoppers, and a warmer and an evictor running every five
+seconds underneath. Every run reported 0 errors and the shop noticed nothing
+wrong.
+
+| `max_queries` | hit rate | hits | most queries watched | forgotten by writes |
+|---|---|---|---|---|
+| 200 | 3.5% | 2,341 | 199 | 55,528 |
+| 2,000 | 13.0% | 8,414 | 308 | 53,842 |
+| 20,000 | 13.0% | 8,516 | 309 | 54,382 |
+
+**At 200 the table was too small.** Each product was browsed about every eight
+seconds, and at about 210 lookups a second, mostly with parameters seen once, a
+query was evicted for room at an average age of 8.6 seconds. Products are never
+written, so once they stopped being evicted they were served from the cache
+about three times in four, and that is nearly all of the 13%.
+
+**Past about 300 the size stops mattering**, because writes empty the table
+faster than queries fill it. The default of 1,000 is enough for this workload.
+
+**What holds it at 13% is deletes.** A delete reaches the cache as a write of
+unknown effect, from the router's own commands and from the change stream alike,
+because neither says which document was removed or what it held. So every
+delete on a collection forgets every query learned on it. In the five minutes at
+200, the fast tier deleted 8,720 orders: 1,983 were the shop cancelling, and
+about 6,700 were the evictor moving documents to the archive. That is about 29
+deletes a second, and a query on `orders` rarely lived 50ms.
+
+An eviction cannot change an answer through the router, since the document is
+still read from the archive. Telling one apart from an application delete is
+possible but racy: the router learns an eviction from a notice the feeder marks
+as spent only after it applies the delete, and a cache that guesses "eviction"
+before that serves a stale answer whenever the guess is wrong. Even with every
+eviction excluded, the shop's own cancels would still forget each query on
+`orders` six times a second, and a customer's count is asked for about every 17
+seconds. Only knowing what each deleted document held would change that, which
+needs pre-images on the fast tier.
+
+So read the hit rate per collection, not as one number. The cache serves a
+collection that is read far more than it is deleted from. On a collection with
+steady deletes it keeps nothing, it costs a lookup per read, and
+`cache_forgotten_total` says so. See [monitoring](monitoring.md#the-query-cache).
+
 **The key carries who is asking**, or one client would be served another's
 documents, which is a bypass this system has had once already. With
-`terminate_auth` on that is the verified user, and answers are shared between
-that user's connections. With authentication proxied the router does not know
-who the client is, so the connection is the identity, and never one client with
-another's answer.
+`terminate_auth` on that is the verified user. With authentication proxied it is
+the user the fast tier accepted, which the router reads as the conversation
+passes through it (since 2026-08-22). Either way the connections of one user
+share answers and two users never do. Only a connection that never
+authenticated is keyed on its own.
 
-**That costs a pooled driver almost all of it,** which is worth being plain
-about. A pool spreads repeats across its connections, so the second asking of a
-question usually lands somewhere the first was never stored. Measured with
-`test/store`, a shop of 3,000 orders read through five connections with the
-cache on: **7 shapes, 378 lookups, 0 hits.** The same run with
-`terminate_auth` on, where the identity is the user and the pool shares one
-cache: 5 hits in 378.
+Before that change the proxied key was the connection, and a pool spreads
+repeats across its connections, so the second asking usually landed where the
+first was never stored. Measured with `test/store`, a shop of 3,000 orders read
+through five connections: **7 shapes, 378 lookups, 0 hits.** Keyed by the user,
+the same run gave 5 in 378.
 
 Five is not a rounding error away from zero, it is the same answer. The cache
-serves a query repeated with the *same parameters*, and a shop asking about a
-different customer each time never repeats one. What it is for is the workload
+serves a query repeated with the *same parameters* while its answer still holds,
+and a shop asking about a different customer each time, on a collection it is
+also writing to, rarely does both. The staging run above is the same lesson at a
+larger scale: the queries that repeated and were never written, the products,
+were served, and nothing on `orders` was. What it is for is the workload
 that does: a dashboard refreshing the same figures, a report run on a timer, a
 hot lookup every request makes with the same argument. `cline cache` ranks what
 your traffic actually repeats, and if the top of that list is thin then this

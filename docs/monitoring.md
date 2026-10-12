@@ -58,11 +58,15 @@ about **0.12 seconds**, and almost every report arrives to find its answer
 already dropped. The measured hit rate on that shape was about 1%, which is what
 those two numbers predict.
 
-So read the three together:
+So read them together:
 
     cache_hits_total        near zero
-    cache_invalidated_total climbing with your write rate   -> the cache is being emptied
-    cache_invalidated_total near zero as well               -> nothing repeats; see cline cache
+    cache_forgotten_total   climbing with your write rate   -> the cache is being emptied
+    cache_forgotten_total   near zero as well               -> nothing repeats; see cline cache
+
+Read `cache_forgotten_total` here, not `cache_invalidated_total`. The second
+counts only answers that were held, and on a collection written this often few
+ever are, so it stays low while writes empty the cache.
 
 The first case is not a cache that cannot learn. It is a cache working exactly
 as designed on a workload it cannot help, and the remedy is to cache a
@@ -84,15 +88,17 @@ until 2026-09-18.
 
 #### The query cache
 
-Eight series appear only when `router.cache.enabled` is true, because a hit
+Ten series appear only when `router.cache.enabled` is true, because a hit
 rate of zero published for a cache nobody turned on reads as a cache that is not
 working:
 
     thermocline_cache_hits_total
     thermocline_cache_misses_total
+    thermocline_cache_miss_reasons_total{reason="unknown|empty|expired"}
     thermocline_cache_learned_total
     thermocline_cache_rejected_total
     thermocline_cache_invalidated_total
+    thermocline_cache_forgotten_total
     thermocline_cache_spared_total
     thermocline_cache_entries
     thermocline_cache_bytes
@@ -113,6 +119,24 @@ the ones it left in place. Deletes, replacements, upserts, and any query or
 write the router cannot read completely still drop everything that read the
 collection. So a collection whose writes are mostly deletes shows `invalidated`
 climbing and `spared` flat, and that is the cache working as designed.
+
+`cache_forgotten_total` is the one that was missing, and its absence hid the
+real cost of writes for two months. A query is held from its second sighting, so
+a write that drops a held answer also drops what was learned about every query
+on that collection still waiting for its second sighting. The next asking starts
+again from nothing. On the staging shop, five minutes with `max_queries: 2000`:
+
+    cache_invalidated_total                  335
+    cache_forgotten_total                 53,842
+    cache_miss_reasons_total{unknown}     53,936   of 56,474 misses
+
+`cache_miss_reasons_total` says which of three things a miss was. `unknown` is a
+query not being watched: never asked, forgotten by a write, or evicted at
+`max_queries`. `empty` is a watched query with no answer held yet. `expired` is a
+held answer past its learned TTL. When `unknown` dominates, compare
+`cache_forgotten_total` with `cache_entries`: forgotten climbing with entries
+well below `max_queries` means writes, and raising `max_queries` will not help;
+entries pinned at `max_queries` means the table is too small.
 
 There is no alert on any of them, on purpose. A cache that is not paying is a
 tuning question, not a page, and the two things it could get wrong that *are*
