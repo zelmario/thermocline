@@ -430,6 +430,9 @@ func (r *Router) Survey(ctx context.Context) error {
 	// question it is asked. Said at creation time in newindex.go, which is once
 	// to whoever was reading the log that minute.
 	r.warnAboutUniqueIndexesTheArchiveLacks(ctx)
+	// And the same for every other index, which costs the reads that fall
+	// through rather than the writes.
+	r.warnAboutIndexesTheArchiveLacks(ctx)
 
 	// The three writes a start makes, reported rather than made. Together with
 	// the checks above this answers the question the command exists for: what
@@ -624,6 +627,9 @@ func (r *Router) Listen(ctx context.Context) error {
 		// same per-namespace cost that delayed a start past the thirty seconds
 		// a suite waits, on a deployment with 139 tiered namespaces.
 		r.warnAboutUniqueIndexesTheArchiveLacks(ctx)
+		// One more listing of each side per namespace, for the indexes the
+		// reads that fall through need.
+		r.warnAboutIndexesTheArchiveLacks(ctx)
 	})
 	// The advisor publishes one last report as it stops, and that write has to
 	// finish before this function returns or the process exits out from under

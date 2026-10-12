@@ -507,6 +507,23 @@ felt much later by a read that falls through. A text or geospatial index gets a
 different line, because those two the archive needs in order to answer at all
 rather than to answer quickly.
 
+That line is said once, to whoever reads the log that minute, and only for an
+index made through the router. So every router start, and `cline preflight`,
+also names each tiered collection whose fast tier has an index the archive
+cannot serve, however it got there:
+
+    WARN the archive has no index for some of the fast tier's indexes on a tiered collection
+         ns=shopstore.orders indexes=[at_-1 customer_1_at_-1 customer_1_status_1]
+
+Unique and TTL indexes are left out of it. A unique one has its own warning,
+below, and a TTL one must never be built on the archive. Leaving an index off
+the archive is a fair choice for a query that never reaches past the fast tier,
+so the line asks you to decide, not to build everything. Missing it is not
+small, though. On the staging pair on 2026-10-12, a shop with only `_id` and
+`ref` indexed on the archive slowed from 269 to 172 operations a second in
+twenty minutes, with the archive's primary at load 5.6 on two cores. The next
+five minutes after building the four indexes it lacked ran at 404.
+
 **Two of those divergences cost more than a slow read, and both were measured
 on 2026-09-21.**
 
