@@ -456,10 +456,42 @@ chk "  a read of it falls through to the archive"       "1" "$(RT "print(db.getS
 # Freeze the secondaries so nobody can be elected, then force the primary down.
 # Twelve seconds plus the election timeout that follows the thaw: about twenty,
 # far past the five a read used to wait and inside the thirty it waits now.
-P=$(coldPrimary)
-for a in $CMEMBERS; do [ "$a" != "$P" ] && D $a 'rs.freeze(12)' >/dev/null; done
-D "$P" 'try{db.adminCommand({replSetStepDown: 30, force: true})}catch(e){}' >/dev/null 2>&1
-chk "  the archive has no primary"                      "none" "$(coldPrimary)"
+#
+# Only from a set that has settled. The section before this one steps the
+# archive's primary down and then waits for the fast tier, not the archive, and
+# coldPrimary reports one member's view. In three runs of four on 2026-10-12 the
+# window never opened and this section passed on a question nobody was asked.
+# So wait until every member names the same primary and that member says it is
+# writable, and print what each freeze and the step-down answered.
+coldAgreed() {
+  local views
+  views=$(for a in $CMEMBERS; do D $a 'print(db.hello().primary || "none")'; done | sort -u)
+  [ "$(echo "$views" | wc -l)" = 1 ] && [ "$views" != none ] || return 1
+  [ "$(D "$views" 'print(db.hello().isWritablePrimary === true)')" = true ] && echo "$views"
+}
+P=""
+for _ in $(seq 1 60); do P=$(coldAgreed) && break; sleep 1; done
+[ -n "$P" ] || echo "      the archive's members never agreed on a primary"
+for a in $CMEMBERS; do
+  [ "$a" != "$P" ] || continue
+  r=$(D $a 'try{print(rs.freeze(12).ok)}catch(e){print(e.codeName || e.message)}')
+  [ "$r" = 1 ] || echo "      freezing $a answered: $r"
+done
+r=$(D "$P" 'try{print(db.adminCommand({replSetStepDown: 30, force: true}).ok)}catch(e){print(e.codeName || e.message)}')
+[ "$r" = 1 ] || echo "      stepping $P down answered: $r"
+# Every member, and given a moment. A member learns of a step-down from the next
+# heartbeat, so for up to two seconds it still names the member that stepped
+# down. coldPrimary asks the first member only, which answers for itself when it
+# was the primary and from that stale view when it was not: every failure of
+# this check on 2026-10-12 named 172.24.0.3, never the first member.
+coldNone() {
+  for _ in $(seq 1 10); do
+    [ "$(for a in $CMEMBERS; do D $a 'print(db.hello().primary || "none")'; done | sort -u)" = none ] && { echo none; return; }
+    sleep 0.5
+  done
+  coldPrimary
+}
+chk "  the archive has no primary"                      "none" "$(coldNone)"
 OUT=$(RT "const c=db.getSiblingDB('shop').$NPNS; c.insertOne({_id:2});
   const t=Date.now(); const n=c.countDocuments({}); print(n+' '+Math.round((Date.now()-t)/1000)+'s')")
 echo "      the read answered: $OUT"
