@@ -679,6 +679,54 @@ that failure and still fails on "not primary" or a timeout.
 Nothing joins **Open** today. The two items there still need a person: a
 measurement off this machine and a rehearsal of the procedure.
 
+## 2026-10-13: one large insert stopped every feeder
+
+**Strict freshness turned a slow feeder into refused reads, and a full gate
+found the slow feeder.** The first gate after strict became the default failed
+testaggwrite, testevict and testmerge on refusals, on the Hetzner staging pair
+with four workers. Every feeder had stopped publishing for 13 seconds at once.
+The hot primary's slow-query log had their change stream getMores at 12.9 to
+13.8 seconds each, with a 20ms await and about 5 CPU-seconds for 252 oplog
+entries.
+
+The write was testindexes seeding 40,000 one-kilobyte documents in 20
+insertMany batches. MongoDB 8.0 logs a retryable insertMany as chained applyOps
+entries, and a change stream unwinds every operation inside them, including
+ones for namespaces it does not mirror. The feeder's filter had one `$or` branch
+for each of the 187 tiered namespaces, tried in turn for each of the 40,000
+operations. Grouped into one branch per database with a `$in` of collections,
+it matches the same events:
+
+| Over the same 40,000-document insert | before | after |
+|---|---|---|
+| one live stream, longest blocked poll | 2,491ms | 28ms |
+| four feeders, longest silence | 7.8 to 9.5s | 23 to 36ms |
+| the same run with nothing written | | 24ms |
+
+A feeder resuming from a checkpoint pays the same cost: one took 52 seconds to
+replay earlier seedings. The cost grows with the namespace list: with one
+namespace listed, a stream catching up over the same insert took 55ms,
+against 2,466 to 2,551ms with the 187. A deployment tiering hundreds of collections, with a bulk
+loader on the fast tier, would have refused fall-through reads for the length
+of every batch.
+
+**Two monitoring defects came out of the same diagnosis.** The cluster-time
+gauge compared against a cache that only refreshes while a read waits, so on a
+healthy feeder it climbed one second per second, 150 after 150 seconds, and
+`ThermoclineClusterTimeBehind` would have fired on any router whose reads
+rarely fall through. And a strict refusal never said which bar it gave up on,
+because that line stayed on the permissive path. Both fixed, with checks.
+
+**The first host sweep on staging found only harness gaps.** 326 passed and 7
+failed, all in two suites whose fixtures plant data with no feeder and which
+had not run since strict became the default. testversion's "patch apart" pair
+also turned out to be two tags of one image on a fresh pull, so it is pinned.
+
+After the fixes, both in-node passes on the same build: 2077 passed, 0 failed,
+cache off and cache on.
+
+Nothing joins **Open**.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these
