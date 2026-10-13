@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -257,29 +258,6 @@ func (r *Router) noteOpTime(reply *wire.Message) {
 			return
 		}
 	}
-}
-
-// mirroredThroughCached returns what is already known about mirroring, and
-// never goes and finds out.
-//
-// For callers that must not disturb the read path. mirroredThrough publishes
-// whatever it fetches into the same cache the barrier reads, including a
-// failure, and publish sets fetched either way, so a caller that fetched and
-// failed leaves "nothing is mirroring" in the cache. The poller only runs while
-// reads are waiting on it, so on a router with no fall-through traffic that
-// answer stands until one arrives, and the first one then gives up at once and
-// answers stale.
-//
-// A metrics scrape is exactly such a caller: it runs on a timer whether or not
-// anything is reading, and an archive it cannot reach is the state it most
-// needs to report. Reporting it must not also cause it.
-func (r *Router) mirroredThroughCached() (reading, bool) {
-	r.ckptCache.mu.Lock()
-	defer r.ckptCache.mu.Unlock()
-	if r.ckptCache.fetched.IsZero() {
-		return reading{}, false
-	}
-	return r.ckptCache.last, true
 }
 
 // mirroredThrough returns how far mirroring has got, reusing a recent reading.
@@ -541,7 +519,7 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		return nil
 	}
 	if c.r.cfg.Freshness != config.FreshnessPermissive {
-		err := c.r.refuseStale(ns, "refused a read the archive could not answer fresh")
+		err := c.r.refuseStale(ctx, c.log, ns, "refused a read the archive could not answer fresh", started)
 		if budget > 0 && ctx.Err() != nil {
 			return errFreshnessDeadline
 		}
@@ -557,7 +535,7 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		"waited", c.r.cfg.ArchiveWait.String(),
 		"suppressed_since_last", suppressed,
 		"effect", "this answer may miss a very recent write, or include a very recently deleted document")
-	c.explainStale(ctx, started)
+	c.r.explainStale(ctx, c.log, started)
 	return nil
 }
 
@@ -577,15 +555,22 @@ var errFreshnessDeadline = fmt.Errorf("%w (the caller's maxTimeMS ran out while 
 
 // refuseStale counts and logs one refusal under router.freshness: strict, rate
 // limited the way stale answers are, and returns the error to refuse with.
-func (r *Router) refuseStale(ns, what string) error {
+//
+// With the bar it gave up on, as a stale answer has. Strict became the default
+// on 2026-10-12 and the explanation stayed on the permissive path, so the
+// default said "waited 5s" and nothing else: a testaggwrite delete refused
+// under four workers on 2026-10-13 left no way to tell a feeder behind from a
+// cluster time it had not yet covered.
+func (r *Router) refuseStale(ctx context.Context, log *slog.Logger, ns, what string, started time.Time) error {
 	r.Stats.Refused.Add(1)
 	if suppressed, say := r.noteStaleRead(); say {
-		r.log.Warn(what,
+		log.Warn(what,
 			"ns", ns,
 			"waited", r.cfg.ArchiveWait.String(),
 			"suppressed_since_last", suppressed,
 			"why", "mirroring has not caught up with the fast tier, and router.freshness is strict",
 			"action", "check the feeder; set router.freshness to permissive to answer from the archive anyway")
+		r.explainStale(ctx, log, started)
 	}
 	return errArchiveBehind
 }
@@ -669,11 +654,12 @@ func (r *Router) archiveIsFreshUnder(ctx context.Context, ns string, budget time
 		ctx, cancel = context.WithTimeout(ctx, budget/2)
 		defer cancel()
 	}
-	if r.waitForArchive(ctx, time.Now()) {
+	started := time.Now()
+	if r.waitForArchive(ctx, started) {
 		return nil
 	}
 	if policy != config.FreshnessPermissive {
-		err := r.refuseStale(ns, "not "+what)
+		err := r.refuseStale(ctx, r.log, ns, "not "+what, started)
 		if budget > 0 && ctx.Err() != nil {
 			return errFreshnessDeadline
 		}
@@ -689,6 +675,7 @@ func (r *Router) archiveIsFreshUnder(ctx context.Context, ns string, budget time
 		"waited", r.cfg.ArchiveWait.String(),
 		"suppressed_since_last", suppressed,
 		"effect", effect)
+	r.explainStale(ctx, r.log, started)
 	return nil
 }
 
@@ -739,35 +726,35 @@ const explainEvery = 10 * time.Second
 // the decision. That the bar has often cleared by the time this runs is itself
 // worth seeing: it says the wait ended a moment early rather than the feeder
 // being stopped.
-func (c *conn) explainStale(ctx context.Context, started time.Time) {
+func (r *Router) explainStale(ctx context.Context, log *slog.Logger, started time.Time) {
 	// No gate of its own: noteStaleRead has already claimed this interval for
 	// the pair, so this runs exactly when the warning above does.
-	got := c.r.mirroredThrough(ctx)
+	got := r.mirroredThrough(ctx)
 	// A position that stopped moving is not a position that was never
 	// published, and saying the second for the first sent a diagnosis on
 	// 2026-09-25 looking for a harness that had not waited for the record to
 	// exist, when the record was there and a feeder paused.
 	if !got.known && got.quiet > 0 {
-		c.log.Warn("and mirroring's published position has stopped moving",
+		log.Warn("and mirroring's published position has stopped moving",
 			"quiet_for", got.quiet.Round(time.Millisecond).String(),
 			"note", "past archive_wait the feeder is taken to have stopped, so reads answer from the "+
 				"archive at once; check the feeder is running and not blocked")
 		return
 	}
 	if !got.known {
-		c.log.Warn("and mirroring has published no position at all",
+		log.Warn("and mirroring has published no position at all",
 			"note", "nothing is mirroring, so no read can clear the barrier; check the feeder is running")
 		return
 	}
-	seen := c.r.seenOpTime.Load()
+	seen := r.seenOpTime.Load()
 	feeder := checkpoint.PackTS(got.ts)
-	mine, mineKnown := c.r.archiveSkew(ctx)
+	mine, mineKnown := r.archiveSkew(ctx)
 	at, until := got.at, started
 	if mineKnown && got.skewKnown {
 		at = at.Add(-got.skew)
 		until = until.Add(-mine)
 	}
-	c.log.Warn("which bar the freshness wait gave up on",
+	log.Warn("which bar the freshness wait gave up on",
 		"wall_clock_short_by", until.Sub(at).Round(time.Millisecond).String(),
 		"cluster_time_short", seen != 0 && got.ts.T != 0 && feeder < seen,
 		"feeder_ts", feeder, "router_seen_ts", seen,

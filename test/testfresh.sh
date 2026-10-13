@@ -743,6 +743,12 @@ chk "and the message names the opt-in"           "true" \
 chk "and it did not hang waiting"                "true" "$([ "$ELAPSED" -lt 8 ] && echo true || echo false)"
 chk "the router logged the refusal"              "true" \
     "$(grep -q 'refused a read the archive could not answer fresh' $LOGDIR/fresh_r.log && echo true || echo false)"
+# With the reason, as a stale answer has. The explanation stayed on the
+# permissive path when strict became the default, so a refusal said "waited 5s"
+# and nothing about which bar: testaggwrite's delete was refused under load on
+# 2026-10-13 and its log could not say whether the feeder was behind.
+chk "and said why the wait gave up"              "true" \
+    "$(grep -q 'and mirroring has published no position at all' $LOGDIR/fresh_r.log && echo true || echo false)"
 # A write that has to bring a document up from the archive is refused the same
 # way, rather than told it matched nothing: a copy-up with mirroring behind can
 # bring back a document deleted a moment ago.
