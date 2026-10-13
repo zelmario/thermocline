@@ -725,6 +725,14 @@ also turned out to be two tags of one image on a fresh pull, so it is pinned.
 After the fixes, both in-node passes on the same build: 2077 passed, 0 failed,
 cache off and cache on.
 
+**The failover lead from 2026-10-12 closed.** testfailover's "write with
+nowhere to go" lost its retry about once in 16 runs, and only in a run where
+the router found the new primary just inside its 5 second lookup. Forced onto
+that path, 9 of 10 writes failed: the driver's monitor check came back at once
+and the retry went out on the connection the router was closing. The router
+now holds `hello` for 250ms after such a close, and the same rounds landed 10
+of 10. The details are in [limitations.md](limitations.md).
+
 Nothing joins **Open**.
 
 ## What is accepted, and needs no work
