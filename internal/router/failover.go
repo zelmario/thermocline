@@ -141,7 +141,58 @@ func (c *conn) endAfterFailover(ctx context.Context) {
 	// client's reconnect to it. See awaitPrimaryProbe for what losing that race
 	// looks like.
 	c.r.awaitPrimaryProbe(ctx)
+	// Before the refusal is written, so any hello the driver sends after
+	// reading it finds the stamp. See holdHelloAfterFailover.
+	c.r.failoverEndedAt.Store(time.Now().UnixNano())
 	c.closeAfterReply = true
+}
+
+// failoverSettle is how long a hello waits after a connection was ended for a
+// failover refusal. The driver read that close 2 to 34ms after the refusal in
+// the rounds measured on 2026-10-13, so this is several times the longest.
+const failoverSettle = 250 * time.Millisecond
+
+// holdHelloAfterFailover delays a hello reply until failoverSettle has passed
+// since the last connection this router ended for a failover refusal.
+//
+// The driver's retry is decided by a hello. A retryable write refused "not
+// primary" marks the server unknown, and server selection for the retry waits
+// for the monitor's next hello. When that took a second or more, as it did
+// while the router was still looking for a primary, the close of the refused
+// connection reached the driver first, the pool dropped it, and the retry went
+// out on a new connection to the new primary. When the router had already found the new primary, the hello came
+// back in about a millisecond, selection finished, and the retry went out on
+// the refused connection the router was closing: "This socket has been ended
+// by the other party", the write not applied and the retry spent.
+//
+// Measured on the Hetzner staging pair, a write through the router while the
+// set had no primary, Node driver logs on: with the router's probe giving up
+// before the election ended, 40 of 40 landed, and in the 20 rounds whose logs
+// were kept every retry went out on a new connection 0.8 to 2.8 seconds
+// later. With the probe lengthened so it found the new primary, 9 of 10
+// failed, each retry sent on the refused connection 3ms after the refusal; the
+// one that landed had taken a new connection. testfailover failed the same
+// way once in 16 runs, the run where the election finished just inside the
+// probe's 5s. So the loss needs a refusal held while the probe runs and then
+// resolves: a write refused during an election shorter than the probe.
+//
+// With the hold, those 10 rounds landed 10 of 10, each retry on a new
+// connection about 256ms after the refusal. What it costs: a write sent after
+// a plain step-down had finished landed 10 of 10 either way, its retry on a
+// new connection 9 to 23ms after the refusal without the hold and 254 to
+// 277ms with it.
+//
+// Holding the hello lets the driver read the close before it selects. It
+// delays a monitor check by at most failoverSettle, only in the moments after
+// a failover. With router.terminate_auth nothing is closed and nothing waits.
+func (r *Router) holdHelloAfterFailover() {
+	at := r.failoverEndedAt.Load()
+	if at == 0 {
+		return
+	}
+	if wait := failoverSettle - time.Since(time.Unix(0, at)); wait > 0 {
+		time.Sleep(wait)
+	}
 }
 
 // closeIdleSiblings ends every other client connection whose own upstream goes

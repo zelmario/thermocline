@@ -214,6 +214,10 @@ type Router struct {
 	staleSaidAt     atomic.Int64
 	staleSuppressed atomic.Int64
 
+	// failoverEndedAt is when this router last ended a client connection after
+	// a failover refusal, as unix nanoseconds. See holdHelloAfterFailover.
+	failoverEndedAt atomic.Int64
+
 	// inv is what each tier is holding, refreshed on a timer.
 	inv     inventoryCache
 	started time.Time
@@ -1849,6 +1853,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 // replyHello rewrites the handshake so the driver stays with this proxy.
 func (c *conn) replyHello(msg, reply *wire.Message) error {
+	c.r.holdHelloAfterFailover()
 	doc, err := reply.ReplyDoc()
 	if err != nil {
 		return c.send(reply)

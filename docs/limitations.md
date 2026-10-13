@@ -624,6 +624,20 @@ Part of [Thermocline](../README.md).
   `router.terminate_auth`, where the router owns the upstream connections and
   replays the command itself, does not have this cost.
 
+  A second sequence lost the retry the same way, and that one is fixed. A
+  write refused while the set had no primary has its reply held while the
+  router looks for the new one, up to 5 seconds. When the router found it
+  inside that time, the driver's monitor check came back at once, and Node
+  sent its retry on the refused connection 3ms after the refusal, before it
+  had read the close: "This socket has been ended by the other party", not
+  applied. Measured on the Hetzner staging pair on 2026-10-13 with the
+  router's lookup lengthened so it always found the primary: 9 of 10 failed.
+  testfailover had failed this way once in 16 runs. The router now holds
+  `hello` replies for 250ms after it ends a connection for a failover refusal,
+  so the driver reads the close before it selects: 10 of 10 landed, each retry
+  on a new connection. A write after a plain step-down pays that 250ms, which
+  landed 10 of 10 before and after.
+
   It is written down rather than open because it is a refusal, not a wrong
   answer: the client is told the write failed, and no write is applied twice.
   `router.terminate_auth` replays the write itself and does not have it.
