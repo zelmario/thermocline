@@ -901,6 +901,51 @@ func (f *Feeder) reportRate() {
 	f.pace = mirrorPace{since: time.Now()}
 }
 
+// namespaceFilter is the change stream's test for "one of these namespaces":
+// one branch per database, each naming its collections in a single $in.
+//
+// It was one {ns.db, ns.coll} branch per namespace, and mongod tries the
+// branches in turn for every operation it reads, the ones this filter exists to
+// skip included. That is cheap for an ordinary write and not for a batch: 8.0
+// logs a retryable insertMany as chained applyOps entries, and every operation
+// inside them is unwound and tested. Measured on the Hetzner staging pair on
+// 2026-10-13, over testindexes' seeding, 40,000 one-kilobyte inserts to a
+// namespace no stream mirrors: one live stream with the 187 namespaces the
+// suites tier blocked a poll for 2.5s, against 28ms with this form. Four
+// feeders on the 2 vCPU primary stopped publishing for 7.8 to 9.5s, against
+// 23 to 36ms, and 24ms with nothing written. In the gate that was 13s, and
+// under strict freshness every read that fell through in it was refused.
+//
+// The same events either way: a namespace is a database and a collection, and
+// this asks for exactly those pairs. Sorted, so the pipeline is the same
+// however the list was written.
+func namespaceFilter(namespaces []string) bson.A {
+	byDB := map[string][]string{}
+	for _, ns := range namespaces {
+		db, coll := splitNS(ns)
+		byDB[db] = append(byDB[db], coll)
+	}
+	dbs := make([]string, 0, len(byDB))
+	for db := range byDB {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	out := make(bson.A, 0, len(dbs))
+	for _, db := range dbs {
+		colls := byDB[db]
+		sort.Strings(colls)
+		in := make(bson.A, 0, len(colls))
+		for _, c := range colls {
+			in = append(in, c)
+		}
+		out = append(out, bson.D{
+			{Key: "ns.db", Value: db},
+			{Key: "ns.coll", Value: bson.D{{Key: "$in", Value: in}}},
+		})
+	}
+	return out
+}
+
 func (f *Feeder) pipeline() mongo.Pipeline {
 	match := bson.D{
 		{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
@@ -934,15 +979,7 @@ func (f *Feeder) pipeline() mongo.Pipeline {
 	}
 
 	if len(f.cfg.Namespaces) > 0 {
-		var want bson.A
-		for _, ns := range f.cfg.Namespaces {
-			db, coll := splitNS(ns)
-			want = append(want, bson.D{
-				{Key: "ns.db", Value: db},
-				{Key: "ns.coll", Value: coll},
-			})
-		}
-		match = append(match, bson.E{Key: "$or", Value: want})
+		match = append(match, bson.E{Key: "$or", Value: namespaceFilter(f.cfg.Namespaces)})
 	}
 
 	// Only what changeEvent reads, and the resume token, which a change stream
