@@ -68,6 +68,10 @@ chk "the fast tier requires TLS" "true" \
 chk "and refuses a plaintext client" "true" \
     "$(timeout 20 mongosh --quiet --port $HOTPORT --eval 'print("connected")' >/dev/null 2>&1 && echo false || echo true)"
 
+# router.freshness: permissive. The documents are planted in the archive with
+# no feeder running, and nothing mirroring can never be shown fresh, so the
+# default since 2026-10-12, strict, refuses the reads this suite checks.
+# testfresh tests strict itself.
 cat > "$DIR/cline.yaml" <<YAML
 hot:
   uri: "mongodb://127.0.0.1:$HOTPORT/?replicaSet=tlshot&tls=true&tlsCAFile=$DIR/ca.pem"
@@ -84,6 +88,7 @@ router:
   listen: "127.0.0.1:$PORT"
   dashboard: ""
   completeness: archive
+  freshness: permissive
   tls:
     cert: "$DIR/srv.pem"
     key: "$DIR/srv-key.pem"

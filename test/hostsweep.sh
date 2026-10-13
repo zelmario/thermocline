@@ -93,8 +93,8 @@ why() {
     testalerts)
       haveImage prom/prometheus:v2.53.5 || echo "docker pull prom/prometheus:v2.53.5" ;;
     testversion)
-      for i in mongo:8.0 mongo:7.0 mongo:7; do
-        haveImage "$i" || { echo "docker pull mongo:8.0 mongo:7.0 mongo:7"; return; }
+      for i in mongo:8.0 mongo:7.0.37 mongo:7.0.32; do
+        haveImage "$i" || { echo "docker pull mongo:8.0 mongo:7.0.37 mongo:7.0.32"; return; }
       done ;;
     verskew)
       for i in mongo:8.0 mongo:7.0; do

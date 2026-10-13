@@ -10,9 +10,14 @@
 #
 # Three of them, from images that are already here:
 #
-#   28060  mongo:8.0  8.0.26   a fast tier
-#   28061  mongo:7.0  7.0.37   an archive a release behind it
-#   28062  mongo:7    7.0.32   an archive a *patch* behind 28061
+#   28060  mongo:8.0     a fast tier
+#   28061  mongo:7.0.37  an archive a release behind it
+#   28062  mongo:7.0.32  an archive a *patch* behind 28061
+#
+# The two 7.0 servers are pinned to patch releases. They were mongo:7.0 and
+# mongo:7, which differed only because this machine pulled them at different
+# times: on a fresh Hetzner app node on 2026-10-13 both were 7.0.43, and "a
+# patch apart" failed with the pair the same release.
 #
 # So two pairs. 28060 with 28061 is the shape this refuses, and it is the
 # ordinary adoption shape: the cluster being adopted is the older side. 28061
@@ -63,14 +68,14 @@ start() { # name image port replset
 
 echo "== setup =="
 # Say what is missing rather than failing as three servers that never came up.
-for img in mongo:8.0 mongo:7.0 mongo:7; do
+for img in mongo:8.0 mongo:7.0.37 mongo:7.0.32; do
   docker image inspect "$img" >/dev/null 2>&1 || {
-    echo "  FATAL  $img is not here. docker pull mongo:8.0 mongo:7.0 mongo:7"; exit 2; }
+    echo "  FATAL  $img is not here. docker pull mongo:8.0 mongo:7.0.37 mongo:7.0.32"; exit 2; }
 done
 docker rm -f tc-ver-hot tc-ver-cold tc-ver-patch >/dev/null 2>&1
 start tc-ver-hot   mongo:8.0 $HOTPORT   verhot
-start tc-ver-cold  mongo:7.0 $COLDPORT  vercold
-start tc-ver-patch mongo:7   $PATCHPORT verpatch
+start tc-ver-cold  mongo:7.0.37 $COLDPORT  vercold
+start tc-ver-patch mongo:7.0.32 $PATCHPORT verpatch
 for p in $HOTPORT $COLDPORT $PATCHPORT; do
   for _ in $(seq 1 40); do
     mongosh --quiet --port $p --eval 'db.hello()' >/dev/null 2>&1 && break
@@ -95,6 +100,10 @@ chk "a patch apart, not a release apart"              "true" \
 mongosh --quiet --port $HOTPORT  --eval 'db.getSiblingDB("probe").tiered.insertMany([{_id:1,v:"hot"},{_id:2,v:"hot"}])' >/dev/null 2>&1
 mongosh --quiet --port $COLDPORT --eval 'db.getSiblingDB("probe").tiered.insertMany([{_id:1,v:"hot"},{_id:2,v:"hot"},{_id:3,v:"archived"},{_id:4,v:"archived"}])' >/dev/null 2>&1
 
+# router.freshness: permissive. Those documents are planted with no feeder
+# running, and nothing mirroring can never be shown fresh, so the default since
+# 2026-10-12, strict, refuses the reads this suite checks. testfresh tests
+# strict itself.
 writeConfig() { # file hotport coldport extra
   cat > "$1" <<YAML
 hot:
@@ -126,6 +135,7 @@ router:
   listen: "127.0.0.1:$PORT"
   dashboard: ""
   completeness: archive
+  freshness: permissive
 YAML
 }
 writeConfig "$DIR/mismatch.yaml" $HOTPORT   $COLDPORT  ""
