@@ -957,8 +957,13 @@ chk "while still listing the real ones"              "true" \
 # archive's half is added to it, so the batches after it used to come straight
 # from the fast tier: measured with batchSize 1, one scratch collection appeared
 # in a later batch of a listing whose first batch was clean.
+# One explicit session for the listing and its getMores. A getMore sent through
+# runCommand is not tied to its cursor the way a driver's cursor is, so each
+# took whatever implicit session mongosh's pool handed out, and on 2026-10-13
+# under four workers mongod refused one: "Cursor session id ... is not the same
+# as the operation context's session id", two lsids with one user digest.
 chk "and not in a later batch of a paged listing"    "0" \
-    "$(R "const d=db.getSiblingDB(process.env.TC_DB);
+    "$(R "const d=db.getMongo().startSession().getDatabase(process.env.TC_DB);
           let r=d.runCommand({listCollections:1,nameOnly:true,cursor:{batchSize:1}});
           let names=r.cursor.firstBatch.map(x=>x.name); let id=r.cursor.id, n=0;
           while (String(id) !== '0' && n < 400) {

@@ -300,10 +300,14 @@ for U in "$HOT" "$COLD"; do
     {_id:1, at:new Date('$OLDD')}, {_id:2, at:new Date('$OLDD')},
     {_id:3, at:new Date('$NOWD')}, {_id:4, at:new Date('$NOWD')}])" >/dev/null
 done
-DB=$DB WDIR=$WDIR python3 - <<'PY'
+# From $CFG, the suite's permissive config. This read $WDIR/cline.yaml, the
+# strict one, so its daemons refused what the suite expects answered: on
+# 2026-10-13 the evclaim router refused a read with "position has stopped
+# moving quiet_for=7.38s" once the evictor ran slow under four workers.
+DB=$DB WDIR=$WDIR CFG=$CFG python3 - <<'PY'
 import os
 db, wdir = os.environ['DB'], os.environ['WDIR']
-s = open(wdir + '/cline.yaml').read()
+s = open(os.environ['CFG']).read()
 head, tail = s[:s.index('evictor:')], s[s.index('warmer:'):]
 open(wdir + '/evclaim.yaml', 'w').write(head + """evictor:
   feeder_id: "test"
@@ -579,10 +583,10 @@ for U in "$HOT" "$COLD"; do
     {_id:2, at:'$OLDDATE',           n:'old, but a string'},
     {_id:3,                          n:'no field at all'}])" >/dev/null
 done
-DB=$DB WDIR=$WDIR python3 - <<'PY'
+DB=$DB WDIR=$WDIR CFG=$CFG python3 - <<'PY'
 import os
 db, wdir = os.environ['DB'], os.environ['WDIR']
-s = open(wdir + '/cline.yaml').read()
+s = open(os.environ['CFG']).read()
 head, tail = s[:s.index('evictor:')], s[s.index('warmer:'):]
 open(wdir + '/evunaged.yaml', 'w').write(head + """evictor:
   feeder_id: "test"

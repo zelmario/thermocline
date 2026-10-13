@@ -228,10 +228,14 @@ echo "== a warm window reaching past its own eviction cutoff =="
 # rounds of 199 questions disagreed nowhere. A refusal would also have been thin
 # protection, because the two daemons can be given separate files that are each
 # legal alone.
-python3 - <<'PY'
+# From $CFG, the suite's permissive config. This read $WDIR/cline.yaml, the
+# strict one, so its daemons refused what the suite expects answered: on
+# 2026-10-13 the evclaim router refused a read with "position has stopped
+# moving quiet_for=7.38s" once the evictor ran slow under four workers.
+CFG=$CFG python3 - <<'PY'
 import os
 db, wdir = os.environ['DB'], os.environ['WDIR']
-s = open(wdir + '/cline.yaml').read()
+s = open(os.environ['CFG']).read()
 s = s.replace('    - ns: "%s.orders"\n      back: 40m' % db,
               '    - ns: "%s.orders"\n      back: 12h' % db)
 open(wdir + '/edge_wide.yaml', 'w').write(s)

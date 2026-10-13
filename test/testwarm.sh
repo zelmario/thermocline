@@ -394,10 +394,14 @@ chk "three of them cannot be aged by the rule"   "3" \
 # Its own config: one rule, on this namespace, aged by a date field. Warming the
 # shared config's namespaces here would take minutes and report somebody else's
 # state in the same log.
-DB=$DB WDIR=$WDIR python3 - <<'PY'
+# From $CFG, the suite's permissive config. This read $WDIR/cline.yaml, the
+# strict one, so its daemons refused what the suite expects answered: on
+# 2026-10-13 the evclaim router refused a read with "position has stopped
+# moving quiet_for=7.38s" once the evictor ran slow under four workers.
+DB=$DB WDIR=$WDIR CFG=$CFG python3 - <<'PY'
 import os
 db, wdir = os.environ['DB'], os.environ['WDIR']
-s = open(wdir + '/cline.yaml').read()
+s = open(os.environ['CFG']).read()
 head = s[:s.index('warmer:')]
 tail = s[s.index('router:'):]
 open(wdir + '/unaged.yaml', 'w').write(head + """warmer:
