@@ -395,9 +395,14 @@ Range queries are governed by the watermark below.
 
   It exits instead, naming the checkpoint it could not resume from. A daemon
   that stops is noticed by whatever runs it; a repeating log line is noticed by
-  nobody. Clearing the checkpoint restarts mirroring from now, which hides the
-  gap rather than closing it, so copy the affected namespaces into the archive
-  first.
+  nobody. Its error names the remedy: `cline backfill --apply
+  --clear-checkpoint`, which copies the affected namespaces into the archive and
+  then leaves the feeder a checkpoint ten seconds before the copy began, so the
+  feeder replays every write made during the copy and until it starts again.
+  Deleting the checkpoint by hand restarts mirroring from whenever the feeder
+  next starts, which hides the gap rather than closing it, and loses the writes
+  made in between: on the staging pair on 2026-10-12 that was ten seconds of a
+  running shop.
 
   **Copying them closes two of the three things that can happen in that window,
   and cannot close the third.** Measured on ten mirrored documents with the

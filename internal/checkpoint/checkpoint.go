@@ -38,6 +38,18 @@ type Record struct {
 	// has not managed to read the archive's clock. A reader without it
 	// subtracts raw instants, which is what everything did before.
 	SkewMS *int64 `bson:"skewMS,omitempty"`
+	// StartAt is where a feeder with no token starts reading, written by
+	// cline backfill in place of a token the oplog no longer holds.
+	//
+	// Clearing the checkpoint instead restarted mirroring from whenever the
+	// feeder next started, so every write between the backfill's copy and that
+	// moment reached neither: on the Hetzner staging pair on 2026-10-12 that
+	// was ten seconds of a running shop, and an update made in it left the
+	// archive holding the version before. Starting from just before the copy
+	// replays what the copy may have missed, and replaying is safe because
+	// every event is applied as an upsert or a mark. The first token the
+	// feeder saves removes it.
+	StartAt *bson.Timestamp `bson:"startAt,omitempty"`
 }
 
 // Skew is how far the publisher's clock was ahead of the archive's when it last
@@ -61,16 +73,33 @@ func New(cold *mongo.Client) *Store {
 
 // Load returns the saved token for id. A missing checkpoint is not an error;
 // it returns a nil token, meaning "start from now".
-func (s *Store) Load(ctx context.Context, id string) (bson.Raw, error) {
+func (s *Store) Load(ctx context.Context, id string) (bson.Raw, *bson.Timestamp, error) {
 	var rec Record
 	err := s.coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&rec)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load checkpoint %q: %w", id, err)
+		return nil, nil, fmt.Errorf("load checkpoint %q: %w", id, err)
 	}
-	return rec.Token, nil
+	return rec.Token, rec.StartAt, nil
+}
+
+// StartFrom replaces the checkpoint with one that has no token and starts
+// reading at at. See Record.StartAt. wall is at's own instant, recorded as
+// eventAt so lag is reported from where mirroring will resume rather than as
+// missing.
+func (s *Store) StartFrom(ctx context.Context, id string, at bson.Timestamp, wall time.Time) error {
+	_, err := s.coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		{Key: "_id", Value: id},
+		{Key: "startAt", Value: at},
+		{Key: "savedAt", Value: time.Now().UTC()},
+		{Key: "eventAt", Value: wall.UTC()},
+	}, options.Replace().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("set checkpoint %q to start at %v: %w", id, at, err)
+	}
+	return nil
 }
 
 // Save writes the token for id. eventAt may be zero when the stream has not
@@ -90,7 +119,7 @@ func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt tim
 
 	_, err := s.coll.UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: id}},
-		bson.D{{Key: "$set", Value: set}},
+		bson.D{{Key: "$set", Value: set}, {Key: "$unset", Value: bson.D{{Key: "startAt", Value: ""}}}},
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {

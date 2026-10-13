@@ -630,7 +630,7 @@ func (f *Feeder) namespacesToCheck(ctx context.Context) []string {
 
 // runOnce opens a stream and pumps it until it fails or ctx ends.
 func (f *Feeder) runOnce(ctx context.Context) error {
-	token, err := f.cp.Load(ctx, f.cfg.ID)
+	token, startAt, err := f.cp.Load(ctx, f.cfg.ID)
 	if err != nil {
 		return err
 	}
@@ -657,6 +657,14 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			}
 		}
 		f.log.Info("resuming from checkpoint", args...)
+	} else if startAt != nil {
+		// Left by cline backfill, which copied the fast tier after this
+		// point. Everything since is replayed, so writes made during the copy
+		// and until now are mirrored rather than lost. See
+		// checkpoint.Record.StartAt.
+		opts.SetStartAtOperationTime(startAt)
+		f.log.Info("replaying from where cline backfill started copying",
+			"id", f.cfg.ID, "from", time.Unix(int64(startAt.T), 0).UTC().Format(time.RFC3339))
 	} else {
 		f.log.Warn("no checkpoint, mirroring from now on",
 			"id", f.cfg.ID,
@@ -667,7 +675,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 
 	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
 	if err != nil {
-		if len(token) > 0 && checkpoint.ResumePointGone(err) {
+		if (len(token) > 0 || startAt != nil) && checkpoint.ResumePointGone(err) {
 			// The instant the checkpoint marks, so the log says how much is
 			// missing rather than only that something is.
 			at, _, _ := f.cp.EventAt(ctx, f.cfg.ID)
@@ -677,9 +685,10 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 					"start of the oplog is on the fast tier and not in the archive",
 				"effect", "reopening cannot fetch them, so the feeder stops rather than run on "+
 					"with a hole in the archive nothing would mention again",
-				"action", "copy the affected namespaces from the fast tier into the archive, then "+
-					"clear the checkpoint; clearing it on its own makes mirroring start from now "+
-					"and hides the gap instead of closing it")
+				"action", "run cline backfill --config FILE --apply --clear-checkpoint, "+
+					"then start this again; it copies what the fast tier holds, marks what was deleted, "+
+					"and leaves a checkpoint this replays from. Clearing the checkpoint by hand makes "+
+					"mirroring start from now and hides the gap instead of closing it")
 			return fmt.Errorf("%w: %v", ErrResumePointLost, err)
 		}
 		return fmt.Errorf("open change stream: %w", err)

@@ -158,13 +158,17 @@ chk "and the checkpoint is still there"               "1" \
 
 echo "== and then applied =="
 APPLIED=$("$BIN" backfill --config "$DIR/bf.yaml" --apply --clear-checkpoint 2>&1)
-chk "it cleared the checkpoint itself"                "true" \
-    "$(grep -q 'Cleared the checkpoint' <<<"$APPLIED" && echo true || echo false)"
-chk "and the row is gone"                             "0" \
-    "$(M $COLDPORT 'print(db.getSiblingDB("_thermocline").checkpoints.countDocuments({_id:"bf"}))')"
-# The window the procedure cannot close, said rather than left to be found.
-chk "and it names the window it cannot cover"         "true" \
-    "$(grep -q 'between the copy above and it starting' <<<"$APPLIED" && echo true || echo false)"
+chk "it replaced the checkpoint itself"               "true" \
+    "$(grep -q 'now starts at' <<<"$APPLIED" && echo true || echo false)"
+chk "with a time to replay from and no token"         "true" \
+    "$(M $COLDPORT 'const c=db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"bf"}); print(!!(c && c.startAt && !c.token))')"
+# The window this used to leave open. Clearing the checkpoint made the feeder
+# start from whenever it was next started, so writes made between the copy and
+# that moment reached neither: ten seconds of a running shop on the Hetzner
+# staging pair on 2026-10-12. Written now, after the copy and before the feeder.
+M $HOTPORT 'const c=db.getSiblingDB("shop").orders;
+  c.updateOne({_id:3},{$set:{v:"changed after the backfill"}});
+  c.insertOne({_id:12,v:"inserted after the backfill",at:new Date()});' >/dev/null
 "$BIN" feeder --config "$DIR/bf.yaml" --log-file "$DIR/f3.log" >/dev/null 2>&1 & disown
 "$BIN" router --config "$DIR/bf.yaml" --log-file "$DIR/r.log" >/dev/null 2>&1 & disown
 for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r.log" 2>/dev/null && break; sleep 1; done
@@ -175,12 +179,19 @@ chk "the insert made in the gap is too"               "inserted in the gap" \
     "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:11}); print(d?d.v:"absent")')"
 # The half copying cannot do: a delete leaves nothing on the fast tier to copy,
 # so only the completeness claim can say it happened.
+chk "the update made after the backfill is too"      "changed after the backfill" \
+    "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:3}); print(d?d.v:"absent")')"
+chk "and the insert made after the backfill"          "inserted after the backfill" \
+    "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:12}); print(d?d.v:"absent")')"
+chk "and the feeder says it replayed"                 "true" \
+    "$(grep -q 'replaying from where cline backfill started copying' "$DIR/f3.log" && echo true || echo false)"
 chk "and the delete is marked rather than live"       "deleted" \
     "$(M $COLDPORT 'const d=db.getSiblingDB("shop").orders.findOne({_id:2}); print(d ? (d._tcDeletedAt ? "deleted" : d.v) : "absent")')"
 chk "so a client does not read the deleted document"  "absent" \
     "$(R 'const d=db.getSiblingDB("shop").orders.findOne({_id:2}); print(d?d.v:"absent")')"
 # The number an operator would check first, and the one that was wrong before.
-chk "and the count is what the application left"      "10" \
+# Eleven: the ten the gap left, and the insert made after the backfill.
+chk "and the count is what the application left"      "11" \
     "$(R 'print(db.getSiblingDB("shop").orders.countDocuments({}))')"
 
 echo "== an archive restored from a backup, which is the documented exposure =="

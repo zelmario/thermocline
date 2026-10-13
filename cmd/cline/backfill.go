@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -55,7 +56,7 @@ func runBackfill(args []string) error {
 	apply := fs.Bool("apply", false, "make the changes, rather than reporting them")
 	force := fs.Bool("force", false, "apply even though a feeder still looks alive")
 	clearCP := fs.Bool("clear-checkpoint", false,
-		"also clear the feeder's checkpoint, so mirroring starts again from now")
+		"also replace the feeder's checkpoint with one that replays from just before the copy")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -122,6 +123,19 @@ func runBackfill(args []string) error {
 	}
 	fmt.Println()
 
+	// Where the feeder will replay from, taken before the first document is
+	// read so that every write the copy might miss comes after it. See
+	// checkpoint.Record.StartAt.
+	var replayFrom bson.Timestamp
+	if *apply && *clearCP && *nsFlag == "" && !markingHeld {
+		at, rerr := replayPoint(ctx, hot)
+		if rerr != nil {
+			return fmt.Errorf("could not read the fast tier's operation time, which the feeder "+
+				"would replay from: %w", rerr)
+		}
+		replayFrom = at
+	}
+
 	marks := watermark.New(cold)
 	var totalCopied, totalMarked, totalRefused int64
 	for _, ns := range namespaces {
@@ -185,7 +199,7 @@ func runBackfill(args []string) error {
 	fmt.Println()
 	if *apply {
 		fmt.Printf("Copied %d document(s) into the archive and marked %d as deleted.\n", totalCopied, totalMarked)
-		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld, totalRefused)
+		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld, totalRefused, replayFrom)
 	}
 	fmt.Printf("Would copy %d document(s) into the archive and mark %d as deleted.\n", totalCopied, totalMarked)
 	fmt.Println("Re-run with --apply to do it.")
@@ -474,7 +488,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	return marked, fmt.Sprintf("%s %d deleted in the claimed range", verb, marked)
 }
 
-// finishBackfill clears the feeder's checkpoint, or says why it did not.
+// finishBackfill replaces the feeder's checkpoint, or says why it did not.
 //
 // The step after the copy, and until now the one with no command behind it. The
 // feeder's own error says to clear the checkpoint and so did this command, and
@@ -483,14 +497,19 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 // does nothing and looks like it worked, which is the same way the hand-typed
 // rollback went wrong before `cline rollback` existed.
 //
-// Not done by default, because it is the irreversible half: clearing restarts
-// mirroring from now, and if the copy above did not cover every affected
+// Not done by default, because it is the irreversible half: the old checkpoint
+// is gone afterwards, and if the copy above did not cover every affected
 // namespace then the rest of the hole is sealed in rather than closed.
+//
+// It used to delete the checkpoint, and that left a hole of its own: the feeder
+// then started from whenever it was next started, and every write between the
+// copy and that moment reached neither. The replacement starts the feeder just
+// before the copy instead. See checkpoint.Record.StartAt.
 //
 // Refused outright after --ns for that exact reason. One namespace was copied
 // and the checkpoint is not per namespace.
 func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
-	only string, clear, feederRunning bool, totalRefused int64) error {
+	only string, clear, feederRunning bool, totalRefused int64, replayFrom bson.Timestamp) error {
 
 	// Which of the two jobs this was decides what to say next, and saying the
 	// wrong one is worse than saying nothing. A feeder that is running means
@@ -519,8 +538,9 @@ func finishBackfill(ctx context.Context, cold *mongo.Client, cfg config.Config,
 		return nil
 	}
 	if !clear {
-		fmt.Println("Now clear the feeder's checkpoint and start it again, or re-run with")
-		fmt.Println("--clear-checkpoint to have this do it.")
+		fmt.Println("Re-run with --clear-checkpoint, which leaves the feeder a checkpoint it replays")
+		fmt.Println("from. Deleting the checkpoint by hand starts mirroring from whenever the feeder")
+		fmt.Println("next starts, and the writes made before then reach neither tier's copy.")
 		return nil
 	}
 	if only != "" {
@@ -534,18 +554,51 @@ Run this without --ns first.
 		return fmt.Errorf("--clear-checkpoint needs a run over every namespace")
 	}
 
-	res, err := cold.Database(meta.DB).Collection(meta.Checkpoints).
-		DeleteOne(ctx, bson.D{{Key: "_id", Value: cfg.Feeder.ID}})
-	if err != nil {
-		return fmt.Errorf("could not clear the checkpoint for feeder %q: %w", cfg.Feeder.ID, err)
+	if replayFrom.IsZero() {
+		// --force over a live feeder: refused above in the plain case, and a
+		// replay point taken under a feeder that is still mirroring would
+		// mean nothing.
+		return fmt.Errorf("no replay point was taken, so the checkpoint is left as it is")
 	}
-	if res.DeletedCount == 0 {
-		fmt.Printf("No checkpoint was stored for feeder %q, so mirroring would have started from now anyway.\n",
-			cfg.Feeder.ID)
-	} else {
-		fmt.Printf("Cleared the checkpoint for feeder %q.\n", cfg.Feeder.ID)
+	wall := time.Unix(int64(replayFrom.T), 0)
+	if err := checkpoint.New(cold).StartFrom(ctx, cfg.Feeder.ID, replayFrom, wall); err != nil {
+		return err
 	}
-	fmt.Println("Start the feeder. Writes made between the copy above and it starting are not")
-	fmt.Println("covered by either, so do this with the application stopped if you can.")
+	fmt.Printf("Feeder %q now starts at %s, %s before this began copying.\n",
+		cfg.Feeder.ID, wall.UTC().Format(time.RFC3339), replayMargin)
+	fmt.Println("Start it. It replays every write the fast tier made from there, so what was")
+	fmt.Println("written while this copied, and until the feeder starts, is mirrored too. Start")
+	fmt.Println("it before the oplog rolls past that point, or this has to be run again.")
 	return nil
+}
+
+// replayMargin is how far before the copy the feeder's replay starts.
+//
+// A write is given its oplog time before it becomes visible, so one committing
+// at the moment the copy starts can carry an earlier time than the copy's
+// reads and still not be seen by them. Replaying a few seconds more costs
+// nothing, because a replayed event is an upsert or a mark.
+const replayMargin = 10 * time.Second
+
+// replayPoint is the fast tier's operation time now, less replayMargin.
+//
+// Every write that commits after this is answered with a later time, so a
+// replay from here covers everything the copy can have missed. It is a lower
+// bound and not a position: see operationtime-is-not-a-position in the
+// project's notes, which is why it is only ever used to start early.
+func replayPoint(ctx context.Context, hot *mongo.Client) (bson.Timestamp, error) {
+	sess, err := hot.StartSession()
+	if err != nil {
+		return bson.Timestamp{}, err
+	}
+	defer sess.EndSession(context.WithoutCancel(ctx))
+	sctx := mongo.NewSessionContext(ctx, sess)
+	if err := hot.Database("admin").RunCommand(sctx, bson.D{{Key: "ping", Value: 1}}).Err(); err != nil {
+		return bson.Timestamp{}, err
+	}
+	ot := sess.OperationTime()
+	if ot == nil || ot.T <= uint32(replayMargin/time.Second) {
+		return bson.Timestamp{}, fmt.Errorf("the reply carried no operation time")
+	}
+	return bson.Timestamp{T: ot.T - uint32(replayMargin/time.Second)}, nil
 }
