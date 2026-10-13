@@ -59,7 +59,13 @@ pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/" 2>/dev/null
 echo "== setup =="
 # terminate_auth is not in the shared config, because every other suite runs
 # with it off. Derived here so the two cannot drift apart.
-sed 's/^  listen:/  terminate_auth: true\n  listen:/' $BASE > $CFG
+#
+# And router.freshness: permissive. No feeder runs here, and the one section that
+# needs the archive writes there directly and deletes the fast tier's copy behind
+# the router's back; a feeder would mirror that delete and the fixture with it.
+# With nothing mirroring, the default since 2026-10-12, strict, refuses every
+# read that needs the archive, which is testfresh's subject, not this suite's.
+sed 's/^  listen:/  terminate_auth: true\n  freshness: permissive\n  listen:/' $BASE > $CFG
 chk "the config asks for terminated authentication" "1" "$(grep -c 'terminate_auth: true' $CFG)"
 
 # Both tiers, not just the fast one. A collection dropped on the fast tier alone

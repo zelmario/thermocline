@@ -341,7 +341,12 @@ func letOf(cmd bson.Raw) bson.Raw {
 // variables. Without them the archive rejects the filter, the copy-up fails and
 // the write is refused: safe, and a working statement turned into an error.
 func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw, opts copyUpOptions) (int, error) {
-	r.copyUpIsFresh(ctx, ns, opts.budget)
+	if err := r.copyUpIsFresh(ctx, ns, opts.budget); err != nil {
+		if errors.Is(err, errFreshnessDeadline) {
+			return 0, errCopyUpExpired
+		}
+		return 0, err
+	}
 	db, coll := splitNS(ns)
 	// Built as a find command rather than through the driver's options, so
 	// anything the client sent that decides matching can be carried across

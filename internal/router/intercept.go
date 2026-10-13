@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -638,6 +639,9 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		// An error the archive itself returned is MongoDB's answer to this
 		// command, so it goes back as it stands. Only a failure to reach the
 		// archive falls through to the refusal below.
+		if errors.Is(aerr, errArchiveBehind) {
+			return c.staleRefusal(msg, aerr)
+		}
 		if out, passed := c.r.serverErrorReply(reply.Header.RequestID, msg.Header.RequestID, aerr); passed {
 			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
 			return out, nil

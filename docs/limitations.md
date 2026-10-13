@@ -1351,11 +1351,25 @@ Part of [Thermocline](../README.md).
   already honest: it exits naming `UserWritesBlocked` and the operation, because
   taking its lease is itself a write.
 
-- **A read waits for mirroring to catch up, and answers anyway when it does
-  not.** This is the one place the system knowingly returns an answer it cannot
-  vouch for, and it is a deliberate trade rather than an oversight: the
-  alternative is to fail reads whenever the feeder is behind, which turns a
-  feeder that is merely slow into an outage.
+- **A read waits for mirroring to catch up, and is refused when it does not.**
+  Since 2026-10-12 `router.freshness` defaults to `strict`: a read that falls
+  through to the archive, or a write that has to copy a document up from it, is
+  refused with `CommandFailed` once the wait below runs out, and the message
+  names the feeder and the setting. `permissive` restores the old behaviour,
+  answering from the archive as it stands, for a deployment that would rather
+  read slightly behind than fail during a feeder outage.
+
+  The trade is the one it always was, decided the other way. Refusing turns a
+  feeder that is merely slow into errors on the reads that fall through.
+  Answering turns it into wrong answers reported as success: on the Hetzner
+  staging pair on 2026-10-12, with the feeder stopped for two minutes under a
+  shop writing through the router, `permissive` gave **2,759** answers that
+  contradicted the shop's own acknowledged writes, counts that did not move
+  after an order and cancelled orders coming back. An error is something the
+  application can see and retry. Two rarer copy-up paths, a sorted
+  `findAndModify` and the multi-document write's copy-up, still treat a refused
+  copy-up the way they treat an unreachable archive: the fast tier's answer
+  stands.
 
   A read that falls through to the archive waits for the feeder to reach the
   instant the read began, bounded by `router.archive_wait`, and by half the
@@ -1392,8 +1406,10 @@ Part of [Thermocline](../README.md).
   in the warning it logs: the answer may miss a very recent write, or include a
   very recently deleted document.
 
-  It is counted and it pages. `thermocline_stale_reads_total` above zero is a
-  page-level rule in `docs/monitoring.md`. A deployment seeing them has a feeder
+  Under `permissive` it is counted and it pages. `thermocline_stale_reads_total`
+  above zero is a page-level rule in `docs/monitoring.md`. Under `strict` the
+  refusals are counted in `refused` instead, beside the completeness refusals,
+  and the stale-read counter stays at zero. A deployment seeing them has a feeder
   that cannot keep up, and the answer is to fix that rather than to raise
   `archive_wait`, which only trades the stale answer for a slow one.
 

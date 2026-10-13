@@ -78,8 +78,10 @@ func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, 
 	// first match can be a document the application has just deleted, and the
 	// write then matches nothing where MongoDB would have found the next one.
 	// The copy-up that follows waits too, but by then the choice is made.
-	r.archiveIsFresh(ctx, ns, 0, "choosing a document for a write from the archive before mirroring caught up",
-		"a single-document write may act on, or miss because of, a document deleted in the last moments")
+	if err := r.archiveIsFresh(ctx, ns, 0, "choosing a document for a write from the archive before mirroring caught up",
+		"a single-document write may act on, or miss because of, a document deleted in the last moments"); err != nil {
+		return bson.RawValue{}, false, err
+	}
 	db, coll := splitNS(ns)
 	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
 	if len(sort) > 0 {

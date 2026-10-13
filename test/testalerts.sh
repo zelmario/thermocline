@@ -22,6 +22,13 @@ IMAGE=${IMAGE:-prom/prometheus:v2.53.5}
 PORT=${PORT:-27100}
 PDASH=${PDASH:-27110}
 CFG=${CFG:-/root/cline.yaml}
+# The stale-read alert needs a stale read, and since 2026-10-12 the router
+# refuses rather than answers one unless router.freshness is permissive. So this
+# suite runs the opt-in, on a copy of the shared config.
+docker exec $NODE sh -c "sed 's/^router:\$/router:\n  freshness: permissive/' $CFG > /root/alerts-permissive.yaml" &&
+  docker exec $NODE grep -q 'freshness: permissive' /root/alerts-permissive.yaml ||
+  { echo "  FATAL  could not derive a permissive config from $CFG"; exit 2; }
+CFG=/root/alerts-permissive.yaml
 WORK=$(mktemp -d)
 # The Prometheus image runs as nobody, and mktemp -d makes a directory only its
 # owner may enter, so every mount into that container fails with a permission

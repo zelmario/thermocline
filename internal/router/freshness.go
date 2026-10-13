@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
+	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -522,7 +524,7 @@ func (r *Router) archiveLacksPrimary(ctx context.Context) bool {
 // five hundred was told its deadline did not apply here, which is not the
 // proxy's decision to make, and one that waited out its whole deadline here
 // would reach the archive with nothing to spend.
-func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.Time, budget time.Duration) {
+func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.Time, budget time.Duration) error {
 	if budget > 0 {
 		// Half, not all of it. Waiting out the whole deadline honours it and
 		// starves the read that deadline was set for: the archive would then
@@ -536,12 +538,19 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		defer cancel()
 	}
 	if c.r.waitForArchive(ctx, started) {
-		return
+		return nil
+	}
+	if c.r.cfg.Freshness != config.FreshnessPermissive {
+		err := c.r.refuseStale(ns, "refused a read the archive could not answer fresh")
+		if budget > 0 && ctx.Err() != nil {
+			return errFreshnessDeadline
+		}
+		return err
 	}
 	c.r.Stats.StaleReads.Add(1)
 	suppressed, say := c.r.noteStaleRead()
 	if !say {
-		return
+		return nil
 	}
 	c.log.Warn("answering from the archive before mirroring caught up",
 		"ns", ns,
@@ -549,6 +558,47 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		"suppressed_since_last", suppressed,
 		"effect", "this answer may miss a very recent write, or include a very recently deleted document")
 	c.explainStale(ctx, started)
+	return nil
+}
+
+// errArchiveBehind is what a read or a write is refused with under
+// router.freshness: strict, when the archive it needs has not caught up.
+var errArchiveBehind = errors.New("thermocline: refusing this because mirroring to the archive has not " +
+	"caught up with the fast tier, so the archive's answer could miss a recent write or include a recently " +
+	"deleted document. Check that the feeder is running, or set router.freshness to permissive to answer anyway")
+
+// errFreshnessDeadline is errArchiveBehind when the wait ended because the
+// caller's own maxTimeMS share ran out, rather than because mirroring had
+// stopped. It is still errArchiveBehind to errors.Is, and its reply is
+// MongoDB's MaxTimeMSExpired: a deadline is the one error whose retry
+// semantics a driver knows, and testops measured the generic refusal (125) in
+// its place on the first run of strict, where the build before said 50.
+var errFreshnessDeadline = fmt.Errorf("%w (the caller's maxTimeMS ran out while waiting)", errArchiveBehind)
+
+// refuseStale counts and logs one refusal under router.freshness: strict, rate
+// limited the way stale answers are, and returns the error to refuse with.
+func (r *Router) refuseStale(ns, what string) error {
+	r.Stats.Refused.Add(1)
+	if suppressed, say := r.noteStaleRead(); say {
+		r.log.Warn(what,
+			"ns", ns,
+			"waited", r.cfg.ArchiveWait.String(),
+			"suppressed_since_last", suppressed,
+			"why", "mirroring has not caught up with the fast tier, and router.freshness is strict",
+			"action", "check the feeder; set router.freshness to permissive to answer from the archive anyway")
+	}
+	return errArchiveBehind
+}
+
+// staleRefusal is the reply a client gets for errArchiveBehind, or for
+// errFreshnessDeadline.
+func (c *conn) staleRefusal(msg *wire.Message, err error) (*wire.Message, error) {
+	c.cls = ClassRefused
+	if errors.Is(err, errFreshnessDeadline) {
+		return c.r.commandErrorWithCode(msg.Header.RequestID, msg.Header.RequestID,
+			"operation exceeded time limit", maxTimeMSExpiredCode, "MaxTimeMSExpired")
+	}
+	return c.r.commandError(msg.Header.RequestID, msg.Header.RequestID, errArchiveBehind.Error())
 }
 
 // copyUpIsFresh is the freshness barrier for a copy-up, which reads the
@@ -571,8 +621,8 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 // a read, and on a timeout the copy-up goes ahead and is counted as a stale
 // read, because refusing the client's write over a slow feeder turns lag into
 // failures.
-func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Duration) {
-	r.archiveIsFresh(ctx, ns, budget, "copying up from the archive before mirroring caught up",
+func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Duration) error {
+	return r.archiveIsFresh(ctx, ns, budget, "copying up from the archive before mirroring caught up",
 		"a document deleted in the last moments may be copied back to the fast tier")
 }
 
@@ -590,8 +640,11 @@ func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Durat
 // Only on the way to a refusal, and then the question is asked again. The
 // clash is the rare case, and waiting before every check would put the barrier
 // on every insert into a collection the fast tier does not hold in full.
+//
+// Never refused under router.freshness: strict. Going ahead stale here errs
+// toward refusing the write as a duplicate, which is already the safe side.
 func (r *Router) clashIsFresh(ctx context.Context, ns string) {
-	r.archiveIsFresh(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
+	_ = r.archiveIsFreshAnyway(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
 		"a key freed by a delete in the last moments may be refused as taken")
 }
 
@@ -600,25 +653,43 @@ func (r *Router) clashIsFresh(ctx context.Context, ns string) {
 // caller's deadline at most; on a timeout the caller goes ahead and it is
 // counted as a stale read, because refusing work over a slow feeder turns lag
 // into failures.
-func (r *Router) archiveIsFresh(ctx context.Context, ns string, budget time.Duration, what, effect string) {
+func (r *Router) archiveIsFresh(ctx context.Context, ns string, budget time.Duration, what, effect string) error {
+	return r.archiveIsFreshUnder(ctx, ns, budget, what, effect, r.cfg.Freshness)
+}
+
+// archiveIsFreshAnyway is archiveIsFresh as router.freshness: permissive.
+func (r *Router) archiveIsFreshAnyway(ctx context.Context, ns string, budget time.Duration, what, effect string) error {
+	return r.archiveIsFreshUnder(ctx, ns, budget, what, effect, config.FreshnessPermissive)
+}
+
+func (r *Router) archiveIsFreshUnder(ctx context.Context, ns string, budget time.Duration, what, effect string,
+	policy config.Freshness) error {
 	if budget > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget/2)
 		defer cancel()
 	}
 	if r.waitForArchive(ctx, time.Now()) {
-		return
+		return nil
+	}
+	if policy != config.FreshnessPermissive {
+		err := r.refuseStale(ns, "not "+what)
+		if budget > 0 && ctx.Err() != nil {
+			return errFreshnessDeadline
+		}
+		return err
 	}
 	r.Stats.StaleReads.Add(1)
 	suppressed, say := r.noteStaleRead()
 	if !say {
-		return
+		return nil
 	}
 	r.log.Warn(what,
 		"ns", ns,
 		"waited", r.cfg.ArchiveWait.String(),
 		"suppressed_since_last", suppressed,
 		"effect", effect)
+	return nil
 }
 
 // noteStaleRead decides whether this stale read gets a log line, and reports how

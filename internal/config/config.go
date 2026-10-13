@@ -104,6 +104,29 @@ const (
 	Permissive Completeness = "permissive"
 )
 
+// Freshness decides what the router does when the archive cannot be shown to
+// have caught up with the fast tier: a read that falls through, or a copy-up,
+// has waited router.archive_wait for mirroring and it has not arrived, or the
+// feeder has stopped publishing altogether.
+type Freshness string
+
+const (
+	// FreshnessStrict refuses the read or the write that needed the archive.
+	// The default since 2026-10-12. With the feeder stopped for two minutes on
+	// the staging pair, answering anyway gave a shop running through the
+	// router 2,759 answers that contradicted its own acknowledged writes:
+	// counts that did not move after an order, and cancelled orders coming
+	// back. An error is what the application can see and retry; a wrong
+	// answer reported as success is not.
+	FreshnessStrict Freshness = "strict"
+	// FreshnessPermissive answers from the archive anyway, counts it in
+	// thermocline_stale_reads_total and logs it. An answer may miss a very
+	// recent write or include a very recently deleted document, and a copy-up
+	// may bring back a document deleted a moment ago. For deployments that
+	// would rather read slightly behind than fail during a feeder outage.
+	FreshnessPermissive Freshness = "permissive"
+)
+
 // RouterConfig tunes the proxy that fronts both tiers.
 type RouterConfig struct {
 	// Listen is the address clients connect to, taking over the one the
@@ -122,6 +145,8 @@ type RouterConfig struct {
 	// keeps up, which is the normal case. Set it to zero to answer immediately
 	// and accept secondary-read freshness.
 	ArchiveWait Duration `yaml:"archive_wait"`
+	// Freshness is what happens when that wait runs out. See Freshness.
+	Freshness Freshness `yaml:"freshness"`
 	// ClaimGrace is how much longer than the ordinary claim cache TTL a router
 	// may keep answering from a completeness claim it can no longer re-read,
 	// because the archive is unreachable. Zero, the default, is no grace at all.
@@ -468,6 +493,7 @@ func Default() Config {
 			Completeness: Archive,
 			Residency:    Duration(30 * 24 * time.Hour),
 			ArchiveWait:  Duration(5 * time.Second),
+			Freshness:    FreshnessStrict,
 			FeederID:     "default",
 			Cache: CacheConfig{
 				// Off. The bounds apply when it is turned on: a thousand
@@ -826,6 +852,11 @@ func (r RouterConfig) Validate() error {
 	case Archive, Strict, Permissive:
 	default:
 		return fmt.Errorf("router.completeness must be archive, strict or permissive, got %q", r.Completeness)
+	}
+	switch r.Freshness {
+	case FreshnessStrict, FreshnessPermissive:
+	default:
+		return fmt.Errorf("router.freshness must be strict or permissive, got %q", r.Freshness)
 	}
 	if r.Residency <= 0 {
 		return errors.New("router.residency must be positive, or the evictor removes what was just copied up")

@@ -79,6 +79,16 @@ waitMirrored() {
   echo "  WARN  the archive never reached $1 live documents, last saw ${n:-none}"
 }
 
+# This suite measures the barrier itself: how long a read waits, what it logs
+# and when it gives up. Giving up answers from the archive only under
+# router.freshness: permissive; the default since 2026-10-12 is strict, which
+# refuses instead. So every section runs the opt-in, and the section at the end
+# runs the default against the same stopped feeder.
+STRICTCFG=$CFG
+grep -q '^router:' "$STRICTCFG" || { echo "  FATAL  no router: block in $STRICTCFG"; exit 2; }
+sed 's/^router:$/router:\n  freshness: permissive/' "$STRICTCFG" > $WDIR/fresh_permissive.yaml
+CFG=$WDIR/fresh_permissive.yaml
+
 echo "== setup =="
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
@@ -709,6 +719,40 @@ H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:/^tx-/})" >/dev/null
 
 stopDaemons
 echo
+echo "== the default refuses what permissive answers stale =="
+# The same stopped feeder as "a stopped feeder must not become an outage", under
+# the default. Found on the Hetzner staging pair on 2026-10-12: with the feeder
+# stopped for two minutes, answering anyway gave a shop 2,759 answers that
+# contradicted its own acknowledged writes. Zelmar's decision the same day:
+# refuse by default, stale as the opt-in.
+stopDaemons
+rm -f $LOGDIR/fresh_r.log
+startFeeder
+startRouter "$STRICTCFG"
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'strict1',n:1})" >/dev/null
+pkill -f "cline feeder --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 20); do pgrep -f "cline feeder --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.5; done
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"}); db.getSiblingDB(process.env.TC_META).positions.deleteOne({_id:"test"})' >/dev/null
+START=$(date +%s)
+GOT=$(R "try { print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({})) } catch (e) { print(e.codeName + ': ' + e.message) }")
+ELAPSED=$(( $(date +%s) - START ))
+chk "a read that needs the archive is refused"   "true" \
+    "$(grep -q '^CommandFailed: thermocline: refusing this because mirroring' <<<"$GOT" && echo true || echo false)"
+chk "and the message names the opt-in"           "true" \
+    "$(grep -q 'router.freshness to permissive' <<<"$GOT" && echo true || echo false)"
+chk "and it did not hang waiting"                "true" "$([ "$ELAPSED" -lt 8 ] && echo true || echo false)"
+chk "the router logged the refusal"              "true" \
+    "$(grep -q 'refused a read the archive could not answer fresh' $LOGDIR/fresh_r.log && echo true || echo false)"
+# A write that has to bring a document up from the archive is refused the same
+# way, rather than told it matched nothing: a copy-up with mirroring behind can
+# bring back a document deleted a moment ago.
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'archonly',n:7})" >/dev/null
+UPD=$(R "try { const r=db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:'archonly'},{\$set:{n:8}}); print('matched='+r.matchedCount) } catch (e) { print(e.codeName) }")
+chk "a write needing a copy-up is refused too"   "CommandFailed" "$UPD"
+chk "and nothing was copied up"                  "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:'archonly'}))")"
+stopDaemons
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

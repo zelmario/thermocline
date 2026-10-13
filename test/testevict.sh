@@ -18,6 +18,14 @@ META=${META:-_thermocline}
 export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
+# router.freshness: permissive for the whole suite. Its fixtures plant
+# documents in the archive with no feeder running, and nothing mirroring can
+# never be shown fresh, so the default since 2026-10-12, strict, refuses the
+# reads this suite is here to check. testfresh tests strict itself.
+CFG_STRICT=$CFG
+CFG=$WDIR/$(basename "$0" .sh)_permissive.yaml
+sed 's/^router:$/router:\n  freshness: permissive/' "$CFG_STRICT" > "$CFG"
+grep -q 'freshness: permissive' "$CFG" || { echo "  FATAL  no router: block in $CFG_STRICT"; exit 2; }
 # The tier endpoints, defaulted the same way every other suite defaults them.
 # Without a default these were ${HOT:?}, which reads as strict and is not: a
 # sweep does not export them, so the two checks that use them exited before

@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -264,6 +265,11 @@ func (c *conn) interceptAggNewest(ctx context.Context, msg *wire.Message, db str
 		c.log.Debug("aggregation answered from the archive", "ns", ns,
 			"because", "the fast tier's own answer did not prove it holds the newest of them")
 		return out, true
+	}
+	if errors.Is(aerr, errArchiveBehind) {
+		if out, rerr := c.staleRefusal(msg, aerr); rerr == nil {
+			return out, true
+		}
 	}
 	if out, passed := c.r.serverErrorReply(reply.Header.RequestID, msg.Header.RequestID, aerr); passed {
 		c.log.Debug("the archive rejected this aggregation; returning its own error", "ns", ns, "err", aerr)

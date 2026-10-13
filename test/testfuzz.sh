@@ -552,6 +552,13 @@ awk '
   }
 ' $CFG > $BOUNDNS
 grep -q "$DB.tcfuzz" $BOUNDNS || { echo "  FATAL  the bound config carries no rule"; exit 2; }
+# No feeder runs in this section: both tiers are planted by hand below, so
+# nothing is mirroring and router.freshness: strict, the default since
+# 2026-10-12, would refuse every read the bound sends to the archive. What is
+# measured here is whether the bound decides the answer, so this router runs
+# the opt-in.
+sed -i 's/^router:$/router:\n  freshness: permissive/' $BOUNDNS
+grep -q "freshness: permissive" $BOUNDNS || { echo "  FATAL  the bound config is not permissive"; exit 2; }
 
 BSEED=$(mongosh "$HOT" --quiet --eval "
   const hot  = db.getSiblingDB(process.env.TC_DB);

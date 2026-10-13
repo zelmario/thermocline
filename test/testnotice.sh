@@ -29,6 +29,14 @@ DB=${DB:-shop}
 META=${META:-_thermocline}
 export TC_DB=$DB TC_META=$META
 CFG=${CFG:-$WDIR/cline.yaml}
+# router.freshness: permissive for the whole suite. Its fixtures plant
+# documents in the archive with no feeder running, and nothing mirroring can
+# never be shown fresh, so the default since 2026-10-12, strict, refuses the
+# reads this suite is here to check. testfresh tests strict itself.
+CFG_STRICT=$CFG
+CFG=$WDIR/$(basename "$0" .sh)_permissive.yaml
+sed 's/^router:$/router:\n  freshness: permissive/' "$CFG_STRICT" > "$CFG"
+grep -q 'freshness: permissive' "$CFG" || { echo "  FATAL  no router: block in $CFG_STRICT"; exit 2; }
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED

@@ -354,8 +354,9 @@ Range queries are governed by the watermark below.
   mirroring to reach what you have already written, up to `router.archive_wait`,
   and a feeder that is merely behind gets there. One that has stopped never
   will, so the router stops waiting for it: a position record that exists and
-  has gone stale is the evidence, and it answers at once and says the answer may
-  be behind.
+  has gone stale is the evidence. Under the default `router.freshness: strict`
+  it then refuses at once, naming the feeder; under `permissive` it answers at
+  once and says the answer may be behind.
 
   It matters more than one wait, because a read of an archived document copies
   it up, and that copy-up is itself a write the next read then waits to see
@@ -365,7 +366,11 @@ Range queries are governed by the watermark below.
 
   The trade is stated rather than hidden: such an answer can miss a very recent
   write, which is what the warning says, and every document the archive holds is
-  still returned. A feeder too old to publish a position leaves only a
+  still returned. That is why it is the opt-in: with the feeder stopped for two
+  minutes on the staging pair on 2026-10-12 it gave a shop 2,759 answers that
+  contradicted the shop's own acknowledged writes.
+
+  A feeder too old to publish a position leaves only a
   checkpoint, and that case still waits, because there is nothing else to go on.
 - **A completeness claim only covers a query bounded in the same dimension.** The
   claim says the fast tier holds every document newer than an instant, and

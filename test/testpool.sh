@@ -36,6 +36,14 @@ export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
 export DB WDIR
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 BASE=$WDIR/cline.yaml
+# router.freshness: permissive for the whole suite. Its fixtures plant
+# documents in the archive with no feeder running, and nothing mirroring can
+# never be shown fresh, so the default since 2026-10-12, strict, refuses the
+# reads this suite is here to check. testfresh tests strict itself.
+BASE_STRICT=$BASE
+BASE=$WDIR/$(basename "$0" .sh)_permissive.yaml
+sed 's/^router:$/router:\n  freshness: permissive/' "$BASE_STRICT" > "$BASE"
+grep -q 'freshness: permissive' "$BASE" || { echo "  FATAL  no router: block in $BASE_STRICT"; exit 2; }
 POOLCFG=$WDIR/cline_pool.yaml
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
 CLIENTS=8

@@ -1048,8 +1048,15 @@ func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
 	// older than their own update, where MongoDB answered null all 13 times.
 	// Once per batch, and only on this path, which is the one where the fast
 	// tier had nothing.
-	r.archiveIsFresh(ctx, want[0].ns, 0, "filling a change stream's documents from the archive before mirroring caught up",
-		"an event's fullDocument may be older than the change it describes, or a document already deleted")
+	//
+	// Under router.freshness: strict an archive that has not caught up is not
+	// asked at all, and the documents stay null. That is an answer MongoDB
+	// gives for a document no longer there, where the archive's could be older
+	// than the change the event describes.
+	if r.archiveIsFresh(ctx, want[0].ns, 0, "filling a change stream's documents from the archive before mirroring caught up",
+		"an event's fullDocument may be older than the change it describes, or a document already deleted") != nil {
+		return events, 0
+	}
 	found := make(map[string]bson.Raw, len(want))
 	for evns, ids := range byNS {
 		db, coll := splitNS(evns)

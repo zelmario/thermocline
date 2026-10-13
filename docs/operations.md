@@ -337,7 +337,8 @@ project's test box: a checkpoint 44 hours and 1,433,277 oplog entries (1.0GB)
 behind took 2m58s to open, and 5m45s from the same point an hour later with the
 oplog's pages no longer in cache, against 0.08s for one a few minutes behind. Nothing
 is mirrored in between, so routers report mirroring as stopped and reads past
-`archive_wait` answer from the archive as stale. The startup line says
+`archive_wait` that need the archive are refused, or answered stale under
+`router.freshness: permissive`. The startup line says
 `resuming from checkpoint` with `behind=` when the checkpoint is a minute or
 more old, and `mirroring` when the stream is open. Silence between those two is
 the oplog scan, not a hang. The takeover times above are for a standby, whose

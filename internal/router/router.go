@@ -1802,6 +1802,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	}
 
 	rewritten, err := c.intercept(ctx, msg, name, db, reply)
+	if errors.Is(err, errArchiveBehind) {
+		// Not the fast tier's answer, which is the whole point of refusing:
+		// a find would get the part the fast tier holds as if it were all of
+		// it, and a write whose copy-up was refused would report matching
+		// nothing. See config.FreshnessStrict.
+		if out, rerr := c.staleRefusal(msg, err); rerr == nil {
+			return c.send(out)
+		}
+	}
 	if err != nil {
 		c.log.Warn("routing failed, returning the fast tier's answer",
 			"command", name, "err", err)

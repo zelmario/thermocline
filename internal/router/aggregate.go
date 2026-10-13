@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -649,6 +650,11 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 			if err == nil {
 				c.log.Debug("aggregation answered from the archive", "ns", scope.primary, "because", because)
 				return out, true
+			}
+			if errors.Is(err, errArchiveBehind) {
+				if out, rerr := c.staleRefusal(msg, err); rerr == nil {
+					return out, true
+				}
 			}
 			if out, passed := c.r.serverErrorReply(msg.Header.RequestID, msg.Header.RequestID, err); passed {
 				c.log.Debug("the archive rejected this aggregation; returning its own error",

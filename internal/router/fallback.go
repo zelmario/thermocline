@@ -313,7 +313,9 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// was found by find and not counted by countDocuments.
 	budget := maxTimeBudget(cmd)
 	waitedFrom := time.Now()
-	c.archiveReadIsFresh(ctx, db+"."+coll, waitedFrom, budget)
+	if ferr := c.archiveReadIsFresh(ctx, db+"."+coll, waitedFrom, budget); ferr != nil {
+		return nil, ferr
+	}
 
 	// The archive gets what is left of the caller's deadline, not the whole of
 	// it a second time.
@@ -1177,6 +1179,11 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 			c.log.Debug("read answered from the archive", "ns", ns, "command", name, "because", because)
 			return out, true
 		}
+		if errors.Is(aerr, errArchiveBehind) {
+			if out, rerr := c.staleRefusal(msg, aerr); rerr == nil {
+				return out, true
+			}
+		}
 		if out, passed := c.r.serverErrorReply(msg.Header.RequestID, msg.Header.RequestID, aerr); passed {
 			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
 			return out, true
@@ -1275,7 +1282,9 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 		msg.Header.RequestID, msg.Header.RequestID); refused {
 		return refusal, nil
 	}
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd))
+	if ferr := c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd)); ferr != nil {
+		return nil, ferr
+	}
 
 	res := c.r.cold.Database(db).RunCommand(ctx, out)
 	if res.Err() != nil {

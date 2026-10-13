@@ -501,7 +501,9 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 	// No budget: this is the reading half of an $out or $merge, which streams
 	// in batches and is expected to be long. Cutting its freshness wait to the
 	// caller's maxTimeMS would trade a slow pipeline for a stale one.
-	c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), 0)
+	if err := c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), 0); err != nil {
+		return 0, err
+	}
 
 	// In the comparison the caller asked for, which is their own collation when
 	// the command carried one and the collection's when it did not. See

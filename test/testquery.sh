@@ -28,6 +28,12 @@ META=${META:-_thermocline}
 export TC_DB=$DB TC_DB2=$DB2 TC_META=$META
 P1=$((PORT+1)); P2=$((PORT+2)); P3=$((PORT+3)); PDASH=$((PORT+10)); PALT=$((PORT+17))
 CFG=${CFG:-$WDIR/cline.yaml}
+# For the sections that plant both tiers by hand with no feeder running. Nothing
+# is mirroring there, so router.freshness: strict, the default since 2026-10-12,
+# would refuse every read they send to the archive; what they measure is which
+# tier answers, so they run the opt-in.
+PERMISSIVE=$WDIR/q_permissive.yaml
+sed 's/^router:$/router:\n  freshness: permissive/' "$CFG" > "$PERMISSIVE"
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.6:27017,172.24.0.7:27017,172.24.0.5:27017/?replicaSet=rsHot&authSource=admin'}
 COLD=${COLD:-'mongodb://dba:secret@172.24.0.4:27017,172.24.0.2:27017,172.24.0.3:27017/?replicaSet=rsCold&authSource=admin'}
 PASS=0; FAIL=0; declare -a FAILED
@@ -51,8 +57,8 @@ startFeeder() {
   done
   echo "  WARN  the feeder never wrote a checkpoint"
 }
-startRouter() {
-  cline router --config $CFG --log-file $LOGDIR/q_r.log & RP=$!
+startRouter() { # [config]
+  cline router --config "${1:-$CFG}" --log-file $LOGDIR/q_r.log & RP=$!
   for _ in $(seq 1 30); do
     mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
@@ -538,7 +544,7 @@ C "db.getSiblingDB(process.env.TC_DB).$BNS.insertMany([
 NEWAT=$(C "print(db.getSiblingDB(process.env.TC_DB).$BNS.findOne({_id:2}).createdAt.toISOString())")
 H "db.getSiblingDB(process.env.TC_DB).$BNS.insertOne(
      {_id:2, createdAt:new Date('$NEWAT'), shippedAt:new Date('$DAYAGO'), n:'new, shipped yesterday'})" >/dev/null
-startRouter
+startRouter "$PERMISSIVE"
 cline watermark --config $CFG --ns $DB.$BNS --complete-from "$FROM" >/dev/null
 sleep 7
 chk "the tiers hold different amounts of it"     "2/1" \
@@ -671,7 +677,7 @@ C "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
 H "db.getSiblingDB(process.env.TC_DB).$TNS.insertMany([
      {_id:0, createdAt:new Date('$T0')},
      {_id:1, createdAt:new Date('$T1')}])" >/dev/null
-startRouter
+startRouter "$PERMISSIVE"
 TFROM=$(H "print(db.getSiblingDB(process.env.TC_DB).$TNS.find().sort({createdAt:1}).limit(1).toArray()[0].createdAt.toISOString())")
 cline watermark --config $CFG --ns $DB.$TNS --complete-from "$TFROM" >/dev/null
 chk "the newest two agree with the archive" \

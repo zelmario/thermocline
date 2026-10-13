@@ -244,6 +244,18 @@ router:
   #               short results and calls them success.
   completeness: archive
 
+  # What to do when a read or a copy-up needs the archive and mirroring has not
+  # caught up with the fast tier within archive_wait (5s), or the feeder has
+  # stopped.
+  #
+  #   strict      refuse it, naming the feeder. The application sees an error
+  #               it can retry instead of an answer that misses its own writes.
+  #   permissive  answer from the archive anyway, log it and count it in
+  #               thermocline_stale_reads_total. With the feeder stopped for
+  #               two minutes on 2026-10-12 this gave a shop 2,759 answers that
+  #               contradicted its own acknowledged writes.
+  freshness: strict
+
   # How long a copied-up document is protected from the evictor.
   residency: 30d
 
