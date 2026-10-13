@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"math"
 	"sort"
 	"strconv"
@@ -260,26 +261,31 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 			"it does not. Zero is healthy. +Inf means nothing has been mirrored at all, the same " +
 			"as its neighbour above."
 		seen := r.seenOpTime.Load()
-		// Cached only. A scrape must not fetch: mirroredThrough publishes what
-		// it fetches into the cache the freshness barrier reads, so a scrape
-		// that could not reach the archive would leave "nothing is mirroring"
-		// behind and make the next fall-through read answer stale. Reporting a
-		// state must not cause it.
-		got, haveReading := r.mirroredThroughCached()
+		// From the record mirroringLag just read for the gauge above, not from
+		// the freshness barrier's cache. That cache is refreshed only while a
+		// read is waiting on it, so between fall-through reads it holds the
+		// feeder where it was at the last one while seen keeps moving with
+		// traffic: on 2026-10-13 a healthy feeder in the staging gate graphed
+		// 6, 16, 26, then one more second every second up to 54, and the rule
+		// below fires on that after two minutes on any router whose reads
+		// rarely fall through. Nor is the cache refreshed here: a scrape that
+		// could not reach the archive would leave "nothing is mirroring" in it
+		// and make the next fall-through read answer stale.
+		got, haveReading := mirroring.ts, mirroring.known
 		switch {
 		case seen == 0:
 			// This router has forwarded no reply, so it holds no cluster time
 			// to clear and the bar cannot fail. caughtUp says the same: an
 			// untilTS of zero passes. Zero is the fact, not a stand-in for one.
 			gauge("mirroring_cluster_time_behind_seconds", behindHelp, 0)
-		case !haveReading || !got.known || got.ts.T == 0:
+		case !haveReading || got.T == 0:
 			gauge("mirroring_cluster_time_behind_seconds", behindHelp, math.Inf(1))
 		default:
 			// Through UnpackTS rather than shifting here, so this does not have
 			// to know how a cluster time is packed.
 			behind := float64(0)
-			if seenT := checkpoint.UnpackTS(seen).T; seenT > got.ts.T {
-				behind = float64(seenT - got.ts.T)
+			if seenT := checkpoint.UnpackTS(seen).T; seenT > got.T {
+				behind = float64(seenT - got.T)
 			}
 			gauge("mirroring_cluster_time_behind_seconds", behindHelp, behind)
 		}
@@ -421,6 +427,7 @@ func (r *Router) mirroringLag(ctx context.Context) mirroringReading {
 		return mirroringReading{
 			lag:        health.LagFrom(time.Now(), rec.At, mine, theirs, mineKnown && theirsKnown),
 			known:      true,
+			ts:         rec.TS,
 			feederSkew: theirs, feederSkewKnown: theirsKnown,
 		}
 	}
@@ -487,6 +494,7 @@ func writeDaemonGauges(b *strings.Builder, skews []daemonSkew, other []daemonGau
 type mirroringReading struct {
 	lag             time.Duration
 	known           bool
+	ts              bson.Timestamp // the position as a cluster time, when the feeder published one
 	feederSkew      time.Duration
 	feederSkewKnown bool
 }
