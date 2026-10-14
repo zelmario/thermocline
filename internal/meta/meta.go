@@ -840,8 +840,7 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 			SetUpdate(EvictionAnnouncement()).
 			SetUpsert(true)
 	}
-	if _, err := cold.Database(DB).Collection(Evicting).
-		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+	if _, err := ParallelBulkWrite(ctx, cold.Database(DB).Collection(Evicting), models); err != nil {
 		return fmt.Errorf("announce eviction: %w", err)
 	}
 	return nil
@@ -1618,4 +1617,59 @@ func WereEvictions(ctx context.Context, hot *mongo.Client, keys []EvictedKey) (m
 		return nil, fmt.Errorf("read eviction record: %w", cerr)
 	}
 	return found, nil
+}
+
+// BulkParts is how many connections an eviction's two bulk writes are split
+// across.
+//
+// mongod applies one connection's bulk write an operation at a time, and an
+// eviction sweep is two of them per batch: a thousand announcements on the
+// archive and a thousand deletes on the fast tier, each delete comparing the
+// whole document. Measured on the Hetzner staging pair, 2 vCPU on every
+// member, 200,000 documents: 77.1s in one part, 59.7s in two, 53.8s in four and
+// 50.4s in eight, with the two writes 69 of the 77 seconds. Four takes most of
+// what is there on that hardware and leaves the rate limit and the health
+// checks to decide the load.
+const BulkParts = 4
+
+// ParallelBulkWrite runs an unordered bulk write as up to BulkParts concurrent
+// ones. Unordered already promises nothing about order between operations, so
+// splitting it changes only how long it takes. The counts are summed; on an
+// error the first is returned, as an unordered bulk write returns its first.
+func ParallelBulkWrite(ctx context.Context, coll *mongo.Collection, models []mongo.WriteModel) (*mongo.BulkWriteResult, error) {
+	parts := BulkParts
+	if len(models) < 2*parts {
+		return coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	}
+	type result struct {
+		res *mongo.BulkWriteResult
+		err error
+	}
+	per := (len(models) + parts - 1) / parts
+	out := make(chan result, parts)
+	n := 0
+	for i := 0; i < len(models); i += per {
+		part := models[i:min(i+per, len(models))]
+		n++
+		go func() {
+			r, err := coll.BulkWrite(ctx, part, options.BulkWrite().SetOrdered(false))
+			out <- result{r, err}
+		}()
+	}
+	total := &mongo.BulkWriteResult{}
+	var first error
+	for k := 0; k < n; k++ {
+		r := <-out
+		if r.res != nil {
+			total.InsertedCount += r.res.InsertedCount
+			total.MatchedCount += r.res.MatchedCount
+			total.ModifiedCount += r.res.ModifiedCount
+			total.DeletedCount += r.res.DeletedCount
+			total.UpsertedCount += r.res.UpsertedCount
+		}
+		if r.err != nil && first == nil {
+			first = r.err
+		}
+	}
+	return total, first
 }

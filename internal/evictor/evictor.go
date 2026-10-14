@@ -735,7 +735,7 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 		}
 		models[i] = mongo.NewDeleteOneModel().SetFilter(filter).SetCollation(simpleCollation)
 	}
-	res, err := hotColl.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	res, err := meta.ParallelBulkWrite(ctx, hotColl, models)
 	if err != nil {
 		return 0, fmt.Errorf("delete from fast tier %s: %w", ns, err)
 	}
