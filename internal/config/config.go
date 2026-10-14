@@ -427,6 +427,16 @@ type FeederConfig struct {
 	// the copy that long after the delete. Reads are unaffected either way: a
 	// tombstoned copy is already invisible to them.
 	TombstoneRetention Duration `yaml:"tombstone_retention"`
+	// EvictionRecord is how long the fast tier keeps the record of each
+	// eviction the feeder confirmed, in meta.Evicted. Zero keeps none.
+	//
+	// It is what lets the archive be restored from a backup this old. The
+	// feeder replays the fast tier's oplog from the backup's checkpoint, and
+	// an eviction in that replay is recognised only by this record: without
+	// it every document evicted since the backup is read as deleted and
+	// tombstoned. So it should cover the archive's backup interval, and the
+	// fast tier's oplog window has to as well. One small row per eviction.
+	EvictionRecord Duration `yaml:"eviction_record"`
 	// MaxAwait is how long a change stream poll blocks before returning empty.
 	//
 	// It is also the floor on every fallback read, which is not obvious and is
@@ -461,6 +471,8 @@ func Default() Config {
 			BatchSize:          500,
 			MaxAwait:           20 * time.Millisecond,
 			UnannouncedDeletes: Tombstone,
+			// A daily backup with a week of slack.
+			EvictionRecord: Duration(8 * 24 * time.Hour),
 		},
 		Evictor: EvictorConfig{
 			Rate:         1000,
@@ -607,6 +619,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("feeder.tombstone_retention is %s, and the longest a TTL index can express "+
 			"is about 68 years: leave it out to keep deleted documents for ever",
 			c.Feeder.TombstoneRetention.String())
+	}
+	if r := c.Feeder.EvictionRecord; r < 0 || (r > 0 && r.D() < time.Hour) {
+		return fmt.Errorf("feeder.eviction_record is %s; give 0 to keep no record, or at least 1h, "+
+			"the age of the oldest archive backup you would restore from", r.String())
+	}
+	if secs := c.Feeder.EvictionRecord.D().Seconds(); secs > math.MaxInt32 {
+		return fmt.Errorf("feeder.eviction_record is %s, longer than an index can expire after",
+			c.Feeder.EvictionRecord.String())
 	}
 	switch c.Feeder.UnannouncedDeletes {
 	case Tombstone, Ignore, Halt:

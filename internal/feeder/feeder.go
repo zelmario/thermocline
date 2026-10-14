@@ -158,7 +158,11 @@ type Feeder struct {
 	// are empty when it names none. See checkpoint.Record.NS.
 	lastTokenNS string
 	lastTokenTS bson.Timestamp
-	lastSaved   time.Time
+	// lookupMissed are documents whose last change reached this feeder with
+	// nothing for updateLookup to find, awaiting the delete that explains it.
+	// See noteLookupMissed.
+	lookupMissed map[string]bool
+	lastSaved    time.Time
 	// lastPublished paces the position write, which is far more frequent than
 	// the checkpoint because a fallback read waits on it.
 	lastPublished time.Time
@@ -282,6 +286,14 @@ type feederCounters struct {
 	// mirrored and tombstoned are the two things mirroring does.
 	mirrored   int64
 	tombstoned int64
+	// replayedEvictions counts deletes recognised as evictions by the durable
+	// record rather than an announcement, which only a replay from before the
+	// last checkpoint meets. See meta.Evicted.
+	replayedEvictions int64
+	// replayedStale counts those whose document changed after the replay's
+	// start and before the eviction, so the archive holds an older version
+	// than the one evicted and nothing holds that one any more.
+	replayedStale int64
 	// unmirrorable counts documents the archive refused and this feeder gave
 	// up on, which it does rather than retrying for ever. Each one is a
 	// document the archive will never hold while the fast tier does, and it was
@@ -370,6 +382,9 @@ func (f *Feeder) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create evicting ttl index: %w", err)
 	}
+
+	// The durable record of evictions, on the fast tier. See meta.Evicted.
+	f.ensureEvictedTTL(ctx)
 
 	// Warming notices expire the same way, for the same reason.
 	_, err = f.cold.Database(meta.DB).Collection(meta.Warming).Indexes().
@@ -653,6 +668,28 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			"id", f.cfg.ID, "ns", rec.NS,
 			"from", time.Unix(int64(rec.TS.T), 0).UTC().Format(time.RFC3339))
 		token, startAt, fromEvent = nil, rec.TS, true
+	}
+
+	// A replay from further back than the eviction record reaches meets
+	// evictions nothing can tell from deletes any more, and tombstones every
+	// one: an archive restored from a backup older than feeder.eviction_record
+	// would lose each document evicted since. Refused, with the remedy that
+	// marks deletes only where the fast tier's claim proves them. Only with a
+	// record kept, because without one this was never a promise, and a feeder
+	// stopped for longer than this has missed no evictions: the evictor
+	// refuses to run while it is behind.
+	if keep := f.cfg.EvictionRecord.D(); keep > 0 && (len(token) > 0 || startAt != nil) &&
+		!rec.EventAt.IsZero() && time.Since(rec.EventAt) > keep {
+		f.log.Error("the checkpoint is older than the eviction record reaches",
+			"id", f.cfg.ID, "checkpoint", rec.EventAt.UTC().Format(time.RFC3339),
+			"eviction_record", f.cfg.EvictionRecord.String(),
+			"meaning", "replaying from there would read every eviction in between as the application "+
+				"deleting the document, and mark the archive's only copy deleted",
+			"action", "run cline backfill --config FILE --apply --clear-checkpoint, then start this again; "+
+				"it copies what the fast tier holds, marks deletes where the fast tier's claim proves them, "+
+				"and leaves a checkpoint this replays from")
+		return fmt.Errorf("%w: the checkpoint at %s is older than feeder.eviction_record (%s)",
+			ErrResumePointLost, rec.EventAt.UTC().Format(time.RFC3339), f.cfg.EvictionRecord.String())
 	}
 
 	opts := options.ChangeStream().
@@ -1178,6 +1215,12 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// updateLookup found nothing, so the document was deleted between the
 		// change and our read. The delete event is behind this one in the
 		// stream and will be handled then.
+		//
+		// Remembered until that delete arrives. If it turns out to be an
+		// eviction only the durable record recognises, this is a replay from
+		// before the last checkpoint and the change was never mirrored: the
+		// archive's copy is older than the one evicted. See resolveDeletes.
+		f.noteLookupMissed(meta.DocID(ns, id))
 		return nil
 	}
 	f.pending = append(f.pending, pendingOp{
@@ -1197,4 +1240,50 @@ func isIndexNotFound(err error) bool {
 		return ce.Code == 27 || ce.Name == "IndexNotFound"
 	}
 	return strings.Contains(err.Error(), "index not found")
+}
+
+// ensureEvictedTTL keeps the fast tier's eviction record expiring after
+// feeder.eviction_record. Failures warn: mirroring does not need the record,
+// only a replay from before the last checkpoint does.
+func (f *Feeder) ensureEvictedTTL(ctx context.Context) {
+	secs := int32(f.cfg.EvictionRecord.D().Seconds())
+	if secs <= 0 || f.hot == nil {
+		return
+	}
+	idx := f.hot.Database(meta.DB).Collection(meta.Evicted).Indexes()
+	model := mongo.IndexModel{
+		Keys:    bson.D{{Key: "at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(secs).SetName("tc_evicted_ttl"),
+	}
+	_, err := idx.CreateOne(ctx, model)
+	if err != nil && optionsConflict(err) {
+		// A retention that changed value since the last start.
+		if derr := idx.DropOne(ctx, "tc_evicted_ttl"); derr == nil {
+			_, err = idx.CreateOne(ctx, model)
+		} else {
+			err = derr
+		}
+	}
+	if err != nil {
+		f.log.Warn("could not create the eviction record's expiry index on the fast tier",
+			"err", err,
+			"note", "the record of evictions grows until this succeeds")
+	}
+}
+
+// maxLookupMissed bounds lookupMissed. Each entry is cleared by the delete
+// behind it, so the set is as large as the deletes in flight; the bound is for
+// a stream that never delivers them.
+const maxLookupMissed = 100000
+
+// noteLookupMissed remembers a change whose document was already gone from the
+// fast tier when the feeder read it.
+func (f *Feeder) noteLookupMissed(docID string) {
+	if f.lookupMissed == nil {
+		f.lookupMissed = map[string]bool{}
+	}
+	if len(f.lookupMissed) >= maxLookupMissed {
+		return
+	}
+	f.lookupMissed[docID] = true
 }

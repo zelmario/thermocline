@@ -70,6 +70,10 @@ What to take, and where each piece lives:
   mirroring checkpoints and positions, residency holds, the eviction and warming
   notices, the singleton markers. Restoring documents without these leaves a
   system whose claims describe a fast tier that no longer matches.
+  Take `_thermocline.checkpoints` **before** the application databases, or take
+  everything in one snapshot. A restore replays from that checkpoint, and one
+  older than the data only replays more, while one newer than the data skips
+  what the data is missing.
 - **A snapshot backup holds mirroring while it runs, and nothing is lost.**
   `db.fsyncLock()` on the archive, which is what a filesystem or volume snapshot
   needs, blocks writes rather than failing them, so the feeder simply waits.
@@ -186,56 +190,71 @@ The evictor now evicts only a document whose archived copy is byte for byte the
 one on the fast tier, so a restored archive no longer costs the writes the fast
 tier still holds; the same suite measures all five kept with eviction running.
 The pause stays in the procedure because a restore is not the moment for any
-daemon to be moving documents, and because the backfill below is what makes
+daemon to be moving documents, and because the replay below is what makes
 those documents evictable again.
 
 **And the limit worth knowing before you need it.** A restored archive is a
-restored past. Documents written after the backup are still on the fast tier if
-they are recent enough to be there, and mirroring will not fetch them: a change
-stream reports changes from now, and it only moves forward.
-
-**`cline backfill` is what fetches them**, and it is the step to run after a
-restore, before letting the evictor go again:
+restored past: every insert, update and delete the application made after the
+backup is missing from it. The fast tier's oplog still holds them, so the
+feeder replays them, from the checkpoint taken with the backup:
 
 ```
-bin/cline pause    --config cline.yaml --reason "restoring the archive"
-# restore the archive
-bin/cline backfill --config cline.yaml --apply
-bin/cline resume   --config cline.yaml
+bin/cline pause --config cline.yaml --reason "restoring the archive"
+systemctl stop cline-feeder
+# restore the application's databases on the archive, then the feeder's
+# checkpoint from the same backup:
+mongorestore --uri "$ARCHIVE" --drop --nsInclude '_thermocline.checkpoints' backup/
+systemctl start cline-feeder     # logs "resuming from checkpoint"
+bin/cline resume --config cline.yaml
 ```
 
-Leave the feeder running while it copies. That is the order with no window in
-it for inserts and updates: the feeder carries what happens next while the copy
-brings back what the restore dropped. Deletes are the exception, below. Measured on ten documents mirrored, a backup, five more
-written, then the archive dropped and restored: a client read ten of the fifteen
-the application had written, and fifteen after the copy. `test/testbackfill.sh`
-walks exactly those steps.
+Restore only the checkpoints from the bookkeeping backup. The rest of
+`_thermocline` describes the archive as it was a moment ago, and that is the
+more accurate description.
 
-**Nor can it see a delete made after the backup.** A delete leaves nothing on
-the fast tier to copy, and with the feeder running `cline backfill` marks
-nothing, so the restored archive holds that document live again and every read
-that falls through to the archive returns it. Measured on the staging pair on
-2026-10-14: ten documents mirrored, a backup, one deleted through the router,
-the procedure above followed exactly, and a client read ten where the
-application had left nine, with no error anywhere. `test/testbackfill.sh`
-states it as that number.
+**A replay also meets every eviction since the backup**, and an eviction is
+a delete on the fast tier like any other. The feeder tells them apart by an
+announcement it spends as it mirrors, so a replay finds them spent and, until
+2026-10-14, read them all as the application deleting the document and marked
+the archive's only copy deleted. Measured on the staging pair: ten documents
+evicted after the backup, the checkpoint restored with it, and a client read
+none of them. The fast tier now keeps a record of every eviction the feeder
+has confirmed, in `_thermocline.evicted`, for `feeder.eviction_record` (8 days
+by default), and a replay checks it first. The same run with the record: a
+client read all ten, and the one document deleted after the backup stayed
+deleted. `test/testbackfill.sh` walks exactly those steps.
 
-The fast tier's oplog still holds those deletes, and replaying it from the
-backup's checkpoint would mark them. It would also mark every document
-**evicted** since the backup, whose only copy is now the archive's: an eviction
-is told from a delete by a notice the feeder spends as it mirrors, and a
-replay finds them spent. Measured the same day, ten documents evicted after
-the backup and then replayed: ten tombstoned, and a client read none of them.
-So do not restore the feeder's checkpoint, and after a restore list the
-application's deletes since the backup from its own records, and delete those
-documents again through the router.
+So two numbers bound the backup you can restore from, and both have to be
+older than it: the fast tier's oplog window and `feeder.eviction_record`.
 
-What it cannot fetch is what the fast tier no longer holds: anything written
-after the backup **and already evicted** is in neither tier, and nothing can
-recover it. That is why the pause comes first, and why the archive's backup
-interval is the real exposure of this system rather than the fast tier's. `cline pause` returns only once no sweep is in
-progress: a sweep that was already running stops before its next batch, and
-the command waits for it.
+- **Past the oplog window**, the feeder stops with "the fast tier's oplog no
+  longer reaches where mirroring got to". `cline backfill --apply
+  --clear-checkpoint` is the remedy, with the feeder stopped: it copies what
+  the fast tier holds and marks deletes only inside the range the fast tier
+  claims to hold in full. A document deleted after the backup and outside
+  that range comes back, and deleting it again through the router removes it.
+- **Past `feeder.eviction_record`**, the feeder refuses before it reads
+  anything ("the checkpoint is older than the eviction record reaches"),
+  because evictions in that window can no longer be told from deletes. The
+  remedy is the same command.
+
+Leaving the feeder running and copying with `cline backfill --apply` instead,
+which is what this section said until 2026-10-14, brings back every
+document the application deleted after the backup: ten mirrored, a backup,
+one deleted, and a client read ten where the application had left nine.
+
+What no replay can fetch is a version only the lost archive held. A document
+changed after the backup and evicted after that comes back as it was before
+the change: the newer version reached the archive, the evictor confirmed it
+there and removed the fast tier's copy, and the restore took the archive's.
+The feeder names each one as it replays ("a document evicted during the
+replayed window comes back older than the application left it") and counts
+them as `replayed_stale`, so the list of documents to rewrite from the
+application's own records is in the log rather than in somebody's bug report.
+That is why the pause comes first, and why the archive's backup interval is
+the real exposure of this system rather than the fast tier's. `cline pause`
+returns only once no sweep is in progress: a sweep that was already running
+stops before its next batch, and the command waits for it.
 `cline rollback`, which counts rather than removes unless you pass `--clear`, is
 what tells you what the two tiers disagree about afterwards.
 

@@ -273,39 +273,102 @@ chk "and does not call it a rolled oplog"              "false" \
 chk "the write made while it was down is mirrored"     "1" \
     "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
 
-echo "== a delete made after an archive backup =="
-# The restore section above wrote only inserts after its backup. A delete leaves
-# nothing on the fast tier to copy, and with a feeder publishing backfill marks
-# nothing, so the restore brings the deleted document back: here the
-# application left nine and a client reads ten, with no error anywhere. Measured first on
-# the staging pair on 2026-10-14.
+echo "== a delete and an eviction made after an archive backup =="
+# The restore section above wrote only inserts after its backup. A delete
+# leaves nothing on the fast tier to copy, and with a feeder publishing backfill
+# marks nothing, so restoring under a running feeder brings the deleted document
+# back. Measured first on the staging pair on 2026-10-14.
 #
-# Replaying the fast tier's oplog from the backup's checkpoint marks it, and
-# also tombstones every document evicted since the backup, because those
-# evictions' notices are spent: ten of ten on the same pair. So this is the
-# exposure stated as a number, as docs/operations.md states it, until the
-# feeder can tell a replayed eviction from a delete.
-R "for (let i=2;i<=10;i++) db.getSiblingDB('shop').$DNS.insertOne({_id:i,v:'before the backup'})" >/dev/null
+# The fast tier's oplog still holds the delete, so the procedure is now to
+# restore the feeder's checkpoint from the same backup and let it replay. That
+# replay also meets every eviction since the backup, whose announcements are
+# spent, and read them all as deletes: ten of ten tombstoned on the same pair.
+# The fast tier's record of evictions is what tells them apart. See meta.Evicted.
+python3 - "$DIR/bf4.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("  rules:\n", "  rules:\n    - ns: \"shop.tresdel\"\n      older_than: 30m\n      date_field: \"at\"\n", 1)
+s = s.replace("evictor:\n", "evictor:\n  backoff:\n    max_replication_lag: 1h\n    max_cache_dirty: 0.9\n    min_write_tickets_free: 0.01\n    min_oplog_window: 1m\n", 1)
+open(p, "w").write(s)
+PY
+R "const c=db.getSiblingDB('shop').$DNS;
+   for (let i=2;i<=10;i++) c.insertOne({_id:i,v:'before the backup'});
+   for (let i=21;i<=25;i++) c.insertOne({_id:i,v:'old enough to evict',at:new Date(Date.now()-2*3600e3)})" >/dev/null
 for _ in $(seq 1 30); do
-  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")" = "10" ] && break
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")" = "15" ] && break
   sleep 1
 done
+sleep 2   # one more checkpoint_every, so the backup's checkpoint is past them
+# The checkpoint first: one older than the data only replays more, and one
+# newer than the data would skip what the data is missing.
 docker exec tc-bf-cold rm -rf /tmp/bk$DNS
+docker exec tc-bf-cold mongodump --port $COLDPORT --db _thermocline --collection checkpoints -o /tmp/bk$DNS --quiet >/dev/null 2>&1
 docker exec tc-bf-cold mongodump --port $COLDPORT --db shop --collection $DNS -o /tmp/bk$DNS --quiet >/dev/null 2>&1
 R "db.getSiblingDB('shop').$DNS.deleteOne({_id:3})" >/dev/null
+# And one changed after the backup and evicted after that. Its newest version
+# was only ever in the archive being restored, so no replay can bring it back;
+# what the feeder can do is say so rather than serve the older one in silence.
+M $HOTPORT "db.getSiblingDB('shop').$DNS.updateOne({_id:21},{\$set:{v:'changed after the backup'}})" >/dev/null
 for _ in $(seq 1 30); do
-  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.findOne({_id:21}).v)")" = "changed after the backup" ] && break
   sleep 1
 done
-chk "the delete is mirrored as a mark"                 "1" \
-    "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+"$BIN" evictor --config "$DIR/bf4.yaml" --once --log-file "$DIR/e4.log" >/dev/null 2>&1
+sleep 3   # the checkpoint that spends the announcements and records the evictions
+chk "the five old ones are evicted from the fast tier" "0" \
+    "$(M $HOTPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_id:{\$gte:21}}))")"
+chk "and the fast tier records all five"               "5" \
+    "$(M $HOTPORT "print(db.getSiblingDB('_thermocline').evicted.countDocuments({'_id.d':/$DNS/}))")"
+chk "a client reads fourteen before the restore"       "14" \
+    "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
+
+# The old order, as the control: restore under a running feeder, then copy.
 "$BIN" pause --config "$DIR/bf4.yaml" --reason "restoring the archive" >/dev/null 2>&1
 docker exec tc-bf-cold mongorestore --port $COLDPORT --quiet --drop --nsInclude "shop.$DNS" /tmp/bk$DNS >/dev/null 2>&1
 "$BIN" backfill --config "$DIR/bf4.yaml" --ns "shop.$DNS" --apply >/dev/null 2>&1
 "$BIN" resume --config "$DIR/bf4.yaml" >/dev/null 2>&1
 sleep 2
-chk "after the restore the deleted one is read again"  "10" \
+chk "under a running feeder the deleted one is back"   "15" \
     "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
+
+# The procedure: feeder stopped, data and checkpoint restored from the same
+# backup, feeder started, and it replays from the backup's instant.
+"$BIN" pause --config "$DIR/bf4.yaml" --reason "restoring the archive" >/dev/null 2>&1
+pkill -9 -f "feeder --config $DIR/bf4.yaml" 2>/dev/null; sleep 1
+docker exec tc-bf-cold mongorestore --port $COLDPORT --quiet --drop --nsInclude "shop.$DNS" /tmp/bk$DNS >/dev/null 2>&1
+docker exec tc-bf-cold mongorestore --port $COLDPORT --quiet --drop --nsInclude "_thermocline.checkpoints" /tmp/bk$DNS >/dev/null 2>&1
+"$BIN" feeder --config "$DIR/bf4.yaml" --log-file "$DIR/f7.log" >/dev/null 2>&1 & disown
+for _ in $(seq 1 30); do
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+  sleep 1
+done
+sleep 2
+"$BIN" resume --config "$DIR/bf4.yaml" >/dev/null 2>&1
+chk "the feeder replays from the backup's checkpoint"  "true" \
+    "$(grep -q 'resuming from checkpoint' "$DIR/f7.log" && echo true || echo false)"
+chk "a client reads the fourteen the application left" "14" \
+    "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
+chk "the deleted one stays deleted"                    "MISSING" \
+    "$(R "const d=db.getSiblingDB('shop').$DNS.findOne({_id:3}); print(d?d.v:'MISSING')")"
+chk "and every evicted one is still read"              "5" \
+    "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({_id:{\$gte:21}}))")"
+chk "the archive marked one delete, not six"           "1" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+chk "and it names the one that comes back older"      "1" \
+    "$(grep -c 'comes back older than the application left it.*'"$DNS"'' "$DIR/f7.log")"
+
+# A backup older than the record would replay evictions nothing recognises any
+# more. The feeder refuses rather than tombstone them.
+pkill -9 -f "feeder --config $DIR/bf4.yaml" 2>/dev/null; sleep 1
+M $COLDPORT "db.getSiblingDB('_thermocline').checkpoints.updateOne({_id:'bf'},{\$set:{eventAt:new Date(Date.now()-9*86400e3)}})" >/dev/null
+sleep 31   # the killed feeder's lease
+timeout 20 "$BIN" feeder --config "$DIR/bf4.yaml" --log-file "$DIR/f8.log" >/dev/null 2>&1
+chk "a checkpoint older than the record is refused"    "true" \
+    "$(grep -q 'older than the eviction record reaches' "$DIR/f8.log" && echo true || echo false)"
+M $COLDPORT "db.getSiblingDB('_thermocline').checkpoints.updateOne({_id:'bf'},{\$set:{eventAt:new Date()}})" >/dev/null
+"$BIN" feeder --config "$DIR/bf4.yaml" --log-file "$DIR/f9.log" >/dev/null 2>&1 & disown
+sleep 3
 # Left running, because the section below needs a feeder publishing to refuse.
 
 echo "== and it refuses to run underneath a feeder =="

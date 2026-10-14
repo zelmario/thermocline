@@ -735,6 +735,50 @@ of 10. The details are in [limitations.md](limitations.md).
 
 Nothing joins **Open**.
 
+## 2026-10-14: reading the procedures before rehearsing them
+
+**The first full gate after the failover hello hold was clean.** On the
+Hetzner staging pair, f17091d: 2077 passed and 0 failed with the cache off,
+the same with it on, and the host sweep 333 and 0. A 40 round fuzz on a new
+seed, 71 and 0.
+
+**Preparing the rehearsal sheet for item 5 found two defects in the prose's
+neighbourhood before anyone walked it.**
+
+The first was the archive restore. The procedure kept the feeder running and
+copied the fast tier back with `cline backfill`, which brings back what was
+written after the backup and cannot see what was deleted: ten mirrored, a
+backup, one deleted, and a client read ten where the application had left
+nine. The fast tier's oplog still holds the delete, so the obvious fix is to
+restore the feeder's checkpoint and replay. Measured before it was written
+down, that replay tombstoned all ten documents evicted after the backup and a
+client read none of them, because an eviction is recognised by an
+announcement the feeder has already spent.
+
+| Ten evicted and one deleted after the backup | evicted ones read | deleted one |
+|---|---|---|
+| feeder running, then copy (the old procedure) | 10 of 10 | read again |
+| checkpoint restored, replay, no record | 0 of 10 | deleted |
+| checkpoint restored, replay, the eviction record | 10 of 10 | deleted |
+
+The fast tier now keeps a record of each eviction the feeder confirmed, for
+`feeder.eviction_record`, 8 days by default, and a replay consults it before
+the announcements. A replay from further back than that is refused rather than
+allowed to tombstone, and a document changed and then evicted after the backup,
+whose newest version only the lost archive held, is named in the log instead
+of served older in silence. `test/testbackfill.sh` checks all of it: 60 and 0,
+against 54 and 5 on the build before.
+
+The second was the feeder itself. mongod resumes a change stream from an
+event's token only while that event passes the stream's filter, so removing a
+namespace from `feeder.namespaces` stopped the feeder with "the fast tier's
+oplog no longer reaches where mirroring got to", the oplog minutes old, and a
+write made while it was down was never mirrored. The checkpoint now names the
+namespace of its event, and a token on a namespace no longer mirrored resumes
+from that event's cluster time.
+
+Nothing joins **Open**: both are closed with checks.
+
 ## What is accepted, and needs no work
 
 Thirty-nine of the forty-seven entries in `docs/limitations.md` are one of these

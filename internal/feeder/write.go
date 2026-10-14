@@ -153,6 +153,16 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	// announcements standing and the replay classifies them correctly. A crash
 	// after it means those events are not replayed at all.
 	if len(f.spentNotices) > 0 {
+		// Recorded first, so there is no moment at which an eviction is
+		// neither announced nor recorded. See meta.Evicted. A failure costs
+		// only a replay from before this point, which is rare, so it warns.
+		if f.cfg.EvictionRecord > 0 && f.hot != nil {
+			if err := meta.RecordEvictions(ctx, f.hot, f.spentNotices); err != nil {
+				f.log.Warn("could not record evictions on the fast tier", "err", err,
+					"note", "an archive restored from a backup older than this cannot tell these "+
+						"evictions from deletes when the feeder replays them")
+			}
+		}
 		if err := meta.SpendEvictionNotices(ctx, f.cold, f.spentNotices); err != nil {
 			// An announcement left standing costs a later application delete
 			// being read as an eviction, so the archive keeps a record it
@@ -400,11 +410,50 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		avail[id] = n - len(f.spentNotices[id])
 	}
 
+	// Asked before the announcements, not after them. A delete the record
+	// names at its exact position is an eviction whose announcement was spent
+	// long ago, which only a replay from an older checkpoint meets; letting it
+	// claim an announcement still pending would take the one belonging to a
+	// later eviction of the same document, and that one would then be
+	// tombstoned. See meta.Evicted.
+	var recorded map[meta.EvictedKey]bool
+	keys := make([]meta.EvictedKey, len(slots))
+	if f.cfg.EvictionRecord > 0 && f.hot != nil {
+		for n, slot := range slots {
+			keys[n] = meta.EvictedKey{Doc: ids[n], At: f.pending[slot].at}
+		}
+		if recorded, err = meta.WereEvictions(ctx, f.hot, keys); err != nil {
+			return err
+		}
+	}
+
 	var unannounced int
 	// Which namespaces the unannounced ones were in, because that is the only
 	// question worth asking about them. See recheckKindOnUnannounced.
 	unannouncedIn := map[string]bool{}
 	for n, slot := range slots {
+		missed := f.lookupMissed[ids[n]]
+		delete(f.lookupMissed, ids[n])
+		if recorded[keys[n]] {
+			f.pending[slot].kind = classifyDelete(true, f.cfg.UnannouncedDeletes)
+			f.counters.replayedEvictions++
+			if missed {
+				// Evicted with the archive holding its newest version, and
+				// changed since the position this replay began at. That
+				// version was in the archive this replay is repairing, which
+				// is the thing that was restored, and the fast tier gave it
+				// up: the archive holds an older one, and nothing holds
+				// the one the application last wrote.
+				f.counters.replayedStale++
+				f.log.Error("a document evicted during the replayed window comes back older than the application left it",
+					"ns", f.pending[slot].ns, "doc", ids[n],
+					"meaning", "it was changed and then evicted after the position this feeder replays from, "+
+						"usually the checkpoint of a restored archive backup; the archive holds the version "+
+						"from before that change and no tier holds the newer one",
+					"action", "rewrite this document from the application's own records")
+			}
+			continue
+		}
 		ok := avail[ids[n]] > 0
 		if ok {
 			avail[ids[n]]--
@@ -941,6 +990,8 @@ func (f *Feeder) publishCounters(ctx context.Context) {
 		"unmirrorable":          f.counters.unmirrorable,
 		"inserts_over_existing": f.counters.insertsOverExisting,
 		"resurrections_undone":  f.counters.resurrectionsUndone,
+		"replayed_evictions":    f.counters.replayedEvictions,
+		"replayed_stale":        f.counters.replayedStale,
 	}
 	if err := meta.PublishDaemonReport(ctx, f.cold, "feeder:"+f.cfg.ID, false, counters, nil); err != nil {
 		f.log.Debug("could not publish feeder statistics", "err", err)

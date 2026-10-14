@@ -22,7 +22,7 @@ import (
 var bookkeepingCollections = map[string]bool{
 	Residency: true, Evicting: true, Checkpoints: true, PositionsColl: true,
 	Warming: true, Markers: true, DaemonStats: true, CacheAdvice: true,
-	Watermarks: true, OwnDDL: true, Unmirrored: true, "keys": true,
+	Watermarks: true, OwnDDL: true, Unmirrored: true, "keys": true, Evicted: true,
 }
 
 // IsBookkeeping reports whether a database holding exactly these collections is
@@ -113,6 +113,22 @@ const (
 	// evictor writes here before deleting from the fast tier, which is how the
 	// feeder tells an eviction apart from an application delete.
 	Evicting = "evicting"
+
+	// Evicted is the durable record of every eviction the feeder has
+	// confirmed: the document and the oplog position of the delete that
+	// removed it. It lives on the FAST tier, in the database of the same name,
+	// beside the key registry.
+	//
+	// An eviction is told from an application's delete by an announcement in
+	// Evicting, which the feeder spends as it mirrors and which expires after
+	// NoticeTTL. A replay of the oplog from an older position, which is what
+	// restoring the archive from a backup needs, finds them spent or gone and
+	// reads every eviction since as a delete. Measured on the Hetzner staging
+	// pair on 2026-10-14: ten documents evicted after the backup, the checkpoint
+	// restored with it, and all ten tombstoned, read by no client. On the fast
+	// tier because the archive is the thing being restored: its own record of
+	// what happened after the backup is what the restore takes away.
+	Evicted = "evicted"
 
 	// Checkpoints stores one change stream resume token per feeder.
 	Checkpoints = "checkpoints"
@@ -1510,4 +1526,86 @@ func IDsAreNotObjectIDs(ctx context.Context, cold *mongo.Client, db, coll string
 		return false, fmt.Errorf("check the _id type of %s.%s: %w", db, coll, err)
 	}
 	return n > 0, nil
+}
+
+// EvictedKey names one eviction: the document and the oplog position of the
+// delete that removed it. A document evicted, warmed and evicted again has one
+// per eviction, and an application deleting it later has none at its position.
+type EvictedKey struct {
+	Doc string         `bson:"d"`
+	At  bson.Timestamp `bson:"t"`
+}
+
+// RecordEvictions writes the evictions a checkpoint has just covered into the
+// fast tier's durable record. See Evicted.
+//
+// Unordered and tolerant of duplicates: a replay records the same eviction
+// again, and that is the same row.
+func RecordEvictions(ctx context.Context, hot *mongo.Client, spent map[string][]bson.Timestamp) error {
+	now := time.Now().UTC()
+	var docs []any
+	for id, ats := range spent {
+		for _, at := range ats {
+			docs = append(docs, bson.D{
+				{Key: "_id", Value: EvictedKey{Doc: id, At: at}},
+				{Key: "at", Value: now},
+			})
+		}
+	}
+	if len(docs) == 0 {
+		return nil
+	}
+	_, err := hot.Database(DB).Collection(Evicted).InsertMany(ctx, docs,
+		options.InsertMany().SetOrdered(false))
+	if err != nil && !onlyDuplicateKeys(err) {
+		return fmt.Errorf("record evictions: %w", err)
+	}
+	return nil
+}
+
+// WereEvictions reports which of keys the durable record holds.
+func WereEvictions(ctx context.Context, hot *mongo.Client, keys []EvictedKey) (map[EvictedKey]bool, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	in := make(bson.A, len(keys))
+	for i, k := range keys {
+		in[i] = k
+	}
+	cur, err := hot.Database(DB).Collection(Evicted).Find(ctx,
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: in}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("read eviction record: %w", err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	found := map[EvictedKey]bool{}
+	for cur.Next(ctx) {
+		var row struct {
+			ID EvictedKey `bson:"_id"`
+		}
+		if derr := cur.Decode(&row); derr != nil {
+			return nil, fmt.Errorf("decode eviction record: %w", derr)
+		}
+		found[row.ID] = true
+	}
+	if cerr := cur.Err(); cerr != nil {
+		return nil, fmt.Errorf("read eviction record: %w", cerr)
+	}
+	return found, nil
+}
+
+// onlyDuplicateKeys reports whether every write error in err is a duplicate
+// key, which for a record written twice means it is already there.
+func onlyDuplicateKeys(err error) bool {
+	var bwe mongo.BulkWriteException
+	if !errors.As(err, &bwe) || bwe.WriteConcernError != nil || len(bwe.WriteErrors) == 0 {
+		return false
+	}
+	for _, we := range bwe.WriteErrors {
+		if we.Code != 11000 {
+			return false
+		}
+	}
+	return true
 }
