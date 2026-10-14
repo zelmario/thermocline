@@ -39,3 +39,16 @@ func ResumePointGone(err error) bool {
 	}
 	return false
 }
+
+// TokenEventMissing reports mongod's answer for a resume token whose event it
+// cannot find, as distinct from ChangeStreamHistoryLost. The oplog may still
+// reach that far: the event no longer passing the stream's filter gets the
+// same answer.
+func TokenEventMissing(err error) bool {
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	return (ce.Code == 280 || ce.Name == "ChangeStreamFatalError") &&
+		strings.Contains(strings.ToLower(ce.Message), "resume token was not found")
+}

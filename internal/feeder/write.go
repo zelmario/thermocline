@@ -131,7 +131,8 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 		return nil
 	}
 	ckSkew, ckSkewKnown := f.clockSkew(ctx)
-	if err := f.cp.Save(ctx, f.cfg.ID, f.lastToken, f.lastEventAt, ckSkew, ckSkewKnown); err != nil {
+	if err := f.cp.Save(ctx, f.cfg.ID, f.lastToken, f.lastEventAt, ckSkew, ckSkewKnown,
+		f.lastTokenNS, f.lastTokenTS); err != nil {
 		return err
 	}
 	f.lastSaved = time.Now()

@@ -14,6 +14,7 @@
 package feeder
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -153,6 +154,10 @@ type Feeder struct {
 	// whether it has to wait. See resumetoken.go for why this is the sound one.
 	lastEventTS bson.Timestamp
 	lastToken   bson.Raw
+	// lastTokenNS and lastTokenTS name the event lastToken was taken from, and
+	// are empty when it names none. See checkpoint.Record.NS.
+	lastTokenNS string
+	lastTokenTS bson.Timestamp
 	lastSaved   time.Time
 	// lastPublished paces the position write, which is far more frequent than
 	// the checkpoint because a fallback read waits on it.
@@ -630,9 +635,24 @@ func (f *Feeder) namespacesToCheck(ctx context.Context) []string {
 
 // runOnce opens a stream and pumps it until it fails or ctx ends.
 func (f *Feeder) runOnce(ctx context.Context) error {
-	token, startAt, err := f.cp.Load(ctx, f.cfg.ID)
+	rec, _, err := f.cp.Mark(ctx, f.cfg.ID)
 	if err != nil {
 		return err
+	}
+	token, startAt := rec.Token, rec.StartAt
+	fromEvent := false
+	if len(token) > 0 && rec.NS != "" && rec.TS != nil && !f.mirrorsNS(rec.NS) {
+		// mongod resumes from an event's token only while that event passes
+		// the stream's filter, so this token is refused as "not found", which
+		// read as a rolled oplog and stopped the feeder. The event's own
+		// cluster time is just as exact a place to start. Replaying the
+		// events that share it is safe, because every event is applied as an
+		// upsert or a mark.
+		f.log.Warn("the checkpoint names an event on a namespace this feeder no longer mirrors, "+
+			"so mirroring resumes from that event's cluster time",
+			"id", f.cfg.ID, "ns", rec.NS,
+			"from", time.Unix(int64(rec.TS.T), 0).UTC().Format(time.RFC3339))
+		token, startAt, fromEvent = nil, rec.TS, true
 	}
 
 	opts := options.ChangeStream().
@@ -663,8 +683,10 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		// and until now are mirrored rather than lost. See
 		// checkpoint.Record.StartAt.
 		opts.SetStartAtOperationTime(startAt)
-		f.log.Info("replaying from where cline backfill started copying",
-			"id", f.cfg.ID, "from", time.Unix(int64(startAt.T), 0).UTC().Format(time.RFC3339))
+		if !fromEvent {
+			f.log.Info("replaying from where cline backfill started copying",
+				"id", f.cfg.ID, "from", time.Unix(int64(startAt.T), 0).UTC().Format(time.RFC3339))
+		}
 	} else {
 		f.log.Warn("no checkpoint, mirroring from now on",
 			"id", f.cfg.ID,
@@ -679,16 +701,25 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			// The instant the checkpoint marks, so the log says how much is
 			// missing rather than only that something is.
 			at, _, _ := f.cp.EventAt(ctx, f.cfg.ID)
+			args := []any{"id", f.cfg.ID, "checkpoint", at.UTC().Format(time.RFC3339), "err", err}
+			if checkpoint.TokenEventMissing(err) && rec.NS == "" {
+				// A checkpoint from before Record.NS cannot say which
+				// namespace its event was on, so the case handled above
+				// arrives here looking like a lost oplog.
+				args = append(args, "note", "mongod gives this same answer when the event the checkpoint "+
+					"names is on a namespace since removed from feeder.namespaces; if one was, put it back, "+
+					"start the feeder until it has mirrored a write, then remove it again")
+			}
 			f.log.Error("the fast tier's oplog no longer reaches where mirroring got to",
-				"id", f.cfg.ID, "checkpoint", at.UTC().Format(time.RFC3339), "err", err,
-				"meaning", "every write the application made between that checkpoint and the "+
-					"start of the oplog is on the fast tier and not in the archive",
-				"effect", "reopening cannot fetch them, so the feeder stops rather than run on "+
-					"with a hole in the archive nothing would mention again",
-				"action", "run cline backfill --config FILE --apply --clear-checkpoint, "+
-					"then start this again; it copies what the fast tier holds, marks what was deleted, "+
-					"and leaves a checkpoint this replays from. Clearing the checkpoint by hand makes "+
-					"mirroring start from now and hides the gap instead of closing it")
+				append(args,
+					"meaning", "every write the application made between that checkpoint and the "+
+						"start of the oplog is on the fast tier and not in the archive",
+					"effect", "reopening cannot fetch them, so the feeder stops rather than run on "+
+						"with a hole in the archive nothing would mention again",
+					"action", "run cline backfill --config FILE --apply --clear-checkpoint, "+
+						"then start this again; it copies what the fast tier holds, marks what was deleted, "+
+						"and leaves a checkpoint this replays from. Clearing the checkpoint by hand makes "+
+						"mirroring start from now and hides the gap instead of closing it")...)
 			return fmt.Errorf("%w: %v", ErrResumePointLost, err)
 		}
 		return fmt.Errorf("open change stream: %w", err)
@@ -724,6 +755,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			f.pace.reading += time.Since(readFrom)
 			f.pace.events++
 			f.lastToken = stream.ResumeToken()
+			f.lastTokenNS, f.lastTokenTS = tokenEvent(stream.Current, f.lastToken)
 			if len(f.pending) > 0 && f.pendingSince.IsZero() {
 				f.pendingSince = readFrom
 			}
@@ -787,6 +819,11 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		// leave the feeder resuming from an ancient position.
 		tok := stream.ResumeToken()
 		if len(tok) > 0 {
+			if !bytes.Equal(tok, f.lastToken) {
+				// A post-batch token past what this stream filtered out names
+				// no event.
+				f.lastTokenNS, f.lastTokenTS = "", bson.Timestamp{}
+			}
 			f.lastToken = tok
 		}
 		if err := f.flush(ctx); err != nil {
@@ -944,6 +981,38 @@ func namespaceFilter(namespaces []string) bson.A {
 		})
 	}
 	return out
+}
+
+// mirrorsNS reports whether this feeder's stream lets ns through. An empty
+// feeder.namespaces mirrors everything.
+func (f *Feeder) mirrorsNS(ns string) bool {
+	if len(f.cfg.Namespaces) == 0 {
+		return true
+	}
+	for _, n := range f.cfg.Namespaces {
+		if n == ns {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenEvent names the event tok was taken from: its namespace and cluster
+// time, or nothing when tok is not that event's own token. Once a batch is used
+// up the driver hands over MongoDB's post-batch token instead, which can stand
+// past entries this stream filtered out and names no event.
+func tokenEvent(ev bson.Raw, tok bson.Raw) (string, bson.Timestamp) {
+	id, err := ev.LookupErr("_id")
+	if err != nil || !bytes.Equal(id.Value, tok) {
+		return "", bson.Timestamp{}
+	}
+	db, okDB := ev.Lookup("ns", "db").StringValueOK()
+	coll, okColl := ev.Lookup("ns", "coll").StringValueOK()
+	t, i, okTS := ev.Lookup("clusterTime").TimestampOK()
+	if !okDB || !okColl || !okTS {
+		return "", bson.Timestamp{}
+	}
+	return db + "." + coll, bson.Timestamp{T: t, I: i}
 }
 
 func (f *Feeder) pipeline() mongo.Pipeline {

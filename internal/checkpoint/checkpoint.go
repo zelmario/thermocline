@@ -50,6 +50,19 @@ type Record struct {
 	// every event is applied as an upsert or a mark. The first token the
 	// feeder saves removes it.
 	StartAt *bson.Timestamp `bson:"startAt,omitempty"`
+	// NS and TS name the event the token was taken from, and are absent for a
+	// token that names no event: MongoDB's post-batch token past entries this
+	// stream filtered out.
+	//
+	// mongod resumes from an event's token only if that event still passes the
+	// stream's filter, and answers "the resume token was not found" otherwise.
+	// Taking a namespace out of feeder.namespaces does exactly that to a
+	// checkpoint whose last event was on it, and the feeder reported a rolled
+	// oplog with the oplog minutes old: measured on the Hetzner staging pair on
+	// 2026-10-14. Knowing which namespace the token names is what tells that
+	// apart from a fast tier that lost the event, and TS is where to resume.
+	NS string          `bson:"ns,omitempty"`
+	TS *bson.Timestamp `bson:"ts,omitempty"`
 }
 
 // Skew is how far the publisher's clock was ahead of the archive's when it last
@@ -103,12 +116,19 @@ func (s *Store) StartFrom(ctx context.Context, id string, at bson.Timestamp, wal
 }
 
 // Save writes the token for id. eventAt may be zero when the stream has not
-// delivered an event yet.
+// delivered an event yet. ns and ts name the event the token was taken from,
+// and ns is empty for a token that names none. See Record.NS.
 func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt time.Time,
-	skew time.Duration, skewKnown bool) error {
+	skew time.Duration, skewKnown bool, ns string, ts bson.Timestamp) error {
 	set := bson.D{
 		{Key: "token", Value: token},
 		{Key: "savedAt", Value: time.Now().UTC()},
+	}
+	unset := bson.D{{Key: "startAt", Value: ""}}
+	if ns != "" {
+		set = append(set, bson.E{Key: "ns", Value: ns}, bson.E{Key: "ts", Value: ts})
+	} else {
+		unset = append(unset, bson.E{Key: "ns", Value: ""}, bson.E{Key: "ts", Value: ""})
 	}
 	if !eventAt.IsZero() {
 		set = append(set, bson.E{Key: "eventAt", Value: eventAt})
@@ -119,7 +139,7 @@ func (s *Store) Save(ctx context.Context, id string, token bson.Raw, eventAt tim
 
 	_, err := s.coll.UpdateOne(ctx,
 		bson.D{{Key: "_id", Value: id}},
-		bson.D{{Key: "$set", Value: set}, {Key: "$unset", Value: bson.D{{Key: "startAt", Value: ""}}}},
+		bson.D{{Key: "$set", Value: set}, {Key: "$unset", Value: unset}},
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
