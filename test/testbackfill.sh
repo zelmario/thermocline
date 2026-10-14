@@ -319,7 +319,7 @@ sleep 3   # the checkpoint that spends the announcements and records the evictio
 chk "the five old ones are evicted from the fast tier" "0" \
     "$(M $HOTPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_id:{\$gte:21}}))")"
 chk "and the fast tier records all five"               "5" \
-    "$(M $HOTPORT "print(db.getSiblingDB('_thermocline').evicted.countDocuments({'_id.d':/$DNS/}))")"
+    "$(M $HOTPORT "print(db.getSiblingDB('_thermocline').evicted.aggregate([{\$unwind:'\$e'},{\$match:{'e.d':/$DNS/}},{\$count:'n'}]).toArray().concat([{n:0}])[0].n)")"
 chk "a client reads fourteen before the restore"       "14" \
     "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
 

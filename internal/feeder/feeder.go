@@ -1255,6 +1255,15 @@ func (f *Feeder) ensureEvictedTTL(ctx context.Context) {
 		Keys:    bson.D{{Key: "at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(secs).SetName("tc_evicted_ttl"),
 	}
+	// The lookup's index. Multikey over each row's evictions.
+	if _, err := idx.CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "e.d", Value: 1}},
+		Options: options.Index().SetName("tc_evicted_doc"),
+	}); err != nil {
+		f.log.Warn("could not create the eviction record's lookup index on the fast tier",
+			"err", err,
+			"note", "a replay reads the whole record for every batch of deletes until this succeeds")
+	}
 	_, err := idx.CreateOne(ctx, model)
 	if err != nil && optionsConflict(err) {
 		// A retention that changed value since the last start.

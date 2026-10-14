@@ -435,7 +435,8 @@ type FeederConfig struct {
 	// an eviction in that replay is recognised only by this record: without
 	// it every document evicted since the backup is read as deleted and
 	// tombstoned. So it should cover the archive's backup interval, and the
-	// fast tier's oplog window has to as well. One small row per eviction.
+	// fast tier's oplog window has to as well. About 54 bytes of the fast
+	// tier's oplog per eviction, measured; see meta.RecordEvictions.
 	EvictionRecord Duration `yaml:"eviction_record"`
 	// MaxAwait is how long a change stream poll blocks before returning empty.
 	//

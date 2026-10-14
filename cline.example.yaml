@@ -141,7 +141,8 @@ feeder:
   # backup's checkpoint, and an eviction in that replay is told from the
   # application's delete only by this record. Set it to at least the age of the
   # oldest archive backup you would restore from; the fast tier's oplog window
-  # has to reach that far too. One small row per eviction. 0 keeps none.
+  # has to reach that far too. It costs the fast tier about 54 bytes of oplog
+  # per eviction, measured. 0 keeps none.
   eviction_record: 8d
 
 evictor:

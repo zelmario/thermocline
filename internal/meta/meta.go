@@ -1536,76 +1536,86 @@ type EvictedKey struct {
 	At  bson.Timestamp `bson:"t"`
 }
 
+// evictedPerRow caps how many evictions one record row holds, which keeps a row
+// far under mongod's 16MB at any document id length a key can have.
+const evictedPerRow = 10000
+
 // RecordEvictions writes the evictions a checkpoint has just covered into the
 // fast tier's durable record. See Evicted.
 //
-// Unordered and tolerant of duplicates: a replay records the same eviction
-// again, and that is the same row.
+// Packed, many to a row, and that is the whole cost of the record: one row per
+// eviction put 226 bytes of oplog behind each one, measured on the Hetzner
+// staging pair as 43MB for a sweep of 200,000 whose own deletes took 52.7MB.
+// The fast tier's oplog window is one of the two limits on restoring the
+// archive, so the record must not be what shortens it.
+//
+// A replay records the same eviction again, in another row. The lookup does
+// not care how many rows name it.
 func RecordEvictions(ctx context.Context, hot *mongo.Client, spent map[string][]bson.Timestamp) error {
 	now := time.Now().UTC()
-	var docs []any
+	var rows []any
+	var batch bson.A
 	for id, ats := range spent {
 		for _, at := range ats {
-			docs = append(docs, bson.D{
-				{Key: "_id", Value: EvictedKey{Doc: id, At: at}},
-				{Key: "at", Value: now},
-			})
+			batch = append(batch, EvictedKey{Doc: id, At: at})
+			if len(batch) == evictedPerRow {
+				rows = append(rows, bson.D{{Key: "at", Value: now}, {Key: "e", Value: batch}})
+				batch = nil
+			}
 		}
 	}
-	if len(docs) == 0 {
+	if len(batch) > 0 {
+		rows = append(rows, bson.D{{Key: "at", Value: now}, {Key: "e", Value: batch}})
+	}
+	if len(rows) == 0 {
 		return nil
 	}
-	_, err := hot.Database(DB).Collection(Evicted).InsertMany(ctx, docs,
-		options.InsertMany().SetOrdered(false))
-	if err != nil && !onlyDuplicateKeys(err) {
+	if _, err := hot.Database(DB).Collection(Evicted).InsertMany(ctx, rows); err != nil {
 		return fmt.Errorf("record evictions: %w", err)
 	}
 	return nil
 }
 
 // WereEvictions reports which of keys the durable record holds.
+//
+// By document through the index on e.d, then by position here: a row names the
+// positions of every eviction it holds, and only the exact one counts.
 func WereEvictions(ctx context.Context, hot *mongo.Client, keys []EvictedKey) (map[EvictedKey]bool, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	in := make(bson.A, len(keys))
-	for i, k := range keys {
-		in[i] = k
+	want := make(map[EvictedKey]bool, len(keys))
+	docs := make(bson.A, 0, len(keys))
+	seen := map[string]bool{}
+	for _, k := range keys {
+		want[k] = true
+		if !seen[k.Doc] {
+			seen[k.Doc] = true
+			docs = append(docs, k.Doc)
+		}
 	}
-	cur, err := hot.Database(DB).Collection(Evicted).Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: in}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	cur, err := hot.Database(DB).Collection(Evicted).Aggregate(ctx, mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{{Key: "e.d", Value: bson.D{{Key: "$in", Value: docs}}}}}},
+		{{Key: "$unwind", Value: "$e"}},
+		{{Key: "$match", Value: bson.D{{Key: "e.d", Value: bson.D{{Key: "$in", Value: docs}}}}}},
+		{{Key: "$replaceWith", Value: "$e"}},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read eviction record: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	found := map[EvictedKey]bool{}
 	for cur.Next(ctx) {
-		var row struct {
-			ID EvictedKey `bson:"_id"`
-		}
-		if derr := cur.Decode(&row); derr != nil {
+		var k EvictedKey
+		if derr := cur.Decode(&k); derr != nil {
 			return nil, fmt.Errorf("decode eviction record: %w", derr)
 		}
-		found[row.ID] = true
+		if want[k] {
+			found[k] = true
+		}
 	}
 	if cerr := cur.Err(); cerr != nil {
 		return nil, fmt.Errorf("read eviction record: %w", cerr)
 	}
 	return found, nil
-}
-
-// onlyDuplicateKeys reports whether every write error in err is a duplicate
-// key, which for a record written twice means it is already there.
-func onlyDuplicateKeys(err error) bool {
-	var bwe mongo.BulkWriteException
-	if !errors.As(err, &bwe) || bwe.WriteConcernError != nil || len(bwe.WriteErrors) == 0 {
-		return false
-	}
-	for _, we := range bwe.WriteErrors {
-		if we.Code != 11000 {
-			return false
-		}
-	}
-	return true
 }

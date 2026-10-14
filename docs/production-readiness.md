@@ -763,7 +763,11 @@ announcement the feeder has already spent.
 
 The fast tier now keeps a record of each eviction the feeder confirmed, for
 `feeder.eviction_record`, 8 days by default, and a replay consults it before
-the announcements. A replay from further back than that is refused rather than
+the announcements. Its cost was measured rather than assumed: one row per
+eviction added 43MB of fast tier oplog to a 200,000 document sweep whose own
+deletes took 52.7MB, and packing a checkpoint's evictions into one row brought
+that to 10.3MB, 54 bytes each, with the sweep at the same 2,587 documents a
+second. A replay from further back than that is refused rather than
 allowed to tombstone, and a document changed and then evicted after the backup,
 whose newest version only the lost archive held, is named in the log instead
 of served older in silence. `test/testbackfill.sh` checks all of it: 60 and 0,
