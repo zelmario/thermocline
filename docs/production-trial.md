@@ -45,7 +45,7 @@ staging pair built the way production will be:
 |---|---|---|
 | Adoption | `docs/adoption.md`, steps 0 to 16 | `test/pilot/setup.sh` |
 | Rollback | `docs/adoption.md`, step 12 | `test/testrollback.sh` |
-| A feeder that stopped past the oplog | `docs/operations.md`, `cline backfill` | `test/testbackfill.sh` |
+| A feeder that stopped past the oplog | `docs/router.md`, the feeder's exit and `cline backfill --apply --clear-checkpoint` | `test/testbackfill.sh` |
 | A rolling upgrade | `README.md`, Both tiers run the same MongoDB release | `test/verskew.sh` |
 | Losing the fast tier | `docs/operations.md`, Backups | `test/testrestore.sh` |
 | Installing the units | `packaging/systemd` | `test/testservice.sh` |

@@ -245,6 +245,67 @@ chk "and a client reads all fifteen"                   "15" \
     "$(R "print(db.getSiblingDB('shop').$RNS.countDocuments({}))")"
 chk "including one written after the backup"           "written after the backup" \
     "$(R "const d=db.getSiblingDB('shop').$RNS.findOne({_id:13}); print(d?d.v:'MISSING')")"
+
+echo "== a feeder restarted without the namespace its checkpoint names =="
+# mongod resumes from an event's token only while that event passes the
+# stream's filter. The section above left a checkpoint on shop.trestore, and a
+# config without it made the feeder report a rolled oplog and stop, with the
+# oplog minutes old: measured on the staging pair on 2026-10-14, with a write
+# made while it was down never mirrored. It now resumes from that event's
+# cluster time.
+DNS=tresdel
+pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+M $HOTPORT "db.getSiblingDB('shop').$DNS.drop()" >/dev/null
+M $COLDPORT "db.getSiblingDB('shop').$DNS.drop()" >/dev/null
+M $HOTPORT "db.getSiblingDB('shop').$DNS.insertOne({_id:1,v:'written while no feeder ran'})" >/dev/null
+sed 's|    - "shop.orders"|    - "shop.orders"\n    - "shop.'"$DNS"'"|' "$DIR/bf.yaml" > "$DIR/bf4.yaml"
+"$BIN" feeder --config "$DIR/bf4.yaml" --log-file "$DIR/f6.log" >/dev/null 2>&1 & disown
+"$BIN" router --config "$DIR/bf4.yaml" --log-file "$DIR/r4.log" >/dev/null 2>&1 & disown
+for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/r4.log" 2>/dev/null && break; sleep 1; done
+for _ in $(seq 1 30); do
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")" = "1" ] && break
+  sleep 1
+done
+chk "it says why it is not resuming from the token"   "true" \
+    "$(grep -q 'no longer mirrors, so mirroring resumes' "$DIR/f6.log" && echo true || echo false)"
+chk "and does not call it a rolled oplog"              "false" \
+    "$(grep -q 'oplog no longer reaches' "$DIR/f6.log" && echo true || echo false)"
+chk "the write made while it was down is mirrored"     "1" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
+
+echo "== a delete made after an archive backup =="
+# The restore section above wrote only inserts after its backup. A delete leaves
+# nothing on the fast tier to copy, and with a feeder publishing backfill marks
+# nothing, so the restore brings the deleted document back: here the
+# application left nine and a client reads ten, with no error anywhere. Measured first on
+# the staging pair on 2026-10-14.
+#
+# Replaying the fast tier's oplog from the backup's checkpoint marks it, and
+# also tombstones every document evicted since the backup, because those
+# evictions' notices are spent: ten of ten on the same pair. So this is the
+# exposure stated as a number, as docs/operations.md states it, until the
+# feeder can tell a replayed eviction from a delete.
+R "for (let i=2;i<=10;i++) db.getSiblingDB('shop').$DNS.insertOne({_id:i,v:'before the backup'})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")" = "10" ] && break
+  sleep 1
+done
+docker exec tc-bf-cold rm -rf /tmp/bk$DNS
+docker exec tc-bf-cold mongodump --port $COLDPORT --db shop --collection $DNS -o /tmp/bk$DNS --quiet >/dev/null 2>&1
+R "db.getSiblingDB('shop').$DNS.deleteOne({_id:3})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+  sleep 1
+done
+chk "the delete is mirrored as a mark"                 "1" \
+    "$(M $COLDPORT "print(db.getSiblingDB('shop').$DNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+"$BIN" pause --config "$DIR/bf4.yaml" --reason "restoring the archive" >/dev/null 2>&1
+docker exec tc-bf-cold mongorestore --port $COLDPORT --quiet --drop --nsInclude "shop.$DNS" /tmp/bk$DNS >/dev/null 2>&1
+"$BIN" backfill --config "$DIR/bf4.yaml" --ns "shop.$DNS" --apply >/dev/null 2>&1
+"$BIN" resume --config "$DIR/bf4.yaml" >/dev/null 2>&1
+sleep 2
+chk "after the restore the deleted one is read again"  "10" \
+    "$(R "print(db.getSiblingDB('shop').$DNS.countDocuments({}))")"
 # Left running, because the section below needs a feeder publishing to refuse.
 
 echo "== and it refuses to run underneath a feeder =="

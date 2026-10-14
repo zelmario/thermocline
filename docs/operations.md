@@ -205,11 +205,30 @@ bin/cline resume   --config cline.yaml
 ```
 
 Leave the feeder running while it copies. That is the order with no window in
-it: the feeder carries what happens next while the copy brings back what the
-restore dropped. Measured on ten documents mirrored, a backup, five more
+it for inserts and updates: the feeder carries what happens next while the copy
+brings back what the restore dropped. Deletes are the exception, below. Measured on ten documents mirrored, a backup, five more
 written, then the archive dropped and restored: a client read ten of the fifteen
 the application had written, and fifteen after the copy. `test/testbackfill.sh`
 walks exactly those steps.
+
+**Nor can it see a delete made after the backup.** A delete leaves nothing on
+the fast tier to copy, and with the feeder running `cline backfill` marks
+nothing, so the restored archive holds that document live again and every read
+that falls through to the archive returns it. Measured on the staging pair on
+2026-10-14: ten documents mirrored, a backup, one deleted through the router,
+the procedure above followed exactly, and a client read ten where the
+application had left nine, with no error anywhere. `test/testbackfill.sh`
+states it as that number.
+
+The fast tier's oplog still holds those deletes, and replaying it from the
+backup's checkpoint would mark them. It would also mark every document
+**evicted** since the backup, whose only copy is now the archive's: an eviction
+is told from a delete by a notice the feeder spends as it mirrors, and a
+replay finds them spent. Measured the same day, ten documents evicted after
+the backup and then replayed: ten tombstoned, and a client read none of them.
+So do not restore the feeder's checkpoint, and after a restore list the
+application's deletes since the backup from its own records, and delete those
+documents again through the router.
 
 What it cannot fetch is what the fast tier no longer holds: anything written
 after the backup **and already evicted** is in neither tier, and nothing can
