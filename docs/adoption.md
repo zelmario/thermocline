@@ -24,7 +24,7 @@ The order matters, because most of what goes wrong goes wrong quietly.
 comparison a router makes at startup -- versions and feature compatibility,
 collections and databases the fast tier has never held, collation and validator
 drift, unique indexes the fast tier is missing, accounts and roles the archive
-lacks, and whether anything has claimed the unique keys an adopted archive
+has and the fast tier does not, and whether anything has claimed the unique keys an adopted archive
 carries -- plus the feeder's own check that every namespace it is told to mirror
 is a kind that can be mirrored at all, and it also names what a start *would*
 build on the fast tier, with the index counts.
@@ -66,7 +66,14 @@ set and has none of them, nor any custom role they refer to; MongoDB refuses to
 create a user whose role is missing and names it, so do the roles first. The router authenticates against the fast tier, so
 until they exist every connection is refused with MongoDB's ordinary
 `Authentication failed`, which says nothing about which tier is missing them.
-The router names them at startup.
+
+The list is in the output of step 0: `cline preflight` prints "the archive has
+roles the fast tier does not" and "the archive has accounts the fast tier does
+not", each naming them. Create each one with the same name, the same roles and
+the password the application already uses; MongoDB stores only a hash, so a
+password cannot be read back from the archive. If preflight names neither, check
+that its account can read `admin.system.users` on both tiers: when it cannot, the
+comparison is skipped and nothing is printed, so silence is not "none missing".
 
 Give the router's own account `killAnyCursor` on the fast tier while you are
 there. When the archive answers a query the fast tier had started, the fast tier

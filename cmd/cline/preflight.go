@@ -27,7 +27,7 @@ import (
 // deployment is fit to tier: collections stranded on the archive, a database
 // the fast tier has no trace of, a collation or validator that differs between
 // the tiers, a unique index the fast tier is missing, accounts and roles the
-// archive does not have, unclaimed unique keys on an adopted archive, and a
+// archive has and the fast tier does not, unclaimed unique keys on an adopted archive, and a
 // version or FCV mismatch that refuses the start outright.
 //
 // And the feeder's own refusal, which was missing until it was noticed that the
@@ -53,7 +53,7 @@ Report whether a pair is fit to tier, without writing to either tier.
 Runs the checks a router runs when it starts -- versions and feature
 compatibility, collections and databases the fast tier does not have, collation
 and validator drift, unique indexes the fast tier is missing, accounts and roles
-the archive lacks, write concerns, and whether anything has ever claimed the
+the archive has and the fast tier does not, write concerns, and whether anything has ever claimed the
 unique keys an adopted archive carries -- and the feeder's check that every
 namespace it is told to mirror is a kind that can be mirrored at all. Prints
 what they find.
