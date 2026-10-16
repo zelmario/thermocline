@@ -961,17 +961,18 @@ func (r *Router) archiveDatabases(ctx context.Context) []string {
 // finding out what to fix is the part that costs an afternoon.
 //
 // Reading admin.system.users needs a privilege the router's own account may not
-// have when it is not terminating authentication, so a refusal here is logged
-// at debug and nothing more: this is a courtesy, not a precondition.
+// have when it is not terminating authentication, so a refusal here is a
+// courtesy skipped rather than a precondition failed. See couldNotCompare for
+// who is told.
 func (r *Router) warnAboutMissingUsers(ctx context.Context) {
 	cold, cerr := usersIn(ctx, r.cold)
 	if cerr != nil {
-		r.log.Debug("could not read the archive's users to compare them", "err", cerr)
+		r.couldNotCompare("accounts", "the archive", "admin.system.users", cerr)
 		return
 	}
 	hot, herr := usersIn(ctx, r.hot)
 	if herr != nil {
-		r.log.Debug("could not read the fast tier's users to compare them", "err", herr)
+		r.couldNotCompare("accounts", "the fast tier", "admin.system.users", herr)
 		return
 	}
 
@@ -1006,12 +1007,12 @@ func (r *Router) warnAboutMissingUsers(ctx context.Context) {
 func (r *Router) warnAboutMissingRoles(ctx context.Context) {
 	cold, cerr := rolesIn(ctx, r.cold)
 	if cerr != nil {
-		r.log.Debug("could not read the archive's roles to compare them", "err", cerr)
+		r.couldNotCompare("roles", "the archive", "admin.system.roles", cerr)
 		return
 	}
 	hot, herr := rolesIn(ctx, r.hot)
 	if herr != nil {
-		r.log.Debug("could not read the fast tier's roles to compare them", "err", herr)
+		r.couldNotCompare("roles", "the fast tier", "admin.system.roles", herr)
 		return
 	}
 
@@ -1030,6 +1031,29 @@ func (r *Router) warnAboutMissingRoles(ctx context.Context) {
 		"meaning", "creating the application's accounts on the fast tier fails while these are "+
 			"missing, because an account cannot be given a role that does not exist there",
 		"action", "create these first, with the same privileges, then the accounts that hold them")
+}
+
+// couldNotCompare reports a comparison of accounts or roles that was skipped
+// because a tier refused the read.
+//
+// At startup it stays at debug. The router's own account need not be able to
+// read either collection when it does not terminate authentication, and a
+// warning on every start would be about a privilege nobody owes it.
+//
+// Under `cline preflight` it warns. Somebody ran that to find out what to
+// create on the fast tier, and silence there reads as "nothing missing": the
+// rehearsal of 2026-10-15 reached adoption step 3 with an empty report and no
+// way to tell a clean comparison from one that never ran.
+func (r *Router) couldNotCompare(what, tier, coll string, err error) {
+	if !r.reporting {
+		r.log.Debug("could not read "+tier+"'s "+what+" to compare them", "err", err)
+		return
+	}
+	r.log.Warn("could not compare the two tiers' "+what,
+		"tier", tier,
+		"err", err,
+		"meaning", "this report says nothing about missing "+what+", which is not the same as none missing",
+		"action", "run preflight with an account that can read "+coll+" on both tiers, or compare them by hand")
 }
 
 // warnAboutOptionDrift says so when a tiered collection is not the same

@@ -71,9 +71,10 @@ The list is in the output of step 0: `cline preflight` prints "the archive has
 roles the fast tier does not" and "the archive has accounts the fast tier does
 not", each naming them. Create each one with the same name, the same roles and
 the password the application already uses; MongoDB stores only a hash, so a
-password cannot be read back from the archive. If preflight names neither, check
-that its account can read `admin.system.users` on both tiers: when it cannot, the
-comparison is skipped and nothing is printed, so silence is not "none missing".
+password cannot be read back from the archive. If its account cannot read
+`admin.system.users` and `admin.system.roles` on both tiers, preflight says "could
+not compare the two tiers' accounts" (or roles) instead. That is not "none
+missing": run it again with an account that can, or compare the two by hand.
 
 Give the router's own account `killAnyCursor` on the fast tier while you are
 there. When the archive answers a query the fast tier had started, the fast tier

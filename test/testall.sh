@@ -216,6 +216,29 @@ mongosh "$COLDU" --quiet --eval "db.getSiblingDB(process.env.TC_DB).$PKNS.drop()
 # as the guard firing on nothing.
 ok "and it is quiet again once it is gone"  0 "Nothing above refuses a start" \
    -- cline preflight --config $CFG
+# Adoption step 3 creates on the fast tier the accounts and roles preflight
+# names, and preflight compared them only when its account could read
+# admin.system.users and admin.system.roles. When it could not, it logged at
+# debug and printed nothing, so an empty report read as "none missing". Found in
+# the rehearsal of 2026-10-15. An account that reads every database but not
+# those two is the shape that hid it.
+for u in "$HOTU" "$COLDU"; do
+  mongosh "$u" --quiet --eval "const a=db.getSiblingDB('admin'); try{a.dropUser('pfnarrow')}catch(e){}
+    a.createUser({user:'pfnarrow',pwd:'pfnarrow',roles:['readAnyDatabase','clusterMonitor']})" >/dev/null 2>&1
+done
+PFCFG=$WDIR/testall_pfnarrow.yaml
+sed -E 's#//[^:/@]+:[^@]*@#//pfnarrow:pfnarrow@#' "$CFG" > "$PFCFG"
+PFOUT=$(cline preflight --config $PFCFG 2>&1)
+chkrb "preflight says when it could not compare accounts" "true" \
+    "$(grep -q "could not compare the two tiers' accounts" <<<"$PFOUT" && echo true || echo false)"
+chkrb "and when it could not compare roles"               "true" \
+    "$(grep -q "could not compare the two tiers' roles" <<<"$PFOUT" && echo true || echo false)"
+PFOUT=$(cline preflight --config $CFG 2>&1)
+chkrb "and says neither when it could compare them"       "false" \
+    "$(grep -q "could not compare the two tiers" <<<"$PFOUT" && echo true || echo false)"
+for u in "$HOTU" "$COLDU"; do
+  mongosh "$u" --quiet --eval "try{db.getSiblingDB('admin').dropUser('pfnarrow')}catch(e){}" >/dev/null 2>&1
+done
 # The adoption shape, which is the case it exists for and the one it used to be
 # silent about: a tiered collection the archive has and the fast tier has never
 # held. warnAboutOptionDrift skips a collection only one tier has, because by
