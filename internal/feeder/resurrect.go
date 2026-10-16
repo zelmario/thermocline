@@ -2,6 +2,7 @@ package feeder
 
 import (
 	"context"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -142,9 +143,19 @@ func (f *Feeder) undoResurrections(ctx context.Context, last map[string]bson.Tim
 	}
 }
 
+// resurrectGrace bounds removeResurrected once the feeder is stopping.
+const resurrectGrace = 30 * time.Second
+
 // removeResurrected takes one resurrected document off the fast tier, and
 // reports whether it is done with it, which includes finding it already gone.
+//
+// From the announcement to the delete it runs on a context a shutdown does not
+// cancel, for the reason the evictor's steps do: an announcement cut off from
+// its delete stands for an hour, and the evictor's stood 3,000 times in twelve
+// SIGTERMs before its steps did the same. See evictor.stepContext.
 func (f *Feeder) removeResurrected(ctx context.Context, op pendingOp) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resurrectGrace)
+	defer cancel()
 	docID := meta.DocID(op.ns, op.id)
 	if err := meta.AnnounceEviction(ctx, f.cold, []string{docID}); err != nil {
 		f.log.Warn("could not announce the removal of a document a copy-up put back",
@@ -159,10 +170,20 @@ func (f *Feeder) removeResurrected(ctx context.Context, op pendingOp) bool {
 		},
 		options.DeleteOne().SetCollation(&options.Collation{Locale: "simple"}))
 	if err != nil {
-		// The announcement stays. No delete of ours is coming for it, and one
-		// left standing costs a later application delete of this document being
-		// read as an eviction; the next flush tries this again, and its
-		// announcement then has one to answer for.
+		// Taken back. The next flush tries again and announces again, so one
+		// left standing here was one more than the deletes coming: two
+		// announcements for the retry's one delete, and the spare read the
+		// application's next delete of this _id as an eviction.
+		//
+		// The delete may have landed despite the error. Then it reaches the
+		// feeder unannounced and reads as the application's, which tombstones
+		// the archive's copy, and that copy is already a tombstone: it is why
+		// this document is being removed at all.
+		if werr := meta.WithdrawEviction(ctx, f.cold, []string{docID}); werr != nil {
+			f.log.Warn("could not withdraw an eviction announcement nothing will answer",
+				"ns", op.ns, "err", werr,
+				"effect", "an application delete of this _id within the hour may be read as an eviction")
+		}
 		f.log.Warn("could not remove a document a copy-up put back",
 			"ns", op.ns, "err", err, "effect", "tried again on the next flush")
 		return false
