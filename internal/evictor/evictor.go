@@ -385,7 +385,18 @@ func (e *Evictor) sweepRule(ctx context.Context, rule config.EvictionRule, bound
 
 		// Health gates every batch, not every sweep. A sweep can run for hours
 		// and the cluster's condition changes underneath it.
-		if backedOff, err := e.waitForHealth(ctx); err != nil {
+		//
+		// The delete behind this batch is the evictor's own load, not the
+		// cluster's condition. Measured with the default write ticket limit:
+		// the check found it holding the tickets and paused twice in one sweep
+		// of 200,000, five seconds each. So a failing check first lets it
+		// finish and looks again.
+		settle := func() error {
+			n, err := behind.wait()
+			stats.Evicted += n
+			return err
+		}
+		if backedOff, err := e.waitForHealth(ctx, settle); err != nil {
 			return stats, err
 		} else if backedOff {
 			stats.Backoffs++
@@ -1037,7 +1048,11 @@ var ErrUnhealthy = errors.New("cluster not healthy enough to evict")
 // A dry run never blocks. It changes nothing, so refusing to report what would
 // happen because the oplog is short would make the flag useless exactly when an
 // operator is trying to understand the system.
-func (e *Evictor) waitForHealth(ctx context.Context) (bool, error) {
+//
+// settle, when there is one, runs once, the first time the check fails, and
+// the check is taken again before anything counts as waiting. It is for load
+// this process put on the cluster itself.
+func (e *Evictor) waitForHealth(ctx context.Context, settle func() error) (bool, error) {
 	const pollEvery = 5 * time.Second
 	const remindEvery = time.Minute
 
@@ -1067,6 +1082,14 @@ func (e *Evictor) waitForHealth(ctx context.Context) (bool, error) {
 
 		reading := e.check.Sample(ctx)
 		verdict := health.Evaluate(reading, e.cfg.Backoff, e.cfg.MaxFeederLag.D())
+		if !verdict.OK && settle != nil {
+			err := settle()
+			settle = nil
+			if err != nil {
+				return waited, err
+			}
+			continue
+		}
 		if verdict.OK {
 			if waited {
 				e.log.Info("resuming eviction", "paused_for", time.Since(start).Round(time.Second))
