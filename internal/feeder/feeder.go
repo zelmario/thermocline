@@ -141,6 +141,11 @@ type Feeder struct {
 	// window both spending the same announcement, which is what the archive's
 	// own count cannot see. See flushAndCheckpoint.
 	spentNotices map[string][]bson.Timestamp
+	// owedNotices are spent notices a saved checkpoint already covers, whose
+	// write-off failed. Those deletes will not be replayed, so nothing else
+	// will ever spend them; they are retried at every checkpoint and once more
+	// on the way out. See settleOwed.
+	owedNotices map[string][]bson.Timestamp
 	// claimedInBatch are the announcements the batch being assembled has taken.
 	// They join spentNotices only once that batch is in the archive, so an
 	// attempt that failed leaves nothing behind for a retry to under-count
@@ -770,6 +775,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 	// testalerts waited 60s for a counter at zero after the stream opened and
 	// read the last run's value throughout, on 2026-10-02.
 	f.publishCounters(ctx)
+	defer f.settleOwed(ctx)
 
 	for {
 		if ctx.Err() != nil {

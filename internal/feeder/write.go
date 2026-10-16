@@ -152,28 +152,81 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	// Tied to the checkpoint instead, a crash before the save leaves the
 	// announcements standing and the replay classifies them correctly. A crash
 	// after it means those events are not replayed at all.
-	if len(f.spentNotices) > 0 {
+	//
+	// From here on these deletes will not be replayed, so writing them off is
+	// owed whatever happens to ctx. A SIGTERM between the save and the write-off
+	// cancelled it, and the notices then stood for the hour a notice lives with
+	// nothing left to spend them: see settleOwed for what one costs.
+	f.owedNotices = mergeNotices(f.owedNotices, f.spentNotices)
+	f.spentNotices = nil
+	if len(f.owedNotices) > 0 {
+		octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owedGrace)
+		defer cancel()
 		// Recorded first, so there is no moment at which an eviction is
 		// neither announced nor recorded. See meta.Evicted. A failure costs
 		// only a replay from before this point, which is rare, so it warns.
 		if f.cfg.EvictionRecord > 0 && f.hot != nil {
-			if err := meta.RecordEvictions(ctx, f.hot, f.spentNotices); err != nil {
+			if err := meta.RecordEvictions(octx, f.hot, f.owedNotices); err != nil {
 				f.log.Warn("could not record evictions on the fast tier", "err", err,
 					"note", "an archive restored from a backup older than this cannot tell these "+
 						"evictions from deletes when the feeder replays them")
 			}
 		}
-		if err := meta.SpendEvictionNotices(ctx, f.cold, f.spentNotices); err != nil {
-			// An announcement left standing costs a later application delete
-			// being read as an eviction, so the archive keeps a record it
-			// should have marked deleted. That is the safe direction: it keeps
-			// something it should not, rather than losing something it should.
-			f.log.Warn("could not spend eviction notices", "err", err)
+		if err := meta.SpendEvictionNotices(octx, f.cold, f.owedNotices); err != nil {
+			f.log.Warn("could not spend eviction notices", "err", err,
+				"effect", "tried again at the next checkpoint and when the feeder stops")
 			return nil
 		}
-		f.spentNotices = nil
+		f.owedNotices = nil
 	}
 	return nil
+}
+
+// owedGrace bounds writing off notices a saved checkpoint covers, once the
+// feeder is stopping.
+const owedGrace = 30 * time.Second
+
+// settleOwed makes one last attempt, as the feeder stops, at writing off
+// notices a saved checkpoint covers.
+//
+// Nothing else will. Those deletes are behind the checkpoint, so a restart does
+// not replay them, and a notice left with a count no delete will take down
+// reads the application's next delete of that document, within the hour, as an
+// eviction: the archive keeps it live and the router answers a document the
+// application deleted. Measured for the evictor's side of the same channel on
+// 2026-10-16.
+//
+// Only the owed ones. Notices spent since the last save belong to deletes the
+// restart will replay, and writing those off now would leave the replay with
+// nothing to recognise them by.
+func (f *Feeder) settleOwed(ctx context.Context) {
+	if len(f.owedNotices) == 0 {
+		return
+	}
+	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owedGrace)
+	defer cancel()
+	if err := meta.SpendEvictionNotices(octx, f.cold, f.owedNotices); err != nil {
+		f.log.Error("stopping with eviction notices not written off", "err", err,
+			"documents", len(f.owedNotices),
+			"effect", "for the hour a notice lives, an application delete of one of these "+
+				"documents after it is copied back up is read as an eviction, and the archive keeps it")
+		return
+	}
+	f.owedNotices = nil
+}
+
+// mergeNotices adds b's spent positions to a's, document by document.
+func mergeNotices(a, b map[string][]bson.Timestamp) map[string][]bson.Timestamp {
+	if len(b) == 0 {
+		return a
+	}
+	if a == nil {
+		a = make(map[string][]bson.Timestamp, len(b))
+	}
+	for id, at := range b {
+		a[id] = append(a[id], at...)
+	}
+	return a
 }
 
 // flush applies every buffered operation to the cold tier.
@@ -407,7 +460,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	f.claimedInBatch = map[string][]bson.Timestamp{}
 	avail := make(map[string]int, len(announced))
 	for id, n := range announced {
-		avail[id] = n - len(f.spentNotices[id])
+		avail[id] = n - len(f.spentNotices[id]) - len(f.owedNotices[id])
 	}
 
 	// Asked before the announcements, not after them. A delete the record

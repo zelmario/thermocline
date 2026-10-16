@@ -1249,6 +1249,16 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   probe: **0 orphaned announcements** from twelve kills, eleven of them mid
   sweep, and the sweep still 27.4s for 200,000.
 
+  The same channel had two more doors, both in the feeder, and both closed
+  the same day. Undoing a resurrection announced and then deleted, and a
+  failed delete left its announcement standing while the retry announced
+  again: two for one delete (a9be54f, with a test that fails without it). And
+  the feeder writes notices off only after saving the checkpoint that covers
+  their deletes, so a stop between the two left them unspent with nothing
+  left to replay: 5 of 30 restarts landed there on a9be54f, each saved only
+  because the request had already reached mongod. They are now written off
+  past cancellation, and kept and retried when that fails: 0 of 30.
+
   What it cannot cover is a process that dies without being asked: SIGKILL,
   the OOM killer, a host lost. That leaves at most two steps of announcements,
   the one deleting and the one being announced, a thousand documents at the

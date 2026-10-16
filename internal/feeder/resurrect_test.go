@@ -106,3 +106,63 @@ func TestFailedResurrectionRemovalLeavesOneAnnouncement(t *testing.T) {
 			"the spare reads the application's next delete as an eviction", p)
 	}
 }
+
+// A feeder stopping with notices a saved checkpoint covers writes them off on
+// the way out, though the context it stops with is already cancelled.
+//
+// Those deletes are behind the checkpoint, so a restart does not replay them,
+// and nothing else will ever take their count down. Left, each reads the
+// application's next delete of that document as an eviction for an hour.
+func TestStoppingFeederSettlesOwedNotices(t *testing.T) {
+	coldURI := os.Getenv("TC_TEST_COLD")
+	if coldURI == "" {
+		t.Skip("set TC_TEST_COLD to a tier URI to run the owed notices test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_owed.docs"
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		_, _ = notices.DeleteMany(context.WithoutCancel(ctx),
+			bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+	idv := bson.Raw(bsoncore(t, bson.NewObjectID())).Lookup("_id")
+	docID := meta.DocID(ns, idv)
+	if err := meta.AnnounceEviction(ctx, cold, []string{docID}); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+
+	f := &Feeder{cold: cold, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		owedNotices: map[string][]bson.Timestamp{docID: {{T: 1792170000, I: 1}}}}
+	stopping, stop := context.WithCancel(ctx)
+	stop()
+	f.settleOwed(stopping)
+
+	var n struct {
+		Pending int `bson:"pending"`
+	}
+	if err := notices.FindOne(ctx, bson.D{{Key: "_id", Value: docID}}).Decode(&n); err != nil {
+		t.Fatalf("read the notice: %v", err)
+	}
+	if n.Pending != 0 {
+		t.Errorf("the notice still counts %d after the feeder stopped; no replay will spend it", n.Pending)
+	}
+	if len(f.owedNotices) != 0 {
+		t.Error("the owed notices were written off and still held")
+	}
+}
+
+func bsoncore(t *testing.T, id bson.ObjectID) []byte {
+	t.Helper()
+	b, err := bson.Marshal(bson.D{{Key: "_id", Value: id}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
