@@ -806,7 +806,7 @@ measurement, and what an operator sees.
 
 ## Open
 
-This is the whole list. Nothing else blocks. **One of eleven remains: item 5, which is not code.**
+This is the whole list. Nothing else blocks. **One of twelve remains: item 5, which is not code.**
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
@@ -1224,6 +1224,38 @@ This is the whole list. Nothing else blocks. **One of eleven remains: item 5, wh
   other application's orders (30,206 and 30,225), both routers 0 stale reads,
   0 refused and 0 panics across about 658,000 commands and 211,000 copy-ups
   each. The full in-node sweep was 2032 and 0 on 2ffb17e the same day.
+
+- [x] **12. Stopping the evictor mid-sweep let an application delete be undone.**
+  Found on 2026-10-16 while checking what a SIGTERM does to the evictor's new
+  overlapped delete. A step announces its documents to the feeder and then
+  deletes them, and the feeder spends one announcement per delete it applies.
+  The signal cancelled the step wherever it was, so a step cut off after
+  announcing never deleted, and the next sweep announced the same documents
+  again on top. Each was left with one announcement no delete would ever
+  spend, for the hour a notice lives.
+
+  Measured on the staging pair, twelve SIGTERMs one to four seconds into a
+  sweep of 200,000, then one sweep to the end: **3,000 orphaned announcements
+  on c38e576** and 4,000 with the delete overlapped (0406cd3), so the defect
+  is older than the overlap. Then the consequence, end to end: one of those
+  documents read through the router, which copied it up, and deleted by the
+  application with `deletedCount: 1`. The feeder spent the stale announcement
+  on that delete, the archive kept the document live, and the router went on
+  answering it.
+
+  **Closed the same day.** A step that has announced now finishes on a context
+  the signal does not cancel, bounded at 30 seconds, and the sweep stops
+  between steps. The checks before an announcement still stop at once. Same
+  probe: **0 orphaned announcements** from twelve kills, eleven of them mid
+  sweep, and the sweep still 27.4s for 200,000.
+
+  What it cannot cover is a process that dies without being asked: SIGKILL,
+  the OOM killer, a host lost. That leaves at most two steps of announcements,
+  the one deleting and the one being announced, a thousand documents at the
+  default batch size of 500, able to turn an application delete within the
+  hour into an eviction. It needs the document to be copied
+  back up and then deleted inside that hour, and it is written in
+  `docs/limitations.md`.
 
 ## What 2026-09-21 added that an operator has to do
 

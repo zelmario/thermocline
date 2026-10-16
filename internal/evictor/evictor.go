@@ -655,13 +655,16 @@ func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Col
 	}
 	removed := 0
 	for _, chunk := range chunks {
-		present, err := e.prepareChunk(ctx, ns, hotColl, chunk)
+		step, endStep := stepContext(ctx)
+		present, err := e.prepareChunk(ctx, step, ns, hotColl, chunk)
 		if err != nil {
+			endStep()
 			return removed, err
 		}
 		n, werr := behind.wait()
 		removed += n
 		if werr != nil {
+			endStep()
 			// The sweep stops here, so this step's delete is never sent and
 			// its announcements would stand for documents still on the fast
 			// tier. A standing one turns an application delete within the hour
@@ -677,11 +680,45 @@ func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Col
 			return removed, werr
 		}
 		if len(present) == 0 {
+			endStep()
 			continue
 		}
-		behind.start(func() (int, error) { return e.removeChunk(ctx, ns, hotColl, present) })
+		behind.start(func() (int, error) {
+			defer endStep()
+			return e.removeChunk(step, ns, hotColl, present)
+		})
 	}
 	return removed, nil
+}
+
+// stepGrace bounds how long a step goes on once the sweep has been told to
+// stop. See stepContext.
+const stepGrace = 30 * time.Second
+
+// stepContext is the context a step runs on from its announcement to its
+// delete: not cancelled when the sweep is, and bounded by stepGrace.
+//
+// An announcement promises the feeder a delete, and the feeder spends one per
+// delete it applies. A SIGTERM cancelled the step wherever it was, so a step
+// cut off after announcing never deleted, and its announcements stood for an
+// hour with nothing coming to spend them. The next sweep announced the same
+// documents again on top. Measured on the staging pair, twelve SIGTERMs one to
+// four seconds into a sweep of 200,000: 3,000 such announcements on c38e576,
+// 4,000 with the delete running behind. Then one of those documents read
+// through the router, which copied it up, and deleted by the application: the
+// feeder spent the stale announcement on that delete, the archive kept the
+// document live and the router went on answering it.
+//
+// So a step that has announced finishes, and the sweep stops between steps.
+// Everything before the announcement still stops at once, because nothing has
+// been promised yet. The bound is for a tier that stops answering: the step
+// then fails as it would have without a signal. A systemd stop waits 90
+// seconds by default, which this fits inside.
+//
+// What this cannot cover is a process that dies without being asked to,
+// SIGKILL or the OOM killer, where no code runs at all.
+func stepContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), stepGrace)
 }
 
 // evictChunkBytes bounds how much document data one step of an eviction holds.
@@ -757,7 +794,10 @@ func (e *Evictor) bySize(ctx context.Context, hotColl *mongo.Collection, docs []
 // prepareChunk is the first half of one step of evict: confirm and announce.
 // It returns the documents announced and still free to remove, for
 // removeChunk.
-func (e *Evictor) prepareChunk(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
+//
+// The checks before the announcement run on ctx and the announcement onwards on
+// step. See stepContext.
+func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
 
 	// Announce only what is actually there, so the announcements and the
 	// deletes cover the same documents.
@@ -790,7 +830,7 @@ func (e *Evictor) prepareChunk(ctx context.Context, ns string, hotColl *mongo.Co
 	if len(present) == 0 {
 		return nil, nil
 	}
-	if err := e.announce(ctx, present); err != nil {
+	if err := e.announce(step, present); err != nil {
 		return nil, err
 	}
 	// And holds asked again, after announcing, for the other half of a
@@ -802,7 +842,7 @@ func (e *Evictor) prepareChunk(ctx context.Context, ns string, hotColl *mongo.Co
 	// tier's copy, this could delete it, and mongod would then accept the
 	// insert and the feeder mirror it over the archived document. See
 	// router.archivedIDClashesNow.
-	return e.dropHeldAfterAnnouncing(ctx, ns, present)
+	return e.dropHeldAfterAnnouncing(step, ns, present)
 }
 
 // removeChunk is the second half: delete what prepareChunk announced, and end
