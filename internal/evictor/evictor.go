@@ -316,6 +316,21 @@ func (e *Evictor) Run(ctx context.Context, every time.Duration) error {
 }
 
 func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundary time.Time) (Stats, error) {
+	// Every way out of a sweep waits for the delete still running behind it.
+	// The lease is held until this returns, and cline pause takes the lease to
+	// know no sweep is in progress, so a delete outliving the sweep would be
+	// one the operator was told had stopped.
+	var behind removal
+	stats, err := e.sweepRule(ctx, rule, boundary, &behind)
+	n, werr := behind.wait()
+	stats.Evicted += n
+	if err == nil {
+		err = werr
+	}
+	return stats, err
+}
+
+func (e *Evictor) sweepRule(ctx context.Context, rule config.EvictionRule, boundary time.Time, behind *removal) (Stats, error) {
 	var stats Stats
 	var after bson.RawValue
 	db, coll := splitNS(rule.NS)
@@ -421,7 +436,7 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 			return stats, nil
 		}
 		if len(out.evict) > 0 {
-			removed, err := e.evict(ctx, rule.NS, hotColl, out.evict)
+			removed, err := e.evictBehind(ctx, rule.NS, hotColl, out.evict, behind)
 			if err != nil {
 				return stats, err
 			}
@@ -570,17 +585,90 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		e.log.Info("would evict", "ns", ns, "count", len(docs))
 		return 0, nil
 	}
+	var behind removal
+	removed, err := e.evictBehind(ctx, ns, hotColl, docs, &behind)
+	n, werr := behind.wait()
+	removed += n
+	if err == nil {
+		err = werr
+	}
+	return removed, err
+}
+
+// removal is one step's delete from the fast tier, running while the next
+// step is confirmed and announced.
+//
+// Measured on the staging pair, 200,000 documents in one sweep: 41.4s, of
+// which the deletes on the fast tier were 25.6s and the announcements on the
+// archive 11.1s, one after the other. They are two replica sets, and nothing
+// orders one step's delete against the next step's announcement: the steps are
+// disjoint ranges of _id, and the order that matters, announce before delete,
+// is per document and kept inside each step.
+//
+// One step deep, no more. The next step's delete starts only once this one
+// has finished, so the feeder sees the deletes in sweep order as before, and
+// at most two steps' documents are held at once.
+type removal struct {
+	done    chan struct{}
+	removed int
+	err     error
+}
+
+func (r *removal) start(f func() (int, error)) {
+	r.done = make(chan struct{})
+	go func() {
+		defer close(r.done)
+		r.removed, r.err = f()
+	}()
+}
+
+// wait returns what the delete behind removed, and nothing when none is
+// running.
+func (r *removal) wait() (int, error) {
+	if r.done == nil {
+		return 0, nil
+	}
+	<-r.done
+	n, err := r.removed, r.err
+	*r = removal{}
+	return n, err
+}
+
+// evictBehind confirms and announces each step, then leaves its delete running
+// in behind and returns. What it reports removed is what the deletes it waited
+// for removed; the caller waits for the last one.
+func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate, behind *removal) (int, error) {
 	chunks, err := e.bySize(ctx, hotColl, docs)
 	if err != nil {
 		return 0, err
 	}
 	removed := 0
 	for _, chunk := range chunks {
-		n, err := e.evictChunk(ctx, ns, hotColl, chunk)
-		removed += n
+		present, err := e.prepareChunk(ctx, ns, hotColl, chunk)
 		if err != nil {
 			return removed, err
 		}
+		n, werr := behind.wait()
+		removed += n
+		if werr != nil {
+			// The sweep stops here, so this step's delete is never sent and
+			// its announcements would stand for documents still on the fast
+			// tier. A standing one turns an application delete within the hour
+			// into an eviction, and the archive keeps what the application
+			// deleted. Unlike the short delete removeChunk leaves alone, nothing of this
+			// step was removed, so taking all of them back is exact.
+			if len(present) > 0 {
+				if err := e.withdraw(context.WithoutCancel(ctx), present); err != nil {
+					e.log.Warn("could not withdraw announcements for documents not evicted",
+						"ns", ns, "count", len(present), "err", err)
+				}
+			}
+			return removed, werr
+		}
+		if len(present) == 0 {
+			continue
+		}
+		behind.start(func() (int, error) { return e.removeChunk(ctx, ns, hotColl, present) })
 	}
 	return removed, nil
 }
@@ -655,8 +743,10 @@ func (e *Evictor) bySize(ctx context.Context, hotColl *mongo.Collection, docs []
 	return chunks, nil
 }
 
-// evictChunk is one step of evict: confirm, announce, remove.
-func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) (int, error) {
+// prepareChunk is the first half of one step of evict: confirm and announce.
+// It returns the documents announced and still free to remove, for
+// removeChunk.
+func (e *Evictor) prepareChunk(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
 
 	// Announce only what is actually there, so the announcements and the
 	// deletes cover the same documents.
@@ -670,14 +760,14 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 	// two collections on the pilot, by the fix meant to stop exactly that.
 	present, err := e.presentOnFastTier(ctx, hotColl, docs)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if len(present) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	current, err := e.currentInArchive(ctx, ns, present)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if changed := len(present) - len(current); changed > 0 {
 		e.log.Info("not evicting documents changed since they were mirrored",
@@ -687,10 +777,10 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 	}
 	present = current
 	if len(present) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	if err := e.announce(ctx, present); err != nil {
-		return 0, err
+		return nil, err
 	}
 	// And holds asked again, after announcing, for the other half of a
 	// handshake with the router. A router about to let mongod answer an insert
@@ -701,12 +791,12 @@ func (e *Evictor) evictChunk(ctx context.Context, ns string, hotColl *mongo.Coll
 	// tier's copy, this could delete it, and mongod would then accept the
 	// insert and the feeder mirror it over the archived document. See
 	// router.archivedIDClashesNow.
-	if present, err = e.dropHeldAfterAnnouncing(ctx, ns, present); err != nil {
-		return 0, err
-	}
-	if len(present) == 0 {
-		return 0, nil
-	}
+	return e.dropHeldAfterAnnouncing(ctx, ns, present)
+}
+
+// removeChunk is the second half: delete what prepareChunk announced, and end
+// the holds it was chosen under.
+func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Collection, present []candidate) (int, error) {
 
 	ids := make([]bson.RawValue, len(present))
 	docIDs := make([]string, len(present))
@@ -927,6 +1017,14 @@ func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
 		docIDs[i] = d.docID
 	}
 	return meta.AnnounceEviction(ctx, e.cold, docIDs)
+}
+
+func (e *Evictor) withdraw(ctx context.Context, docs []candidate) error {
+	docIDs := make([]string, len(docs))
+	for i, d := range docs {
+		docIDs[i] = d.docID
+	}
+	return meta.WithdrawEviction(ctx, e.cold, docIDs)
 }
 
 // ErrUnhealthy is returned when the cluster did not become fit for eviction

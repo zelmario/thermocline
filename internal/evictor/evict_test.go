@@ -2,6 +2,7 @@ package evictor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -456,5 +457,85 @@ func TestHeldAfterAnnouncingTakesTheAnnouncementBack(t *testing.T) {
 	if have[c.docID] != 0 {
 		t.Errorf("the announcement for a document left on the fast tier still stands at %d; "+
 			"the application's next delete of it would be read as an eviction", have[c.docID])
+	}
+}
+
+// A delete that fails behind the sweep takes back the announcements of the step
+// that was announced while it ran.
+//
+// Since the delete of one step runs while the next is confirmed and announced,
+// a failed delete stops the sweep with the next step announced and never
+// deleted. Left standing, each of those announcements turns an application
+// delete of that document within the hour into an eviction, and the archive
+// keeps a document the application deleted. Nothing of that step was removed,
+// so all of them come back.
+func TestFailedDeleteBehindWithdrawsTheNextStep(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two tiers to run the failed delete test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatalf("connect hot: %v", err)
+	}
+	t.Cleanup(func() { _ = hot.Disconnect(context.WithoutCancel(ctx)) })
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect cold: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_behind.docs"
+	hc := hot.Database("tc_behind").Collection("docs")
+	cc := cold.Database("tc_behind").Collection("docs")
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = hc.Drop(c)
+		_ = cc.Drop(c)
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+	_ = hc.Drop(ctx)
+	_ = cc.Drop(ctx)
+
+	var cands []candidate
+	for i := 0; i < 3; i++ {
+		id := bson.NewObjectID()
+		doc := bson.D{{Key: "_id", Value: id}, {Key: "n", Value: i}}
+		if _, err := hc.InsertOne(ctx, doc); err != nil {
+			t.Fatalf("insert hot: %v", err)
+		}
+		if _, err := cc.InsertOne(ctx, doc); err != nil {
+			t.Fatalf("insert cold: %v", err)
+		}
+		raw := rawIDValue(t, id)
+		cands = append(cands, candidate{id: raw, docID: meta.DocID(ns, raw)})
+	}
+
+	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "test"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	// The step before this one, whose delete fails while this one is announced.
+	var behind removal
+	failed := errors.New("delete refused")
+	behind.start(func() (int, error) { return 0, failed })
+
+	if _, err := e.evictBehind(ctx, ns, hc, cands, &behind); !errors.Is(err, failed) {
+		t.Fatalf("evictBehind returned %v, want the failed delete behind it", err)
+	}
+	if n, _ := hc.CountDocuments(ctx, bson.D{}); n != 3 {
+		t.Errorf("the fast tier holds %d of 3; the step after a failed delete must not be removed", n)
+	}
+	pending, err := notices.CountDocuments(ctx, bson.D{
+		{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}},
+		{Key: "pending", Value: bson.D{{Key: "$gt", Value: 0}}},
+	})
+	if err != nil {
+		t.Fatalf("count notices: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("%d announcements stand for documents never deleted; an application delete of "+
+			"any of them within the hour would be read as an eviction", pending)
 	}
 }
