@@ -149,6 +149,7 @@ type shop struct {
 	lastResync  time.Time
 	resyncs     atomic.Int64
 	told        atomic.Int64 // history-lost errors the router passed on
+	unrolled    atomic.Int64 // resyncs mongod itself would not have refused
 	scanned     atomic.Int64
 	// index is what the consumer keeps: the orders it believes exist. Built
 	// by each resync and kept by every insert and delete after it.
@@ -1684,6 +1685,10 @@ func (s *shop) report(elapsed time.Duration) {
 	if s.resyncEvery > 0 {
 		fmt.Printf("resync: fell behind the oplog %d time(s), told so %d time(s), scans read %s orders\n",
 			s.resyncs.Load(), s.told.Load(), commas(int(s.scanned.Load())))
+	}
+	if n := s.unrolled.Load(); n > 0 {
+		fmt.Printf("resync: NOT TESTED %d time(s): the fast tier's oplog has never rolled over, so mongod "+
+			"itself opens a stream from before it and there was nothing to be told\n", n)
 	}
 	// Printed for the same reason. A shared run whose consumer saw nothing of
 	// the other application proves nothing about sharing a stream.

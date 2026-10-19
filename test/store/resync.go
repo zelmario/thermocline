@@ -33,6 +33,16 @@ func (s *shop) resync(ctx context.Context) (bson.Timestamp, bool) {
 	switch {
 	case err == nil:
 		_ = cur.Close(context.WithoutCancel(ctx))
+		// Unless mongod opens it too. A replica set whose oplog has never
+		// rolled over has lost nothing, and mongod starts a stream from before
+		// its first entry: measured on a staging pair built the same day, 27
+		// of 27 resyncs read as this violation with the router answering
+		// exactly what mongod answered. That run tested nothing here, and says
+		// so below rather than reporting the router.
+		if s.mongodOpensFromLongAgo(ctx) {
+			s.unrolled.Add(1)
+			break
+		}
 		s.violation("a consumer behind the oplog opened its stream anyway, and was never told what it missed")
 	case isHistoryLost(err):
 		s.told.Add(1)
@@ -156,6 +166,26 @@ func (s *shop) finished(ctx context.Context) {
 		time.Sleep(2 * time.Second)
 	}
 	fmt.Println("  the other applications never said they had finished; judging the index anyway")
+}
+
+// mongodOpensFromLongAgo asks the fast tier itself, without the router, the
+// question resync asks: does a stream open from a time no oplog holds.
+func (s *shop) mongodOpensFromLongAgo(ctx context.Context) bool {
+	if s.truthHot == "" {
+		return false
+	}
+	c, err := mongo.Connect(options.Client().ApplyURI(s.truthHot))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = c.Disconnect(context.WithoutCancel(ctx)) }()
+	cur, err := c.Database(s.db.Name()).Collection("orders").Watch(ctx, mongo.Pipeline{},
+		options.ChangeStream().SetStartAtOperationTime(&longAgo))
+	if err != nil {
+		return false
+	}
+	_ = cur.Close(context.WithoutCancel(ctx))
+	return true
 }
 
 // checkIndex is the consumer's promise, judged against the tiers: what it keeps
