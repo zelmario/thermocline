@@ -839,13 +839,7 @@ func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mo
 		// read as an eviction: the archive kept it, and the router served it
 		// back. Taken back by this step's name, which touches only what this
 		// step raised.
-		wctx, cancel := context.WithTimeout(context.WithoutCancel(step), stepGrace)
-		defer cancel()
-		if werr := e.withdraw(wctx, present); werr != nil {
-			e.log.Warn("could not withdraw announcements for documents not evicted",
-				"ns", ns, "count", len(present), "err", werr,
-				"effect", "an application delete of one of these within the hour may be read as an eviction")
-		}
+		e.withdrawUndeleted(step, ns, present)
 		return nil, err
 	}
 	// And holds asked again, after announcing, for the other half of a
@@ -857,7 +851,59 @@ func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mo
 	// tier's copy, this could delete it, and mongod would then accept the
 	// insert and the feeder mirror it over the archived document. See
 	// router.archivedIDClashesNow.
-	return e.dropHeldAfterAnnouncing(step, ns, present)
+	kept, err := e.dropHeldAfterAnnouncing(step, ns, present)
+	if err != nil {
+		// Announced and then stopped before anything was deleted, the same as
+		// an announce that failed above, and taken back the same way.
+		e.withdrawUndeleted(step, ns, present)
+		return nil, err
+	}
+	return kept, nil
+}
+
+// stillHeld returns the candidates whose _id the fast tier still holds. Only
+// for after a delete of them has finished, when that is exactly the set it did
+// not remove. A read that fails returns none, which leaves announcements
+// standing rather than taking one back that a delete answers for.
+func (e *Evictor) stillHeld(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate) []candidate {
+	ids := make([]bson.RawValue, len(docs))
+	for i, d := range docs {
+		ids[i] = d.id
+	}
+	cur, err := hotColl.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}},
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	have := map[string]bool{}
+	for cur.Next(ctx) {
+		if v, lerr := cur.Current.LookupErr("_id"); lerr == nil {
+			have[meta.DocID(ns, v)] = true
+		}
+	}
+	if cur.Err() != nil {
+		return nil
+	}
+	var left []candidate
+	for _, d := range docs {
+		if have[d.docID] {
+			left = append(left, d)
+		}
+	}
+	return left
+}
+
+// withdrawUndeleted takes back the announcements of a step that stops before
+// deleting docs, on a context of its own: the step's may be what ran out.
+func (e *Evictor) withdrawUndeleted(step context.Context, ns string, docs []candidate) {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(step), stepGrace)
+	defer cancel()
+	if werr := e.withdraw(wctx, docs); werr != nil {
+		e.log.Warn("could not withdraw announcements for documents not evicted",
+			"ns", ns, "count", len(docs), "err", werr,
+			"effect", "an application delete of one of these within the hour may be read as an eviction")
+	}
 }
 
 // removeChunk is the second half: delete what prepareChunk announced, and end
@@ -898,19 +944,33 @@ func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Col
 	e.log.Debug("evicted", "ns", ns, "deleted", res.DeletedCount)
 	if int(res.DeletedCount) < len(present) {
 		// Still possible, in the moment between the check above and this
-		// delete, and nothing here can say which id it was. The announcements
-		// stay where they are.
+		// delete: a document the application changed, which the delete left
+		// alone, or one something else removed first.
 		//
-		// Leaving one standing costs a later application delete of that same
-		// document being read as an eviction, so the archive keeps a record it
-		// should have marked deleted, and the notice expires within the hour.
-		// Taking one back wrongly costs a document evicted from the fast tier
-		// and tombstoned in the archive, which is gone from both. Of the two,
-		// keep the data.
+		// The changed one keeps its announcement and no delete of ours is
+		// coming for it, so the application's next delete of it within the
+		// hour was read as an eviction and the archive kept the older version
+		// live. That used to be left standing because nothing here could say
+		// which document it was, and taking back the wrong announcement loses a
+		// document from both tiers. Both have an answer now. The delete has
+		// finished, so what the fast tier still holds is exactly what it did
+		// not take; and the withdrawal carries this step's name, so it takes
+		// back only this step's announcement and never another eviction's.
+		//
+		// One something else removed stays announced, and its delete will be
+		// read as this eviction: the archive keeps it. That is the cost the
+		// moment between the check and the delete has always had.
+		left := e.stillHeld(ctx, ns, hotColl, present)
+		if len(left) > 0 {
+			if werr := e.withdraw(ctx, left); werr != nil {
+				e.log.Warn("could not withdraw announcements for documents not evicted",
+					"ns", ns, "count", len(left), "err", werr,
+					"effect", "an application delete of one of these within the hour may be read as an eviction")
+			}
+		}
 		e.log.Info("fewer documents to evict than were there a moment ago",
-			"ns", ns, "announced", len(present), "deleted", res.DeletedCount,
-			"note", "something else removed them first; the announcements are left standing, "+
-				"because taking back the wrong one loses a document")
+			"ns", ns, "announced", len(present), "deleted", res.DeletedCount, "changed_since", len(left),
+			"note", "a document changed since it was compared stays on the fast tier and its announcement is taken back")
 	}
 
 	// The hold is over once the document has left the fast tier, and the record

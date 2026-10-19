@@ -1259,6 +1259,30 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   because the request had already reached mongod. They are now written off
   past cancellation, and kept and retried when that fails: 0 of 30.
 
+  On 2026-10-19 the same channel turned out to count by number where it had
+  to count by act. A write-off retried after its reply was lost subtracted
+  again, and so did the feeder's own reckoning of what was left (125dd77).
+  An announcement retried, or one the archive half took before a step's
+  deadline, could not be taken back exactly, so a failed step left it
+  standing (8970198). Each announcement now carries the step that made it
+  and each spend the delete it answers for, so a repeat is a no-op and a
+  withdrawal takes back only its own. That also let the evictor take back
+  the announcement of a document the application changed between the
+  compare and the delete, which it had left standing because it could not
+  tell which one it was. Measured on staging, 100,000 documents swept while
+  four writers updated them, then every document left on the fast tier
+  deleted by the application:
+
+      d4581ed   1,359 left, 94 notices standing, 94 deleted documents live in the archive
+      this      1,306 left,  0 notices standing,  0
+
+  The evictor also rode out the archive cut off for 32 and for 60 seconds
+  mid-sweep with no error and no notice left over: the checks before an
+  announcement wait for the archive, and the cut never caught an announce
+  in flight. That window is milliseconds a step, so the tests against the
+  archive are the evidence for it, each failing on a build without its
+  guard.
+
   What it cannot cover is a process that dies without being asked: SIGKILL,
   the OOM killer, a host lost. That leaves at most two steps of announcements,
   the one deleting and the one being announced, a thousand documents at the
