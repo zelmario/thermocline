@@ -70,7 +70,13 @@ stopDaemons() {
 
 # startRouter refuses to continue if the router is not answering. A suite that
 # reports failures when its own fixture never came up is worse than no suite.
+#
+# It stops the one it started last, first. On 2026-10-16 a section called it
+# with the previous router still running: the new one failed to bind, the old
+# one answered the ping, and the section's checks were made against a router
+# that had been up through every fixture change before them.
 startRouter() {
+  if [ -n "$RP" ]; then kill $RP 2>/dev/null; wait $RP 2>/dev/null; fi
   cline router --config $CFG --log-file $LOGDIR/keys_r.log & RP=$!
   for _ in $(seq 1 30); do
     if mongosh --port $PORT -u dba -p secret --authenticationDatabase admin \
@@ -1299,15 +1305,23 @@ C "db.getSiblingDB(process.env.TC_DB).$FNS2.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$FNS2.createIndex({code:1},{name:'code_u',unique:true})" >/dev/null
 cline feeder --config $CFG --log-file $LOGDIR/refused_f3.log & FRP3=$!
 sleep 3
-H "const c=db.getSiblingDB(process.env.TC_DB).$FNS2;
-   c.insertOne({_id:1,code:'A',what:'the first'});
-   c.insertOne({_id:2,code:'A',what:'the one to delete'});" >/dev/null
+FIX=$(H "const c=db.getSiblingDB(process.env.TC_DB).$FNS2;
+   try { c.insertOne({_id:1,code:'A',what:'the first'});
+         c.insertOne({_id:2,code:'A',what:'the one to delete'}); print('ok') }
+   catch(e) { print('the fast tier refused the fixture: '+e.message.substring(0,120)) }")
+[ "$FIX" = "ok" ] || echo "        $FIX"
 for _ in $(seq 1 40); do
   [ "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")" = "1" ] && break
   sleep 1
 done
 chk "a duplicate the archive will not take, recorded"  "1" \
     "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")"
+# It failed once in a gate (2026-10-16) with nothing recorded and a count of 1
+# afterwards, and nothing kept could say which tier was short. Print both.
+if [ "$(C "print(db.getSiblingDB(process.env.TC_META).unmirrored.countDocuments({ns:process.env.TC_DB+'.$FNS2'}))")" != "1" ]; then
+  echo "        fast tier: $(H "const c=db.getSiblingDB(process.env.TC_DB).$FNS2; print(JSON.stringify({docs:c.find().toArray(), idx:c.getIndexes().map(i=>i.name)}))")"
+  echo "        archive:   $(C "const c=db.getSiblingDB(process.env.TC_DB).$FNS2; print(JSON.stringify({docs:c.find().toArray(), idx:c.getIndexes().map(i=>i.name)}))")"
+fi
 startRouter
 chk "and reads of it are refused"                      "refused" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).$FNS2.countDocuments({}))}catch(e){print(/not a superset|does not hold one document/.test(e.message)?'refused':'other: '+e.message.substring(0,50))}")"

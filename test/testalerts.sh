@@ -220,6 +220,16 @@ import json,sys
 for g in json.load(sys.stdin)["data"]["groups"]:
   for r in g["rules"]:
     if r["name"] == "ThermoclineClusterTimeBehind": print(r.get("state"))' 2>/dev/null)"
+# It stayed inactive once in a gate (2026-10-16) with the router saying the
+# position had stood still for 14s, which the gauge code turns into 14 and a
+# firing rule. The gauge reading 0, the series being absent and a scrape
+# failing all leave the rule inactive, so on a failure say which it was.
+if ! PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"'; then
+  echo "      gauge now: $(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null | grep '^thermocline_mirroring_cluster_time_behind_seconds')"
+  echo "      last 5m:   $(PQ 'query?query=thermocline_mirroring_cluster_time_behind_seconds%5B5m%5D' | head -c 1500)"
+  echo "      scrapes:   $(PQ 'query?query=up%5B5m%5D' | grep -o '"value[s]*":.*' | head -c 600)"
+  echo "      durations: $(PQ 'query?query=max_over_time(scrape_duration_seconds%5B5m%5D)' | head -c 400)"
+fi
 
 # Dropped on both tiers, so nothing downstream inherits this suite's fixture the
 # way this suite used to inherit everyone else's.
