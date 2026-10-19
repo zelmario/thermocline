@@ -425,7 +425,9 @@ func TestHeldAfterAnnouncingTakesTheAnnouncementBack(t *testing.T) {
 
 	id := bson.NewObjectID()
 	raw := rawIDValue(t, id)
-	c := candidate{id: raw, docID: meta.DocID(ns, raw)}
+	// Named as e.announce names it, since a withdrawal takes back only the
+	// announcements its own step made.
+	c := candidate{id: raw, docID: meta.DocID(ns, raw), announcedAs: "test:0"}
 	if _, err := residency.InsertOne(ctx, bson.D{
 		{Key: "_id", Value: c.docID}, {Key: "ns", Value: ns}, {Key: "doc", Value: id},
 		{Key: "hotUntil", Value: time.Now().UTC().Add(2 * time.Minute)},
