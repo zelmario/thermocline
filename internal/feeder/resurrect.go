@@ -2,6 +2,7 @@ package feeder
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -157,7 +158,12 @@ func (f *Feeder) removeResurrected(ctx context.Context, op pendingOp) bool {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resurrectGrace)
 	defer cancel()
 	docID := meta.DocID(op.ns, op.id)
-	if err := meta.AnnounceEviction(ctx, f.cold, []string{docID}); err != nil {
+	// Named by the echo it repairs, the same on every attempt, so an announce
+	// that landed and lost its reply is not counted again when the next flush
+	// tries again. Counted twice, the spare read the application's next delete
+	// of this _id as an eviction.
+	by := fmt.Sprintf("resurrect:%d.%d", op.at.T, op.at.I)
+	if err := meta.AnnounceEviction(ctx, f.cold, []string{docID}, by); err != nil {
 		f.log.Warn("could not announce the removal of a document a copy-up put back",
 			"ns", op.ns, "err", err, "effect", "tried again on the next flush")
 		return false
@@ -179,7 +185,7 @@ func (f *Feeder) removeResurrected(ctx context.Context, op pendingOp) bool {
 		// feeder unannounced and reads as the application's, which tombstones
 		// the archive's copy, and that copy is already a tombstone: it is why
 		// this document is being removed at all.
-		if werr := meta.WithdrawEviction(ctx, f.cold, []string{docID}); werr != nil {
+		if werr := meta.WithdrawEviction(ctx, f.cold, []string{docID}, by); werr != nil {
 			f.log.Warn("could not withdraw an eviction announcement nothing will answer",
 				"ns", op.ns, "err", werr,
 				"effect", "an application delete of this _id within the hour may be read as an eviction")
@@ -193,7 +199,7 @@ func (f *Feeder) removeResurrected(ctx context.Context, op pendingOp) bool {
 		// reach the stream, so the announcement is taken back: left, it would
 		// make the application's next delete of this _id look like an eviction
 		// and the archive would keep what the application removed.
-		if werr := meta.WithdrawEviction(ctx, f.cold, []string{docID}); werr != nil {
+		if werr := meta.WithdrawEviction(ctx, f.cold, []string{docID}, by); werr != nil {
 			f.log.Warn("could not withdraw an eviction announcement nothing will answer",
 				"ns", op.ns, "err", werr,
 				"effect", "an application delete of this _id within the hour may be read as an eviction")

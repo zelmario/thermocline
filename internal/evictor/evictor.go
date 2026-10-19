@@ -831,6 +831,21 @@ func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mo
 		return nil, nil
 	}
 	if err := e.announce(step, present); err != nil {
+		// Some of it may have landed: the announcement is several writes in
+		// parallel under the step's deadline, and an archive that stalls past
+		// it takes some and not others. The sweep stops here and nothing is
+		// deleted, so whatever landed stood for an hour over documents still on
+		// the fast tier, and the application's next delete of one of them was
+		// read as an eviction: the archive kept it, and the router served it
+		// back. Taken back by this step's name, which touches only what this
+		// step raised.
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(step), stepGrace)
+		defer cancel()
+		if werr := e.withdraw(wctx, present); werr != nil {
+			e.log.Warn("could not withdraw announcements for documents not evicted",
+				"ns", ns, "count", len(present), "err", werr,
+				"effect", "an application delete of one of these within the hour may be read as an eviction")
+		}
 		return nil, err
 	}
 	// And holds asked again, after announcing, for the other half of a
@@ -1062,20 +1077,34 @@ func (e *Evictor) nsOf(docs []candidate) string {
 	return ns
 }
 
+// announce names the step on every candidate before announcing them, so the
+// step can take back what it raised whatever happens to the write.
 func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
+	by := "evict:" + bson.NewObjectID().Hex()
 	docIDs := make([]string, len(docs))
-	for i, d := range docs {
-		docIDs[i] = d.docID
+	for i := range docs {
+		docs[i].announcedAs = by
+		docIDs[i] = docs[i].docID
 	}
-	return meta.AnnounceEviction(ctx, e.cold, docIDs)
+	return meta.AnnounceEviction(ctx, e.cold, docIDs, by)
 }
 
+// withdraw takes back the announcements docs were evicted under, one write per
+// step that announced them.
 func (e *Evictor) withdraw(ctx context.Context, docs []candidate) error {
-	docIDs := make([]string, len(docs))
-	for i, d := range docs {
-		docIDs[i] = d.docID
+	bySteps := map[string][]string{}
+	for _, d := range docs {
+		bySteps[d.announcedAs] = append(bySteps[d.announcedAs], d.docID)
 	}
-	return meta.WithdrawEviction(ctx, e.cold, docIDs)
+	for by, docIDs := range bySteps {
+		if by == "" {
+			continue
+		}
+		if err := meta.WithdrawEviction(ctx, e.cold, docIDs, by); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ErrUnhealthy is returned when the cluster did not become fit for eviction
@@ -1378,15 +1407,15 @@ func (e *Evictor) dropHeldAfterAnnouncing(ctx context.Context, ns string, presen
 		return present, nil
 	}
 	keep := present[:0:0]
-	var back []string
+	var back []candidate
 	for _, d := range present {
 		if held[d.docID] {
-			back = append(back, d.docID)
+			back = append(back, d)
 			continue
 		}
 		keep = append(keep, d)
 	}
-	if err := meta.WithdrawEviction(ctx, e.cold, back); err != nil {
+	if err := e.withdraw(ctx, back); err != nil {
 		return nil, fmt.Errorf("withdraw announcements for documents held since: %w", err)
 	}
 	e.log.Info("not evicting documents a hold was placed on while the batch was announced",

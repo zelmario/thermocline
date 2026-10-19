@@ -776,6 +776,10 @@ type EvictionNotice struct {
 	// entries share one. wallTime would have done as well from 6.0 and this
 	// supports 4.2.
 	Spent []bson.Timestamp `bson:"spent,omitempty"`
+	// By names the acts that announced this notice, newest last and capped,
+	// so one act is counted once however often it is sent and can take back
+	// exactly what it raised. See AnnounceEviction.
+	By []string `bson:"by,omitempty"`
 }
 
 // SpentOn reports whether this notice has already been spent on the delete at
@@ -830,15 +834,28 @@ func (n EvictionNotice) Left() int {
 // collections while a client read them: 66 batches of "deletes not announced by
 // the evictor", and an archive left holding 200 tombstoned trips and 45
 // tombstoned sales that nothing had ever deleted.
-func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+//
+// by names the act announcing, and one act counts once however often it is
+// sent. The announcement is several bulk writes in parallel under a deadline,
+// so a stalled archive can take some of them and not others, and the caller
+// is told only that it failed. Sending it again, or taking back exactly what
+// landed with WithdrawEviction, both need to know which notices this act
+// already raised. Without that, a failed announce either left notices standing
+// for documents that stayed on the fast tier, which reads the application's
+// next delete of one of them as an eviction and keeps it alive in the archive,
+// or was taken back blind and took another eviction's announcement with it.
+func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string, by string) error {
 	if len(docIDs) == 0 {
 		return nil
+	}
+	if by == "" {
+		return errors.New("announce eviction: no name for the act announcing it")
 	}
 	models := make([]mongo.WriteModel, len(docIDs))
 	for i, id := range docIDs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(EvictionAnnouncement()).
+			SetUpdate(EvictionAnnouncement(by)).
 			SetUpsert(true)
 	}
 	if _, err := ParallelBulkWrite(ctx, cold.Database(DB).Collection(Evicting), models); err != nil {
@@ -856,18 +873,27 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 // announcement is left standing.
 //
 // Floored at zero for the reason SpendEvictionNotices gives.
-func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string) error {
+//
+// And only the announcements by made, so a withdrawal for a document whose
+// announcement never landed takes nothing, rather than one that belongs to
+// another eviction still waiting for its delete.
+func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string, by string) error {
 	if len(docIDs) == 0 {
 		return nil
 	}
 	_, err := cold.Database(DB).Collection(Evicting).UpdateMany(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
+		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}, {Key: "by", Value: by}},
 		mongo.Pipeline{{{Key: "$set", Value: bson.D{
 			{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
 				0,
 				bson.D{{Key: "$add", Value: bson.A{
 					bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 1}}}, -1,
 				}}},
+			}}}},
+			{Key: "by", Value: bson.D{{Key: "$filter", Value: bson.D{
+				{Key: "input", Value: "$by"},
+				{Key: "as", Value: "b"},
+				{Key: "cond", Value: bson.D{{Key: "$ne", Value: bson.A{"$$b", by}}}},
 			}}}},
 		}}}})
 	if err != nil {
@@ -904,8 +930,15 @@ func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string) 
 // copy and the document is lost from both tiers, with nothing said anywhere.
 // $currentDate takes the reading where it is judged, so there is nothing left
 // to correct for and nothing to measure.
-func EvictionAnnouncement() mongo.Pipeline {
+//
+// Counted once per act: by is recorded on the notice, and a notice that already
+// records it is left as it is. See AnnounceEviction.
+func EvictionAnnouncement(by string) mongo.Pipeline {
+	byNow := bson.D{{Key: "$ifNull", Value: bson.A{"$by", bson.A{}}}}
 	return mongo.Pipeline{
+		{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: bson.D{{Key: "$not", Value: bson.A{
+			bson.D{{Key: "$in", Value: bson.A{by, byNow}}},
+		}}}}}}},
 		{{Key: "$set", Value: bson.D{
 			// At least one, not simply one more.
 			//
@@ -918,14 +951,27 @@ func EvictionAnnouncement() mongo.Pipeline {
 			// eviction is pending, so saying that heals the row at the moment
 			// it matters, and says the same thing as +1 for every row that was
 			// never damaged.
-			{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
-				1,
-				bson.D{{Key: "$add", Value: bson.A{
-					bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 1,
+			{Key: "pending", Value: bson.D{{Key: "$cond", Value: bson.A{
+				"$_fresh",
+				bson.D{{Key: "$max", Value: bson.A{
+					1,
+					bson.D{{Key: "$add", Value: bson.A{
+						bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 1,
+					}}},
 				}}},
+				"$pending",
+			}}}},
+			{Key: "by", Value: bson.D{{Key: "$cond", Value: bson.A{
+				"$_fresh",
+				bson.D{{Key: "$slice", Value: bson.A{
+					bson.D{{Key: "$concatArrays", Value: bson.A{byNow, bson.A{by}}}},
+					-MaxSpentRecorded,
+				}}},
+				"$by",
 			}}}},
 			{Key: "at", Value: "$$NOW"},
 		}}},
+		{{Key: "$unset", Value: "_fresh"}},
 	}
 }
 

@@ -17,6 +17,10 @@ type candidate struct {
 	// doc is the fast tier's copy, read at eviction time. See evict: it is
 	// what the archive's copy has to equal, and what the delete insists on.
 	doc bson.Raw
+	// announcedAs names the step that announced this candidate's eviction, so
+	// that step can take back exactly the announcements it made. See
+	// meta.AnnounceEviction.
+	announcedAs string
 }
 
 // candidateFilter builds the query that selects removable documents.

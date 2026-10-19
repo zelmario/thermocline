@@ -2,6 +2,7 @@ package meta
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -162,7 +163,7 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+	if err := AnnounceEviction(ctx, c, []string{noticeID}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	have, err := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
@@ -193,7 +194,7 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 2; i++ {
-		if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}, fmt.Sprintf("test:%d", i)); err != nil {
 			t.Fatalf("announce: %v", err)
 		}
 	}
@@ -224,7 +225,7 @@ func TestEvictionNoticeSpentTwiceForOneDelete(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 2; i++ {
-		if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}, fmt.Sprintf("test:%d", i)); err != nil {
 			t.Fatalf("announce: %v", err)
 		}
 	}
@@ -251,7 +252,7 @@ func TestOwedPositionAlreadySpentIsNotSubtractedAgain(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 2; i++ {
-		if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}, fmt.Sprintf("test:%d", i)); err != nil {
 			t.Fatalf("announce: %v", err)
 		}
 	}
@@ -266,6 +267,58 @@ func TestOwedPositionAlreadySpentIsNotSubtractedAgain(t *testing.T) {
 	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID}, owed)
 	if have[noticeID] != 1 {
 		t.Errorf("the owed spend landed and the feeder sees %d left, want 1", have[noticeID])
+	}
+}
+
+// The announcement is several writes in parallel under a deadline, and an
+// archive that stalls past it takes some of them. Sent again, the ones that
+// landed must not count twice: a spare reads the application's next delete of
+// that document as an eviction, and the archive keeps what it deleted.
+func TestOneActAnnouncesOnce(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}, "step:a"); err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	}
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
+	if have[noticeID] != 1 {
+		t.Errorf("one act announced twice counts %d, want 1", have[noticeID])
+	}
+}
+
+// And taking it back takes only what the act raised. A step whose announce
+// failed does not know which notices landed, and withdrawing blind took the
+// announcement of another eviction still waiting for its delete, which the
+// feeder then read as the application's and tombstoned.
+func TestAWithdrawalTakesOnlyItsOwn(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := AnnounceEviction(ctx, c, []string{noticeID}, "step:earlier"); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	// The failed step's announce never reached this document.
+	if err := WithdrawEviction(ctx, c, []string{noticeID}, "step:failed"); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
+	if have[noticeID] != 1 {
+		t.Fatalf("a withdrawal by a step that announced nothing here left %d, want 1", have[noticeID])
+	}
+	if err := AnnounceEviction(ctx, c, []string{noticeID}, "step:failed"); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if err := WithdrawEviction(ctx, c, []string{noticeID}, "step:failed"); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
+	if have[noticeID] != 1 {
+		t.Errorf("withdrawing its own left %d, want the earlier eviction's 1", have[noticeID])
 	}
 }
 
@@ -460,6 +513,20 @@ func setStage(t *testing.T, pipe mongo.Pipeline) bson.D {
 	return nil
 }
 
+// stageSetting returns the $set stage of pipe that sets name.
+func stageSetting(t *testing.T, pipe mongo.Pipeline, name string) bson.D {
+	t.Helper()
+	for _, stage := range pipe {
+		for _, e := range stage {
+			if d, ok := e.Value.(bson.D); ok && e.Key == "$set" && field(d, name) != nil {
+				return d
+			}
+		}
+	}
+	t.Fatalf("no $set stage in %v sets %s", pipe, name)
+	return nil
+}
+
 func field(d bson.D, name string) interface{} {
 	for _, e := range d {
 		if e.Key == name {
@@ -490,7 +557,7 @@ func TestInstantsOthersJudgeComeFromTheArchive(t *testing.T) {
 	// the property this test is about, so it accepts either shape rather than
 	// the spelling one of them happened to use.
 	t.Run("an eviction announcement", func(t *testing.T) {
-		set := setStage(t, EvictionAnnouncement())
+		set := stageSetting(t, EvictionAnnouncement("test:0"), "pending")
 		if got := field(set, "at"); got != "$$NOW" {
 			t.Fatalf("at is %#v, want $$NOW: it is expired by the archive's TTL monitor, "+
 				"and an early expiry loses documents from both tiers", got)
@@ -583,10 +650,20 @@ func TestInstantsOthersJudgeComeFromTheArchive(t *testing.T) {
 // second is what heals a deployment whose counters are already negative, which
 // flooring the spend cannot do on its own.
 func TestTheEvictionCounterCannotStrandADocument(t *testing.T) {
-	set := setStage(t, EvictionAnnouncement())
-	pending, ok := field(set, "pending").(bson.D)
+	set := stageSetting(t, EvictionAnnouncement("test:0"), "pending")
+	// The raise is the branch taken by an act not already counted; the other
+	// leaves the count alone. See TestOneActAnnouncesOnce.
+	cond, ok := field(set, "pending").(bson.D)
 	if !ok {
 		t.Fatalf("pending is %#v, want an expression", field(set, "pending"))
+	}
+	branches, ok := field(cond, "$cond").(bson.A)
+	if !ok || len(branches) != 3 {
+		t.Fatalf("pending is %#v, want $cond on whether this act is new", cond)
+	}
+	pending, ok := branches[1].(bson.D)
+	if !ok {
+		t.Fatalf("a new act sets pending to %#v, want an expression", branches[1])
 	}
 	arms, ok := field(pending, "$max").(bson.A)
 	if !ok || len(arms) != 2 {

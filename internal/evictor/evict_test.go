@@ -433,7 +433,7 @@ func TestHeldAfterAnnouncingTakesTheAnnouncementBack(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("residency: %v", err)
 	}
-	if err := meta.AnnounceEviction(ctx, cl, []string{c.docID}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cl, []string{c.docID}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 

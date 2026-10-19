@@ -35,7 +35,7 @@ func TestCopyUpDoesNotSkipADocumentBeingEvicted(t *testing.T) {
 	if _, err := coll.InsertOne(ctx, bson.D{{Key: "_id", Value: 1}, {Key: "v", Value: 1}}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := meta.AnnounceEviction(ctx, cl, []string{meta.DocID(ns, id)}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cl, []string{meta.DocID(ns, id)}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	promote.HeldForTest = func(string, []bson.RawValue, []bool) {
@@ -71,13 +71,13 @@ func TestCopyUpKeepsADocumentWhoseEvictionWasWithdrawn(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 	docID := meta.DocID(ns, id)
-	if err := meta.AnnounceEviction(ctx, cl, []string{docID}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cl, []string{docID}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	promote.HeldForTest = func(string, []bson.RawValue, []bool) {
 		go func() {
 			time.Sleep(100 * time.Millisecond)
-			_ = meta.WithdrawEviction(context.Background(), cl, []string{docID})
+			_ = meta.WithdrawEviction(context.Background(), cl, []string{docID}, "test:0")
 		}()
 	}
 	t.Cleanup(func() { promote.HeldForTest = nil })
@@ -108,7 +108,7 @@ func TestCopyUpDoesNotWaitOnAnOldAnnouncement(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 	docID := meta.DocID(ns, id)
-	if err := meta.AnnounceEviction(ctx, cl, []string{docID}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cl, []string{docID}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	if _, err := cl.Database(meta.DB).Collection(meta.Evicting).UpdateOne(ctx,
@@ -146,7 +146,7 @@ func TestAMatchOldEnoughToEvictIsHeldBeforeAWriteRelies(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 	id := rawID(t, 1)
-	if err := meta.AnnounceEviction(ctx, cl, []string{meta.DocID(ns, id)}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cl, []string{meta.DocID(ns, id)}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	promote.HeldForTest = func(string, []bson.RawValue, []bool) {

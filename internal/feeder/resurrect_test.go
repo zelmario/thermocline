@@ -134,7 +134,7 @@ func TestStoppingFeederSettlesOwedNotices(t *testing.T) {
 	})
 	idv := bson.Raw(bsoncore(t, bson.NewObjectID())).Lookup("_id")
 	docID := meta.DocID(ns, idv)
-	if err := meta.AnnounceEviction(ctx, cold, []string{docID}); err != nil {
+	if err := meta.AnnounceEviction(ctx, cold, []string{docID}, "test:0"); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 
