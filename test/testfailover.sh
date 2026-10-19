@@ -442,10 +442,16 @@ stopFeeder
 H "db.getSiblingDB('shop').$NPNS.drop()" >/dev/null
 C "db.getSiblingDB('shop').$NPNS.drop()" >/dev/null
 docker exec -d $NODE cline feeder --config $BASE --log-file /var/log/cline/fo_f.log
+FEEDING=false
 for _ in $(seq 1 30); do
-  [ "$(C 'const p=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(!!p && Date.now()-p.savedAt.getTime() < 3000)')" = "true" ] && break
+  [ "$(C 'const p=db.getSiblingDB("_thermocline").positions.findOne({_id:"test"}); print(!!p && Date.now()-p.savedAt.getTime() < 3000)')" = "true" ] && { FEEDING=true; break; }
   sleep 1
 done
+# Said here rather than left to the checks below. On 2026-10-19 the feeder
+# refused to start, its checkpoint older than an oplog shrunk for another test,
+# and this section reported two refused reads instead, which is the router
+# being right about a feeder that was never running.
+$FEEDING || echo "      the feeder never published: $(docker exec $NODE sh -c "grep 'level=ERROR' /var/log/cline/fo_f.log | tail -1 | cut -c1-200")"
 startRouter $BASE
 RT "db.getSiblingDB('shop').$NPNS.insertOne({_id:1})" >/dev/null
 for _ in $(seq 1 30); do [ "$(C "print(db.getSiblingDB('shop').$NPNS.countDocuments({}))")" = "1" ] && break; sleep 0.5; done
