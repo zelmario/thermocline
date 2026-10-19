@@ -1115,7 +1115,13 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 				{{Key: "$unset", Value: "_fresh"}},
 			}))
 	}
-	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+	// In parallel parts, as the announcement is. The feeder spends a whole
+	// checkpoint's worth at once and mirrors nothing meanwhile, and one
+	// connection applies its updates one at a time: measured after a sweep of
+	// 200,000, 61,905 spent in 8.5 seconds, and mirroring stood still for all
+	// of it. Each update names its own notice and is safe to send again, so
+	// the parts need no order between them.
+	if _, err := ParallelBulkWrite(ctx, coll, models); err != nil {
 		return fmt.Errorf("spend eviction notices: %w", err)
 	}
 	// Spent, not removed. It used to be deleted here, which left the router
