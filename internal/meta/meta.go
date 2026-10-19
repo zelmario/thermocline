@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -940,14 +941,21 @@ func EvictionAnnouncement() mongo.Pipeline {
 // documents it then left on the fast tier, and each stood for up to an hour,
 // ready to make the application's next delete of that document read as an
 // eviction.
-func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string) (map[string]int, error) {
+//
+// owed are positions the caller has spent and not yet seen land, and each one
+// the notice does not already record is taken off what is left. One it does
+// record is not: that spend landed and only its reply was lost, so the count
+// already reflects it, and taking it off again left a later eviction of the
+// same document with no announcement to claim. It was tombstoned in the
+// archive after leaving the fast tier.
+func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string, owed map[string][]bson.Timestamp) (map[string]int, error) {
 	if len(docIDs) == 0 {
 		return nil, nil
 	}
 	coll := cold.Database(DB).Collection(Evicting)
 	cur, err := coll.Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}}))
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}}))
 	if err != nil {
 		return nil, fmt.Errorf("read eviction notices: %w", err)
 	}
@@ -964,7 +972,13 @@ func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []strin
 		// feeder must not claim it: doing so would treat an application's own
 		// delete as an eviction and leave the archive holding a live copy of a
 		// document that was removed.
-		if left := rec.Left(); left > 0 {
+		left := rec.Left()
+		for _, p := range owed[rec.ID] {
+			if !slices.Contains(rec.Spent, p) {
+				left--
+			}
+		}
+		if left > 0 {
 			have[rec.ID] = left
 		}
 	}
@@ -1017,25 +1031,42 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 		// pending at -1; then one feeder, restore, evict again, and all 40 were
 		// tombstoned. The same sequence with one feeder throughout left pending
 		// at 0 and lost none.
+		//
+		// And only for the positions it does not already record, which is what
+		// makes sending it twice the same as sending it once. A spend whose
+		// reply is lost is sent again at the next checkpoint, and the first one
+		// may have landed: subtracting n regardless took a later eviction's
+		// announcement. The position names one delete exactly, so a repeat is
+		// recognisable; one older than the last MaxSpentRecorded is not, and an
+		// hour holding that many evictions of one document is not a retry.
+		fresh := bson.D{{Key: "$filter", Value: bson.D{
+			{Key: "input", Value: at},
+			{Key: "as", Value: "p"},
+			{Key: "cond", Value: bson.D{{Key: "$not", Value: bson.A{
+				bson.D{{Key: "$in", Value: bson.A{"$$p", bson.D{{Key: "$ifNull", Value: bson.A{"$spent", bson.A{}}}}}}},
+			}}}},
+		}}}
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
 			SetUpdate(mongo.Pipeline{
+				{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: fresh}}}},
 				{{Key: "$set", Value: bson.D{
 					{Key: "pending", Value: bson.D{{Key: "$max", Value: bson.A{
 						0,
 						bson.D{{Key: "$subtract", Value: bson.A{
 							bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}},
-							n,
+							bson.D{{Key: "$size", Value: "$_fresh"}},
 						}}},
 					}}}},
 					{Key: "spent", Value: bson.D{{Key: "$slice", Value: bson.A{
 						bson.D{{Key: "$concatArrays", Value: bson.A{
 							bson.D{{Key: "$ifNull", Value: bson.A{"$spent", bson.A{}}}},
-							at,
+							"$_fresh",
 						}}},
 						-MaxSpentRecorded,
 					}}}},
 				}}},
+				{{Key: "$unset", Value: "_fresh"}},
 			}))
 	}
 	if _, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {

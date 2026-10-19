@@ -450,7 +450,7 @@ func TestHeldAfterAnnouncingTakesTheAnnouncementBack(t *testing.T) {
 	if len(left) != 0 {
 		t.Fatalf("a held document was kept in the batch: %d left", len(left))
 	}
-	have, err := meta.ReadEvictionNotices(ctx, cl, []string{c.docID})
+	have, err := meta.ReadEvictionNotices(ctx, cl, []string{c.docID}, nil)
 	if err != nil {
 		t.Fatalf("read notices: %v", err)
 	}

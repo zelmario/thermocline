@@ -165,7 +165,7 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
-	have, err := ReadEvictionNotices(ctx, c, []string{noticeID})
+	have, err := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestEvictionNoticeIsSpentOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
-	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID})
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
 	if have[noticeID] != 0 {
 		t.Errorf("the announcement survived being spent, so the next delete of this "+
 			"document would be read as an eviction: %d left", have[noticeID])
@@ -197,7 +197,7 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 			t.Fatalf("announce: %v", err)
 		}
 	}
-	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID})
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
 	if have[noticeID] != 2 {
 		t.Fatalf("announced twice, the feeder sees %d", have[noticeID])
 	}
@@ -206,10 +206,66 @@ func TestEvictionNoticeCountsTwoInFlight(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("spend: %v", err)
 	}
-	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID})
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
 	if have[noticeID] != 1 {
 		t.Errorf("one of two spent leaves %d, so the second delete would be tombstoned",
 			have[noticeID])
+	}
+}
+
+// A spend is retried when its reply is lost, and the write may already have
+// landed. The feeder keeps the positions it could not confirm as owed and sends
+// them again at the next checkpoint, so the same spend arriving twice has to
+// take the count down once. Otherwise the second takes the announcement of a
+// later eviction of the same document, and that eviction is tombstoned.
+func TestEvictionNoticeSpentTwiceForOneDelete(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	}
+	once := map[string][]bson.Timestamp{noticeID: {{T: 100, I: 1}}}
+	for i := 0; i < 2; i++ {
+		if err := SpendEvictionNotices(ctx, c, once); err != nil {
+			t.Fatalf("spend: %v", err)
+		}
+	}
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
+	if have[noticeID] != 1 {
+		t.Errorf("one delete spent twice leaves %d of two announcements, want 1", have[noticeID])
+	}
+}
+
+// And the reader's half. Positions the feeder still owes are subtracted from
+// what the archive says is left, because a spend that has not landed has not
+// taken the count down yet. One that landed and lost its reply has, and
+// subtracting it again reads the next eviction of that document as the
+// application deleting it.
+func TestOwedPositionAlreadySpentIsNotSubtractedAgain(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := AnnounceEviction(ctx, c, []string{noticeID}); err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	}
+	owed := map[string][]bson.Timestamp{noticeID: {{T: 100, I: 1}}}
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, owed)
+	if have[noticeID] != 1 {
+		t.Fatalf("two announced and one owed, the feeder sees %d, want 1", have[noticeID])
+	}
+	if err := SpendEvictionNotices(ctx, c, owed); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	have, _ = ReadEvictionNotices(ctx, c, []string{noticeID}, owed)
+	if have[noticeID] != 1 {
+		t.Errorf("the owed spend landed and the feeder sees %d left, want 1", have[noticeID])
 	}
 }
 
@@ -225,7 +281,7 @@ func TestNoticeWithoutACountIsWorthOne(t *testing.T) {
 		bson.D{{Key: "_id", Value: noticeID}, {Key: "at", Value: time.Now().UTC()}}); err != nil {
 		t.Fatalf("insert an old-style notice: %v", err)
 	}
-	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID})
+	have, _ := ReadEvictionNotices(ctx, c, []string{noticeID}, nil)
 	if have[noticeID] != 1 {
 		t.Errorf("a notice written before the count existed is worth %d, want 1", have[noticeID])
 	}

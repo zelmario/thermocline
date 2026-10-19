@@ -442,7 +442,9 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// A count rather than a flag, because a document can be evicted, warmed back
 	// up and evicted again inside one batch, and the second delete is as
 	// announced as the first.
-	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids)
+	// The owed ones are taken off there, against what the archive records, so
+	// a spend that landed without its reply is not counted twice.
+	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids, f.owedNotices)
 	if err != nil {
 		return err
 	}
@@ -460,7 +462,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	f.claimedInBatch = map[string][]bson.Timestamp{}
 	avail := make(map[string]int, len(announced))
 	for id, n := range announced {
-		avail[id] = n - len(f.spentNotices[id]) - len(f.owedNotices[id])
+		avail[id] = n - len(f.spentNotices[id])
 	}
 
 	// Asked before the announcements, not after them. A delete the record
