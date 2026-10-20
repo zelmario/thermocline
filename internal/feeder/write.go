@@ -159,27 +159,82 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	// nothing left to spend them: see settleOwed for what one costs.
 	f.owedNotices = mergeNotices(f.owedNotices, f.spentNotices)
 	f.spentNotices = nil
-	if len(f.owedNotices) > 0 {
+	f.collectWriteOff(false)
+	f.writeOffOwed(ctx)
+	return nil
+}
+
+// writeOffOwed writes off the owed notices beside mirroring rather than in its
+// way, unless a write-off is already running, in which case they wait for the
+// next checkpoint.
+//
+// It used to run here, in line, and mirroring stood still for it: after a sweep
+// of 200,000, about 34,000 notices a checkpoint and 2.5 seconds each time, with
+// every read that fell through to the archive waiting on the published
+// position meanwhile. Nothing about it needs mirroring to wait. The notices it
+// takes stay counted as owed until it reports, and ReadEvictionNotices takes
+// off only the positions a notice does not record yet, so a delete classified
+// meanwhile is judged the same whether the write-off has landed or not.
+func (f *Feeder) writeOffOwed(ctx context.Context) {
+	if len(f.owedNotices) == 0 || f.writeOffDone != nil {
+		return
+	}
+	batch := f.owedNotices
+	f.owedNotices = nil
+	f.writingOff = batch
+	done := make(chan error, 1)
+	f.writeOffDone = done
+	go func() {
 		octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owedGrace)
 		defer cancel()
 		// Recorded first, so there is no moment at which an eviction is
 		// neither announced nor recorded. See meta.Evicted. A failure costs
 		// only a replay from before this point, which is rare, so it warns.
 		if f.cfg.EvictionRecord > 0 && f.hot != nil {
-			if err := meta.RecordEvictions(octx, f.hot, f.owedNotices); err != nil {
+			if err := meta.RecordEvictions(octx, f.hot, batch); err != nil {
 				f.log.Warn("could not record evictions on the fast tier", "err", err,
 					"note", "an archive restored from a backup older than this cannot tell these "+
 						"evictions from deletes when the feeder replays them")
 			}
 		}
-		if err := meta.SpendEvictionNotices(octx, f.cold, f.owedNotices); err != nil {
-			f.log.Warn("could not spend eviction notices", "err", err,
-				"effect", "tried again at the next checkpoint and when the feeder stops")
-			return nil
-		}
-		f.owedNotices = nil
+		done <- meta.SpendEvictionNotices(octx, f.cold, batch)
+	}()
+}
+
+// collectWriteOff takes the result of a write-off running beside mirroring, if
+// there is one and it has finished, or waits for it when wait is set. A failed
+// one goes back to owed and is tried again at the next checkpoint.
+func (f *Feeder) collectWriteOff(wait bool) {
+	if f.writeOffDone == nil {
+		return
 	}
-	return nil
+	var err error
+	if wait {
+		err = <-f.writeOffDone
+	} else {
+		select {
+		case err = <-f.writeOffDone:
+		default:
+			return
+		}
+	}
+	if err != nil {
+		f.log.Warn("could not spend eviction notices", "err", err,
+			"effect", "tried again at the next checkpoint and when the feeder stops")
+		f.owedNotices = mergeNotices(f.owedNotices, f.writingOff)
+	}
+	f.writingOff = nil
+	f.writeOffDone = nil
+}
+
+// owedNow is every position spent and not yet known to be written off: owed,
+// and taken by a write-off that has not reported.
+func (f *Feeder) owedNow() map[string][]bson.Timestamp {
+	if len(f.writingOff) == 0 {
+		return f.owedNotices
+	}
+	all := mergeNotices(nil, f.writingOff)
+	return mergeNotices(all, f.owedNotices)
 }
 
 // owedGrace bounds writing off notices a saved checkpoint covers, once the
@@ -200,6 +255,7 @@ const owedGrace = 30 * time.Second
 // restart will replay, and writing those off now would leave the replay with
 // nothing to recognise them by.
 func (f *Feeder) settleOwed(ctx context.Context) {
+	f.collectWriteOff(true)
 	if len(f.owedNotices) == 0 {
 		return
 	}
@@ -444,7 +500,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// announced as the first.
 	// The owed ones are taken off there, against what the archive records, so
 	// a spend that landed without its reply is not counted twice.
-	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids, f.owedNotices)
+	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids, f.owedNow())
 	if err != nil {
 		return err
 	}

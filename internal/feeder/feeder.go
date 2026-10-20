@@ -146,6 +146,12 @@ type Feeder struct {
 	// will ever spend them; they are retried at every checkpoint and once more
 	// on the way out. See settleOwed.
 	owedNotices map[string][]bson.Timestamp
+	// writingOff are owed notices a write-off running beside mirroring has
+	// taken, and writeOffDone reports how it went. Only this goroutine changes
+	// either; the write-off reads its own map and nothing writes it until the
+	// result is collected. See writeOffOwed.
+	writingOff   map[string][]bson.Timestamp
+	writeOffDone chan error
 	// claimedInBatch are the announcements the batch being assembled has taken.
 	// They join spentNotices only once that batch is in the archive, so an
 	// attempt that failed leaves nothing behind for a retry to under-count
