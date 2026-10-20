@@ -36,18 +36,28 @@ Part of [Thermocline](../README.md).
   checked. Nothing is written either way; the difference is which error the
   client reads.
 
-- **An evictor killed without warning can let one application delete be
-  undone, within the hour after.** A step announces its documents to the feeder
-  and then deletes them. Since 2026-10-16 a step that has announced finishes
-  when the evictor is asked to stop, so a SIGTERM leaves nothing behind:
-  measured with twelve kills mid-sweep, 0 announcements left over against 3,000
-  before. SIGKILL, the OOM killer or a lost host run no code, and can leave at
-  most two steps announced and not deleted, a thousand documents at the default
-  `batch_size` of 500. For the hour a notice lives, if one of those documents
-  is copied back up by a read and then deleted by the application, the feeder
-  takes that delete for the eviction, the archive keeps the document, and the
-  router answers it again. Stop the evictor with SIGTERM (`systemctl stop`
-  does), and give its unit room for a step to finish: 30 seconds is the bound.
+- **An evictor killed without warning leaves its last steps announced until
+  the next evictor starts.** A step announces its documents to the feeder and
+  then deletes them. Since 2026-10-16 a step that has announced finishes when
+  the evictor is asked to stop, so a SIGTERM leaves nothing behind. SIGKILL,
+  the OOM killer or a lost host run no code, and can leave up to two steps
+  announced and not deleted, a thousand documents at the default `batch_size`
+  of 500. Since 2026-10-20 the next evictor to start takes those back: every
+  step is named after the evictor's feeder id, so on start it finds its
+  predecessor's pending announcements, asks the fast tier's oplog which of
+  those documents a delete has touched since, and withdraws the rest. Measured
+  with five kills mid-sweep: 1,750 announcements left standing before, 0 after,
+  and nothing tombstoned.
+
+  What is left is the window until an evictor starts again, and two cases the
+  oplog cannot answer, where nothing is taken back and the notices expire
+  within the hour as before: an oplog that no longer reaches back to the step,
+  and an evictor account that cannot read `local.oplog.rs` (both are logged).
+  In that window, if one of those documents is copied back up by a read and
+  then deleted by the application, the feeder takes that delete for the
+  eviction, the archive keeps the document, and the router answers it again.
+  Stop the evictor with SIGTERM (`systemctl stop` does), give its unit room
+  for a step to finish (30 seconds is the bound), and restart it after a crash.
 
 - **Two feeders with different ids are not refused, and they double the work.**
   The lease stops two of the same daemon with the same id; two with different

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -270,6 +271,20 @@ func DocID(ns string, id bson.RawValue) string {
 	buf = append(buf, byte(id.Type))
 	buf = append(buf, id.Value...)
 	return ns + "|" + hex.EncodeToString(buf)
+}
+
+// ParseDocID takes a DocID apart again, into the namespace and the _id it was
+// made from.
+func ParseDocID(docID string) (ns string, id bson.RawValue, ok bool) {
+	i := strings.LastIndexByte(docID, '|')
+	if i < 0 {
+		return "", bson.RawValue{}, false
+	}
+	b, err := hex.DecodeString(docID[i+1:])
+	if err != nil || len(b) == 0 {
+		return "", bson.RawValue{}, false
+	}
+	return docID[:i], bson.RawValue{Type: bson.Type(b[0]), Value: b[1:]}, true
 }
 
 // UnmirroredRecord is one document the archive refused, which the feeder has
@@ -973,6 +988,24 @@ func EvictionAnnouncement(by string) mongo.Pipeline {
 		}}},
 		{{Key: "$unset", Value: "_fresh"}},
 	}
+}
+
+// PendingAnnouncedBy returns the notices with an announcement still pending
+// that carry a name starting with prefix, which is how an evictor finds what a
+// predecessor under the same lease announced and never got to delete.
+func PendingAnnouncedBy(ctx context.Context, cold *mongo.Client, prefix string) ([]EvictionNotice, error) {
+	cur, err := cold.Database(DB).Collection(Evicting).Find(ctx, bson.D{
+		{Key: "pending", Value: bson.D{{Key: "$gt", Value: 0}}},
+		{Key: "by", Value: bson.D{{Key: "$regex", Value: "^" + regexp.QuoteMeta(prefix)}}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read pending announcements: %w", err)
+	}
+	var out []EvictionNotice
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, fmt.Errorf("read pending announcements: %w", err)
+	}
+	return out, nil
 }
 
 // ReadEvictionNotices reports how many announcements each of docIDs has left to

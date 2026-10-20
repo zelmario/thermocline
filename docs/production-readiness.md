@@ -1301,7 +1301,11 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   default batch size of 500, able to turn an application delete within the
   hour into an eviction. It needs the document to be copied
   back up and then deleted inside that hour, and it is written in
-  `docs/limitations.md`.
+  `docs/limitations.md`. Since 2026-10-20 it lasts only until the next
+  evictor starts: steps are named after the evictor, and on start it takes
+  back its predecessor's announcements that the fast tier's oplog shows no
+  delete for. Five SIGKILLs mid-sweep left 1,750 standing on 237c1f9 and 0
+  on that build, with nothing tombstoned.
 
 ## What 2026-09-21 added that an operator has to do
 

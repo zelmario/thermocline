@@ -541,3 +541,69 @@ func TestFailedDeleteBehindWithdrawsTheNextStep(t *testing.T) {
 			"any of them within the hour would be read as an eviction", pending)
 	}
 }
+
+// An evictor killed between announcing and deleting left its announcements
+// standing for an hour. The next one takes back the ones whose document no
+// delete has touched since, and leaves alone the ones a delete answers, which
+// the feeder spends: taking one of those back turns the eviction's delete into
+// a tombstone over a document already gone from the fast tier.
+func TestStartTakesBackOnlyWhatNoDeleteAnswered(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two tiers to run the orphan test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatalf("connect hot: %v", err)
+	}
+	t.Cleanup(func() { _ = hot.Disconnect(context.WithoutCancel(ctx)) })
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect cold: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_orphans.docs"
+	hc := hot.Database("tc_orphans").Collection("docs")
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = hc.Drop(c)
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+
+	evicted, stayed := bson.NewObjectID(), bson.NewObjectID()
+	for _, id := range []bson.ObjectID{evicted, stayed} {
+		if _, err := hc.InsertOne(ctx, bson.D{{Key: "_id", Value: id}}); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "tcorphans"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	// The step the killed evictor was running: both announced, one deleted.
+	step := e.stepPrefix() + bson.NewObjectID().Hex()
+	idE, idS := meta.DocID(ns, rawIDValue(t, evicted)), meta.DocID(ns, rawIDValue(t, stayed))
+	if err := meta.AnnounceEviction(ctx, cold, []string{idE, idS}, step); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if _, err := hc.DeleteOne(ctx, bson.D{{Key: "_id", Value: evicted}}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	e.takeBackOrphans(ctx)
+
+	have, err := meta.ReadEvictionNotices(ctx, cold, []string{idE, idS}, nil)
+	if err != nil {
+		t.Fatalf("read notices: %v", err)
+	}
+	if have[idE] != 1 {
+		t.Errorf("the announcement a delete answers was taken back (%d left); the feeder would "+
+			"tombstone a document already gone from the fast tier", have[idE])
+	}
+	if have[idS] != 0 {
+		t.Errorf("the announcement no delete answers still stands at %d; the application's next "+
+			"delete of that document would be read as an eviction", have[idS])
+	}
+}

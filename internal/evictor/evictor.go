@@ -55,6 +55,9 @@ type Evictor struct {
 	// renewal. See RunOnce and keepLease.
 	hold   *lease.Lease
 	heldAt time.Time
+	// reconciled says the announcements a predecessor left have been looked
+	// at, which happens once per process. See takeBackOrphans.
+	reconciled bool
 
 	// unagedSeen records which namespaces have already been counted for
 	// documents the rule cannot age, so the scan that costs happens once per
@@ -243,6 +246,10 @@ func (e *Evictor) RunOnce(ctx context.Context) (Stats, error) {
 	}
 
 	e.checkClock(ctx)
+	if !e.dryRun && !e.reconciled {
+		e.reconciled = true
+		e.takeBackOrphans(ctx)
+	}
 
 	total := Stats{DryRun: e.dryRun}
 	if e.dryRun {
@@ -1140,13 +1147,180 @@ func (e *Evictor) nsOf(docs []candidate) string {
 // announce names the step on every candidate before announcing them, so the
 // step can take back what it raised whatever happens to the write.
 func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
-	by := "evict:" + bson.NewObjectID().Hex()
+	by := e.stepPrefix() + bson.NewObjectID().Hex()
 	docIDs := make([]string, len(docs))
 	for i := range docs {
 		docs[i].announcedAs = by
 		docIDs[i] = docs[i].docID
 	}
 	return meta.AnnounceEviction(ctx, e.cold, docIDs, by)
+}
+
+// stepPrefix starts the name of every step this evictor announces under. The
+// lease allows one evictor per feeder id, so a name with this prefix that is
+// still pending when this process starts was announced by one that has died.
+func (e *Evictor) stepPrefix() string {
+	return "evict:" + e.cfg.FeederID + ":"
+}
+
+// takeBackOrphans withdraws announcements a predecessor made and never
+// deleted, as this evictor starts.
+//
+// A step announces and then deletes, and an evictor stopped with SIGTERM
+// finishes the step first. SIGKILL, the OOM killer and a lost host run no code,
+// and left up to two steps announced: a thousand notices at the default batch
+// size, each standing for the hour a notice lives over a document still on the
+// fast tier. The application's next delete of one of them was read as an
+// eviction, and the archive kept a document the application deleted. Written
+// down as a limitation until the step names made it possible to tell which.
+//
+// Still on the fast tier is not the test, because a document evicted and then
+// copied back up before this ran is there too, and its eviction's delete is the
+// one the announcement answers: taking it back would turn that delete into a
+// tombstone over a document gone from the fast tier. The oplog is the test. A
+// document with no delete in it since the step that announced it was not
+// evicted by that step, and nothing will spend the announcement. When the oplog
+// no longer reaches back to the step, nothing is taken back: that is the old
+// behaviour, and the notice expires within the hour.
+func (e *Evictor) takeBackOrphans(ctx context.Context) {
+	prefix := e.stepPrefix()
+	recs, err := meta.PendingAnnouncedBy(ctx, e.cold, prefix)
+	if err != nil {
+		e.log.Warn("could not look for announcements a previous evictor left", "err", err)
+		return
+	}
+	if len(recs) == 0 {
+		return
+	}
+	type mine struct {
+		docID string
+		id    bson.RawValue
+		names []string
+		since time.Time
+	}
+	byNS := map[string][]mine{}
+	for _, r := range recs {
+		ns, id, ok := meta.ParseDocID(r.ID)
+		if !ok {
+			continue
+		}
+		m := mine{docID: r.ID, id: id}
+		for _, b := range r.By {
+			if !strings.HasPrefix(b, prefix) {
+				continue
+			}
+			oid, err := bson.ObjectIDFromHex(strings.TrimPrefix(b, prefix))
+			if err != nil {
+				continue
+			}
+			m.names = append(m.names, b)
+			if at := oid.Timestamp(); m.since.IsZero() || at.Before(m.since) {
+				m.since = at
+			}
+		}
+		if len(m.names) > 0 {
+			byNS[ns] = append(byNS[ns], m)
+		}
+	}
+	taken := 0
+	for ns, docs := range byNS {
+		since := docs[0].since
+		ids := make(bson.A, 0, len(docs))
+		for _, d := range docs {
+			ids = append(ids, d.id)
+			if d.since.Before(since) {
+				since = d.since
+			}
+		}
+		deleted, reaches, err := e.deletedSince(ctx, ns, ids, since)
+		if err != nil || !reaches {
+			e.log.Warn("left announcements a previous evictor made standing",
+				"ns", ns, "documents", len(docs), "err", err, "oplog_reaches", reaches,
+				"effect", "for the hour a notice lives, an application delete of one of these "+
+					"documents may be read as an eviction")
+			continue
+		}
+		for _, d := range docs {
+			if deleted[meta.DocID(ns, d.id)] {
+				continue
+			}
+			for _, name := range d.names {
+				if werr := meta.WithdrawEviction(ctx, e.cold, []string{d.docID}, name); werr != nil {
+					e.log.Warn("could not withdraw an announcement a previous evictor left",
+						"ns", ns, "err", werr)
+					continue
+				}
+				taken++
+			}
+		}
+	}
+	if taken > 0 {
+		e.log.Warn("took back announcements a previous evictor made and never deleted",
+			"count", taken,
+			"meaning", "the evictor before this one stopped without finishing its steps, "+
+				"which SIGKILL, the OOM killer or a lost host does")
+	}
+}
+
+// deletedSince reports which of ids the fast tier's oplog shows deleted from ns
+// since a moment, and whether the oplog reaches back that far at all. A delete
+// may be its own entry or one operation of an applyOps, which is how 8.0 logs
+// a batch of them.
+func (e *Evictor) deletedSince(ctx context.Context, ns string, ids bson.A, since time.Time) (map[string]bool, bool, error) {
+	oplog := e.hot.Database("local").Collection("oplog.rs")
+	var first struct {
+		Wall time.Time `bson:"wall"`
+	}
+	if err := oplog.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: 1}})).Decode(&first); err != nil {
+		return nil, false, err
+	}
+	// A minute's margin, for the evictor's clock that stamped the step and the
+	// primary's that stamped the oplog.
+	from := since.Add(-time.Minute)
+	if first.Wall.After(from) {
+		return nil, false, nil
+	}
+	ts := bson.Timestamp{T: uint32(from.Unix())}
+	cur, err := oplog.Find(ctx, bson.D{
+		{Key: "ts", Value: bson.D{{Key: "$gte", Value: ts}}},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "op", Value: "d"}, {Key: "ns", Value: ns}, {Key: "o._id", Value: bson.D{{Key: "$in", Value: ids}}}},
+			bson.D{{Key: "op", Value: "c"}, {Key: "o.applyOps", Value: bson.D{{Key: "$elemMatch", Value: bson.D{
+				{Key: "op", Value: "d"}, {Key: "ns", Value: ns}, {Key: "o._id", Value: bson.D{{Key: "$in", Value: ids}}},
+			}}}}},
+		}},
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	deleted := map[string]bool{}
+	note := func(op bson.Raw) {
+		if v, err := op.LookupErr("o", "_id"); err == nil {
+			deleted[meta.DocID(ns, v)] = true
+		}
+	}
+	for cur.Next(ctx) {
+		if opType, _ := cur.Current.Lookup("op").StringValueOK(); opType == "d" {
+			note(cur.Current)
+			continue
+		}
+		arr, ok := cur.Current.Lookup("o", "applyOps").ArrayOK()
+		if !ok {
+			continue
+		}
+		vals, _ := arr.Values()
+		for _, v := range vals {
+			if doc, ok := v.DocumentOK(); ok {
+				if t, _ := doc.Lookup("op").StringValueOK(); t == "d" {
+					if n, _ := doc.Lookup("ns").StringValueOK(); n == ns {
+						note(doc)
+					}
+				}
+			}
+		}
+	}
+	return deleted, true, cur.Err()
 }
 
 // withdraw takes back the announcements docs were evicted under, one write per
