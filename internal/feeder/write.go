@@ -1,6 +1,7 @@
 package feeder
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -131,9 +132,26 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 		return nil
 	}
 	ckSkew, ckSkewKnown := f.clockSkew(ctx)
-	if err := f.cp.Save(ctx, f.cfg.ID, f.lastToken, f.lastEventAt, ckSkew, ckSkewKnown,
-		f.lastTokenNS, f.lastTokenTS); err != nil {
-		return err
+	// Finished once started, whatever happens to ctx. Its outcome decides what
+	// the notices spent since the last save are: covered by this checkpoint and
+	// owed a write-off, or left for the replay. A stop that cancelled it after
+	// it reached mongod returned an error for a save that had landed, so they
+	// were neither: the restart resumed past their deletes and nothing wrote
+	// them off. The same stop one step later is what settleOwed is for.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), owedGrace)
+	err := f.cp.Save(sctx, f.cfg.ID, f.lastToken, f.lastEventAt, ckSkew, ckSkewKnown,
+		f.lastTokenNS, f.lastTokenTS)
+	cancel()
+	if err != nil {
+		// And a save that timed out may have landed too, so it is asked
+		// rather than assumed. Holding this token means it is saved.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), owedGrace)
+		tok, _, lerr := f.cp.Load(rctx, f.cfg.ID)
+		rcancel()
+		if lerr != nil || !bytes.Equal(tok, f.lastToken) {
+			return err
+		}
+		f.log.Warn("the checkpoint was saved though saving it reported an error", "err", err)
 	}
 	f.lastSaved = time.Now()
 	f.reportRate()
