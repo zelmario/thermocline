@@ -39,11 +39,13 @@ import (
 
 // Router accepts client connections and routes them between the tiers.
 type Router struct {
-	cfg   config.RouterConfig
-	hot   *mongo.Client
-	cold  *mongo.Client
-	marks *watermark.Store
-	log   *slog.Logger
+	cfg config.RouterConfig
+	// missed remembers recent point-read misses, for copy_up_reads: repeated.
+	missed missMemory
+	hot    *mongo.Client
+	cold   *mongo.Client
+	marks  *watermark.Store
+	log    *slog.Logger
 
 	// olderArchive holds the two releases when the archive is behind the fast
 	// tier, which only a deployment running with allow_version_skew reaches. It

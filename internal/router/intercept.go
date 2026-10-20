@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -273,7 +274,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 			c.log.Debug("not promoting a document read through a view",
 				"view", ns, "why", "a view is not a namespace a document can be written to, and "+
 					"the _id a view produces need not be one the collection underneath has")
-		} else {
+		} else if c.r.copyUpRead(meta.DocID(ns, id)) {
 			c.r.copyUpAsync(ns, id)
 		}
 	} else {

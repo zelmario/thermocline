@@ -127,6 +127,26 @@ const (
 	FreshnessPermissive Freshness = "permissive"
 )
 
+// CopyUpReads decides whether a point read the fast tier misses copies the
+// document up. Writes and transactions copy up regardless: they need the
+// document on the fast tier to be applied there.
+type CopyUpReads string
+
+const (
+	// CopyUpAlways copies every document a point read finds only in the
+	// archive. The behaviour before this setting existed, and the default.
+	CopyUpAlways CopyUpReads = "always"
+	// CopyUpRepeated copies a document up on its second miss inside
+	// copy_up_window, and answers the first from the archive alone. A read of
+	// an old record that nobody asks for again is the common case in a long
+	// tail, and copying it costs a write on each tier and the bookkeeping that
+	// keeps it from looking like an application insert, for a document the next
+	// sweep evicts again.
+	CopyUpRepeated CopyUpReads = "repeated"
+	// CopyUpNever answers every such read from the archive and copies nothing.
+	CopyUpNever CopyUpReads = "never"
+)
+
 // RouterConfig tunes the proxy that fronts both tiers.
 type RouterConfig struct {
 	// Listen is the address clients connect to, taking over the one the
@@ -147,6 +167,12 @@ type RouterConfig struct {
 	ArchiveWait Duration `yaml:"archive_wait"`
 	// Freshness is what happens when that wait runs out. See Freshness.
 	Freshness Freshness `yaml:"freshness"`
+	// CopyUpReads is whether a point read the fast tier misses copies the
+	// document up. See CopyUpReads.
+	CopyUpReads CopyUpReads `yaml:"copy_up_reads"`
+	// CopyUpWindow is how close together two misses of one document have to
+	// be for copy_up_reads: repeated to copy it up.
+	CopyUpWindow Duration `yaml:"copy_up_window"`
 	// ClaimGrace is how much longer than the ordinary claim cache TTL a router
 	// may keep answering from a completeness claim it can no longer re-read,
 	// because the archive is unreachable. Zero, the default, is no grace at all.
@@ -507,6 +533,8 @@ func Default() Config {
 			Residency:    Duration(30 * 24 * time.Hour),
 			ArchiveWait:  Duration(5 * time.Second),
 			Freshness:    FreshnessStrict,
+			CopyUpReads:  CopyUpAlways,
+			CopyUpWindow: Duration(10 * time.Minute),
 			FeederID:     "default",
 			Cache: CacheConfig{
 				// Off. The bounds apply when it is turned on: a thousand
@@ -878,6 +906,14 @@ func (r RouterConfig) Validate() error {
 	case FreshnessStrict, FreshnessPermissive:
 	default:
 		return fmt.Errorf("router.freshness must be strict or permissive, got %q", r.Freshness)
+	}
+	switch r.CopyUpReads {
+	case CopyUpAlways, CopyUpRepeated, CopyUpNever:
+	default:
+		return fmt.Errorf("router.copy_up_reads must be always, repeated or never, got %q", r.CopyUpReads)
+	}
+	if r.CopyUpReads == CopyUpRepeated && r.CopyUpWindow <= 0 {
+		return errors.New("router.copy_up_window must be positive when copy_up_reads is repeated")
 	}
 	if r.Residency <= 0 {
 		return errors.New("router.residency must be positive, or the evictor removes what was just copied up")
