@@ -1283,6 +1283,18 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   archive are the evidence for it, each failing on a build without its
   guard.
 
+  On 2026-10-20 the feeder's own restart probe found one more, in code
+  already pushed. A checkpoint save ran on a context the stop cancels, so a
+  save that landed could report "context canceled", and the notices it
+  covered were then neither written off nor replayed. Three sweeps of
+  200,000 with the feeder restarted 30 times a sweep, 0.3 to 1 second
+  apart: 101 and 1,000 notices left standing on 8ea0274, 0 and 0 with the
+  save finishing once started (2ffef00). Across every run of the probe that
+  day, 4 of 9 runs without it left notices standing and 0 of 4 with it.
+  The write-off also moved beside mirroring rather than in its way
+  (8d0cb93): the published position trailed the fast tier by a median of
+  1s and at most 4s during a sweep, and now by 0s and at most 1s.
+
   What it cannot cover is a process that dies without being asked: SIGKILL,
   the OOM killer, a host lost. That leaves at most two steps of announcements,
   the one deleting and the one being announced, a thousand documents at the
