@@ -180,8 +180,21 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	// the first clause never saw it, and $type "array" is the one spelling that
 	// matches the array itself. Not asked when the age is the _id timestamp:
 	// mongod does not allow an array _id.
+	//
+	// The array half cannot use an index's bounds: an array's elements are
+	// what an index holds, so the clause reads every document. Measured on an
+	// archive of 41 million orders with an index on at: the two clauses
+	// together took 719 seconds, the type clause alone 2 milliseconds, the
+	// array clause alone 546. So every router gave up at the timeout, kept
+	// the no, and sent every newest-first query to the archive.
+	//
+	// The index already knows. MongoDB marks an index multikey the moment any
+	// document holds an array in a field it indexes, and never clears the
+	// mark, so an index on the field that is not multikey proves no document
+	// has ever held an array there while it existed, and it has existed for
+	// every document it holds. Only without such an index is the scan asked.
 	probe := bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: types}}}}
-	if !byID {
+	if !byID && !r.archiveFieldNeverArray(probeCtx, db, coll, field) {
 		probe = bson.D{{Key: "$or", Value: bson.A{
 			bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: types}}}},
 			bson.D{{Key: field, Value: bson.D{{Key: "$type", Value: "array"}}}},
@@ -205,7 +218,8 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 		safe = false
 		r.log.Warn("gave up asking whether the archive ages every document the same way",
 			"ns", ns, "field", field, "waited", bracketProbeTimeout.String(),
-			"reason", "the archive has no index on "+field+", so the question is a collection scan",
+			"reason", "the archive has no index on "+field+" that can answer it, or the only one is multikey, "+
+				"so the question is a collection scan",
 			"effect", "newest-first queries on this namespace consult the archive, which is slower "+
 				"and always correct",
 			"action", "create an index on "+field+" in the archive, then restart the router")
@@ -237,6 +251,93 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 			"effect", "newest-first queries on this namespace consult the archive, as they did before")
 	}
 	return safe
+}
+
+// archiveFieldNeverArray reports whether the archive has an index leading with
+// field that is not multikey, which proves no document it holds has an array
+// there. Any doubt, an error or a plan that does not say, is a no.
+func (r *Router) archiveFieldNeverArray(ctx context.Context, db, coll, field string) bool {
+	cur, err := r.cold.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		return false
+	}
+	var keys []bson.Raw
+	for cur.Next(ctx) {
+		key, ok := cur.Current.Lookup("key").DocumentOK()
+		if !ok {
+			continue
+		}
+		// A partial or sparse index does not hold every document, so its
+		// mark speaks only for the ones it holds.
+		if _, err := cur.Current.LookupErr("partialFilterExpression"); err == nil {
+			continue
+		}
+		if sp, _ := cur.Current.Lookup("sparse").BooleanOK(); sp {
+			continue
+		}
+		elems, err := key.Elements()
+		if err != nil || len(elems) == 0 || elems[0].Key() != field {
+			continue
+		}
+		if _, ok := elems[0].Value().AsInt64OK(); !ok {
+			// A hashed, text or 2dsphere index says nothing about arrays the
+			// way a plain one does.
+			if _, ok := elems[0].Value().DoubleOK(); !ok {
+				continue
+			}
+		}
+		keys = append(keys, append(bson.Raw(nil), key...))
+	}
+	_ = cur.Close(ctx)
+	for _, key := range keys {
+		var plan bson.Raw
+		err := r.cold.Database(db).RunCommand(ctx, bson.D{
+			{Key: "explain", Value: bson.D{
+				{Key: "find", Value: coll},
+				{Key: "filter", Value: bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}},
+				{Key: "hint", Value: key},
+				{Key: "limit", Value: int32(1)},
+			}},
+			{Key: "verbosity", Value: "queryPlanner"},
+		}).Decode(&plan)
+		if err != nil {
+			continue
+		}
+		if multi, said := multikeyIn(plan.Lookup("queryPlanner", "winningPlan")); said && !multi {
+			return true
+		}
+	}
+	return false
+}
+
+// multikeyIn reads isMultiKey off the index scans of a plan, true if any of
+// them is, and says whether any said at all.
+func multikeyIn(v bson.RawValue) (multi, said bool) {
+	var elems []bson.RawElement
+	switch v.Type {
+	case bson.TypeEmbeddedDocument:
+		elems, _ = v.Document().Elements()
+	case bson.TypeArray:
+		vals, _ := v.Array().Values()
+		for _, x := range vals {
+			m, s := multikeyIn(x)
+			multi, said = multi || m, said || s
+		}
+		return multi, said
+	default:
+		return false, false
+	}
+	for _, e := range elems {
+		if e.Key() == "isMultiKey" {
+			if b, ok := e.Value().BooleanOK(); ok {
+				multi, said = multi || b, true
+			}
+			continue
+		}
+		m, s := multikeyIn(e.Value())
+		multi, said = multi || m, said || s
+	}
+	return multi, said
 }
 
 // forgetBrackets drops what is remembered about ns, for the DDL that can make

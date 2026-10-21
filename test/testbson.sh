@@ -398,6 +398,21 @@ chk "and the router agrees, asking for the first time" "$TRUTHA" "$GOTA"
 # reaches the proof at all.
 chk "  which is not what the fast tier would say"      "true" \
     "$([ "$GOTA" != "$(H "$QA")" ] && echo true || echo "false (both $GOTA)")"
+
+# The same document with the field indexed in the archive. The array clause of
+# the probe reads every document, which on 41 million orders took 546 seconds,
+# so the router now asks the index first: one that is not multikey proves there
+# is no array. An index built over this document is multikey, and the router
+# has to see that and ask the long way.
+stopDaemons
+C "db.getSiblingDB(process.env.TC_DB).$NA.createIndex({createdAt:1})" >/dev/null
+chk "the archive's index on it is multikey"            "true" \
+    "$(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$NA.find({createdAt:{\$exists:true}}).hint({createdAt:1}).explain().queryPlanner.winningPlan).includes('\"isMultiKey\":true'))")"
+startRouter
+GOTI=$(R "$QA")
+chk "and with it indexed the router still agrees"      "$TRUTHA" "$GOTI"
+chk "  which is still not what the fast tier would say" "true" \
+    "$([ "$GOTI" != "$(H "$QA")" ] && echo true || echo "false (both $GOTI)")"
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NA.drop()" >/dev/null
