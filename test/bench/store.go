@@ -119,6 +119,8 @@ type store struct {
 	db     *mongo.Database
 	orders *mongo.Collection
 	placed atomic.Int64
+	// rate, when set, is the shoppers' operations a second in all. See run.
+	rate int
 }
 
 // shopper is one client's session state: who is shopping, and the orders the
@@ -179,6 +181,20 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 
 	deadline := time.Now().Add(d)
 	began := time.Now()
+	// At a set rate, each step takes the next slot on one shared schedule and
+	// waits for it. A shopper running late does not wait, so a target that
+	// cannot keep up shows it as a lower rate, and the latency is measured from
+	// when the step began.
+	var slots atomic.Int64
+	pace := func() {
+		if s.rate <= 0 {
+			return
+		}
+		at := began.Add(time.Duration(slots.Add(1)) * time.Second / time.Duration(s.rate))
+		if wait := time.Until(at); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
 	var wg sync.WaitGroup
 	for k := 0; k < conc; k++ {
 		wg.Add(1)
@@ -201,6 +217,7 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 						break
 					}
 				}
+				pace()
 				timed(local, name, func() error { return s.shopperStep(ctx, p, name) })
 			}
 			merge(local)
@@ -220,7 +237,11 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 			merge(local)
 		}()
 	}
-	office("ship the oldest placed order", 0, s.ship)
+	shipEvery := time.Duration(0)
+	if s.rate > 0 {
+		shipEvery = 20 * time.Millisecond
+	}
+	office("ship the oldest placed order", shipEvery, s.ship)
 	office("price change", time.Second, s.reprice)
 	office("report: sales by hour, 24h", 5*time.Second, s.salesByHour)
 	office("report: top sellers, 7 days", 15*time.Second, s.topSellers)
