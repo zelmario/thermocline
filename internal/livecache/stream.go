@@ -21,7 +21,7 @@ const maxEventDoc = 4 << 20
 // tiered ones and the system's own.
 func (c *Cache) Run(ctx context.Context, hot *mongo.Client, skip func(ns string) bool, log *slog.Logger) {
 	for ctx.Err() == nil {
-		err := c.follow(ctx, hot, skip)
+		err := c.follow(ctx, hot, skip, log)
 		// Whatever was applied before the stream broke is still right, but
 		// what happened while it was down is unknown, so everything goes.
 		c.Reset()
@@ -38,7 +38,7 @@ func (c *Cache) Run(ctx context.Context, hot *mongo.Client, skip func(ns string)
 	}
 }
 
-func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns string) bool) error {
+func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns string) bool, log *slog.Logger) error {
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.D{{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
 			"insert", "update", "replace", "delete", "drop", "rename", "dropDatabase", "invalidate",
@@ -63,7 +63,14 @@ func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns stri
 		return err
 	}
 	defer func() { _ = cs.Close(context.WithoutCancel(ctx)) }()
+	said := time.Now()
 	for {
+		if time.Since(said) >= 30*time.Second {
+			said = time.Now()
+			s := c.Stats()
+			log.Info("live cache", "entries", s.Entries, "bytes", s.Bytes, "hits", s.Hits, "misses", s.Misses,
+				"waited_for_stream", s.Behind, "fills", s.Fills, "dropped", s.Dropped, "refused_shapes", s.Refusals)
+		}
 		// Fills first, so a miss waits at most one poll for its entry.
 		c.fillPending(ctx, hot)
 		if cs.TryNext(ctx) {

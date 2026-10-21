@@ -460,6 +460,7 @@ func replyAddressedTo(stored []byte, requestID int32) (*wire.Message, error) {
 // guards. One funnel, and nothing can be added later that quietly skips it.
 func (c *conn) send(out *wire.Message) error {
 	c.cacheStore(out)
+	c.liveAfterReply(out)
 	return wire.Write(c.client, out)
 }
 

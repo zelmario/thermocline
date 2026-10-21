@@ -32,6 +32,7 @@ import (
 	"github.com/zelmario/thermocline/internal/cache"
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/livecache"
 	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
 	"github.com/zelmario/thermocline/internal/wire"
@@ -187,6 +188,9 @@ type Router struct {
 
 	// cache holds answers for as long as each query has been observed to keep
 	// giving the same one. Nil unless router.cache.enabled. See querycache.go.
+	// live is the live cache, nil unless router.live_cache.enabled. See
+	// livecache.go.
+	live  *livecache.Cache
 	cache *cache.Cache
 
 	// advisor watches every read and works out which queries would be worth
@@ -653,6 +657,12 @@ func (r *Router) Listen(ctx context.Context) error {
 	}()
 	r.goSafely("watching the fast tier for changes this router did not make",
 		func() { r.watchFastTier(ctx) })
+	if r.cfg.LiveCache.Enabled {
+		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
+		r.goSafely("keeping the live cache up to date", func() { r.live.Run(ctx, r.hot, r.liveSkip, r.log) })
+		r.log.Info("live cache on", "max_bytes", r.cfg.LiveCache.MaxBytes,
+			"note", "equality reads of untiered collections are answered from memory, kept up to date from the fast tier's change stream")
+	}
 
 	r.log.Info("router listening",
 		"addr", ln.Addr().String(),
@@ -959,6 +969,10 @@ type conn struct {
 	// cacheOf is the key the read in flight will be learned under, set when the
 	// cache decided the command was one it could hold. See querycache.go.
 	cacheOf cachePending
+	// liveAsk and liveWrites are what this command asked of the live cache,
+	// settled when its reply goes out. See livecache.go.
+	liveAsk    liveProof
+	liveWrites []string
 
 	// auth is the SCRAM conversation in progress, and grants what the finished
 	// one established. grants being nil is what "not authenticated" means, and
@@ -1158,6 +1172,9 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// not happening. Authorization has already run above, and the key carries
 	// who is asking. See querycache.go.
 	if nameErr == nil && !msg.MoreToCome() {
+		if out, hit := c.liveLookup(msg, name, db); hit {
+			return c.send(out)
+		}
 		if out, hit := c.cacheLookup(ctx, msg, name, db); hit {
 			return c.send(out)
 		}
@@ -1168,6 +1185,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if nameErr == nil {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
 			c.cacheInvalidate(msg, name, db, cmd)
+			c.liveNoteWrites(name, db, cmd)
 		}
 	}
 

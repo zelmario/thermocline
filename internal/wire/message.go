@@ -209,6 +209,11 @@ func NewMsg(requestID, responseTo int32, doc bson.D) (*Message, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wire: marshal reply: %w", err)
 	}
+	return NewMsgRaw(requestID, responseTo, payload), nil
+}
+
+// NewMsgRaw builds an OP_MSG carrying a document already encoded.
+func NewMsgRaw(requestID, responseTo int32, payload bson.Raw) *Message {
 
 	length := HeaderLen + 4 + 1 + len(payload)
 	raw := make([]byte, length)
@@ -223,7 +228,7 @@ func NewMsg(requestID, responseTo int32, doc bson.D) (*Message, error) {
 	return &Message{
 		Header: Header{Length: int32(length), RequestID: requestID, ResponseTo: responseTo, OpCode: OpMsg},
 		Raw:    raw,
-	}, nil
+	}
 }
 
 // ReplyDoc returns the single document carried by an OP_MSG or OP_REPLY.

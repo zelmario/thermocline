@@ -219,6 +219,9 @@ type RouterConfig struct {
 	// Cache holds query results for as long as they have been observed to stay
 	// the same. Off unless enabled.
 	Cache CacheConfig `yaml:"cache"`
+	// LiveCache keeps the answers to equality reads of untiered collections in
+	// memory, updated from the fast tier's change stream. See package livecache.
+	LiveCache LiveCacheConfig `yaml:"live_cache"`
 	// HotTLS says the fast tier requires TLS, taken from hot.uri at load time.
 	// The driver reads that option for its own connections; the router also
 	// proxies raw bytes over a connection it opens itself, and that one has to
@@ -534,6 +537,7 @@ func Default() Config {
 			ArchiveWait:  Duration(5 * time.Second),
 			Freshness:    FreshnessStrict,
 			CopyUpReads:  CopyUpAlways,
+			LiveCache:    LiveCacheConfig{MaxBytes: 256 << 20},
 			CopyUpWindow: Duration(10 * time.Minute),
 			FeederID:     "default",
 			Cache: CacheConfig{
@@ -912,6 +916,9 @@ func (r RouterConfig) Validate() error {
 	default:
 		return fmt.Errorf("router.copy_up_reads must be always, repeated or never, got %q", r.CopyUpReads)
 	}
+	if r.LiveCache.Enabled && r.LiveCache.MaxBytes <= 0 {
+		return errors.New("router.live_cache.max_bytes must be positive")
+	}
 	if r.CopyUpReads == CopyUpRepeated && r.CopyUpWindow <= 0 {
 		return errors.New("router.copy_up_window must be positive when copy_up_reads is repeated")
 	}
@@ -1089,6 +1096,14 @@ func samePort(a, b string) bool {
 // will use to hold the upstream connection when it terminates authentication.
 // Configuring them twice is a way for the two to drift apart, and the failure
 // when they do is a login that works everywhere except through the proxy.
+// LiveCacheConfig turns on the live cache and bounds it.
+type LiveCacheConfig struct {
+	// Enabled turns it on. Off by default.
+	Enabled bool `yaml:"enabled"`
+	// MaxBytes bounds the documents it holds, least recently used first.
+	MaxBytes int `yaml:"max_bytes"`
+}
+
 // CacheConfig is the learned-TTL query cache.
 //
 // Nothing here is a TTL. The point of the feature is that the router works out

@@ -40,6 +40,8 @@ type Cache struct {
 	// served only while applied has reached its last write. See Fresh.
 	applied   bson.Timestamp
 	lastWrite map[string]bson.Timestamp
+	// lastWriteDB is the same for writes naming a whole database.
+	lastWriteDB map[string]bson.Timestamp
 
 	// readers are the users mongod has let read each namespace lately. See
 	// Allowed.
@@ -82,18 +84,19 @@ type doc struct {
 // New makes an empty cache bounded to maxBytes of documents.
 func New(maxBytes int) *Cache {
 	return &Cache{
-		maxBytes:  maxBytes,
-		lru:       list.New(),
-		entries:   map[string]*entry{},
-		shapes:    map[string]map[string]*shape{},
-		rev:       map[string]map[*entry]struct{}{},
-		refused:   map[string]bool{},
-		refusedNS: map[string]bool{},
-		lastWrite: map[string]bson.Timestamp{},
-		readers:   map[string]map[string]time.Time{},
-		fillq:     make(chan Query, 1024),
-		pending:   map[string]bool{},
-		plainNS:   map[string]bool{},
+		maxBytes:    maxBytes,
+		lru:         list.New(),
+		entries:     map[string]*entry{},
+		shapes:      map[string]map[string]*shape{},
+		rev:         map[string]map[*entry]struct{}{},
+		refused:     map[string]bool{},
+		refusedNS:   map[string]bool{},
+		lastWrite:   map[string]bson.Timestamp{},
+		lastWriteDB: map[string]bson.Timestamp{},
+		readers:     map[string]map[string]time.Time{},
+		fillq:       make(chan Query, 1024),
+		pending:     map[string]bool{},
+		plainNS:     map[string]bool{},
 	}
 }
 
@@ -134,6 +137,15 @@ func (c *Cache) NoteWrite(ns string, at bson.Timestamp) {
 	}
 }
 
+// NoteWriteDB is NoteWrite for a write whose namespace is a whole database.
+func (c *Cache) NoteWriteDB(db string, at bson.Timestamp) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if after(at, c.lastWriteDB[db]) {
+		c.lastWriteDB[db] = at
+	}
+}
+
 func after(a, b bson.Timestamp) bool {
 	return a.T > b.T || (a.T == b.T && a.I > b.I)
 }
@@ -146,7 +158,8 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		c.mu.Unlock()
 		return nil, false
 	}
-	if after(c.lastWrite[q.NS], c.applied) {
+	db, _ := splitNS(q.NS)
+	if after(c.lastWrite[q.NS], c.applied) || after(c.lastWriteDB[db], c.applied) {
 		c.mu.Unlock()
 		c.Behind.Add(1)
 		return nil, false
