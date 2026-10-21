@@ -122,7 +122,7 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 	})
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	go c.Run(runCtx, cl, func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	queries := func(r *rand.Rand) Query {
 		cust := fmt.Sprintf("c%02d", r.Intn(customers))

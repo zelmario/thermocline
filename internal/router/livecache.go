@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/livecache"
@@ -158,4 +159,18 @@ func (c *conn) liveAfterReply(reply *wire.Message) {
 		}
 		c.liveAsk = liveProof{}
 	}
+}
+
+// WithLiveStream gives the live cache its own client for the change stream,
+// one that prefers a secondary. See router.live_cache.stream_from.
+func (r *Router) WithLiveStream(c *mongo.Client) *Router {
+	r.liveStream = c
+	return r
+}
+
+func (r *Router) liveStreamFrom() string {
+	if r.liveStream != nil {
+		return "secondary"
+	}
+	return "primary"
 }

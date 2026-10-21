@@ -190,8 +190,12 @@ type Router struct {
 	// giving the same one. Nil unless router.cache.enabled. See querycache.go.
 	// live is the live cache, nil unless router.live_cache.enabled. See
 	// livecache.go.
-	live  *livecache.Cache
-	cache *cache.Cache
+	live *livecache.Cache
+	// liveStream is the client the live cache reads its change stream
+	// through, hot unless router.live_cache.stream_from says otherwise. See
+	// WithLiveStream.
+	liveStream *mongo.Client
+	cache      *cache.Cache
 
 	// advisor watches every read and works out which queries would be worth
 	// caching and for how long. It runs whether or not the cache does, because
@@ -661,9 +665,14 @@ func (r *Router) Listen(ctx context.Context) error {
 		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
 		r.live.Tiers(r.cfg.Manages, r.liveProve)
 		r.live.SetMaxStaleness(r.cfg.LiveCache.MaxStaleness.D())
-		r.goSafely("keeping the live cache up to date", func() { r.live.Run(ctx, r.hot, r.liveSkip, r.log) })
+		stream := r.hot
+		if r.liveStream != nil {
+			stream = r.liveStream
+		}
+		r.goSafely("keeping the live cache up to date", func() { r.live.Run(ctx, r.hot, stream, r.liveSkip, r.log) })
 		r.log.Info("live cache on", "max_bytes", r.cfg.LiveCache.MaxBytes,
 			"max_staleness", r.cfg.LiveCache.MaxStaleness.D().String(),
+			"stream_from", r.liveStreamFrom(),
 			"note", "equality reads are answered from memory, kept up to date from the fast tier's change stream; on a tiered collection only what the fast tier proves")
 	}
 

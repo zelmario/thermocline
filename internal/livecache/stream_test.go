@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 // The cache against MongoDB itself, under writes. Every answer it gives once
@@ -50,7 +51,7 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	c := New(64 << 20)
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	go c.Run(runCtx, cl, func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	queries := func(r *rand.Rand) Query {
 		cat := fmt.Sprintf("c%02d", r.Intn(20))
@@ -181,6 +182,27 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	if checked < 200 {
 		t.Errorf("only %d answers came from the cache, too few to say anything", checked)
 	}
+}
+
+// streamClient is the client the applier reads its stream through: the same
+// one, or with TC_LIVE_STREAM=secondary one that prefers a secondary, which is
+// router.live_cache.stream_from: secondary.
+func streamClient(t *testing.T, uri string) *mongo.Client {
+	t.Helper()
+	if os.Getenv("TC_LIVE_STREAM") != "secondary" {
+		cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
+		return cl
+	}
+	cl, err := mongo.Connect(options.Client().ApplyURI(uri).SetReadPreference(readpref.SecondaryPreferred()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
+	return cl
 }
 
 func mustRaw(d bson.D) bson.Raw {

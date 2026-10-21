@@ -382,6 +382,14 @@ func runRouter(args []string) error {
 	warnIfArchiveReadPreferenceIgnored(cfg.Cold.URI, log)
 
 	r := router.New(hot, cold, cfg.Router, log).WatchArchivePrimary(primary)
+	if cfg.Router.LiveCache.Enabled && cfg.Router.LiveCache.StreamFrom == "secondary" {
+		stream, err := connect(ctx, cfg.Hot.URI, "hot", secondaryPreferred)
+		if err != nil {
+			return err
+		}
+		defer disconnect(stream, log)
+		r.WithLiveStream(stream)
+	}
 	go reportRouterStats(ctx, r, log)
 	if cfg.Router.Dashboard != "" {
 		go func() {
@@ -474,11 +482,26 @@ func warnIfArchiveReadPreferenceIgnored(uri string, log *slog.Logger) {
 			"miss a write that has already been acknowledged")
 }
 
-// connect takes at most one monitor, which the router uses to watch the archive.
-func connect(ctx context.Context, uri, name string, monitor ...*event.ServerMonitor) (*mongo.Client, error) {
+// secondaryPreferred is a connect option for a client whose reads should go to
+// a secondary when one is up: the live cache's change stream.
+var secondaryPreferred = connectOption(func(o *options.ClientOptions) {
+	o.SetReadPreference(readpref.SecondaryPreferred())
+})
+
+// connectOption is an option for connect.
+type connectOption func(*options.ClientOptions)
+
+// connect takes at most one monitor, which the router uses to watch the
+// archive, and options of its own.
+func connect(ctx context.Context, uri, name string, extra ...any) (*mongo.Client, error) {
 	opts := options.Client().ApplyURI(uri).SetAppName("cline")
-	if len(monitor) > 0 {
-		opts.SetServerMonitor(monitor[0])
+	for _, x := range extra {
+		switch x := x.(type) {
+		case *event.ServerMonitor:
+			opts.SetServerMonitor(x)
+		case connectOption:
+			x(opts)
+		}
 	}
 	client, err := mongo.Connect(opts)
 	if err != nil {

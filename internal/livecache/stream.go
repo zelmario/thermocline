@@ -17,11 +17,15 @@ const maxEventDoc = 4 << 20
 
 // Run is the applier: it follows the fast tier's change stream and fills
 // entries, both in one goroutine, so a fill and the changes around it are
-// applied in one order. skip names namespaces never to cache, which are the
-// tiered ones and the system's own.
-func (c *Cache) Run(ctx context.Context, hot *mongo.Client, skip func(ns string) bool, log *slog.Logger) {
+// applied in one order. skip names namespaces never to cache, the system's
+// own.
+//
+// The stream is read through stream and fills through hot. They may be
+// different nodes: a fill must be at least as new as the stream position, and
+// a read of the primary always is.
+func (c *Cache) Run(ctx context.Context, hot, stream *mongo.Client, skip func(ns string) bool, log *slog.Logger) {
 	for ctx.Err() == nil {
-		err := c.follow(ctx, hot, skip, log)
+		err := c.follow(ctx, hot, stream, skip, log)
 		// Whatever was applied before the stream broke is still right, but
 		// what happened while it was down is unknown, so everything goes.
 		c.Reset()
@@ -38,7 +42,7 @@ func (c *Cache) Run(ctx context.Context, hot *mongo.Client, skip func(ns string)
 	}
 }
 
-func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns string) bool, log *slog.Logger) error {
+func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func(ns string) bool, log *slog.Logger) error {
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.D{{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
 			"insert", "update", "replace", "delete", "drop", "rename", "dropDatabase", "invalidate",
@@ -58,7 +62,7 @@ func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns stri
 		}}},
 	}
 	opts := options.ChangeStream().SetFullDocument(options.UpdateLookup).SetMaxAwaitTime(5 * time.Millisecond)
-	cs, err := hot.Watch(ctx, pipeline, opts)
+	cs, err := stream.Watch(ctx, pipeline, opts)
 	if err != nil {
 		return err
 	}

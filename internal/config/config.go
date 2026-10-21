@@ -918,6 +918,11 @@ func (r RouterConfig) Validate() error {
 	default:
 		return fmt.Errorf("router.copy_up_reads must be always, repeated or never, got %q", r.CopyUpReads)
 	}
+	switch r.LiveCache.StreamFrom {
+	case "", "primary", "secondary":
+	default:
+		return fmt.Errorf("router.live_cache.stream_from must be primary or secondary, not %q", r.LiveCache.StreamFrom)
+	}
 	if r.LiveCache.MaxStaleness < 0 {
 		return errors.New("router.live_cache.max_staleness cannot be negative")
 	}
@@ -1115,6 +1120,14 @@ type LiveCacheConfig struct {
 	// model ReadySet uses: an answer may miss a write, but never one
 	// acknowledged longer ago than this. See livecache.SetMaxStaleness.
 	MaxStaleness Duration `yaml:"max_staleness"`
+	// StreamFrom is where the cache reads the fast tier's change stream:
+	// "primary", the default, or "secondary", which reads a secondary when
+	// one is up. The stream's events are majority committed, which a
+	// secondary holds, and everything the cache reads directly still goes to
+	// the primary, so the reads stay at least as new as the stream. What
+	// moves is the oplog scan and the lookup of every updated document, off
+	// the node every client is waiting on.
+	StreamFrom string `yaml:"stream_from"`
 }
 
 // CacheConfig is the learned-TTL query cache.
