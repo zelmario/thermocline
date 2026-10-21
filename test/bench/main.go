@@ -54,6 +54,7 @@ func main() {
 	label := flag.String("label", "", "a name for this run in the report")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
 	kind := flag.String("workload", "mix", "mix: the operation mix over orders alone; store: shoppers and a back office over a whole shop")
+	mixName := flag.String("store-mix", "store", "store workload: the shopper's mix, store (write heavy, the first one) or real (a shop's shape: about one step in seventy buys)")
 	rate := flag.Int("rate", 0, "store workload: hold the shoppers to this many operations a second in all, and ship every 20ms, so every target does the same work (0: as fast as they can)")
 	loadStoreFlag := flag.Bool("load-store", false, "stock the shop's products and customers in -ns's database, then stop")
 	metaURI := flag.String("meta-uri", "", "where the load was recorded, when -uri is a router: "+
@@ -104,7 +105,11 @@ func main() {
 
 	runner := func(d time.Duration, seed int64) *report { return w.run(ctx, d, *conc, seed) }
 	if *kind == "store" {
-		st := &store{w: w, db: cl.Database(db), orders: c, rate: *rate}
+		mix, ok := mixes[*mixName]
+		if !ok {
+			die("-store-mix must be store or real, not %q", *mixName)
+		}
+		st := &store{w: w, db: cl.Database(db), orders: c, rate: *rate, mix: mix}
 		runner = func(d time.Duration, seed int64) *report { return st.run(ctx, d, *conc, seed) }
 	}
 	if *warm > 0 {

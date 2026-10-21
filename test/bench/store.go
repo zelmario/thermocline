@@ -98,20 +98,45 @@ func padding(rng *rand.Rand, n int) string {
 	return string(b)
 }
 
-// The shopper's mix, in percent of what one shopper does next.
-var storeMix = []struct {
+// mixEntry is one step a shopper can take, and its share in thousandths.
+type mixEntry struct {
 	name  string
 	share int
-}{
-	{"browse a category", 26},
-	{"product page", 24},
-	{"filter by price", 6},
-	{"add to cart", 12},
-	{"checkout", 6},
-	{"my orders", 10},
-	{"open one of my orders", 8},
-	{"customer profile", 4},
-	{"old order (support)", 4},
+}
+
+// The shopper's mix, in thousandths of what one shopper does next.
+//
+// "store" is the first mix, and it writes far more than a shop does: one step
+// in sixteen is a checkout, which at 32 shoppers flat out was about 245 orders
+// a second, so the writes decided every result. "real" is the shape a shop's
+// traffic takes: product pages and browsing are two thirds of it, about one
+// step in seventy buys something, and a support agent opens an old order now
+// and then. The shares are a design choice, not measured traffic.
+var mixes = map[string][]mixEntry{
+	"store": storeMix,
+	"real": {
+		{"browse a category", 300},
+		{"product page", 385},
+		{"filter by price", 80},
+		{"add to cart", 60},
+		{"checkout", 15},
+		{"my orders", 60},
+		{"open one of my orders", 40},
+		{"customer profile", 40},
+		{"old order (support)", 20},
+	},
+}
+
+var storeMix = []mixEntry{
+	{"browse a category", 260},
+	{"product page", 240},
+	{"filter by price", 60},
+	{"add to cart", 120},
+	{"checkout", 60},
+	{"my orders", 100},
+	{"open one of my orders", 80},
+	{"customer profile", 40},
+	{"old order (support)", 40},
 }
 
 type store struct {
@@ -121,6 +146,8 @@ type store struct {
 	placed atomic.Int64
 	// rate, when set, is the shoppers' operations a second in all. See run.
 	rate int
+	// mix is the shopper's mix, one of mixes.
+	mix []mixEntry
 }
 
 // shopper is one client's session state: who is shopping, and the orders the
@@ -209,8 +236,8 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 					p.recent = p.recent[:0]
 				}
 				p.ops++
-				r, acc, name := p.rng.Intn(100), 0, ""
-				for _, op := range storeMix {
+				r, acc, name := p.rng.Intn(1000), 0, ""
+				for _, op := range s.mix {
 					acc += op.share
 					if r < acc {
 						name = op.name
@@ -237,9 +264,16 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 			merge(local)
 		}()
 	}
+	// At a set rate the warehouse ships as fast as the shop sells, so the
+	// orders waiting to ship neither pile up nor run out.
 	shipEvery := time.Duration(0)
 	if s.rate > 0 {
 		shipEvery = 20 * time.Millisecond
+		for _, op := range s.mix {
+			if op.name == "checkout" && op.share > 0 {
+				shipEvery = time.Second * 1000 / time.Duration(s.rate*op.share)
+			}
+		}
 	}
 	office("ship the oldest placed order", shipEvery, s.ship)
 	office("price change", time.Second, s.reprice)
