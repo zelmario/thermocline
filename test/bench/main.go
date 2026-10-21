@@ -53,6 +53,8 @@ func main() {
 	out := flag.String("json", "", "also write the report here as JSON")
 	label := flag.String("label", "", "a name for this run in the report")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
+	kind := flag.String("workload", "mix", "mix: the operation mix over orders alone; store: shoppers and a back office over a whole shop")
+	loadStoreFlag := flag.Bool("load-store", false, "stock the shop's products and customers in -ns's database, then stop")
 	metaURI := flag.String("meta-uri", "", "where the load was recorded, when -uri is a router: "+
 		"the record lives beside the data, in a collection the router does not tier")
 	flag.Parse()
@@ -71,6 +73,12 @@ func main() {
 		start := time.Now().Add(-period)
 		if err := loadOrders(ctx, c, *load, *loaders, start, period, *pad); err != nil {
 			die("load: %v", err)
+		}
+		return
+	}
+	if *loadStoreFlag {
+		if err := loadStore(ctx, cl.Database(db), *pad); err != nil {
+			die("load store: %v", err)
 		}
 		return
 	}
@@ -93,12 +101,17 @@ func main() {
 	w := &workload{c: c, n: m.N, start: m.Start, period: m.Period, recency: recency,
 		history: *history, pad: *pad}
 
+	runner := func(d time.Duration, seed int64) *report { return w.run(ctx, d, *conc, seed) }
+	if *kind == "store" {
+		st := &store{w: w, db: cl.Database(db), orders: c}
+		runner = func(d time.Duration, seed int64) *report { return st.run(ctx, d, *conc, seed) }
+	}
 	if *warm > 0 {
 		fmt.Printf("warming for %s\n", *warm)
-		w.run(ctx, *warm, *conc, *seed+1000)
+		runner(*warm, *seed+1000)
 	}
-	fmt.Printf("running for %s at %d clients\n", *runFor, *conc)
-	rep := w.run(ctx, *runFor, *conc, *seed)
+	fmt.Printf("running %s for %s at %d clients\n", *kind, *runFor, *conc)
+	rep := runner(*runFor, *seed)
 	rep.Label, rep.URI = *label, redact(*uri)
 	rep.print()
 	if *out != "" {
@@ -307,6 +320,12 @@ func (w *workload) run(ctx context.Context, d time.Duration, conc int, seed int6
 	}
 	wg.Wait()
 	rep.Seconds = time.Since(began).Seconds()
+	finish(rep)
+	return rep
+}
+
+// finish turns each operation's latencies into its counts and percentiles.
+func finish(rep *report) {
 	for _, s := range rep.Ops {
 		sort.Slice(s.lat, func(i, j int) bool { return s.lat[i] < s.lat[j] })
 		s.N = len(s.lat)
@@ -319,7 +338,6 @@ func (w *workload) run(ctx context.Context, d time.Duration, conc int, seed int6
 		}
 		s.P50, s.P95, s.P99, s.P999 = q(0.50), q(0.95), q(0.99), q(0.999)
 	}
-	return rep
 }
 
 func (w *workload) do(ctx context.Context, name string, rng *rand.Rand, inserted *atomic.Int64) error {
@@ -377,13 +395,13 @@ func (r *report) print() {
 	sort.Strings(names)
 	total := 0
 	fmt.Printf("\n%s  %.0fs, %d clients\n", r.Label, r.Seconds, r.Clients)
-	fmt.Printf("  %-26s %9s %8s %8s %8s %8s %8s %6s\n", "operation", "n", "ops/s", "p50 ms", "p95", "p99", "p99.9", "errors")
+	fmt.Printf("  %-30s %9s %8s %8s %8s %8s %8s %6s\n", "operation", "n", "ops/s", "p50 ms", "p95", "p99", "p99.9", "errors")
 	for _, n := range names {
 		s := r.Ops[n]
 		total += s.N
-		fmt.Printf("  %-26s %9d %8.0f %8.2f %8.2f %8.2f %8.2f %6d\n", n, s.N, s.PerSec, s.P50, s.P95, s.P99, s.P999, s.Errors)
+		fmt.Printf("  %-30s %9d %8.0f %8.2f %8.2f %8.2f %8.2f %6d\n", n, s.N, s.PerSec, s.P50, s.P95, s.P99, s.P999, s.Errors)
 	}
-	fmt.Printf("  %-26s %9d %8.0f\n", "all", total, float64(total)/r.Seconds)
+	fmt.Printf("  %-30s %9d %8.0f\n", "all", total, float64(total)/r.Seconds)
 }
 
 func redact(uri string) string {

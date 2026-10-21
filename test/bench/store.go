@@ -1,0 +1,411 @@
+package main
+
+// The store workload: shoppers and a back office against one shop, instead of
+// reads by _id.
+//
+// Reads by _id were never how a shop reads. A shop browses a category in price
+// order, opens product pages, fills carts, checks out, and shows a customer
+// their newest orders, and behind it a worker ships what was placed and
+// somebody looks at today's sales. The catalogue and the customers are small
+// and read constantly; the orders only grow. That is the shape tiering is for,
+// and the one this measures.
+//
+//	bench -uri URI -load-store                   stock products and customers
+//	bench -uri URI -workload store -for 10m      shop
+//
+// Products, customers and carts are untiered. In a tiered deployment they live
+// on the fast tier, so -load-store goes to the fast tier there and to the plain
+// cluster otherwise. Orders are the 40 million already loaded with -load.
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+const (
+	products   = 20000
+	categories = 200
+	pageSize   = 24
+)
+
+func sku(i int) string      { return fmt.Sprintf("S%05d", i) }
+func category(i int) string { return fmt.Sprintf("cat%03d", i) }
+func custID(i int) string   { return fmt.Sprintf("c%06d", i) }
+
+// loadStore stocks the catalogue and the customer list. The products' skus are
+// the ones the loaded orders already name, so top sellers and stock agree.
+func loadStore(ctx context.Context, db *mongo.Database, pad int) error {
+	rng := rand.New(rand.NewSource(11))
+	pc := db.Collection("products")
+	_ = pc.Drop(ctx)
+	docs := make([]any, 0, 1000)
+	for i := 0; i < products; i++ {
+		docs = append(docs, bson.D{
+			{Key: "_id", Value: sku(i)},
+			{Key: "category", Value: category(i % categories)},
+			{Key: "name", Value: fmt.Sprintf("Product %d", i)},
+			{Key: "price", Value: float64(100+rng.Intn(50000)) / 100},
+			{Key: "stock", Value: 1000 + rng.Intn(9000)},
+			{Key: "rating", Value: float64(10+rng.Intn(40)) / 10},
+			{Key: "description", Value: padding(rng, pad/2)},
+		})
+		if len(docs) == cap(docs) {
+			if _, err := pc.InsertMany(ctx, docs); err != nil {
+				return err
+			}
+			docs = docs[:0]
+		}
+	}
+	if _, err := pc.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "category", Value: 1}, {Key: "price", Value: 1}}}); err != nil {
+		return err
+	}
+	cc := db.Collection("customers")
+	_ = cc.Drop(ctx)
+	for i := 0; i < customers; i++ {
+		docs = append(docs, bson.D{
+			{Key: "_id", Value: custID(i)},
+			{Key: "name", Value: fmt.Sprintf("Customer %d", i)},
+			{Key: "email", Value: fmt.Sprintf("customer%d@example.com", i)},
+			{Key: "address", Value: padding(rng, 120)},
+			{Key: "since", Value: time.Now().Add(-time.Duration(rng.Intn(1500)) * 24 * time.Hour)},
+		})
+		if len(docs) == cap(docs) {
+			if _, err := cc.InsertMany(ctx, docs); err != nil {
+				return err
+			}
+			docs = docs[:0]
+		}
+	}
+	_ = db.Collection("carts").Drop(ctx)
+	fmt.Printf("stocked %d products and %d customers in %s\n", products, customers, db.Name())
+	return nil
+}
+
+func padding(rng *rand.Rand, n int) string {
+	b := make([]byte, n)
+	for k := range b {
+		b[k] = byte(33 + rng.Intn(94))
+	}
+	return string(b)
+}
+
+// The shopper's mix, in percent of what one shopper does next.
+var storeMix = []struct {
+	name  string
+	share int
+}{
+	{"browse a category", 26},
+	{"product page", 24},
+	{"filter by price", 6},
+	{"add to cart", 12},
+	{"checkout", 6},
+	{"my orders", 10},
+	{"open one of my orders", 8},
+	{"customer profile", 4},
+	{"old order (support)", 4},
+}
+
+type store struct {
+	w      *workload
+	db     *mongo.Database
+	orders *mongo.Collection
+	placed atomic.Int64
+}
+
+// shopper is one client's session state: who is shopping, and the orders the
+// last "my orders" page showed, which is where an order detail is opened from.
+type shopper struct {
+	rng    *rand.Rand
+	custZ  *rand.Zipf
+	catZ   *rand.Zipf
+	prodZ  *rand.Zipf
+	cust   string
+	recent []bson.ObjectID
+	ops    int
+}
+
+func (s *store) newShopper(seed int64) *shopper {
+	rng := rand.New(rand.NewSource(seed))
+	return &shopper{
+		rng:   rng,
+		custZ: rand.NewZipf(rng, 1.1, 8, customers-1),
+		catZ:  rand.NewZipf(rng, 1.2, 2, categories-1),
+		prodZ: rand.NewZipf(rng, 1.3, 1, products/categories-1),
+	}
+}
+
+// pickProduct takes a popular category, then a popular product in it.
+func (p *shopper) pickProduct() int {
+	return int(p.catZ.Uint64()) + categories*int(p.prodZ.Uint64())
+}
+
+func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) *report {
+	rep := &report{Clients: conc, Ops: map[string]*opStat{}}
+	var mu sync.Mutex
+	merge := func(local map[string]*opStat) {
+		mu.Lock()
+		defer mu.Unlock()
+		for name, st := range local {
+			all, ok := rep.Ops[name]
+			if !ok {
+				all = &opStat{}
+				rep.Ops[name] = all
+			}
+			all.lat = append(all.lat, st.lat...)
+			all.Errors += st.Errors
+		}
+	}
+	timed := func(local map[string]*opStat, name string, f func() error) {
+		st, ok := local[name]
+		if !ok {
+			st = &opStat{}
+			local[name] = st
+		}
+		t0 := time.Now()
+		if err := f(); err != nil {
+			st.Errors++
+		}
+		st.lat = append(st.lat, time.Since(t0))
+	}
+
+	deadline := time.Now().Add(d)
+	began := time.Now()
+	var wg sync.WaitGroup
+	for k := 0; k < conc; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			p := s.newShopper(seed*1000 + int64(k))
+			local := map[string]*opStat{}
+			for time.Now().Before(deadline) {
+				// A new customer every twenty or so steps: a session.
+				if p.ops%20 == 0 {
+					p.cust = custID(int(p.custZ.Uint64()))
+					p.recent = p.recent[:0]
+				}
+				p.ops++
+				r, acc, name := p.rng.Intn(100), 0, ""
+				for _, op := range storeMix {
+					acc += op.share
+					if r < acc {
+						name = op.name
+						break
+					}
+				}
+				timed(local, name, func() error { return s.shopperStep(ctx, p, name) })
+			}
+			merge(local)
+		}(k)
+	}
+	// The back office, at a fixed pace whatever the shopper count.
+	office := func(name string, every time.Duration, f func(*rand.Rand) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(seed + int64(len(name))))
+			local := map[string]*opStat{}
+			for time.Now().Before(deadline) {
+				timed(local, name, func() error { return f(rng) })
+				time.Sleep(every)
+			}
+			merge(local)
+		}()
+	}
+	office("ship the oldest placed order", 0, s.ship)
+	office("price change", time.Second, s.reprice)
+	office("report: sales by hour, 24h", 5*time.Second, s.salesByHour)
+	office("report: top sellers, 7 days", 15*time.Second, s.topSellers)
+	wg.Wait()
+	rep.Seconds = time.Since(began).Seconds()
+	finish(rep)
+	return rep
+}
+
+func (s *store) shopperStep(ctx context.Context, p *shopper, name string) error {
+	pc, cc, carts := s.db.Collection("products"), s.db.Collection("customers"), s.db.Collection("carts")
+	drain := func(cur *mongo.Cursor, err error) (int, error) {
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = cur.Close(ctx) }()
+		n := 0
+		for cur.Next(ctx) {
+			n++
+		}
+		return n, cur.Err()
+	}
+	switch name {
+	case "browse a category":
+		page := 0
+		if p.rng.Intn(4) == 0 {
+			page = 1 + p.rng.Intn(3)
+		}
+		_, err := drain(pc.Find(ctx, bson.D{{Key: "category", Value: category(int(p.catZ.Uint64()))}},
+			options.Find().SetSort(bson.D{{Key: "price", Value: 1}}).SetSkip(int64(page*pageSize)).SetLimit(pageSize).
+				SetProjection(bson.D{{Key: "description", Value: 0}})))
+		return err
+	case "product page":
+		err := pc.FindOne(ctx, bson.D{{Key: "_id", Value: sku(p.pickProduct())}}).Err()
+		return ignoreNone(err)
+	case "filter by price":
+		lo := float64(p.rng.Intn(400))
+		_, err := drain(pc.Find(ctx, bson.D{
+			{Key: "category", Value: category(int(p.catZ.Uint64()))},
+			{Key: "price", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: lo + 50}}},
+		}, options.Find().SetSort(bson.D{{Key: "price", Value: 1}}).SetLimit(pageSize).
+			SetProjection(bson.D{{Key: "description", Value: 0}})))
+		return err
+	case "add to cart":
+		_, err := carts.UpdateOne(ctx, bson.D{{Key: "_id", Value: p.cust}}, bson.D{
+			{Key: "$push", Value: bson.D{{Key: "items", Value: bson.D{
+				{Key: "sku", Value: sku(p.pickProduct())}, {Key: "qty", Value: 1 + p.rng.Intn(2)}}}}},
+			{Key: "$set", Value: bson.D{{Key: "updatedAt", Value: time.Now()}}},
+		}, options.UpdateOne().SetUpsert(true))
+		return err
+	case "checkout":
+		return s.checkout(ctx, p)
+	case "my orders":
+		cur, err := s.orders.Find(ctx, bson.D{{Key: "customer", Value: p.cust}},
+			options.Find().SetSort(bson.D{{Key: "at", Value: -1}}).SetLimit(10).
+				SetProjection(bson.D{{Key: "note", Value: 0}}))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = cur.Close(ctx) }()
+		p.recent = p.recent[:0]
+		for cur.Next(ctx) {
+			if id, ok := cur.Current.Lookup("_id").ObjectIDOK(); ok {
+				p.recent = append(p.recent, id)
+			}
+		}
+		return cur.Err()
+	case "open one of my orders":
+		if len(p.recent) == 0 {
+			return s.shopperStep(ctx, p, "my orders")
+		}
+		id := p.recent[p.rng.Intn(len(p.recent))]
+		return ignoreNone(s.orders.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Err())
+	case "customer profile":
+		return ignoreNone(cc.FindOne(ctx, bson.D{{Key: "_id", Value: p.cust}}).Err())
+	case "old order (support)":
+		// A return or a dispute: any order of the last three years, evenly.
+		seq := p.rng.Intn(s.w.n)
+		return ignoreNone(s.orders.FindOne(ctx, bson.D{{Key: "_id", Value: idAt(s.w.atOf(seq), seq)}}).Err())
+	}
+	return fmt.Errorf("unknown step %q", name)
+}
+
+// checkout is what pressing the button costs: read the cart, place the order,
+// take the stock, empty the cart. Timed as one operation.
+func (s *store) checkout(ctx context.Context, p *shopper) error {
+	carts, pc := s.db.Collection("carts"), s.db.Collection("products")
+	var cart struct {
+		Items []struct {
+			SKU string `bson:"sku"`
+			Qty int    `bson:"qty"`
+		} `bson:"items"`
+	}
+	err := carts.FindOne(ctx, bson.D{{Key: "_id", Value: p.cust}}).Decode(&cart)
+	if err != nil && err != mongo.ErrNoDocuments {
+		return err
+	}
+	if len(cart.Items) == 0 {
+		cart.Items = append(cart.Items, struct {
+			SKU string `bson:"sku"`
+			Qty int    `bson:"qty"`
+		}{sku(p.pickProduct()), 1})
+	}
+	items, total := bson.A{}, 0.0
+	for _, it := range cart.Items {
+		price := float64(100+p.rng.Intn(50000)) / 100
+		total += price * float64(it.Qty)
+		items = append(items, bson.D{{Key: "sku", Value: it.SKU}, {Key: "qty", Value: it.Qty}, {Key: "price", Value: price}})
+	}
+	now := time.Now()
+	seq := s.w.n + int(s.placed.Add(1)) + int(p.rng.Int31())<<20
+	if _, err := s.orders.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: idAt(now, seq)}, {Key: "at", Value: now}, {Key: "customer", Value: p.cust},
+		{Key: "status", Value: "placed"}, {Key: "total", Value: total}, {Key: "items", Value: items},
+		{Key: "note", Value: padding(p.rng, s.w.pad)},
+	}); err != nil {
+		return err
+	}
+	for _, it := range cart.Items {
+		if _, err := pc.UpdateOne(ctx, bson.D{{Key: "_id", Value: it.SKU}},
+			bson.D{{Key: "$inc", Value: bson.D{{Key: "stock", Value: -it.Qty}}}}); err != nil {
+			return err
+		}
+	}
+	_, err = carts.UpdateOne(ctx, bson.D{{Key: "_id", Value: p.cust}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "items", Value: bson.A{}}}}})
+	return err
+}
+
+// ship takes the oldest order still placed and marks it shipped, which is what
+// a fulfilment worker does all day.
+func (s *store) ship(rng *rand.Rand) error {
+	err := s.orders.FindOneAndUpdate(context.Background(),
+		bson.D{{Key: "status", Value: "placed"}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: "shipped"}, {Key: "shippedAt", Value: time.Now()}}}},
+		options.FindOneAndUpdate().SetSort(bson.D{{Key: "at", Value: 1}})).Err()
+	if err == mongo.ErrNoDocuments {
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}
+	return err
+}
+
+func (s *store) reprice(rng *rand.Rand) error {
+	_, err := s.db.Collection("products").UpdateOne(context.Background(),
+		bson.D{{Key: "_id", Value: sku(rng.Intn(products))}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: "price", Value: float64(100+rng.Intn(50000)) / 100}}}})
+	return err
+}
+
+func (s *store) salesByHour(rng *rand.Rand) error {
+	cur, err := s.orders.Aggregate(context.Background(), mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().Add(-24 * time.Hour)}}}}}},
+		{{Key: "$group", Value: bson.D{{Key: "_id", Value: bson.D{{Key: "$hour", Value: "$at"}}},
+			{Key: "orders", Value: bson.D{{Key: "$sum", Value: 1}}}, {Key: "revenue", Value: bson.D{{Key: "$sum", Value: "$total"}}}}}},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cur.Close(context.Background()) }()
+	for cur.Next(context.Background()) {
+	}
+	return cur.Err()
+}
+
+func (s *store) topSellers(rng *rand.Rand) error {
+	cur, err := s.orders.Aggregate(context.Background(), mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().Add(-7 * 24 * time.Hour)}}}}}},
+		{{Key: "$unwind", Value: "$items"}},
+		{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$items.sku"}, {Key: "sold", Value: bson.D{{Key: "$sum", Value: "$items.qty"}}}}}},
+		{{Key: "$sort", Value: bson.D{{Key: "sold", Value: -1}}}},
+		{{Key: "$limit", Value: 10}},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cur.Close(context.Background()) }()
+	for cur.Next(context.Background()) {
+	}
+	return cur.Err()
+}
+
+func ignoreNone(err error) error {
+	if err == mongo.ErrNoDocuments {
+		return nil
+	}
+	return err
+}
