@@ -297,7 +297,7 @@ func (c *Cache) unproven(q Query) {
 	c.Unproven.Add(1)
 	c.mu.Lock()
 	key := q.entryKey()
-	delete(c.pending, key)
+	delete(c.filling, key)
 	if len(c.unprovenAt) >= maxUnproven {
 		clear(c.unprovenAt)
 	}
@@ -316,7 +316,7 @@ func hasEq(q Query, field string) bool {
 
 func (c *Cache) unpend(q Query) {
 	c.mu.Lock()
-	delete(c.pending, q.entryKey())
+	delete(c.filling, q.entryKey())
 	c.mu.Unlock()
 }
 

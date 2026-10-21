@@ -2,6 +2,7 @@ package livecache
 
 import (
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -123,6 +124,50 @@ func TestReadYourWrites(t *testing.T) {
 	c.Advance(bson.Timestamp{T: 20})
 	if _, hit := c.Get(q); !hit {
 		t.Fatal("not served once the stream reached the write")
+	}
+}
+
+// With a bound, an acknowledged write may go unapplied for that long and no
+// longer, measured from the oldest one the stream has not reached.
+func TestBoundedStaleness(t *testing.T) {
+	c := New(1 << 20)
+	c.SetMaxStaleness(50 * time.Millisecond)
+	t0 := time.Unix(1_000_000, 0)
+	clock := t0
+	c.now = func() time.Time { return clock }
+	q := listQuery(t, "a", 1)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+	served := func() bool { _, hit := c.Get(q); return hit }
+
+	c.NoteWrite("shop.products", bson.Timestamp{T: 10})
+	clock = t0.Add(40 * time.Millisecond)
+	c.NoteWrite("shop.products", bson.Timestamp{T: 20})
+	if !served() {
+		t.Fatal("not served with every unapplied write inside the bound")
+	}
+	// The first write is now 60ms old and the second 20ms: the first decides.
+	clock = t0.Add(60 * time.Millisecond)
+	if served() {
+		t.Fatal("served with a write older than the bound still unapplied")
+	}
+	// The stream reaches the first, and the second is inside the bound.
+	c.Advance(bson.Timestamp{T: 10})
+	if !served() {
+		t.Fatal("not served once only a write inside the bound was left")
+	}
+	clock = t0.Add(95 * time.Millisecond)
+	if served() {
+		t.Fatal("served with the second write past the bound")
+	}
+	c.Advance(bson.Timestamp{T: 20})
+	if !served() {
+		t.Fatal("not served once the stream reached every write")
+	}
+	// A whole database's write holds every namespace in it the same way.
+	c.NoteWriteDB("shop", bson.Timestamp{T: 30})
+	clock = t0.Add(200 * time.Millisecond)
+	if served() {
+		t.Fatal("served past a database write older than the bound")
 	}
 }
 

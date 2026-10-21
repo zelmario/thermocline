@@ -918,6 +918,9 @@ func (r RouterConfig) Validate() error {
 	default:
 		return fmt.Errorf("router.copy_up_reads must be always, repeated or never, got %q", r.CopyUpReads)
 	}
+	if r.LiveCache.MaxStaleness < 0 {
+		return errors.New("router.live_cache.max_staleness cannot be negative")
+	}
 	if r.LiveCache.Enabled && r.LiveCache.MaxBytes <= 0 {
 		return errors.New("router.live_cache.max_bytes must be positive")
 	}
@@ -1104,6 +1107,14 @@ type LiveCacheConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// MaxBytes bounds the documents it holds, least recently used first.
 	MaxBytes int `yaml:"max_bytes"`
+	// MaxStaleness is how long a write this router acknowledged may go
+	// unapplied while the cache still answers its collection. Zero, the
+	// default, is read-your-writes: a write sends every read of its
+	// collection to mongod until the change stream has applied it, which on a
+	// collection written all the time is nearly every read. A bound is the
+	// model ReadySet uses: an answer may miss a write, but never one
+	// acknowledged longer ago than this. See livecache.SetMaxStaleness.
+	MaxStaleness Duration `yaml:"max_staleness"`
 }
 
 // CacheConfig is the learned-TTL query cache.

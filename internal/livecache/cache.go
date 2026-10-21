@@ -36,20 +36,26 @@ type Cache struct {
 	// refusedNS are namespaces never to answer, such as one with a collation.
 	refusedNS map[string]bool
 
-	// applied is how far the change stream has been applied, and lastWrite is
-	// the newest write this router acknowledged per namespace. A namespace is
-	// served only while applied has reached its last write. See Fresh.
-	applied   bson.Timestamp
-	lastWrite map[string]bson.Timestamp
-	// lastWriteDB is the same for writes naming a whole database.
-	lastWriteDB map[string]bson.Timestamp
+	// applied is how far the change stream has been applied, and pending are
+	// the writes this router acknowledged per namespace that it has not yet
+	// applied, oldest first. A namespace is served while none of them is older
+	// than maxStale. See fresh.
+	applied bson.Timestamp
+	pending map[string][]pendingWrite
+	// pendingDB is the same for writes naming a whole database.
+	pendingDB map[string][]pendingWrite
+	// maxStale is how long an acknowledged write may go unapplied while the
+	// cache still answers. Zero is read-your-writes. See SetMaxStaleness.
+	maxStale time.Duration
+	// now is the clock, replaceable in tests.
+	now func() time.Time
 
 	// readers are the users mongod has let read each namespace lately. See
 	// Allowed.
 	readers map[string]map[string]time.Time
 
 	fillq   chan Query
-	pending map[string]bool
+	filling map[string]bool
 	// unprovenAt are tiered entries a fill could not prove, by when, so the
 	// same miss does not cost a second read of the fast tier every time.
 	unprovenAt map[string]time.Time
@@ -119,20 +125,21 @@ type doc struct {
 // New makes an empty cache bounded to maxBytes of documents.
 func New(maxBytes int) *Cache {
 	return &Cache{
-		maxBytes:    maxBytes,
-		lru:         list.New(),
-		entries:     map[string]*entry{},
-		shapes:      map[string]map[string]*shape{},
-		rev:         map[string]map[*entry]struct{}{},
-		refused:     map[string]bool{},
-		refusedNS:   map[string]bool{},
-		lastWrite:   map[string]bson.Timestamp{},
-		lastWriteDB: map[string]bson.Timestamp{},
-		readers:     map[string]map[string]time.Time{},
-		fillq:       make(chan Query, 1024),
-		pending:     map[string]bool{},
-		unprovenAt:  map[string]time.Time{},
-		plainNS:     map[string]bool{},
+		maxBytes:   maxBytes,
+		lru:        list.New(),
+		entries:    map[string]*entry{},
+		shapes:     map[string]map[string]*shape{},
+		rev:        map[string]map[*entry]struct{}{},
+		refused:    map[string]bool{},
+		refusedNS:  map[string]bool{},
+		pending:    map[string][]pendingWrite{},
+		pendingDB:  map[string][]pendingWrite{},
+		now:        time.Now,
+		readers:    map[string]map[string]time.Time{},
+		fillq:      make(chan Query, 1024),
+		filling:    map[string]bool{},
+		unprovenAt: map[string]time.Time{},
+		plainNS:    map[string]bool{},
 	}
 }
 
@@ -170,24 +177,94 @@ func (c *Cache) Proved(ns, user string) {
 	m[user] = time.Now()
 }
 
+// pendingWrite is one acknowledged write not yet applied: its position, and
+// when it was acknowledged.
+type pendingWrite struct {
+	ts bson.Timestamp
+	at time.Time
+}
+
+// maxPending bounds the writes remembered per namespace. Past it the two
+// oldest are merged, which keeps the earlier time and the later position, so
+// the merged write is waited for sooner and for longer: stricter, never laxer.
+const maxPending = 4096
+
+// SetMaxStaleness sets how long a write this router acknowledged may go
+// unapplied while the cache still answers its namespace. Called before Run.
+//
+// Zero, the default, is read-your-writes: after a write to a namespace, every
+// read of it goes to mongod until the change stream has applied the write. On
+// a namespace written all the time that is every read, which is what measuring
+// a store found: 1.68 million reads held for the stream against 196,000
+// answered. A bound is what ReadySet offers, and less than it promises, since
+// ReadySet's answers lag its replication stream by however long that takes:
+// here an answer may miss a write, but never one acknowledged more than d ago.
+func (c *Cache) SetMaxStaleness(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxStale = d
+}
+
 // NoteWrite records that this router acknowledged a write to ns at or before
-// at. Until the change stream is applied that far, ns is answered by mongod, so
-// a client always reads what it has just written.
+// at. Until the change stream is applied that far, ns is answered by mongod
+// once the write is older than the staleness bound, and at once with no bound,
+// so a client reads what it has just written. See SetMaxStaleness.
 func (c *Cache) NoteWrite(ns string, at bson.Timestamp) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if after(at, c.lastWrite[ns]) {
-		c.lastWrite[ns] = at
-	}
+	c.pending[ns] = c.noteWrite(c.pending[ns], at)
 }
 
 // NoteWriteDB is NoteWrite for a write whose namespace is a whole database.
 func (c *Cache) NoteWriteDB(db string, at bson.Timestamp) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if after(at, c.lastWriteDB[db]) {
-		c.lastWriteDB[db] = at
+	c.pendingDB[db] = c.noteWrite(c.pendingDB[db], at)
+}
+
+func (c *Cache) noteWrite(q []pendingWrite, ts bson.Timestamp) []pendingWrite {
+	if !after(ts, c.applied) {
+		return q
 	}
+	now := c.now()
+	// Writes within a millisecond of each other are one: the bound is
+	// measured from the earliest, and the position is the newest.
+	if n := len(q); n > 0 && now.Sub(q[n-1].at) < time.Millisecond {
+		if after(ts, q[n-1].ts) {
+			q[n-1].ts = ts
+		}
+		return q
+	}
+	q = append(q, pendingWrite{ts: ts, at: now})
+	if len(q) > maxPending {
+		if after(q[0].ts, q[1].ts) {
+			q[1].ts = q[0].ts
+		}
+		q[1].at = q[0].at
+		q = q[1:]
+	}
+	return q
+}
+
+// fresh reports whether a namespace's pending writes allow an answer, and
+// forgets those the stream has applied. Called with mu held.
+func (c *Cache) fresh(m map[string][]pendingWrite, key string, now time.Time) bool {
+	q := m[key]
+	i := 0
+	// Positions only go up along the queue, but a merge can raise one
+	// above its successor's, so this stops at the first unapplied write.
+	for i < len(q) && !after(q[i].ts, c.applied) {
+		i++
+	}
+	if i == len(q) {
+		delete(m, key)
+		return true
+	}
+	if i > 0 {
+		q = q[i:]
+		m[key] = q
+	}
+	return c.maxStale > 0 && now.Sub(q[0].at) < c.maxStale
 }
 
 func after(a, b bson.Timestamp) bool {
@@ -203,7 +280,8 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		return nil, false
 	}
 	db, _ := splitNS(q.NS)
-	if after(c.lastWrite[q.NS], c.applied) || after(c.lastWriteDB[db], c.applied) {
+	now := c.now()
+	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) {
 		c.mu.Unlock()
 		c.Behind.Add(1)
 		return nil, false
@@ -241,7 +319,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 func (c *Cache) requestFill(q Query) {
 	c.mu.Lock()
 	key := q.entryKey()
-	if c.pending[key] {
+	if c.filling[key] {
 		c.mu.Unlock()
 		return
 	}
@@ -252,7 +330,7 @@ func (c *Cache) requestFill(q Query) {
 		}
 		delete(c.unprovenAt, key)
 	}
-	c.pending[key] = true
+	c.filling[key] = true
 	c.mu.Unlock()
 	// Its values point into the client's message, which is reused once the
 	// reply is sent, and the fill runs after that.
@@ -261,7 +339,7 @@ func (c *Cache) requestFill(q Query) {
 	case c.fillq <- q:
 	default:
 		c.mu.Lock()
-		delete(c.pending, key)
+		delete(c.filling, key)
 		c.mu.Unlock()
 	}
 }
@@ -271,7 +349,7 @@ func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := q.entryKey()
-	delete(c.pending, key)
+	delete(c.filling, key)
 	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
 		return
 	}
