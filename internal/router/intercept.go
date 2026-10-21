@@ -239,7 +239,9 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// collation, hint and read concern across, and the freshness wait a miss
 	// needs before it can treat the archive's copy as the truth happens inside
 	// answerFromArchive with every other archive read.
+	c.archivePoint = &id
 	out, err := c.answerFromArchive(ctx, msg, db, coll, false)
+	c.archivePoint = nil
 	if err != nil {
 		return nil, err
 	}

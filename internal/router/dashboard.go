@@ -156,6 +156,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"copied_up":                r.Stats.CopiedUp.Load(),
 			"incomplete":               r.Stats.Incomplete.Load(),
 			"newest_first":             r.Stats.NewestFirst.Load(),
+			"point_reads_unwaited":     r.Stats.PointReadsUnwaited.Load(),
 			"superseded_cursors":       r.Stats.SupersededCursors.Load(),
 			"panics":                   r.Stats.Panics.Load(),
 			"refused":                  r.Stats.Refused.Load(),

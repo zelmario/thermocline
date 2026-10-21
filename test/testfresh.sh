@@ -194,6 +194,52 @@ done
 chk "and once mirroring catches up it is gone"     "0" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:301}))")"
 
+echo "== a point read of a deleted archived document, with the feeder running =="
+# A read by _id the fast tier misses asks the fast tier's oplog whether the
+# document was deleted after the feeder's position, instead of waiting for
+# every write to be mirrored. See pointfresh.go. This is the read it must get
+# right: the document lived only in the archive, the router copied it up to
+# delete it, and the tombstone is still on its way when the read arrives. The
+# oplog holds that delete, so the read has to wait as it did before.
+#
+# The feeder keeps running, because with it stopped there is no position and
+# the check never runs: that section above passes whatever this does.
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:40},(_,k)=>({_id:400+k, n:400+k, grp:'d'})))" >/dev/null
+SR0=$(staleReads)
+PLOOP=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  let back = 0;
+  for (let i = 400; i < 420; i++) {
+    c.deleteOne({_id:i});
+    if (c.findOne({_id:i}) !== null) back++;
+  }
+  print(back);")
+SR1=$(staleReads)
+ADMITTED=$(( ${SR1:-0} - ${SR0:-0} ))
+echo "      ${PLOOP:-?} of twenty deleted documents came back, and the router admitted $ADMITTED stale read(s)"
+chk "a deleted document read by _id comes back only if admitted" "true" \
+    "$(awk -v m="${PLOOP:-x}" -v a="$ADMITTED" 'BEGIN{print (m ~ /^[0-9]+$/ && m+0 <= a+0) ? "true" : "false"}')"
+# And the reads it exists for: documents nobody has touched, answered from the
+# archive without the wait. The counter says the check answered, not the wait.
+U0=$(curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -o '"point_reads_unwaited"[: ]*[0-9]*' | grep -o '[0-9]*$')
+FOUND=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  let n = 0;
+  for (let i = 420; i < 440; i++) if (c.findOne({_id:i}) !== null) n++;
+  print(n);")
+U1=$(curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -o '"point_reads_unwaited"[: ]*[0-9]*' | grep -o '[0-9]*$')
+chk "untouched archived documents are all found"       "20" "$FOUND"
+chk "  and answered without the wait"                  "true" \
+    "$([ $(( ${U1:-0} - ${U0:-0} )) -ge 10 ] && echo true || echo "false (${U0:-?} -> ${U1:-?})")"
+# Gone from both tiers, tombstones included, or the sections below count them.
+# The reads above copied some up, so the fast tier holds them too.
+sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})" >/dev/null
+sleep 1
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})" >/dev/null
+
 echo "== every deleted document that comes back is one the router admitted =="
 # The section above asks the question once. This asks it eight times, through
 # both of the paths a delete can take, and counts.

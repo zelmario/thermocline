@@ -313,8 +313,12 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// was found by find and not counted by countDocuments.
 	budget := maxTimeBudget(cmd)
 	waitedFrom := time.Now()
-	if ferr := c.archiveReadIsFresh(ctx, db+"."+coll, waitedFrom, budget); ferr != nil {
-		return nil, ferr
+	// A read of one document by _id asks the oplog whether it was deleted
+	// rather than waiting for every write to be mirrored. See pointfresh.go.
+	if c.archivePoint == nil || !c.r.pointReadIsFresh(ctx, db+"."+coll, *c.archivePoint) {
+		if ferr := c.archiveReadIsFresh(ctx, db+"."+coll, waitedFrom, budget); ferr != nil {
+			return nil, ferr
+		}
 	}
 
 	// The archive gets what is left of the caller's deadline, not the whole of

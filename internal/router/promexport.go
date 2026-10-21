@@ -59,6 +59,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	// every other counter here into a rate.
 	counter("commands_total", "Client commands the router handled.", snap.Counters["commands"])
 	counter("newest_first_total", "Reads for the newest N the fast tier proved it could answer from its own reply. Each one is an archive round trip that did not happen.", snap.Counters["newest_first"])
+	counter("point_reads_unwaited_total", "Reads by _id answered from the archive without the freshness wait, because the fast tier's oplog showed no delete of that document waiting to be mirrored.", snap.Counters["point_reads_unwaited"])
 	counter("warmed_for_txn_total", "Documents brought up so a transaction could run against the fast tier alone.", snap.Counters["warmed_for_txn"])
 	counter("read_misses_total", "Point lookups that found the document only in the archive.", snap.Counters["read_misses"])
 	counter("write_misses_total", "Writes that matched nothing on the fast tier and found the document in the archive.", snap.Counters["write_misses"])

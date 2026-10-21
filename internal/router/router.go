@@ -256,6 +256,10 @@ type Stats struct {
 	// could answer from its own reply. Each one is an archive round trip that
 	// did not happen. See newestfirst.go.
 	NewestFirst atomic.Int64
+	// PointReadsUnwaited counts reads by _id answered from the archive
+	// without the freshness wait, because the fast tier's oplog showed no
+	// delete of that document waiting to be mirrored. See pointfresh.go.
+	PointReadsUnwaited atomic.Int64
 	// SupersededCursors counts fast tier cursors closed because the archive's
 	// answer replaced the one they belonged to. See superseded.go.
 	SupersededCursors atomic.Int64
@@ -939,6 +943,11 @@ type conn struct {
 	// and cannot be moved. See upstreamMember.
 	dialed string
 	log    *slog.Logger
+
+	// archivePoint is the _id of the document a point read is about to ask
+	// the archive for, set only around that call, so answerFromArchive can ask
+	// the oplog instead of waiting. See pointfresh.go.
+	archivePoint *bson.RawValue
 
 	// cls is how the command in flight was served. Every path that does
 	// something other than hand the command to the fast tier sets it, and pump
