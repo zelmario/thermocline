@@ -188,7 +188,15 @@ func (p *shopper) planVisit() {
 		p.browse(2 + p.geom(3))
 		return
 	}
-	p.cust = custID(int(p.custZ.Uint64()))
+	// Most visits are from a customer who seldom comes back, so four in five
+	// are any customer at all and one in five a regular. A Zipf over all of
+	// them alone put half the logged-in visits on the same thousand customers
+	// out of 25 million, which makes every cache look better than it is.
+	if p.rng.Intn(5) == 0 {
+		p.cust = custID(int(p.custZ.Uint64()))
+	} else {
+		p.cust = custID(p.rng.Intn(customers))
+	}
 	if p.rng.Float64() < 0.25 {
 		p.plan = append(p.plan, "my orders")
 		if p.rng.Float64() < 0.6 {
