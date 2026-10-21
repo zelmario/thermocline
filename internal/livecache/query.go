@@ -1,0 +1,609 @@
+// Package livecache keeps the answers to a router's commonest reads in memory
+// and keeps them right as the data changes, rather than throwing them away.
+//
+// The query cache in package cache stores whole replies and drops them when a
+// write could have changed them. On a shop that is the whole problem: every
+// checkout changes a product's stock, so every product listing is dropped many
+// times a second and almost nothing is ever served. Measured on a store
+// workload over 40 million orders: 3.1% of reads answered, and throughput lower
+// with it on than off.
+//
+// This follows the idea ReadySet is built on: a cached answer is a view, keyed
+// by the values the query was asked with, and the database's own change stream
+// is applied to it as it happens. A product whose stock changed is replaced in
+// every listing that holds it, in its sorted place, instead of the listings
+// being thrown away. Only what ReadySet calls partial views are kept: an entry
+// exists once somebody asked for it, and is filled by asking MongoDB.
+//
+// It is deliberately narrow, and says no to anything whose answer it could get
+// wrong: equality filters on top-level fields, a sort, a skip and a limit, a
+// projection of top-level fields, and counts over the same filters. Arrays,
+// nulls, collations, mixed types in a sort and operators are all answered by
+// MongoDB, as before.
+package livecache
+
+import (
+	"math"
+	"math/big"
+	"sort"
+	"strings"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+)
+
+// Kind is what a cached answer is.
+type Kind int
+
+const (
+	// KindFind is a list of documents, from find.
+	KindFind Kind = iota
+	// KindCount is a number, from the count command.
+	KindCount
+	// KindCountAgg is a number asked for as a pipeline, which is how drivers
+	// send countDocuments: [{$match}, {$group: {_id: K, n: {$sum: 1}}}].
+	KindCountAgg
+)
+
+// Query is a read this package can answer, taken apart.
+type Query struct {
+	Kind Kind
+	NS   string
+	// Eq are the filter's field = value pairs, sorted by field.
+	Eq []EqPair
+	// Sort is the sort, in order. Empty for a count.
+	Sort        []SortKey
+	Skip, Limit int
+	Proj        Projection
+	// GroupID is the _id a counting pipeline groups under, echoed back.
+	GroupID bson.RawValue
+	// CountField is the name the counting pipeline gives its total.
+	CountField string
+	// Limit and skip of a count command.
+	CountSkip, CountLimit int
+}
+
+// EqPair is one field = value in a filter.
+type EqPair struct {
+	Field string
+	Value bson.RawValue
+	key   string
+}
+
+// SortKey is one field of a sort.
+type SortKey struct {
+	Field string
+	Desc  bool
+}
+
+// Projection is an inclusion or exclusion of top-level fields.
+type Projection struct {
+	Set     bool
+	Include bool
+	Fields  map[string]bool
+	NoID    bool
+}
+
+// maxWindow bounds how deep into a sorted list an entry reaches.
+const maxWindow = 500
+
+// ParseFind takes a find command apart, or reports that it cannot be answered
+// here. ns is db.collection.
+func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
+	q := Query{Kind: KindFind, NS: ns, Limit: 0}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return q, false
+	}
+	batchSize := -1
+	singleBatch := false
+	for _, e := range elems {
+		k, v := e.Key(), e.Value()
+		switch k {
+		case "find", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference", "txnNumber":
+			if k == "txnNumber" {
+				return q, false
+			}
+		case "readConcern":
+			if !plainReadConcern(v) {
+				return q, false
+			}
+		case "filter":
+			d, ok := v.DocumentOK()
+			if !ok {
+				return q, false
+			}
+			eq, ok := parseEq(d)
+			if !ok {
+				return q, false
+			}
+			q.Eq = eq
+		case "sort":
+			d, ok := v.DocumentOK()
+			if !ok {
+				return q, false
+			}
+			s, ok := parseSort(d)
+			if !ok {
+				return q, false
+			}
+			q.Sort = s
+		case "projection":
+			d, ok := v.DocumentOK()
+			if !ok {
+				return q, false
+			}
+			p, ok := parseProjection(d)
+			if !ok {
+				return q, false
+			}
+			q.Proj = p
+		case "skip":
+			n, ok := asInt(v)
+			if !ok || n < 0 {
+				return q, false
+			}
+			q.Skip = n
+		case "limit":
+			n, ok := asInt(v)
+			if !ok {
+				return q, false
+			}
+			if n < 0 {
+				n, singleBatch = -n, true
+			}
+			q.Limit = n
+		case "batchSize":
+			n, ok := asInt(v)
+			if !ok || n < 0 {
+				return q, false
+			}
+			batchSize = n
+		case "singleBatch":
+			b, ok := v.BooleanOK()
+			if !ok {
+				return q, false
+			}
+			singleBatch = b
+		default:
+			// hint, collation, min, max, returnKey, showRecordId, tailable,
+			// allowPartialResults, let, and anything a later server adds.
+			return q, false
+		}
+	}
+	// A list with no limit is the whole match, and a list longer than the
+	// window would be half an answer.
+	if q.Limit == 0 || q.Skip+q.Limit > maxWindow {
+		return q, false
+	}
+	// The reply has to be one batch with the cursor closed, which is what the
+	// client then expects: a batch smaller than the answer leaves a cursor this
+	// cache does not have.
+	if batchSize >= 0 && batchSize < q.Limit && !singleBatch {
+		return q, false
+	}
+	return q, true
+}
+
+// ParseCount takes a count command apart.
+func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
+	q := Query{Kind: KindCount, NS: ns}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return q, false
+	}
+	for _, e := range elems {
+		k, v := e.Key(), e.Value()
+		switch k {
+		case "count", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference":
+		case "readConcern":
+			if !plainReadConcern(v) {
+				return q, false
+			}
+		case "query":
+			d, ok := v.DocumentOK()
+			if !ok {
+				return q, false
+			}
+			eq, ok := parseEq(d)
+			if !ok {
+				return q, false
+			}
+			q.Eq = eq
+		case "skip", "limit":
+			n, ok := asInt(v)
+			if !ok || n != 0 {
+				return q, false
+			}
+		default:
+			return q, false
+		}
+	}
+	return q, true
+}
+
+// ParseCountAgg recognises the counting pipeline drivers send for
+// countDocuments, and nothing else.
+func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
+	q := Query{Kind: KindCountAgg, NS: ns}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return q, false
+	}
+	var pipe bson.Raw
+	for _, e := range elems {
+		k, v := e.Key(), e.Value()
+		switch k {
+		case "aggregate", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference", "cursor":
+		case "readConcern":
+			if !plainReadConcern(v) {
+				return q, false
+			}
+		case "pipeline":
+			a, ok := v.ArrayOK()
+			if !ok {
+				return q, false
+			}
+			pipe = bson.Raw(a)
+		default:
+			return q, false
+		}
+	}
+	stages, err := pipe.Values()
+	if err != nil || len(stages) < 1 || len(stages) > 2 {
+		return q, false
+	}
+	at := 0
+	if len(stages) == 2 {
+		d, ok := stages[0].DocumentOK()
+		if !ok {
+			return q, false
+		}
+		m, ok := single(d, "$match")
+		if !ok {
+			return q, false
+		}
+		md, ok := m.DocumentOK()
+		if !ok {
+			return q, false
+		}
+		eq, ok := parseEq(md)
+		if !ok {
+			return q, false
+		}
+		q.Eq = eq
+		at = 1
+	}
+	gd, ok := stages[at].DocumentOK()
+	if !ok {
+		return q, false
+	}
+	g, ok := single(gd, "$group")
+	if !ok {
+		return q, false
+	}
+	gdoc, ok := g.DocumentOK()
+	if !ok {
+		return q, false
+	}
+	ge, err := gdoc.Elements()
+	if err != nil || len(ge) != 2 || ge[0].Key() != "_id" {
+		return q, false
+	}
+	id := ge[0].Value()
+	switch id.Type {
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeNull, bson.TypeString:
+		if id.Type == bson.TypeString && strings.HasPrefix(id.StringValue(), "$") {
+			return q, false
+		}
+	default:
+		return q, false
+	}
+	sum, ok := ge[1].Value().DocumentOK()
+	if !ok {
+		return q, false
+	}
+	one, ok := single(sum, "$sum")
+	if !ok {
+		return q, false
+	}
+	if n, ok := asInt(one); !ok || n != 1 {
+		return q, false
+	}
+	q.GroupID, q.CountField = id, ge[1].Key()
+	return q, true
+}
+
+func single(d bson.Raw, key string) (bson.RawValue, bool) {
+	e, err := d.Elements()
+	if err != nil || len(e) != 1 || e[0].Key() != key {
+		return bson.RawValue{}, false
+	}
+	return e[0].Value(), true
+}
+
+func plainReadConcern(v bson.RawValue) bool {
+	d, ok := v.DocumentOK()
+	if !ok {
+		return false
+	}
+	e, err := d.Elements()
+	if err != nil {
+		return false
+	}
+	for _, x := range e {
+		if x.Key() != "level" {
+			return false
+		}
+		s, ok := x.Value().StringValueOK()
+		if !ok || (s != "local" && s != "majority" && s != "available") {
+			return false
+		}
+	}
+	return true
+}
+
+// parseEq accepts a filter of top-level field: literal pairs and nothing else.
+func parseEq(filter bson.Raw) ([]EqPair, bool) {
+	e, err := filter.Elements()
+	if err != nil {
+		return nil, false
+	}
+	out := make([]EqPair, 0, len(e))
+	for _, x := range e {
+		k := x.Key()
+		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") {
+			return nil, false
+		}
+		key, ok := valueKey(x.Value())
+		if !ok {
+			return nil, false
+		}
+		out = append(out, EqPair{Field: k, Value: x.Value(), key: key})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Field < out[j].Field })
+	for i := 1; i < len(out); i++ {
+		if out[i].Field == out[i-1].Field {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+func parseSort(d bson.Raw) ([]SortKey, bool) {
+	e, err := d.Elements()
+	if err != nil || len(e) > 3 {
+		return nil, false
+	}
+	out := make([]SortKey, 0, len(e))
+	for _, x := range e {
+		k := x.Key()
+		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") {
+			return nil, false
+		}
+		n, ok := asInt(x.Value())
+		if !ok || (n != 1 && n != -1) {
+			return nil, false
+		}
+		out = append(out, SortKey{Field: k, Desc: n == -1})
+	}
+	return out, true
+}
+
+func parseProjection(d bson.Raw) (Projection, bool) {
+	p := Projection{Fields: map[string]bool{}}
+	e, err := d.Elements()
+	if err != nil {
+		return p, false
+	}
+	if len(e) == 0 {
+		return p, true
+	}
+	p.Set = true
+	mode := 0 // 1 include, -1 exclude
+	for _, x := range e {
+		k := x.Key()
+		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") {
+			return p, false
+		}
+		on, ok := truth(x.Value())
+		if !ok {
+			return p, false
+		}
+		if k == "_id" {
+			p.NoID = !on
+			continue
+		}
+		m := -1
+		if on {
+			m = 1
+		}
+		if mode != 0 && m != mode {
+			return p, false
+		}
+		mode = m
+		p.Fields[k] = true
+	}
+	p.Include = mode == 1 || (mode == 0 && !p.NoID)
+	if mode == 0 && p.NoID {
+		// {_id: 0} alone excludes only _id.
+		p.Include = false
+	}
+	return p, true
+}
+
+func truth(v bson.RawValue) (bool, bool) {
+	switch v.Type {
+	case bson.TypeBoolean:
+		return v.Boolean(), true
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+		n, ok := asInt(v)
+		if !ok || (n != 0 && n != 1) {
+			return false, false
+		}
+		return n == 1, true
+	}
+	return false, false
+}
+
+func asInt(v bson.RawValue) (int, bool) {
+	switch v.Type {
+	case bson.TypeInt32:
+		return int(v.Int32()), true
+	case bson.TypeInt64:
+		return int(v.Int64()), true
+	case bson.TypeDouble:
+		f := v.Double()
+		if f != math.Trunc(f) || math.IsInf(f, 0) || math.Abs(f) > 1<<31 {
+			return 0, false
+		}
+		return int(f), true
+	}
+	return 0, false
+}
+
+// valueKey is a value's identity for equality as MongoDB judges it, or false
+// for a value whose equality this does not reproduce.
+//
+// Numbers compare by value whatever their type, so 1, 1.0 and NumberLong(1)
+// are one key. Strings compare by bytes, which is the simple collation; a
+// collection with a default collation is refused before anything gets here.
+// Arrays are left out because {tags: "a"} matches a document whose tags holds
+// "a" among others, and null because it also matches a missing field.
+func valueKey(v bson.RawValue) (string, bool) {
+	switch v.Type {
+	case bson.TypeString:
+		return "s" + v.StringValue(), true
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+		if v.Type == bson.TypeDouble && (math.IsNaN(v.Double()) || math.IsInf(v.Double(), 0)) {
+			return "", false
+		}
+		return "n" + exact(v).Text('g', -1), true
+	case bson.TypeBoolean:
+		if v.Boolean() {
+			return "bt", true
+		}
+		return "bf", true
+	case bson.TypeObjectID:
+		id := v.ObjectID()
+		return "o" + string(id[:]), true
+	case bson.TypeDateTime:
+		return "d" + big.NewInt(v.DateTime()).String(), true
+	}
+	return "", false
+}
+
+func exact(v bson.RawValue) *big.Float {
+	f := new(big.Float).SetPrec(0)
+	switch v.Type {
+	case bson.TypeInt32:
+		return f.SetInt64(int64(v.Int32()))
+	case bson.TypeInt64:
+		return f.SetInt64(v.Int64())
+	}
+	return f.SetFloat64(v.Double())
+}
+
+// bracket is the class a sortable value sorts within. Values of two different
+// brackets in one sort are refused rather than ordered.
+func bracket(v bson.RawValue) string {
+	switch v.Type {
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+		if v.Type == bson.TypeDouble && math.IsNaN(v.Double()) {
+			return ""
+		}
+		return "n"
+	case bson.TypeString:
+		return "s"
+	case bson.TypeDateTime:
+		return "d"
+	case bson.TypeObjectID:
+		return "o"
+	case bson.TypeBoolean:
+		return "b"
+	}
+	return ""
+}
+
+// compareSame orders two values of one bracket the way MongoDB does.
+func compareSame(a, b bson.RawValue) int {
+	switch bracket(a) {
+	case "n":
+		return exact(a).Cmp(exact(b))
+	case "s":
+		return strings.Compare(a.StringValue(), b.StringValue())
+	case "d":
+		x, y := a.DateTime(), b.DateTime()
+		switch {
+		case x < y:
+			return -1
+		case x > y:
+			return 1
+		}
+		return 0
+	case "o":
+		x, y := a.ObjectID(), b.ObjectID()
+		return strings.Compare(string(x[:]), string(y[:]))
+	case "b":
+		x, y := a.Boolean(), b.Boolean()
+		switch {
+		case x == y:
+			return 0
+		case !x:
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// shapeID names everything about a query except the values it was asked with.
+func (q Query) shapeID() string {
+	var b strings.Builder
+	switch q.Kind {
+	case KindFind:
+		b.WriteString("find|")
+	default:
+		b.WriteString("count|")
+	}
+	b.WriteString(q.NS)
+	b.WriteString("|eq:")
+	for _, p := range q.Eq {
+		b.WriteString(p.Field)
+		b.WriteByte(',')
+	}
+	if q.Kind == KindFind {
+		b.WriteString("|sort:")
+		for _, s := range q.Sort {
+			b.WriteString(s.Field)
+			if s.Desc {
+				b.WriteString("-")
+			}
+			b.WriteByte(',')
+		}
+	}
+	return b.String()
+}
+
+// entryKey names one entry: the shape and the values.
+func (q Query) entryKey() string {
+	var b strings.Builder
+	b.WriteString(q.shapeID())
+	for _, p := range q.Eq {
+		b.WriteByte(0)
+		b.WriteString(p.key)
+	}
+	return b.String()
+}
+
+// detached copies everything a query points to, so it can outlive the message
+// it was read from.
+func (q Query) detached() Query {
+	eq := make([]EqPair, len(q.Eq))
+	for i, p := range q.Eq {
+		p.Value = bson.RawValue{Type: p.Value.Type, Value: append([]byte(nil), p.Value.Value...)}
+		eq[i] = p
+	}
+	q.Eq = eq
+	q.GroupID = bson.RawValue{Type: q.GroupID.Type, Value: append([]byte(nil), q.GroupID.Value...)}
+	return q
+}
