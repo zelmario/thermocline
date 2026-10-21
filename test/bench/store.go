@@ -40,9 +40,59 @@ func sku(i int) string      { return fmt.Sprintf("S%05d", i) }
 func category(i int) string { return fmt.Sprintf("cat%03d", i) }
 func custID(i int) string   { return fmt.Sprintf("c%06d", i) }
 
+// resetShopTo puts a loaded shop back the way the load left it, so a cluster
+// that took an hour to fill can be used by test after test.
+//
+// It can be done without reloading because the runs barely touch history. The
+// orders they place are dated after the load ended, and shipping only moves
+// those: the loaded ones are settled. Prices, stock and carts change, and those
+// are reloaded, which takes seconds. Customers are only read. What Thermocline
+// wrote beside the data, its own databases, goes too.
+func resetShopTo(ctx context.Context, cl *mongo.Client, db *mongo.Database, orders *mongo.Collection) error {
+	var m marker
+	if err := db.Collection("bench_meta").FindOne(ctx, bson.D{{Key: "_id", Value: orders.Name()}}).Decode(&m); err != nil {
+		return fmt.Errorf("no load recorded for %s: %w", orders.Name(), err)
+	}
+	end := m.Start.Add(m.Period)
+	res, err := orders.DeleteMany(ctx, bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: end}}}})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("removed %d orders placed after the load ended at %s\n", res.DeletedCount, end.UTC().Format(time.RFC3339))
+	if err := loadProducts(ctx, db, 800); err != nil {
+		return err
+	}
+	if err := db.Collection("carts").Drop(ctx); err != nil {
+		return err
+	}
+	names, err := cl.ListDatabaseNames(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: "^_thermocline"}}}})
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		if err := cl.Database(n).Drop(ctx); err != nil {
+			return err
+		}
+	}
+	n, err := orders.EstimatedDocumentCount(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("restocked %d products, emptied the carts, dropped %v; %d orders\n", products, names, n)
+	return nil
+}
+
 // loadStore stocks the catalogue and the customer list. The products' skus are
 // the ones the loaded orders already name, so top sellers and stock agree.
 func loadStore(ctx context.Context, db *mongo.Database, pad int) error {
+	if err := loadProducts(ctx, db, pad); err != nil {
+		return err
+	}
+	return loadCustomers(ctx, db)
+}
+
+// loadProducts stocks the catalogue, the same every time.
+func loadProducts(ctx context.Context, db *mongo.Database, pad int) error {
 	rng := rand.New(rand.NewSource(11))
 	pc := db.Collection("products")
 	_ = pc.Drop(ctx)
@@ -68,6 +118,13 @@ func loadStore(ctx context.Context, db *mongo.Database, pad int) error {
 		Keys: bson.D{{Key: "category", Value: 1}, {Key: "price", Value: 1}}}); err != nil {
 		return err
 	}
+	return nil
+}
+
+// loadCustomers stocks the customer list.
+func loadCustomers(ctx context.Context, db *mongo.Database) error {
+	rng := rand.New(rand.NewSource(12))
+	docs := make([]any, 0, 1000)
 	cc := db.Collection("customers")
 	_ = cc.Drop(ctx)
 	for i := 0; i < customers; i++ {
