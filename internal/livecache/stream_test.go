@@ -90,7 +90,10 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 			sess, _ := cl.StartSession()
 			defer sess.EndSession(context.Background())
 			for time.Now().Before(deadline) {
-				id := fmt.Sprintf("p%04d", r.Intn(650))
+				// Its own ids: another writer's later write to the same one
+				// would make mongod's answer newer than this writer's, which
+				// is not the cache reading the state before it.
+				id := fmt.Sprintf("p%04d", r.Intn(650/4)*4+w)
 				var err error
 				sctx := mongo.NewSessionContext(ctx, sess)
 				switch r.Intn(5) {
