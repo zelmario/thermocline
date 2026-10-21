@@ -4,9 +4,31 @@ variable "location" {
   default     = "fsn1"
 }
 
-variable "db_server_type" {
-  description = "Server type for the six mongod nodes."
+variable "hot_server_type" {
+  description = <<-EOT
+    Server type for the fast tier's three mongod nodes (rsHot). Empty creates
+    no fast tier, for a phase that measures the baselines alone: the account's
+    Primary IP limit stops ten database nodes and the app node existing at
+    once.
+  EOT
   type        = string
+  default     = ""
+}
+
+variable "cold_server_type" {
+  description = "Server type for the archive's three mongod nodes (rsCold)."
+  type        = string
+}
+
+variable "big_server_type" {
+  description = <<-EOT
+    Server type for a third replica set, rsBig, holding a whole copy of the
+    data for the "MongoDB alone on fast nodes" baseline. Empty creates no such
+    set. It is never part of Thermocline: a baseline that shares a cluster with
+    the archive writes into it behind the router's back.
+  EOT
+  type        = string
+  default     = ""
 }
 
 variable "app_server_type" {

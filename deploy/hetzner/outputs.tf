@@ -23,3 +23,8 @@ output "dba_password" {
   value     = random_password.dba.result
   sensitive = true
 }
+
+output "big_uri" {
+  value     = var.big_server_type == "" ? "" : "mongodb://dba:${random_password.dba.result}@10.20.1.31:27017,10.20.1.32:27017,10.20.1.33:27017/?replicaSet=rsBig&authSource=admin"
+  sensitive = true
+}

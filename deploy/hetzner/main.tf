@@ -4,9 +4,13 @@
 # the public side, and only from admin_cidr.
 
 locals {
-  hot    = { for i in [1, 2, 3] : "hot${i}" => { ip = "10.20.1.${10 + i}", set = "rsHot" } }
-  cold   = { for i in [1, 2, 3] : "cold${i}" => { ip = "10.20.1.${20 + i}", set = "rsCold" } }
-  dbs    = merge(local.hot, local.cold)
+  hot  = var.hot_server_type == "" ? {} : { for i in [1, 2, 3] : "hot${i}" => { ip = "10.20.1.${10 + i}", set = "rsHot" } }
+  cold = { for i in [1, 2, 3] : "cold${i}" => { ip = "10.20.1.${20 + i}", set = "rsCold" } }
+  # The baseline set, only when a type is given for it. See big_server_type.
+  big    = var.big_server_type == "" ? {} : { for i in [1, 2, 3] : "big${i}" => { ip = "10.20.1.${30 + i}", set = "rsBig" } }
+  dbs    = merge(local.hot, local.cold, local.big)
+  sets   = toset(distinct([for k, v in local.dbs : v.set]))
+  type   = { rsHot = var.hot_server_type, rsCold = var.cold_server_type, rsBig = var.big_server_type }
   app_ip = "10.20.1.5"
 }
 
@@ -45,7 +49,7 @@ resource "hcloud_firewall" "ssh_only" {
 # One keyfile per replica set: members of a set authenticate to each other with
 # it, and the two sets never need to.
 resource "random_password" "keyfile" {
-  for_each = toset(["rsHot", "rsCold"])
+  for_each = local.sets
   length   = 756
   special  = false
 }
@@ -58,7 +62,7 @@ resource "random_password" "dba" {
 resource "hcloud_server" "db" {
   for_each     = local.dbs
   name         = "${var.name_prefix}-${each.key}"
-  server_type  = var.db_server_type
+  server_type  = local.type[each.value.set]
   image        = var.image
   location     = var.location
   ssh_keys     = [hcloud_ssh_key.admin.id]
