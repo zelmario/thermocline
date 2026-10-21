@@ -146,8 +146,11 @@ type store struct {
 	placed atomic.Int64
 	// rate, when set, is the shoppers' operations a second in all. See run.
 	rate int
-	// mix is the shopper's mix, one of mixes.
+	// mix is the shopper's mix, one of mixes, unless sessions is set.
 	mix []mixEntry
+	// sessions plans each shopper's steps a visit at a time. See planVisit.
+	sessions bool
+	shipped  atomic.Int64
 }
 
 // shopper is one client's session state: who is shopping, and the orders the
@@ -160,13 +163,73 @@ type shopper struct {
 	cust   string
 	recent []bson.ObjectID
 	ops    int
+	// plan is what is left of the current visit. See planVisit.
+	plan []string
 }
+
+// planVisit is one visit to the shop, the shape of a common one.
+//
+// Three in four visitors never log in: they land on a category or a product,
+// look around a few pages and leave. About one in four is a customer, who may
+// check their orders first, browses, and in about a third of visits puts things
+// in the cart, of which a quarter are bought: two purchases in a hundred
+// visits. One visit in a hundred is a support agent opening an old order. The
+// shares are a design choice, not measured traffic.
+func (p *shopper) planVisit() {
+	p.recent = p.recent[:0]
+	r := p.rng.Float64()
+	switch {
+	case r < 0.01:
+		p.cust = ""
+		p.plan = append(p.plan, "old order (support)")
+		return
+	case r < 0.76:
+		p.cust = ""
+		p.browse(2 + p.geom(3))
+		return
+	}
+	p.cust = custID(int(p.custZ.Uint64()))
+	if p.rng.Float64() < 0.25 {
+		p.plan = append(p.plan, "my orders")
+		if p.rng.Float64() < 0.6 {
+			p.plan = append(p.plan, "open one of my orders")
+		}
+	}
+	if p.rng.Float64() < 0.2 {
+		p.plan = append(p.plan, "customer profile")
+	}
+	p.browse(1 + p.geom(3))
+	if p.rng.Float64() < 0.35 {
+		for n := 1 + p.rng.Intn(3); n > 0; n-- {
+			p.plan = append(p.plan, "product page", "add to cart")
+		}
+		if p.rng.Float64() < 0.25 {
+			p.plan = append(p.plan, "checkout")
+		}
+	}
+}
+
+// browse adds n pages of looking around: categories, products, a price filter.
+func (p *shopper) browse(n int) {
+	for i := 0; i < n; i++ {
+		switch r := p.rng.Intn(100); {
+		case r < 40:
+			p.plan = append(p.plan, "browse a category")
+		case r < 85:
+			p.plan = append(p.plan, "product page")
+		default:
+			p.plan = append(p.plan, "filter by price")
+		}
+	}
+}
+
+func (p *shopper) geom(mean float64) int { return int(p.rng.ExpFloat64() * mean) }
 
 func (s *store) newShopper(seed int64) *shopper {
 	rng := rand.New(rand.NewSource(seed))
 	return &shopper{
 		rng:   rng,
-		custZ: rand.NewZipf(rng, 1.1, 8, customers-1),
+		custZ: rand.NewZipf(rng, 1.1, 8, uint64(customers-1)),
 		catZ:  rand.NewZipf(rng, 1.2, 2, categories-1),
 		prodZ: rand.NewZipf(rng, 1.3, 1, products/categories-1),
 	}
@@ -230,20 +293,28 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 			p := s.newShopper(seed*1000 + int64(k))
 			local := map[string]*opStat{}
 			for time.Now().Before(deadline) {
-				// A new customer every twenty or so steps: a session.
-				if p.ops%20 == 0 {
-					p.cust = custID(int(p.custZ.Uint64()))
-					p.recent = p.recent[:0]
-				}
-				p.ops++
-				r, acc, name := p.rng.Intn(1000), 0, ""
-				for _, op := range s.mix {
-					acc += op.share
-					if r < acc {
-						name = op.name
-						break
+				var name string
+				if s.sessions {
+					if len(p.plan) == 0 {
+						p.planVisit()
+					}
+					name, p.plan = p.plan[0], p.plan[1:]
+				} else {
+					// A new customer every twenty or so steps: a session.
+					if p.ops%20 == 0 {
+						p.cust = custID(int(p.custZ.Uint64()))
+						p.recent = p.recent[:0]
+					}
+					r, acc := p.rng.Intn(1000), 0
+					for _, op := range s.mix {
+						acc += op.share
+						if r < acc {
+							name = op.name
+							break
+						}
 					}
 				}
+				p.ops++
 				pace()
 				timed(local, name, func() error { return s.shopperStep(ctx, p, name) })
 			}
@@ -251,14 +322,18 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 		}(k)
 	}
 	// The back office, at a fixed pace whatever the shopper count.
-	office := func(name string, every time.Duration, f func(*rand.Rand) error) {
+	// office runs a back office task every so often. ready, when given, says
+	// whether there is anything to do; a turn with nothing to do is not timed.
+	office := func(name string, every time.Duration, f func(*rand.Rand) error, ready ...func() bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed + int64(len(name))))
 			local := map[string]*opStat{}
 			for time.Now().Before(deadline) {
-				timed(local, name, func() error { return f(rng) })
+				if len(ready) == 0 || ready[0]() {
+					timed(local, name, func() error { return f(rng) })
+				}
 				time.Sleep(every)
 			}
 			merge(local)
@@ -275,7 +350,16 @@ func (s *store) run(ctx context.Context, d time.Duration, conc int, seed int64) 
 			}
 		}
 	}
-	office("ship the oldest placed order", shipEvery, s.ship)
+	if s.sessions {
+		// Visits decide how much is sold, so the warehouse ships what was
+		// placed, as it is placed, rather than at a rate of its own.
+		office("ship the oldest placed order", 10*time.Millisecond, func(rng *rand.Rand) error {
+			s.shipped.Add(1)
+			return s.ship(rng)
+		}, func() bool { return s.shipped.Load() < s.placed.Load() })
+	} else {
+		office("ship the oldest placed order", shipEvery, s.ship)
+	}
 	office("price change", time.Second, s.reprice)
 	office("report: sales by hour, 24h", 5*time.Second, s.salesByHour)
 	office("report: top sellers, 7 days", 15*time.Second, s.topSellers)

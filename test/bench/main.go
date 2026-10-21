@@ -36,7 +36,12 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-const customers = 200000
+// customers is how many customers the orders belong to. Set by -customers when
+// loading and read back from the load's record when running, so a run asks
+// about the customers the load created. 200,000 was fixed before, which for
+// 200 million orders is a thousand orders a customer; a shop's customer buys a
+// few times in three years, and that is what makes their order history old.
+var customers = 200000
 
 func main() {
 	uri := flag.String("uri", "mongodb://127.0.0.1:27017/", "what to run against")
@@ -54,12 +59,14 @@ func main() {
 	label := flag.String("label", "", "a name for this run in the report")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
 	kind := flag.String("workload", "mix", "mix: the operation mix over orders alone; store: shoppers and a back office over a whole shop")
-	mixName := flag.String("store-mix", "store", "store workload: the shopper's mix, store (write heavy, the first one) or real (a shop's shape: about one step in seventy buys)")
+	mixName := flag.String("store-mix", "store", "store workload: store (write heavy, the first one), real (a shop's shares of steps) or shop (visits: anonymous browsing, logged-in customers, a purchase funnel)")
+	custN := flag.Int("customers", customers, "with -load or -load-store: how many customers the orders belong to; a run reads it back from the load")
 	rate := flag.Int("rate", 0, "store workload: hold the shoppers to this many operations a second in all, and ship every 20ms, so every target does the same work (0: as fast as they can)")
 	loadStoreFlag := flag.Bool("load-store", false, "stock the shop's products and customers in -ns's database, then stop")
 	metaURI := flag.String("meta-uri", "", "where the load was recorded, when -uri is a router: "+
 		"the record lives beside the data, in a collection the router does not tier")
 	flag.Parse()
+	customers = *custN
 
 	ctx := context.Background()
 	cl, err := mongo.Connect(options.Client().ApplyURI(*uri).SetMaxPoolSize(uint64(*conc + *loaders + 4)))
@@ -99,6 +106,9 @@ func main() {
 	if err := mc.Database(db).Collection("bench_meta").FindOne(ctx, bson.D{{Key: "_id", Value: coll}}).Decode(&m); err != nil {
 		die("no load recorded for %s: %v", *ns, err)
 	}
+	if m.Customers > 0 {
+		customers = m.Customers
+	}
 	recency := math.Log(0.1) / math.Log(*newest10)
 	w := &workload{c: c, n: m.N, start: m.Start, period: m.Period, recency: recency,
 		history: *history, pad: *pad}
@@ -106,10 +116,10 @@ func main() {
 	runner := func(d time.Duration, seed int64) *report { return w.run(ctx, d, *conc, seed) }
 	if *kind == "store" {
 		mix, ok := mixes[*mixName]
-		if !ok {
-			die("-store-mix must be store or real, not %q", *mixName)
+		if !ok && *mixName != "shop" {
+			die("-store-mix must be store, real or shop, not %q", *mixName)
 		}
-		st := &store{w: w, db: cl.Database(db), orders: c, rate: *rate, mix: mix}
+		st := &store{w: w, db: cl.Database(db), orders: c, rate: *rate, mix: mix, sessions: *mixName == "shop"}
 		runner = func(d time.Duration, seed int64) *report { return st.run(ctx, d, *conc, seed) }
 	}
 	if *warm > 0 {
@@ -129,9 +139,10 @@ func main() {
 }
 
 type marker struct {
-	N      int           `bson:"n"`
-	Start  time.Time     `bson:"start"`
-	Period time.Duration `bson:"period"`
+	N         int           `bson:"n"`
+	Start     time.Time     `bson:"start"`
+	Period    time.Duration `bson:"period"`
+	Customers int           `bson:"customers,omitempty"`
 }
 
 // loadOrders inserts n orders evenly over the period, oldest first within each
@@ -181,7 +192,7 @@ func loadOrders(ctx context.Context, c *mongo.Collection, n, loaders int, start 
 		return err
 	}
 	_, err := c.Database().Collection("bench_meta").ReplaceOne(ctx, bson.D{{Key: "_id", Value: c.Name()}},
-		marker{N: n, Start: start, Period: period}, options.Replace().SetUpsert(true))
+		marker{N: n, Start: start, Period: period, Customers: customers}, options.Replace().SetUpsert(true))
 	fmt.Printf("done in %s\n", time.Since(began).Round(time.Second))
 	return err
 }
