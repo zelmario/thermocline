@@ -2,6 +2,7 @@ package livecache
 
 import (
 	"container/list"
+	"context"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -49,11 +50,45 @@ type Cache struct {
 
 	fillq   chan Query
 	pending map[string]bool
+	// unprovenAt are tiered entries a fill could not prove, by when, so the
+	// same miss does not cost a second read of the fast tier every time.
+	unprovenAt map[string]time.Time
 	// plainNS says, per namespace, that it has no default collation and is not
 	// a view. Read and written by the applier only.
 	plainNS map[string]bool
 
-	Hits, Misses, Behind, Fills, Dropped, Refusals atomic.Int64
+	// tiered says a namespace is tiered, and prove how much of the fast tier's
+	// answer for one is the whole answer's. See Tiers.
+	tiered func(ns string) bool
+	prove  ProveFunc
+
+	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven atomic.Int64
+}
+
+// ProveFunc reports how many of docs, the head of the fast tier's answer to a
+// query on a tiered namespace sorted by sort, are certainly the head of the
+// answer over both tiers. Zero proves nothing.
+type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.Raw) int
+
+// Tiers lets the cache hold tiered namespaces. Called before Run.
+//
+// A tiered namespace differs in two ways, and both come from the fast tier
+// holding only part of it. An entry is filled with only what prove says the
+// fast tier's answer settles, which for a sorted list is the router's own
+// newest-first proof, and for an _id is the document being there. And a
+// document leaving the fast tier is not known to have gone: an eviction is a
+// delete on its change stream, of a document that still exists. So every entry
+// holding a document that leaves is dropped, rather than the document being
+// taken out of it.
+//
+// A document arriving needs nothing: a copy-up inserts a document's real state,
+// and state is what is applied.
+func (c *Cache) Tiers(tiered func(ns string) bool, prove ProveFunc) {
+	c.tiered, c.prove = tiered, prove
+}
+
+func (c *Cache) isTiered(ns string) bool {
+	return c.tiered != nil && c.tiered(ns)
 }
 
 type shape struct {
@@ -96,9 +131,18 @@ func New(maxBytes int) *Cache {
 		readers:     map[string]map[string]time.Time{},
 		fillq:       make(chan Query, 1024),
 		pending:     map[string]bool{},
+		unprovenAt:  map[string]time.Time{},
 		plainNS:     map[string]bool{},
 	}
 }
+
+// unprovenRetry is how long a tiered entry the fast tier could not prove is not
+// asked for again. The fast tier gains what would prove it only as documents
+// are written or warmed, which is slow next to how often a page is asked for.
+const unprovenRetry = 5 * time.Second
+
+// maxUnproven bounds what is remembered of unproven fills.
+const maxUnproven = 100000
 
 // readerTTL is how long a user mongod let read a namespace is trusted to still
 // be allowed to. Revoking access takes effect here within it.
@@ -200,6 +244,13 @@ func (c *Cache) requestFill(q Query) {
 	if c.pending[key] {
 		c.mu.Unlock()
 		return
+	}
+	if at, ok := c.unprovenAt[key]; ok {
+		if time.Since(at) < unprovenRetry {
+			c.mu.Unlock()
+			return
+		}
+		delete(c.unprovenAt, key)
 	}
 	c.pending[key] = true
 	c.mu.Unlock()
@@ -423,8 +474,14 @@ func (c *Cache) Apply(ch Change) {
 		c.dropNS(ch.NS)
 		return
 	}
-	// Out of every list it was in.
+	// Out of every list it was in. On a tiered namespace a document that left
+	// may only have been evicted, so the lists holding it go. See Tiers.
+	tiered := c.isTiered(ch.NS)
 	for e := range c.rev[id] {
+		if tiered && ch.Doc == nil {
+			c.drop(e)
+			continue
+		}
 		c.removeDoc(e, id)
 	}
 	// Counts cannot be taken down without knowing what the document held
@@ -603,8 +660,8 @@ func (c *Cache) Advance(at bson.Timestamp) {
 
 // Stats is what the cache holds.
 type Stats struct {
-	Entries, Bytes                                 int
-	Hits, Misses, Behind, Fills, Dropped, Refusals int64
+	Entries, Bytes                                           int
+	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven int64
 }
 
 func (c *Cache) Stats() Stats {
@@ -613,6 +670,7 @@ func (c *Cache) Stats() Stats {
 	c.mu.Unlock()
 	s.Hits, s.Misses, s.Behind = c.Hits.Load(), c.Misses.Load(), c.Behind.Load()
 	s.Fills, s.Dropped, s.Refusals = c.Fills.Load(), c.Dropped.Load(), c.Refusals.Load()
+	s.Unproven = c.Unproven.Load()
 	return s
 }
 

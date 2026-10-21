@@ -69,7 +69,7 @@ func (c *Cache) follow(ctx context.Context, hot *mongo.Client, skip func(ns stri
 			said = time.Now()
 			s := c.Stats()
 			log.Info("live cache", "entries", s.Entries, "bytes", s.Bytes, "hits", s.Hits, "misses", s.Misses,
-				"waited_for_stream", s.Behind, "fills", s.Fills, "dropped", s.Dropped, "refused_shapes", s.Refusals)
+				"waited_for_stream", s.Behind, "fills", s.Fills, "dropped", s.Dropped, "refused_shapes", s.Refusals, "unproven", s.Unproven)
 		}
 		// Fills first, so a miss waits at most one poll for its entry.
 		c.fillPending(ctx, hot)
@@ -199,6 +199,14 @@ func (c *Cache) fill(ctx context.Context, hot *mongo.Client, q Query) {
 		c.unpend(q)
 		return
 	}
+	tiered := c.isTiered(q.NS)
+	if tiered && q.Kind != KindFind {
+		// A count over a tiered namespace is over both tiers, and the fast
+		// tier's stream cannot keep one: a copy-up is an insert of a document
+		// that was already counted.
+		c.unpend(q)
+		return
+	}
 	filter := bson.D{}
 	for _, p := range q.Eq {
 		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
@@ -243,11 +251,67 @@ func (c *Cache) fill(ctx context.Context, hot *mongo.Client, q Query) {
 		return
 	}
 	_ = cur.Close(ctx)
+	if tiered {
+		c.fillTiered(ctx, q, docs, window)
+		return
+	}
 	complete := len(docs) <= window
 	if !complete {
 		docs = docs[:window]
 	}
 	c.install(q, docs, complete, 0)
+}
+
+// fillTiered installs what the fast tier's answer settles for a tiered
+// namespace, and nothing it does not. An entry here is never the whole list:
+// what follows the proven head may be in the archive.
+//
+// The proof is asked for after the read, which is the order it needs. The
+// evictor raises its claim and lets every cached copy of the old one expire
+// before it deletes anything, so a claim read now is at least as narrow as any
+// eviction the read already missed.
+func (c *Cache) fillTiered(ctx context.Context, q Query, docs []bson.Raw, window int) {
+	if hasEq(q, "_id") {
+		// One document at most, and the fast tier holding it is the whole
+		// answer, which is how the router answers it too. Not holding it says
+		// nothing: the archive may.
+		if len(docs) == 0 {
+			c.unproven(q)
+			return
+		}
+		c.install(q, docs, true, 0)
+		return
+	}
+	n := 0
+	if c.prove != nil && len(docs) > 0 {
+		n = min(c.prove(ctx, q.NS, q.Sort, docs), len(docs), window)
+	}
+	if n < q.Skip+q.Limit {
+		c.unproven(q)
+		return
+	}
+	c.install(q, docs[:n], false, 0)
+}
+
+func (c *Cache) unproven(q Query) {
+	c.Unproven.Add(1)
+	c.mu.Lock()
+	key := q.entryKey()
+	delete(c.pending, key)
+	if len(c.unprovenAt) >= maxUnproven {
+		clear(c.unprovenAt)
+	}
+	c.unprovenAt[key] = time.Now()
+	c.mu.Unlock()
+}
+
+func hasEq(q Query, field string) bool {
+	for _, p := range q.Eq {
+		if p.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Cache) unpend(q Query) {

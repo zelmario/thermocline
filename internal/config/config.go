@@ -219,8 +219,10 @@ type RouterConfig struct {
 	// Cache holds query results for as long as they have been observed to stay
 	// the same. Off unless enabled.
 	Cache CacheConfig `yaml:"cache"`
-	// LiveCache keeps the answers to equality reads of untiered collections in
-	// memory, updated from the fast tier's change stream. See package livecache.
+	// LiveCache keeps the answers to equality reads in memory, updated from the
+	// fast tier's change stream. On a tiered collection it holds only what the
+	// fast tier proves, newest first by the age field or by _id. See package
+	// livecache.
 	LiveCache LiveCacheConfig `yaml:"live_cache"`
 	// HotTLS says the fast tier requires TLS, taken from hot.uri at load time.
 	// The driver reads that option for its own connections; the router also

@@ -659,9 +659,10 @@ func (r *Router) Listen(ctx context.Context) error {
 		func() { r.watchFastTier(ctx) })
 	if r.cfg.LiveCache.Enabled {
 		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
+		r.live.Tiers(r.cfg.Manages, r.liveProve)
 		r.goSafely("keeping the live cache up to date", func() { r.live.Run(ctx, r.hot, r.liveSkip, r.log) })
 		r.log.Info("live cache on", "max_bytes", r.cfg.LiveCache.MaxBytes,
-			"note", "equality reads of untiered collections are answered from memory, kept up to date from the fast tier's change stream")
+			"note", "equality reads are answered from memory, kept up to date from the fast tier's change stream; on a tiered collection only what the fast tier proves")
 	}
 
 	r.log.Info("router listening",
