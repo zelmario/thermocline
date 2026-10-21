@@ -37,6 +37,27 @@ write_files:
         keyFile: /etc/mongod.key
       processManagement:
         fork: false
+%{ if data_volume ~}
+  - path: /root/mount-data.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # The data lives on a network volume, which is what makes this node the
+      # slow one. Terraform attaches it after the server exists, so it is
+      # waited for, then mounted where mongod keeps its data, before mongod is
+      # installed.
+      set -euo pipefail
+      for _ in $(seq 1 120); do
+        DEV=$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -1 || true)
+        [ -n "$DEV" ] && break
+        sleep 5
+      done
+      [ -n "$DEV" ] || { echo "no data volume appeared" > /root/VOLUME_MISSING; exit 1; }
+      blkid "$DEV" >/dev/null 2>&1 || mkfs.xfs -q "$DEV"
+      mkdir -p /var/lib/mongodb
+      echo "$DEV /var/lib/mongodb xfs defaults,noatime,nofail 0 2" >> /etc/fstab
+      mount /var/lib/mongodb
+%{ endif ~}
   - path: /root/install-psmdb.sh
     permissions: "0755"
     content: |
@@ -79,11 +100,14 @@ write_files:
         "percona-server-mongodb-mongos=$PKG" "percona-server-mongodb-tools=$PKG" percona-mongodb-mongosh
       apt-mark hold percona-server-mongodb percona-server-mongodb-server percona-server-mongodb-mongos percona-server-mongodb-tools
       mkdir -p /var/log/mongo
-      chown mongod:mongod /etc/mongod.key /var/log/mongo
+      chown mongod:mongod /etc/mongod.key /var/log/mongo /var/lib/mongodb
       systemctl enable mongod
       systemctl restart mongod
       echo "$PKG" > /root/PSMDB_INSTALLED
 runcmd:
   - [netplan, apply]
   - [bash, -c, "sysctl -w vm.swappiness=1 && echo vm.swappiness=1 > /etc/sysctl.d/90-mongod.conf"]
+%{ if data_volume ~}
+  - [bash, /root/mount-data.sh]
+%{ endif ~}
   - [bash, /root/install-psmdb.sh]

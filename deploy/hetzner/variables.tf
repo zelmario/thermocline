@@ -20,6 +20,16 @@ variable "cold_server_type" {
   type        = string
 }
 
+variable "cold_volume_gb" {
+  description = <<-EOT
+    A network volume of this many GB for each archive node's data, which is
+    what a cluster that has outgrown its hardware looks like. Zero keeps the
+    data on the server's local disk.
+  EOT
+  type        = number
+  default     = 0
+}
+
 variable "big_server_type" {
   description = <<-EOT
     Server type for a third replica set, rsBig, holding a whole copy of the

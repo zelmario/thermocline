@@ -88,6 +88,7 @@ resource "hcloud_server" "db" {
     private_ip    = each.value.ip
     keyfile       = random_password.keyfile[each.value.set].result
     psmdb_version = var.psmdb_version
+    data_volume   = each.value.set == "rsCold" && var.cold_volume_gb > 0
   })
 
   # user_data runs once, at first boot, so an edited template must not replace
@@ -98,6 +99,16 @@ resource "hcloud_server" "db" {
   }
 
   depends_on = [hcloud_network_subnet.sub]
+}
+
+# The archive's data, on network volumes. See cold_volume_gb.
+resource "hcloud_volume" "data" {
+  for_each  = var.cold_volume_gb > 0 ? local.cold : {}
+  name      = "${var.name_prefix}-${each.key}-data"
+  size      = var.cold_volume_gb
+  server_id = hcloud_server.db[each.key].id
+  automount = false
+  labels    = { project = "thermocline", role = "rsCold" }
 }
 
 resource "hcloud_server" "app" {
