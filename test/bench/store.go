@@ -392,9 +392,22 @@ func (s *store) reprice(rng *rand.Rand) error {
 	return err
 }
 
+// loadEnd is the newest instant of the loaded history. The reports read
+// windows ending there, not now.
+//
+// Every checkout writes an order dated now, about 150,000 in a ten minute run
+// at 32 shoppers, so a window ending now grows with every run: measured on
+// 2026-10-21, after a day of runs the last 24 hours held 1,872,509 orders
+// against 36,530 in a loaded day, and the hourly report read all of them every
+// five seconds. Each run was measured against more data than the one before,
+// so no two runs were comparable. A window of the loaded history is the same
+// orders in every run, against every target.
+func (s *store) loadEnd() time.Time { return s.w.start.Add(s.w.period) }
+
 func (s *store) salesByHour(rng *rand.Rand) error {
+	end := s.loadEnd()
 	cur, err := s.orders.Aggregate(context.Background(), mongo.Pipeline{
-		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().Add(-24 * time.Hour)}}}}}},
+		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: end.Add(-24 * time.Hour)}, {Key: "$lt", Value: end}}}}}},
 		{{Key: "$group", Value: bson.D{{Key: "_id", Value: bson.D{{Key: "$hour", Value: "$at"}}},
 			{Key: "orders", Value: bson.D{{Key: "$sum", Value: 1}}}, {Key: "revenue", Value: bson.D{{Key: "$sum", Value: "$total"}}}}}},
 	})
@@ -408,8 +421,9 @@ func (s *store) salesByHour(rng *rand.Rand) error {
 }
 
 func (s *store) topSellers(rng *rand.Rand) error {
+	end := s.loadEnd()
 	cur, err := s.orders.Aggregate(context.Background(), mongo.Pipeline{
-		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: time.Now().Add(-7 * 24 * time.Hour)}}}}}},
+		{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: end.Add(-7 * 24 * time.Hour)}, {Key: "$lt", Value: end}}}}}},
 		{{Key: "$unwind", Value: "$items"}},
 		{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$items.sku"}, {Key: "sold", Value: bson.D{{Key: "$sum", Value: "$items.qty"}}}}}},
 		{{Key: "$sort", Value: bson.D{{Key: "sold", Value: -1}}}},
