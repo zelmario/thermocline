@@ -16,8 +16,13 @@ variable "hot_server_type" {
 }
 
 variable "cold_server_type" {
-  description = "Server type for the archive's three mongod nodes (rsCold)."
+  description = <<-EOT
+    Server type for the archive's three mongod nodes (rsCold). Empty removes
+    the servers and keeps their data volumes, which is how the archive is
+    parked between tests. See hcloud_volume.data.
+  EOT
   type        = string
+  default     = ""
 }
 
 variable "cold_volume_gb" {
@@ -42,8 +47,9 @@ variable "big_server_type" {
 }
 
 variable "app_server_type" {
-  description = "Server type for the node running the router, the daemons and the workload."
+  description = "Server type for the node running the router, the daemons and the workload. Empty creates none."
   type        = string
+  default     = ""
 }
 
 variable "image" {

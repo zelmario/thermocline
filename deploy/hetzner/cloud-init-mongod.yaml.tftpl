@@ -100,7 +100,10 @@ write_files:
         "percona-server-mongodb-mongos=$PKG" "percona-server-mongodb-tools=$PKG" percona-mongodb-mongosh
       apt-mark hold percona-server-mongodb percona-server-mongodb-server percona-server-mongodb-mongos percona-server-mongodb-tools
       mkdir -p /var/log/mongo
-      chown mongod:mongod /etc/mongod.key /var/log/mongo /var/lib/mongodb
+      chown mongod:mongod /etc/mongod.key /var/log/mongo
+      # -R: a volume mounted again on a new server holds files owned by the
+      # mongod user of the server before, whose uid this one need not share.
+      chown -R mongod:mongod /var/lib/mongodb
       systemctl enable mongod
       systemctl restart mongod
       echo "$PKG" > /root/PSMDB_INSTALLED

@@ -5,7 +5,10 @@
 
 locals {
   hot  = var.hot_server_type == "" ? {} : { for i in [1, 2, 3] : "hot${i}" => { ip = "10.20.1.${10 + i}", set = "rsHot" } }
-  cold = { for i in [1, 2, 3] : "cold${i}" => { ip = "10.20.1.${20 + i}", set = "rsCold" } }
+  # Every archive node there could be, whether or not it exists right now: the
+  # volumes holding their data outlive them. See cold_server_type.
+  cold_all = { for i in [1, 2, 3] : "cold${i}" => { ip = "10.20.1.${20 + i}", set = "rsCold" } }
+  cold     = var.cold_server_type == "" ? {} : local.cold_all
   # The baseline set, only when a type is given for it. See big_server_type.
   big    = var.big_server_type == "" ? {} : { for i in [1, 2, 3] : "big${i}" => { ip = "10.20.1.${30 + i}", set = "rsBig" } }
   dbs    = merge(local.hot, local.cold, local.big)
@@ -48,8 +51,10 @@ resource "hcloud_firewall" "ssh_only" {
 
 # One keyfile per replica set: members of a set authenticate to each other with
 # it, and the two sets never need to.
+# Every set's keyfile is kept whether or not its nodes exist, so an archive whose
+# servers were removed and recreated comes back with the key its data expects.
 resource "random_password" "keyfile" {
-  for_each = local.sets
+  for_each = toset(["rsHot", "rsCold", "rsBig"])
   length   = 756
   special  = false
 }
@@ -102,16 +107,38 @@ resource "hcloud_server" "db" {
 }
 
 # The archive's data, on network volumes. See cold_volume_gb.
+#
+# Not tied to the servers. Loading the archive takes an hour at 200 GB and most
+# of a day at a terabyte, so between tests its servers are removed and these
+# are kept, which costs the volumes alone. Recreated servers mount them again
+# and the replica set comes back with its data. prevent_destroy is what keeps a
+# plain `destroy` from taking the data with it: remove the volumes on purpose.
 resource "hcloud_volume" "data" {
+  for_each = var.cold_volume_gb > 0 ? local.cold_all : {}
+  name     = "${var.name_prefix}-${each.key}-data"
+  size     = var.cold_volume_gb
+  location = var.location
+  labels   = { project = "thermocline", role = "rsCold" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "hcloud_volume_attachment" "data" {
   for_each  = var.cold_volume_gb > 0 ? local.cold : {}
-  name      = "${var.name_prefix}-${each.key}-data"
-  size      = var.cold_volume_gb
+  volume_id = hcloud_volume.data[each.key].id
   server_id = hcloud_server.db[each.key].id
   automount = false
-  labels    = { project = "thermocline", role = "rsCold" }
+}
+
+moved {
+  from = hcloud_server.app
+  to   = hcloud_server.app[0]
 }
 
 resource "hcloud_server" "app" {
+  count        = var.app_server_type == "" ? 0 : 1
   name         = "${var.name_prefix}-app"
   server_type  = var.app_server_type
   image        = var.image

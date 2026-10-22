@@ -53,6 +53,22 @@ private URIs filled in.
 - The Terraform state holds the keyfiles and the `dba` password. It stays on
   this machine and is ignored by git.
 
+## Park it between tests
+
+With `cold_volume_gb` set, the archive's data lives on network volumes that
+outlive its servers. Loading 200 million orders took 2h8m, so between tests
+the servers go and the volumes stay:
+
+```
+$ bash park.sh      # stop mongod, unmount, remove every server
+$ bash unpark.sh    # recreate them from terraform.tfvars and bootstrap
+```
+
+Measured on 2026-10-22: the archive came back with all 200,315,996 orders, its
+indexes and its replica set, in 63 seconds of apply and 72 of bootstrap. The
+fast tier and the app node start fresh. `bench -reset-shop` puts the archive
+back the way the load left it, in about five minutes.
+
 ## Take it down
 
 ```
@@ -60,4 +76,6 @@ $ bash tf.sh destroy
 ```
 
 The servers, the network, the firewall and the SSH key entry all go. Nothing
-outside this directory's state is touched.
+outside this directory's state is touched. The archive's volumes refuse to go
+(`prevent_destroy`), so a destroy cannot take the data with it by accident:
+remove them on purpose, by taking `prevent_destroy` out first.

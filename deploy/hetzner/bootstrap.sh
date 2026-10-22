@@ -52,7 +52,7 @@ initiate() { # node set m1 m2 m3
 }
 HAS_HOT=$(echo "$DBS" | grep -qx hot1 && echo yes || true)
 if [ -n "$HAS_HOT" ]; then echo "== rsHot";  initiate hot1  rsHot  10.20.1.11 10.20.1.12 10.20.1.13; fi
-echo "== rsCold"; initiate cold1 rsCold 10.20.1.21 10.20.1.22 10.20.1.23
+if echo "$DBS" | grep -qx cold1; then echo "== rsCold"; initiate cold1 rsCold 10.20.1.21 10.20.1.22 10.20.1.23; fi
 if [ -n "$BIG_URI" ]; then echo "== rsBig"; initiate big1 rsBig 10.20.1.31 10.20.1.32 10.20.1.33; fi
 
 echo "== cline on the app node"

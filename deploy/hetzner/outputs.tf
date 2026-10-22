@@ -1,7 +1,7 @@
 output "public_ips" {
   value = merge(
     { for k, s in hcloud_server.db : k => s.ipv4_address },
-    { app = hcloud_server.app.ipv4_address },
+    var.app_server_type == "" ? {} : { app = hcloud_server.app[0].ipv4_address },
   )
 }
 
