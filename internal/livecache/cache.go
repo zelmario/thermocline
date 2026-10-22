@@ -215,6 +215,21 @@ func (c *Cache) NoteWrite(ns string, at bson.Timestamp) {
 	c.pending[ns] = c.noteWrite(c.pending[ns], at)
 }
 
+// allKey is the pendingDB key for a write that may have touched anything.
+const allKey = "\x00all"
+
+// NoteWriteAll is NoteWrite for a write that may have touched any namespace:
+// a transaction's commit. Its statements were noted as they were acknowledged,
+// at times before the commit, and the stream carries their changes at the
+// commit's time, so an event between the two could pass those marks while the
+// transaction was still unapplied. The commit's reply names no namespace, so
+// it holds every one.
+func (c *Cache) NoteWriteAll(at bson.Timestamp) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingDB[allKey] = c.noteWrite(c.pendingDB[allKey], at)
+}
+
 // NoteWriteDB is NoteWrite for a write whose namespace is a whole database.
 func (c *Cache) NoteWriteDB(db string, at bson.Timestamp) {
 	c.mu.Lock()
@@ -281,7 +296,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	}
 	db, _ := splitNS(q.NS)
 	now := c.now()
-	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) {
+	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) || !c.fresh(c.pendingDB, allKey, now) {
 		c.mu.Unlock()
 		c.Behind.Add(1)
 		return nil, false

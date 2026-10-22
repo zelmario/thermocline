@@ -131,6 +131,12 @@ func (c *conn) liveNoteWrites(name, db string, cmd bson.Raw) {
 	if c.r.live == nil {
 		return
 	}
+	if name == "commitTransaction" {
+		// It names no namespace and may have written to any. See
+		// livecache.NoteWriteAll.
+		c.liveWrites = append(c.liveWrites[:0], "*")
+		return
+	}
 	c.liveWrites = append(c.liveWrites[:0], writtenNamespaces(name, db, cmd)...)
 }
 
@@ -144,6 +150,10 @@ func (c *conn) liveAfterReply(reply *wire.Message) {
 	if len(c.liveWrites) > 0 {
 		at := checkpoint.UnpackTS(c.r.seenOpTime.Load())
 		for _, ns := range c.liveWrites {
+			if ns == "*" {
+				c.r.live.NoteWriteAll(at)
+				continue
+			}
 			if strings.HasSuffix(ns, ".*") {
 				// A whole database: every namespace in it waits.
 				c.r.live.NoteWriteDB(strings.TrimSuffix(ns, ".*"), at)

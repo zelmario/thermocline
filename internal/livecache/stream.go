@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 )
 
 // maxEventDoc is the largest document the stream carries whole. A larger one
@@ -120,6 +121,12 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
 	// Only a document is a document. An update whose document was deleted
 	// before the lookup carries null, and stored as one it reads back as a
 	// batch that decodes to nothing.
+	//
+	// Null and missing are two different answers. Null is a document that is
+	// gone. Missing is the pipeline above dropping one over maxEventDoc, which
+	// still exists: read as gone, it was taken out of complete entries and a
+	// list came back short.
+	missing := e.Full.Type == 0
 	var full bson.Raw
 	if d, ok := e.Full.DocumentOK(); ok {
 		full = d
@@ -155,7 +162,7 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
 		return
 	}
 	ch := Change{NS: ns, Op: e.Op, ID: id, Doc: full, Updated: e.Updated, At: e.At}
-	if e.Op != "delete" && full == nil && e.Op != "update" {
+	if e.Op != "delete" && missing {
 		// Too large to carry: what changed is unknown.
 		c.DropNS(ns)
 		c.Advance(e.At)
@@ -217,7 +224,12 @@ func (c *Cache) fill(ctx context.Context, hot *mongo.Client, q Query) {
 	}
 	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	co := hot.Database(db).Collection(coll)
+	// Majority, because every change the stream applies is majority
+	// committed, and a fill read at the default level could hold a write
+	// that is not and may be rolled back. Then the whole cache is majority
+	// committed, which answers a majority read correctly and a local one
+	// no later than the staleness bound allows.
+	co := hot.Database(db).Collection(coll, options.Collection().SetReadConcern(readconcern.Majority()))
 	if q.Kind != KindFind {
 		n, err := co.CountDocuments(fctx, filter)
 		if err != nil {

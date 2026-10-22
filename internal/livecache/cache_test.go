@@ -237,3 +237,68 @@ func TestBatchOfReadsAReply(t *testing.T) {
 		t.Fatalf("batchOf read %v from %v", batchOf(r), r)
 	}
 }
+
+// An update whose document was too large for the stream to carry arrives with
+// no document at all, and one whose document was deleted before the lookup
+// arrives with null. The first still exists, so its listings must go rather
+// than lose it; the second is gone and is taken out.
+func TestOversizedUpdateIsNotADelete(t *testing.T) {
+	event := func(full any) bson.Raw {
+		d := bson.D{
+			{Key: "operationType", Value: "update"},
+			{Key: "ns", Value: bson.D{{Key: "db", Value: "shop"}, {Key: "coll", Value: "products"}}},
+			{Key: "documentKey", Value: bson.D{{Key: "_id", Value: "p1"}}},
+			{Key: "clusterTime", Value: bson.Timestamp{T: 30}},
+			{Key: "updated", Value: bson.A{"stock"}},
+		}
+		if full != nil {
+			d = append(d, bson.E{Key: "fullDocument", Value: full})
+		}
+		return raw(t, d)
+	}
+	skip := func(string) bool { return false }
+	fill := func(c *Cache) Query {
+		q := listQuery(t, "a", 2)
+		c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+		return q
+	}
+
+	c := New(1 << 20)
+	q := fill(c)
+	c.handle(event(nil), skip)
+	if _, hit := c.Get(q); hit {
+		t.Fatal("a listing was still answered after an update too large to see, which may have changed it")
+	}
+
+	c = New(1 << 20)
+	q = fill(c)
+	c.handle(event(primitiveNull{}), skip)
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("a deleted document's listing was dropped instead of taking it out")
+	}
+	if ids := ids(t, got); len(ids) != 1 || ids[0] != "p2" {
+		t.Fatalf("after its document was deleted the listing holds %v, want [p2]", ids)
+	}
+}
+
+// primitiveNull marshals as BSON null.
+type primitiveNull struct{}
+
+func (primitiveNull) MarshalBSONValue() (byte, []byte, error) { return byte(bson.TypeNull), nil, nil }
+
+// A transaction's commit holds every namespace until the stream passes it: its
+// statements were noted before the commit, at times its changes do not carry.
+func TestCommitHoldsEverything(t *testing.T) {
+	c := New(1 << 20)
+	q := listQuery(t, "a", 1)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+	c.NoteWriteAll(bson.Timestamp{T: 40})
+	if _, hit := c.Get(q); hit {
+		t.Fatal("served before the stream reached a commit")
+	}
+	c.Advance(bson.Timestamp{T: 40})
+	if _, hit := c.Get(q); !hit {
+		t.Fatal("not served once the stream reached the commit")
+	}
+}
