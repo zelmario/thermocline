@@ -2,6 +2,7 @@ package livecache
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -406,5 +407,49 @@ func TestWritesHoldOnlyWhatTheyChange(t *testing.T) {
 	c.Advance(bson.Timestamp{T: 50})
 	if !served(qc) {
 		t.Fatal("still held after the stream applied the write")
+	}
+}
+
+// An entry keeps what its projection leaves, plus _id and the fields it
+// filters and sorts by, and nothing else: the document applied from the
+// stream is trimmed the same way as the one filled.
+func TestEntriesKeepOnlyWhatTheyAnswer(t *testing.T) {
+	c := New(1 << 20)
+	q, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"},
+		{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
+		{Key: "sort", Value: bson.D{{Key: "price", Value: 1}}},
+		{Key: "limit", Value: int32(5)},
+		{Key: "projection", Value: bson.D{{Key: "description", Value: 0}}},
+	}))
+	if !ok {
+		t.Fatal("not understood")
+	}
+	big := strings.Repeat("x", 1000)
+	withText := func(id string, price float64) bson.Raw {
+		return raw(t, append(product(id, "a", price), bson.E{Key: "description", Value: big}))
+	}
+	c.install(q, []bson.Raw{withText("p1", 1), withText("p2", 2)}, true, 0)
+	if s := c.Stats(); s.Bytes > 800 {
+		t.Fatalf("two products held in %d bytes, which is their descriptions as well", s.Bytes)
+	}
+	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p0"), Doc: withText("p0", 0.5), At: bson.Timestamp{T: 1}})
+	if s := c.Stats(); s.Bytes > 1100 {
+		t.Fatalf("three products held in %d bytes after one came from the stream whole", s.Bytes)
+	}
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("not answered")
+	}
+	if ids := ids(t, got); fmt.Sprint(ids) != "[p0 p1 p2]" {
+		t.Fatalf("answered %v", ids)
+	}
+	first, _ := got.Lookup("cursor", "firstBatch").Array().Values()
+	d := first[0].Document()
+	if _, err := d.LookupErr("description"); err == nil {
+		t.Fatal("the projected away field came back")
+	}
+	if _, err := d.LookupErr("stock"); err != nil {
+		t.Fatal("a field the projection keeps was lost")
 	}
 }

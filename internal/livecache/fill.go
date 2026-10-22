@@ -439,7 +439,7 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		return true
 	}
 	if c.fits(sh, e, ch.Doc) {
-		c.insertDoc(e, doc{id: id, raw: ch.Doc})
+		c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 	}
 	_, live := c.entries[e.key]
 	return live

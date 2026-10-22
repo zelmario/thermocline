@@ -3,6 +3,7 @@ package livecache
 import (
 	"container/list"
 	"context"
+	"encoding/binary"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -116,6 +117,62 @@ type shape struct {
 	ns     string
 	fields []string
 	sort   []SortKey
+	// proj is the projection every query of the shape asks for, which is
+	// what its entries keep of a document. See trimDoc.
+	proj Projection
+}
+
+// trimDoc is what an entry of a shape keeps of a document: what its projection
+// leaves, and always _id and the fields the shape filters and sorts by, which
+// applying a change reads. Every entry used to keep the whole document, so a
+// customer's order history held each order's 800 byte note that the query
+// projected away, and 256 MB held a fraction of the entries it could.
+func trimDoc(sh *shape, d bson.Raw) bson.Raw {
+	if !sh.proj.Set {
+		return d
+	}
+	elems, err := d.Elements()
+	if err != nil {
+		return d
+	}
+	keep := func(k string) bool {
+		if k == "_id" {
+			return true
+		}
+		for _, f := range sh.fields {
+			if f == k {
+				return true
+			}
+		}
+		for _, s := range sh.sort {
+			if s.Field == k {
+				return true
+			}
+		}
+		if sh.proj.Include {
+			return sh.proj.Fields[k]
+		}
+		return !sh.proj.Fields[k]
+	}
+	all := true
+	for _, e := range elems {
+		if !keep(e.Key()) {
+			all = false
+			break
+		}
+	}
+	if all {
+		return d
+	}
+	out := make([]byte, 4, len(d))
+	for _, e := range elems {
+		if keep(e.Key()) {
+			out = append(out, e...)
+		}
+	}
+	out = append(out, 0)
+	binary.LittleEndian.PutUint32(out[:4], uint32(len(out)))
+	return out
 }
 
 type entry struct {
@@ -531,6 +588,7 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	}
 	e := &entry{key: key, shape: sh, complete: complete, n: n}
 	for _, d := range docs {
+		d = trimDoc(sh, d)
 		id, ok := docKey(d)
 		if !ok {
 			return nil
@@ -562,7 +620,7 @@ func (c *Cache) shapeFor(q Query) *shape {
 	if s, ok := m[id]; ok {
 		return s
 	}
-	s := &shape{id: id, kind: q.Kind, ns: q.NS, sort: q.Sort}
+	s := &shape{id: id, kind: q.Kind, ns: q.NS, sort: q.Sort, proj: q.Proj}
 	if s.kind == KindCountAgg {
 		s.kind = KindCount
 	}
@@ -772,7 +830,7 @@ func (c *Cache) Apply(ch Change) {
 		if !c.fits(sh, e, ch.Doc) {
 			continue
 		}
-		c.insertDoc(e, doc{id: id, raw: ch.Doc})
+		c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 	}
 	c.evict()
 }

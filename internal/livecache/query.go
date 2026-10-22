@@ -587,6 +587,28 @@ func (q Query) shapeID() string {
 			}
 			b.WriteByte(',')
 		}
+		// The projection is part of the shape, because an entry keeps only
+		// the fields its projection leaves. See trimDoc.
+		if q.Proj.Set {
+			b.WriteString("|proj:")
+			if q.Proj.Include {
+				b.WriteByte('+')
+			} else {
+				b.WriteByte('-')
+			}
+			if q.Proj.NoID {
+				b.WriteString("!id")
+			}
+			fields := make([]string, 0, len(q.Proj.Fields))
+			for f := range q.Proj.Fields {
+				fields = append(fields, f)
+			}
+			sort.Strings(fields)
+			for _, f := range fields {
+				b.WriteByte(',')
+				b.WriteString(f)
+			}
+		}
 	}
 	return b.String()
 }
