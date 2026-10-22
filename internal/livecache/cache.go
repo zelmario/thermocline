@@ -44,6 +44,14 @@ type Cache struct {
 	pending map[string][]pendingWrite
 	// pendingDB is the same for writes naming a whole database.
 	pendingDB map[string][]pendingWrite
+	// Writes classified finer than a namespace, see NoteWrites. pendingEntry
+	// holds an entry by its key, pendingDoc every entry holding a document by
+	// ns and _id, pendingCount every count of a namespace. classified is
+	// every classified write per namespace, which an entry installed after
+	// the write inherits. sweeps counts calls to Advance between clean-ups of
+	// queues nobody looked at.
+	pendingEntry, pendingDoc, pendingCount, classified map[string][]pendingWrite
+	sweeps                                             int
 	// maxStale is how long an acknowledged write may go unapplied while the
 	// cache still answers. Zero is read-your-writes. See SetMaxStaleness.
 	maxStale time.Duration
@@ -60,7 +68,8 @@ type Cache struct {
 	// same miss does not cost a second read of the fast tier every time.
 	unprovenAt map[string]time.Time
 	// plainNS says, per namespace, that it has no default collation and is not
-	// a view. Read and written by the applier only.
+	// a view. Read and written by the fill workers, under plainMu.
+	plainMu sync.Mutex
 	plainNS map[string]bool
 
 	// tiered says a namespace is tiered, and prove how much of the fast tier's
@@ -125,21 +134,25 @@ type doc struct {
 // New makes an empty cache bounded to maxBytes of documents.
 func New(maxBytes int) *Cache {
 	return &Cache{
-		maxBytes:   maxBytes,
-		lru:        list.New(),
-		entries:    map[string]*entry{},
-		shapes:     map[string]map[string]*shape{},
-		rev:        map[string]map[*entry]struct{}{},
-		refused:    map[string]bool{},
-		refusedNS:  map[string]bool{},
-		pending:    map[string][]pendingWrite{},
-		pendingDB:  map[string][]pendingWrite{},
-		now:        time.Now,
-		readers:    map[string]map[string]time.Time{},
-		fillq:      make(chan Query, 1024),
-		filling:    map[string]bool{},
-		unprovenAt: map[string]time.Time{},
-		plainNS:    map[string]bool{},
+		maxBytes:     maxBytes,
+		lru:          list.New(),
+		entries:      map[string]*entry{},
+		shapes:       map[string]map[string]*shape{},
+		rev:          map[string]map[*entry]struct{}{},
+		refused:      map[string]bool{},
+		refusedNS:    map[string]bool{},
+		pending:      map[string][]pendingWrite{},
+		pendingDB:    map[string][]pendingWrite{},
+		pendingEntry: map[string][]pendingWrite{},
+		pendingDoc:   map[string][]pendingWrite{},
+		pendingCount: map[string][]pendingWrite{},
+		classified:   map[string][]pendingWrite{},
+		now:          time.Now,
+		readers:      map[string]map[string]time.Time{},
+		fillq:        make(chan Query, 1024),
+		filling:      map[string]bool{},
+		unprovenAt:   map[string]time.Time{},
+		plainNS:      map[string]bool{},
 	}
 }
 
@@ -237,6 +250,113 @@ func (c *Cache) NoteWriteDB(db string, at bson.Timestamp) {
 	c.pendingDB[db] = c.noteWrite(c.pendingDB[db], at)
 }
 
+// WriteNote is what a write could have changed in one namespace, as far as the
+// command says. Whole means anything in it; otherwise IDs are the documents it
+// named by _id, Fields the top-level fields an update set or removed (nil for a
+// delete), and Docs the documents an insert added.
+type WriteNote struct {
+	NS     string
+	Whole  bool
+	IDs    []bson.RawValue
+	Fields []string
+	Docs   []bson.Raw
+}
+
+// NoteWrites records writes this router acknowledged at or before at, held
+// back from only what each can have changed.
+//
+// A write used to hold its whole namespace until the stream had applied it.
+// On a shop every checkout changes a product's stock, so every product page
+// waited on every checkout. A write that names its documents can be held to
+// them: an update or delete by _id holds the entries holding that document,
+// unless it changes a field some cached query filters or sorts by, which can
+// move the document into entries that do not hold it yet; an insert holds the
+// entries its document belongs in. Counts of a namespace are held by any
+// delete or update, which they cannot see by document. Anything else holds the
+// namespace, as before.
+//
+// An entry filled after the write was noted holds none of this, so it inherits
+// every classified write of its namespace newer than the position it was read
+// at. See installAt.
+func (c *Cache) NoteWrites(notes []WriteNote, at bson.Timestamp) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, n := range notes {
+		if n.Whole {
+			c.pending[n.NS] = c.noteWrite(c.pending[n.NS], at)
+			continue
+		}
+		shapes := c.shapes[n.NS]
+		whole := false
+		for _, sh := range shapes {
+			if touches(n.Fields, sh.fields) || touches(n.Fields, sortFields(sh)) {
+				whole = true
+			}
+		}
+		if whole {
+			c.pending[n.NS] = c.noteWrite(c.pending[n.NS], at)
+			continue
+		}
+		c.classified[n.NS] = c.noteWrite(c.classified[n.NS], at)
+		for _, id := range n.IDs {
+			k, ok := idKey(id)
+			if !ok {
+				c.pending[n.NS] = c.noteWrite(c.pending[n.NS], at)
+				break
+			}
+			dk := n.NS + "\x00" + k
+			c.pendingDoc[dk] = c.noteWrite(c.pendingDoc[dk], at)
+		}
+		if len(n.IDs) > 0 {
+			c.pendingCount[n.NS] = c.noteWrite(c.pendingCount[n.NS], at)
+		}
+		for _, d := range n.Docs {
+			for _, sh := range shapes {
+				if key, ok := c.keyOfQuiet(sh, d); ok {
+					c.pendingEntry[key] = c.noteWrite(c.pendingEntry[key], at)
+				}
+			}
+		}
+	}
+}
+
+func sortFields(sh *shape) []string {
+	out := make([]string, len(sh.sort))
+	for i, s := range sh.sort {
+		out[i] = s.Field
+	}
+	return out
+}
+
+// inherit holds a newly installed entry back by every classified write of its
+// namespace later than the position it was read at. Called with mu held.
+func (c *Cache) inherit(e *entry, p0 bson.Timestamp) {
+	for _, w := range c.classified[e.shape.ns] {
+		if after(w.ts, p0) && after(w.ts, c.applied) {
+			c.pendingEntry[e.key] = append(c.pendingEntry[e.key], w)
+		}
+	}
+}
+
+// sweep forgets queues the stream has passed that no Get has looked at since.
+// Called with mu held, every so often.
+func (c *Cache) sweep() {
+	for _, m := range []map[string][]pendingWrite{c.pendingEntry, c.pendingDoc, c.pendingCount, c.classified} {
+		for k, q := range m {
+			stale := true
+			for _, w := range q {
+				if after(w.ts, c.applied) {
+					stale = false
+					break
+				}
+			}
+			if stale {
+				delete(m, k)
+			}
+		}
+	}
+}
+
 func (c *Cache) noteWrite(q []pendingWrite, ts bson.Timestamp) []pendingWrite {
 	if !after(ts, c.applied) {
 		return q
@@ -286,6 +406,25 @@ func after(a, b bson.Timestamp) bool {
 	return a.T > b.T || (a.T == b.T && a.I > b.I)
 }
 
+// entryFresh reports whether the writes classified to an entry let it answer.
+// See NoteWrites. Called with mu held.
+func (c *Cache) entryFresh(e *entry, q Query, now time.Time) bool {
+	if !c.fresh(c.pendingEntry, e.key, now) {
+		return false
+	}
+	if e.shape.kind == KindCount {
+		return c.fresh(c.pendingCount, e.shape.ns, now)
+	}
+	end := min(q.Skip+q.Limit, len(e.docs))
+	start := min(q.Skip, end)
+	for _, d := range e.docs[start:end] {
+		if !c.fresh(c.pendingDoc, e.shape.ns+"\x00"+d.id, now) {
+			return false
+		}
+	}
+	return true
+}
+
 // Get answers q from memory, or reports a miss and asks for a fill.
 func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	key := q.entryKey()
@@ -309,6 +448,11 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		c.mu.Unlock()
 		c.Misses.Add(1)
 		c.requestFill(q)
+		return nil, false
+	}
+	if !c.entryFresh(e, q, now) {
+		c.mu.Unlock()
+		c.Behind.Add(1)
 		return nil, false
 	}
 	c.lru.MoveToFront(e.el)
@@ -363,10 +507,19 @@ func (c *Cache) requestFill(q Query) {
 func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.installLocked(q, docs, complete, n) != nil {
+		c.evict()
+	}
+}
+
+// installLocked is install with mu held, returning the entry, or nil when it
+// was not installed. It does not evict, so a caller can bring the entry up to
+// date before anything is chosen to go.
+func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) *entry {
 	key := q.entryKey()
 	delete(c.filling, key)
 	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
-		return
+		return nil
 	}
 	sh := c.shapeFor(q)
 	if old, ok := c.entries[key]; ok {
@@ -376,10 +529,10 @@ func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 	for _, d := range docs {
 		id, ok := docKey(d)
 		if !ok {
-			return
+			return nil
 		}
 		if !c.fits(sh, e, d) || !c.plainMatch(sh, q, d) {
-			return
+			return nil
 		}
 		e.docs = append(e.docs, doc{id: id, raw: d})
 		e.bytes += len(d)
@@ -392,7 +545,7 @@ func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 	e.el = c.lru.PushFront(e)
 	c.bytes += e.bytes
 	c.Fills.Add(1)
-	c.evict()
+	return e
 }
 
 func (c *Cache) shapeFor(q Query) *shape {
@@ -664,6 +817,29 @@ func (c *Cache) keyOf(sh *shape, d bson.Raw) (string, bool) {
 	return string(b), true
 }
 
+// keyOfQuiet is keyOf without refusing the shape: for a write being noted,
+// whose document need not be one the cache would ever hold.
+func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
+	keys := make([]string, 0, len(sh.fields))
+	for _, f := range sh.fields {
+		v, err := d.LookupErr(f)
+		if err != nil {
+			return "", false
+		}
+		k, ok := valueKey(v)
+		if !ok {
+			return "", false
+		}
+		keys = append(keys, k)
+	}
+	b := []byte(sh.id)
+	for _, k := range keys {
+		b = append(b, 0)
+		b = append(b, k...)
+	}
+	return string(b), true
+}
+
 func (c *Cache) removeDoc(e *entry, id string) {
 	for i, d := range e.docs {
 		if d.id == id {
@@ -748,6 +924,10 @@ func (c *Cache) Advance(at bson.Timestamp) {
 	defer c.mu.Unlock()
 	if after(at, c.applied) {
 		c.applied = at
+	}
+	if c.sweeps++; c.sweeps >= 1024 {
+		c.sweeps = 0
+		c.sweep()
 	}
 }
 

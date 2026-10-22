@@ -999,6 +999,9 @@ type conn struct {
 	// settled when its reply goes out. See livecache.go.
 	liveAsk    liveProof
 	liveWrites []string
+	// liveNotes are the writes classified finer than a namespace. See
+	// classifyWrite.
+	liveNotes []livecache.WriteNote
 
 	// auth is the SCRAM conversation in progress, and grants what the finished
 	// one established. grants being nil is what "not authenticated" means, and
@@ -1211,7 +1214,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	if nameErr == nil {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
 			c.cacheInvalidate(msg, name, db, cmd)
-			c.liveNoteWrites(name, db, cmd)
+			c.liveNoteWrites(msg, name, db, cmd)
 		}
 	}
 

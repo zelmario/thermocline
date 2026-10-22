@@ -9,21 +9,20 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 )
 
 // maxEventDoc is the largest document the stream carries whole. A larger one
 // arrives without it, and its namespace is forgotten instead of updated.
 const maxEventDoc = 4 << 20
 
-// Run is the applier: it follows the fast tier's change stream and fills
-// entries, both in one goroutine, so a fill and the changes around it are
-// applied in one order. skip names namespaces never to cache, the system's
-// own.
+// Run is the applier: it follows the fast tier's change stream, hands fills to
+// workers and installs what they read, all in one goroutine, so a fill and the
+// changes around it are applied in one order. See fill.go. skip names
+// namespaces never to cache, the system's own.
 //
 // The stream is read through stream and fills through hot. They may be
-// different nodes: a fill must be at least as new as the stream position, and
-// a read of the primary always is.
+// different nodes: a fill reads a snapshot at the position the stream has
+// reached, which every member that delivered it has.
 func (c *Cache) Run(ctx context.Context, hot, stream *mongo.Client, skip func(ns string) bool, log *slog.Logger) {
 	for ctx.Err() == nil {
 		err := c.follow(ctx, hot, stream, skip, log)
@@ -45,9 +44,17 @@ func (c *Cache) Run(ctx context.Context, hot, stream *mongo.Client, skip func(ns
 
 func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func(ns string) bool, log *slog.Logger) error {
 	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.D{{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
-			"insert", "update", "replace", "delete", "drop", "rename", "dropDatabase", "invalidate",
-		}}}}}}},
+		{{Key: "$match", Value: bson.D{
+			{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{
+				"insert", "update", "replace", "delete", "drop", "rename", "dropDatabase", "invalidate",
+			}}}},
+			// Never cached, so never worth a lookup on the fast tier's primary:
+			// the server's own databases and this system's.
+			{Key: "ns.db", Value: bson.D{
+				{Key: "$nin", Value: bson.A{"admin", "config", "local"}},
+				{Key: "$not", Value: bson.Regex{Pattern: "^_thermocline"}},
+			}},
+		}}},
 		{{Key: "$project", Value: bson.D{
 			{Key: "operationType", Value: 1}, {Key: "ns", Value: 1}, {Key: "to", Value: 1},
 			{Key: "documentKey", Value: 1}, {Key: "clusterTime", Value: 1},
@@ -68,6 +75,13 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		return err
 	}
 	defer func() { _ = cs.Close(context.WithoutCancel(ctx)) }()
+	fctx, stopFills := context.WithCancel(ctx)
+	fs := newFillState()
+	workers := c.startFills(fctx, hot, fs)
+	defer func() {
+		stopFills()
+		workers.Wait()
+	}()
 	said := time.Now()
 	for {
 		if time.Since(said) >= 30*time.Second {
@@ -76,10 +90,20 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			log.Info("live cache", "entries", s.Entries, "bytes", s.Bytes, "hits", s.Hits, "misses", s.Misses,
 				"waited_for_stream", s.Behind, "fills", s.Fills, "dropped", s.Dropped, "refused_shapes", s.Refusals, "unproven", s.Unproven)
 		}
-		// Fills first, so a miss waits at most one poll for its entry.
-		c.fillPending(ctx, hot)
+		// Fills first, so a miss waits at most one poll for its entry. Both
+		// only hand out and take back: the reads run on the workers.
+		c.collect(fs)
+		c.dispatch(fs)
 		if cs.TryNext(ctx) {
-			c.handle(cs.Current, skip)
+			c.handle(cs.Current, skip, fs)
+			// The end of a batch is a position the stream has passed even
+			// while it is never empty, which is when the pending marks wait
+			// longest for one. See Advance.
+			if cs.RemainingBatchLength() == 0 {
+				if at, ok := clusterTimeFromToken(cs.ResumeToken()); ok {
+					c.Advance(at)
+				}
+			}
 			continue
 		}
 		if err := cs.Err(); err != nil {
@@ -94,7 +118,7 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 	}
 }
 
-func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
+func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {
 	var e struct {
 		Op string `bson:"operationType"`
 		NS struct {
@@ -135,12 +159,15 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
 	switch e.Op {
 	case "drop", "rename", "invalidate":
 		c.DropNS(ns)
+		fs.forget(ns)
 		if e.To.Coll != "" {
 			c.DropNS(e.To.DB + "." + e.To.Coll)
+			fs.forget(e.To.DB + "." + e.To.Coll)
 		}
 		c.Advance(e.At)
 		return
 	case "dropDatabase":
+		fs.forget("")
 		c.mu.Lock()
 		for _, en := range c.entries {
 			if len(en.shape.ns) > len(e.NS.DB) && en.shape.ns[:len(e.NS.DB)+1] == e.NS.DB+"." {
@@ -158,6 +185,7 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
 	id, err := e.Key.LookupErr("_id")
 	if err != nil {
 		c.DropNS(ns)
+		fs.forget(ns)
 		c.Advance(e.At)
 		return
 	}
@@ -165,148 +193,12 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool) {
 	if e.Op != "delete" && missing {
 		// Too large to carry: what changed is unknown.
 		c.DropNS(ns)
+		fs.forget(ns)
 		c.Advance(e.At)
 		return
 	}
+	fs.keep(ch)
 	c.Apply(ch)
-}
-
-// fillPending runs the fills asked for since the last poll.
-func (c *Cache) fillPending(ctx context.Context, hot *mongo.Client) {
-	for {
-		select {
-		case q := <-c.fillq:
-			c.fill(ctx, hot, q)
-		default:
-			return
-		}
-	}
-}
-
-func (c *Cache) fill(ctx context.Context, hot *mongo.Client, q Query) {
-	db, coll := splitNS(q.NS)
-	if ok, seen := c.plainNS[q.NS]; !seen {
-		ok = true
-		cur, err := hot.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
-		if err == nil {
-			for cur.Next(ctx) {
-				if _, cerr := cur.Current.LookupErr("options", "collation"); cerr == nil {
-					ok = false
-				}
-				if t, _ := cur.Current.Lookup("type").StringValueOK(); t == "view" {
-					ok = false
-				}
-			}
-			_ = cur.Close(ctx)
-		} else {
-			c.unpend(q)
-			return
-		}
-		c.plainNS[q.NS] = ok
-		if !ok {
-			c.RefuseNS(q.NS)
-		}
-	} else if !ok {
-		c.unpend(q)
-		return
-	}
-	tiered := c.isTiered(q.NS)
-	if tiered && q.Kind != KindFind {
-		// A count over a tiered namespace is over both tiers, and the fast
-		// tier's stream cannot keep one: a copy-up is an insert of a document
-		// that was already counted.
-		c.unpend(q)
-		return
-	}
-	filter := bson.D{}
-	for _, p := range q.Eq {
-		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
-	}
-	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	// Majority, because every change the stream applies is majority
-	// committed, and a fill read at the default level could hold a write
-	// that is not and may be rolled back. Then the whole cache is majority
-	// committed, which answers a majority read correctly and a local one
-	// no later than the staleness bound allows.
-	co := hot.Database(db).Collection(coll, options.Collection().SetReadConcern(readconcern.Majority()))
-	if q.Kind != KindFind {
-		n, err := co.CountDocuments(fctx, filter)
-		if err != nil {
-			c.unpend(q)
-			return
-		}
-		c.install(q, nil, true, n)
-		return
-	}
-	window := min(maxWindow, q.Skip+q.Limit+fillWindow)
-	sortDoc := bson.D{}
-	for _, s := range q.Sort {
-		dir := 1
-		if s.Desc {
-			dir = -1
-		}
-		sortDoc = append(sortDoc, bson.E{Key: s.Field, Value: dir})
-	}
-	fo := options.Find().SetLimit(int64(window + 1))
-	if len(sortDoc) > 0 {
-		fo.SetSort(sortDoc)
-	}
-	cur, err := co.Find(fctx, filter, fo)
-	if err != nil {
-		c.unpend(q)
-		return
-	}
-	var docs []bson.Raw
-	for cur.Next(fctx) {
-		docs = append(docs, append(bson.Raw(nil), cur.Current...))
-	}
-	if cur.Err() != nil {
-		_ = cur.Close(ctx)
-		c.unpend(q)
-		return
-	}
-	_ = cur.Close(ctx)
-	if tiered {
-		c.fillTiered(ctx, q, docs, window)
-		return
-	}
-	complete := len(docs) <= window
-	if !complete {
-		docs = docs[:window]
-	}
-	c.install(q, docs, complete, 0)
-}
-
-// fillTiered installs what the fast tier's answer settles for a tiered
-// namespace, and nothing it does not. An entry here is never the whole list:
-// what follows the proven head may be in the archive.
-//
-// The proof is asked for after the read, which is the order it needs. The
-// evictor raises its claim and lets every cached copy of the old one expire
-// before it deletes anything, so a claim read now is at least as narrow as any
-// eviction the read already missed.
-func (c *Cache) fillTiered(ctx context.Context, q Query, docs []bson.Raw, window int) {
-	if hasEq(q, "_id") {
-		// One document at most, and the fast tier holding it is the whole
-		// answer, which is how the router answers it too. Not holding it says
-		// nothing: the archive may.
-		if len(docs) == 0 {
-			c.unproven(q)
-			return
-		}
-		c.install(q, docs, true, 0)
-		return
-	}
-	n := 0
-	if c.prove != nil && len(docs) > 0 {
-		n = min(c.prove(ctx, q.NS, q.Sort, docs), len(docs), window)
-	}
-	if n < q.Skip+q.Limit {
-		c.unproven(q)
-		return
-	}
-	c.install(q, docs[:n], false, 0)
 }
 
 func (c *Cache) unproven(q Query) {

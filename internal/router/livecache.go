@@ -125,19 +125,156 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 	return wire.NewMsgRaw(0, msg.Header.RequestID, reply), true
 }
 
-// liveNoteWrites remembers which namespaces a write names, for when its reply
-// goes out.
-func (c *conn) liveNoteWrites(name, db string, cmd bson.Raw) {
+// liveNoteWrites remembers what a write can have changed, for when its reply
+// goes out. See livecache.NoteWrites.
+func (c *conn) liveNoteWrites(msg *wire.Message, name, db string, cmd bson.Raw) {
 	if c.r.live == nil {
 		return
 	}
+	c.liveWrites = c.liveWrites[:0]
+	c.liveNotes = c.liveNotes[:0]
 	if name == "commitTransaction" {
 		// It names no namespace and may have written to any. See
 		// livecache.NoteWriteAll.
-		c.liveWrites = append(c.liveWrites[:0], "*")
+		c.liveWrites = append(c.liveWrites, "*")
 		return
 	}
-	c.liveWrites = append(c.liveWrites[:0], writtenNamespaces(name, db, cmd)...)
+	if inTransaction(cmd) {
+		// Its changes reach the stream at the commit's time, which the
+		// commit notes; held whole meanwhile, as before.
+		c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, cmd)...)
+		return
+	}
+	if note, ok := classifyWrite(msg, name, db, cmd); ok {
+		c.liveNotes = append(c.liveNotes, note)
+		return
+	}
+	c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, cmd)...)
+}
+
+// classifyWrite says what an insert, update, delete or findAndModify can have
+// changed, as livecache.WriteNote, from the command alone. ok false means it
+// names no single namespace this can read, and it is noted whole by name.
+func classifyWrite(msg *wire.Message, name, db string, cmd bson.Raw) (livecache.WriteNote, bool) {
+	var note livecache.WriteNote
+	if name == "findandmodify" {
+		name = "findAndModify"
+	}
+	coll, ok := stringField(cmd, name)
+	if !ok {
+		return note, false
+	}
+	note.NS = db + "." + coll
+	whole := func() (livecache.WriteNote, bool) {
+		note.Whole = true
+		note.IDs, note.Fields, note.Docs = nil, nil, nil
+		return note, true
+	}
+	switch name {
+	case "insert":
+		for _, d := range msg.AllOf("documents") {
+			note.Docs = append(note.Docs, append(bson.Raw(nil), d...))
+		}
+		if len(note.Docs) == 0 {
+			return whole()
+		}
+		return note, true
+	case "update":
+		for _, st := range msg.AllOf("updates") {
+			q, _ := st.Lookup("q").DocumentOK()
+			id, has := idFromFilter(q)
+			upsert, _ := st.Lookup("upsert").BooleanOK()
+			if !has || upsert {
+				return whole()
+			}
+			fields, ok := updatedFields(st.Lookup("u"))
+			if !ok {
+				return whole()
+			}
+			note.IDs = append(note.IDs, copyValue(id))
+			note.Fields = append(note.Fields, fields...)
+		}
+	case "delete":
+		for _, st := range msg.AllOf("deletes") {
+			q, _ := st.Lookup("q").DocumentOK()
+			id, has := idFromFilter(q)
+			if !has {
+				return whole()
+			}
+			note.IDs = append(note.IDs, copyValue(id))
+		}
+	case "findAndModify":
+		q, _ := cmd.Lookup("query").DocumentOK()
+		id, has := idFromFilter(q)
+		upsert, _ := cmd.Lookup("upsert").BooleanOK()
+		if !has || upsert {
+			return whole()
+		}
+		note.IDs = append(note.IDs, copyValue(id))
+		if remove, _ := cmd.Lookup("remove").BooleanOK(); !remove {
+			fields, ok := updatedFields(cmd.Lookup("update"))
+			if !ok {
+				return whole()
+			}
+			note.Fields = fields
+		}
+	default:
+		return note, false
+	}
+	if len(note.IDs) == 0 {
+		return whole()
+	}
+	return note, true
+}
+
+// updatedFields reads the top-level fields an update document's operators
+// change. A replacement, a pipeline or anything else unreadable says no: a
+// replacement can change every field, and the old ones are not in the command.
+func updatedFields(u bson.RawValue) ([]string, bool) {
+	d, ok := u.DocumentOK()
+	if !ok {
+		return nil, false
+	}
+	ops, err := d.Elements()
+	if err != nil || len(ops) == 0 {
+		return nil, false
+	}
+	var out []string
+	for _, op := range ops {
+		name := op.Key()
+		if len(name) == 0 || name[0] != '$' {
+			return nil, false
+		}
+		args, ok := op.Value().DocumentOK()
+		if !ok {
+			return nil, false
+		}
+		fields, err := args.Elements()
+		if err != nil {
+			return nil, false
+		}
+		for _, f := range fields {
+			path := f.Key()
+			if i := strings.IndexByte(path, '.'); i >= 0 {
+				path = path[:i]
+			}
+			out = append(out, path)
+			if name == "$rename" {
+				// The new name is a field the document now has.
+				if to, ok := f.Value().StringValueOK(); ok {
+					if i := strings.IndexByte(to, '.'); i >= 0 {
+						to = to[:i]
+					}
+					out = append(out, to)
+				}
+			}
+		}
+	}
+	return out, true
+}
+
+func copyValue(v bson.RawValue) bson.RawValue {
+	return bson.RawValue{Type: v.Type, Value: append([]byte(nil), v.Value...)}
 }
 
 // liveAfterReply settles what the command asked of the live cache once its
@@ -146,6 +283,10 @@ func (c *conn) liveNoteWrites(name, db string, cmd bson.Raw) {
 func (c *conn) liveAfterReply(reply *wire.Message) {
 	if c.r.live == nil {
 		return
+	}
+	if len(c.liveNotes) > 0 {
+		c.r.live.NoteWrites(c.liveNotes, checkpoint.UnpackTS(c.r.seenOpTime.Load()))
+		c.liveNotes = c.liveNotes[:0]
 	}
 	if len(c.liveWrites) > 0 {
 		at := checkpoint.UnpackTS(c.r.seenOpTime.Load())

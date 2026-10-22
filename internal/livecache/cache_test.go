@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -265,14 +266,14 @@ func TestOversizedUpdateIsNotADelete(t *testing.T) {
 
 	c := New(1 << 20)
 	q := fill(c)
-	c.handle(event(nil), skip)
+	c.handle(event(nil), skip, newFillState())
 	if _, hit := c.Get(q); hit {
 		t.Fatal("a listing was still answered after an update too large to see, which may have changed it")
 	}
 
 	c = New(1 << 20)
 	q = fill(c)
-	c.handle(event(primitiveNull{}), skip)
+	c.handle(event(primitiveNull{}), skip, newFillState())
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("a deleted document's listing was dropped instead of taking it out")
@@ -300,5 +301,110 @@ func TestCommitHoldsEverything(t *testing.T) {
 	c.Advance(bson.Timestamp{T: 40})
 	if _, hit := c.Get(q); !hit {
 		t.Fatal("not served once the stream reached the commit")
+	}
+}
+
+// A fill read at P0 is brought up to date with the changes kept while it was
+// out, and only those after P0: a change at or before P0 is already in what
+// was read, and applying it again would count an insert twice.
+func TestFillReplaysOnlyLaterChanges(t *testing.T) {
+	c := New(1 << 20)
+	q, ok := ParseCount("shop.products", raw(t, bson.D{
+		{Key: "count", Value: "products"},
+		{Key: "query", Value: bson.D{{Key: "category", Value: "a"}}},
+	}))
+	if !ok {
+		t.Fatal("a count was not understood")
+	}
+	insert := func(id string, at uint32) Change {
+		return Change{NS: "shop.products", Op: "insert", ID: strVal(t, id), Doc: raw(t, product(id, "a", 1)), At: bson.Timestamp{T: at}}
+	}
+	f := &inflight{q: q, key: q.entryKey(), p0: bson.Timestamp{T: 10},
+		buf: []Change{insert("p9", 9), insert("p10", 10), insert("p11", 11)}}
+	c.installAt(f, nil, true, 5)
+	reply, hit := c.Get(q)
+	if !hit {
+		t.Fatal("the count was not installed")
+	}
+	if n, _ := reply.Lookup("n").AsInt64OK(); n != 6 {
+		t.Fatalf("count %d after a read of 5 at P0 and one insert after it, want 6", n)
+	}
+
+	lq := listQuery(t, "a", 10)
+	g := &inflight{q: lq, key: lq.entryKey(), p0: bson.Timestamp{T: 10}, buf: []Change{
+		{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 5)), At: bson.Timestamp{T: 11}},
+		{NS: "shop.products", Op: "delete", ID: strVal(t, "p2"), At: bson.Timestamp{T: 12}},
+		insert("p3", 13),
+	}}
+	c.installAt(g, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+	got, hit := c.Get(lq)
+	if !hit {
+		t.Fatal("the listing was not installed")
+	}
+	if ids := ids(t, got); fmt.Sprint(ids) != "[p3 p1]" {
+		t.Fatalf("listing %v after the kept changes, want [p3 p1]: p1 moved to price 5, p2 deleted, p3 added at 1", ids)
+	}
+}
+
+// A write that names its document holds back only what it can change. See
+// NoteWrites.
+func TestWritesHoldOnlyWhatTheyChange(t *testing.T) {
+	c := New(1 << 20)
+	c.SetMaxStaleness(0)
+	qa, qb := listQuery(t, "a", 2), listQuery(t, "b", 2)
+	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+	c.install(qb, []bson.Raw{raw(t, product("p3", "b", 1))}, true, 0)
+	c.Advance(bson.Timestamp{T: 10})
+	served := func(q Query) bool { _, hit := c.Get(q); return hit }
+
+	c.NoteWrites([]WriteNote{{NS: "shop.products", IDs: []bson.RawValue{strVal(t, "p1")}, Fields: []string{"stock"}}}, bson.Timestamp{T: 20})
+	if served(qa) {
+		t.Fatal("a listing holding the document changed by _id was served before the stream applied it")
+	}
+	if !served(qb) {
+		t.Fatal("a listing not holding the document changed by _id was held back")
+	}
+	c.Advance(bson.Timestamp{T: 20})
+	if !served(qa) {
+		t.Fatal("held back after the stream applied the write")
+	}
+
+	c.NoteWrites([]WriteNote{{NS: "shop.products", Docs: []bson.Raw{raw(t, product("p4", "b", 3))}}}, bson.Timestamp{T: 30})
+	if served(qb) {
+		t.Fatal("the listing an inserted document belongs in was served before the stream applied it")
+	}
+	if !served(qa) {
+		t.Fatal("a listing the inserted document does not belong in was held back")
+	}
+	c.Advance(bson.Timestamp{T: 30})
+
+	// A change to a field a query sorts by can move the document into a
+	// listing that does not hold it, so it holds the namespace.
+	c.NoteWrites([]WriteNote{{NS: "shop.products", IDs: []bson.RawValue{strVal(t, "p3")}, Fields: []string{"price"}}}, bson.Timestamp{T: 40})
+	if served(qa) {
+		t.Fatal("a sort field change held only the listings holding the document")
+	}
+	c.Advance(bson.Timestamp{T: 40})
+
+	// An entry filled after a classified write inherits it. A count is a
+	// shape nothing had asked for when the insert was noted, so the insert
+	// could not name the entry it belongs in, and the count was read at 45,
+	// before the insert at 50.
+	c.NoteWrites([]WriteNote{{NS: "shop.products", Docs: []bson.Raw{raw(t, product("p10", "d", 1))}}}, bson.Timestamp{T: 50})
+	qc, ok := ParseCount("shop.products", raw(t, bson.D{
+		{Key: "count", Value: "products"},
+		{Key: "query", Value: bson.D{{Key: "category", Value: "d"}}},
+	}))
+	if !ok {
+		t.Fatal("a count was not understood")
+	}
+	f := &inflight{q: qc, key: qc.entryKey(), p0: bson.Timestamp{T: 45}}
+	c.installAt(f, nil, true, 0)
+	if served(qc) {
+		t.Fatal("a count read at 45 answered before the stream applied an insert at 50 that it counts")
+	}
+	c.Advance(bson.Timestamp{T: 50})
+	if !served(qc) {
+		t.Fatal("still held after the stream applied the write")
 	}
 }
