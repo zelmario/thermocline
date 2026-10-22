@@ -328,6 +328,11 @@ router:
   #
   # dashboard: "127.0.0.1:27101"
 
+  # Go's profiler, off unless named: CPU, allocations, locks and goroutines of
+  # the running router, at /debug/pprof/. Keep it on localhost; a profile shows
+  # command shapes and costs CPU to collect.
+  # pprof: "127.0.0.1:6060"
+
   # The learned cache.
   #
   # The router records the shape of every read, a hash of its parameters and a

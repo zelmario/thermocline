@@ -400,6 +400,9 @@ func runRouter(args []string) error {
 			}
 		}()
 	}
+	if cfg.Router.Pprof != "" {
+		go servePprof(ctx, cfg.Router.Pprof, log)
+	}
 	if err := r.Listen(ctx); err != nil {
 		return fatal(log, "router", err)
 	}

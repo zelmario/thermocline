@@ -213,6 +213,12 @@ type RouterConfig struct {
 	// collections and reports traffic, so it belongs on an operator network
 	// rather than wherever the application already connects.
 	Dashboard string `yaml:"dashboard"`
+	// Pprof is the address Go's profiler listens on, empty for off. It is
+	// what a performance question is answered with rather than reasoned
+	// about: CPU, allocations, locks, goroutines, on the running router. Bind
+	// it to localhost: a profile exposes command shapes and internals, and
+	// collecting one costs CPU.
+	Pprof string `yaml:"pprof"`
 	// TLS is the certificate clients connect with, empty for a plaintext
 	// listener.
 	TLS TLSConfig `yaml:"tls"`
