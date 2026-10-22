@@ -2,6 +2,8 @@ package livecache
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +64,8 @@ type fillResult struct {
 	ok bool
 	// unproven: a tiered read the fast tier could not prove; remembered.
 	unproven bool
+	// why is what failed when ok is false and a read was attempted.
+	why string
 }
 
 // fillState is the applier's side of fills in flight. Only the applier touches
@@ -199,6 +203,9 @@ func (c *Cache) finish(fs *fillState, r fillResult) {
 	}
 	switch {
 	case f.dropped || !r.ok:
+		if !f.dropped && r.why != "" {
+			c.failed(f.q, r.why)
+		}
 		c.unpend(f.q)
 	case r.unproven:
 		c.unproven(f.q)
@@ -214,6 +221,7 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	out := fillResult{f: f}
 	plain, ok := c.plain(ctx, hot, q.NS)
 	if !ok {
+		out.why = "could not read the collection's options"
 		return out
 	}
 	if !plain {
@@ -234,7 +242,6 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	db, coll := splitNS(q.NS)
 	rctx, cancel := context.WithTimeout(ctx, fillTimeout)
 	defer cancel()
-	snapshot := bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: f.p0}}
 
 	if q.Kind != KindFind {
 		var res struct {
@@ -244,16 +251,16 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 				} `bson:"firstBatch"`
 			} `bson:"cursor"`
 		}
-		err := hot.Database(db).RunCommand(rctx, bson.D{
+		err := snapshotRun(rctx, hot.Database(db), bson.D{
 			{Key: "aggregate", Value: coll},
 			{Key: "pipeline", Value: bson.A{
 				bson.D{{Key: "$match", Value: filter}},
 				bson.D{{Key: "$count", Value: "n"}},
 			}},
 			{Key: "cursor", Value: bson.D{}},
-			{Key: "readConcern", Value: snapshot},
-		}).Decode(&res)
+		}, f.p0, &res)
 		if err != nil {
+			out.why = "count: " + err.Error()
 			return out
 		}
 		if len(res.Cursor.FirstBatch) > 0 {
@@ -282,14 +289,14 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	cmd = append(cmd,
 		bson.E{Key: "limit", Value: int64(window + 1)},
 		bson.E{Key: "batchSize", Value: int64(window + 1)},
-		bson.E{Key: "singleBatch", Value: true},
-		bson.E{Key: "readConcern", Value: snapshot})
+		bson.E{Key: "singleBatch", Value: true})
 	var res struct {
 		Cursor struct {
 			FirstBatch []bson.Raw `bson:"firstBatch"`
 		} `bson:"cursor"`
 	}
-	if err := hot.Database(db).RunCommand(rctx, cmd).Decode(&res); err != nil {
+	if err := snapshotRun(rctx, hot.Database(db), cmd, f.p0, &res); err != nil {
+		out.why = "find: " + err.Error()
 		return out
 	}
 	docs := make([]bson.Raw, 0, len(res.Cursor.FirstBatch))
@@ -480,4 +487,42 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 	}
 	_, live := c.entries[e.key]
 	return live
+}
+
+// snapshotRun runs cmd as a snapshot read at p0, the stream's position.
+//
+// On a quiet stream that position is the resume token of an empty poll, a
+// high-water mark that can sit an increment past the node's own clock, and
+// mongod refuses a snapshot there: "readConcern atClusterTime value must not
+// be greater than the current clusterTime". Every fill of a collection nothing
+// was writing failed that way until some write moved the clock, so on a quiet
+// collection nothing was cached. Measured through testquery with the router's
+// verify mode: 0 fills installed in 50.
+//
+// The node's clock is past every entry in its oplog, so between it and p0
+// there is nothing, and a snapshot at the clock is the snapshot at p0. That is
+// the one retry.
+func snapshotRun(ctx context.Context, db *mongo.Database, cmd bson.D, p0 bson.Timestamp, out any) error {
+	at := func(ts bson.Timestamp) bson.D {
+		return append(cmd[:len(cmd):len(cmd)], bson.E{Key: "readConcern", Value: bson.D{
+			{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: ts}}})
+	}
+	err := db.RunCommand(ctx, at(p0)).Decode(out)
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) || ce.Code != 72 || !strings.Contains(ce.Message, "atClusterTime") {
+		return err
+	}
+	raw, perr := db.RunCommand(ctx, bson.D{{Key: "ping", Value: 1}}).Raw()
+	if perr != nil {
+		return err
+	}
+	t, i, ok := raw.Lookup("operationTime").TimestampOK()
+	if !ok {
+		return err
+	}
+	now := bson.Timestamp{T: t, I: i}
+	if !after(p0, now) {
+		return err
+	}
+	return db.RunCommand(ctx, at(now)).Decode(out)
 }

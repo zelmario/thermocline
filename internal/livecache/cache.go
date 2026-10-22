@@ -72,6 +72,8 @@ type Cache struct {
 	// unprovenAt are tiered entries a fill could not prove, by when, so the
 	// same miss does not cost a second read of the fast tier every time.
 	unprovenAt map[string]time.Time
+	// failedAt are entries whose last fill failed, with why, for State.
+	failedAt map[string]fillFailure
 	// plainNS says, per namespace, that it has no default collation and is not
 	// a view. Read and written by the fill workers, under plainMu.
 	plainMu sync.Mutex
@@ -220,6 +222,7 @@ func New(maxBytes int) *Cache {
 		fillq:        make(chan Query, 1024),
 		filling:      map[string]bool{},
 		unprovenAt:   map[string]time.Time{},
+		failedAt:     map[string]fillFailure{},
 		plainNS:      map[string]bool{},
 	}
 }
@@ -515,7 +518,11 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	if !ok {
 		c.mu.Unlock()
 		c.Misses.Add(1)
-		c.requestFill(q)
+		// A count over a tiered namespace is over both tiers, which the fast
+		// tier's stream cannot keep (see read), so no fill is asked for.
+		if q.Kind == KindFind || !c.isTiered(q.NS) {
+			c.requestFill(q)
+		}
 		return nil, false
 	}
 	if !c.entryFresh(e, q, now) {
@@ -571,6 +578,77 @@ func (c *Cache) requestFill(q Query) {
 	}
 }
 
+// State says why Get would not answer q now, or "hit" when it would. For the
+// router's verify mode, which waits out the states that pass on their own:
+// "filling", "behind" and "entry behind".
+func (c *Cache) State(q Query) string {
+	key := q.entryKey()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
+		return "refused"
+	}
+	db, _ := splitNS(q.NS)
+	now := c.now()
+	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) || !c.fresh(c.pendingDB, allKey, now) {
+		return "behind"
+	}
+	e, ok := c.entries[key]
+	switch {
+	case !ok && q.Kind != KindFind && c.isTiered(q.NS):
+		return "tiered count"
+	case !ok && c.filling[key]:
+		return "filling"
+	case !ok:
+		if _, un := c.unprovenAt[key]; un {
+			return "unproven"
+		}
+		return "no entry"
+	case q.Kind == KindFind && !e.complete && q.Skip+q.Limit > len(e.docs):
+		if c.filling[key] {
+			return "filling"
+		}
+		return "short"
+	case !c.entryFresh(e, q, now):
+		return "entry behind"
+	}
+	return "hit"
+}
+
+// fillFailure is why an entry's last fill failed, and when.
+type fillFailure struct {
+	why string
+	at  time.Time
+}
+
+func (c *Cache) failed(q Query, why string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.failedAt) >= maxUnproven {
+		clear(c.failedAt)
+	}
+	c.failedAt[q.entryKey()] = fillFailure{why: why, at: time.Now()}
+}
+
+// FailedSince reports why q's entry's last fill failed, when it failed after
+// since.
+func (c *Cache) FailedSince(q Query, since time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f, ok := c.failedAt[q.entryKey()]
+	if !ok || f.at.Before(since) {
+		return "", false
+	}
+	return f.why, true
+}
+
+// Filling reports whether a fill for q's entry is in flight.
+func (c *Cache) Filling(q Query) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.filling[q.entryKey()]
+}
+
 // install puts a filled entry in place. Called by the applier only.
 func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 	c.mu.Lock()
@@ -586,6 +664,7 @@ func (c *Cache) install(q Query, docs []bson.Raw, complete bool, n int64) {
 func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) *entry {
 	key := q.entryKey()
 	delete(c.filling, key)
+	delete(c.failedAt, key)
 	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
 		return nil
 	}
