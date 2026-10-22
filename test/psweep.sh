@@ -83,6 +83,23 @@ if [ "${CACHE:-0}" = "1" ]; then
   echo "psweep: the query cache is on for every worker in this run"
 fi
 
+# LIVE=1 runs the whole sweep with the live cache on, and LIVE=secondary with
+# its change stream read from a secondary. No suite turns it on, so its router
+# side (what a write holds, the fast tier's proof, the merged fill, a client
+# reading its own write through the proxy) was proved only by its own package's
+# tests against a bare replica set.
+if [ -n "${LIVE:-}" ] && [ "${LIVE}" != "0" ]; then
+  FROM=primary
+  [ "$LIVE" = "secondary" ] && FROM=secondary
+  LIVECFG=/root/cline_live_sweep.yaml
+  sed "s|^  completeness:|  live_cache:\n    enabled: true\n    stream_from: $FROM\n  completeness:|" \
+    "$SHARED" > "$LIVECFG"
+  grep -q '^  live_cache:' "$LIVECFG" || {
+    echo "psweep: LIVE=$LIVE but $LIVECFG does not turn the live cache on"; exit 2; }
+  SHARED=$LIVECFG
+  echo "psweep: the live cache is on for every worker in this run, its stream from the $FROM"
+fi
+
 # The partition check is not run here, and that is deliberate. This sweep runs
 # inside node0, where $0 is /root/psweep.sh and the suite files sit beside
 # whatever anyone has ever copied into /root: five stray testX_old.sh from old

@@ -95,7 +95,9 @@ if grep -q '^  cache:' $CFG; then
 else
   sed 's|^  completeness:|  cache:\n    enabled: true\n    max_queries: 200\n    max_ttl: 60s\n  completeness:|' $CFG > $CCFG
 fi
-chk "the derived config turns the cache on" "1" "$(grep -c 'enabled: true' $CCFG)"
+# The cache block's own line, not every enabled: true in the file. psweep's
+# LIVE=1 adds the live cache's, and counting both failed this with got=2.
+chk "the derived config turns the cache on" "1" "$(grep -A1 '^  cache:' $CCFG | grep -c 'enabled: true')"
 # The feeder starts before the seed, not after it, and the suite then waits for
 # the archive rather than sleeping at it.
 #
