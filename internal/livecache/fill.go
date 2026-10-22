@@ -95,6 +95,9 @@ func (c *Cache) startFills(ctx context.Context, hot *mongo.Client, fs *fillState
 					return
 				case f := <-fs.work:
 					r := c.read(ctx, hot, f)
+					if c.fillDelay > 0 {
+						time.Sleep(c.fillDelay)
+					}
 					select {
 					case fs.done <- r:
 					case <-ctx.Done():

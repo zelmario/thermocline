@@ -57,6 +57,10 @@ type Cache struct {
 	maxStale time.Duration
 	// now is the clock, replaceable in tests.
 	now func() time.Time
+	// fillDelay holds every fill this long after its read, so a test can
+	// widen the window in which changes arrive between a fill's position and
+	// its install. Zero outside tests.
+	fillDelay time.Duration
 
 	// readers are the users mongod has let read each namespace lately. See
 	// Allowed.

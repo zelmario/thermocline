@@ -49,6 +49,10 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	}
 
 	c := New(64 << 20)
+	// Every fill held after its read, so changes arrive between its position
+	// and its install as they do under load. A fill that lost them would hold
+	// a state the stream has moved past; the checks below then see it.
+	c.fillDelay = 20 * time.Millisecond
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
