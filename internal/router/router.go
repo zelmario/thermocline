@@ -672,7 +672,7 @@ func (r *Router) Listen(ctx context.Context) error {
 		func() { r.watchFastTier(ctx) })
 	if r.cfg.LiveCache.Enabled {
 		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
-		r.live.Tiers(r.cfg.Manages, r.liveProve)
+		r.live.Tiers(r.cfg.Manages, r.liveProve, r.liveMerge)
 		r.live.SetMaxStaleness(r.cfg.LiveCache.MaxStaleness.D())
 		stream := r.hot
 		if r.liveStream != nil {

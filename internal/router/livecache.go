@@ -3,9 +3,11 @@ package router
 import (
 	"context"
 	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/livecache"
@@ -324,4 +326,89 @@ func (r *Router) liveStreamFrom() string {
 		return "secondary"
 	}
 	return "primary"
+}
+
+// liveMerge is livecache.MergeFunc: the merged read of mergedread.go, for a
+// fill. The archive is asked for the head of the same query, the fast tier's
+// oplog whether any document it returned was updated or deleted since the
+// feeder's position, and when none was the two heads are merged in sort order.
+// The fast tier's head here is a snapshot at the fill's position, not now;
+// what changed since is applied to the entry from the stream, as every fill's
+// is.
+func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []livecache.SortKey, fast []bson.Raw, window int) ([]bson.Raw, bool) {
+	if _, has := r.defaultCollation(ctx, ns); has {
+		return nil, false
+	}
+	got := r.recentPosition(ctx)
+	if !got.known || got.ts.IsZero() {
+		return nil, false
+	}
+	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	if until.IsZero() {
+		return nil, false
+	}
+	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
+	if behind && !r.windowCheckable(ctx, got.ts, until) {
+		return nil, false
+	}
+	plan := mergePlan{limit: window}
+	sortDoc := bson.D{}
+	for _, s := range sort {
+		plan.sort = append(plan.sort, mergeSortKey{field: s.Field, desc: s.Desc})
+		dir := 1
+		if s.Desc {
+			dir = -1
+		}
+		sortDoc = append(sortDoc, bson.E{Key: s.Field, Value: dir})
+	}
+	filter, err := bson.Marshal(eq)
+	if err != nil {
+		return nil, false
+	}
+	db, coll := splitNS(ns)
+	opts := options.Find().SetLimit(int64(window))
+	if len(sortDoc) > 0 {
+		opts.SetSort(sortDoc)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cur, err := r.cold.Database(db).Collection(coll).Find(cctx, liveOnly(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: filter}), opts)
+	if err != nil {
+		return nil, false
+	}
+	var archived []bson.Raw
+	for cur.Next(cctx) {
+		archived = append(archived, append(bson.Raw(nil), cur.Current...))
+	}
+	cerr := cur.Err()
+	_ = cur.Close(cctx)
+	if cerr != nil {
+		return nil, false
+	}
+	if behind && len(archived) > 0 {
+		ids := make(bson.A, 0, len(archived))
+		for _, d := range archived {
+			id, err := d.LookupErr("_id")
+			if err != nil {
+				return nil, false
+			}
+			ids = append(ids, id)
+		}
+		if touched, err := r.oplogTouched(ctx, ns, got.ts, until, ids); err != nil || touched {
+			return nil, false
+		}
+	}
+	merged, ok := mergeSorted(fast, archived, plan)
+	if !ok {
+		return nil, false
+	}
+	out := make([]bson.Raw, 0, len(merged))
+	for _, d := range merged {
+		raw, ok := d.(bson.Raw)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, raw)
+	}
+	return out, true
 }

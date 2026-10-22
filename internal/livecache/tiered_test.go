@@ -119,6 +119,34 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 			}
 		}
 		return len(docs)
+	}, func(ctx context.Context, _ string, eq bson.D, sort []SortKey, _ []bson.Raw, window int) ([]bson.Raw, bool) {
+		// The archive is written in the same step as the fast tier here, so
+		// it is always current, and the merge over both tiers is its answer.
+		// Held under mu, so it sees no write half done.
+		mu.Lock()
+		defer mu.Unlock()
+		sd := bson.D{}
+		for _, k := range sort {
+			dir := 1
+			if k.Desc {
+				dir = -1
+			}
+			sd = append(sd, bson.E{Key: k.Field, Value: dir})
+		}
+		o := options.Find().SetLimit(int64(window))
+		if len(sd) > 0 {
+			o.SetSort(sd)
+		}
+		cur, err := archive.Find(ctx, eq, o)
+		if err != nil {
+			return nil, false
+		}
+		var out []bson.Raw
+		for cur.Next(ctx) {
+			out = append(out, append(bson.Raw(nil), cur.Current...))
+		}
+		_ = cur.Close(ctx)
+		return out, cur.Err() == nil
 	})
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()

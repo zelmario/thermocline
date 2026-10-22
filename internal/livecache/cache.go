@@ -81,6 +81,7 @@ type Cache struct {
 	// answer for one is the whole answer's. See Tiers.
 	tiered func(ns string) bool
 	prove  ProveFunc
+	merge  MergeFunc
 
 	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven atomic.Int64
 }
@@ -89,6 +90,12 @@ type Cache struct {
 // query on a tiered namespace sorted by sort, are certainly the head of the
 // answer over both tiers. Zero proves nothing.
 type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.Raw) int
+
+// MergeFunc completes what the fast tier's answer does not prove: fast is the
+// fast tier's head of the answer to a query on a tiered namespace, eq its
+// filter and sort its sort, and it returns the head of the answer over both
+// tiers, at most window long. ok false means it cannot be told now.
+type MergeFunc func(ctx context.Context, ns string, eq bson.D, sort []SortKey, fast []bson.Raw, window int) (docs []bson.Raw, ok bool)
 
 // Tiers lets the cache hold tiered namespaces. Called before Run.
 //
@@ -103,8 +110,8 @@ type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.
 //
 // A document arriving needs nothing: a copy-up inserts a document's real state,
 // and state is what is applied.
-func (c *Cache) Tiers(tiered func(ns string) bool, prove ProveFunc) {
-	c.tiered, c.prove = tiered, prove
+func (c *Cache) Tiers(tiered func(ns string) bool, prove ProveFunc, merge MergeFunc) {
+	c.tiered, c.prove, c.merge = tiered, prove, merge
 }
 
 func (c *Cache) isTiered(ns string) bool {

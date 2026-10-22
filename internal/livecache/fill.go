@@ -297,7 +297,7 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 		docs = append(docs, append(bson.Raw(nil), d...))
 	}
 	if tiered {
-		return c.proveFill(ctx, out, docs, window)
+		return c.proveFill(ctx, out, filter, docs, window)
 	}
 	out.complete = len(docs) <= window
 	if !out.complete {
@@ -315,28 +315,65 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 // evictor raises its claim and lets every cached copy of the old one expire
 // before it deletes anything, so a claim read now is at least as narrow as any
 // eviction the read already missed.
-func (c *Cache) proveFill(ctx context.Context, out fillResult, docs []bson.Raw, window int) fillResult {
+func (c *Cache) proveFill(ctx context.Context, out fillResult, filter bson.D, docs []bson.Raw, window int) fillResult {
 	q := out.f.q
 	if hasEq(q, "_id") {
 		// One document at most, and the fast tier holding it is the whole
 		// answer, which is how the router answers it too. Not holding it says
-		// nothing: the archive may.
-		if len(docs) == 0 {
-			out.unproven, out.ok = true, true
+		// nothing: the archive may, and the merge asks it.
+		if len(docs) > 0 {
+			out.docs, out.complete, out.ok = docs, true, true
 			return out
 		}
-		out.docs, out.complete, out.ok = docs, true, true
-		return out
+		return c.mergeFill(ctx, out, filter, docs, window, true)
 	}
 	n := 0
 	if c.prove != nil && len(docs) > 0 {
 		n = min(c.prove(ctx, q.NS, q.Sort, docs), len(docs), window)
 	}
-	if n < q.Skip+q.Limit {
+	if n >= q.Skip+q.Limit {
+		out.docs, out.ok = docs[:n], true
+		return out
+	}
+	return c.mergeFill(ctx, out, filter, docs, window, false)
+}
+
+// mergeFill fills what the fast tier cannot prove from both tiers: the fast
+// tier's snapshot merged with the archive's answer, as the router's merged read
+// does. See MergeFunc.
+//
+// The entry stays exact afterwards by the rules every tiered entry keeps. An
+// archived document the application changes is copied up first, so its new
+// state arrives on the stream; one deleted or evicted arrives as a delete,
+// which drops the entry; a copy-up of a document older than the entry's tail
+// falls past its end and is left out. On a cold-start adoption this is nearly
+// every customer's order history, which the proof alone never held.
+func (c *Cache) mergeFill(ctx context.Context, out fillResult, filter bson.D, fast []bson.Raw, window int, byID bool) fillResult {
+	q := out.f.q
+	// An unsorted list has no head to merge: which documents a limit keeps
+	// is the server's choice, and the router's merged read refuses it too.
+	if c.merge == nil || (!byID && len(q.Sort) == 0) {
 		out.unproven, out.ok = true, true
 		return out
 	}
-	out.docs, out.ok = docs[:n], true
+	docs, ok := c.merge(ctx, q.NS, filter, q.Sort, fast, window)
+	if !ok {
+		out.unproven, out.ok = true, true
+		return out
+	}
+	if byID {
+		// The whole answer, found or not: an _id names one document.
+		out.docs, out.complete, out.ok = docs, true, true
+		return out
+	}
+	if len(docs) < q.Skip+q.Limit && len(docs) == window {
+		out.unproven, out.ok = true, true
+		return out
+	}
+	// Fewer than the window means both tiers ran out, so this is the whole
+	// list; otherwise a head, never complete, since what follows it may be
+	// in the archive.
+	out.docs, out.complete, out.ok = docs, len(docs) < window, true
 	return out
 }
 
