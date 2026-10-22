@@ -144,12 +144,14 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 			}
 			q.Skip = n
 		case "limit":
+			// Negative was a single batch in the old OP_QUERY. The find
+			// command refuses it ("BSON field 'limit' value must be >= 0"),
+			// and read as a single batch it was answered where mongod
+			// answers an error. Found by the router's verify mode on
+			// testconform's "a negative limit".
 			n, ok := asInt(v)
-			if !ok {
+			if !ok || n < 0 {
 				return q, false
-			}
-			if n < 0 {
-				n, singleBatch = -n, true
 			}
 			q.Limit = n
 		case "batchSize":

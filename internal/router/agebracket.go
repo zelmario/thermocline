@@ -253,6 +253,18 @@ func (r *Router) sortSafeAges(ctx context.Context, ns, ageField string) bool {
 	return safe
 }
 
+// bracketUntil is when ns's bracket is asked again, the most an answer proved
+// by it may be kept. Zero when it was never asked.
+func (r *Router) bracketUntil(ns string) time.Time {
+	r.brackets.mu.RLock()
+	defer r.brackets.mu.RUnlock()
+	at, ok := r.brackets.at[ns]
+	if !ok {
+		return time.Time{}
+	}
+	return at.Add(bracketRecheckSafe)
+}
+
 // archiveFieldNeverArray reports whether the archive has an index leading with
 // field that is not multikey, which proves no document it holds has an array
 // there. Any doubt, an error or a plan that does not say, is a no.

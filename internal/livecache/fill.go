@@ -66,6 +66,8 @@ type fillResult struct {
 	unproven bool
 	// why is what failed when ok is false and a read was attempted.
 	why string
+	// until bounds how long the entry may be kept, zero for tieredTTL alone.
+	until time.Time
 }
 
 // fillState is the applier's side of fills in flight. Only the applier touches
@@ -210,7 +212,7 @@ func (c *Cache) finish(fs *fillState, r fillResult) {
 	case r.unproven:
 		c.unproven(f.q)
 	default:
-		c.installAt(f, r.docs, r.complete, r.n)
+		c.installAt(f, r.docs, r.complete, r.n, r.until)
 	}
 }
 
@@ -336,7 +338,9 @@ func (c *Cache) proveFill(ctx context.Context, out fillResult, filter bson.D, do
 	}
 	n := 0
 	if c.prove != nil && len(docs) > 0 {
-		n = min(c.prove(ctx, q.NS, q.Sort, docs), len(docs), window)
+		var proved int
+		proved, out.until = c.prove(ctx, q.NS, q.Sort, docs)
+		n = min(proved, len(docs), window)
 	}
 	if n >= q.Skip+q.Limit {
 		out.docs, out.ok = docs[:n], true
@@ -417,12 +421,15 @@ func (c *Cache) plain(ctx context.Context, hot *mongo.Client, ns string) (bool, 
 
 // installAt installs a fill read at f.p0 and applies to it, alone, every change
 // kept for it later than f.p0.
-func (c *Cache) installAt(f *inflight, docs []bson.Raw, complete bool, n int64) {
+func (c *Cache) installAt(f *inflight, docs []bson.Raw, complete bool, n int64, until time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e := c.installLocked(f.q, docs, complete, n)
 	if e == nil {
 		return
+	}
+	if !until.IsZero() && (e.expires.IsZero() || until.Before(e.expires)) {
+		e.expires = until
 	}
 	c.inherit(e, f.p0)
 	for _, ch := range f.buf {

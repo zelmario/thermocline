@@ -90,8 +90,10 @@ type Cache struct {
 
 // ProveFunc reports how many of docs, the head of the fast tier's answer to a
 // query on a tiered namespace sorted by sort, are certainly the head of the
-// answer over both tiers. Zero proves nothing.
-type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.Raw) int
+// answer over both tiers. Zero proves nothing. until is when what the proof
+// rested on is to be asked again, zero for no such time; an entry it proves is
+// kept no longer. See tieredTTL.
+type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.Raw) (n int, until time.Time)
 
 // MergeFunc completes what the fast tier's answer does not prove: fast is the
 // fast tier's head of the answer to a query on a tiered namespace, eq its
@@ -194,7 +196,23 @@ type entry struct {
 	n        int64
 	bytes    int
 	el       *list.Element
+	// expires is when an entry on a tiered namespace is asked for again. See
+	// tieredTTL.
+	expires time.Time
 }
+
+// tieredTTL is how long an entry on a tiered namespace is kept before it is
+// filled again.
+//
+// What made it exact when filled can change where the stream does not see:
+// the archive. The proof rests on the bracket of ages the archive holds, which
+// the router asks again at most a minute later (bracketRecheckSafe), and a
+// merge rests on the archive's head. testbson writes a Timestamp age into the
+// archive, which sorts above every Date: the router caught up within its
+// minute, and the cache, asked once, would have kept the old newest three for
+// good. Found by the router's verify mode. Bounded now, at ten seconds past
+// the router's own minute at worst, for one fill per entry per ten seconds.
+const tieredTTL = 10 * time.Second
 
 type doc struct {
 	id  string
@@ -512,6 +530,10 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		return nil, false
 	}
 	e, ok := c.entries[key]
+	if ok && !e.expires.IsZero() && now.After(e.expires) {
+		c.drop(e)
+		ok = false
+	}
 	if ok && q.Kind == KindFind && !e.complete && q.Skip+q.Limit > len(e.docs) {
 		ok = false
 	}
@@ -594,6 +616,9 @@ func (c *Cache) State(q Query) string {
 		return "behind"
 	}
 	e, ok := c.entries[key]
+	if ok && !e.expires.IsZero() && now.After(e.expires) {
+		ok = false
+	}
 	switch {
 	case !ok && q.Kind != KindFind && c.isTiered(q.NS):
 		return "tiered count"
@@ -673,6 +698,9 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 		c.drop(old)
 	}
 	e := &entry{key: key, shape: sh, complete: complete, n: n}
+	if c.isTiered(q.NS) {
+		e.expires = c.now().Add(tieredTTL)
+	}
 	for _, d := range docs {
 		d = trimDoc(sh, d)
 		id, ok := docKey(d)

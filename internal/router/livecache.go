@@ -38,36 +38,40 @@ func (r *Router) liveSkip(ns string) bool {
 // page, so this counts how far the proof reaches instead, stopping at the
 // first document older than the claim. That one and everything after it may
 // have an archived document in front of it.
-func (r *Router) liveProve(ctx context.Context, ns string, sort []livecache.SortKey, docs []bson.Raw) int {
+func (r *Router) liveProve(ctx context.Context, ns string, sort []livecache.SortKey, docs []bson.Raw) (int, time.Time) {
 	mark, known := r.completenessForRead(ctx, ns)
 	if !known || !mark.Claimed {
-		return 0
+		return 0, time.Time{}
 	}
 	if mark.CoversAll() {
 		// The fast tier claims all of history, so its answer is the answer.
-		return len(docs)
+		return len(docs), time.Time{}
 	}
 	af, ok := r.ageFieldOf(ns)
 	if !ok {
-		return 0
+		return 0, time.Time{}
 	}
 	want := af
 	if want == "" {
 		want = "_id"
 	}
 	if len(sort) == 0 || sort[0].Field != want || !sort[0].Desc {
-		return 0
+		return 0, time.Time{}
 	}
 	if !r.sortSafeAges(ctx, ns, af) {
-		return 0
+		return 0, time.Time{}
 	}
+	// The bracket was asked once and is asked again after a minute; an entry
+	// it proves is kept no longer than the router would trust it. Without
+	// this the cache kept an answer the router had already corrected.
+	until := r.bracketUntil(ns)
 	for i, d := range docs {
 		at, ok := documentAge(d, af)
 		if !ok || at.Before(mark.From) {
-			return i
+			return i, until
 		}
 	}
-	return len(docs)
+	return len(docs), until
 }
 
 // liveProof and liveWrites are what a command asked of the live cache, settled

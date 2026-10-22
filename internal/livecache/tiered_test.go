@@ -108,17 +108,17 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 	}
 
 	c := New(64 << 20)
-	c.Tiers(func(n string) bool { return n == ns }, func(_ context.Context, _ string, sort []SortKey, docs []bson.Raw) int {
+	c.Tiers(func(n string) bool { return n == ns }, func(_ context.Context, _ string, sort []SortKey, docs []bson.Raw) (int, time.Time) {
 		if len(sort) == 0 || sort[0].Field != "at" || !sort[0].Desc {
-			return 0
+			return 0, time.Time{}
 		}
 		f := claim()
 		for i, d := range docs {
 			if d.Lookup("at").Time().Before(f) {
-				return i
+				return i, time.Time{}
 			}
 		}
-		return len(docs)
+		return len(docs), time.Time{}
 	}, func(ctx context.Context, _ string, eq bson.D, sort []SortKey, _ []bson.Raw, window int) ([]bson.Raw, bool) {
 		// The archive is written in the same step as the fast tier here, so
 		// it is always current, and the merge over both tiers is its answer.

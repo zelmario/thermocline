@@ -322,7 +322,7 @@ func TestFillReplaysOnlyLaterChanges(t *testing.T) {
 	}
 	f := &inflight{q: q, key: q.entryKey(), p0: bson.Timestamp{T: 10},
 		buf: []Change{insert("p9", 9), insert("p10", 10), insert("p11", 11)}}
-	c.installAt(f, nil, true, 5)
+	c.installAt(f, nil, true, 5, time.Time{})
 	reply, hit := c.Get(q)
 	if !hit {
 		t.Fatal("the count was not installed")
@@ -337,7 +337,7 @@ func TestFillReplaysOnlyLaterChanges(t *testing.T) {
 		{NS: "shop.products", Op: "delete", ID: strVal(t, "p2"), At: bson.Timestamp{T: 12}},
 		insert("p3", 13),
 	}}
-	c.installAt(g, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+	c.installAt(g, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0, time.Time{})
 	got, hit := c.Get(lq)
 	if !hit {
 		t.Fatal("the listing was not installed")
@@ -400,7 +400,7 @@ func TestWritesHoldOnlyWhatTheyChange(t *testing.T) {
 		t.Fatal("a count was not understood")
 	}
 	f := &inflight{q: qc, key: qc.entryKey(), p0: bson.Timestamp{T: 45}}
-	c.installAt(f, nil, true, 0)
+	c.installAt(f, nil, true, 0, time.Time{})
 	if served(qc) {
 		t.Fatal("a count read at 45 answered before the stream applied an insert at 50 that it counts")
 	}
@@ -451,5 +451,58 @@ func TestEntriesKeepOnlyWhatTheyAnswer(t *testing.T) {
 	}
 	if _, err := d.LookupErr("stock"); err != nil {
 		t.Fatal("a field the projection keeps was lost")
+	}
+}
+
+// An entry on a tiered namespace is asked for again after tieredTTL, because
+// the archive it was proved or merged against changes where the stream does
+// not see; one on an untiered namespace is kept.
+func TestTieredEntriesExpire(t *testing.T) {
+	for _, tiered := range []bool{true, false} {
+		c := New(1 << 20)
+		c.Tiers(func(string) bool { return tiered }, nil, nil)
+		t0 := time.Unix(1_000_000, 0)
+		clock := t0
+		c.now = func() time.Time { return clock }
+		q := listQuery(t, "a", 1)
+		c.install(q, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+		if _, hit := c.Get(q); !hit {
+			t.Fatalf("tiered=%v: not served when filled", tiered)
+		}
+		clock = t0.Add(tieredTTL + time.Millisecond)
+		_, hit := c.Get(q)
+		if hit == tiered {
+			t.Errorf("tiered=%v: served=%v past tieredTTL", tiered, hit)
+		}
+	}
+}
+
+// The find command refuses a negative limit, so the cache must not answer it.
+func TestNegativeLimitIsMongodsToRefuse(t *testing.T) {
+	if _, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"}, {Key: "filter", Value: bson.D{}},
+		{Key: "sort", Value: bson.D{{Key: "_id", Value: 1}}}, {Key: "limit", Value: int32(-3)},
+	})); ok {
+		t.Fatal("a find with limit -3 was taken, and mongod answers it with BadValue")
+	}
+}
+
+// A proof that rests on something the router asks again sooner than tieredTTL
+// bounds its entry to that time.
+func TestProofBoundsItsEntry(t *testing.T) {
+	c := New(1 << 20)
+	c.Tiers(func(string) bool { return true }, nil, nil)
+	t0 := time.Unix(1_000_000, 0)
+	clock := t0
+	c.now = func() time.Time { return clock }
+	q := listQuery(t, "a", 1)
+	f := &inflight{q: q, key: q.entryKey(), p0: bson.Timestamp{T: 10}}
+	c.installAt(f, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0, t0.Add(2*time.Second))
+	if _, hit := c.Get(q); !hit {
+		t.Fatal("not served when filled")
+	}
+	clock = t0.Add(3 * time.Second)
+	if _, hit := c.Get(q); hit {
+		t.Fatal("served past the time its proof is asked again, inside tieredTTL")
 	}
 }
