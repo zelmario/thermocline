@@ -61,8 +61,14 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 	if !r.cfg.Manages(ns) {
 		return false, nil
 	}
-	if err := r.copyUpIsFresh(ctx, ns, 0); err != nil {
-		return false, err
+	// Waiting for mirroring protects against copying up a document the
+	// application has just deleted, and the fast tier's oplog says whether it
+	// has. See pointfresh.go. Shipping an archived order waited here a second
+	// time after choosing it, a whole publication cycle each.
+	if !r.noDeletePending(ctx, ns, id) {
+		if err := r.copyUpIsFresh(ctx, ns, 0); err != nil {
+			return false, err
+		}
 	}
 	doc, found, err := r.readArchived(ctx, ns, id, "")
 	if err != nil || !found {

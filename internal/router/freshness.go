@@ -134,6 +134,9 @@ type checkpointCache struct {
 	// is above zero and for checkpointIdle afterwards.
 	waiters int
 	polling bool
+	// used is when a read last asked for the position without waiting on
+	// it, as the oplog checks do. See recentPosition.
+	used time.Time
 }
 
 // reading is everything one look at the published position says.
@@ -194,8 +197,9 @@ func (r *Router) poll(ctx context.Context) {
 
 		r.ckptCache.mu.Lock()
 		n := r.ckptCache.waiters
+		inUse := time.Since(r.ckptCache.used) < checkpointIdle
 		r.ckptCache.mu.Unlock()
-		if n > 0 {
+		if n > 0 || inUse {
 			idleSince = time.Time{}
 		} else if idleSince.IsZero() {
 			idleSince = time.Now()
@@ -209,6 +213,24 @@ func (r *Router) poll(ctx context.Context) {
 		case <-time.After(r.ckptCache.pollInterval()):
 		}
 	}
+}
+
+// recentPosition is mirroredThrough for a read that uses the position without
+// waiting on it: the oplog checks of point reads, merged reads and copy-ups.
+//
+// The poller ran only while a read was waiting, and those reads exist to not
+// wait. So once they had taken over, nothing waited, the poller stopped a
+// second later, and the position they read grew older and older until it was
+// further behind than they check the oplog for, and they waited after all.
+// Measured on testfresh: a merged read that should have merged never did,
+// while the same read under a mutant that skipped the check merged every time.
+// Using the position keeps the poller going, as waiting on it does.
+func (r *Router) recentPosition(ctx context.Context) reading {
+	r.ckptCache.mu.Lock()
+	r.ckptCache.used = time.Now()
+	r.ckptCache.mu.Unlock()
+	r.startPolling(ctx)
+	return r.mirroredThrough(ctx)
 }
 
 // startPolling makes sure the poller is running.

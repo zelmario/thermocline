@@ -54,10 +54,22 @@ const pointCheckWindow = 2 * time.Second
 // answered by the archive now, because no delete of it is waiting to be
 // mirrored. False means wait as every other archive read does.
 func (r *Router) pointReadIsFresh(ctx context.Context, ns string, id bson.RawValue) bool {
+	if !r.noDeletePending(ctx, ns, id) {
+		return false
+	}
+	r.Stats.PointReadsUnwaited.Add(1)
+	return true
+}
+
+// noDeletePending reports whether the archive's copy of the document with this
+// _id is certainly not one the application has deleted and whose tombstone is
+// still being mirrored. False means wait for mirroring. See the top of this
+// file for why a delete is the only write that can make that copy wrong.
+func (r *Router) noDeletePending(ctx context.Context, ns string, id bson.RawValue) bool {
 	if r.cfg.ArchiveWait.D() <= 0 || r.cfg.FeederID == "" {
 		return false
 	}
-	got := r.mirroredThrough(ctx)
+	got := r.recentPosition(ctx)
 	if !got.known || got.ts.IsZero() {
 		return false
 	}
@@ -67,22 +79,19 @@ func (r *Router) pointReadIsFresh(ctx context.Context, ns string, id bson.RawVal
 	}
 	if checkpoint.PackTS(until) <= checkpoint.PackTS(got.ts) {
 		// Mirrored past every write this router has seen already.
-		r.Stats.PointReadsUnwaited.Add(1)
 		return true
 	}
 	if time.Duration(until.T-got.ts.T)*time.Second > pointCheckWindow {
 		return false
 	}
-	db, _ := splitNS(ns)
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
-	filter := bson.D{
-		{Key: "ts", Value: bson.D{{Key: "$gt", Value: got.ts}}},
-		{Key: "$or", Value: bson.A{
-			bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: "d"}, {Key: "o._id", Value: id}},
-			bson.D{{Key: "op", Value: "c"}, {Key: "ns", Value: bson.D{{Key: "$in", Value: bson.A{"admin.$cmd", db + ".$cmd"}}}}},
-		}},
-	}
+	// Only a delete matters here, at the top level or inside an applyOps:
+	// see the top of this file. An applyOps of inserts and updates, which is
+	// what an insertMany is on 8.0, cannot hide one.
+	filter := oplogWindow(ns, got.ts,
+		bson.A{bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: "d"}, {Key: "o._id", Value: id}}},
+		bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: bson.D{{Key: "$nin", Value: bson.A{"i", "u"}}}}})
 	var out struct {
 		Cursor struct {
 			FirstBatch []bson.Raw `bson:"firstBatch"`
@@ -95,9 +104,5 @@ func (r *Router) pointReadIsFresh(ctx context.Context, ns string, id bson.RawVal
 		{Key: "limit", Value: int32(1)},
 		{Key: "readConcern", Value: bson.D{{Key: "level", Value: "local"}, {Key: "afterClusterTime", Value: until}}},
 	}, options.RunCmd().SetReadPreference(readpref.Primary())).Decode(&out)
-	if err != nil || len(out.Cursor.FirstBatch) > 0 {
-		return false
-	}
-	r.Stats.PointReadsUnwaited.Add(1)
-	return true
+	return err == nil && len(out.Cursor.FirstBatch) == 0
 }

@@ -68,6 +68,8 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("live_refused_shapes_total", "Query shapes the live cache stopped holding because a document showed it could not answer them exactly.", snap.Counters["live_refused_shapes"])
 	gauge("live_entries", "Entries the live cache holds now.", float64(snap.Counters["live_entries"]))
 	gauge("live_bytes", "Bytes of documents the live cache holds now.", float64(snap.Counters["live_bytes"]))
+	counter("merged_reads_total", "Reads the fast tier could not prove complete, answered by merging its answer with the archive's instead of waiting for mirroring.", snap.Counters["merged_reads"])
+	counter("merge_fallbacks_total", "Merged reads the fast tier's oplog sent back to the freshness wait, because a document the archive returned had changed since the feeder's position.", snap.Counters["merge_fallbacks"])
 	counter("point_reads_unwaited_total", "Reads by _id answered from the archive without the freshness wait, because the fast tier's oplog showed no delete of that document waiting to be mirrored.", snap.Counters["point_reads_unwaited"])
 	counter("warmed_for_txn_total", "Documents brought up so a transaction could run against the fast tier alone.", snap.Counters["warmed_for_txn"])
 	counter("read_misses_total", "Point lookups that found the document only in the archive.", snap.Counters["read_misses"])

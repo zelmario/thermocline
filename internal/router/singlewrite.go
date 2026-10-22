@@ -3,11 +3,14 @@ package router
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -73,6 +76,9 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort,
 // the archive's own first match is therefore the document the statement would
 // have found with nothing tiered underneath it.
 func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
+	if id, found, ok := r.archivedMatchUnwaited(ctx, ns, filter, sort, collation); ok {
+		return id, found, nil
+	}
 	// Which document the write acts on is decided here, so the archive is
 	// asked once mirroring has caught up, as a read would be. Otherwise its
 	// first match can be a document the application has just deleted, and the
@@ -291,3 +297,152 @@ func (r *Router) fastTierHolds(ctx context.Context, ns string, id bson.RawValue)
 			options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
 	return err == nil
 }
+
+// unwaitedCandidates is how many of the archive's best matches are asked for,
+// so that one changed since the feeder's position can be passed over.
+const unwaitedCandidates = 8
+
+// archivedMatchUnwaited chooses the document oneArchivedMatch would, without
+// waiting for mirroring first. ok false means it could not, and the caller
+// waits as before.
+//
+// The wait made the archive's best match current. The fast tier's oplog says
+// instead which of the archive's best few have changed since the feeder's
+// position. One that was inserted or updated since is on the fast tier, every
+// write lands there, so the fast tier's own sort weighs it and it can be passed
+// over. One that was deleted may have been evicted rather than deleted, and is
+// still live, so that is not decided here. The first candidate nothing has
+// touched is current in the archive, and it is the one. Shipping the oldest
+// order waited here and again in its copy-up, measured at 29.3 ms against
+// 8.2 ms on the old cluster alone.
+func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, bool) {
+	if len(collation) > 0 || r.cfg.ArchiveWait.D() <= 0 || r.cfg.FeederID == "" {
+		return bson.RawValue{}, false, false
+	}
+	if _, has := r.defaultCollation(ctx, ns); has {
+		return bson.RawValue{}, false, false
+	}
+	got := r.recentPosition(ctx)
+	if !got.known || got.ts.IsZero() {
+		return bson.RawValue{}, false, false
+	}
+	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	if until.IsZero() {
+		return bson.RawValue{}, false, false
+	}
+	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
+	if behind && time.Duration(until.T-got.ts.T)*time.Second > pointCheckWindow {
+		return bson.RawValue{}, false, false
+	}
+
+	db, coll := splitNS(ns)
+	opts := options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetLimit(unwaitedCandidates)
+	if len(sort) > 0 {
+		opts.SetSort(sort)
+	}
+	cur, err := r.cold.Database(db).Collection(coll).Find(ctx, liveOnly(bson.RawValue{
+		Type:  bson.TypeEmbeddedDocument,
+		Value: filter,
+	}), opts)
+	if err != nil {
+		return bson.RawValue{}, false, false
+	}
+	var ids []bson.RawValue
+	for cur.Next(ctx) {
+		id, err := cur.Current.LookupErr("_id")
+		if err != nil {
+			_ = cur.Close(ctx)
+			return bson.RawValue{}, false, false
+		}
+		ids = append(ids, bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)})
+	}
+	cerr := cur.Err()
+	_ = cur.Close(ctx)
+	if cerr != nil {
+		return bson.RawValue{}, false, false
+	}
+	if len(ids) == 0 {
+		// Nothing matching in the archive, which mirroring cannot change: it
+		// is behind only by writes that land on the fast tier first, and a
+		// document the fast tier has that the archive has not seen yet is the
+		// fast tier's own sort to pick. What a lag leaves in the archive is
+		// more, a deleted document still live, never less.
+		return bson.RawValue{}, false, true
+	}
+	if !behind {
+		return ids[0], true, true
+	}
+	touched, err := r.oplogTouchedBy(ctx, ns, got.ts, until, ids)
+	if err != nil {
+		return bson.RawValue{}, false, false
+	}
+	for _, id := range ids {
+		switch touched[idKeyOf(id)] {
+		case "d", "c":
+			return bson.RawValue{}, false, false
+		case "i", "u":
+			continue
+		}
+		return id, true, true
+	}
+	return bson.RawValue{}, false, false
+}
+
+// oplogTouchedBy is oplogTouched saying which of ids each entry touched and
+// how: "i", "u" or "d" by _id, and "c" under every key when a command (a
+// transaction's applyOps, DDL) ran, since it could hide any of them.
+func (r *Router) oplogTouchedBy(ctx context.Context, ns string, from, until bson.Timestamp, ids []bson.RawValue) (map[string]string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	arr := make(bson.A, len(ids))
+	for i, id := range ids {
+		arr[i] = id
+	}
+	// Inserts as well: one inserted since is on the fast tier, whose own sort
+	// weighs it, so it can be passed over. See archivedMatchUnwaited.
+	direct, inner := touchesIDs(ns, arr, true)
+	filter := oplogWindow(ns, from, direct, inner)
+	var out struct {
+		Cursor struct {
+			FirstBatch []bson.Raw `bson:"firstBatch"`
+		} `bson:"cursor"`
+	}
+	err := r.hot.Database("local").RunCommand(cctx, bson.D{
+		{Key: "find", Value: "oplog.rs"},
+		{Key: "filter", Value: filter},
+		{Key: "projection", Value: bson.D{{Key: "op", Value: 1}, {Key: "o._id", Value: 1}, {Key: "o2._id", Value: 1}}},
+		{Key: "batchSize", Value: int32(1000)},
+		{Key: "readConcern", Value: bson.D{{Key: "level", Value: "local"}, {Key: "afterClusterTime", Value: until}}},
+	}, options.RunCmd().SetReadPreference(readpref.Primary())).Decode(&out)
+	if err != nil {
+		return nil, err
+	}
+	// Any command that matched, an applyOps holding something other than a
+	// plain insert of another document, DDL, a commit, is taken as touching
+	// every candidate: which of them it touched is not worth reading out.
+	touched := map[string]string{}
+	for _, e := range out.Cursor.FirstBatch {
+		op, _ := e.Lookup("op").StringValueOK()
+		if op == "c" {
+			for _, id := range ids {
+				touched[idKeyOf(id)] = "c"
+			}
+			return touched, nil
+		}
+		id, err := e.LookupErr("o2", "_id")
+		if err != nil {
+			id, err = e.LookupErr("o", "_id")
+		}
+		if err != nil {
+			continue
+		}
+		k := idKeyOf(id)
+		// A delete outranks anything else that happened to the same _id.
+		if touched[k] != "d" {
+			touched[k] = op
+		}
+	}
+	return touched, nil
+}
+
+func idKeyOf(v bson.RawValue) string { return string(rune(v.Type)) + string(v.Value) }

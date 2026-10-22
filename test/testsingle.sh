@@ -243,6 +243,34 @@ chk "and that is the document it marked"           "oldest" \
 H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 
+echo "== a queue taken from the archive one job after another =="
+# What a warehouse does all day: take the oldest pending job, mark it, take the
+# next. The router used to wait for mirroring before choosing which archived job
+# the sort means. Now the fast tier's oplog says which of the archive's best few
+# changed since the feeder's position, and the first one nothing touched is the
+# one. See archivedMatchUnwaited. Taken back to back, the archive still shows the
+# job just taken as pending, because its change has not been mirrored yet: that
+# job has to be passed over, or the same job is offered twice and the queue
+# stalls. One job is deleted through the router first, so the case where a
+# candidate was deleted, and the read has to wait, is in it too.
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany(Array.from({length:20},(_,k)=>({_id:k+1,seq:k+1,status:'pending'})))" >/dev/null
+TAKEN=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB)[process.env.TC_SNS];
+  c.deleteOne({_id:3});
+  const got = [];
+  for (let i = 0; i < 19; i++) {
+    const d = c.findOneAndUpdate({status:'pending'}, {\$set:{status:'done'}}, {sort:{seq:1}});
+    got.push(d ? d._id : 'null');
+  }
+  print(got.join(','));")
+chk "every job is taken once, oldest first" "1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20" "$TAKEN"
+chk "  and none is left pending"            "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB)[process.env.TC_SNS].countDocuments({status:'pending'}))")"
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

@@ -638,6 +638,14 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 	// tier cannot. This is what keeps a query the application already had
 	// working, instead of turning it into an error nobody asked for.
 	if c.r.cfg.Completeness == config.Archive {
+		// Merged with the archive's answer when the oplog shows nothing it
+		// returned is still being mirrored, instead of waiting. See
+		// mergedread.go.
+		if !viaView {
+			if out, ok := c.mergedFind(ctx, ns, msg, reply); ok {
+				return out, nil
+			}
+		}
 		db, coll := splitNS(ns)
 		// The fast tier ran this and may be holding the rest of it. Nothing
 		// will ever ask for that rest. See superseded.go.

@@ -260,6 +260,11 @@ type Stats struct {
 	// without the freshness wait, because the fast tier's oplog showed no
 	// delete of that document waiting to be mirrored. See pointfresh.go.
 	PointReadsUnwaited atomic.Int64
+	// MergedReads counts reads the fast tier could not prove complete that
+	// were answered by merging its answer with the archive's instead of
+	// waiting for mirroring, and MergeFallbacks those the oplog sent back to
+	// the wait. See mergedread.go.
+	MergedReads, MergeFallbacks atomic.Int64
 	// SupersededCursors counts fast tier cursors closed because the archive's
 	// answer replaced the one they belonged to. See superseded.go.
 	SupersededCursors atomic.Int64

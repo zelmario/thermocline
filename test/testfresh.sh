@@ -240,6 +240,58 @@ H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})
 sleep 1
 C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:400,\$lt:500}})" >/dev/null
 
+echo "== a sorted read merged from both tiers instead of waiting =="
+# A read the fast tier cannot prove complete used to wait for mirroring and ask
+# the archive alone. Now it asks the archive at once and the fast tier's oplog
+# whether anything the archive returned changed since the feeder's position,
+# and merges the two answers when nothing did. See mergedread.go. This is the
+# adoption shape: orders only the archive holds, written before the router
+# existed, and new ones written through it.
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:30},(_,k)=>({_id:700+k, n:700+k, grp:'m'})))" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:5},(_,k)=>({_id:740+k, n:740+k, grp:'m'})))" >/dev/null
+MQ="print(db.getSiblingDB(process.env.TC_DB).$NS.find({grp:'m'}).sort({n:-1}).limit(8).toArray().map(d=>d._id+':'+d.n).join(','))"
+MQC="print(db.getSiblingDB(process.env.TC_DB).$NS.find({grp:'m',_tcDeletedAt:{\$exists:false}}).sort({n:-1}).limit(8).toArray().map(d=>d._id+':'+d.n).join(','))"
+mergedCount() { curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -o '"merged_reads"[: ]*[0-9]*' | grep -o '[0-9]*$'; }
+M0=$(mergedCount)
+GOTM=$(R "$MQ")
+# The truth is the archive once the five new orders are mirrored into it.
+for _ in $(seq 1 60); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:{\$gte:740,\$lt:745}}))")" = "5" ] && break
+  sleep 0.5
+done
+chk "both tiers merged in order"                   "$(C "$MQC")" "$GOTM"
+chk "  and it was a merge, not the wait"           "true" \
+    "$([ $(( $(mergedCount) - ${M0:-0} )) -ge 1 ] && echo true || echo "false (${M0:-?} -> $(mergedCount))")"
+# An archived order changed through the router is copied up and changed on the
+# fast tier, and the archive's copy is old until mirrored: the fast tier's wins.
+GOTU=$(R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:705},{\$set:{n:900}}); $MQ")
+chk "an archived order changed a moment ago comes back changed" "705:900" "${GOTU%%,*}"
+# The case the oplog check is for: an archived order deleted through the router,
+# read straight back. The archive still holds it live until the tombstone is
+# mirrored, so the read has to wait. Counted against what the router admitted,
+# like the loops above.
+SR0=$(staleReads)
+BACK=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$NS;
+  let back = 0;
+  for (let i = 720; i < 730; i++) {
+    c.deleteOne({_id:i});
+    const ids = c.find({grp:'m'}).sort({n:-1}).limit(30).toArray().map(d=>d._id);
+    if (ids.includes(i)) back++;
+  }
+  print(back);")
+SR1=$(staleReads)
+ADMITTED=$(( ${SR1:-0} - ${SR0:-0} ))
+echo "      ${BACK:-?} of ten deleted archived orders came back in a merged read, and the router admitted $ADMITTED stale read(s)"
+chk "a deleted archived order comes back only if admitted" "true" \
+    "$(awk -v m="${BACK:-x}" -v a="$ADMITTED" 'BEGIN{print (m ~ /^[0-9]+$/ && m+0 <= a+0) ? "true" : "false"}')"
+sleep 1
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
+sleep 1
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
+
 echo "== every deleted document that comes back is one the router admitted =="
 # The section above asks the question once. This asks it eight times, through
 # both of the paths a delete can take, and counts.

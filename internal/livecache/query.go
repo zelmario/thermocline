@@ -524,6 +524,13 @@ func bracket(v bson.RawValue) string {
 	return ""
 }
 
+// SortBracket is bracket for other packages: the class a sortable value sorts
+// within, "" for one this does not order.
+func SortBracket(v bson.RawValue) string { return bracket(v) }
+
+// CompareSame is compareSame for other packages.
+func CompareSame(a, b bson.RawValue) int { return compareSame(a, b) }
+
 // compareSame orders two values of one bracket the way MongoDB does.
 func compareSame(a, b bson.RawValue) int {
 	switch bracket(a) {
