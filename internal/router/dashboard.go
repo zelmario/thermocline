@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/zelmario/thermocline/internal/livecache"
 )
 
 // The router already knew everything an operator wants to see and told nobody:
@@ -136,6 +138,10 @@ const dashboardAdviceRows = 12
 
 // SnapshotAll gathers everything the dashboard needs in one read.
 func (r *Router) SnapshotAll() Snapshot {
+	var live livecache.Stats
+	if r.live != nil {
+		live = r.live.Stats()
+	}
 	return Snapshot{
 		NowUnix: time.Now().Unix(),
 		UptimeS: int64(time.Since(r.started).Seconds()),
@@ -177,6 +183,18 @@ func (r *Router) SnapshotAll() Snapshot {
 			"claim_grace_reads":        r.Stats.ClaimGraceReads.Load(),
 			"clients_open":             r.Stats.ClientsOpen.Load(),
 			"clients_total":            r.Stats.ClientsTotal.Load(),
+			// The live cache's own counters, zero while it is off. They were
+			// only logged every 30 seconds, and a benchmark whose router log
+			// went with its server could not say what the cache had answered.
+			"live_hits":              live.Hits,
+			"live_misses":            live.Misses,
+			"live_waited_for_stream": live.Behind,
+			"live_fills":             live.Fills,
+			"live_unproven":          live.Unproven,
+			"live_dropped":           live.Dropped,
+			"live_refused_shapes":    live.Refusals,
+			"live_entries":           int64(live.Entries),
+			"live_bytes":             int64(live.Bytes),
 		},
 		Metrics:   r.Metrics.Snapshot(),
 		Inventory: r.InventorySnapshot(),
