@@ -506,3 +506,32 @@ func TestProofBoundsItsEntry(t *testing.T) {
 		t.Fatal("served past the time its proof is asked again, inside tieredTTL")
 	}
 }
+
+// A tiered entry is filled on its second miss inside admitWindow, an untiered
+// one on its first.
+func TestTieredFillsOnTheSecondMiss(t *testing.T) {
+	for _, tiered := range []bool{true, false} {
+		c := New(1 << 20)
+		c.Tiers(func(string) bool { return tiered }, nil, nil)
+		t0 := time.Unix(1_000_000, 0)
+		clock := t0
+		c.now = func() time.Time { return clock }
+		q := listQuery(t, "a", 1)
+		c.Get(q)
+		if got := c.Filling(q); got == tiered {
+			t.Fatalf("tiered=%v: filling after the first miss = %v", tiered, got)
+		}
+		if tiered {
+			clock = t0.Add(admitWindow + time.Second)
+			c.Get(q)
+			if c.Filling(q) {
+				t.Fatal("filled on a second miss outside admitWindow")
+			}
+			clock = clock.Add(time.Second)
+			c.Get(q)
+			if !c.Filling(q) {
+				t.Fatal("not filled on a second miss inside admitWindow")
+			}
+		}
+	}
+}

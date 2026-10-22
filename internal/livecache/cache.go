@@ -74,6 +74,8 @@ type Cache struct {
 	unprovenAt map[string]time.Time
 	// failedAt are entries whose last fill failed, with why, for State.
 	failedAt map[string]fillFailure
+	// missedOnce are tiered entries missed once, by when. See admitTiered.
+	missedOnce map[string]time.Time
 	// plainNS says, per namespace, that it has no default collation and is not
 	// a view. Read and written by the fill workers, under plainMu.
 	plainMu sync.Mutex
@@ -241,6 +243,7 @@ func New(maxBytes int) *Cache {
 		filling:      map[string]bool{},
 		unprovenAt:   map[string]time.Time{},
 		failedAt:     map[string]fillFailure{},
+		missedOnce:   map[string]time.Time{},
 		plainNS:      map[string]bool{},
 	}
 }
@@ -586,6 +589,10 @@ func (c *Cache) requestFill(q Query) {
 		}
 		delete(c.unprovenAt, key)
 	}
+	if !c.admitTiered(q, key) {
+		c.mu.Unlock()
+		return
+	}
 	c.filling[key] = true
 	c.mu.Unlock()
 	// Its values point into the client's message, which is reused once the
@@ -598,6 +605,36 @@ func (c *Cache) requestFill(q Query) {
 		delete(c.filling, key)
 		c.mu.Unlock()
 	}
+}
+
+// admitWindow is how soon a tiered entry must be missed again to be filled.
+const admitWindow = 2 * time.Minute
+
+// admitTiered says whether a miss on q should fill it, which on a tiered
+// namespace waits for the second miss within admitWindow. Called with mu held.
+//
+// A fill there that the fast tier cannot prove reads the archive, on top of the
+// archive read the client's own query already made. On the 200 million order
+// adoption, every customer's "my orders" was such a fill and almost none was
+// read again inside the entry's life: 25 million customers. The fills took the
+// archive's network volume to 98% busy, its reads stalled in steps of 200ms, and
+// "my orders" went from a p95 of 14ms alone to 213ms. The fill a second visit
+// asks for is one somebody is coming back to. This is TinyLFU's doorkeeper,
+// applied only where a fill is expensive: an untiered fill reads the fast tier.
+func (c *Cache) admitTiered(q Query, key string) bool {
+	if !c.isTiered(q.NS) {
+		return true
+	}
+	now := c.now()
+	if at, ok := c.missedOnce[key]; ok && now.Sub(at) < admitWindow {
+		delete(c.missedOnce, key)
+		return true
+	}
+	if len(c.missedOnce) >= maxUnproven {
+		clear(c.missedOnce)
+	}
+	c.missedOnce[key] = now
+	return false
 }
 
 // State says why Get would not answer q now, or "hit" when it would. For the

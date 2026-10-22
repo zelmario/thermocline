@@ -61,6 +61,9 @@ func (v *liveVerifier) write(line string) {
 func (c *conn) liveVerifyGet(q livecache.Query) (bson.Raw, bool) {
 	start := time.Now()
 	deadline := start.Add(liveVerifyWait)
+	// A tiered entry is filled on its second miss (see livecache's
+	// admitTiered), so one more ask is what a client coming back would make.
+	asked := false
 	for {
 		if reply, hit := c.r.live.Get(q); hit {
 			return reply, true
@@ -73,6 +76,10 @@ func (c *conn) liveVerifyGet(q livecache.Query) (bson.Raw, bool) {
 			return nil, false
 		}
 		st := c.r.live.State(q)
+		if st == "no entry" && !asked {
+			asked = true
+			continue
+		}
 		switch st {
 		case "filling", "behind", "entry behind":
 			if time.Now().Before(deadline) {
