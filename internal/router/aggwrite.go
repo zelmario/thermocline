@@ -82,6 +82,12 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 		read = append(read, doc)
 	}
 
+	// Every write below is made on this router's own client, so no reply
+	// on the client's connection carries its time, and the reply the client
+	// gets is built here. On every way out, a failure included since a
+	// failed write may have landed in part, the router's clock is brought
+	// past them. See catchUpOpTime.
+	defer c.r.catchUpOpTime(ctx)
 	sink, err := c.newWriteSink(ctx, final, db)
 	if err != nil {
 		return c.writePipelineError(msg, s, "preparing the target failed", false, err)

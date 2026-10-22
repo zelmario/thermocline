@@ -282,6 +282,38 @@ func (r *Router) noteOpTime(reply *wire.Message) {
 	}
 }
 
+// catchUpOpTime brings seenOpTime past every write the fast tier has
+// acknowledged, for writes this router made on its own client on a client's
+// behalf: those replies never pass noteOpTime, so the freshness barrier and the
+// live cache's read-your-writes were judged against a time before them.
+//
+// Found by the live cache's verify mode on testexplain: a $out whose input
+// came from the archive, written here and renamed over the target, then a
+// count of the target straight after. The note of the write carried the time
+// before it, and the cache would have answered 0 for the 10 documents just
+// written. A ping's operationTime is the node's clock, past every write it has
+// acknowledged, so one round trip after the work settles it.
+func (r *Router) catchUpOpTime(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	raw, err := r.hot.Database("admin").RunCommand(cctx, bson.D{{Key: "ping", Value: 1}},
+		options.RunCmd().SetReadPreference(readpref.Primary())).Raw()
+	if err != nil {
+		return
+	}
+	t, i, ok := raw.Lookup("operationTime").TimestampOK()
+	if !ok {
+		return
+	}
+	want := checkpoint.PackTS(bson.Timestamp{T: t, I: i})
+	for {
+		got := r.seenOpTime.Load()
+		if want <= got || r.seenOpTime.CompareAndSwap(got, want) {
+			return
+		}
+	}
+}
+
 // mirroredThrough returns how far mirroring has got, reusing a recent reading.
 func (r *Router) mirroredThrough(ctx context.Context) reading {
 	r.ckptCache.mu.Lock()
