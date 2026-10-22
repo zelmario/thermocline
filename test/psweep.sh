@@ -92,7 +92,12 @@ if [ -n "${LIVE:-}" ] && [ "${LIVE}" != "0" ]; then
   FROM=primary
   [ "$LIVE" = "secondary" ] && FROM=secondary
   LIVECFG=/root/cline_live_sweep.yaml
-  sed "s|^  completeness:|  live_cache:\n    enabled: true\n    stream_from: $FROM\n  completeness:|" \
+  # In verify mode: the cache answers nothing and every answer it could have
+  # given is compared with the real one, so a pass is a count of comparisons
+  # rather than of reads that happened to miss. See liveverify.go.
+  LIVELOG=/root/live_verify.log
+  rm -f "$LIVELOG"
+  sed "s|^  completeness:|  live_cache:\n    enabled: true\n    stream_from: $FROM\n    verify_log: $LIVELOG\n  completeness:|" \
     "$SHARED" > "$LIVECFG"
   grep -q '^  live_cache:' "$LIVECFG" || {
     echo "psweep: LIVE=$LIVE but $LIVECFG does not turn the live cache on"; exit 2; }
@@ -207,6 +212,14 @@ MINS=$(( ($(date +%s) - START) / 60 ))
   # Only the tally line, which starts at column one. The per-check lines are
   # indented, and counting those would double every number.
   echo "checks: $(grep -hE '^PASS [0-9]+ +FAIL [0-9]+' "$OUT"/*.log | awk '{p+=$2; f+=$4} END {print p+0" passed, "f+0" failed"}')"
+  if [ -n "${LIVELOG:-}" ]; then
+    LOK=$(grep -c '^OK' "$LIVELOG" 2>/dev/null); LBAD=$(grep -c '^MISMATCH' "$LIVELOG" 2>/dev/null)
+    echo "live cache: ${LOK:-0} answers compared, ${LBAD:-0} differed ($LIVELOG)"
+    # Kept with the run, since the next sweep empties it.
+    cp "$LIVELOG" "$OUT/live_verify.log" 2>/dev/null
+    [ "${LOK:-0}" = "0" ] && echo "live cache: NO ANSWERS COMPARED, the run proved nothing about it"
+    [ "${LBAD:-0}" != "0" ] && echo "live cache: FAIL 1 (answers differed)"
+  fi
 } >> "$OUT/summary.txt"
 
 # And a status a caller can read. Without this the script ended on whatever the
@@ -215,5 +228,5 @@ MINS=$(( ($(date +%s) - START) / 60 ))
 # the summary. The same rule hostsweep.sh follows: a tally is for people, an
 # exit status is for whatever started it.
 cat "$OUT/summary.txt"
-grep -qE 'FAIL [1-9]|TIMED OUT|MISSING|no tally|SETUP FAILED' "$OUT/summary.txt" && exit 1
+grep -qE 'FAIL [1-9]|TIMED OUT|MISSING|no tally|SETUP FAILED|NO ANSWERS COMPARED' "$OUT/summary.txt" && exit 1
 exit 0

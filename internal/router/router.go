@@ -191,6 +191,9 @@ type Router struct {
 	// live is the live cache, nil unless router.live_cache.enabled. See
 	// livecache.go.
 	live *livecache.Cache
+	// liveVerify is router.live_cache.verify_log, nil when off. See
+	// liveverify.go.
+	liveVerify *liveVerifier
 	// liveStream is the client the live cache reads its change stream
 	// through, hot unless router.live_cache.stream_from says otherwise. See
 	// WithLiveStream.
@@ -674,6 +677,11 @@ func (r *Router) Listen(ctx context.Context) error {
 		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
 		r.live.Tiers(r.cfg.Manages, r.liveProve, r.liveMerge)
 		r.live.SetMaxStaleness(r.cfg.LiveCache.MaxStaleness.D())
+		if p := r.cfg.LiveCache.VerifyLog; p != "" {
+			r.liveVerify = &liveVerifier{path: p}
+			r.log.Warn("the live cache is in verify mode: it answers nothing and compares every answer it could have given",
+				"verify_log", p)
+		}
 		stream := r.hot
 		if r.liveStream != nil {
 			stream = r.liveStream
@@ -1002,6 +1010,9 @@ type conn struct {
 	// liveNotes are the writes classified finer than a namespace. See
 	// classifyWrite.
 	liveNotes []livecache.WriteNote
+	// liveCheck is the answer the live cache would have given, compared with
+	// the real one when it goes out. See liveverify.go.
+	liveCheck *liveCheck
 
 	// auth is the SCRAM conversation in progress, and grants what the finished
 	// one established. grants being nil is what "not authenticated" means, and

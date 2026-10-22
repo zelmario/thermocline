@@ -1134,6 +1134,13 @@ type LiveCacheConfig struct {
 	// moves is the oplog scan and the lookup of every updated document, off
 	// the node every client is waiting on.
 	StreamFrom string `yaml:"stream_from"`
+	// VerifyLog, when set, makes the cache prove itself instead of answer:
+	// every read it could answer is answered as if it were off, and the two
+	// answers are compared, a line per comparison appended to this file. A
+	// read it misses waits for its fill first, so the first read of a query
+	// is checked too. For tests: it doubles every cached read and slows every
+	// miss.
+	VerifyLog string `yaml:"verify_log"`
 }
 
 // CacheConfig is the learned-TTL query cache.

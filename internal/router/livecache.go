@@ -108,6 +108,9 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 		return nil, false
 	}
 	if !ok {
+		if c.r.liveVerify != nil {
+			c.liveVerifySkip(ns, "shape: "+name)
+		}
 		return nil, false
 	}
 	// Authentication is proxied, so mongod decides who may read what, and an
@@ -115,8 +118,19 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 	// namespace within the last minute is answered here; anybody else is
 	// sent to mongod, and its yes is what lets them in next time.
 	user := c.identity()
-	if !c.r.live.Allowed(ns, user) {
+	allowed := c.r.live.Allowed(ns, user)
+	if !allowed {
 		c.liveAsk = liveProof{ns: ns, user: user}
+	}
+	// Verify mode answers nothing, so who may read is not its question.
+	if c.r.liveVerify != nil {
+		if reply, hit := c.liveVerifyGet(q); hit {
+			c.liveCheck = &liveCheck{ns: ns, cmd: append(bson.Raw(nil), cmd...),
+				cached: append(bson.Raw(nil), reply...), at: time.Now()}
+		}
+		return nil, false
+	}
+	if !allowed {
 		return nil, false
 	}
 	reply, hit := c.r.live.Get(q)
@@ -305,6 +319,12 @@ func (c *conn) liveAfterReply(reply *wire.Message) {
 			c.r.live.NoteWrite(ns, at)
 		}
 		c.liveWrites = c.liveWrites[:0]
+	}
+	if chk := c.liveCheck; chk != nil {
+		c.liveCheck = nil
+		if doc, err := reply.ReplyDoc(); err == nil {
+			c.liveVerifyReply(chk, doc)
+		}
 	}
 	if c.liveAsk.ns != "" {
 		if doc, err := reply.ReplyDoc(); err == nil && replyOK(doc) {
