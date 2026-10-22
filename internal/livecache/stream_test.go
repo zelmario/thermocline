@@ -101,15 +101,25 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 				id := fmt.Sprintf("p%04d", r.Intn(650/4)*4+w)
 				var err error
 				sctx := mongo.NewSessionContext(ctx, sess)
+				// Noted as the router notes it, by what the write names:
+				// see classifyWrite. A namespace-wide mark held every read
+				// behind four writers' latest write, about twenty of them
+				// inside the applier's 20ms, so entries were filled only when
+				// that queue happened to empty: 0 to 733 answers a run.
+				note := WriteNote{NS: ns, IDs: []bson.RawValue{strVal(t, id)}}
 				switch r.Intn(5) {
 				case 0:
+					note.Fields = []string{"category"}
 					_, err = co.UpdateOne(sctx, bson.D{{Key: "_id", Value: id}}, bson.D{{Key: "$set", Value: bson.D{{Key: "category", Value: fmt.Sprintf("c%02d", r.Intn(20))}}}})
 				case 1:
 					_, err = co.DeleteOne(sctx, bson.D{{Key: "_id", Value: id}})
 				case 2:
-					_, err = co.InsertOne(sctx, bson.D{{Key: "_id", Value: id}, {Key: "category", Value: fmt.Sprintf("c%02d", r.Intn(20))},
-						{Key: "price", Value: float64(r.Intn(1_000_000)) / 100}, {Key: "stock", Value: int32(5)}})
+					d := bson.D{{Key: "_id", Value: id}, {Key: "category", Value: fmt.Sprintf("c%02d", r.Intn(20))},
+						{Key: "price", Value: float64(r.Intn(1_000_000)) / 100}, {Key: "stock", Value: int32(5)}}
+					note = WriteNote{NS: ns, Docs: []bson.Raw{mustRaw(d)}}
+					_, err = co.InsertOne(sctx, d)
 				default:
+					note.Fields = []string{"price", "stock"}
 					p := float64(r.Intn(1_000_000)) / 100
 					_, err = co.UpdateOne(sctx, bson.D{{Key: "_id", Value: id}}, bson.D{
 						{Key: "$set", Value: bson.D{{Key: "price", Value: p}}},
@@ -121,7 +131,7 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 					return
 				}
 				if ot := sess.OperationTime(); ot != nil {
-					c.NoteWrite(ns, *ot)
+					c.NoteWrites([]WriteNote{note}, *ot)
 				}
 				q, _ := ParseFind(ns, mustRaw(bson.D{{Key: "find", Value: "products"}, {Key: "filter", Value: bson.D{{Key: "_id", Value: id}}}, {Key: "limit", Value: int32(1)}}))
 				if got, hit := c.Get(q); hit {
@@ -181,8 +191,51 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 			}
 		}
 	}
+	// A change landing while a fill is in flight, and the last change that
+	// document gets. Under the writers above a fill that lost one was mostly
+	// healed by the next write to the same document, whose event carries the
+	// whole document, so the loss showed only by accident of timing. Here the
+	// fill is asked for, the write follows once the fill has its position, and
+	// nothing writes that document again.
+	raced, lost := 0, 0
+	for round := 0; round < 40; round++ {
+		cat := fmt.Sprintf("c%02d", round%20)
+		q, _ := ParseFind(ns, mustRaw(bson.D{{Key: "find", Value: "products"}, {Key: "filter", Value: bson.D{{Key: "category", Value: cat}}},
+			{Key: "sort", Value: bson.D{{Key: "price", Value: int32(1)}}}, {Key: "limit", Value: int32(3)},
+			{Key: "projection", Value: bson.D{{Key: "price", Value: int32(1)}, {Key: "category", Value: int32(1)}, {Key: fmt.Sprintf("r%d", round), Value: int32(1)}}}}))
+		if _, hit := c.Get(q); hit {
+			continue
+		}
+		var last bson.M
+		o := options.FindOne().SetSort(bson.D{{Key: "price", Value: -1}})
+		if err := co.FindOne(ctx, bson.D{{Key: "category", Value: cat}}, o).Decode(&last); err != nil {
+			continue
+		}
+		// Past the applier's next turn, which hands the fill its position,
+		// and inside the fill's 20ms delay: to the top of the list.
+		time.Sleep(8 * time.Millisecond)
+		if _, err := co.UpdateOne(ctx, bson.D{{Key: "_id", Value: last["_id"]}}, bson.D{{Key: "$set", Value: bson.D{{Key: "price", Value: -1 - float64(round)}}}}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		got, hit := c.Get(q)
+		if !hit {
+			continue
+		}
+		raced++
+		if want := direct(t, ctx, co, q); !reflect.DeepEqual(batchOf(got), want) {
+			lost++
+			if lost <= 3 {
+				t.Errorf("a fill lost a change made while it was in flight: %s: cache %v, mongod %v", q.entryKey(), batchOf(got), want)
+			}
+		}
+	}
+	if raced < 10 {
+		t.Errorf("only %d fills raced a write, too few to say anything", raced)
+	}
+
 	s := c.Stats()
-	t.Logf("checked %d answers after the writes, %d wrong; %d writer reads disagreed; stats %+v", checked, wrong, n, s)
+	t.Logf("checked %d answers after the writes, %d wrong; %d writer reads disagreed; %d fills raced a write, %d lost it; stats %+v", checked, wrong, n, raced, lost, s)
 	if checked < 200 {
 		t.Errorf("only %d answers came from the cache, too few to say anything", checked)
 	}
