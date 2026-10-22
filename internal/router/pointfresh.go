@@ -41,14 +41,62 @@ import (
 //
 // Anything it cannot reason about waits as before: a command entry in the
 // window, because a delete can sit inside applyOps or a transaction, a feeder
-// whose position carries no cluster time, a window wider than pointCheckWindow,
-// and any error.
+// whose position carries no cluster time, a window the oplog no longer reaches
+// back to or that holds more than windowMaxEntries, and any error.
 
-// pointCheckWindow is the widest gap between the feeder's position and this
-// router's cluster time that is checked rather than waited for. Wider means the
-// feeder is behind, and a scan of seconds of oplog on the read path is not
-// cheaper than the wait it would save.
+// pointCheckWindow is the gap between the feeder's position and this router's
+// cluster time that is checked without first asking how much oplog it holds.
 const pointCheckWindow = 2 * time.Second
+
+// windowMaxEntries is the most oplog entries a window may hold and still be
+// checked rather than waited for. More means the feeder is behind, and a scan
+// of that much oplog on the read path is not cheaper than the wait it saves.
+const windowMaxEntries = 500
+
+// windowCheckable reports whether the fast tier's oplog after from, up to
+// until, can be asked what changed instead of waiting for mirroring.
+//
+// A gap in seconds alone said "behind" when the feeder was idle. A feeder's
+// position moves with an event or an empty poll's resume token, and on an idle
+// replica set nothing moves the cluster time but the periodic no-op writer,
+// every ten seconds by default. So the first write after a few quiet seconds
+// opened a gap of seconds holding one entry, the write itself, and the read
+// behind it waited. Measured on testfresh: one run in five refused its merged
+// read this way, at 2.4 seconds and one entry.
+//
+// So a wider gap is measured in entries, and the oplog must still reach back
+// to from: an entry at or before it, or the window's entries are not all
+// there. Both are cheap, the first entry and a ts bound being seeks.
+func (r *Router) windowCheckable(ctx context.Context, from, until bson.Timestamp) bool {
+	if time.Duration(until.T-from.T)*time.Second <= pointCheckWindow {
+		return true
+	}
+	cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	oplog := r.hot.Database("local", options.Database().SetReadPreference(readpref.Primary())).Collection("oplog.rs")
+	tsOnly := bson.D{{Key: "ts", Value: 1}}
+	var first struct {
+		TS bson.Timestamp `bson:"ts"`
+	}
+	if err := oplog.FindOne(cctx, bson.D{}, options.FindOne().
+		SetSort(bson.D{{Key: "$natural", Value: 1}}).SetProjection(tsOnly)).Decode(&first); err != nil {
+		return false
+	}
+	if checkpoint.PackTS(first.TS) > checkpoint.PackTS(from) {
+		return false
+	}
+	cur, err := oplog.Find(cctx, bson.D{{Key: "ts", Value: bson.D{{Key: "$gt", Value: from}}}}, options.Find().
+		SetProjection(tsOnly).SetLimit(windowMaxEntries+1).SetBatchSize(windowMaxEntries+1))
+	if err != nil {
+		return false
+	}
+	defer cur.Close(cctx)
+	n := 0
+	for cur.Next(cctx) {
+		n++
+	}
+	return cur.Err() == nil && n <= windowMaxEntries
+}
 
 // pointReadIsFresh reports whether a read of the document with this _id can be
 // answered by the archive now, because no delete of it is waiting to be
@@ -81,7 +129,7 @@ func (r *Router) noDeletePending(ctx context.Context, ns string, id bson.RawValu
 		// Mirrored past every write this router has seen already.
 		return true
 	}
-	if time.Duration(until.T-got.ts.T)*time.Second > pointCheckWindow {
+	if !r.windowCheckable(ctx, got.ts, until) {
 		return false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)

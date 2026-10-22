@@ -250,6 +250,11 @@ echo "== a sorted read merged from both tiers instead of waiting =="
 H "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$gte:700,\$lt:800}})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:30},(_,k)=>({_id:700+k, n:700+k, grp:'m'})))" >/dev/null
+# Quiet first, so the write below opens a gap of seconds that holds one entry.
+# An idle feeder's position stands still until the next event or no-op, and a
+# gap measured in seconds alone once read that as a feeder behind: one run in
+# five refused this merge. See windowCheckable.
+sleep 3
 R "db.getSiblingDB(process.env.TC_DB).$NS.insertMany(Array.from({length:5},(_,k)=>({_id:740+k, n:740+k, grp:'m'})))" >/dev/null
 MQ="print(db.getSiblingDB(process.env.TC_DB).$NS.find({grp:'m'}).sort({n:-1}).limit(8).toArray().map(d=>d._id+':'+d.n).join(','))"
 MQC="print(db.getSiblingDB(process.env.TC_DB).$NS.find({grp:'m',_tcDeletedAt:{\$exists:false}}).sort({n:-1}).limit(8).toArray().map(d=>d._id+':'+d.n).join(','))"

@@ -331,7 +331,7 @@ func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, s
 		return bson.RawValue{}, false, false
 	}
 	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
-	if behind && time.Duration(until.T-got.ts.T)*time.Second > pointCheckWindow {
+	if behind && !r.windowCheckable(ctx, got.ts, until) {
 		return bson.RawValue{}, false, false
 	}
 

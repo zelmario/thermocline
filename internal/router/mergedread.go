@@ -291,7 +291,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 		return no("no cluster time seen yet")
 	}
 	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
-	if behind && time.Duration(until.T-got.ts.T)*time.Second > pointCheckWindow {
+	if behind && !c.r.windowCheckable(ctx, got.ts, until) {
 		return no("the feeder is further behind than the oplog is read for")
 	}
 
