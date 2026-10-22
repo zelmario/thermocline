@@ -49,7 +49,18 @@ func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue, 
 
 // copyUp moves one document from the archive into the fast tier and protects it
 // from the next eviction sweep. It reports whether the document existed.
+//
+// Never into a collection nothing tiers. Such a collection is the fast tier's
+// alone, and the archive's copy of it is whatever the old cluster held when it
+// was adopted. Copying one up writes into a collection the feeder never
+// mirrors, and brings back documents the application has since deleted: an
+// update by _id of a deleted cart matched nothing on the fast tier, as it
+// should, and this brought the archive's old cart back and changed it. It
+// reports not found, which is the fast tier's answer and the right one.
 func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool, error) {
+	if !r.cfg.Manages(ns) {
+		return false, nil
+	}
 	if err := r.copyUpIsFresh(ctx, ns, 0); err != nil {
 		return false, err
 	}

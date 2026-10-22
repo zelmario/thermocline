@@ -392,6 +392,23 @@ chk "nothing was copied into it"              "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
 chk "and the archive still has it"            "2" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
+# Writes by exact _id took the same shortcut after reads stopped taking it. A
+# write that matches nothing is repaired by copying the document up and running
+# it again, and that repair never asked whether the collection is tiered. So an
+# update of a document the application had deleted from the fast tier brought
+# the archive's old copy back and changed it: a deleted cart came back to life.
+# MongoDB answers each of these with nothing matched.
+chk "an update by _id matches nothing"        "0/0" \
+    "$(R "const r=db.getSiblingDB(process.env.TC_DB).tuntier.updateOne({_id:'p2'},{\$set:{name:'changed'}}); print(r.matchedCount+'/'+r.modifiedCount)")"
+chk "a delete by _id deletes nothing"         "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tuntier.deleteOne({_id:'p2'}).deletedCount)")"
+chk "a findOneAndUpdate by _id finds nothing" "NOTHING" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tuntier.findOneAndUpdate({_id:'p2'},{\$set:{name:'changed'}}); print(d?d.name:'NOTHING')")"
+sleep 2
+chk "  and none of them copied anything up"   "0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tuntier.countDocuments({}))")"
+chk "  and the archive's copy is untouched"   "a toaster" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tuntier.findOne({_id:'p2'}).name)")"
 C "db.getSiblingDB(process.env.TC_DB).tuntier.drop()" >/dev/null
 kill $UP 2>/dev/null; wait $UP 2>/dev/null
 # Correct and silent is the wrong pair: the application sees an empty collection

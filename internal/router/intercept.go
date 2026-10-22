@@ -321,6 +321,11 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 		return reply, nil
 	}
 	ns := db + "." + coll
+	// A collection nothing tiers has no archived documents to repair a miss
+	// with, so matching nothing is the answer. See copyUp.
+	if !c.r.cfg.Manages(ns) {
+		return reply, nil
+	}
 
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
@@ -419,6 +424,11 @@ func (c *conn) interceptFindAndModify(ctx context.Context, msg *wire.Message, db
 		}
 	}
 	ns := db + "." + coll
+	// The same as interceptWrite: nothing to repair on a collection nothing
+	// tiers. See copyUp.
+	if !c.r.cfg.Manages(ns) {
+		return reply, nil
+	}
 
 	rdoc, err := reply.ReplyDoc()
 	if err != nil || !replyOK(rdoc) {
