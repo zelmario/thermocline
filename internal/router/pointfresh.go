@@ -8,6 +8,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
+	"github.com/zelmario/thermocline/internal/wire"
+
 	"github.com/zelmario/thermocline/internal/checkpoint"
 )
 
@@ -98,15 +100,48 @@ func (r *Router) windowCheckable(ctx context.Context, from, until bson.Timestamp
 	return cur.Err() == nil && n <= windowMaxEntries
 }
 
-// pointReadIsFresh reports whether a read of the document with this _id can be
-// answered by the archive now, because no delete of it is waiting to be
-// mirrored. False means wait as every other archive read does.
-func (r *Router) pointReadIsFresh(ctx context.Context, ns string, id bson.RawValue) bool {
-	if !r.noDeletePending(ctx, ns, id) {
-		return false
+
+// pointReadInParallel answers a read of one document by _id from the archive
+// with the oplog check and the archive read run at the same time. ok false
+// means the check did not clear it, or the read was not one batch, and the
+// caller waits for mirroring and reads again, as every read did before.
+//
+// The two were one after the other, and the read is all round trips: the fast
+// tier's miss, the check, the archive. On the Docker test server a point read
+// took 1.65ms through the router against 0.41ms on the archive alone, and the
+// check went to the oplog for the entries its stream had not reached in two
+// reads of three. They do not depend on each other once the window is read,
+// and it is read first: from is where the archive is current to, so the archive
+// read that follows holds everything mirrored up to it.
+func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, coll string, id bson.RawValue,
+	rewritten bson.D, batchSize int, budget time.Duration, count bool) (*wire.Message, bool) {
+	ns := db + "." + coll
+	from, until, ok := c.r.pointWindow(ctx)
+	if !ok {
+		return nil, false
 	}
-	r.Stats.PointReadsUnwaited.Add(1)
-	return true
+	fresh := make(chan bool, 1)
+	go func() { fresh <- c.r.noDeletePendingIn(ctx, ns, id, from, until) }()
+	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, withRemainingTime(rewritten, budget, 0))
+	var batch bson.A
+	more := false
+	if err == nil {
+		batch, more, err = readBatch(ctx, cur, batchSize)
+		_ = cur.Close(ctx)
+	}
+	if !<-fresh || err != nil || more {
+		return nil, false
+	}
+	c.r.Stats.PointReadsUnwaited.Add(1)
+	if count {
+		c.r.Stats.Archived.Add(1)
+		c.cls = ClassArchive
+	}
+	out, err := cursorReply(msg.Header.RequestID, msg.Header.RequestID, 0, ns, "firstBatch", batch)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // noDeletePending reports whether the archive's copy of the document with this
@@ -114,23 +149,40 @@ func (r *Router) pointReadIsFresh(ctx context.Context, ns string, id bson.RawVal
 // still being mirrored. False means wait for mirroring. See the top of this
 // file for why a delete is the only write that can make that copy wrong.
 func (r *Router) noDeletePending(ctx context.Context, ns string, id bson.RawValue) bool {
-	if r.cfg.ArchiveWait.D() <= 0 || r.cfg.FeederID == "" {
+	from, until, ok := r.pointWindow(ctx)
+	if !ok {
 		return false
+	}
+	return r.noDeletePendingIn(ctx, ns, id, from, until)
+}
+
+// pointWindow is the window a point read checks: from the feeder's published
+// position, which is where the archive is current to, to the newest cluster
+// time this router has seen. Read before the archive is, so everything
+// mirrored up to from is in what the archive then returns. ok false means a
+// point read cannot be checked and waits.
+func (r *Router) pointWindow(ctx context.Context) (from, until bson.Timestamp, ok bool) {
+	if r.cfg.ArchiveWait.D() <= 0 || r.cfg.FeederID == "" {
+		return from, until, false
 	}
 	got := r.recentPosition(ctx)
 	if !got.known || got.ts.IsZero() {
-		return false
+		return from, until, false
 	}
-	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	until = checkpoint.UnpackTS(r.seenOpTime.Load())
 	if until.IsZero() {
-		return false
+		return from, until, false
 	}
-	if checkpoint.PackTS(until) <= checkpoint.PackTS(got.ts) {
+	return got.ts, until, true
+}
+
+// noDeletePendingIn is noDeletePending for a window already read.
+func (r *Router) noDeletePendingIn(ctx context.Context, ns string, id bson.RawValue, from, until bson.Timestamp) bool {
+	if checkpoint.PackTS(until) <= checkpoint.PackTS(from) {
 		// Mirrored past every write this router has seen already.
 		return true
 	}
-	from := got.ts
-	if touched, rest, known := r.touches.ask(ns, got.ts, until, []bson.RawValue{id}, true); known {
+	if touched, rest, known := r.touches.ask(ns, from, until, []bson.RawValue{id}, true); known {
 		if touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
 			r.Stats.OplogChecksInMemory.Add(1)
 			return !touched
