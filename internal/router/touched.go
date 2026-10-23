@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -55,8 +56,11 @@ type touchMark struct {
 }
 
 type touchTracker struct {
-	mu   sync.Mutex
-	cond *sync.Cond
+	// waits and waitedNS count the questions that waited for the stream to
+	// reach the end of their window, and how long they waited in all.
+	waits, waitedNS atomic.Int64
+	mu              sync.Mutex
+	cond            *sync.Cond
 	// applied is how far the stream has been read, start where it began,
 	// horizon how far back what is held reaches. All packed.
 	applied, start, horizon uint64
@@ -200,7 +204,9 @@ func (t *touchTracker) question(ns string, from, until bson.Timestamp, ids []bso
 		return false, false
 	}
 	if !t.past(u) {
-		deadline := time.Now().Add(touchWaitFor)
+		t0 := time.Now()
+		defer func() { t.waits.Add(1); t.waitedNS.Add(int64(time.Since(t0))) }()
+		deadline := t0.Add(touchWaitFor)
 		timer := time.AfterFunc(touchWaitFor, func() {
 			t.mu.Lock()
 			t.cond.Broadcast()
@@ -346,4 +352,18 @@ func (r *Router) fastTierClock(ctx context.Context) (bson.Timestamp, bool) {
 	}
 	t, i, ok := raw.Lookup("operationTime").TimestampOK()
 	return bson.Timestamp{T: t, I: i}, ok
+}
+
+func (r *Router) touchWaits() int64 {
+	if r.touches == nil {
+		return 0
+	}
+	return r.touches.waits.Load()
+}
+
+func (r *Router) touchWaitedUS() int64 {
+	if r.touches == nil {
+		return 0
+	}
+	return r.touches.waitedNS.Load() / 1000
 }

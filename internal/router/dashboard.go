@@ -165,6 +165,8 @@ func (r *Router) SnapshotAll() Snapshot {
 			"point_reads_unwaited":     r.Stats.PointReadsUnwaited.Load(),
 			"oplog_checks_in_memory":   r.Stats.OplogChecksInMemory.Load(),
 			"oplog_checks_queried":     r.Stats.OplogChecksQueried.Load(),
+			"oplog_check_waits":        r.touchWaits(),
+			"oplog_check_waited_us":    r.touchWaitedUS(),
 			"merged_reads":             r.Stats.MergedReads.Load(),
 			"merge_fallbacks":          r.Stats.MergeFallbacks.Load(),
 			"superseded_cursors":       r.Stats.SupersededCursors.Load(),
