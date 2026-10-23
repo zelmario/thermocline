@@ -226,7 +226,9 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 		}
 	}
 
+	t0 := time.Now()
 	id, found, err := c.r.oneArchivedMatch(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"))
+	c.r.Metrics.RecordStage(stageFamMatch, time.Since(t0))
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this sort means, so the fast tier's answer stands",
 			"ns", ns, "err", err)
@@ -250,12 +252,17 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	// absent if an eviction already under way takes it, so it is copied up.
 	{
 		db, coll := splitNS(ns)
-		if have, _, herr := c.r.holdWhatIsThere(ctx, ns, c.r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil && have[0] {
+		t1 := time.Now()
+		have, _, herr := c.r.holdWhatIsThere(ctx, ns, c.r.hot.Database(db).Collection(coll), []bson.RawValue{id})
+		c.r.Metrics.RecordStage(stageFamHold, time.Since(t1))
+		if herr == nil && have[0] {
 			return nil, false
 		}
 	}
 
+	t2 := time.Now()
 	copied, cerr := c.r.copyUp(ctx, ns, id)
+	c.r.Metrics.RecordStage(stageFamCopyUp, time.Since(t2))
 	if cerr != nil {
 		c.log.Warn("could not bring up the document this sort means, so the fast tier's answer stands",
 			"ns", ns, "err", cerr)

@@ -124,6 +124,7 @@ type Metrics struct {
 	// every archive and miss latency above and is reported on its own because
 	// it is the part that is not the archive. See RecordWait.
 	wait    classStat
+	stages  [len(stageNames)]classStat
 	history []second
 	cur     second
 	window  int
@@ -172,6 +173,34 @@ func (m *Metrics) Record(cls Class, d time.Duration) {
 // pair with the archive indexed, and the archive answered the same query in 4ms
 // asked directly. The difference is mostly this wait, which the class latencies
 // fold in with everything else, so it gets a histogram of its own.
+// stageNames are the parts of a read timed on their own, so a latency can be
+// split into what each tier and step cost. See RecordStage.
+var stageNames = [...]string{"merge_total", "merge_archive", "fam_match", "fam_hold", "fam_copyup"}
+
+// RecordStage adds one timing of stage i, an index into stageNames.
+func (m *Metrics) RecordStage(i int, d time.Duration) {
+	ms := float64(d) / float64(time.Millisecond)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := &m.stages[i]
+	st.count++
+	st.totalMS += ms
+	if ms > st.maxMS {
+		st.maxMS = ms
+	}
+	st.buckets[bucketOf(ms)]++
+}
+
+const (
+	stageMergeTotal = iota
+	stageMergeArchive
+	// A sorted findAndModify on a tiered namespace: asking the archive which
+	// document the sort means, holding it on the fast tier, copying it up.
+	stageFamMatch
+	stageFamHold
+	stageFamCopyUp
+)
+
 func (m *Metrics) RecordWait(d time.Duration) {
 	ms := float64(d) / float64(time.Millisecond)
 	m.mu.Lock()
@@ -231,6 +260,8 @@ type MetricsSnapshot struct {
 	History []SecondSnapshot `json:"history"`
 	// FreshnessWait is the barrier on its own. See RecordWait.
 	FreshnessWait ClassSnapshot `json:"freshness_wait"`
+	// Stages are parts of a read timed on their own. See RecordStage.
+	Stages []ClassSnapshot `json:"stages"`
 }
 
 // Snapshot copies the metrics out for reporting.
@@ -247,6 +278,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		out.Classes = append(out.Classes, m.stats[i].snapshot(ClassNames[i]))
 	}
 	out.FreshnessWait = m.wait.snapshot("freshness_wait")
+	for i, name := range stageNames {
+		out.Stages = append(out.Stages, m.stages[i].snapshot(name))
+	}
 
 	hist := append(append([]second(nil), m.history...), m.cur)
 	for _, h := range hist {

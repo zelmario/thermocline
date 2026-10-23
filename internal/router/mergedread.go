@@ -246,6 +246,7 @@ func readPrefModeOf(v bson.RawValue) (string, bool) {
 // the fast tier's answer with the archive's. ok false means take the ordinary
 // path, which waits for mirroring and asks the archive alone.
 func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Message) (*wire.Message, bool) {
+	t0 := time.Now()
 	// Each way out says why at Debug, because a merge that is never taken
 	// is otherwise indistinguishable from one that is, the answer being
 	// right either way.
@@ -300,6 +301,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 	if err != nil {
 		return no("the read could not be rewritten for the archive")
 	}
+	ta := time.Now()
 	acur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
 		return no("the archive refused the read: " + err.Error())
@@ -313,6 +315,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 	if aerr != nil {
 		return no("the archive read failed: " + aerr.Error())
 	}
+	c.r.Metrics.RecordStage(stageMergeArchive, time.Since(ta))
 
 	if behind && len(archived) > 0 {
 		ids := make(bson.A, 0, len(archived))
@@ -346,6 +349,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 		return no("the reply could not be built")
 	}
 	c.r.Stats.MergedReads.Add(1)
+	c.r.Metrics.RecordStage(stageMergeTotal, time.Since(t0))
 	c.cls = ClassArchive
 	return out, true
 }
@@ -412,12 +416,20 @@ func touchesIDs(ns string, ids bson.A, inserts bool) (bson.A, bson.D) {
 // that could hide one: a transaction's applyOps or DDL on the database.
 func (r *Router) oplogTouched(ctx context.Context, ns string, from, until bson.Timestamp, ids bson.A) (bool, error) {
 	if vals, ok := rawValues(ids); ok {
-		if touched, known := r.touches.question(ns, from, until, vals, false); known {
-			r.Stats.OplogChecksInMemory.Add(1)
-			return touched, nil
+		if touched, rest, known := r.touches.ask(ns, from, until, vals, false); known {
+			if touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
+				r.Stats.OplogChecksInMemory.Add(1)
+				return touched, nil
+			}
+			// Only what the stream has not reached yet is read.
+			from = rest
+			r.Stats.OplogChecksTail.Add(1)
+		} else {
+			r.Stats.OplogChecksQueried.Add(1)
 		}
+	} else {
+		r.Stats.OplogChecksQueried.Add(1)
 	}
-	r.Stats.OplogChecksQueried.Add(1)
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	direct, inner := touchesIDs(ns, ids, false)

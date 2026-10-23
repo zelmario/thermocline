@@ -129,20 +129,27 @@ func (r *Router) noDeletePending(ctx context.Context, ns string, id bson.RawValu
 		// Mirrored past every write this router has seen already.
 		return true
 	}
-	if touched, known := r.touches.question(ns, got.ts, until, []bson.RawValue{id}, true); known {
-		r.Stats.OplogChecksInMemory.Add(1)
-		return !touched
+	from := got.ts
+	if touched, rest, known := r.touches.ask(ns, got.ts, until, []bson.RawValue{id}, true); known {
+		if touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
+			r.Stats.OplogChecksInMemory.Add(1)
+			return !touched
+		}
+		// Only what the stream has not reached yet is read.
+		from = rest
+		r.Stats.OplogChecksTail.Add(1)
+	} else {
+		r.Stats.OplogChecksQueried.Add(1)
 	}
-	if !r.windowCheckable(ctx, got.ts, until) {
+	if !r.windowCheckable(ctx, from, until) {
 		return false
 	}
-	r.Stats.OplogChecksQueried.Add(1)
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	// Only a delete matters here, at the top level or inside an applyOps:
 	// see the top of this file. An applyOps of inserts and updates, which is
 	// what an insertMany is on 8.0, cannot hide one.
-	filter := oplogWindow(ns, got.ts,
+	filter := oplogWindow(ns, from,
 		bson.A{bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: "d"}, {Key: "o._id", Value: id}}},
 		bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: bson.D{{Key: "$nin", Value: bson.A{"i", "u"}}}}})
 	var out struct {

@@ -266,10 +266,11 @@ type Stats struct {
 	// without the freshness wait, because the fast tier's oplog showed no
 	// delete of that document waiting to be mirrored. See pointfresh.go.
 	PointReadsUnwaited atomic.Int64
-	// OplogChecksInMemory and OplogChecksQueried count the oplog checks of
-	// merged and unwaited reads answered from the tracker's memory and from
-	// the fast tier's oplog. See touched.go.
-	OplogChecksInMemory, OplogChecksQueried atomic.Int64
+	// OplogChecksInMemory, OplogChecksTail and OplogChecksQueried count the
+	// oplog checks of merged and unwaited reads answered from the tracker's
+	// memory, from memory plus the oplog entries its stream had not reached,
+	// and from the oplog alone. See touched.go.
+	OplogChecksInMemory, OplogChecksTail, OplogChecksQueried atomic.Int64
 	// MergedReads counts reads the fast tier could not prove complete that
 	// were answered by merging its answer with the archive's instead of
 	// waiting for mirroring, and MergeFallbacks those the oplog sent back to
