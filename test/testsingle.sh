@@ -271,6 +271,47 @@ chk "  and none is left pending"            "0" \
 H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 
+echo "== a queue whose old jobs only the archive holds, under a claim =="
+# The adoption's shape: jobs from before the claim live only in the archive, and
+# newer ones in both tiers. A job the archive names inside the fast tier's claim
+# is there and stays there while mongod runs the command, so it is neither held
+# nor copied up (guardSortedFindAndModify). One older than the claim still has
+# to be copied up first, or the fast tier's own sort takes the oldest job it
+# holds, a newer one. Without the claim this path never ran, and a router that
+# skipped the copy-up for every job passed the queue above.
+QNS=tmenag2
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$QNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$QNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$QNS'})" >/dev/null
+OLDJ="Array.from({length:5},(_,k)=>({_id:k+1, createdAt:new Date(Date.UTC(2024,k,1)), status:'pending'}))"
+NEWJ="Array.from({length:3},(_,k)=>({_id:101+k, createdAt:new Date(Date.UTC(2025,6+k,1)), status:'pending'}))"
+C "db.getSiblingDB(process.env.TC_DB).$QNS.insertMany($OLDJ.concat($NEWJ))" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$QNS.insertMany($NEWJ)" >/dev/null
+cline watermark --config $CFG --ns $DB.$QNS --complete-from 2025-06-01T00:00:00Z >/dev/null 2>&1
+startFeeder
+startRouter
+famClaimed() { curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -o '"fam_claimed"[: ]*[0-9]*' | grep -o '[0-9]*$'; }
+F0=$(famClaimed)
+QTAKEN=$(R "
+  const c = db.getSiblingDB(process.env.TC_DB).$QNS;
+  const got = [];
+  for (let i = 0; i < 8; i++) {
+    const d = c.findOneAndUpdate({status:'pending'}, {\$set:{status:'done'}}, {sort:{createdAt:1}});
+    got.push(d ? d._id : 'null');
+  }
+  print(got.join(','));")
+chk "the archive's old jobs first, then the claimed ones" "1,2,3,4,5,101,102,103" "$QTAKEN"
+# How many skipped the hold and the copy-up, said rather than checked: it is an
+# optimisation, and a claim that cannot be read in time under a full sweep takes
+# the slower path, which is still right. The order above is what catches a
+# router skipping them outside the claim.
+echo "      $(( $(famClaimed) - ${F0:-0} )) of the claimed jobs were taken without a hold or a copy-up"
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$QNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$QNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).watermarks.deleteOne({_id:'$DB.$QNS'})" >/dev/null
+
 stopDaemons
 echo
 echo "================================"

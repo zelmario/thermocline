@@ -76,8 +76,28 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort,
 // the archive's own first match is therefore the document the statement would
 // have found with nothing tiered underneath it.
 func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
-	if id, found, ok := r.archivedMatchUnwaited(ctx, ns, filter, sort, collation); ok {
-		return id, found, nil
+	doc, found, err := r.oneArchivedMatchDoc(ctx, ns, filter, sort, collation, nil)
+	if err != nil || !found {
+		return bson.RawValue{}, found, err
+	}
+	id, lerr := doc.LookupErr("_id")
+	if lerr != nil {
+		return bson.RawValue{}, false, lerr
+	}
+	return id, true, nil
+}
+
+// oneArchivedMatchDoc is oneArchivedMatch returning the document with _id and
+// the fields in also, which a caller deciding more than which document needs.
+func (r *Router) oneArchivedMatchDoc(ctx context.Context, ns string, filter, sort, collation bson.Raw, also []string) (bson.Raw, bool, error) {
+	proj := bson.D{{Key: "_id", Value: 1}}
+	for _, f := range also {
+		if f != "" && f != "_id" {
+			proj = append(proj, bson.E{Key: f, Value: 1})
+		}
+	}
+	if doc, found, ok := r.archivedMatchUnwaited(ctx, ns, filter, sort, collation, proj); ok {
+		return doc, found, nil
 	}
 	// Which document the write acts on is decided here, so the archive is
 	// asked once mirroring has caught up, as a read would be. Otherwise its
@@ -86,10 +106,10 @@ func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, 
 	// The copy-up that follows waits too, but by then the choice is made.
 	if err := r.archiveIsFresh(ctx, ns, 0, "choosing a document for a write from the archive before mirroring caught up",
 		"a single-document write may act on, or miss because of, a document deleted in the last moments"); err != nil {
-		return bson.RawValue{}, false, err
+		return nil, false, err
 	}
 	db, coll := splitNS(ns)
-	opts := options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})
+	opts := options.FindOne().SetProjection(proj)
 	if len(sort) > 0 {
 		opts.SetSort(sort)
 	}
@@ -116,16 +136,12 @@ func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, 
 	}), opts).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		// Not in the archive either, so matching nothing was the truth.
-		return bson.RawValue{}, false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return bson.RawValue{}, false, err
+		return nil, false, err
 	}
-	id, lerr := doc.LookupErr("_id")
-	if lerr != nil {
-		return bson.RawValue{}, false, lerr
-	}
-	return id, true, nil
+	return doc, true, nil
 }
 
 // A sort says which of several matches the caller means, and the fast tier
@@ -227,7 +243,8 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	}
 
 	t0 := time.Now()
-	id, found, err := c.r.oneArchivedMatch(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"))
+	af, aok := c.r.ageFieldOf(ns)
+	match, found, err := c.r.oneArchivedMatchDoc(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"), []string{af})
 	c.r.Metrics.RecordStage(stageFamMatch, time.Since(t0))
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this sort means, so the fast tier's answer stands",
@@ -236,6 +253,25 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	}
 	if !found {
 		return nil, false
+	}
+	id, lerr := match.LookupErr("_id")
+	if lerr != nil {
+		return nil, false
+	}
+
+	// A document inside the fast tier's claim is there, and stays there while
+	// mongod runs this command: the evictor raises its claim past a document
+	// before it deletes it, and then waits longer than this router keeps a
+	// claim reading before it deletes anything. So it needs neither the hold
+	// nor the copy-up below. Shipping the oldest placed order asks this every
+	// time, and the order is nearly always one placed since adoption: the hold
+	// was a read of the fast tier and a write to the archive on every one,
+	// 3.31ms of an 8.30ms shipment on the Docker test server.
+	if mark, known := c.r.completeness(ctx, ns); known && mark.Claimed && aok {
+		if age, ok := documentAge(match, af); ok && !age.Before(mark.From) {
+			c.r.Stats.FamClaimed.Add(1)
+			return nil, false
+		}
 	}
 
 	// Usually it is already here, and asking is much cheaper than finding out
@@ -322,28 +358,28 @@ const unwaitedCandidates = 8
 // touched is current in the archive, and it is the one. Shipping the oldest
 // order waited here and again in its copy-up, measured at 29.3 ms against
 // 8.2 ms on the old cluster alone.
-func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, bool) {
+func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, sort, collation bson.Raw, proj bson.D) (bson.Raw, bool, bool) {
 	if len(collation) > 0 || r.cfg.ArchiveWait.D() <= 0 || r.cfg.FeederID == "" {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	if _, has := r.defaultCollation(ctx, ns); has {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	got := r.recentPosition(ctx)
 	if !got.known || got.ts.IsZero() {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	until := checkpoint.UnpackTS(r.seenOpTime.Load())
 	if until.IsZero() {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
 	if behind && !r.windowCheckable(ctx, got.ts, until) {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 
 	db, coll := splitNS(ns)
-	opts := options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}).SetLimit(unwaitedCandidates)
+	opts := options.Find().SetProjection(proj).SetLimit(unwaitedCandidates)
 	if len(sort) > 0 {
 		opts.SetSort(sort)
 	}
@@ -352,21 +388,24 @@ func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, s
 		Value: filter,
 	}), opts)
 	if err != nil {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	var ids []bson.RawValue
+	var docs []bson.Raw
 	for cur.Next(ctx) {
-		id, err := cur.Current.LookupErr("_id")
+		d := append(bson.Raw(nil), cur.Current...)
+		id, err := d.LookupErr("_id")
 		if err != nil {
 			_ = cur.Close(ctx)
-			return bson.RawValue{}, false, false
+			return nil, false, false
 		}
-		ids = append(ids, bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)})
+		ids = append(ids, id)
+		docs = append(docs, d)
 	}
 	cerr := cur.Err()
 	_ = cur.Close(ctx)
 	if cerr != nil {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
 	if len(ids) == 0 {
 		// Nothing matching in the archive, which mirroring cannot change: it
@@ -374,25 +413,25 @@ func (r *Router) archivedMatchUnwaited(ctx context.Context, ns string, filter, s
 		// document the fast tier has that the archive has not seen yet is the
 		// fast tier's own sort to pick. What a lag leaves in the archive is
 		// more, a deleted document still live, never less.
-		return bson.RawValue{}, false, true
+		return nil, false, true
 	}
 	if !behind {
-		return ids[0], true, true
+		return docs[0], true, true
 	}
 	touched, err := r.oplogTouchedBy(ctx, ns, got.ts, until, ids)
 	if err != nil {
-		return bson.RawValue{}, false, false
+		return nil, false, false
 	}
-	for _, id := range ids {
+	for i, id := range ids {
 		switch touched[idKeyOf(id)] {
 		case "d", "c":
-			return bson.RawValue{}, false, false
+			return nil, false, false
 		case "i", "u":
 			continue
 		}
-		return id, true, true
+		return docs[i], true, true
 	}
-	return bson.RawValue{}, false, false
+	return nil, false, false
 }
 
 // oplogTouchedBy is oplogTouched saying which of ids each entry touched and
