@@ -71,6 +71,8 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("merged_reads_total", "Reads the fast tier could not prove complete, answered by merging its answer with the archive's instead of waiting for mirroring.", snap.Counters["merged_reads"])
 	counter("merge_fallbacks_total", "Merged reads the fast tier's oplog sent back to the freshness wait, because a document the archive returned had changed since the feeder's position.", snap.Counters["merge_fallbacks"])
 	counter("point_reads_unwaited_total", "Reads by _id answered from the archive without the freshness wait, because the fast tier's oplog showed no delete of that document waiting to be mirrored.", snap.Counters["point_reads_unwaited"])
+	counter("oplog_checks_in_memory_total", "Oplog checks of merged and unwaited reads answered from memory, with no round trip to the fast tier.", snap.Counters["oplog_checks_in_memory"])
+	counter("oplog_checks_queried_total", "Oplog checks of merged and unwaited reads that read the fast tier's oplog.", snap.Counters["oplog_checks_queried"])
 	counter("warmed_for_txn_total", "Documents brought up so a transaction could run against the fast tier alone.", snap.Counters["warmed_for_txn"])
 	counter("read_misses_total", "Point lookups that found the document only in the archive.", snap.Counters["read_misses"])
 	counter("write_misses_total", "Writes that matched nothing on the fast tier and found the document in the archive.", snap.Counters["write_misses"])

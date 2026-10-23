@@ -129,9 +129,14 @@ func (r *Router) noDeletePending(ctx context.Context, ns string, id bson.RawValu
 		// Mirrored past every write this router has seen already.
 		return true
 	}
+	if touched, known := r.touches.question(ns, got.ts, until, []bson.RawValue{id}, true); known {
+		r.Stats.OplogChecksInMemory.Add(1)
+		return !touched
+	}
 	if !r.windowCheckable(ctx, got.ts, until) {
 		return false
 	}
+	r.Stats.OplogChecksQueried.Add(1)
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	// Only a delete matters here, at the top level or inside an applyOps:

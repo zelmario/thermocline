@@ -256,3 +256,6 @@ func clusterTimeFromToken(tok bson.Raw) (bson.Timestamp, bool) {
 		I: uint32(raw[5])<<24 | uint32(raw[6])<<16 | uint32(raw[7])<<8 | uint32(raw[8]),
 	}, true
 }
+
+// TokenTime is clusterTimeFromToken for the router's own streams.
+func TokenTime(tok bson.Raw) (bson.Timestamp, bool) { return clusterTimeFromToken(tok) }

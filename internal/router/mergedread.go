@@ -411,6 +411,13 @@ func touchesIDs(ns string, ids bson.A, inserts bool) (bson.A, bson.D) {
 // at least until, an insert, update or delete of any of ids in ns, or a command
 // that could hide one: a transaction's applyOps or DDL on the database.
 func (r *Router) oplogTouched(ctx context.Context, ns string, from, until bson.Timestamp, ids bson.A) (bool, error) {
+	if vals, ok := rawValues(ids); ok {
+		if touched, known := r.touches.question(ns, from, until, vals, false); known {
+			r.Stats.OplogChecksInMemory.Add(1)
+			return touched, nil
+		}
+	}
+	r.Stats.OplogChecksQueried.Add(1)
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	direct, inner := touchesIDs(ns, ids, false)
@@ -523,6 +530,20 @@ func mergeSorted(fast, archived []bson.Raw, plan mergePlan) (bson.A, bool) {
 			break
 		}
 		out = append(out, docs[i])
+	}
+	return out, true
+}
+
+// rawValues reads ids as the raw values the tracker keys by. False when one is
+// not a raw value, which the tracker cannot compare.
+func rawValues(ids bson.A) ([]bson.RawValue, bool) {
+	out := make([]bson.RawValue, 0, len(ids))
+	for _, id := range ids {
+		v, ok := id.(bson.RawValue)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, v)
 	}
 	return out, true
 }
