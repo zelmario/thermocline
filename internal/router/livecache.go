@@ -396,6 +396,10 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	var tc *tailCheck
+	if behind {
+		tc = r.startTailCheck(cctx, ns, got.ts, until)
+	}
 	cur, err := r.cold.Database(db).Collection(coll).Find(cctx, liveOnly(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: filter}), opts)
 	if err != nil {
 		return nil, false
@@ -418,7 +422,7 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 			}
 			ids = append(ids, id)
 		}
-		if touched, err := r.oplogTouched(ctx, ns, got.ts, until, ids); err != nil || touched {
+		if touched, err := r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids); err != nil || touched {
 			return nil, false
 		}
 	}

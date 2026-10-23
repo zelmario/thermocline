@@ -221,6 +221,29 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 	return false, rest, true
 }
 
+// covered is how far what the tracker holds covers a window starting at from,
+// with no _id to check yet: rest as ask would give it. ok false means it holds
+// nothing that covers from.
+func (t *touchTracker) covered(from bson.Timestamp) (rest bson.Timestamp, ok bool) {
+	if t == nil {
+		return bson.Timestamp{}, false
+	}
+	f := checkpoint.PackTS(from)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.start == 0 || f < t.start || f < t.horizon || t.applied <= f {
+		return bson.Timestamp{}, false
+	}
+	rest = checkpoint.UnpackTS(t.applied)
+	if !t.inclusive {
+		rest = prevTS(rest)
+	}
+	if checkpoint.PackTS(rest) < f {
+		rest = from
+	}
+	return rest, true
+}
+
 // prevTS is the timestamp just before ts.
 func prevTS(ts bson.Timestamp) bson.Timestamp {
 	if ts.I > 0 {

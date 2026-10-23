@@ -301,6 +301,12 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 	if err != nil {
 		return no("the read could not be rewritten for the archive")
 	}
+	// The oplog's tail, after what the tracker holds, is read while the
+	// archive is: it needs no _id. See startTailCheck.
+	var tc *tailCheck
+	if behind {
+		tc = c.r.startTailCheck(ctx, ns, got.ts, until)
+	}
 	ta := time.Now()
 	acur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
@@ -326,7 +332,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 			}
 			ids = append(ids, id)
 		}
-		if touched, err := c.r.oplogTouched(ctx, ns, got.ts, until, ids); err != nil || touched {
+		if touched, err := c.r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids); err != nil || touched {
 			c.r.Stats.MergeFallbacks.Add(1)
 			if err != nil {
 				return no("the oplog could not be read: " + err.Error())
@@ -544,6 +550,122 @@ func mergeSorted(fast, archived []bson.Raw, plan mergePlan) (bson.A, bool) {
 		out = append(out, docs[i])
 	}
 	return out, true
+}
+
+// tailTouch is what the oplog says of the entries after the tracker's
+// memory: the _ids of ns updated or deleted there, by idKey, or all when a
+// command could hide one. ok false means it could not say.
+type tailTouch struct {
+	ids map[string]bool
+	all bool
+	ok  bool
+}
+
+// tailMaxEntries bounds the tail read as a whole. Past it the read says
+// nothing and the check asks the oplog by _id as before.
+const tailMaxEntries = 1000
+
+// tailTouched reads the tail of a window, (from, until], for every update and
+// delete of ns, whatever its _id, and every command that could hide one. It
+// needs no _id, so it runs while the archive is being read. See
+// startTailCheck.
+func (r *Router) tailTouched(ctx context.Context, ns string, from, until bson.Timestamp) tailTouch {
+	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	op := bson.D{{Key: "$in", Value: bson.A{"u", "d"}}}
+	filter := oplogWindow(ns, from,
+		bson.A{bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: op}}},
+		bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: bson.D{{Key: "$ne", Value: "i"}}}})
+	var out struct {
+		Cursor struct {
+			FirstBatch []bson.Raw `bson:"firstBatch"`
+		} `bson:"cursor"`
+	}
+	err := r.hot.Database("local").RunCommand(cctx, bson.D{
+		{Key: "find", Value: "oplog.rs"},
+		{Key: "filter", Value: filter},
+		{Key: "projection", Value: bson.D{{Key: "op", Value: 1}, {Key: "o._id", Value: 1}, {Key: "o2._id", Value: 1}}},
+		{Key: "limit", Value: int32(tailMaxEntries + 1)},
+		{Key: "batchSize", Value: int32(tailMaxEntries + 1)},
+		{Key: "singleBatch", Value: true},
+		{Key: "readConcern", Value: bson.D{{Key: "level", Value: "local"}, {Key: "afterClusterTime", Value: until}}},
+	}, options.RunCmd().SetReadPreference(readpref.Primary())).Decode(&out)
+	if err != nil || len(out.Cursor.FirstBatch) > tailMaxEntries {
+		return tailTouch{}
+	}
+	t := tailTouch{ids: map[string]bool{}, ok: true}
+	for _, e := range out.Cursor.FirstBatch {
+		if o, _ := e.Lookup("op").StringValueOK(); o == "c" {
+			t.all = true
+			return t
+		}
+		id, err := e.LookupErr("o2", "_id")
+		if err != nil {
+			if id, err = e.LookupErr("o", "_id"); err != nil {
+				t.all = true
+				return t
+			}
+		}
+		t.ids[idKey(id)] = true
+	}
+	return t
+}
+
+// tailCheck is a tail read under way, started before the archive is read so
+// the two overlap. Its window starts where the tracker's memory ended.
+type tailCheck struct {
+	rest bson.Timestamp
+	done chan tailTouch
+}
+
+// startTailCheck starts the tail read of a window starting at from, when the
+// tracker covers from but not until. nil means there is nothing to overlap,
+// and oplogTouched is asked as before.
+//
+// A merged read asked the oplog about the documents the archive returned, so
+// it could only ask once the archive had answered: the archive, then the
+// oplog, one after the other. On the Docker test server the oplog went for the
+// tail in two checks of three, a round trip after an archive read of 1.1ms.
+func (r *Router) startTailCheck(ctx context.Context, ns string, from, until bson.Timestamp) *tailCheck {
+	rest, ok := r.touches.covered(from)
+	if !ok || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
+		return nil
+	}
+	tc := &tailCheck{rest: rest, done: make(chan tailTouch, 1)}
+	go func() { tc.done <- r.tailTouched(ctx, ns, rest, until) }()
+	return tc
+}
+
+// oplogTouchedWith is oplogTouched with a tail read already under way: the
+// tracker answers for the window up to where the tail starts, the tail read
+// for the rest. Anything either cannot say goes to oplogTouched.
+func (r *Router) oplogTouchedWith(ctx context.Context, tc *tailCheck, ns string, from, until bson.Timestamp, ids bson.A) (bool, error) {
+	if tc == nil {
+		return r.oplogTouched(ctx, ns, from, until, ids)
+	}
+	tail := <-tc.done
+	vals, vok := rawValues(ids)
+	if !vok || !tail.ok {
+		return r.oplogTouched(ctx, ns, from, until, ids)
+	}
+	// The memory has to reach the tail's start still. A stream that restarted
+	// in between holds a minute back again and may not have read that far yet,
+	// which would leave the stretch between the two unasked.
+	touched, _, known := r.touches.ask(ns, from, until, vals, false)
+	now, cok := r.touches.covered(from)
+	if !known || !cok || checkpoint.PackTS(now) < checkpoint.PackTS(tc.rest) {
+		return r.oplogTouched(ctx, ns, from, until, ids)
+	}
+	r.Stats.OplogChecksTail.Add(1)
+	if touched || tail.all {
+		return true, nil
+	}
+	for _, v := range vals {
+		if tail.ids[idKey(v)] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // rawValues reads ids as the raw values the tracker keys by. False when one is
