@@ -62,7 +62,8 @@ func main() {
 	mixName := flag.String("store-mix", "store", "store workload: store (write heavy, the first one), real (a shop's shares of steps) or shop (visits: anonymous browsing, logged-in customers, a purchase funnel)")
 	custN := flag.Int("customers", customers, "with -load or -load-store: how many customers the orders belong to; a run reads it back from the load")
 	rate := flag.Int("rate", 0, "store workload: hold the shoppers to this many operations a second in all, and ship every 20ms, so every target does the same work (0: as fast as they can)")
-	resetShop := flag.Bool("reset-shop", false, "put a loaded shop back as it was loaded: remove the orders runs placed, restock the products, empty the carts, drop Thermocline's own databases; then stop")
+	resetShop := flag.Bool("reset-shop", false, "put a loaded shop back as it was loaded: remove the orders runs placed, restock the products, empty the carts, drop -meta-db; then stop")
+	metaDB := flag.String("meta-db", "_thermocline_bench", "with -reset-shop: the bookkeeping database of the Thermocline the shop was adopted by, the only one dropped")
 	loadStoreFlag := flag.Bool("load-store", false, "stock the shop's products and customers in -ns's database, then stop")
 	metaURI := flag.String("meta-uri", "", "where the load was recorded, when -uri is a router: "+
 		"the record lives beside the data, in a collection the router does not tier")
@@ -93,7 +94,7 @@ func main() {
 		return
 	}
 	if *resetShop {
-		if err := resetShopTo(ctx, cl, cl.Database(db), c); err != nil {
+		if err := resetShopTo(ctx, cl, cl.Database(db), c, *metaDB); err != nil {
 			die("reset: %v", err)
 		}
 		return

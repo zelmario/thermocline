@@ -48,7 +48,7 @@ func custID(i int) string   { return fmt.Sprintf("c%06d", i) }
 // those: the loaded ones are settled. Prices, stock and carts change, and those
 // are reloaded, which takes seconds. Customers are only read. What Thermocline
 // wrote beside the data, its own databases, goes too.
-func resetShopTo(ctx context.Context, cl *mongo.Client, db *mongo.Database, orders *mongo.Collection) error {
+func resetShopTo(ctx context.Context, cl *mongo.Client, db *mongo.Database, orders *mongo.Collection, metaDB string) error {
 	var m marker
 	if err := db.Collection("bench_meta").FindOne(ctx, bson.D{{Key: "_id", Value: orders.Name()}}).Decode(&m); err != nil {
 		return fmt.Errorf("no load recorded for %s: %w", orders.Name(), err)
@@ -65,20 +65,19 @@ func resetShopTo(ctx context.Context, cl *mongo.Client, db *mongo.Database, orde
 	if err := db.Collection("carts").Drop(ctx); err != nil {
 		return err
 	}
-	names, err := cl.ListDatabaseNames(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: "^_thermocline"}}}})
-	if err != nil {
+	// Only the one the shop's adoption used. Every database whose name began
+	// with _thermocline used to go, and on an archive shared with the test
+	// suites that took their bookkeeping with it, the archive's identity
+	// included: every router after that refused to start, the fast tier
+	// having been paired with an archive that now had no id.
+	if err := cl.Database(metaDB).Drop(ctx); err != nil {
 		return err
-	}
-	for _, n := range names {
-		if err := cl.Database(n).Drop(ctx); err != nil {
-			return err
-		}
 	}
 	n, err := orders.EstimatedDocumentCount(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("restocked %d products, emptied the carts, dropped %v; %d orders\n", products, names, n)
+	fmt.Printf("restocked %d products, emptied the carts, dropped %s; %d orders\n", products, metaDB, n)
 	return nil
 }
 
