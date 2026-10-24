@@ -36,9 +36,17 @@
 #   pkill -9 -f "[p]sweep.sh"
 #   pkill -9 -f "bash /root/[t]est"      # the suites, which outlive the driver
 #   pkill -9 -f "[c]line (feeder|router|evictor|warmer)"
+#   pkill -9 -f "[m]ongosh"              # and what the suites were running
+#
+# The fourth was missing until 2026-10-24. A sweep stopped a minute in left
+# testfuzz's reseed running in a mongosh of its own, waiting on a feeder that
+# was gone; two minutes later it deleted its sentinel from shop_w4, in the
+# middle of the next sweep's testchange@3 on the same worker, whose database
+# stream reported two deletes it had never caused. Nothing else runs mongosh
+# in the node, so the kill is safe there.
 #
 # Then check nothing survived, because each of those can miss:
-#   pgrep -af "[t]est|[c]line" ; ss -ltn | grep 272
+#   pgrep -af "[t]est|[c]line|[m]ongosh" ; ss -ltn | grep 272
 # Eight, measured on the Docker box (20 threads) on 2026-10-23 with the suites
 # in parts: 21m at four workers in the old order, 17m at six, 15m at eight. The
 # box is saturated from six on (load 19-21), so more buys little.
