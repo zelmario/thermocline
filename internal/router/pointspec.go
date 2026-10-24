@@ -111,7 +111,7 @@ func (r *Router) notePointRead(ns string, missed bool) {
 // answered it, when the namespace's recent point reads say it will be needed.
 // It leaves c.spec set for pointReadInParallel to take, or nil.
 func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string) {
-	c.spec = nil
+	c.spec, c.mspec = nil, nil
 	if msg.Header.OpCode != wire.OpMsg {
 		return
 	}
@@ -128,12 +128,15 @@ func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string)
 		return
 	}
 	ns := db + "." + coll
-	if c.r.specScore(ns).Load() <= 0 {
-		return
-	}
 	fdoc, _ := cmd.Lookup("filter").DocumentOK()
 	id, hasID := idFromFilter(fdoc)
-	if !hasID || inTransaction(cmd) {
+	if !hasID {
+		// A sorted read with a limit may be merged from both tiers instead.
+		// See mergespec.go.
+		c.startMergeSpec(ctx, cmd, db, ns, msg.Header.RequestID)
+		return
+	}
+	if c.r.specScore(ns).Load() <= 0 || inTransaction(cmd) {
 		return
 	}
 	if _, honourable := archiveLevel(cmd); !honourable {

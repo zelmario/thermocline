@@ -262,6 +262,8 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 	if !ok {
 		return no("not a sorted find with a limit this can merge")
 	}
+	// A read that got here needed the archive. See mergeScore.
+	c.r.noteMerge(ns, 2)
 	// Strings compare by collation, and the merge compares bytes.
 	if _, has := c.r.defaultCollation(ctx, ns); has {
 		return no("the collection has a default collation")
@@ -283,6 +285,16 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 
 	// Where the archive is current to. Read before the archive is, so
 	// everything mirrored up to it is in what the archive returns.
+	// The archive's half asked as the command arrived, when it was. See
+	// mergespec.go.
+	if archived, taken, refused, why := c.takeMergeSpec(ctx, ns, msg); taken {
+		if refused {
+			return no(why)
+		}
+		db, _ := splitNS(ns)
+		return c.finishMerge(ctx, ns, db, msg, reply, rdoc, plan, fast, fastID, archived, t0)
+	}
+
 	got := c.r.recentPosition(ctx)
 	if !got.known || got.ts.IsZero() {
 		return no("no feeder position with a cluster time")
@@ -332,7 +344,7 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 			}
 			ids = append(ids, id)
 		}
-		if touched, err := c.r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids); err != nil || touched {
+		if touched, err := c.r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids, false); err != nil || touched {
 			c.r.Stats.MergeFallbacks.Add(1)
 			if err != nil {
 				return no("the oplog could not be read: " + err.Error())
@@ -341,6 +353,16 @@ func (c *conn) mergedFind(ctx context.Context, ns string, msg, reply *wire.Messa
 		}
 	}
 
+	return c.finishMerge(ctx, ns, db, msg, reply, rdoc, plan, fast, fastID, archived, t0)
+}
+
+// finishMerge merges the two halves of a merged read and builds its reply.
+func (c *conn) finishMerge(ctx context.Context, ns, db string, msg, reply *wire.Message, rdoc bson.Raw,
+	plan mergePlan, fast []bson.Raw, fastID int64, archived []bson.Raw, t0 time.Time) (*wire.Message, bool) {
+	no := func(why string) (*wire.Message, bool) {
+		c.log.Debug("not merging this read", "ns", ns, "why", why)
+		return nil, false
+	}
 	merged, ok := mergeSorted(fast, archived, plan)
 	if !ok {
 		return no("the sort values are not of one bracket")
@@ -419,10 +441,12 @@ func touchesIDs(ns string, ids bson.A, inserts bool) (bson.A, bson.D) {
 
 // oplogTouched reports whether the fast tier's oplog has, after from and up to
 // at least until, an insert, update or delete of any of ids in ns, or a command
-// that could hide one: a transaction's applyOps or DDL on the database.
-func (r *Router) oplogTouched(ctx context.Context, ns string, from, until bson.Timestamp, ids bson.A) (bool, error) {
+// that could hide one: a transaction's applyOps or DDL on the database. With
+// anyDelete, a delete of any document of ns counts too.
+func (r *Router) oplogTouched(ctx context.Context, ns string, from, until bson.Timestamp, ids bson.A, anyDelete bool) (bool, error) {
 	if vals, ok := rawValues(ids); ok {
 		if touched, rest, known := r.touches.ask(ns, from, until, vals, false); known {
+			touched = touched || (anyDelete && r.touches.deletedSince(ns, from))
 			if touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
 				r.Stats.OplogChecksInMemory.Add(1)
 				return touched, nil
@@ -439,6 +463,11 @@ func (r *Router) oplogTouched(ctx context.Context, ns string, from, until bson.T
 	cctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	direct, inner := touchesIDs(ns, ids, false)
+	if anyDelete {
+		del := bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: "d"}}
+		direct = append(direct, del)
+		inner = bson.D{{Key: "$or", Value: bson.A{inner, del}}}
+	}
 	filter := oplogWindow(ns, from, direct, inner)
 	var out struct {
 		Cursor struct {
@@ -557,6 +586,8 @@ func mergeSorted(fast, archived []bson.Raw, plan mergePlan) (bson.A, bool) {
 // command could hide one. ok false means it could not say.
 type tailTouch struct {
 	ids map[string]bool
+	// del says a document of the namespace was deleted, whatever its _id.
+	del bool
 	all bool
 	ok  bool
 }
@@ -607,6 +638,9 @@ func (r *Router) tailTouched(ctx context.Context, ns string, from, until bson.Ti
 			}
 		}
 		t.ids[idKey(id)] = true
+		if o, _ := e.Lookup("op").StringValueOK(); o == "d" {
+			t.del = true
+		}
 	}
 	return t
 }
@@ -639,14 +673,14 @@ func (r *Router) startTailCheck(ctx context.Context, ns string, from, until bson
 // oplogTouchedWith is oplogTouched with a tail read already under way: the
 // tracker answers for the window up to where the tail starts, the tail read
 // for the rest. Anything either cannot say goes to oplogTouched.
-func (r *Router) oplogTouchedWith(ctx context.Context, tc *tailCheck, ns string, from, until bson.Timestamp, ids bson.A) (bool, error) {
+func (r *Router) oplogTouchedWith(ctx context.Context, tc *tailCheck, ns string, from, until bson.Timestamp, ids bson.A, anyDelete bool) (bool, error) {
 	if tc == nil {
-		return r.oplogTouched(ctx, ns, from, until, ids)
+		return r.oplogTouched(ctx, ns, from, until, ids, anyDelete)
 	}
 	tail := <-tc.done
 	vals, vok := rawValues(ids)
 	if !vok || !tail.ok {
-		return r.oplogTouched(ctx, ns, from, until, ids)
+		return r.oplogTouched(ctx, ns, from, until, ids, anyDelete)
 	}
 	// The memory has to reach the tail's start still. A stream that restarted
 	// in between holds a minute back again and may not have read that far yet,
@@ -654,10 +688,10 @@ func (r *Router) oplogTouchedWith(ctx context.Context, tc *tailCheck, ns string,
 	touched, _, known := r.touches.ask(ns, from, until, vals, false)
 	now, cok := r.touches.covered(from)
 	if !known || !cok || checkpoint.PackTS(now) < checkpoint.PackTS(tc.rest) {
-		return r.oplogTouched(ctx, ns, from, until, ids)
+		return r.oplogTouched(ctx, ns, from, until, ids, anyDelete)
 	}
 	r.Stats.OplogChecksTail.Add(1)
-	if touched || tail.all {
+	if touched || tail.all || (anyDelete && (tail.del || r.touches.deletedSince(ns, from))) {
 		return true, nil
 	}
 	for _, v := range vals {

@@ -148,6 +148,9 @@ feeder:
     # collection because the section stops and starts the feeder around each
     # one, and tprobe is read by the sections either side of it.
     - "shop.tfdel"
+    # testfresh.sh: a merged read asked ahead while a document is mirrored and
+    # evicted between its two halves. Aged by `when`, so a sweep takes it.
+    - "shop.tmspec"
     # testevict.sh: a claim narrowed and acted on in the same sweep.
     - "shop.tevclaim"
     # testevict.sh: a cursor held open while a sweep takes its documents off the
@@ -507,6 +510,10 @@ evictor:
     - ns: "shop.tevneg"
       older_than: 40m
     - ns: "shop.tevcursor"
+      older_than: 40m
+      date_field: "when"
+    # testfresh.sh: the document evicted between a merged read's two halves.
+    - ns: "shop.tmspec"
       older_than: 40m
       date_field: "when"
     # testevict.sh: the aggregation half of the same section.

@@ -61,11 +61,14 @@ type touchTracker struct {
 	ids       map[string]map[string]touchMark
 	ns        map[string]uint64
 	db        map[string]uint64
-	n         int
+	// dels is the latest delete of any document, per namespace. See
+	// deletedSince.
+	dels map[string]uint64
+	n    int
 }
 
 func newTouchTracker() *touchTracker {
-	t := &touchTracker{ids: map[string]map[string]touchMark{}, ns: map[string]uint64{}, db: map[string]uint64{}}
+	t := &touchTracker{ids: map[string]map[string]touchMark{}, ns: map[string]uint64{}, db: map[string]uint64{}, dels: map[string]uint64{}}
 	return t
 }
 
@@ -123,6 +126,7 @@ func (t *touchTracker) touch(op, db, coll string, id bson.RawValue, at uint64) {
 		mk, had := m[k]
 		if op == "delete" {
 			mk.del = max(mk.del, at)
+			t.dels[db+"."+coll] = max(t.dels[db+"."+coll], at)
 		} else {
 			mk.upd = max(mk.upd, at)
 		}
@@ -219,6 +223,18 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 		rest = from
 	}
 	return false, rest, true
+}
+
+// deletedSince says whether any document of ns was deleted after from, for a
+// window ask has said it knows. It is never forgotten, so it can only say yes
+// too often.
+func (t *touchTracker) deletedSince(ns string, from bson.Timestamp) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.dels[ns] > checkpoint.PackTS(from)
 }
 
 // covered is how far what the tracker holds covers a window starting at from,

@@ -166,6 +166,8 @@ func (r *Router) SnapshotAll() Snapshot {
 			"point_reads_speculated":   r.Stats.PointReadsSpeculated.Load(),
 			"point_spec_used":          r.Stats.PointSpecUsed.Load(),
 			"point_spec_wasted":        r.Stats.PointSpecWasted.Load(),
+			"merges_speculated":        r.Stats.MergesSpeculated.Load(),
+			"merges_spec_used":         r.Stats.MergesSpecUsed.Load(),
 			"oplog_checks_in_memory":   r.Stats.OplogChecksInMemory.Load(),
 			"oplog_checks_queried":     r.Stats.OplogChecksQueried.Load(),
 			"oplog_checks_tail":        r.Stats.OplogChecksTail.Load(),

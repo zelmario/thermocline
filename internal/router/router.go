@@ -143,6 +143,9 @@ type Router struct {
 	// pointSpecScores holds, per namespace, how its recent point reads went.
 	// See specScore.
 	pointSpecScores sync.Map
+	// mergeSpecScores is the same for sorted reads that end up merged. See
+	// mergeScore.
+	mergeSpecScores sync.Map
 
 	wmCache  watermarkCache
 	idxCache indexCache
@@ -276,6 +279,11 @@ type Stats struct {
 	PointReadsSpeculated atomic.Int64
 	PointSpecUsed        atomic.Int64
 	PointSpecWasted      atomic.Int64
+	// MergesSpeculated counts merged reads whose archive half was asked as
+	// the command arrived, and MergesSpecUsed those that were answered with
+	// it. See mergespec.go.
+	MergesSpeculated atomic.Int64
+	MergesSpecUsed   atomic.Int64
 	// OplogChecksInMemory, OplogChecksTail and OplogChecksQueried count the
 	// oplog checks of merged and unwaited reads answered from the tracker's
 	// memory, from memory plus the oplog entries its stream had not reached,
@@ -989,6 +997,9 @@ type conn struct {
 	// spec is the archive read a point read started ahead of the fast tier's
 	// answer, for answerFromArchive to take. See pointspec.go.
 	spec *pointSpec
+	// mspec is the same for the archive's half of a merged read. See
+	// mergespec.go.
+	mspec *mergeSpec
 	// cmdStarted is when the command in flight arrived, for the stage timings
 	// of a read whose parts are spread over several functions.
 	cmdStarted time.Time
@@ -1197,7 +1208,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// otherwise be consumed by whatever command came next, against ids from a
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
-	c.spec = nil
+	c.spec, c.mspec = nil, nil
 	c.rename = nil
 	c.indexDrop = nil
 

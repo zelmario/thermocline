@@ -862,6 +862,58 @@ chk "and nothing was copied up"                  "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:'archonly'}))")"
 stopDaemons
 
+echo "== a merged read asked ahead keeps a document evicted between its halves =="
+# On a namespace whose sorted reads mostly merge, the archive is asked as the
+# command arrives, beside the fast tier (mergespec.go). The ordinary merge asked
+# the fast tier first, so a document it lacked had left it, mirrored, before
+# the archive was read. Asked ahead, the archive can be read before a document
+# is mirrored and the fast tier after it is evicted, and the answer holds it in
+# neither half. Any delete in the window must send the read the ordinary way.
+#
+# The fast tier's read is held by a $where that sleeps on a decoy only it
+# holds, ahead of the document in its natural order: the test commands are off
+# on the rig, so failCommand cannot. Without the any-delete check this answered
+# 30,29,...,23 with order 500 in neither tier's half.
+SNS=tmspec
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop(); db.getSiblingDB(process.env.TC_DB).createCollection('$SNS')" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop(); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({ns:process.env.TC_DB+'.$SNS'})" >/dev/null
+# Created before the window: a create in it is DDL, which sends every read the
+# ordinary way and would leave nothing to see.
+startFeeder
+startRouter "$STRICTCFG"
+C "db.getSiblingDB(process.env.TC_DB).$SNS.insertMany(Array.from({length:30},(_,i)=>({_id:i+1, n:i+1, when:new Date(Date.UTC(2024,0,1+i))})))" >/dev/null
+cline watermark --config $STRICTCFG --ns $DB.$SNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+sleep 7
+snapCtr() { curl -s http://127.0.0.1:$PDASH/api/snapshot | grep -o "\"$1\"[: ]*[0-9]*" | grep -o '[0-9]*$'; }
+SQ="print(db.getSiblingDB(process.env.TC_DB).$SNS.find({}).sort({n:-1}).limit(8).toArray().map(d=>d._id).join(','))"
+# Two merged reads make the namespace one whose reads are asked ahead.
+R "$SQ" >/dev/null; R "$SQ" >/dev/null
+kill -STOP $FP
+H "db.getSiblingDB(process.env.TC_DB).$SNS.insertOne({_id:0, n:-1, when:new Date(Date.UTC(2031,0,1))})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$SNS.insertOne({_id:500, n:999, when:new Date(Date.UTC(2024,0,1))})" >/dev/null
+SPEC0=$(snapCtr merges_speculated)
+SQW="print(db.getSiblingDB(process.env.TC_DB).$SNS.find({\$where:'if (this._id === 0) sleep(20000); return true'}).sort({n:-1}).limit(8).toArray().map(d=>d._id).join(','))"
+( R "$SQW" > $LOGDIR/fresh_mspec.out ) & SREAD=$!
+sleep 2
+kill -CONT $FP
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({_id:500}))")" = "1" ] && break
+  sleep 0.5
+done
+cline evictor --config $STRICTCFG --once --log-file $LOGDIR/fresh_mspec_ev.log >/dev/null 2>&1
+EVICTED=$(H "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({_id:500}))")
+wait $SREAD
+GOTS=$(tail -1 $LOGDIR/fresh_mspec.out)
+# The preconditions, asserted: the read was asked ahead, and the sweep took the
+# document off the fast tier while the read was held.
+chk "the read was asked ahead"                    "true" \
+    "$([ $(( $(snapCtr merges_speculated) - ${SPEC0:-0} )) -ge 1 ] && echo true || echo false)"
+chk "the sweep evicted it while the read was held" "0" "$EVICTED"
+chk "the evicted order is in the answer"          "500" "${GOTS%%,*}"
+H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
+stopDaemons
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

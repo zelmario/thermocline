@@ -73,6 +73,8 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("point_reads_unwaited_total", "Reads by _id answered from the archive without the freshness wait, because the fast tier's oplog showed no delete of that document waiting to be mirrored.", snap.Counters["point_reads_unwaited"])
 	counter("point_reads_speculated_total", "Reads by _id whose archive read was started beside the fast tier's, because most recent point reads of the namespace missed.", snap.Counters["point_reads_speculated"])
 	counter("point_spec_used_total", "Speculated point reads answered from the archive read started ahead, one round trip sooner.", snap.Counters["point_spec_used"])
+	counter("merges_speculated_total", "Merged reads whose archive half was asked as the command arrived, because most recent sorted reads of the namespace were merged.", snap.Counters["merges_speculated"])
+	counter("merges_spec_used_total", "Merged reads answered with the archive half asked ahead, one round trip sooner. The difference from merges_speculated_total is archive reads that did not need to happen.", snap.Counters["merges_spec_used"])
 	counter("point_spec_wasted_total", "Speculated point reads whose early archive read was not used: the fast tier held the document, the archive did not, or the oplog check did not clear it. Each is one archive read that did not need to happen.", snap.Counters["point_spec_wasted"])
 	counter("oplog_checks_in_memory_total", "Oplog checks of merged and unwaited reads answered from memory, with no round trip to the fast tier.", snap.Counters["oplog_checks_in_memory"])
 	counter("oplog_checks_queried_total", "Oplog checks of merged and unwaited reads that read the fast tier's oplog.", snap.Counters["oplog_checks_queried"])

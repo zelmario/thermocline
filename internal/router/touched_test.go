@@ -57,6 +57,10 @@ func TestTouchTracker(t *testing.T) {
 	tr.advance(at(25), false)
 	ask("a window ending at a mark", 10, 25, false, false, true, bson.Timestamp{T: 25, I: 0}, int32(2))
 
+	if !tr.deletedSince("shop.orders", ts(10)) || tr.deletedSince("shop.orders", ts(13)) || tr.deletedSince("shop.carts", ts(10)) {
+		t.Error("deletedSince: want a delete after 10 in shop.orders only")
+	}
+
 	tr.touch("modify", "shop", "orders", bson.RawValue{}, at(16))
 	ask("DDL touches every document", 15, 20, false, true, true, all, int32(2))
 	tr.touch("dropDatabase", "shop", "", bson.RawValue{}, at(22))

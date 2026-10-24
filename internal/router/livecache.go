@@ -422,7 +422,7 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 			}
 			ids = append(ids, id)
 		}
-		if touched, err := r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids); err != nil || touched {
+		if touched, err := r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids, false); err != nil || touched {
 			return nil, false
 		}
 	}
