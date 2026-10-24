@@ -118,6 +118,11 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 		return c.guardCompleteness(ctx, ns, fdoc, msg, reply)
 	}
 	if len(batch) > 0 {
+		c.r.notePointRead(ns, false)
+		if c.spec != nil {
+			c.r.Stats.PointSpecWasted.Add(1)
+			c.spec = nil
+		}
 		return reply, nil
 	}
 
@@ -240,6 +245,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// needs before it can treat the archive's copy as the truth happens inside
 	// answerFromArchive with every other archive read.
 	c.r.Metrics.RecordStage(stagePointFast, time.Since(c.cmdStarted))
+	c.r.notePointRead(ns, true)
 	c.archivePoint = &id
 	out, err := c.answerFromArchive(ctx, msg, db, coll, false)
 	c.archivePoint = nil

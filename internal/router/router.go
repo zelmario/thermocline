@@ -140,6 +140,9 @@ type Router struct {
 	// mirroring to reach it. See freshness.go for why a cluster time and not a
 	// clock.
 	seenOpTime atomic.Uint64
+	// pointSpecScores holds, per namespace, how its recent point reads went.
+	// See specScore.
+	pointSpecScores sync.Map
 
 	wmCache  watermarkCache
 	idxCache indexCache
@@ -266,6 +269,13 @@ type Stats struct {
 	// without the freshness wait, because the fast tier's oplog showed no
 	// delete of that document waiting to be mirrored. See pointfresh.go.
 	PointReadsUnwaited atomic.Int64
+	// PointReadsSpeculated counts point reads whose archive read was started
+	// beside the fast tier's, PointSpecUsed those that answered from it, and
+	// PointSpecWasted those it did not: the fast tier held the document, the
+	// archive did not, or the oplog check did not clear it. See pointspec.go.
+	PointReadsSpeculated atomic.Int64
+	PointSpecUsed        atomic.Int64
+	PointSpecWasted      atomic.Int64
 	// OplogChecksInMemory, OplogChecksTail and OplogChecksQueried count the
 	// oplog checks of merged and unwaited reads answered from the tracker's
 	// memory, from memory plus the oplog entries its stream had not reached,
@@ -976,6 +986,9 @@ type conn struct {
 	// the archive for, set only around that call, so answerFromArchive can ask
 	// the oplog instead of waiting. See pointfresh.go.
 	archivePoint *bson.RawValue
+	// spec is the archive read a point read started ahead of the fast tier's
+	// answer, for answerFromArchive to take. See pointspec.go.
+	spec *pointSpec
 	// cmdStarted is when the command in flight arrived, for the stage timings
 	// of a read whose parts are spread over several functions.
 	cmdStarted time.Time
@@ -1184,6 +1197,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// otherwise be consumed by whatever command came next, against ids from a
 	// statement that has already finished.
 	c.txnKeys = txnKeyCheck{}
+	c.spec = nil
 	c.rename = nil
 	c.indexDrop = nil
 
@@ -1236,6 +1250,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 		if out, hit := c.cacheLookup(ctx, msg, name, db); hit {
 			return c.send(out)
+		}
+		// A read by _id on a namespace whose point reads mostly miss asks the
+		// archive now, beside the fast tier. See pointspec.go.
+		if name == "find" {
+			c.startPointSpec(ctx, msg, db)
 		}
 	}
 

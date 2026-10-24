@@ -319,6 +319,9 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// for it at the same time. See pointfresh.go.
 	if c.archivePoint != nil {
 		c.r.Metrics.RecordStage(stagePointPrep, time.Since(prepFrom))
+		if out, ok := c.takeSpec(ctx, msg, db+"."+coll, *c.archivePoint, count); ok {
+			return out, nil
+		}
 		if out, ok := c.pointReadInParallel(ctx, msg, db, coll, *c.archivePoint, rewritten, batchSize, budget, count); ok {
 			return out, nil
 		}
