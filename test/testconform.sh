@@ -536,6 +536,25 @@ samew 'findAndModify with fields' 'print(JSON.stringify(d.runCommand({findAndMod
 # on, and the count left behind is the difference between the two.
 samew 'ordered insert, duplicate in the middle' 'try{ COLL.insertMany([{_id:81,n:81},{_id:15,n:0},{_id:82,n:82}],{ordered:true}) }catch(e){}; print(COLL.countDocuments({_id:{$in:[81,82]}}))'
 samew 'unordered insert, duplicate in the middle' 'try{ COLL.insertMany([{_id:83,n:83},{_id:15,n:0},{_id:84,n:84}],{ordered:false}) }catch(e){}; print(COLL.countDocuments({_id:{$in:[83,84]}}))'
+# The same insert and count, twelve times in one session. The router trims an
+# insert naming an archived _id and builds the reply itself, and the fast
+# tier's reply to the trimmed batch was never noted: the count after it was
+# answered from an archive that did not have the two documents yet, believing
+# it was current. It is a race with mirroring, so it is asked repeatedly.
+# Measured on 2026-10-24 with three of these suites at once: 4 short counts in
+# 60 rounds before the fix, 4 in 60 with the fix taken out again, 0 in 120 with
+# it. Freezing the feeder to make it certain did not hold still: the router's
+# own clash check waits for mirroring first, and the documents land before the
+# count is asked.
+reseed
+SHORT=$(R "const c=db.getSiblingDB(process.env.TC_DB).tcon; let short=0;
+  for (let i=0; i<12; i++) {
+    const a=1000+2*i, b=a+1;
+    try { c.insertMany([{_id:a,n:a},{_id:15,n:0},{_id:b,n:b}],{ordered:false}) } catch(e) {}
+    if (c.countDocuments({_id:{\$in:[a,b]}}) !== 2) short++;
+  }
+  print(short)")
+chk "and twelve times over, every count whole"  "0" "$SHORT"
 samew 'findOneAndReplace()'  'print(JSON.stringify(COLL.findOneAndReplace({_id:13},{_id:13,fresh:1},{returnDocument:"after"})))'
 samew 'findOneAndDelete()'   'print(JSON.stringify(COLL.findOneAndDelete({_id:13}))+"/"+COLL.countDocuments({}))'
 

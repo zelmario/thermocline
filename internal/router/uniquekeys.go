@@ -1270,6 +1270,13 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		c.r.releaseKeys(ctx, claimed)
 		return nil, false
 	}
+	// The kept documents are written now, and the reply that says so is
+	// replaced below, so this is the only place their time can be noted.
+	// Without it the freshness barrier was judged against a time before them:
+	// an unordered insert of [83, 15, 84] with 15 archived, then a count of 83
+	// and 84 in the same session, answered 0 in 4 of 60 rounds on 2026-10-24,
+	// while both tiers held the two documents.
+	c.r.noteOpTime(reply)
 	rdoc, derr := reply.ReplyDoc()
 	if derr != nil {
 		return reply, true
@@ -1357,11 +1364,21 @@ func (r *Router) insertErrorReply(msg *wire.Message, ns string, n int, clashes [
 			}
 		}
 	}
-	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
+	out := bson.D{
 		{Key: "n", Value: int32(n)},
 		{Key: "writeErrors", Value: errs},
 		{Key: "ok", Value: 1.0},
-	})
+	}
+	// The fast tier's clock travels on, as it would from mongod. A driver
+	// advances a causally consistent session by operationTime, and a reply
+	// without it leaves the next read in that session free to be older than
+	// this write.
+	for _, k := range []string{"$clusterTime", "operationTime"} {
+		if v, err := upstream.LookupErr(k); err == nil {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+	}
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, out)
 }
 
 func mustElements(d bson.Raw) []bson.RawElement {
