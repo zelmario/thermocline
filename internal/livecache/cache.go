@@ -86,7 +86,7 @@ type Cache struct {
 
 	// tiered says a namespace is tiered, and prove how much of the fast tier's
 	// answer for one is the whole answer's. See Tiers.
-	tiered func(ns string) bool
+	tiered  func(ns string) bool
 	prove   ProveFunc
 	merge   MergeFunc
 	archive ArchiveFunc
@@ -572,10 +572,9 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		c.mu.Unlock()
 		return nil, false
 	}
-	// A range on a tiered namespace is not filled: the proof and the merge
-	// that complete a tiered entry are built for equalities. See proveFill.
-	// A grouping is, from both tiers, once the router lets it. See readGroup.
-	if c.isTiered(q.NS) && (q.Kind == KindFind && len(q.Ranges) > 0 || q.Kind == KindGroup && c.archive == nil) {
+	// A grouping on a tiered namespace is filled from both tiers, once the
+	// router lets it. See readGroup.
+	if c.isTiered(q.NS) && q.Kind == KindGroup && c.archive == nil {
 		c.mu.Unlock()
 		return nil, false
 	}

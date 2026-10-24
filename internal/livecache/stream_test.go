@@ -399,8 +399,14 @@ func direct(t *testing.T, ctx context.Context, co *mongo.Collection, q Query) an
 	for _, p := range q.Eq {
 		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
 	}
-	for _, r := range q.Ranges {
-		filter = append(filter, bson.E{Key: r.Field, Value: bson.D{{Key: r.Op, Value: r.Value}}})
+	// One field's bounds in one document, as the fill writes them.
+	for i := 0; i < len(q.Ranges); {
+		ops := bson.D{}
+		f := q.Ranges[i].Field
+		for ; i < len(q.Ranges) && q.Ranges[i].Field == f; i++ {
+			ops = append(ops, bson.E{Key: q.Ranges[i].Op, Value: q.Ranges[i].Value})
+		}
+		filter = append(filter, bson.E{Key: f, Value: ops})
 	}
 	if q.Kind != KindFind {
 		n, err := co.CountDocuments(ctx, filter)

@@ -202,7 +202,21 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 				{Key: "filter", Value: bson.D{{Key: "_id", Value: fmt.Sprintf("o%06d", r.Intn(orders+200))}}}, {Key: "limit", Value: int32(1)}}))
 			return q
 		}
-		cmd := bson.D{{Key: "find", Value: "orders"}, {Key: "filter", Value: bson.D{{Key: "customer", Value: cust}}},
+		filter := bson.D{{Key: "customer", Value: cust}}
+		switch r.Intn(4) {
+		case 0:
+			// A range a write moves orders in and out of, across both tiers.
+			lo := int32(r.Intn(6))
+			filter = bson.D{{Key: "stock", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: lo + int32(r.Intn(3))}}}}
+		case 1:
+			// A customer's orders before a moment in the older half of
+			// history, below the claim, so the fast tier cannot prove the page
+			// and the archive is merged in. Three moments, so a query is asked
+			// again and filled on its second miss, as a tiered entry is.
+			before := base.Add(time.Duration(1+r.Intn(3)) * 500 * time.Minute)
+			filter = append(filter, bson.E{Key: "at", Value: bson.D{{Key: "$lt", Value: before}}})
+		}
+		cmd := bson.D{{Key: "find", Value: "orders"}, {Key: "filter", Value: filter},
 			{Key: "sort", Value: bson.D{{Key: "at", Value: int32(-1)}}}, {Key: "skip", Value: int32(r.Intn(2) * 10)}, {Key: "limit", Value: int32(10)}}
 		if r.Intn(2) == 0 {
 			cmd = append(cmd, bson.E{Key: "projection", Value: bson.D{{Key: "stock", Value: 0}}})
@@ -419,7 +433,7 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 	// Caught up, and nothing moving: every answer must be the both-tier one.
 	time.Sleep(500 * time.Millisecond)
 	r := rand.New(rand.NewSource(99))
-	checked, lists, wrong := 0, 0, 0
+	checked, lists, ranges, wrong := 0, 0, 0, 0
 	for i := 0; i < 3000; i++ {
 		q := queries(r)
 		got, hit := c.Get(q)
@@ -429,6 +443,9 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 		checked++
 		if !hasEq(q, "_id") {
 			lists++
+		}
+		if len(q.Ranges) > 0 {
+			ranges++
 		}
 		if want := direct(t, ctx, archive, q); !reflect.DeepEqual(batchOf(got), want) {
 			wrong++
@@ -465,8 +482,11 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 		}
 	}
 	s := c.Stats()
-	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists, then %d groupings) after, %d wrong; %d writer reads disagreed; stats %+v",
-		evicted, warmed, written, checked, lists, grouped, wrong, n, s)
+	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists, %d ranges, then %d groupings) after, %d wrong; %d writer reads disagreed; stats %+v",
+		evicted, warmed, written, checked, lists, ranges, grouped, wrong, n, s)
+	if ranges < 100 {
+		t.Errorf("only %d ranges came from the cache, too few to say anything", ranges)
+	}
 	if grouped < 100 {
 		t.Errorf("only %d groupings came from the cache, too few to say anything", grouped)
 	}
