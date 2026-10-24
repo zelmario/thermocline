@@ -76,8 +76,12 @@ H "db.getSiblingDB('payroll').salaries.drop();
    db.getSiblingDB(process.env.TC_DB).tatrm.drop();
    db.getSiblingDB(process.env.TC_DB).tatrm.insertMany([{_id:1,v:'one'},{_id:2,v:'two'}])" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tatrm.drop()" >/dev/null
-H "try { db.getSiblingDB('admin').dropUser('limited') } catch(e) {}
-   db.getSiblingDB('admin').createUser({user:'limited',pwd:'limpass',roles:[{role:'read',db:'$DB'}]})" >/dev/null
+# Users are server-wide, not per worker, so the name is this suite's own.
+# testauth.sh creates a 'limited' too, with read on its worker's database; on
+# 2026-10-23 the sweep's new order ran the two at once and 17 checks here failed
+# with "Authentication failed" as each recreated the other's user.
+H "try { db.getSiblingDB('admin').dropUser('atlimited') } catch(e) {}
+   db.getSiblingDB('admin').createUser({user:'atlimited',pwd:'limpass',roles:[{role:'read',db:'$DB'}]})" >/dev/null
 H "try { db.getSiblingDB('admin').dropUser('writer') } catch(e) {}
    db.getSiblingDB('admin').createUser({user:'writer',pwd:'writepass',roles:[{role:'readWrite',db:'$DB'}]})" >/dev/null
 
@@ -108,15 +112,15 @@ out=$(AS nosuchuser whatever 'print("GOT IN")')
 chk "and neither does a user that does not exist" "Authentication failed." "$(echo "$out" | sed 's/.*MongoServerError: //')"
 
 echo "== a user reaches its own database and no other =="
-chk "limited reads the database it was granted" "2"      "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).tatrm.countDocuments({}))')"
-chk "find on another database is refused"       "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").salaries.find().toArray().length)')")"
-chk "count on another database is refused"      "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").salaries.count())')")"
-chk "distinct on another database is refused"   "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").salaries.distinct("who"))')")"
-chk "aggregate on another database is refused"  "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").salaries.aggregate([{$group:{_id:null,t:{$sum:"$amount"}}}]).toArray().length)')")"
+chk "limited reads the database it was granted" "2"      "$(AS atlimited limpass 'print(db.getSiblingDB(process.env.TC_DB).tatrm.countDocuments({}))')"
+chk "find on another database is refused"       "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("payroll").salaries.find().toArray().length)')")"
+chk "count on another database is refused"      "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("payroll").salaries.count())')")"
+chk "distinct on another database is refused"   "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("payroll").salaries.distinct("who"))')")"
+chk "aggregate on another database is refused"  "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("payroll").salaries.aggregate([{$group:{_id:null,t:{$sum:"$amount"}}}]).toArray().length)')")"
 
 echo "== read does not imply write =="
-chk "a read only user cannot insert"            "DENIED" "$(denied "$(AS limited limpass 'db.getSiblingDB(process.env.TC_DB).tatrm.insertOne({_id:99}); print("INSERTED")')")"
-chk "a read only user cannot delete"            "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).tatrm.deleteOne({_id:1}).deletedCount)')")"
+chk "a read only user cannot insert"            "DENIED" "$(denied "$(AS atlimited limpass 'db.getSiblingDB(process.env.TC_DB).tatrm.insertOne({_id:99}); print("INSERTED")')")"
+chk "a read only user cannot delete"            "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB(process.env.TC_DB).tatrm.deleteOne({_id:1}).deletedCount)')")"
 chk "and the document is still there"           "2"      "$(H 'print(db.getSiblingDB(process.env.TC_DB).tatrm.countDocuments({}))')"
 chk "a readWrite user can insert"               "3"      "$(AS writer writepass 'db.getSiblingDB(process.env.TC_DB).tatrm.insertOne({_id:3,v:"three"}); print(db.getSiblingDB(process.env.TC_DB).tatrm.countDocuments({}))')"
 
@@ -139,13 +143,13 @@ chk "a root user can read server status"        "1"      "$(AS dba secret 'print
 chk "and a parameter"                           "1"      "$(AS dba secret 'print(db.adminCommand({getParameter:1,featureCompatibilityVersion:1}).ok)')"
 chk "and the startup warnings mongosh asks for" "1"      "$(AS dba secret 'print(db.adminCommand({getLog:"startupWarnings"}).ok)')"
 chk "and the replica set status"                "1"      "$(AS dba secret 'print(db.adminCommand({replSetGetStatus:1}).ok)')"
-chk "a read only user is refused server status" "DENIED" "$(denied "$(AS limited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
-chk "and mongod refuses the same user the same" "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
-chk "and it is refused the user list"           "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("admin").runCommand({usersInfo:1}).ok)')")"
-chk "and refused what is running"               "DENIED" "$(denied "$(AS limited limpass 'print(db.adminCommand({currentOp:1}).ok)')")"
+chk "a read only user is refused server status" "DENIED" "$(denied "$(AS atlimited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
+chk "and mongod refuses the same user the same" "DENIED" "$(denied "$(HOTAS atlimited limpass 'print(db.adminCommand({serverStatus:1}).ok)')")"
+chk "and it is refused the user list"           "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("admin").runCommand({usersInfo:1}).ok)')")"
+chk "and refused what is running"               "DENIED" "$(denied "$(AS atlimited limpass 'print(db.adminCommand({currentOp:1}).ok)')")"
 # connectionStatus reports the caller's own authentication state and mongod
 # asks no privilege for it. mongosh sends it on connect.
-chk "connectionStatus needs no privilege"       "1"      "$(AS limited limpass 'print(db.adminCommand({connectionStatus:1}).ok)')"
+chk "connectionStatus needs no privilege"       "1"      "$(AS atlimited limpass 'print(db.adminCommand({connectionStatus:1}).ok)')"
 # The sharpest of these: the same command, allowed on the database this user can
 # read and refused on the one it cannot. A blanket exemption would pass the
 # first and fail the second.
@@ -160,9 +164,9 @@ H "db.getSiblingDB(process.env.TC_DB).tazhash.drop();
    db.getSiblingDB(process.env.TC_DB).tazhash.insertOne({_id:1,v:'x'});
    db.getSiblingDB('payroll').tazhash.drop();
    db.getSiblingDB('payroll').tazhash.insertOne({_id:1,v:'x'})" >/dev/null
-chk "dbHash on the granted database"            "1"      "$(AS limited limpass 'print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:["tazhash"]}).ok)')"
-chk "and refused on another"                    "DENIED" "$(denied "$(AS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
-chk "and mongod agrees about both"              "DENIED" "$(denied "$(HOTAS limited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
+chk "dbHash on the granted database"            "1"      "$(AS atlimited limpass 'print(db.getSiblingDB(process.env.TC_DB).runCommand({dbHash:1,collections:["tazhash"]}).ok)')"
+chk "and refused on another"                    "DENIED" "$(denied "$(AS atlimited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
+chk "and mongod agrees about both"              "DENIED" "$(denied "$(HOTAS atlimited limpass 'print(db.getSiblingDB("payroll").runCommand({dbHash:1,collections:["tazhash"]}).ok)')")"
 # atlasVersion is how mongosh asks whether it is talking to Atlas, and mongod
 # does not have the command. Forwarded, so the client gets mongod's own answer
 # rather than a refusal this proxy invented, and so the refusal counter is not
@@ -180,7 +184,7 @@ sleep 6
 C "db.getSiblingDB(process.env.TC_DB).tatrm.updateOne({_id:1},{\$set:{v:'one'}},{upsert:true})" >/dev/null
 H "db.getSiblingDB(process.env.TC_DB).tatrm.deleteOne({_id:1})" >/dev/null
 chk "an archived document is still served"      "one"    "$(AS dba secret 'const d=db.getSiblingDB(process.env.TC_DB).tatrm.findOne({_id:1}); print(d?d.v:"MISSING")')"
-chk "and refused to a user without the grant"   "DENIED" "$(denied "$(AS limited limpass 'const d=db.getSiblingDB("payroll").salaries.findOne({_id:1}); print(d?d.who:"MISSING")')")"
+chk "and refused to a user without the grant"   "DENIED" "$(denied "$(AS atlimited limpass 'const d=db.getSiblingDB("payroll").salaries.findOne({_id:1}); print(d?d.who:"MISSING")')")"
 
 # A command names more collections than the one it is sent to.
 #
@@ -276,7 +280,7 @@ echo "== renaming, which mongod judges by the database =="
 # readWrite carries and read does not. Across databases mongod wants privileges
 # on both sides that this does not know how to check, so that stays refused by
 # name rather than guessed at.
-chk "a read only user cannot rename"                "DENIED"     "$(denied "$(AS limited limpass 'db.adminCommand({renameCollection:process.env.TC_DB+".tazopen",to:process.env.TC_DB+".tazmoved"}); print("RENAMED")')")"
+chk "a read only user cannot rename"                "DENIED"     "$(denied "$(AS atlimited limpass 'db.adminCommand({renameCollection:process.env.TC_DB+".tazopen",to:process.env.TC_DB+".tazmoved"}); print("RENAMED")')")"
 chk "a readWrite user can"                          "RENAMED"     "$(denied "$(AS writer writepass 'db.adminCommand({renameCollection:process.env.TC_DB+".tazopen",to:process.env.TC_DB+".tazmoved"}); print("RENAMED")')")"
 H 'db.adminCommand({renameCollection:process.env.TC_DB+".tazmoved",to:process.env.TC_DB+".tazopen"})' >/dev/null 2>&1
 chk "a rename across databases is refused by name"  "REFUSED"     "$(refused "$(AS dba secret 'db.adminCommand({renameCollection:process.env.TC_DB+".tazopen",to:"payroll.tazopen"}); print("RENAMED")')")"
@@ -289,11 +293,11 @@ echo "== a write that asks for no acknowledgement is still a write =="
 # bypass in the system: no error anywhere, and the document lands.
 UNACK='db.getSiblingDB("payroll").salaries.insertOne({_id:777,who:"unack"},{writeConcern:{w:0}}); print("sent")'
 H 'db.getSiblingDB("payroll").salaries.deleteMany({_id:777})' >/dev/null
-HOTAS limited limpass "$UNACK" >/dev/null 2>&1
+HOTAS atlimited limpass "$UNACK" >/dev/null 2>&1
 sleep 2
 REFUNACK=$(H 'print(db.getSiblingDB("payroll").salaries.countDocuments({_id:777}))')
 H 'db.getSiblingDB("payroll").salaries.deleteMany({_id:777})' >/dev/null
-AS limited limpass "$UNACK" >/dev/null 2>&1
+AS atlimited limpass "$UNACK" >/dev/null 2>&1
 sleep 2
 chk "an unacknowledged forbidden write matches mongod" "$REFUNACK" \
     "$(H 'print(db.getSiblingDB("payroll").salaries.countDocuments({_id:777}))')"

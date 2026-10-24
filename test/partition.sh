@@ -21,7 +21,8 @@ def listed(path):
     if not m:
         print(f"partition: no SUITES list in {path}")
         sys.exit(2)
-    return set(m.group(1).split())
+    # suite@n is part n of one suite file.
+    return {x.split('@')[0] for x in m.group(1).split()}
 
 p, h = listed('psweep.sh'), listed('hostsweep.sh')
 files = {os.path.basename(f)[:-3] for f in glob.glob('test*.sh')}

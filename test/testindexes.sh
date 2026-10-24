@@ -79,6 +79,12 @@ startRouter() {
   echo "  FATAL  the router never came up on $PORT"; exit 2
 }
 
+# PART=n runs the setup and then only part n of this suite, so a sweep can run
+# its parts on separate workers at once; unset, the whole suite runs as always.
+# psweep.sh names a part as suite@n. A helper a later part calls is defined
+# above the setup, not in the part that first needs it.
+inpart() { [ -z "${PART:-}" ] || [ "$PART" = "$1" ]; }
+
 echo "== setup: $N documents with a kilobyte each =="
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
@@ -101,6 +107,7 @@ for _ in $(seq 1 300); do
 done
 echo "  archive holds $(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")"
 
+if inpart 1; then
 echo "== indexes are not copied, in either direction =="
 # Stated as a check rather than a comment, because somebody will eventually
 # assume otherwise and this says so out loud.
@@ -617,6 +624,8 @@ chk "and mirroring refused nothing"               "0" \
 H "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ONS.drop()" >/dev/null
 
+fi
+if inpart 2; then
 echo "== a unique index the archive has and the fast tier does not =="
 # The router reads the FAST TIER's unique indexes to know what to protect across
 # both tiers, so while this is true it accepts a value the archive refuses. The
@@ -1203,6 +1212,7 @@ H "db.getSiblingDB(process.env.TC_DB).$IXNS.drop(); db.getSiblingDB(process.env.
 C "db.getSiblingDB(process.env.TC_DB).$IXNS.drop()" >/dev/null
 
 stopDaemons
+fi
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

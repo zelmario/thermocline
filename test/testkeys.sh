@@ -142,12 +142,19 @@ evictBehindTheFeeder() {
   startFeeder
 }
 
+# PART=n runs the setup and then only part n of this suite, so a sweep can run
+# its parts on separate workers at once; unset, the whole suite runs as always.
+# psweep.sh names a part as suite@n. A helper a later part calls is defined
+# above the setup, not in the part that first needs it.
+inpart() { [ -z "${PART:-}" ] || [ "$PART" = "$1" ]; }
+
 echo "== setup =="
 stopDaemons
 C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
 startFeeder
 startRouter
 
+if inpart 1; then
 echo "== an update must not take a key held by an evicted document =="
 fresh tkupd '{email:1}'
 R 'db.getSiblingDB(process.env.TC_DB).tkupd.insertMany([{_id:1,email:"held@x.com"},{_id:2,email:"free@x.com"}])' >/dev/null
@@ -749,6 +756,8 @@ chk "the value an updateMany landed stays taken"      "11000" \
 chk "and so does one a partly refused insert landed"  "11000" \
     "$(R 'try{db.getSiblingDB(process.env.TC_DB).tkcoll2.insertOne({_id:6,email:"p@x"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
 
+fi
+if inpart 2; then
 echo "== updates whose result has to be computed, not read =="
 # $inc, $rename and pipeline updates do not say what the field will hold, they
 # say how to work it out. The router has the fast tier apply the statement in a
@@ -1142,11 +1151,14 @@ sleep 1
 chk "claims outlive the documents that made them"      "40" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:'$DB.$GNS'}) - $BEFORE)")"
 # The number an operator can watch. The inventory refreshes on a timer, so this
-# waits for it rather than sampling once.
+# waits for it rather than sampling once, and waits for what the check below
+# asserts rather than for any number at all: under an eight-worker sweep on
+# 2026-10-23 the first refresh landed while the inserts were still going, the
+# loop stopped at 23 and the check failed a registry that was right.
 REG=""
 for _ in $(seq 1 40); do
   REG=$(curl -s "http://127.0.0.1:$PDASH/metrics" 2>/dev/null | awk '/^thermocline_key_registry_rows /{print $2}')
-  [ -n "$REG" ] && [ "${REG%%.*}" -gt 0 ] 2>/dev/null && break
+  [ -n "$REG" ] && [ "${REG%%.*}" -ge 40 ] 2>/dev/null && break
   sleep 2
 done
 chk "and the registry's size is reported"              "true" \
@@ -1596,6 +1608,7 @@ H "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$MNS.drop()" >/dev/null
 
 pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"
+fi
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

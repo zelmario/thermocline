@@ -679,3 +679,86 @@ Things these encode that are easy to get wrong when testing by hand:
   exec with `GLIBC_2.34 not found`. That surfaces as `FATAL the router never
   came up`, which looks like the router refusing to start rather than a build
   problem. This cost two runs before the Makefile was fixed.
+
+## Checking one change in minutes
+
+A full sweep is 42 suite runs and fifteen minutes at eight workers (it was 21 at four, before the parts), and most changes reach
+a handful of suites. `test/quick.sh` runs only those, plus the unit tests of the
+packages the change touches, on the Docker test box:
+
+    test/quick.sh                    # the uncommitted change, against HEAD
+    test/quick.sh -base master~2     # the last two commits as well
+    test/quick.sh testkeys testtxn   # these suites, whatever changed
+    LIVE=1 test/quick.sh             # with the live cache in verify mode
+
+The unit tests are built here and run on the box with `TC_TEST_HOT` and
+`TC_TEST_COLD` set, so the ones that need a real MongoDB run instead of
+skipping.
+
+**Which suites a change reaches is measured, not guessed.** `test/suitepick`
+diffs the tree, finds the function around every changed line and looks it up in
+`test/suitemap/funcs.tsv`, a list of every function each suite executed. It
+picks the cheapest set of suites, by run time, in which two different suites
+execute each changed function. The last four commits of 2026-10-23 came out at
+2, 3, 5 and 6 suites, 175 to 595 seconds of suite time, which six workers run
+in three or four minutes.
+
+Two, not one, because running a function is not checking it. The cheapest
+single cover of those commits was `testretry`, fourteen seconds, for nearly
+every function: it passes through the merged read and asserts nothing about
+it. A second suite makes it likelier that one of them looks at the answer. A
+mutant is still what proves that one does.
+
+It says which changed functions no suite runs at all, since a change there is
+checked only by its unit tests. A function that is new falls back to the suites
+that run its file.
+
+**Rebuild the map when suites are added or a batch lands.** The map stores
+function names rather than lines, so it survives the code moving under it, but
+not new code paths:
+
+    CGO_ENABLED=0 go build -buildvcs=false -cover -covermode=atomic -coverpkg=./... -o cline-cover ./cmd/cline
+    # install it as /usr/local/bin/cline in the node, then:
+    docker exec -e COVER=1 -e OUT=/root/psweep.cov <node> bash /root/psweep.sh
+    # copy /root/psweep.cov back here, then:
+    test/mkcovmap.sh psweep.cov
+    # and put the plain binary back in the node
+
+Two details cost a run each. The binary must be built with `-covermode=atomic`,
+because in the default mode `runtime/coverage.WriteCounters` refuses and the
+daemons write nothing. And the suites stop most daemons with `kill -9`, which
+skips the counters a coverage binary writes at exit, so `cmd/cline/coverflush.go`
+rewrites them every two seconds while `GOCOVERDIR` is set. The 2026-10-23 map
+covers 1,185 of 1,399 functions.
+
+### Suites in parts
+
+The sweep's length was set by its longest suite rather than by the total.
+`testchange` alone took 665 seconds, because its checks wait on purpose: a
+consumer that reads 40 seconds late, and ten second windows that prove an event
+does not arrive. Shortening those would weaken what they prove, so the suite
+runs in parts instead.
+
+`PART=n bash testchange.sh` runs the setup and then only part n. Unset, the
+whole suite runs exactly as before. `psweep.sh` names a part `suite@n`, and
+the four longest suites are split where their own section times said:
+`testchange` and `testconform` in three, `testkeys` and `testindexes` in two.
+The parts' checks add up to the whole suite's: 6 + 27 + 29 = 62 for
+`testchange`. A helper a later part calls is defined above the setup, because a
+part never runs the code of the one before it.
+
+Every suite now writes `$OUT/<suite>.times`, when each section started, read
+from its log every two seconds. That is what the split points came from, and
+it is where to look before splitting another.
+
+The queue is ordered longest first, so the last suite to start is a short one.
+In the old order `testchange` started ten minutes in and alone took the last
+eleven.
+
+**Reordering is a test of isolation.** The first sweep in the new order failed
+17 checks in `testauthterm` with `Authentication failed`. Users are
+server-wide, not per worker, and `testauth` and `testauthterm` both created a
+user named `limited`, each with read on its own worker's database. The old
+order had always kept the two apart. Still server-wide and unguarded:
+`testindexes` changes `setParameter` on the archive, and `testauth` changes the
+default read and write concern.

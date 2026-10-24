@@ -204,6 +204,14 @@ reseed() {
   cline watermark --config $CFG --ns $DB.tcon --complete-from 2030-01-01T00:00:00Z >/dev/null
 }
 
+E() { echo "print(JSON.stringify(COLL.aggregate([{\$sort:{_id:1}},{\$project:{v:$1}}]).toArray().map(d=>d.v)))"; }
+
+# PART=n runs the setup and then only part n of this suite, so a sweep can run
+# its parts on separate workers at once; unset, the whole suite runs as always.
+# psweep.sh names a part as suite@n. A helper a later part calls is defined
+# above the setup, not in the part that first needs it.
+inpart() { [ -z "${PART:-}" ] || [ "$PART" = "$1" ]; }
+
 echo "== setup =="
 stopDaemons
 C "db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:'test'}); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({}); db.getSiblingDB(process.env.TC_META).residency.deleteMany({}); db.getSiblingDB(process.env.TC_META).evicting.deleteMany({})" >/dev/null
@@ -217,6 +225,7 @@ chk "its archive holds twenty"                  "20" "$(C "print(db.getSiblingDB
 
 S='.sort({_id:1}).toArray()))'
 echo
+if inpart 1; then
 echo "== CRUD reads =="
 same 'find()'                 "print(JSON.stringify(COLL.find({})$S"
 same 'findOne()'              'print(JSON.stringify(COLL.findOne({_id:17})))'
@@ -398,7 +407,6 @@ same '$bottomN'     "print(JSON.stringify(COLL.aggregate([{\$group:{_id:null,v:{
 
 echo
 echo "== aggregation expressions =="
-E() { echo "print(JSON.stringify(COLL.aggregate([{\$sort:{_id:1}},{\$project:{v:$1}}]).toArray().map(d=>d.v)))"; }
 same '$add'          "$(E '{$add:["$n",5]}')"
 same '$subtract'     "$(E '{$subtract:["$n",5]}')"
 same '$multiply'     "$(E '{$multiply:["$n",3]}')"
@@ -492,6 +500,8 @@ upd '$sort modifier' '{$push:{items:{$each:[{sku:"s0",qty:99}],$sort:{qty:-1}}}}
 samew '$currentDate' 'COLL.updateOne({_id:17},{$currentDate:{seen:true}}); print(COLL.findOne({_id:17}).seen instanceof Date)'
 
 echo
+fi
+if inpart 2; then
 echo "== the write commands themselves =="
 samew 'insertOne()'          'COLL.insertOne({_id:77,n:77}); print(COLL.countDocuments({}))'
 samew 'insertMany()'         'COLL.insertMany([{_id:78,n:78},{_id:79,n:79}]); print(COLL.countDocuments({}))'
@@ -540,6 +550,8 @@ samew 'bulkWrite deleteMany' 'const r=COLL.bulkWrite([{deleteMany:{filter:{n:{$g
 samew 'bulkWrite mixed'      'const r=COLL.bulkWrite([{insertOne:{document:{_id:91,n:91}}},{updateOne:{filter:{_id:18},update:{$set:{m:1}}}},{deleteOne:{filter:{_id:20}}}]); print(r.insertedCount+"/"+r.matchedCount+"/"+r.deletedCount+"/"+COLL.countDocuments({}))'
 
 echo
+fi
+if inpart 3; then
 echo "== indexes =="
 reseed
 same 'createIndex()' 'print(COLL.createIndex({f:1},{name:"conf_f"}))'
@@ -826,6 +838,7 @@ chk "a \$group over the archive buckets the way the caller asked" \
     "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$OUTS.find({},{_id:1,n:1}).sort({_id:1}).toArray()))")"
 
 stopDaemons
+fi
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

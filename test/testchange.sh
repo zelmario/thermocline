@@ -85,6 +85,33 @@ waitMirrored() {
 # sweep it failed "a lookup is answered from the archive" once, with the wire
 # showing the update delivered to mongosh. With a start option that call is
 # skipped, and the watcher still sees everything from the moment it opened.
+# The watcher runs in its own client and writes what it saw to a file, because
+# a change stream has to already be open when the eviction happens. Its pid is
+# waited on by name: a bare wait here would also wait for the feeder and the
+# router, which are background jobs of this shell and never exit.
+# Wait for a watcher to say what it saw, not for a fixed number of seconds.
+#
+# Each watcher prints exactly once, at the end. Killing it on a deadline instead
+# means that under load it is killed mid-flight and the file is empty, and an
+# empty answer is not a wrong answer, it is no answer: the third watcher failed
+# a parallel sweep that way while passing every run on its own.
+awaitWatcher() { # awaitWatcher FILE PID
+  for _ in $(seq 1 240); do
+    [ -s "$1" ] && break
+    kill -0 "$2" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill "$2" 2>/dev/null
+  [ -s "$1" ] || echo "  the watcher never reported, so the check below is about the fixture" >&2
+  tail -1 "$1" 2>/dev/null
+}
+
+# PART=n runs the setup and then only part n of this suite, so a sweep can run
+# its parts on separate workers at once; unset, the whole suite runs as always.
+# psweep.sh names a part as suite@n. A helper a later part calls is defined
+# above the setup, not in the part that first needs it.
+inpart() { [ -z "${PART:-}" ] || [ "$PART" = "$1" ]; }
+
 echo "== setup =="
 stopDaemons
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
@@ -92,6 +119,7 @@ C "db.getSiblingDB(process.env.TC_DB).$NS.drop(); db.getSiblingDB(process.env.TC
 startFeeder
 startRouter
 
+if inpart 1; then
 echo "== a change stream can be opened at all =="
 # Two hours old, so the evictor's forty minute rule will take them later.
 OPENED=$(R "
@@ -158,27 +186,6 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$not:{\$type:'object
 OID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 771)
 R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID'), v:'old'})" >/dev/null
 waitMirrored 1
-
-# The watcher runs in its own client and writes what it saw to a file, because
-# a change stream has to already be open when the eviction happens. Its pid is
-# waited on by name: a bare wait here would also wait for the feeder and the
-# router, which are background jobs of this shell and never exit.
-# Wait for a watcher to say what it saw, not for a fixed number of seconds.
-#
-# Each watcher prints exactly once, at the end. Killing it on a deadline instead
-# means that under load it is killed mid-flight and the file is empty, and an
-# empty answer is not a wrong answer, it is no answer: the third watcher failed
-# a parallel sweep that way while passing every run on its own.
-awaitWatcher() { # awaitWatcher FILE PID
-  for _ in $(seq 1 240); do
-    [ -s "$1" ] && break
-    kill -0 "$2" 2>/dev/null || break
-    sleep 0.5
-  done
-  kill "$2" 2>/dev/null
-  [ -s "$1" ] || echo "  the watcher never reported, so the check below is about the fixture" >&2
-  tail -1 "$1" 2>/dev/null
-}
 
 rm -f /tmp/cs_events.txt
 mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
@@ -510,6 +517,8 @@ echo "  the watcher saw: ${LOOKUP:-nothing}"
 chk "a lookup is answered from the archive"            "HAS looked up" "$LOOKUP"
 startFeeder
 
+fi
+if inpart 2; then
 echo "== the same two events, read by a consumer that is behind =="
 # Both suppressions are decided when the events are handed over, not when they
 # happened. An application that stores its resume token and comes back to it,
@@ -587,6 +596,8 @@ chk "the second late watcher was actually watching"    "true" \
 chk "a copy-up read late is not an insert"             "true" \
     "$(echo "${LATE2:-none}" | grep -q "insert:\"$OID4\"" && echo false || echo true)"
 
+fi
+if inpart 3; then
 echo "== a change stream on the whole database =="
 # db.watch() sends aggregate: 1 rather than a collection name, so it carried no
 # namespace to match against the configuration, was never registered for
@@ -1116,6 +1127,7 @@ C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null 2>&1
 LEFT=$(( $(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")        + $(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))") ))
 chk "this suite left nothing of $NS on either tier"     "0" "$LEFT"
 
+fi
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"

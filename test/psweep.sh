@@ -39,7 +39,10 @@
 #
 # Then check nothing survived, because each of those can miss:
 #   pgrep -af "[t]est|[c]line" ; ss -ltn | grep 272
-WORKERS=${WORKERS:-4}
+# Eight, measured on the Docker box (20 threads) on 2026-10-23 with the suites
+# in parts: 21m at four workers in the old order, 17m at six, 15m at eight. The
+# box is saturated from six on (load 19-21), so more buys little.
+WORKERS=${WORKERS:-8}
 # How long one suite may take before it is killed and reported as a failure.
 #
 # This was 25m when testconform took about seven. Both it and testkeys grew past
@@ -50,12 +53,22 @@ WORKERS=${WORKERS:-4}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-45m}
 OUT=${OUT:-/root/psweep}
 SHARED=${SHARED:-/root/cline.yaml}
-SUITES=${SUITES:-"testconform testfuzz testauthterm testkeys testtxn testconcerns
-        testall testrouter testops testedge testlife testchange testquery
-        testddl testcache testfresh testaggwrite testexplain testindexes
-        testmerge testecho testunack testupsert testsingle testauth testbulk
-        testreadpref testreadprefterm testtypes testbson testwarm testevict
-        testdaemonmetrics testretry testpool testnotice"}
+# Longest first, by the times of a four-worker sweep on 2026-10-23, so the last
+# suite to start is a short one. When the order was by topic, testchange
+# started ten minutes in and alone took the last eleven.
+#
+# suite@n is part n of a suite that runs in parts (PART=n, see inpart() in the
+# suite). The four longest were split where their own section times said, so
+# no one piece holds a worker much past four minutes: testchange was 665s,
+# testconform 463s, testkeys 355s and testindexes 280s.
+SUITES=${SUITES:-"testchange@3 testfuzz testchange@1 testrouter testquery
+        testchange@2 testkeys@2 testkeys@1 testlife testaggwrite testwarm
+        testconform@2 testconform@1 testfresh testevict testindexes@1
+        testindexes@2 testconform@3 testunack testbson testops testcache
+        testall testnotice testtxn testedge testsingle testddl testecho
+        testconcerns testmerge testtypes testauthterm testauth
+        testreadprefterm testexplain testreadpref testdaemonmetrics testbulk
+        testpool testupsert testretry"}
 
 # CACHE=1 runs the whole sweep with the query cache on.
 #
@@ -153,12 +166,22 @@ worker() {
   bash /root/mkworker.sh "$SHARED" "$WDIR/cline.yaml" || {
     echo "worker $n: could not write its config" >> "$OUT/summary.txt"; return 1; }
 
-  local s start secs rc line
+  local s f part start secs rc line
   while :; do
     s=$(claim)
     [ -z "$s" ] && break
-    [ -f "/root/$s.sh" ] || { printf '%-18s MISSING\n' "$s" >> "$OUT/summary.txt"; continue; }
+    f=${s%@*}
+    part=""; [ "$f" != "$s" ] && part=${s#*@}
+    [ -f "/root/$f.sh" ] || { printf '%-18s MISSING\n' "$s" >> "$OUT/summary.txt"; continue; }
     start=$(date +%s)
+    # COVER=1 is for a sweep run with a coverage binary installed (go build
+    # -cover -covermode=atomic): each suite's daemons and commands write their counters to a
+    # directory of its own, which test/mkcovmap.sh turns into the map
+    # test/suitepick reads to pick the suites a change reaches.
+    if [ "${COVER:-0}" = "1" ]; then
+      export GOCOVERDIR="$OUT/cov/$s"
+      mkdir -p "$GOCOVERDIR"
+    fi
     # Bounded, because a suite that hangs used to stall the whole sweep and
     # there is nothing to read while it does: no failure, no output, just a
     # worker that never claims again. Twice in one day a run was lost to one
@@ -169,15 +192,36 @@ worker() {
     # which is what makes it visible. The bound is generous next to the longest
     # suite, which is testconform at about seven minutes, so reaching it means
     # something is wrong rather than slow.
-    timeout --kill-after=30s "$SUITE_TIMEOUT" bash "/root/$s.sh" > "$OUT/$s.log" 2>&1
+    # A part carries its name as an argument, which the suite ignores, so the
+    # pkill below can tell testchange@2 from testchange@3 on another worker.
+    PART=$part timeout --kill-after=30s "$SUITE_TIMEOUT" bash "/root/$f.sh" ${part:+"@$part"} > "$OUT/$s.log" 2>&1 &
+    local spid=$!
+    # When each section started, for deciding where a long suite splits. Read
+    # from the log every two seconds rather than by piping the suite through a
+    # timestamper: a pipe would wait for every background process that inherited
+    # the suite's stdout, and a file does not.
+    local seen=0 now cnt
+    : > "$OUT/$s.times"
+    while kill -0 "$spid" 2>/dev/null; do
+      cnt=$(grep -c '^== ' "$OUT/$s.log" 2>/dev/null)
+      if [ "${cnt:-0}" -gt "$seen" ]; then
+        now=$(( $(date +%s) - start ))
+        grep '^== ' "$OUT/$s.log" | sed -n "$((seen + 1)),${cnt}p" |
+          while IFS= read -r l; do printf '%5ss %s\n' "$now" "$l"; done >> "$OUT/$s.times"
+        seen=$cnt
+      fi
+      sleep 2
+    done
+    wait "$spid"
     rc=$?
+    printf '%5ss == end ==\n' "$(( $(date +%s) - start ))" >> "$OUT/$s.times"
     secs=$(( $(date +%s) - start ))
     line=$(grep -E '^PASS [0-9]+ +FAIL [0-9]+' "$OUT/$s.log" | tail -1)
     if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
       line="TIMED OUT after ${SUITE_TIMEOUT}, killed. ${line:-no tally}"
       # Whatever it left running is this worker's to clear, and the cleanup
       # below only reaches daemons. A shell it was waiting on outlives it.
-      pkill -f "bash /root/$s.sh" 2>/dev/null
+      pkill -f "bash /root/$f.sh${part:+ @$part}" 2>/dev/null
     fi
     [ -z "$line" ] && line="(no tally, rc=$rc)"
     # A failed suite keeps its daemons' logs. They live in the worker's own
