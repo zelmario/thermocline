@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/logo.png" alt="Thermocline" width="200"></p>
+
 # Thermocline
 
 Storage tiering for MongoDB. Run a small fast cluster holding what people
