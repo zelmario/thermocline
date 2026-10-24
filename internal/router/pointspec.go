@@ -161,6 +161,7 @@ func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string)
 		return
 	}
 	budget := maxTimeBudget(cmd)
+	arrived := c.cmdStarted
 	spec := &pointSpec{ns: ns, id: id, from: from, early: early,
 		earlyDone: make(chan bool, 1), done: make(chan specResult, 1)}
 	c.r.Stats.PointReadsSpeculated.Add(1)
@@ -177,6 +178,9 @@ func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string)
 			defer cancel()
 		}
 		var res specResult
+		ts := time.Now()
+		c.r.Metrics.RecordStage(stagePointSpecStart, ts.Sub(arrived))
+		defer func() { c.r.Metrics.RecordStage(stagePointSpecRead, time.Since(ts)) }()
 		cur, err := c.r.cold.Database(db).RunCommandCursor(actx, withRemainingTime(rewritten, budget, 0))
 		if err == nil {
 			res.batch, res.more, err = readBatch(actx, cur, batchSize)

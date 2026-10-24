@@ -176,7 +176,8 @@ func (m *Metrics) Record(cls Class, d time.Duration) {
 // stageNames are the parts of a read timed on their own, so a latency can be
 // split into what each tier and step cost. See RecordStage.
 var stageNames = [...]string{"merge_total", "merge_archive", "fam_match", "fam_hold", "fam_copyup",
-	"point_total", "point_fast", "point_prep", "point_archive", "point_check"}
+	"point_total", "point_fast", "point_prep", "point_archive", "point_check",
+	"point_spec_start", "point_spec_read"}
 
 // RecordStage adds one timing of stage i, an index into stageNames.
 func (m *Metrics) RecordStage(i int, d time.Duration) {
@@ -209,6 +210,10 @@ const (
 	stagePointPrep
 	stagePointArchive
 	stagePointCheck
+	// A point read's archive read asked ahead (pointspec.go): from the
+	// command's arrival to the read being sent, and the read itself.
+	stagePointSpecStart
+	stagePointSpecRead
 )
 
 func (m *Metrics) RecordWait(d time.Duration) {

@@ -2,16 +2,15 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
-	"github.com/zelmario/thermocline/internal/livecache"
 )
 
 // The merged read, the unwaited point read and the live cache's merged fill
@@ -24,12 +23,21 @@ import (
 // and the fast tier's primary went from 128% to 158% CPU against the run that
 // waited instead.
 //
-// The tracker keeps the same answer in memory. A change stream on the fast
-// tier carries every update, replace and delete of a tiered namespace, by _id
-// and cluster time, and every command that could hide one. A question about a
-// window it has seen to the end of is answered here, with no round trip. One
-// it has not, because the stream is behind the read or the window starts
-// before the tracker could see, still goes to the oplog.
+// The tracker keeps the same answer in memory. It reads the fast tier's oplog
+// as it is written, every update and delete of a tiered namespace by _id and
+// every command that could hide one. A question about a window it has read to
+// the end of is answered here, with no round trip. One it has not, because
+// the read is ahead of it or the window starts before the tracker could see,
+// still goes to the oplog.
+//
+// It followed a change stream, which hands out only what a majority has
+// written. On the Docker test server at 1,000 writes a second an insert
+// reached a change stream 20.7ms after it was acknowledged at the median,
+// and a tailable read of the oplog 0.07ms after (p99 46ms against 0.73ms).
+// Every read checks a window ending at the fast tier's reply, so the stream
+// was behind almost every one: 1,293 of 5,435 checks answered in memory in a
+// two minute store run. Seeing an entry a majority may yet roll back only
+// makes a check refuse when it need not.
 //
 // What it records is what the oplog check counts: updates and deletes by _id,
 // compared the way mongod's _id index compares (idKey), and anything else that
@@ -64,7 +72,10 @@ type touchTracker struct {
 	// dels is the latest delete of any document, per namespace. See
 	// deletedSince.
 	dels map[string]uint64
-	n    int
+	// all is the latest entry that may have touched anything, such as a
+	// prepared transaction's commit. See touchCommand.
+	all uint64
+	n   int
 }
 
 func newTouchTracker() *touchTracker {
@@ -200,7 +211,7 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 		return false, bson.Timestamp{}, false
 	}
 	db, _ := splitNS(ns)
-	if t.ns[ns] > f || t.db[db] > f {
+	if t.ns[ns] > f || t.db[db] > f || t.all > f {
 		return true, bson.Timestamp{}, true
 	}
 	m := t.ids[ns]
@@ -225,6 +236,15 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 	return false, rest, true
 }
 
+// touchAll records an entry that may have changed any document.
+func (t *touchTracker) touchAll(at uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.start != 0 && at > t.all {
+		t.all = at
+	}
+}
+
 // deletedSince says whether any document of ns was deleted after from, for a
 // window ask has said it knows. It is never forgotten, so it can only say yes
 // too often.
@@ -234,7 +254,8 @@ func (t *touchTracker) deletedSince(ns string, from bson.Timestamp) bool {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.dels[ns] > checkpoint.PackTS(from)
+	f := checkpoint.PackTS(from)
+	return t.dels[ns] > f || t.all > f
 }
 
 // covered is how far what the tracker holds covers a window starting at from,
@@ -275,13 +296,13 @@ func (r *Router) followTouches(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		// A stream that ended may have missed events: start again knowing
+		// A read that ended may have missed entries: start again knowing
 		// nothing, so nothing is answered from a gap.
 		r.touches.mu.Lock()
-		r.touches.applied, r.touches.start, r.touches.horizon = 0, 0, 0
+		r.touches.applied, r.touches.start, r.touches.horizon, r.touches.all = 0, 0, 0, 0
 		r.touches.ids, r.touches.ns, r.touches.db, r.touches.n = map[string]map[string]touchMark{}, map[string]uint64{}, map[string]uint64{}, 0
 		r.touches.mu.Unlock()
-		r.log.Warn("the stream that answers the oplog check in memory stopped, starting it again",
+		r.log.Warn("the oplog read that answers the oplog check in memory stopped, starting it again",
 			"err", err, "meanwhile", "merged reads ask the oplog, as they did before")
 		select {
 		case <-ctx.Done():
@@ -292,85 +313,180 @@ func (r *Router) followTouches(ctx context.Context) {
 }
 
 func (r *Router) followTouchesOnce(ctx context.Context) error {
-	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.D{{Key: "operationType", Value: bson.D{{Key: "$ne", Value: "insert"}}}}}},
-		{{Key: "$project", Value: bson.D{
-			{Key: "operationType", Value: 1}, {Key: "ns", Value: 1}, {Key: "to", Value: 1}, {Key: "documentKey._id", Value: 1}, {Key: "clusterTime", Value: 1}, {Key: "txnNumber", Value: 1},
-		}}},
-	}
-	opts := options.ChangeStream().SetMaxAwaitTime(5 * time.Millisecond).SetShowExpandedEvents(true)
+	oplog := r.hot.Database("local", options.Database().SetReadPreference(readpref.Primary())).Collection("oplog.rs")
 	// From a retention ago rather than from now. The window a read asks about
 	// starts at the feeder's position, which on an idle feeder stands still
 	// and can be well before this router started: opened at now, the tracker
-	// could say nothing about it.
-	var from *bson.Timestamp
-	if now, ok := r.fastTierClock(ctx); ok && now.T > uint32(touchRetention/time.Second) {
-		from = &bson.Timestamp{T: now.T - uint32(touchRetention/time.Second)}
-		opts.SetStartAtOperationTime(from)
+	// could say nothing about it. An oplog that does not reach that far back
+	// is read from its first entry.
+	var first, last struct {
+		TS bson.Timestamp `bson:"ts"`
 	}
-	cs, err := r.hot.Watch(ctx, pipeline, opts)
-	if err != nil && from != nil {
-		// An oplog that does not reach that far back: from now, then.
-		from = nil
-		cs, err = r.hot.Watch(ctx, pipeline, options.ChangeStream().SetMaxAwaitTime(5*time.Millisecond).SetShowExpandedEvents(true))
+	tsOnly := bson.D{{Key: "ts", Value: 1}}
+	if err := oplog.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: 1}}).SetProjection(tsOnly)).Decode(&first); err != nil {
+		return err
 	}
+	if err := oplog.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: -1}}).SetProjection(tsOnly)).Decode(&last); err != nil {
+		return err
+	}
+	from := first.TS
+	if keep := uint32(touchRetention / time.Second); last.TS.T > keep && last.TS.T-keep > from.T {
+		from = bson.Timestamp{T: last.TS.T - keep}
+	}
+	// Every entry is read, inserts and no-ops too, so the position moves with
+	// the oplog. What is kept of one is what the check needs: the _id an
+	// update or delete names, the operations of an applyOps by _id alone,
+	// and a command whole.
+	ifID := func(prefix string) bson.D {
+		return bson.D{{Key: "$ifNull", Value: bson.A{prefix + "o2._id", prefix + "o._id"}}}
+	}
+	proj := bson.D{
+		{Key: "_id", Value: 0}, {Key: "ts", Value: 1}, {Key: "op", Value: 1}, {Key: "ns", Value: 1},
+		{Key: "id", Value: ifID("$")},
+		{Key: "c", Value: bson.D{{Key: "$cond", Value: bson.A{
+			bson.D{{Key: "$eq", Value: bson.A{"$op", "c"}}},
+			bson.D{{Key: "$cond", Value: bson.A{
+				bson.D{{Key: "$isArray", Value: "$o.applyOps"}},
+				bson.D{{Key: "applyOps", Value: bson.D{{Key: "$map", Value: bson.D{
+					{Key: "input", Value: "$o.applyOps"},
+					{Key: "in", Value: bson.D{{Key: "op", Value: "$$this.op"}, {Key: "ns", Value: "$$this.ns"}, {Key: "id", Value: ifID("$$this.")}}},
+				}}}}},
+				"$o",
+			}}},
+			"$$REMOVE",
+		}}}},
+	}
+	cur, err := oplog.Find(ctx, bson.D{{Key: "ts", Value: bson.D{{Key: "$gt", Value: from}}}},
+		options.Find().SetCursorType(options.TailableAwait).SetMaxAwaitTime(5*time.Millisecond).SetProjection(proj))
 	if err != nil {
 		return err
 	}
-	if from != nil {
-		// Every event after it is on its way, so a window from it is known
-		// once the stream has been read to the window's end.
-		r.touches.startAt(checkpoint.PackTS(*from))
-	}
-	defer func() { _ = cs.Close(context.WithoutCancel(ctx)) }()
-	for {
-		if cs.TryNext(ctx) {
-			var ev struct {
-				Op string `bson:"operationType"`
-				NS struct {
-					DB   string `bson:"db"`
-					Coll string `bson:"coll"`
-				} `bson:"ns"`
-				To struct {
-					DB   string `bson:"db"`
-					Coll string `bson:"coll"`
-				} `bson:"to"`
-				Key struct {
-					ID bson.RawValue `bson:"_id"`
-				} `bson:"documentKey"`
-				At  bson.Timestamp `bson:"clusterTime"`
-				Txn *int64         `bson:"txnNumber"`
-			}
-			if err := cs.Decode(&ev); err != nil {
-				return err
-			}
-			// A rename onto a tiered namespace names the source, which may
-			// not be tiered.
-			if ev.To.Coll != "" && r.cfg.Manages(ev.To.DB+"."+ev.To.Coll) {
-				r.touches.touch(ev.Op, ev.To.DB, ev.To.Coll, bson.RawValue{}, checkpoint.PackTS(ev.At))
-			}
-			if ev.NS.Coll == "" || r.cfg.Manages(ev.NS.DB+"."+ev.NS.Coll) {
-				id := ev.Key.ID
-				id.Value = append([]byte(nil), id.Value...)
-				r.touches.touch(ev.Op, ev.NS.DB, ev.NS.Coll, id, checkpoint.PackTS(ev.At))
-			}
-			if cs.RemainingBatchLength() == 0 {
-				r.touches.advance(checkpoint.PackTS(ev.At), ev.Txn == nil)
-				if at, ok := livecache.TokenTime(cs.ResumeToken()); ok {
-					r.touches.advance(checkpoint.PackTS(at), false)
-				}
-			}
-			continue
-		}
-		if err := cs.Err(); err != nil {
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	// Every entry after from is on its way, so a window from it is known once
+	// the oplog has been read to the window's end.
+	r.touches.startAt(checkpoint.PackTS(from))
+	for cur.Next(ctx) {
+		var e oplogTouch
+		if err := cur.Decode(&e); err != nil {
 			return err
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		at := checkpoint.PackTS(e.TS)
+		switch e.Op {
+		case "u", "d":
+			r.touchOne(e.Op, e.NS, e.ID, at)
+		case "c":
+			r.touchCommand(e.NS, e.C, at)
 		}
-		if at, ok := livecache.TokenTime(cs.ResumeToken()); ok {
-			r.touches.advance(checkpoint.PackTS(at), false)
+		if cur.RemainingBatchLength() == 0 {
+			// Each entry has a time of its own, and a forward read of the
+			// oplog returns none past a hole, so everything through this
+			// one has been seen.
+			r.touches.advance(at, true)
 		}
+	}
+	if err := cur.Err(); err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return errors.New("the oplog cursor ended, the oplog may have rolled past it")
+}
+
+// oplogTouch is one oplog entry as followTouchesOnce reads it.
+type oplogTouch struct {
+	TS bson.Timestamp `bson:"ts"`
+	Op string         `bson:"op"`
+	NS string         `bson:"ns"`
+	ID bson.RawValue  `bson:"id"`
+	C  bson.Raw       `bson:"c"`
+}
+
+// touchOne records an update or delete of one document, of a tiered
+// namespace only.
+func (r *Router) touchOne(op, ns string, id bson.RawValue, at uint64) {
+	if !r.cfg.Manages(ns) {
+		return
+	}
+	db, coll := splitNS(ns)
+	if id.Type == 0 || id.Type == bson.TypeNull {
+		// Not known which document: the namespace.
+		r.touches.touch("modify", db, coll, bson.RawValue{}, at)
+		return
+	}
+	id.Value = append([]byte(nil), id.Value...)
+	if op == "d" {
+		r.touches.touch("delete", db, coll, id, at)
+		return
+	}
+	r.touches.touch("update", db, coll, id, at)
+}
+
+// touchCommand records a command entry, as oplogWindow counts one: an applyOps
+// by its operations, DDL on a tiered collection as touching all of it, DDL
+// whose collection cannot be told as touching its database, and anything else
+// on admin, a prepared transaction's commit above all, as touching everything:
+// a prepared transaction's operations carry the time it was prepared, and take
+// effect at its commit.
+func (r *Router) touchCommand(ns string, c bson.Raw, at uint64) {
+	db, _ := splitNS(ns)
+	if ops, ok := c.Lookup("applyOps").ArrayOK(); ok {
+		vals, err := ops.Values()
+		if err != nil {
+			r.touches.touchAll(at)
+			return
+		}
+		for _, v := range vals {
+			d, ok := v.DocumentOK()
+			if !ok {
+				r.touches.touchAll(at)
+				return
+			}
+			op, _ := d.Lookup("op").StringValueOK()
+			ins, _ := d.Lookup("ns").StringValueOK()
+			switch op {
+			case "i", "n":
+			case "u", "d":
+				r.touchOne(op, ins, d.Lookup("id"), at)
+			default:
+				idb, _ := splitNS(ins)
+				r.touches.touch("modify", idb, "", bson.RawValue{}, at)
+			}
+		}
+		return
+	}
+	if db == "admin" {
+		r.touches.touchAll(at)
+		return
+	}
+	elems, err := c.Elements()
+	if err != nil || len(elems) == 0 {
+		r.touches.touch("modify", db, "", bson.RawValue{}, at)
+		return
+	}
+	name, v := elems[0].Key(), elems[0].Value()
+	if name == "renameCollection" {
+		src, _ := v.StringValueOK()
+		dst, _ := c.Lookup("to").StringValueOK()
+		for _, n := range []string{src, dst} {
+			if n == "" {
+				r.touches.touch("modify", db, "", bson.RawValue{}, at)
+				return
+			}
+			if r.cfg.Manages(n) {
+				ndb, ncoll := splitNS(n)
+				r.touches.touch("modify", ndb, ncoll, bson.RawValue{}, at)
+			}
+		}
+		return
+	}
+	coll, ok := v.StringValueOK()
+	if !ok || name == "dropDatabase" {
+		r.touches.touch("modify", db, "", bson.RawValue{}, at)
+		return
+	}
+	if r.cfg.Manages(db + "." + coll) {
+		r.touches.touch("modify", db, coll, bson.RawValue{}, at)
 	}
 }
 
