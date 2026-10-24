@@ -808,6 +808,30 @@ other one looking like real lag: a host thirty seconds ahead of its feeder
 graphed thirty seconds of mirroring lag on a deployment where nothing was
 behind, and that is the number the alert rules watch.
 
+**A read waits for the newest write it can see, not for the present.** Both bars
+above wait for mirroring to reach the instant the read began, and on a fast tier
+that takes writes all the time that is the whole of mirroring's lag on every
+such read. Measured on the Docker test server with the shop at 2,000 operations
+a second, a write reached a change stream in 7.3 ms at the median, the archive
+in 9.7 ms and the published position in 11.5 ms. The sales report answered from
+the archive took 18.8 ms at the median against 4.6 ms on the cluster alone.
+
+Most of what it waited for were writes it could not see. So the router first
+asks the fast tier's primary for `hello`'s `lastWrite`, an oplog position at or
+after every write acknowledged to anyone, through this router or not. It waits
+for its own tail of the fast tier's oplog to read that far, a fraction of a
+millisecond, and takes the newest write that tail saw in the read's database. A
+position at or past that write is enough, and the bars above are not consulted.
+A database rather than a collection, because a pipeline's `$lookup` and
+`$unionWith` and a view's definition name collections of their own database
+only. When any step cannot be had the read clears the two bars as before.
+
+| | sales report, p50 | barrier wait, mean |
+|---|---|---|
+| waiting for the present | 18.8 ms | 22.5 ms |
+| waiting for the newest write | 5.8 ms | 4.1 ms (p50 0.5 ms) |
+| the cluster alone | 4.6 ms | |
+
 **Liveness is decided by watching, not by subtracting.** A feeder that has
 stopped leaves its last position behind, and a router that read that as
 "mirroring is a little behind" would make every fallback read wait the whole
