@@ -26,6 +26,9 @@ type Cache struct {
 	lru      *list.List
 
 	entries map[string]*entry
+	// groups holds the entries of shapes with a range, by group key, so a
+	// document's values find every entry it may belong to. See groupKey.
+	groups map[string]map[*entry]struct{}
 	// shapes are every shape asked for, per namespace, which is what an
 	// incoming change is applied against.
 	shapes map[string]map[string]*shape
@@ -129,7 +132,10 @@ type shape struct {
 	kind   Kind
 	ns     string
 	fields []string
-	sort   []SortKey
+	// rng are the shape's range fields and operators, the bounds being each
+	// entry's own.
+	rng  []RangePred
+	sort []SortKey
 	// proj is the projection every query of the shape asks for, which is
 	// what its entries keep of a document. See trimDoc.
 	proj Projection
@@ -154,6 +160,11 @@ func trimDoc(sh *shape, d bson.Raw) bson.Raw {
 		}
 		for _, f := range sh.fields {
 			if f == k {
+				return true
+			}
+		}
+		for _, r := range sh.rng {
+			if r.Field == k {
 				return true
 			}
 		}
@@ -191,6 +202,10 @@ func trimDoc(sh *shape, d bson.Raw) bson.Raw {
 type entry struct {
 	key   string
 	shape *shape
+	// group is the entry's group key, and bounds its range, for a shape with
+	// one. See groupKey.
+	group  string
+	bounds []RangePred
 	// docs is the sorted head of the list, complete says it is the whole of
 	// it. For a count, n is the count.
 	docs     []doc
@@ -227,6 +242,7 @@ func New(maxBytes int) *Cache {
 		maxBytes:     maxBytes,
 		lru:          list.New(),
 		entries:      map[string]*entry{},
+		groups:       map[string]map[*entry]struct{}{},
 		shapes:       map[string]map[string]*shape{},
 		rev:          map[string]map[*entry]struct{}{},
 		refused:      map[string]bool{},
@@ -381,7 +397,7 @@ func (c *Cache) NoteWrites(notes []WriteNote, at bson.Timestamp) {
 		shapes := c.shapes[n.NS]
 		whole := false
 		for _, sh := range shapes {
-			if touches(n.Fields, sh.fields) || touches(n.Fields, sortFields(sh)) {
+			if touches(n.Fields, filterFields(sh)) || touches(n.Fields, sortFields(sh)) {
 				whole = true
 			}
 		}
@@ -410,6 +426,18 @@ func (c *Cache) NoteWrites(notes []WriteNote, at bson.Timestamp) {
 			}
 		}
 	}
+}
+
+// filterFields are the fields a shape filters by, equality and range.
+func filterFields(sh *shape) []string {
+	if len(sh.rng) == 0 {
+		return sh.fields
+	}
+	out := append([]string(nil), sh.fields...)
+	for _, r := range sh.rng {
+		out = append(out, r.Field)
+	}
+	return out
 }
 
 func sortFields(sh *shape) []string {
@@ -504,6 +532,10 @@ func (c *Cache) entryFresh(e *entry, q Query, now time.Time) bool {
 	if !c.fresh(c.pendingEntry, e.key, now) {
 		return false
 	}
+	// An insert is noted against the group, not knowing which bounds hold it.
+	if e.group != e.key && !c.fresh(c.pendingEntry, e.group, now) {
+		return false
+	}
 	if e.shape.kind == KindCount {
 		return c.fresh(c.pendingCount, e.shape.ns, now)
 	}
@@ -522,6 +554,12 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	key := q.entryKey()
 	c.mu.Lock()
 	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
+		c.mu.Unlock()
+		return nil, false
+	}
+	// A range on a tiered namespace is not filled: the proof and the merge
+	// that complete a tiered entry are built for equalities. See proveFill.
+	if len(q.Ranges) > 0 && c.isTiered(q.NS) {
 		c.mu.Unlock()
 		return nil, false
 	}
@@ -734,7 +772,7 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	if old, ok := c.entries[key]; ok {
 		c.drop(old)
 	}
-	e := &entry{key: key, shape: sh, complete: complete, n: n}
+	e := &entry{key: key, shape: sh, complete: complete, n: n, group: q.groupKey(), bounds: q.Ranges}
 	if c.isTiered(q.NS) {
 		e.expires = c.now().Add(tieredTTL)
 	}
@@ -752,6 +790,14 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	}
 	e.bytes += len(key) + 64
 	c.entries[key] = e
+	if len(sh.rng) > 0 {
+		g := c.groups[e.group]
+		if g == nil {
+			g = map[*entry]struct{}{}
+			c.groups[e.group] = g
+		}
+		g[e] = struct{}{}
+	}
 	for _, d := range e.docs {
 		c.addRev(d.id, e)
 	}
@@ -777,6 +823,9 @@ func (c *Cache) shapeFor(q Query) *shape {
 	}
 	for _, p := range q.Eq {
 		s.fields = append(s.fields, p.Field)
+	}
+	for _, r := range q.Ranges {
+		s.rng = append(s.rng, RangePred{Field: r.Field, Op: r.Op})
 	}
 	m[id] = s
 	return s
@@ -817,7 +866,66 @@ func (c *Cache) plainMatch(sh *shape, q Query, d bson.Raw) bool {
 			return false
 		}
 	}
+	for _, r := range q.Ranges {
+		v, err := d.LookupErr(r.Field)
+		if err != nil {
+			c.refuse(sh)
+			return false
+		}
+		if _, ok := valueKey(v); !ok || !r.inRange(v) {
+			c.refuse(sh)
+			return false
+		}
+	}
 	return true
+}
+
+// rangeValues are a document's values for a shape's range fields, in the
+// order of its bounds, with Type 0 for a missing field, which mongod's range
+// never matches. ok false means a value this cannot judge, an array above all,
+// and the shape is refused, as keyOf refuses it for an equality. Read once per
+// change and shape, not once per entry: see compareNumbers.
+func (c *Cache) rangeValues(sh *shape, d bson.Raw) ([]bson.RawValue, bool) {
+	out := make([]bson.RawValue, len(sh.rng))
+	for i, r := range sh.rng {
+		v, err := d.LookupErr(r.Field)
+		if err != nil {
+			continue
+		}
+		if bracket(v) == "" {
+			c.refuse(sh)
+			return nil, false
+		}
+		out[i] = v
+	}
+	return out, true
+}
+
+// inBounds says whether values, from rangeValues, satisfy an entry's range.
+func inBounds(bounds []RangePred, values []bson.RawValue) bool {
+	for i, r := range bounds {
+		if values[i].Type == 0 || !r.inRange(values[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// candidates are the entries a document whose values give key may belong to
+// under a shape. Called with mu held.
+func (c *Cache) candidates(sh *shape, key string) []*entry {
+	if len(sh.rng) == 0 {
+		if e, ok := c.entries[key]; ok {
+			return []*entry{e}
+		}
+		return nil
+	}
+	g := c.groups[key]
+	out := make([]*entry, 0, len(g))
+	for e := range g {
+		out = append(out, e)
+	}
+	return out
 }
 
 func (c *Cache) refuse(sh *shape) {
@@ -864,6 +972,12 @@ func (c *Cache) drop(e *entry) {
 		return
 	}
 	delete(c.entries, e.key)
+	if g := c.groups[e.group]; g != nil {
+		delete(g, e)
+		if len(g) == 0 {
+			delete(c.groups, e.group)
+		}
+	}
 	for _, d := range e.docs {
 		c.delRev(d.id, e)
 	}
@@ -951,7 +1065,7 @@ func (c *Cache) Apply(ch Change) {
 		c.dropCounts(ch.NS)
 	case "update":
 		for _, sh := range shapes {
-			if sh.kind == KindCount && touches(ch.Updated, sh.fields) {
+			if sh.kind == KindCount && touches(ch.Updated, filterFields(sh)) {
 				for _, e := range c.entries {
 					if e.shape == sh {
 						c.drop(e)
@@ -968,20 +1082,29 @@ func (c *Cache) Apply(ch Change) {
 		if !ok {
 			continue
 		}
-		e, have := c.entries[key]
-		if !have {
+		values, ok := c.rangeValues(sh, ch.Doc)
+		if !ok {
 			continue
 		}
-		if sh.kind == KindCount {
-			if ch.Op == "insert" {
-				e.n++
+		for _, e := range c.candidates(sh, key) {
+			if _, live := c.entries[e.key]; !live {
+				// Refused, and so dropped, by an earlier candidate.
+				break
 			}
-			continue
+			if !inBounds(e.bounds, values) {
+				continue
+			}
+			if sh.kind == KindCount {
+				if ch.Op == "insert" {
+					e.n++
+				}
+				continue
+			}
+			if !c.fits(sh, e, ch.Doc) {
+				break
+			}
+			c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 		}
-		if !c.fits(sh, e, ch.Doc) {
-			continue
-		}
-		c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 	}
 	c.evict()
 }

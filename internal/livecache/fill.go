@@ -241,6 +241,14 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	for _, p := range q.Eq {
 		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
 	}
+	for i := 0; i < len(q.Ranges); {
+		ops := bson.D{}
+		f := q.Ranges[i].Field
+		for ; i < len(q.Ranges) && q.Ranges[i].Field == f; i++ {
+			ops = append(ops, bson.E{Key: q.Ranges[i].Op, Value: q.Ranges[i].Value})
+		}
+		filter = append(filter, bson.E{Key: f, Value: ops})
+	}
 	db, coll := splitNS(q.NS)
 	rctx, cancel := context.WithTimeout(ctx, fillTimeout)
 	defer cancel()
@@ -470,7 +478,7 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 			c.drop(e)
 			return false
 		case "update":
-			if touches(ch.Updated, sh.fields) {
+			if touches(ch.Updated, filterFields(sh)) {
 				c.drop(e)
 				return false
 			}
@@ -480,8 +488,13 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		return true
 	}
 	key, ok := c.keyOf(sh, ch.Doc)
-	if !ok || key != e.key {
+	if !ok || key != e.group {
 		return true
+	}
+	values, ok := c.rangeValues(sh, ch.Doc)
+	if !ok || !inBounds(e.bounds, values) {
+		_, live := c.entries[e.key]
+		return live
 	}
 	if sh.kind == KindCount {
 		if ch.Op == "insert" {

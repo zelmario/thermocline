@@ -2,6 +2,7 @@ package livecache
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -217,7 +218,11 @@ func TestEqualityAsMongoJudgesIt(t *testing.T) {
 	for _, f := range []bson.D{
 		{{Key: "tags", Value: bson.A{"a"}}},
 		{{Key: "n", Value: nil}},
-		{{Key: "n", Value: bson.D{{Key: "$gt", Value: 1}}}},
+		{{Key: "n", Value: bson.D{{Key: "$ne", Value: 1}}}},
+		{{Key: "n", Value: bson.D{{Key: "$gt", Value: nil}}}},
+		{{Key: "n", Value: bson.D{{Key: "$gt", Value: bson.A{1}}}}},
+		{{Key: "n", Value: bson.D{{Key: "$gt", Value: 1}, {Key: "x", Value: 1}}}},
+		{{Key: "n", Value: bson.D{}}},
 		{{Key: "a.b", Value: 1}},
 	} {
 		if _, ok := ParseFind("s.c", raw(t, bson.D{{Key: "find", Value: "c"}, {Key: "filter", Value: f}, {Key: "limit", Value: int32(5)}})); ok {
@@ -535,3 +540,160 @@ func TestTieredFillsOnTheSecondMiss(t *testing.T) {
 		}
 	}
 }
+
+func rangeQuery(t *testing.T, cat string, lo, hi any, limit int) Query {
+	t.Helper()
+	q, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"},
+		{Key: "filter", Value: bson.D{{Key: "category", Value: cat}, {Key: "price", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lt", Value: hi}}}}},
+		{Key: "sort", Value: bson.D{{Key: "price", Value: 1}}},
+		{Key: "limit", Value: int32(limit)},
+	}))
+	if !ok {
+		t.Fatal("a price range was not understood")
+	}
+	return q
+}
+
+// A range entry takes a document whose value falls inside its bounds, lets go
+// of one that moves out, and leaves one of another type bracket alone, as
+// mongod's match does: {price: {$gte: 10}} matches no string.
+func TestRangesAsMongoJudgesThem(t *testing.T) {
+	c := New(1 << 20)
+	q := rangeQuery(t, "a", 10, 20, 5)
+	other := rangeQuery(t, "a", 20, 30, 5)
+	if q.entryKey() == other.entryKey() || q.groupKey() != other.groupKey() {
+		t.Fatal("two bounds over one category should be two entries of one group")
+	}
+	if q2 := rangeQuery(t, "a", 10.0, int64(20), 5); q2.entryKey() != q.entryKey() {
+		t.Fatal("{$gte: 10, $lt: 20} and {$gte: 10.0, $lt: NumberLong(20)} are different keys")
+	}
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 12))}, true, 0)
+	c.install(other, []bson.Raw{raw(t, product("p5", "a", 25))}, true, 0)
+	at := uint32(1)
+	apply := func(op, id string, d bson.D, upd ...string) {
+		at++
+		ch := Change{NS: "shop.products", Op: op, ID: strVal(t, id), Updated: upd, At: bson.Timestamp{T: at}}
+		if d != nil {
+			ch.Doc = raw(t, d)
+		}
+		c.Apply(ch)
+	}
+	list := func(q Query) string {
+		got, hit := c.Get(q)
+		if !hit {
+			return "miss"
+		}
+		return strings.Join(ids(t, got), ",")
+	}
+	apply("insert", "p2", product("p2", "a", 10)) // the lower bound is in
+	apply("insert", "p3", product("p3", "a", 20)) // the upper is not
+	apply("insert", "p4", product("p4", "b", 15)) // another category
+	apply("insert", "p6", bson.D{{Key: "_id", Value: "p6"}, {Key: "category", Value: "a"}, {Key: "price", Value: "15"}})
+	apply("insert", "p7", bson.D{{Key: "_id", Value: "p7"}, {Key: "category", Value: "a"}})
+	if got := list(q); got != "p2,p1" {
+		t.Fatalf("[10, 20) holds %s, want p2,p1", got)
+	}
+	if got := list(other); got != "p3,p5" {
+		t.Fatalf("[20, 30) holds %s, want p3,p5", got)
+	}
+	// A price change moves the document from one range to the other.
+	apply("update", "p1", product("p1", "a", 22), "price")
+	if got := list(q); got != "p2" {
+		t.Fatalf("[10, 20) holds %s after p1 left it, want p2", got)
+	}
+	if got := list(other); got != "p3,p1,p5" {
+		t.Fatalf("[20, 30) holds %s after p1 joined it, want p3,p1,p5", got)
+	}
+	// An array is matched by mongod element by element, which this does not
+	// reproduce: the shape goes.
+	apply("insert", "p8", bson.D{{Key: "_id", Value: "p8"}, {Key: "category", Value: "a"}, {Key: "price", Value: bson.A{15, 40}}})
+	if got := list(q); got != "miss" {
+		t.Fatalf("served %s after an array price arrived", got)
+	}
+}
+
+// A count over a range counts an insert inside it and nothing outside, and a
+// change to the bounded field drops it, as a change to a counted field does.
+func TestRangeCounts(t *testing.T) {
+	c := New(1 << 20)
+	q, ok := ParseCount("shop.products", raw(t, bson.D{
+		{Key: "count", Value: "products"},
+		{Key: "query", Value: bson.D{{Key: "price", Value: bson.D{{Key: "$gt", Value: 5}}}}},
+	}))
+	if !ok {
+		t.Fatal("a count over a range was not understood")
+	}
+	c.install(q, nil, true, 3)
+	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 6)), At: bson.Timestamp{T: 2}})
+	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 5)), At: bson.Timestamp{T: 3}})
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("miss")
+	}
+	if n := got.Lookup("n").Int32(); n != 4 {
+		t.Fatalf("count %d, want 4", n)
+	}
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 7)), Updated: []string{"price"}, At: bson.Timestamp{T: 4}})
+	if _, hit := c.Get(q); hit {
+		t.Fatal("a count survived a change to the field it bounds")
+	}
+}
+
+// An insert inside a range holds that range's entries until the stream applies
+// it, and leaves other categories alone.
+func TestRangeReadYourWrites(t *testing.T) {
+	c := New(1 << 20)
+	c.SetMaxStaleness(0)
+	q := rangeQuery(t, "a", 10, 20, 5)
+	qb := rangeQuery(t, "b", 10, 20, 5)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 12))}, true, 0)
+	c.install(qb, []bson.Raw{raw(t, product("p2", "b", 12))}, true, 0)
+	c.Advance(bson.Timestamp{T: 10})
+	c.NoteWrites([]WriteNote{{NS: "shop.products", Docs: []bson.Raw{raw(t, product("p3", "a", 15))}}}, bson.Timestamp{T: 20})
+	if _, hit := c.Get(q); hit {
+		t.Fatal("a range an inserted document belongs in was served before the stream applied it")
+	}
+	if _, hit := c.Get(qb); !hit {
+		t.Fatal("a range of another category was held back")
+	}
+	// A change to the bounded field can move a document into any range.
+	c.Advance(bson.Timestamp{T: 20})
+	c.NoteWrites([]WriteNote{{NS: "shop.products", IDs: []bson.RawValue{strVal(t, "p2")}, Fields: []string{"price"}}}, bson.Timestamp{T: 30})
+	if _, hit := c.Get(q); hit {
+		t.Fatal("a change to a bounded field held only the entries holding the document")
+	}
+}
+
+// The float64 shortcut orders numbers exactly as the big.Float comparison
+// does, at the edges where float64 rounds: 2^53 and past it, the ends of
+// int64, infinities and negative zero.
+func TestCompareNumbersIsExact(t *testing.T) {
+	val := func(v any) bson.RawValue {
+		typ, b, err := bson.MarshalValue(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bson.RawValue{Type: typ, Value: b}
+	}
+	const p53 = int64(1) << 53
+	vals := []bson.RawValue{
+		val(int32(0)), val(int32(-1)), val(int32(math.MaxInt32)), val(int32(math.MinInt32)),
+		val(int64(0)), val(p53), val(p53 + 1), val(-p53), val(-p53 - 1), val(int64(math.MaxInt64)), val(int64(math.MinInt64)),
+		val(int64(math.MaxInt64 - 1)), val(0.0), val(math.Copysign(0, -1)), val(1.5), val(-1.5),
+		val(float64(p53)), val(float64(p53) + 2), val(9.223372036854776e18), val(-9.223372036854776e18),
+		val(math.Inf(1)), val(math.Inf(-1)), val(math.MaxFloat64), val(math.SmallestNonzeroFloat64),
+	}
+	for _, a := range vals {
+		for _, b := range vals {
+			want := exactCmp(a, b)
+			if got := compareNumbers(a, b); got != want {
+				t.Errorf("compareNumbers(%v, %v) = %d, want %d", a, b, got, want)
+			}
+		}
+	}
+}
+
+// exactCmp is the comparison compareNumbers shortcuts. big.Float holds
+// infinities and orders them too.
+func exactCmp(a, b bson.RawValue) int { return exact(a).Cmp(exact(b)) }

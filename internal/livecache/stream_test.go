@@ -57,9 +57,38 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	defer stop()
 	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	// Range bounds from a short list, so the same range is asked again.
+	bound := func(r *rand.Rand) (any, any) {
+		lo := r.Intn(8) * 1000
+		if r.Intn(2) == 0 {
+			return int32(lo), float64(lo + 2500)
+		}
+		return float64(lo), int64(lo + 2500)
+	}
 	queries := func(r *rand.Rand) Query {
 		cat := fmt.Sprintf("c%02d", r.Intn(20))
-		switch r.Intn(4) {
+		switch r.Intn(7) {
+		case 4:
+			// The store's "filter by price".
+			lo, hi := bound(r)
+			q, _ := ParseFind(ns, mustRaw(bson.D{{Key: "find", Value: "products"},
+				{Key: "filter", Value: bson.D{{Key: "category", Value: cat}, {Key: "price", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: hi}}}}},
+				{Key: "sort", Value: bson.D{{Key: "price", Value: int32(1)}}}, {Key: "limit", Value: int32(10)},
+				{Key: "projection", Value: bson.D{{Key: "stock", Value: 0}}}}))
+			return q
+		case 5:
+			lo, _ := bound(r)
+			q, _ := ParseFind(ns, mustRaw(bson.D{{Key: "find", Value: "products"},
+				{Key: "filter", Value: bson.D{{Key: "price", Value: bson.D{{Key: "$gt", Value: lo}}}}},
+				{Key: "sort", Value: bson.D{{Key: "price", Value: int32(-1)}}}, {Key: "skip", Value: int32(r.Intn(2) * 10)}, {Key: "limit", Value: int32(10)}}))
+			return q
+		case 6:
+			lo, hi := bound(r)
+			q, _ := ParseCountAgg(ns, mustRaw(bson.D{{Key: "aggregate", Value: "products"}, {Key: "pipeline", Value: bson.A{
+				bson.D{{Key: "$match", Value: bson.D{{Key: "price", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lt", Value: hi}}}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}},
+				{Key: "cursor", Value: bson.D{}}}))
+			return q
 		case 0:
 			q, _ := ParseCountAgg(ns, mustRaw(bson.D{{Key: "aggregate", Value: "products"}, {Key: "pipeline", Value: bson.A{
 				bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: cat}}}},
@@ -120,7 +149,12 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 					_, err = co.InsertOne(sctx, d)
 				default:
 					note.Fields = []string{"price", "stock"}
-					p := float64(r.Intn(1_000_000)) / 100
+					var p any = float64(r.Intn(1_000_000)) / 100
+					if r.Intn(4) == 0 {
+						// A whole number of another type, which a range
+						// compares by value.
+						p = int32(r.Intn(10_000))
+					}
 					_, err = co.UpdateOne(sctx, bson.D{{Key: "_id", Value: id}}, bson.D{
 						{Key: "$set", Value: bson.D{{Key: "price", Value: p}}},
 						{Key: "$inc", Value: bson.D{{Key: "stock", Value: int32(-1)}}},
@@ -168,14 +202,17 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	// Caught up: every entry must now be what MongoDB answers.
 	time.Sleep(500 * time.Millisecond)
 	r := rand.New(rand.NewSource(99))
-	checked, wrong := 0, 0
-	for i := 0; i < 2000; i++ {
+	checked, wrong, ranged := 0, 0, 0
+	for i := 0; i < 3000; i++ {
 		q := queries(r)
 		got, hit := c.Get(q)
 		if !hit {
 			continue
 		}
 		checked++
+		if len(q.Ranges) > 0 {
+			ranged++
+		}
 		want := direct(t, ctx, co, q)
 		if !reflect.DeepEqual(batchOf(got), want) {
 			wrong++
@@ -235,9 +272,12 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	}
 
 	s := c.Stats()
-	t.Logf("checked %d answers after the writes, %d wrong; %d writer reads disagreed; %d fills raced a write, %d lost it; stats %+v", checked, wrong, n, raced, lost, s)
+	t.Logf("checked %d answers after the writes (%d of them ranges), %d wrong; %d writer reads disagreed; %d fills raced a write, %d lost it; stats %+v", checked, ranged, wrong, n, raced, lost, s)
 	if checked < 200 {
 		t.Errorf("only %d answers came from the cache, too few to say anything", checked)
+	}
+	if ranged < 100 {
+		t.Errorf("only %d range answers came from the cache, too few to say anything", ranged)
 	}
 }
 
@@ -310,6 +350,9 @@ func direct(t *testing.T, ctx context.Context, co *mongo.Collection, q Query) an
 	filter := bson.D{}
 	for _, p := range q.Eq {
 		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
+	}
+	for _, r := range q.Ranges {
+		filter = append(filter, bson.E{Key: r.Field, Value: bson.D{{Key: r.Op, Value: r.Value}}})
 	}
 	if q.Kind != KindFind {
 		n, err := co.CountDocuments(ctx, filter)

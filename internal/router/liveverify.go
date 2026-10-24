@@ -32,7 +32,10 @@ const liveVerifyWait = 500 * time.Millisecond
 
 // liveCheck is a cached answer waiting for the real one.
 type liveCheck struct {
-	ns     string
+	ns string
+	// shape is the query's shape, written on its line so a run can count
+	// which shapes were compared.
+	shape  string
 	cmd    bson.Raw
 	cached bson.Raw
 	at     time.Time
@@ -110,7 +113,7 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 	why := liveDiffer(chk.cached, real)
 	took := time.Since(chk.at).Round(time.Microsecond)
 	if why == "" {
-		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\n", chk.ns, took))
+		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
 	}
 	c.log.Warn("the live cache would have answered differently", "ns", chk.ns, "why", why)

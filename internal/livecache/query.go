@@ -16,10 +16,10 @@
 // exists once somebody asked for it, and is filled by asking MongoDB.
 //
 // It is deliberately narrow, and says no to anything whose answer it could get
-// wrong: equality filters on top-level fields, a sort, a skip and a limit, a
-// projection of top-level fields, and counts over the same filters. Arrays,
-// nulls, collations, mixed types in a sort and operators are all answered by
-// MongoDB, as before.
+// wrong: equality and range ($gt, $gte, $lt, $lte) filters on top-level
+// fields, a sort, a skip and a limit, a projection of top-level fields, and
+// counts over the same filters. Arrays, nulls, collations, mixed types in a
+// sort and other operators are all answered by MongoDB, as before.
 package livecache
 
 import (
@@ -50,6 +50,9 @@ type Query struct {
 	NS   string
 	// Eq are the filter's field = value pairs, sorted by field.
 	Eq []EqPair
+	// Ranges are the filter's range bounds, sorted by field and operator. A
+	// field is in Eq or in Ranges, never both.
+	Ranges []RangePred
 	// Sort is the sort, in order. Empty for a count.
 	Sort        []SortKey
 	Skip, Limit int
@@ -67,6 +70,36 @@ type EqPair struct {
 	Field string
 	Value bson.RawValue
 	key   string
+}
+
+// RangePred is one bound of a range in a filter: Field Op Value, Op one of
+// $gt, $gte, $lt and $lte.
+type RangePred struct {
+	Field string
+	Op    string
+	Value bson.RawValue
+	key   string
+}
+
+// inRange says whether v, a value valueKey accepts, satisfies the bound the
+// way mongod's match does. A range compares only within the bound's type
+// bracket: {price: {$gt: 5}} matches no string, however it sorts.
+func (r RangePred) inRange(v bson.RawValue) bool {
+	if bracket(v) != bracket(r.Value) {
+		return false
+	}
+	n := compareSame(v, r.Value)
+	switch r.Op {
+	case "$gt":
+		return n > 0
+	case "$gte":
+		return n >= 0
+	case "$lt":
+		return n < 0
+	case "$lte":
+		return n <= 0
+	}
+	return false
 }
 
 // SortKey is one field of a sort.
@@ -112,11 +145,11 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 			if !ok {
 				return q, false
 			}
-			eq, ok := parseEq(d)
+			eq, rng, ok := parseFilter(d)
 			if !ok {
 				return q, false
 			}
-			q.Eq = eq
+			q.Eq, q.Ranges = eq, rng
 		case "sort":
 			d, ok := v.DocumentOK()
 			if !ok {
@@ -206,11 +239,11 @@ func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
 			if !ok {
 				return q, false
 			}
-			eq, ok := parseEq(d)
+			eq, rng, ok := parseFilter(d)
 			if !ok {
 				return q, false
 			}
-			q.Eq = eq
+			q.Eq, q.Ranges = eq, rng
 		case "skip", "limit":
 			n, ok := asInt(v)
 			if !ok || n != 0 {
@@ -268,11 +301,11 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 		if !ok {
 			return q, false
 		}
-		eq, ok := parseEq(md)
+		eq, rng, ok := parseFilter(md)
 		if !ok {
 			return q, false
 		}
-		q.Eq = eq
+		q.Eq, q.Ranges = eq, rng
 		at = 1
 	}
 	gd, ok := stages[at].DocumentOK()
@@ -344,31 +377,64 @@ func plainReadConcern(v bson.RawValue) bool {
 	return true
 }
 
-// parseEq accepts a filter of top-level field: literal pairs and nothing else.
-func parseEq(filter bson.Raw) ([]EqPair, bool) {
+// parseFilter accepts a filter of top-level fields, each either equal to a
+// literal or bounded by $gt, $gte, $lt and $lte, and nothing else.
+//
+// A bound is a value valueKey accepts, so the same values an equality takes:
+// no null, which $lte: null would match a missing field by, no array, no
+// document, no NaN, no MinKey or MaxKey.
+func parseFilter(filter bson.Raw) ([]EqPair, []RangePred, bool) {
 	e, err := filter.Elements()
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	out := make([]EqPair, 0, len(e))
+	var rng []RangePred
+	seen := map[string]bool{}
 	for _, x := range e {
 		k := x.Key()
-		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") {
-			return nil, false
+		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") || seen[k] {
+			return nil, nil, false
+		}
+		seen[k] = true
+		if d, ok := x.Value().DocumentOK(); ok {
+			ops, err := d.Elements()
+			if err != nil || len(ops) == 0 {
+				return nil, nil, false
+			}
+			for _, o := range ops {
+				switch o.Key() {
+				case "$gt", "$gte", "$lt", "$lte":
+				default:
+					return nil, nil, false
+				}
+				key, ok := valueKey(o.Value())
+				if !ok {
+					return nil, nil, false
+				}
+				for _, r := range rng {
+					if r.Field == k && r.Op == o.Key() {
+						return nil, nil, false
+					}
+				}
+				rng = append(rng, RangePred{Field: k, Op: o.Key(), Value: o.Value(), key: key})
+			}
+			continue
 		}
 		key, ok := valueKey(x.Value())
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
 		out = append(out, EqPair{Field: k, Value: x.Value(), key: key})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Field < out[j].Field })
-	for i := 1; i < len(out); i++ {
-		if out[i].Field == out[i-1].Field {
-			return nil, false
+	sort.Slice(rng, func(i, j int) bool {
+		if rng[i].Field != rng[j].Field {
+			return rng[i].Field < rng[j].Field
 		}
-	}
-	return out, true
+		return rng[i].Op < rng[j].Op
+	})
+	return out, rng, true
 }
 
 func parseSort(d bson.Raw) ([]SortKey, bool) {
@@ -530,6 +596,51 @@ func bracket(v bson.RawValue) string {
 // within, "" for one this does not order.
 func SortBracket(v bson.RawValue) string { return bracket(v) }
 
+// compareNumbers orders two numbers by value, as exact as exact() is, without
+// its allocations where float64 already decides: two integers, two doubles, or
+// an integer within 2^53 of zero against a double. Applying a change compared
+// every range entry of a category through big.Float, under the lock every
+// cached read waits on: on the Docker test server inBounds was 82% of Apply,
+// and the p99 of reads that hold no range went from 0.71ms to 1.88ms.
+func compareNumbers(a, b bson.RawValue) int {
+	ai, aInt := intValue(a)
+	bi, bInt := intValue(b)
+	switch {
+	case aInt && bInt:
+		return cmp3(ai < bi, ai > bi)
+	case !aInt && !bInt:
+		x, y := a.Double(), b.Double()
+		return cmp3(x < y, x > y)
+	case aInt && ai >= -1<<53 && ai <= 1<<53:
+		x, y := float64(ai), b.Double()
+		return cmp3(x < y, x > y)
+	case bInt && bi >= -1<<53 && bi <= 1<<53:
+		x, y := a.Double(), float64(bi)
+		return cmp3(x < y, x > y)
+	}
+	return exact(a).Cmp(exact(b))
+}
+
+func intValue(v bson.RawValue) (int64, bool) {
+	switch v.Type {
+	case bson.TypeInt32:
+		return int64(v.Int32()), true
+	case bson.TypeInt64:
+		return v.Int64(), true
+	}
+	return 0, false
+}
+
+func cmp3(less, more bool) int {
+	switch {
+	case less:
+		return -1
+	case more:
+		return 1
+	}
+	return 0
+}
+
 // CompareSame is compareSame for other packages.
 func CompareSame(a, b bson.RawValue) int { return compareSame(a, b) }
 
@@ -537,7 +648,7 @@ func CompareSame(a, b bson.RawValue) int { return compareSame(a, b) }
 func compareSame(a, b bson.RawValue) int {
 	switch bracket(a) {
 	case "n":
-		return exact(a).Cmp(exact(b))
+		return compareNumbers(a, b)
 	case "s":
 		return strings.Compare(a.StringValue(), b.StringValue())
 	case "d":
@@ -565,6 +676,10 @@ func compareSame(a, b bson.RawValue) int {
 	return 0
 }
 
+// Shape names everything about a query except the values it was asked with,
+// for logs that count which shapes the cache answers.
+func (q Query) Shape() string { return q.shapeID() }
+
 // shapeID names everything about a query except the values it was asked with.
 func (q Query) shapeID() string {
 	var b strings.Builder
@@ -579,6 +694,15 @@ func (q Query) shapeID() string {
 	for _, p := range q.Eq {
 		b.WriteString(p.Field)
 		b.WriteByte(',')
+	}
+	// The fields and operators of a range are the shape, its bounds the key.
+	if len(q.Ranges) > 0 {
+		b.WriteString("|rng:")
+		for _, r := range q.Ranges {
+			b.WriteString(r.Field)
+			b.WriteString(r.Op)
+			b.WriteByte(',')
+		}
 	}
 	if q.Kind == KindFind {
 		b.WriteString("|sort:")
@@ -617,6 +741,23 @@ func (q Query) shapeID() string {
 
 // entryKey names one entry: the shape and the values.
 func (q Query) entryKey() string {
+	g := q.groupKey()
+	if len(q.Ranges) == 0 {
+		return g
+	}
+	var b strings.Builder
+	b.WriteString(g)
+	for _, r := range q.Ranges {
+		b.WriteByte(1)
+		b.WriteString(r.key)
+	}
+	return b.String()
+}
+
+// groupKey names the entries of a shape asked with the same equalities, which
+// differ only in their bounds: every entry a document can belong to, found by
+// its values (keyOf). For a shape with no range it is the entry's key.
+func (q Query) groupKey() string {
 	var b strings.Builder
 	b.WriteString(q.shapeID())
 	for _, p := range q.Eq {
@@ -635,6 +776,12 @@ func (q Query) detached() Query {
 		eq[i] = p
 	}
 	q.Eq = eq
+	rng := make([]RangePred, len(q.Ranges))
+	for i, r := range q.Ranges {
+		r.Value = bson.RawValue{Type: r.Value.Type, Value: append([]byte(nil), r.Value.Value...)}
+		rng[i] = r
+	}
+	q.Ranges = rng
 	q.GroupID = bson.RawValue{Type: q.GroupID.Type, Value: append([]byte(nil), q.GroupID.Value...)}
 	return q
 }
