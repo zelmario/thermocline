@@ -400,7 +400,7 @@ func (r *Router) readPosition(ctx context.Context) reading {
 // every document; it is merely behind, which is the same guarantee this read
 // had before any of this existed. The caller says so in the log rather than
 // turning a slow answer into an error.
-func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
+func (r *Router) waitForArchive(ctx context.Context, until time.Time, db string) bool {
 	wait := r.cfg.ArchiveWait.D()
 	if wait <= 0 || r.cfg.FeederID == "" {
 		return true
@@ -415,6 +415,10 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		began := time.Now()
 		defer func() { r.Metrics.RecordWait(time.Since(began)) }()
 	}
+
+	// The newest write this read can see, when it can be had: the bar is then
+	// that write rather than everything up to now. See writesToWaitFor.
+	need, narrow := r.writesToWaitFor(ctx, db)
 
 	deadline := time.Now().Add(wait)
 	waitBegan := time.Now()
@@ -438,6 +442,9 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 		r.ckptCache.mu.Unlock()
 
 		got := r.mirroredThrough(ctx)
+		if narrow && got.known && got.ts.T != 0 && checkpoint.PackTS(got.ts) >= need {
+			return true
+		}
 		if got.known && r.caughtUp(ctx, got, until, untilTS) {
 			return true
 		}
@@ -517,6 +524,60 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time) bool {
 	}
 }
 
+// writesToWaitFor is the newest write to a tiered namespace of db that a read
+// beginning now has to find in the archive, so the freshness barrier can wait
+// for mirroring to reach that write rather than the present.
+//
+// The barrier waited for mirroring to reach the instant the read began, and on
+// a fast tier taking writes all the time that is the whole of mirroring's lag
+// on every read: the change stream, the flush to the archive, the published
+// position and the poll. Measured on the Docker test server, the shop at
+// 2,000 operations a second: a report answered from the archive took 20.6ms
+// at the median against 4.8ms on the cluster alone, and 17.7ms of it was this
+// wait. Most of what it waited for were writes to other collections, or to the
+// same collection long enough ago to be in the archive already.
+//
+// Three steps, each sound on its own:
+//
+//   - hello asks the fast tier's primary for its lastWrite, an oplog position.
+//     Every write acknowledged to anyone before it was asked is at or before
+//     it, through this router or not. A reply's operationTime is not that, it
+//     is the node's logical clock: see meta.OwnDDLSpan.
+//   - the tracker, which reads the fast tier's oplog as it is written, is
+//     waited for until it has read through that position. It is fractions of
+//     a millisecond behind.
+//   - what it holds then is the newest write to db, and mirroring reaching
+//     that write means the archive holds every write this read could see.
+//
+// ok false means one of them could not be had, and the read waits as it did
+// before. An empty db says the caller does not know which database it reads.
+func (r *Router) writesToWaitFor(ctx context.Context, db string) (need uint64, ok bool) {
+	if db == "" || r.touches == nil {
+		return 0, false
+	}
+	hctx, cancel := context.WithTimeout(ctx, narrowBarrierTimeout)
+	defer cancel()
+	raw, err := r.hot.Database("admin").RunCommand(hctx, bson.D{{Key: "hello", Value: 1}},
+		options.RunCmd().SetReadPreference(readpref.Primary())).Raw()
+	if err != nil {
+		return 0, false
+	}
+	v, err := raw.LookupErr("lastWrite", "opTime", "ts")
+	if err != nil {
+		return 0, false
+	}
+	t, i, ok := v.TimestampOK()
+	if !ok || t == 0 {
+		return 0, false
+	}
+	return r.touches.lastWriteIn(hctx, db, checkpoint.PackTS(bson.Timestamp{T: t, I: i}))
+}
+
+// narrowBarrierTimeout bounds what writesToWaitFor spends before the read
+// waits as it used to: a hello and the tracker catching up, both well under a
+// millisecond when the fast tier is healthy.
+const narrowBarrierTimeout = 100 * time.Millisecond
+
 // noPrimaryRecheck is how often a wait held open by an archive with no primary
 // asks again, and noPrimaryCap is the most it is held open in all. Thirty
 // seconds is the driver's own server selection timeout: the read after it would
@@ -569,7 +630,7 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		ctx, cancel = context.WithTimeout(ctx, budget/2)
 		defer cancel()
 	}
-	if c.r.waitForArchive(ctx, started) {
+	if c.r.waitForArchive(ctx, started, nsDB(ns)) {
 		return nil
 	}
 	if c.r.cfg.Freshness != config.FreshnessPermissive {
@@ -591,6 +652,12 @@ func (c *conn) archiveReadIsFresh(ctx context.Context, ns string, started time.T
 		"effect", "this answer may miss a very recent write, or include a very recently deleted document")
 	c.r.explainStale(ctx, c.log, started)
 	return nil
+}
+
+// nsDB is the database of ns, or empty when ns does not name one.
+func nsDB(ns string) string {
+	db, _ := splitNS(ns)
+	return db
 }
 
 // errArchiveBehind is what a read or a write is refused with under
@@ -693,15 +760,21 @@ func (r *Router) clashIsFresh(ctx context.Context, ns string) {
 // counted as a stale read, because refusing work over a slow feeder turns lag
 // into failures.
 func (r *Router) archiveIsFresh(ctx context.Context, ns string, budget time.Duration, what, effect string) error {
-	return r.archiveIsFreshUnder(ctx, ns, budget, what, effect, r.cfg.Freshness)
+	return r.archiveIsFreshUnder(ctx, ns, nsDB(ns), budget, what, effect, r.cfg.Freshness)
+}
+
+// archiveIsFreshAcross is archiveIsFresh for work that reads more than one
+// database, or none that it can name: db empty waits for everything.
+func (r *Router) archiveIsFreshAcross(ctx context.Context, ns, db string, budget time.Duration, what, effect string) error {
+	return r.archiveIsFreshUnder(ctx, ns, db, budget, what, effect, r.cfg.Freshness)
 }
 
 // archiveIsFreshAnyway is archiveIsFresh as router.freshness: permissive.
 func (r *Router) archiveIsFreshAnyway(ctx context.Context, ns string, budget time.Duration, what, effect string) error {
-	return r.archiveIsFreshUnder(ctx, ns, budget, what, effect, config.FreshnessPermissive)
+	return r.archiveIsFreshUnder(ctx, ns, nsDB(ns), budget, what, effect, config.FreshnessPermissive)
 }
 
-func (r *Router) archiveIsFreshUnder(ctx context.Context, ns string, budget time.Duration, what, effect string,
+func (r *Router) archiveIsFreshUnder(ctx context.Context, ns, db string, budget time.Duration, what, effect string,
 	policy config.Freshness) error {
 	if budget > 0 {
 		var cancel context.CancelFunc
@@ -709,7 +782,7 @@ func (r *Router) archiveIsFreshUnder(ctx context.Context, ns string, budget time
 		defer cancel()
 	}
 	started := time.Now()
-	if r.waitForArchive(ctx, started) {
+	if r.waitForArchive(ctx, started, db) {
 		return nil
 	}
 	if policy != config.FreshnessPermissive {

@@ -1,7 +1,9 @@
 package router
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -65,4 +67,58 @@ func TestTouchTracker(t *testing.T) {
 	ask("DDL touches every document", 15, 20, false, true, true, all, int32(2))
 	tr.touch("dropDatabase", "shop", "", bson.RawValue{}, at(22))
 	ask("a dropped database touches every document", 21, 22, true, true, true, all, int32(2))
+}
+
+// The narrow freshness bar: the newest write to a database once the tracker
+// has read through a position, inserts included, and nothing older than the
+// tracker's start.
+func TestLastWriteIn(t *testing.T) {
+	ts := func(s uint32) bson.Timestamp { return bson.Timestamp{T: s, I: 1} }
+	at := func(s uint32) uint64 { return checkpoint.PackTS(ts(s)) }
+	short := func() context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		t.Cleanup(cancel)
+		return ctx
+	}
+
+	tr := newTouchTracker()
+	if _, ok := tr.lastWriteIn(short(), "shop", at(5)); ok {
+		t.Fatal("answered before the tracker had a position")
+	}
+	tr.advance(at(10), true)
+	tr.touch("insert", "shop", "orders", bson.RawValue{}, at(12))
+	tr.touch("insert", "other", "things", bson.RawValue{}, at(14))
+	tr.advance(at(15), true)
+
+	if need, ok := tr.lastWriteIn(short(), "shop", at(15)); !ok || need != at(12) {
+		t.Errorf("shop through 15: need %v ok %v, want the insert at 12", need, ok)
+	}
+	if need, ok := tr.lastWriteIn(short(), "quiet", at(15)); !ok || need != at(10) {
+		t.Errorf("a database with no write seen: need %v ok %v, want the tracker's start", need, ok)
+	}
+	if _, ok := tr.lastWriteIn(short(), "shop", at(16)); ok {
+		t.Error("answered for a position the tracker has not read")
+	}
+
+	// A wait for a position the tracker reaches while waiting.
+	done := make(chan uint64, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		need, _ := tr.lastWriteIn(ctx, "shop", at(20))
+		done <- need
+	}()
+	time.Sleep(10 * time.Millisecond)
+	tr.touch("update", "shop", "orders", bson.RawValue{}, at(18))
+	tr.advance(at(20), true)
+	if need := <-done; need != at(18) {
+		t.Errorf("waited for 20: need %v, want the update at 18", need)
+	}
+
+	// Anything that may touch everything is a write to every database.
+	tr.touchAll(at(21))
+	tr.advance(at(22), true)
+	if need, _ := tr.lastWriteIn(short(), "quiet", at(22)); need != at(21) {
+		t.Errorf("after a touch of everything: need %v, want 21", need)
+	}
 }

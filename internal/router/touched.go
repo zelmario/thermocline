@@ -76,10 +76,17 @@ type touchTracker struct {
 	// prepared transaction's commit. See touchCommand.
 	all uint64
 	n   int
+	// wrote is the latest entry of any kind, inserts included, on a tiered
+	// namespace of each database. See lastWriteIn.
+	wrote map[string]uint64
+	// moved is closed and replaced every time applied moves, for a read
+	// waiting for the tracker to reach a position. See lastWriteIn.
+	moved chan struct{}
 }
 
 func newTouchTracker() *touchTracker {
-	t := &touchTracker{ids: map[string]map[string]touchMark{}, ns: map[string]uint64{}, db: map[string]uint64{}, dels: map[string]uint64{}}
+	t := &touchTracker{ids: map[string]map[string]touchMark{}, ns: map[string]uint64{}, db: map[string]uint64{},
+		dels: map[string]uint64{}, wrote: map[string]uint64{}}
 	return t
 }
 
@@ -106,6 +113,10 @@ func (t *touchTracker) advance(at uint64, inclusive bool) {
 			t.start = at
 		}
 		t.prune()
+		if t.moved != nil {
+			close(t.moved)
+			t.moved = nil
+		}
 	}
 	t.mu.Unlock()
 }
@@ -118,6 +129,7 @@ func (t *touchTracker) touch(op, db, coll string, id bson.RawValue, at uint64) {
 		// Nothing is answered before the stream's first position.
 		return
 	}
+	t.wrote[db] = max(t.wrote[db], at)
 	switch {
 	case coll == "":
 		if at > t.db[db] {
@@ -236,6 +248,45 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 	return false, rest, true
 }
 
+// lastWriteIn is what a read of database db from the archive has to wait for
+// mirroring to reach: the newest write to any tiered namespace of db that the
+// tracker has read, once it has read the oplog through through.
+//
+// A database rather than a namespace, because that is as far as a read can
+// reach. A pipeline's $lookup and $unionWith, and a view's definition, name
+// collections of the database they run in, and nothing in the read itself
+// says which. Taking the database answers for all of them without resolving
+// any.
+//
+// The tracker's own start counts as a write. What came before it was never
+// read, so the newest write in db may be anywhere up to there.
+//
+// It waits for the tracker to reach through, at most until ctx ends. ok false
+// says it did not, or that the tracker is not reading, and the caller waits
+// the way it always did.
+func (t *touchTracker) lastWriteIn(ctx context.Context, db string, through uint64) (need uint64, ok bool) {
+	if t == nil {
+		return 0, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for t.start == 0 || t.applied < through || (t.applied == through && !t.inclusive) {
+		if t.moved == nil {
+			t.moved = make(chan struct{})
+		}
+		moved := t.moved
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			t.mu.Lock()
+			return 0, false
+		case <-moved:
+		}
+		t.mu.Lock()
+	}
+	return max(t.wrote[db], t.all, t.start), true
+}
+
 // touchAll records an entry that may have changed any document.
 func (t *touchTracker) touchAll(at uint64) {
 	t.mu.Lock()
@@ -301,6 +352,7 @@ func (r *Router) followTouches(ctx context.Context) {
 		r.touches.mu.Lock()
 		r.touches.applied, r.touches.start, r.touches.horizon, r.touches.all = 0, 0, 0, 0
 		r.touches.ids, r.touches.ns, r.touches.db, r.touches.n = map[string]map[string]touchMark{}, map[string]uint64{}, map[string]uint64{}, 0
+		r.touches.wrote = map[string]uint64{}
 		r.touches.mu.Unlock()
 		r.log.Warn("the oplog read that answers the oplog check in memory stopped, starting it again",
 			"err", err, "meanwhile", "merged reads ask the oplog, as they did before")
@@ -342,6 +394,7 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 	}
 	proj := bson.D{
 		{Key: "_id", Value: 0}, {Key: "ts", Value: 1}, {Key: "op", Value: 1}, {Key: "ns", Value: 1},
+		{Key: "prev", Value: "$prevOpTime.ts"},
 		{Key: "id", Value: ifID("$")},
 		{Key: "c", Value: bson.D{{Key: "$cond", Value: bson.A{
 			bson.D{{Key: "$eq", Value: bson.A{"$op", "c"}}},
@@ -372,10 +425,21 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 		}
 		at := checkpoint.PackTS(e.TS)
 		switch e.Op {
+		case "i":
+			r.touchInsert(e.NS, at)
 		case "u", "d":
 			r.touchOne(e.Op, e.NS, e.ID, at)
 		case "c":
 			r.touchCommand(e.NS, e.C, at)
+			// One entry of a transaction written as several. Its operations
+			// take effect at the last entry, which need not name them: an
+			// update in the first and a commit that names only other
+			// collections. So any entry of such a chain touches everything.
+			// The first has no previous entry, and is not told from a
+			// transaction of one entry; the chain's second entry covers it.
+			if e.Prev.T != 0 {
+				r.touches.touchAll(at)
+			}
 		}
 		if cur.RemainingBatchLength() == 0 {
 			// Each entry has a time of its own, and a forward read of the
@@ -400,6 +464,9 @@ type oplogTouch struct {
 	NS string         `bson:"ns"`
 	ID bson.RawValue  `bson:"id"`
 	C  bson.Raw       `bson:"c"`
+	// Prev is the previous entry of the same transaction, zero for the first
+	// and for anything else.
+	Prev bson.Timestamp `bson:"prev"`
 }
 
 // touchOne records an update or delete of one document, of a tiered
@@ -420,6 +487,16 @@ func (r *Router) touchOne(op, ns string, id bson.RawValue, at uint64) {
 		return
 	}
 	r.touches.touch("update", db, coll, id, at)
+}
+
+// touchInsert records an insert, of a tiered namespace only. The oplog check
+// leaves inserts out, so it is kept only as a write to the database.
+func (r *Router) touchInsert(ns string, at uint64) {
+	if !r.cfg.Manages(ns) {
+		return
+	}
+	db, coll := splitNS(ns)
+	r.touches.touch("insert", db, coll, bson.RawValue{}, at)
 }
 
 // touchCommand records a command entry, as oplogWindow counts one: an applyOps
@@ -445,7 +522,9 @@ func (r *Router) touchCommand(ns string, c bson.Raw, at uint64) {
 			op, _ := d.Lookup("op").StringValueOK()
 			ins, _ := d.Lookup("ns").StringValueOK()
 			switch op {
-			case "i", "n":
+			case "n":
+			case "i":
+				r.touchInsert(ins, at)
 			case "u", "d":
 				r.touchOne(op, ins, d.Lookup("id"), at)
 			default:

@@ -1053,7 +1053,15 @@ func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
 	// asked at all, and the documents stay null. That is an answer MongoDB
 	// gives for a document no longer there, where the archive's could be older
 	// than the change the event describes.
-	if r.archiveIsFresh(ctx, want[0].ns, 0, "filling a change stream's documents from the archive before mirroring caught up",
+	// One database for the narrow bar, or none: a stream on a whole
+	// deployment fills documents from several.
+	fillDB := nsDB(want[0].ns)
+	for _, w := range want {
+		if nsDB(w.ns) != fillDB {
+			fillDB = ""
+		}
+	}
+	if r.archiveIsFreshAcross(ctx, want[0].ns, fillDB, 0, "filling a change stream's documents from the archive before mirroring caught up",
 		"an event's fullDocument may be older than the change it describes, or a document already deleted") != nil {
 		return events, 0
 	}
