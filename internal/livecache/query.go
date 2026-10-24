@@ -42,7 +42,12 @@ const (
 	// KindCountAgg is a number asked for as a pipeline, which is how drivers
 	// send countDocuments: [{$match}, {$group: {_id: K, n: {$sum: 1}}}].
 	KindCountAgg
+	// KindGroup is a grouping pipeline, a report. See group.go.
+	KindGroup
 )
+
+// firstBatchDefault is the first batch mongod returns when none is asked for.
+const firstBatchDefault = 101
 
 // Query is a read this package can answer, taken apart.
 type Query struct {
@@ -63,6 +68,8 @@ type Query struct {
 	CountField string
 	// Limit and skip of a count command.
 	CountSkip, CountLimit int
+	// Group is the grouping of a KindGroup query.
+	Group *GroupSpec
 }
 
 // EqPair is one field = value in a filter.
@@ -686,6 +693,8 @@ func (q Query) shapeID() string {
 	switch q.Kind {
 	case KindFind:
 		b.WriteString("find|")
+	case KindGroup:
+		b.WriteString("group|")
 	default:
 		b.WriteString("count|")
 	}
@@ -736,6 +745,9 @@ func (q Query) shapeID() string {
 			}
 		}
 	}
+	if q.Group != nil {
+		b.WriteString(q.Group.canon)
+	}
 	return b.String()
 }
 
@@ -767,6 +779,9 @@ func (q Query) groupKey() string {
 	return b.String()
 }
 
+// Detached is detached for other packages.
+func (q Query) Detached() Query { return q.detached() }
+
 // detached copies everything a query points to, so it can outlive the message
 // it was read from.
 func (q Query) detached() Query {
@@ -782,6 +797,13 @@ func (q Query) detached() Query {
 		rng[i] = r
 	}
 	q.Ranges = rng
+	if q.Group != nil {
+		g := *q.Group
+		g.ID.konst = bson.RawValue{Type: g.ID.konst.Type, Value: append([]byte(nil), g.ID.konst.Value...)}
+		g.Accs = append([]accSpec(nil), g.Accs...)
+		g.Sort = append([]SortKey(nil), g.Sort...)
+		q.Group = &g
+	}
 	q.GroupID = bson.RawValue{Type: q.GroupID.Type, Value: append([]byte(nil), q.GroupID.Value...)}
 	return q
 }

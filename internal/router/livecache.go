@@ -108,6 +108,9 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 		q, ok = livecache.ParseCount(ns, cmd)
 	case "aggregate":
 		q, ok = livecache.ParseCountAgg(ns, cmd)
+		if !ok {
+			q, ok = livecache.ParseGroupAgg(ns, cmd)
+		}
 	default:
 		return nil, false
 	}
@@ -129,7 +132,7 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 	// Verify mode answers nothing, so who may read is not its question.
 	if c.r.liveVerify != nil {
 		if reply, hit := c.liveVerifyGet(q); hit {
-			c.liveCheck = &liveCheck{ns: ns, shape: q.Shape(), cmd: append(bson.Raw(nil), cmd...),
+			c.liveCheck = &liveCheck{ns: ns, shape: q.Shape(), q: q.Detached(), cmd: append(bson.Raw(nil), cmd...),
 				cached: append(bson.Raw(nil), reply...), at: time.Now()}
 		}
 		return nil, false

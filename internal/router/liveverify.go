@@ -35,7 +35,9 @@ type liveCheck struct {
 	ns string
 	// shape is the query's shape, written on its line so a run can count
 	// which shapes were compared.
-	shape  string
+	shape string
+	// q is the query, for a comparison that depends on its kind.
+	q      livecache.Query
 	cmd    bson.Raw
 	cached bson.Raw
 	at     time.Time
@@ -111,6 +113,15 @@ func (c *conn) liveVerifySkip(ns, why string) {
 // would have given, and logs the comparison.
 func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 	why := liveDiffer(chk.cached, real)
+	if chk.q.Kind == livecache.KindGroup {
+		// The order of groups without a $sort is mongod's choice, so the
+		// same answer can come in another order.
+		if !replyOK(real) {
+			why = "the real reply is an error"
+		} else {
+			why = livecache.SameGroupAnswer(chk.q, chk.cached, real)
+		}
+	}
 	took := time.Since(chk.at).Round(time.Microsecond)
 	if why == "" {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))

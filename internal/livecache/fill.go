@@ -253,6 +253,9 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	rctx, cancel := context.WithTimeout(ctx, fillTimeout)
 	defer cancel()
 
+	if q.Kind == KindGroup {
+		return c.readGroup(rctx, hot.Database(db), coll, filter, out)
+	}
 	if q.Kind != KindFind {
 		var res struct {
 			Cursor struct {
@@ -502,11 +505,103 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		}
 		return true
 	}
+	if sh.kind == KindGroup {
+		return c.addToGroup(sh, e, id, ch.Doc)
+	}
 	if c.fits(sh, e, ch.Doc) {
 		c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 	}
 	_, live := c.entries[e.key]
 	return live
+}
+
+// readGroup is a grouped entry's fill: the documents its $match takes, read
+// at the fill's position with only the fields the grouping reads. The totals
+// are computed here, from the same documents the stream will change, rather
+// than asked of mongod, so an entry is always the sum of what it remembers.
+func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, filter bson.D, out fillResult) fillResult {
+	q := out.f.q
+	proj := bson.D{{Key: "_id", Value: 1}}
+	keep := append(append([]string(nil), q.Group.fields()...), filterFieldsOf(q)...)
+	for _, f := range keep {
+		if f == "_id" || hasKey(proj, f) {
+			continue
+		}
+		proj = append(proj, bson.E{Key: f, Value: 1})
+	}
+	cmd := bson.D{
+		{Key: "find", Value: coll},
+		{Key: "filter", Value: filter},
+		{Key: "projection", Value: proj},
+		{Key: "limit", Value: int64(maxGroupDocs + 1)},
+		{Key: "batchSize", Value: int64(10000)},
+	}
+	cur, err := snapshotCursor(ctx, db, cmd, out.f.p0)
+	if err != nil {
+		out.why = "group: " + err.Error()
+		return out
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	for cur.Next(ctx) {
+		if len(out.docs) == maxGroupDocs {
+			out.why = "group: the $match takes more documents than an entry remembers"
+			return out
+		}
+		out.docs = append(out.docs, append(bson.Raw(nil), cur.Current...))
+	}
+	if err := cur.Err(); err != nil {
+		out.why = "group: " + err.Error()
+		return out
+	}
+	out.complete, out.ok = true, true
+	return out
+}
+
+func filterFieldsOf(q Query) []string {
+	var out []string
+	for _, p := range q.Eq {
+		out = append(out, p.Field)
+	}
+	for _, r := range q.Ranges {
+		out = append(out, r.Field)
+	}
+	return out
+}
+
+func hasKey(d bson.D, k string) bool {
+	for _, e := range d {
+		if e.Key == k {
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotCursor is snapshotRun for a read of more than one batch: the
+// getMores of a snapshot cursor read at the same cluster time.
+func snapshotCursor(ctx context.Context, db *mongo.Database, cmd bson.D, p0 bson.Timestamp) (*mongo.Cursor, error) {
+	at := func(ts bson.Timestamp) bson.D {
+		return append(cmd[:len(cmd):len(cmd)], bson.E{Key: "readConcern", Value: bson.D{
+			{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: ts}}})
+	}
+	cur, err := db.RunCommandCursor(ctx, at(p0))
+	var ce mongo.CommandError
+	if !errors.As(err, &ce) || ce.Code != 72 || !strings.Contains(ce.Message, "atClusterTime") {
+		return cur, err
+	}
+	raw, perr := db.RunCommand(ctx, bson.D{{Key: "ping", Value: 1}}).Raw()
+	if perr != nil {
+		return nil, err
+	}
+	t, i, ok := raw.Lookup("operationTime").TimestampOK()
+	if !ok {
+		return nil, err
+	}
+	now := bson.Timestamp{T: t, I: i}
+	if !after(p0, now) {
+		return nil, err
+	}
+	return db.RunCommandCursor(ctx, at(now))
 }
 
 // snapshotRun runs cmd as a snapshot read at p0, the stream's position.

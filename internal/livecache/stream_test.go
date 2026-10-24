@@ -41,8 +41,12 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	price := func() float64 { return float64(rng.Intn(1_000_000)) / 100 }
 	var docs []any
 	for i := 0; i < 600; i++ {
+		tags := bson.A{}
+		for k := 0; k < i%4; k++ {
+			tags = append(tags, fmt.Sprintf("t%d", (i+k)%7))
+		}
 		docs = append(docs, bson.D{{Key: "_id", Value: fmt.Sprintf("p%04d", i)}, {Key: "category", Value: fmt.Sprintf("c%02d", i%20)},
-			{Key: "price", Value: price()}, {Key: "stock", Value: int32(100)}})
+			{Key: "price", Value: price()}, {Key: "stock", Value: int32(100)}, {Key: "tags", Value: tags}})
 	}
 	if _, err := co.InsertMany(ctx, docs); err != nil {
 		t.Fatal(err)
@@ -65,9 +69,35 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 		}
 		return float64(lo), int64(lo + 2500)
 	}
+	// The pipelines of the grouped queries, by entry, for asking mongod.
+	var pipes sync.Map
+	group := func(p bson.A) Query {
+		q, ok := ParseGroupAgg(ns, mustRaw(bson.D{{Key: "aggregate", Value: "products"}, {Key: "pipeline", Value: p}, {Key: "cursor", Value: bson.D{}}}))
+		if !ok {
+			panic(fmt.Sprintf("not understood: %v", p))
+		}
+		pipes.Store(q.entryKey(), p)
+		return q
+	}
 	queries := func(r *rand.Rand) Query {
 		cat := fmt.Sprintf("c%02d", r.Intn(20))
-		switch r.Intn(7) {
+		switch r.Intn(11) {
+		case 7:
+			// Stock and value per category, in no order.
+			return group(bson.A{bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$category"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}},
+				{Key: "value", Value: bson.D{{Key: "$sum", Value: "$price"}}}, {Key: "units", Value: bson.D{{Key: "$sum", Value: "$stock"}}}}}}})
+		case 8:
+			lo, hi := bound(r)
+			return group(bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "price", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: hi}}}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$category"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+				bson.D{{Key: "$sort", Value: bson.D{{Key: "n", Value: int32(-1)}}}}, bson.D{{Key: "$limit", Value: int32(3)}}})
+		case 9:
+			return group(bson.A{bson.D{{Key: "$unwind", Value: "$tags"}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$tags"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}, {Key: "units", Value: bson.D{{Key: "$sum", Value: "$stock"}}}}}},
+				bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: int32(1)}}}}})
+		case 10:
+			return group(bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: cat}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: nil}, {Key: "value", Value: bson.D{{Key: "$sum", Value: "$price"}}}}}}})
 		case 4:
 			// The store's "filter by price".
 			lo, hi := bound(r)
@@ -202,8 +232,8 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	// Caught up: every entry must now be what MongoDB answers.
 	time.Sleep(500 * time.Millisecond)
 	r := rand.New(rand.NewSource(99))
-	checked, wrong, ranged := 0, 0, 0
-	for i := 0; i < 3000; i++ {
+	checked, wrong, ranged, grouped := 0, 0, 0, 0
+	for i := 0; i < 4000; i++ {
 		q := queries(r)
 		got, hit := c.Get(q)
 		if !hit {
@@ -212,6 +242,21 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 		checked++
 		if len(q.Ranges) > 0 {
 			ranged++
+		}
+		if q.Kind == KindGroup {
+			grouped++
+			p, _ := pipes.Load(q.entryKey())
+			real, err := cl.Database("tc_live").RunCommand(ctx, bson.D{{Key: "aggregate", Value: "products"}, {Key: "pipeline", Value: p}, {Key: "cursor", Value: bson.D{}}}).Raw()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if why := SameGroupAnswer(q, got, real); why != "" {
+				wrong++
+				if wrong <= 5 {
+					t.Errorf("%s: %s: cache %v, mongod %v", q.entryKey(), why, got.Lookup("cursor", "firstBatch"), real.Lookup("cursor", "firstBatch"))
+				}
+			}
+			continue
 		}
 		want := direct(t, ctx, co, q)
 		if !reflect.DeepEqual(batchOf(got), want) {
@@ -272,12 +317,15 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	}
 
 	s := c.Stats()
-	t.Logf("checked %d answers after the writes (%d of them ranges), %d wrong; %d writer reads disagreed; %d fills raced a write, %d lost it; stats %+v", checked, ranged, wrong, n, raced, lost, s)
+	t.Logf("checked %d answers after the writes (%d of them ranges, %d groupings), %d wrong; %d writer reads disagreed; %d fills raced a write, %d lost it; stats %+v", checked, ranged, grouped, wrong, n, raced, lost, s)
 	if checked < 200 {
 		t.Errorf("only %d answers came from the cache, too few to say anything", checked)
 	}
 	if ranged < 100 {
 		t.Errorf("only %d range answers came from the cache, too few to say anything", ranged)
+	}
+	if grouped < 100 {
+		t.Errorf("only %d grouped answers came from the cache, too few to say anything", grouped)
 	}
 }
 

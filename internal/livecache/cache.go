@@ -136,6 +136,8 @@ type shape struct {
 	// entry's own.
 	rng  []RangePred
 	sort []SortKey
+	// group is the grouping of a KindGroup shape.
+	group *GroupSpec
 	// proj is the projection every query of the shape asks for, which is
 	// what its entries keep of a document. See trimDoc.
 	proj Projection
@@ -206,6 +208,8 @@ type entry struct {
 	// one. See groupKey.
 	group  string
 	bounds []RangePred
+	// grp is a grouped entry's documents and totals. See group.go.
+	grp *groupState
 	// docs is the sorted head of the list, complete says it is the whole of
 	// it. For a count, n is the count.
 	docs     []doc
@@ -536,7 +540,7 @@ func (c *Cache) entryFresh(e *entry, q Query, now time.Time) bool {
 	if e.group != e.key && !c.fresh(c.pendingEntry, e.group, now) {
 		return false
 	}
-	if e.shape.kind == KindCount {
+	if e.shape.kind == KindCount || e.shape.kind == KindGroup {
 		return c.fresh(c.pendingCount, e.shape.ns, now)
 	}
 	end := min(q.Skip+q.Limit, len(e.docs))
@@ -559,7 +563,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	}
 	// A range on a tiered namespace is not filled: the proof and the merge
 	// that complete a tiered entry are built for equalities. See proveFill.
-	if len(q.Ranges) > 0 && c.isTiered(q.NS) {
+	if (len(q.Ranges) > 0 || q.Kind == KindGroup) && c.isTiered(q.NS) {
 		c.mu.Unlock()
 		return nil, false
 	}
@@ -603,6 +607,16 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 			out = append(out, d.raw)
 		}
 		c.mu.Unlock()
+		reply = findReply(q, out)
+	} else if e.grp != nil {
+		out, ok := e.grp.output()
+		c.mu.Unlock()
+		if !ok {
+			// mongod's own answer would depend on an order this does not
+			// know. See groupState.output.
+			c.Misses.Add(1)
+			return nil, false
+		}
 		reply = findReply(q, out)
 	} else {
 		n := e.n
@@ -776,7 +790,21 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	if c.isTiered(q.NS) {
 		e.expires = c.now().Add(tieredTTL)
 	}
+	if sh.kind == KindGroup {
+		e.grp = newGroupState(sh.group)
+	}
 	for _, d := range docs {
+		if e.grp != nil {
+			id, ok := docKey(d)
+			if !ok || !c.plainMatch(sh, q, d) {
+				return nil
+			}
+			if !e.grp.add(id, d) {
+				c.refuse(sh)
+				return nil
+			}
+			continue
+		}
 		d = trimDoc(sh, d)
 		id, ok := docKey(d)
 		if !ok {
@@ -788,8 +816,16 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 		e.docs = append(e.docs, doc{id: id, raw: d})
 		e.bytes += len(d)
 	}
+	if e.grp != nil {
+		e.bytes += e.grp.bytes()
+	}
 	e.bytes += len(key) + 64
 	c.entries[key] = e
+	if e.grp != nil {
+		for id := range e.grp.byDoc {
+			c.addRev(id, e)
+		}
+	}
 	if len(sh.rng) > 0 {
 		g := c.groups[e.group]
 		if g == nil {
@@ -817,7 +853,7 @@ func (c *Cache) shapeFor(q Query) *shape {
 	if s, ok := m[id]; ok {
 		return s
 	}
-	s := &shape{id: id, kind: q.Kind, ns: q.NS, sort: q.Sort, proj: q.Proj}
+	s := &shape{id: id, kind: q.Kind, ns: q.NS, sort: q.Sort, proj: q.Proj, group: q.Group}
 	if s.kind == KindCountAgg {
 		s.kind = KindCount
 	}
@@ -981,6 +1017,11 @@ func (c *Cache) drop(e *entry) {
 	for _, d := range e.docs {
 		c.delRev(d.id, e)
 	}
+	if e.grp != nil {
+		for id := range e.grp.byDoc {
+			c.delRev(id, e)
+		}
+	}
 	if e.el != nil {
 		c.lru.Remove(e.el)
 	}
@@ -1100,6 +1141,12 @@ func (c *Cache) Apply(ch Change) {
 				}
 				continue
 			}
+			if sh.kind == KindGroup {
+				if !c.addToGroup(sh, e, id, ch.Doc) {
+					break
+				}
+				continue
+			}
 			if !c.fits(sh, e, ch.Doc) {
 				break
 			}
@@ -1177,6 +1224,10 @@ func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
 }
 
 func (c *Cache) removeDoc(e *entry, id string) {
+	if e.grp != nil {
+		e.grp.remove(id)
+		c.regrouped(e)
+	}
 	for i, d := range e.docs {
 		if d.id == id {
 			e.docs = append(e.docs[:i], e.docs[i+1:]...)
@@ -1186,6 +1237,28 @@ func (c *Cache) removeDoc(e *entry, id string) {
 		}
 	}
 	c.delRev(id, e)
+}
+
+// regrouped brings a grouped entry's size up to date after a change.
+func (c *Cache) regrouped(e *entry) {
+	n := len(e.key) + 64 + e.grp.bytes()
+	c.bytes += n - e.bytes
+	e.bytes = n
+}
+
+// addToGroup puts a document's part into a grouped entry, or refuses the
+// shape when it holds a value this does not reproduce mongod's handling of.
+// It reports whether the entry is still there.
+func (c *Cache) addToGroup(sh *shape, e *entry, id string, d bson.Raw) bool {
+	if !e.grp.add(id, d) {
+		c.refuse(sh)
+		return false
+	}
+	if _, has := e.grp.byDoc[id]; has {
+		c.addRev(id, e)
+	}
+	c.regrouped(e)
+	return true
 }
 
 // insertDoc places a document in its sorted position. Past the end of an entry
