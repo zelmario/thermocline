@@ -443,3 +443,66 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 	}
 	return out, true
 }
+
+// liveArchive reads the archive's half of a grouping on a tiered namespace:
+// every live document filter takes, with proj's fields. It is the merged
+// read's guard without its sort: the feeder's position is read first, so the
+// archive holds everything mirrored up to it, and a document it returns that
+// the fast tier's oplog shows changed since then refuses the fill, since the
+// archive's copy may be one the fast tier has deleted.
+func (r *Router) liveArchive(ctx context.Context, ns string, filter, proj bson.D) ([]bson.Raw, bool) {
+	if _, has := r.defaultCollation(ctx, ns); has || r.notSupersetCached(ns) != 0 {
+		return nil, false
+	}
+	got := r.recentPosition(ctx)
+	if !got.known || got.ts.IsZero() {
+		return nil, false
+	}
+	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	if until.IsZero() {
+		return nil, false
+	}
+	behind := checkpoint.PackTS(until) > checkpoint.PackTS(got.ts)
+	if behind && !r.windowCheckable(ctx, got.ts, until) {
+		return nil, false
+	}
+	raw, err := bson.Marshal(filter)
+	if err != nil {
+		return nil, false
+	}
+	db, coll := splitNS(ns)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var tc *tailCheck
+	if behind {
+		tc = r.startTailCheck(cctx, ns, got.ts, until)
+	}
+	cur, err := r.cold.Database(db).Collection(coll).Find(cctx, liveOnly(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw}),
+		options.Find().SetProjection(proj).SetBatchSize(10000))
+	if err != nil {
+		return nil, false
+	}
+	var archived []bson.Raw
+	for cur.Next(cctx) {
+		archived = append(archived, append(bson.Raw(nil), cur.Current...))
+	}
+	cerr := cur.Err()
+	_ = cur.Close(cctx)
+	if cerr != nil {
+		return nil, false
+	}
+	if behind && len(archived) > 0 {
+		ids := make(bson.A, 0, len(archived))
+		for _, d := range archived {
+			id, err := d.LookupErr("_id")
+			if err != nil {
+				return nil, false
+			}
+			ids = append(ids, id)
+		}
+		if touched, err := r.oplogTouchedWith(ctx, tc, ns, got.ts, until, ids, false); err != nil || touched {
+			return nil, false
+		}
+	}
+	return archived, true
+}

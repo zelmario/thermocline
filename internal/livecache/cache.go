@@ -87,8 +87,9 @@ type Cache struct {
 	// tiered says a namespace is tiered, and prove how much of the fast tier's
 	// answer for one is the whole answer's. See Tiers.
 	tiered func(ns string) bool
-	prove  ProveFunc
-	merge  MergeFunc
+	prove   ProveFunc
+	merge   MergeFunc
+	archive ArchiveFunc
 
 	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven atomic.Int64
 }
@@ -122,6 +123,16 @@ type MergeFunc func(ctx context.Context, ns string, eq bson.D, sort []SortKey, f
 func (c *Cache) Tiers(tiered func(ns string) bool, prove ProveFunc, merge MergeFunc) {
 	c.tiered, c.prove, c.merge = tiered, prove, merge
 }
+
+// ArchiveFunc reads, for a grouping on a tiered namespace, the documents of
+// the archive that filter takes, live ones only, with only proj's fields. ok
+// false means it cannot be told now: the archive's answer could hold a copy
+// the fast tier has since changed or deleted.
+type ArchiveFunc func(ctx context.Context, ns string, filter, proj bson.D) (docs []bson.Raw, ok bool)
+
+// GroupArchive lets groupings on tiered namespaces be filled. Called before
+// Run. See readGroup.
+func (c *Cache) GroupArchive(f ArchiveFunc) { c.archive = f }
 
 func (c *Cache) isTiered(ns string) bool {
 	return c.tiered != nil && c.tiered(ns)
@@ -563,7 +574,8 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 	}
 	// A range on a tiered namespace is not filled: the proof and the merge
 	// that complete a tiered entry are built for equalities. See proveFill.
-	if (len(q.Ranges) > 0 || q.Kind == KindGroup) && c.isTiered(q.NS) {
+	// A grouping is, from both tiers, once the router lets it. See readGroup.
+	if c.isTiered(q.NS) && (q.Kind == KindFind && len(q.Ranges) > 0 || q.Kind == KindGroup && c.archive == nil) {
 		c.mu.Unlock()
 		return nil, false
 	}
@@ -587,7 +599,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		c.Misses.Add(1)
 		// A count over a tiered namespace is over both tiers, which the fast
 		// tier's stream cannot keep (see read), so no fill is asked for.
-		if q.Kind == KindFind || !c.isTiered(q.NS) {
+		if q.Kind == KindFind || q.Kind == KindGroup || !c.isTiered(q.NS) {
 			c.requestFill(q)
 		}
 		return nil, false

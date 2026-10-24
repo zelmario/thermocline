@@ -148,6 +148,46 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 		_ = cur.Close(ctx)
 		return out, cur.Err() == nil
 	})
+	c.GroupArchive(func(ctx context.Context, _ string, filter, proj bson.D) ([]bson.Raw, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		cur, err := archive.Find(ctx, filter, options.Find().SetProjection(proj))
+		if err != nil {
+			return nil, false
+		}
+		var out []bson.Raw
+		for cur.Next(ctx) {
+			out = append(out, append(bson.Raw(nil), cur.Current...))
+		}
+		_ = cur.Close(ctx)
+		return out, cur.Err() == nil
+	})
+	// Groupings over both tiers, and their pipelines for asking the archive.
+	var pipes sync.Map
+	groupQ := func(r *rand.Rand) Query {
+		var p bson.A
+		switch r.Intn(3) {
+		case 0:
+			p = bson.A{bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$customer"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}},
+				{Key: "stock", Value: bson.D{{Key: "$sum", Value: "$stock"}}}}}}}
+		case 1:
+			cust := fmt.Sprintf("c%02d", customers+r.Intn(rare))
+			p = bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "customer", Value: cust}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: bson.D{{Key: "$hour", Value: "$at"}}}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+				bson.D{{Key: "$sort", Value: bson.D{{Key: "_id", Value: int32(1)}}}}}
+		default:
+			since := base.Add(time.Duration(r.Intn(4)*600) * time.Minute)
+			p = bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "at", Value: bson.D{{Key: "$gte", Value: since}}}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$status"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}},
+					{Key: "stock", Value: bson.D{{Key: "$sum", Value: "$stock"}}}}}}}
+		}
+		q, ok := ParseGroupAgg(ns, mustRaw(bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: p}, {Key: "cursor", Value: bson.D{}}}))
+		if !ok {
+			panic(fmt.Sprintf("not understood: %v", p))
+		}
+		pipes.Store(q.entryKey(), p)
+		return q
+	}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -355,6 +395,9 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 			r := rand.New(rand.NewSource(int64(100 + k)))
 			for time.Now().Before(deadline) {
 				c.Get(queries(r))
+				if r.Intn(4) == 0 {
+					c.Get(groupQ(r))
+				}
 				time.Sleep(time.Millisecond)
 			}
 		}(k)
@@ -394,9 +437,39 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 			}
 		}
 	}
+	// Groupings over both tiers, asked twice so a tiered entry, filled on its
+	// second miss, exists to be checked.
+	grouped := 0
+	for i := 0; i < 600; i++ {
+		q := groupQ(r)
+		got, hit := c.Get(q)
+		if !hit {
+			time.Sleep(20 * time.Millisecond)
+			if got, hit = c.Get(q); !hit {
+				continue
+			}
+		}
+		grouped++
+		p, _ := pipes.Load(q.entryKey())
+		mu.Lock()
+		real, err := db.RunCommand(ctx, bson.D{{Key: "aggregate", Value: "archive"}, {Key: "pipeline", Value: p}, {Key: "cursor", Value: bson.D{}}}).Raw()
+		mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if why := SameGroupAnswer(q, got, real); why != "" {
+			wrong++
+			if wrong <= 5 {
+				t.Errorf("%s: %s: cache %v, both tiers %v", q.entryKey(), why, got.Lookup("cursor", "firstBatch"), real.Lookup("cursor", "firstBatch"))
+			}
+		}
+	}
 	s := c.Stats()
-	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists) after, %d wrong; %d writer reads disagreed; stats %+v",
-		evicted, warmed, written, checked, lists, wrong, n, s)
+	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists, then %d groupings) after, %d wrong; %d writer reads disagreed; stats %+v",
+		evicted, warmed, written, checked, lists, grouped, wrong, n, s)
+	if grouped < 100 {
+		t.Errorf("only %d groupings came from the cache, too few to say anything", grouped)
+	}
 	if evicted < 500 || warmed < 200 {
 		t.Errorf("the tiering hardly moved (%d evicted, %d copied up), so this proves little", evicted, warmed)
 	}

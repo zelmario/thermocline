@@ -709,6 +709,7 @@ func (r *Router) Listen(ctx context.Context) error {
 	if r.cfg.LiveCache.Enabled {
 		r.live = livecache.New(r.cfg.LiveCache.MaxBytes)
 		r.live.Tiers(r.cfg.Manages, r.liveProve, r.liveMerge)
+		r.live.GroupArchive(r.liveArchive)
 		r.live.SetMaxStaleness(r.cfg.LiveCache.MaxStaleness.D())
 		if p := r.cfg.LiveCache.VerifyLog; p != "" {
 			r.liveVerify = &liveVerifier{path: p}

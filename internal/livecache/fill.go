@@ -231,7 +231,7 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 		return out
 	}
 	tiered := c.isTiered(q.NS)
-	if tiered && q.Kind != KindFind {
+	if tiered && q.Kind != KindFind && q.Kind != KindGroup {
 		// A count over a tiered namespace is over both tiers, and the fast
 		// tier's stream cannot keep one: a copy-up is an insert of a document
 		// that was already counted.
@@ -552,6 +552,57 @@ func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, 
 	if err := cur.Err(); err != nil {
 		out.why = "group: " + err.Error()
 		return out
+	}
+	if c.isTiered(q.NS) {
+		return c.withArchive(ctx, out, filter, proj)
+	}
+	out.complete, out.ok = true, true
+	return out
+}
+
+// withArchive completes a grouping on a tiered namespace with the archive's
+// documents: the fast tier's copy of a document wins, since it is the newer,
+// and every other document the $match takes is the archive's.
+//
+// The entry then stays exact by the rules every tiered entry keeps. A copy-up
+// arrives as an insert of a document it already holds, which replaces that
+// document's part; a document the application changes is copied up first, so
+// its new state arrives too; and any delete of a document it holds drops it,
+// because an eviction is a delete of a document that still exists. What the
+// stream cannot see, the archive changing under it, is bounded by tieredTTL.
+func (c *Cache) withArchive(ctx context.Context, out fillResult, filter, proj bson.D) fillResult {
+	if c.archive == nil {
+		out.unproven, out.ok = true, true
+		return out
+	}
+	archived, ok := c.archive(ctx, out.f.q.NS, filter, proj)
+	if !ok {
+		out.unproven, out.ok = true, true
+		out.docs = nil
+		return out
+	}
+	have := make(map[string]bool, len(out.docs))
+	for _, d := range out.docs {
+		if id, ok := docKey(d); ok {
+			have[id] = true
+		}
+	}
+	for _, d := range archived {
+		id, ok := docKey(d)
+		if !ok {
+			out.why = "group: an archived document has no _id"
+			out.docs = nil
+			return out
+		}
+		if have[id] {
+			continue
+		}
+		if len(out.docs) == maxGroupDocs {
+			out.why = "group: the $match takes more documents than an entry remembers"
+			out.docs = nil
+			return out
+		}
+		out.docs = append(out.docs, d)
 	}
 	out.complete, out.ok = true, true
 	return out
