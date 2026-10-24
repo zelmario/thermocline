@@ -1,0 +1,32 @@
+# Thermocline's case in YCSB terms: the active data is the newest data, and
+# it moves as records are inserted.
+#
+# requestdistribution=latest picks keys zipfian over recency, so the hot set
+# follows the inserts. hotspot would pin it to a fixed low key range that never
+# moves, which is not how an application's data ages. Run uniform as well, as
+# the control: every key equally likely is the honest worst case.
+#
+# insertorder=ordered with zeropadding makes the key carry its number in an
+# order mongod's _id index keeps, so datehistory.js can date the loaded
+# history by key and scans read a range of consecutive records.
+
+workload=site.ycsb.workloads.CoreWorkload
+recordcount=1000000
+operationcount=10000000
+
+fieldcount=10
+fieldlength=100
+
+readallfields=true
+readproportion=0.85
+updateproportion=0.10
+insertproportion=0.05
+scanproportion=0
+readmodifywriteproportion=0
+
+requestdistribution=latest
+insertorder=ordered
+zeropadding=12
+
+maxscanlength=100
+scanlengthdistribution=uniform
