@@ -21,7 +21,7 @@
 #   docker exec thermocline-zelmar-node0 sh -c \
 #     "sed 's/^  listen:/  terminate_auth: true\n  listen:/' /root/cline.yaml > /root/cline_chaos_ta.yaml"
 #   CFG=/root/cline_chaos_ta.yaml bash test/testchaos.sh
-NODE=thermocline-zelmar-node0
+NODE=${NODE:-thermocline-zelmar-node0}
 CFG=${CFG:-/root/cline.yaml}
 NS=tprobe
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
@@ -37,8 +37,8 @@ C() { docker exec $NODE mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
 CLINE() { docker exec $NODE cline "$@"; }
 nodeFor() {
   for n in 0 1 2 3 4 5; do
-    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' thermocline-zelmar-node$n 2>/dev/null)
-    [ "$ip" = "$1" ] && { echo "thermocline-zelmar-node$n"; return; }
+    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${NODE%0}$n 2>/dev/null)
+    [ "$ip" = "$1" ] && { echo "${NODE%0}$n"; return; }
   done
 }
 feederUp() { docker exec -d $NODE cline feeder --config $CFG --log-file /var/log/cline/chaos_f.log; }

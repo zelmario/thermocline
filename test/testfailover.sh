@@ -19,7 +19,7 @@
 # here looks identical to one that never ran. So only writes MongoDB itself
 # deduplicates are replayed, and this checks both halves, that the write
 # succeeds and that it was applied exactly once.
-NODE=thermocline-zelmar-node0
+NODE=${NODE:-thermocline-zelmar-node0}
 BASE=/root/cline.yaml
 FOCFG=/root/cline_fo.yaml
 HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}

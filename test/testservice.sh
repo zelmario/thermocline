@@ -155,6 +155,9 @@ LR=$(N "logrotate -d /root/clinelogrotate 2>&1 | grep -c '^error:'" | tr -d '\n'
 chk "the logrotate file parses clean"             "0" "$LR"
 
 echo "== the feeder as a service =="
+# Emptied first, so what is read from it below is this run's: the wait for the
+# change stream to open looks for a line an earlier run also wrote.
+N "rm -f /var/log/cline/cline.log" >/dev/null 2>&1
 N "systemctl enable --now cline-feeder" >/dev/null 2>&1
 for _ in $(seq 1 30); do [ "$(active cline-feeder)" = "active" ] && break; sleep 1; done
 chk "the feeder is active"                        "active" "$(active cline-feeder)"
@@ -167,6 +170,15 @@ for _ in $(seq 1 20); do
 done
 chk "and can write the log the config names"      "true" \
     "$([ "$SZ" -gt 0 ] 2>/dev/null && echo true || echo false)"
+# Written to only once the change stream is open. A non-empty log says the
+# daemon started, not that it is mirroring: the first lines are the version
+# checks, and an insert made then is before the stream and never mirrored. On
+# the Docker test box the insert won that race, and "it is really mirroring"
+# read 0 with a feeder that mirrored everything after it.
+for _ in $(seq 1 30); do
+  N "grep -q 'msg=mirroring' /var/log/cline/cline.log" && break
+  sleep 1
+done
 H "db.getSiblingDB('$DB').orders.insertOne({k:1, x:'before'})" >/dev/null
 for _ in $(seq 1 30); do
   GOT=$(C "print(db.getSiblingDB('$DB').orders.countDocuments({k:1}))")

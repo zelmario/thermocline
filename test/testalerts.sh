@@ -17,7 +17,9 @@
 # So the rules are extracted from the document itself rather than copied here.
 # A copy would drift, and the copy is not what anyone deploys.
 NODE=${NODE:-thermocline-zelmar-node0}
-NET=${NET:-thermocline-zelmar-anydbver}
+# The node's own network, asked rather than named: anydbver names it after the
+# user who built the cluster, so the name written here was one machine's.
+NET=${NET:-$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$NODE" 2>/dev/null)}
 IMAGE=${IMAGE:-prom/prometheus:v2.53.5}
 PORT=${PORT:-27100}
 PDASH=${PDASH:-27110}
