@@ -288,6 +288,7 @@ func (reg *cursorRegistry) closeAll(ctx context.Context) {
 // promoted or an ordinary archive read is not known until the answer is in
 // hand, and the two are different numbers an operator watches. See Class.
 func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, coll string, count bool) (*wire.Message, error) {
+	prepFrom := time.Now()
 	cmd, err := msg.CommandDoc()
 	if err != nil {
 		return nil, err
@@ -317,6 +318,7 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// rather than waiting for every write to be mirrored, and asks the archive
 	// for it at the same time. See pointfresh.go.
 	if c.archivePoint != nil {
+		c.r.Metrics.RecordStage(stagePointPrep, time.Since(prepFrom))
 		if out, ok := c.pointReadInParallel(ctx, msg, db, coll, *c.archivePoint, rewritten, batchSize, budget, count); ok {
 			return out, nil
 		}

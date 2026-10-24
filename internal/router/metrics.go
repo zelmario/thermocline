@@ -175,7 +175,8 @@ func (m *Metrics) Record(cls Class, d time.Duration) {
 // fold in with everything else, so it gets a histogram of its own.
 // stageNames are the parts of a read timed on their own, so a latency can be
 // split into what each tier and step cost. See RecordStage.
-var stageNames = [...]string{"merge_total", "merge_archive", "fam_match", "fam_hold", "fam_copyup"}
+var stageNames = [...]string{"merge_total", "merge_archive", "fam_match", "fam_hold", "fam_copyup",
+	"point_total", "point_fast", "point_prep", "point_archive", "point_check"}
 
 // RecordStage adds one timing of stage i, an index into stageNames.
 func (m *Metrics) RecordStage(i int, d time.Duration) {
@@ -199,6 +200,15 @@ const (
 	stageFamMatch
 	stageFamHold
 	stageFamCopyUp
+	// A read by _id the fast tier did not hold, answered from the archive:
+	// all of it, the fast tier's empty answer and the guards before it, the
+	// archive's preparation (superset, collation, hint), the archive read and
+	// the oplog check run beside it. See pointfresh.go.
+	stagePointTotal
+	stagePointFast
+	stagePointPrep
+	stagePointArchive
+	stagePointCheck
 )
 
 func (m *Metrics) RecordWait(d time.Duration) {

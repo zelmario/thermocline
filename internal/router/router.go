@@ -976,6 +976,9 @@ type conn struct {
 	// the archive for, set only around that call, so answerFromArchive can ask
 	// the oplog instead of waiting. See pointfresh.go.
 	archivePoint *bson.RawValue
+	// cmdStarted is when the command in flight arrived, for the stage timings
+	// of a read whose parts are spread over several functions.
+	cmdStarted time.Time
 
 	// cls is how the command in flight was served. Every path that does
 	// something other than hand the command to the fast tier sets it, and pump
@@ -1121,6 +1124,7 @@ func (c *conn) pump(ctx context.Context) error {
 		// Timed around the whole exchange, so what is recorded is what the
 		// client waited for and not what the router thinks it did.
 		started := time.Now()
+		c.cmdStarted = started
 		c.cls = classOf(msg)
 		err = c.handle(ctx, msg)
 		c.r.Metrics.Record(c.cls, time.Since(started))

@@ -100,7 +100,6 @@ func (r *Router) windowCheckable(ctx context.Context, from, until bson.Timestamp
 	return cur.Err() == nil && n <= windowMaxEntries
 }
 
-
 // pointReadInParallel answers a read of one document by _id from the archive
 // with the oplog check and the archive read run at the same time. ok false
 // means the check did not clear it, or the read was not one batch, and the
@@ -121,7 +120,13 @@ func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, c
 		return nil, false
 	}
 	fresh := make(chan bool, 1)
-	go func() { fresh <- c.r.noDeletePendingIn(ctx, ns, id, from, until) }()
+	go func() {
+		t := time.Now()
+		ok := c.r.noDeletePendingIn(ctx, ns, id, from, until)
+		c.r.Metrics.RecordStage(stagePointCheck, time.Since(t))
+		fresh <- ok
+	}()
+	ta := time.Now()
 	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, withRemainingTime(rewritten, budget, 0))
 	var batch bson.A
 	more := false
@@ -129,6 +134,7 @@ func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, c
 		batch, more, err = readBatch(ctx, cur, batchSize)
 		_ = cur.Close(ctx)
 	}
+	c.r.Metrics.RecordStage(stagePointArchive, time.Since(ta))
 	if !<-fresh || err != nil || more {
 		return nil, false
 	}
