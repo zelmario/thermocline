@@ -84,8 +84,10 @@ echo "quick: $N suite(s) on $W worker(s): $SUITES"
 
 make -s build >/dev/null || exit 2
 put bin/cline test/psweep.sh test/mkworker.sh test/fuzz.js "$BOX:/tmp/" || exit 2
-for s in $SUITES; do put "test/$s.sh" "$BOX:/tmp/" || exit 2; done
-FILES="psweep.sh mkworker.sh fuzz.js $(printf '%s.sh ' $SUITES)"
+# A part, suite@n, is a run of the suite's own file.
+SFILES=$(printf '%s\n' $SUITES | sed 's/@.*//' | sort -u)
+for s in $SFILES; do put "test/$s.sh" "$BOX:/tmp/" || exit 2; done
+FILES="psweep.sh mkworker.sh fuzz.js $(printf '%s.sh ' $SFILES)"
 rsh "set -e
   docker exec $NODE sh -c 'pgrep -f \"[p]sweep.sh\" >/dev/null' && { echo 'quick: a sweep is already running in $NODE'; exit 3; }
   docker cp /tmp/cline $NODE:/usr/local/bin/cline
