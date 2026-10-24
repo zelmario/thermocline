@@ -753,29 +753,60 @@ func SameGroupAnswer(q Query, cached, real bson.Raw) string {
 	if len(cb) != len(rb) {
 		return "length"
 	}
+	sums := map[string]bool{}
+	for _, a := range q.Group.Accs {
+		sums[a.Name] = true
+	}
 	for i := range rb {
 		for _, k := range q.Group.Sort {
-			x, y := cb[i].Lookup(k.Field), rb[i].Lookup(k.Field)
-			if x.Type != y.Type || !bytesEqual(x.Value, y.Value) {
+			if !sameOutput(cb[i].Lookup(k.Field), rb[i].Lookup(k.Field), sums[k.Field]) {
 				return "sort order"
 			}
 		}
 	}
-	ks := func(b []bson.Raw) []string {
-		out := make([]string, len(b))
-		for i, d := range b {
-			out[i] = string(d)
-		}
-		sort.Strings(out)
-		return out
+	byID := make(map[string]bson.Raw, len(rb))
+	for _, d := range rb {
+		id := d.Lookup("_id")
+		byID[string(append([]byte{byte(id.Type)}, id.Value...))] = d
 	}
-	c, r := ks(cb), ks(rb)
-	for i := range c {
-		if c[i] != r[i] {
+	for _, d := range cb {
+		id := d.Lookup("_id")
+		r, ok := byID[string(append([]byte{byte(id.Type)}, id.Value...))]
+		if !ok {
 			return "documents"
+		}
+		ce, err1 := d.Elements()
+		re, err2 := r.Elements()
+		if err1 != nil || err2 != nil || len(ce) != len(re) {
+			return "documents"
+		}
+		for j := range ce {
+			if ce[j].Key() != re[j].Key() || !sameOutput(ce[j].Value(), re[j].Value(), sums[ce[j].Key()]) {
+				return "documents"
+			}
 		}
 	}
 	return ""
+}
+
+// sameOutput compares one field of a group's output. A sum of doubles may be
+// one unit in the last place from mongod's and still be an answer mongod
+// gives: mongod's own $sum of doubles changes with the order it reads the
+// documents in, when the exact total lies near halfway between two doubles.
+// Measured on 8.0.26: of 2,000 groups of 15 prices, 63 gave a total other
+// than the exact one rounded once, every one within 0.08 of a unit of the
+// halfway point; and 45 of 60 such groups, inserted again in eight shuffled
+// orders, came back with both neighbouring doubles. The cache keeps the exact
+// total, which is what most orders give.
+func sameOutput(x, y bson.RawValue, sum bool) bool {
+	if x.Type == y.Type && bytesEqual(x.Value, y.Value) {
+		return true
+	}
+	if !sum || x.Type != bson.TypeDouble || y.Type != bson.TypeDouble {
+		return false
+	}
+	a, b := x.Double(), y.Double()
+	return math.Nextafter(a, b) == b
 }
 
 func batchOfRaw(reply bson.Raw) ([]bson.Raw, bool) {

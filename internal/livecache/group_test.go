@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -219,4 +220,35 @@ func i32(n int32) []byte {
 func i64(n int64) []byte {
 	_, b, _ := bson.MarshalValue(n)
 	return b
+}
+
+// A double total one unit in the last place from mongod's is an answer mongod
+// gives too; anything else is not.
+func TestSameGroupAnswerRounding(t *testing.T) {
+	q, ok := ParseGroupAgg("s.p", mustRaw(bson.D{{Key: "aggregate", Value: "p"}, {Key: "pipeline", Value: bson.A{
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$category"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}},
+			{Key: "value", Value: bson.D{{Key: "$sum", Value: "$price"}}}}}}}}, {Key: "cursor", Value: bson.D{}}}))
+	if !ok {
+		t.Fatal("not understood")
+	}
+	reply := func(id any, n int32, v float64) bson.Raw {
+		return mustRaw(bson.D{{Key: "cursor", Value: bson.D{{Key: "id", Value: int64(0)}, {Key: "ns", Value: "s.p"},
+			{Key: "firstBatch", Value: bson.A{bson.D{{Key: "_id", Value: id}, {Key: "n", Value: n}, {Key: "value", Value: v}}}}}}, {Key: "ok", Value: 1.0}})
+	}
+	real := reply("c1", 3, 65675.4)
+	for _, c := range []struct {
+		name string
+		got  bson.Raw
+		same bool
+	}{
+		{"identical", reply("c1", 3, 65675.4), true},
+		{"a sum one unit up", reply("c1", 3, math.Nextafter(65675.4, 1e9)), true},
+		{"a sum two units up", reply("c1", 3, math.Nextafter(math.Nextafter(65675.4, 1e9), 1e9)), false},
+		{"a different count", reply("c1", 4, 65675.4), false},
+		{"another group", reply("c2", 3, 65675.4), false},
+	} {
+		if why := SameGroupAnswer(q, c.got, real); (why == "") != c.same {
+			t.Errorf("%s: %q, want same=%v", c.name, why, c.same)
+		}
+	}
 }
