@@ -62,12 +62,18 @@ type tieredRead struct {
 	// eleven, and the getMores after that were forwarded unchecked while the
 	// evictor narrowed the claim under them.
 	used time.Time
-	// pinned is a cursor opened with noCursorTimeout, which mongod never
-	// times out: reaped after ten idle minutes, its later getMores went to the
-	// fast tier unchecked. It is forgotten when it is drained or killed, as
-	// mongod forgets it.
+	// pinned is a cursor opened with noCursorTimeout, which mongod does not
+	// time out: reaped after ten idle minutes, its later getMores went to the
+	// fast tier unchecked. It is forgotten when it is drained or killed, or
+	// when the session it was opened in would have expired. See pinnedIdle.
 	pinned bool
 }
+
+// pinnedIdle is mongod's default logical session timeout,
+// localLogicalSessionTimeoutMinutes. A noCursorTimeout cursor is still killed
+// when its session expires, so one abandoned without killCursors is forgotten
+// then rather than kept for the life of the router.
+const pinnedIdle = 30 * time.Minute
 
 // tieredCursors remembers them, per router.
 //
@@ -259,12 +265,16 @@ func (reg *tieredCursors) reapIdle(idle time.Duration) {
 	cut := time.Now().Add(-idle)
 	reg.mu.Lock()
 	for id, r := range reg.by {
-		if r.pinned {
-			continue
-		}
 		last := r.used
 		if r.at.After(last) {
 			last = r.at
+		}
+		if r.pinned {
+			// mongod keeps it until the session it was opened in expires.
+			if last.Before(time.Now().Add(-pinnedIdle)) {
+				delete(reg.by, id)
+			}
+			continue
 		}
 		if last.Before(cut) {
 			delete(reg.by, id)

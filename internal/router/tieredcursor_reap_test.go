@@ -31,9 +31,14 @@ func TestTieredCursorIdlesFromItsLastUse(t *testing.T) {
 // the fast tier unchecked.
 func TestTieredCursorWithNoTimeoutIsKept(t *testing.T) {
 	var reg tieredCursors
-	reg.add(1, tieredRead{at: time.Now().Add(-time.Hour), pinned: true})
+	reg.add(1, tieredRead{at: time.Now().Add(-20 * time.Minute), pinned: true})
+	reg.add(2, tieredRead{at: time.Now().Add(-time.Hour), pinned: true})
 	reg.reapIdle(10 * time.Minute)
 	if _, ok := reg.get(1); !ok {
-		t.Error("a noCursorTimeout cursor idle for an hour was reaped")
+		t.Error("a noCursorTimeout cursor idle for twenty minutes was reaped")
+	}
+	// Past the session timeout mongod has killed it too.
+	if _, ok := reg.get(2); ok {
+		t.Error("a noCursorTimeout cursor idle for an hour was kept past its session")
 	}
 }

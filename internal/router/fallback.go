@@ -252,7 +252,11 @@ func (reg *cursorRegistry) reapIdle(ctx context.Context, idle time.Duration) {
 	var dead []*archiveCursor
 	reg.mu.Lock()
 	for id, ac := range reg.open {
-		if !ac.pinned && time.Since(ac.lastUsed) > idle {
+		limit := idle
+		if ac.pinned {
+			limit = pinnedIdle
+		}
+		if time.Since(ac.lastUsed) > limit {
 			dead = append(dead, ac)
 			delete(reg.open, id)
 		}
