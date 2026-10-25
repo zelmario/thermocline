@@ -138,14 +138,23 @@ func runBackfill(args []string) error {
 
 	marks := watermark.New(cold)
 	var totalCopied, totalMarked, totalRefused int64
+	// Every namespace whose copy, lease or marking failed. finishBackfill
+	// moves the checkpoint to the time of this copy, and it used to whatever
+	// happened here: the updates a failed namespace missed were then never
+	// mirrored, and deletes left unmarked came back as live documents, with
+	// exit status 0.
+	failed := 0
 	for _, ns := range namespaces {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
+			fmt.Printf("  %-40s is not db.collection, so nothing was done\n", ns)
+			failed++
 			continue
 		}
 		copied, refused, alreadyMarked, refusalWhy, cerr := backfillDocuments(ctx, hot, cold, db, coll, *apply)
 		if cerr != nil {
 			fmt.Printf("  %-40s could not be copied: %v\n", ns, cerr)
+			failed++
 			continue
 		}
 		totalCopied += copied
@@ -182,12 +191,16 @@ func runBackfill(args []string) error {
 			r, lerr := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
 			if lerr != nil {
 				fmt.Printf("  %-40s deletes not marked: %v\n", ns, lerr)
+				failed++
 				continue
 			}
 			release = r
 		}
-		marked, why := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
+		marked, why, dfailed := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
 		release()
+		if dfailed {
+			failed++
+		}
 		totalMarked += marked
 		verb := "would copy"
 		if *apply {
@@ -199,6 +212,11 @@ func runBackfill(args []string) error {
 	fmt.Println()
 	if *apply {
 		fmt.Printf("Copied %d document(s) into the archive and marked %d as deleted.\n", totalCopied, totalMarked)
+		if failed > 0 {
+			fmt.Printf("%d namespace(s) above were not done, so the gap is not closed and the checkpoint\n"+
+				"is left where it was. Fix what each line says and run this again.\n", failed)
+			return fmt.Errorf("%d namespace(s) were not backfilled", failed)
+		}
 		return finishBackfill(ctx, cold, cfg, *nsFlag, *clearCP, markingHeld, totalRefused, replayFrom)
 	}
 	fmt.Printf("Would copy %d document(s) into the archive and mark %d as deleted.\n", totalCopied, totalMarked)
@@ -371,22 +389,25 @@ func firstLine(s string) string {
 // The claim is read in the dimension the rules tier by, which is the same field
 // every completeness decision is made in. Reading it in any other would compare
 // a bound against a different clock.
+//
+// The third result says the look failed, as against finding nothing to mark,
+// so the caller does not close a gap this left open.
 func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.Store,
-	hot, cold *mongo.Client, ns, db, coll string, apply, held bool) (int64, string) {
+	hot, cold *mongo.Client, ns, db, coll string, apply, held bool) (int64, string, bool) {
 
 	if held {
-		return 0, "no deletes looked for: a feeder is still publishing"
+		return 0, "no deletes looked for: a feeder is still publishing", false
 	}
 	mark, err := marks.Load(ctx, ns)
 	if err != nil {
-		return 0, fmt.Sprintf("could not read the completeness claim: %v", err)
+		return 0, fmt.Sprintf("could not read the completeness claim: %v", err), true
 	}
 	if !mark.Claimed {
-		return 0, "no deletes looked for: nothing claims the fast tier is complete for any range of it"
+		return 0, "no deletes looked for: nothing claims the fast tier is complete for any range of it", false
 	}
 	field, ok := cfg.Router.AgeField(ns)
 	if !ok {
-		return 0, "no deletes looked for: no rule says which field this namespace ages by"
+		return 0, "no deletes looked for: no rule says which field this namespace ages by", false
 	}
 
 	// The claim's own dimension. An empty field name means the timestamp inside
@@ -407,7 +428,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	cur, err := cold.Database(db).Collection(coll).Find(ctx, filter,
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}}))
 	if err != nil {
-		return 0, fmt.Sprintf("could not read the archive for deletes: %v", err)
+		return 0, fmt.Sprintf("could not read the archive for deletes: %v", err), true
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
@@ -422,16 +443,16 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	// that has not been warmed is one line away from that.
 	inFast, ferr := src.CountDocuments(ctx, inRange)
 	if ferr != nil {
-		return 0, fmt.Sprintf("could not read the fast tier for the claimed range: %v", ferr)
+		return 0, fmt.Sprintf("could not read the fast tier for the claimed range: %v", ferr), true
 	}
 	inCold, cerr := cold.Database(db).Collection(coll).CountDocuments(ctx, filter)
 	if cerr != nil {
-		return 0, fmt.Sprintf("could not read the archive for the claimed range: %v", cerr)
+		return 0, fmt.Sprintf("could not read the archive for the claimed range: %v", cerr), true
 	}
 	if inCold > 0 && inFast == 0 {
 		return 0, fmt.Sprintf("no deletes marked: the claim says the fast tier holds this range in full "+
 			"and it holds none of it, so the claim is wrong rather than the archive; "+
-			"withdraw it with cline watermark --ns %s --clear, or warm the range first", ns)
+			"withdraw it with cline watermark --ns %s --clear, or warm the range first", ns), false
 	}
 
 	// And the softer half of the same doubt. A claim can be wrong without being
@@ -462,13 +483,13 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 		candidates = append(candidates, bson.RawValue{Type: id.Type, Value: append([]byte(nil), id.Value...)})
 	}
 	if cerr := cur.Err(); cerr != nil {
-		return 0, fmt.Sprintf("stopped reading the archive: %v", cerr)
+		return 0, fmt.Sprintf("stopped reading the archive: %v", cerr), true
 	}
 
 	if inCold > 0 && float64(len(candidates)) > mostOfIt*float64(inCold) {
 		return 0, fmt.Sprintf("no deletes marked: %d of the %d live documents the archive holds in the "+
 			"claimed range are missing from the fast tier, which is most of it and not the shape of a "+
-			"feeder's gap; check the claim before trusting it", len(candidates), inCold)
+			"feeder's gap; check the claim before trusting it", len(candidates), inCold), false
 	}
 
 	for _, id := range candidates {
@@ -476,7 +497,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 		if apply {
 			if _, uerr := dst.UpdateOne(ctx,
 				bson.D{{Key: "_id", Value: id}}, meta.Tombstone(now)); uerr != nil {
-				return marked, fmt.Sprintf("could not mark %s: %v", id.String(), uerr)
+				return marked, fmt.Sprintf("could not mark %s: %v", id.String(), uerr), true
 			}
 		}
 	}
@@ -485,7 +506,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	if apply {
 		verb = "marked"
 	}
-	return marked, fmt.Sprintf("%s %d deleted in the claimed range", verb, marked)
+	return marked, fmt.Sprintf("%s %d deleted in the claimed range", verb, marked), false
 }
 
 // finishBackfill replaces the feeder's checkpoint, or says why it did not.

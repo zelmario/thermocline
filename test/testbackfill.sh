@@ -156,6 +156,13 @@ chk "clearing the checkpoint is refused after --ns"   "true" \
 chk "and the checkpoint is still there"               "1" \
     "$(M $COLDPORT 'print(db.getSiblingDB("_thermocline").checkpoints.countDocuments({_id:"bf"}))')"
 
+# A namespace this could not do is a failure, not a pass that copied nothing:
+# the closing step moves the checkpoint past the gap, and it did so whatever
+# had failed, with status 0.
+BAD=$("$BIN" backfill --config "$DIR/bf.yaml" --ns orders --apply 2>&1); BADRC=$?
+chk "a namespace it could not do fails the command"   "1 true" \
+    "$BADRC $(grep -q 'were not backfilled' <<<"$BAD" && echo true || echo false)"
+
 echo "== and then applied =="
 APPLIED=$("$BIN" backfill --config "$DIR/bf.yaml" --apply --clear-checkpoint 2>&1)
 chk "it replaced the checkpoint itself"               "true" \
