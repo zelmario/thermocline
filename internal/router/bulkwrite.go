@@ -572,7 +572,10 @@ func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Ra
 				results = append(results, r)
 			}
 		}
-		c.pendingKeys = append(c.pendingKeys, claimed...)
+		// Settled here: a guard's answer does not pass the reply settle in
+		// handle, and the claims of a statement left out, or of one the fast
+		// tier refused, would stay until the next writer took them over.
+		c.r.releaseUnheld(ctx, claimed)
 	}
 
 	nErrors, _ := intOf(up.Lookup("nErrors"))

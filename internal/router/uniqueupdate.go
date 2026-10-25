@@ -696,7 +696,10 @@ func (c *conn) applyOthers(ctx context.Context, msg *wire.Message, cmd bson.Raw,
 			out.Header.ResponseTo = msg.Header.RequestID
 			return out, true
 		}
-		c.pendingKeys = append(c.pendingKeys, claimed...)
+		// Settled here: a guard's answer does not pass the reply settle in
+		// handle, and the claims of a statement left out, or of one the fast
+		// tier refused, would stay until the next writer took them over.
+		c.r.releaseUnheld(ctx, claimed)
 	}
 	out, err := c.r.updateMergedReply(msg, ns, up, keepAt, clashes, ordered)
 	if err != nil {
