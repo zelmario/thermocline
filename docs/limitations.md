@@ -286,7 +286,7 @@ Part of [Thermocline](../README.md).
   documented recovery, does not have the document at all, because its copy reads
   as deleted.
 
-  Every write command that can leave one is refused: an insert, a replacement
+  Every write command that names one is refused: an insert, a replacement
   document, `findAndModify`, a pipeline update, and an update by **any**
   operator that names the field. Any, rather than a list of the likely ones,
   because the predicate that hides a document is `{$exists: false}` and a field
@@ -335,6 +335,18 @@ Part of [Thermocline](../README.md).
   application's schema colliding with this system's, it will recur on every
   batch until the field is renamed, and a partial success would let a bulk load
   report progress while quietly dropping the same document every time.
+
+  **A pipeline update that builds the new document from data is not read.**
+  `$replaceWith`, `$replaceRoot` and `$mergeObjects` are read where their
+  arguments are literal documents, `$literal` or `$setField`, which is how a
+  pipeline names the fields it writes. A field path or another expression
+  builds its keys from the document itself, so `[{$replaceWith: {$mergeObjects:
+  ["$$ROOT", "$payload"]}}]` lifts a nested `payload._tcDeletedAt`, which an
+  insert is allowed to carry, to the top level, and the document then reads as
+  deleted in the archive. Refusing every expression that can evaluate to a
+  document would refuse most pipelines that legitimately write one. The
+  feeder's warning names the collection when it mirrors such a document, and
+  `cline preflight` counts them.
 
   **One path is not covered**, and it follows from that split: a `$merge` into a
   tiered collection, of documents that already carry the field, taken from a
