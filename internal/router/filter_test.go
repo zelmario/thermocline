@@ -270,9 +270,12 @@ func TestLowerTimeBoundReadsEqAndIn(t *testing.T) {
 		{"$in of dates", bson.D{
 			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{later, when}}}}}, true,
 			"bounded at its earliest member"},
-		{"$in of ObjectIds", bson.D{
-			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{oid}}}}}, true,
-			"an ObjectId carries its own instant"},
+		{"$in of ObjectIds on a date field", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{oid}}}}}, false,
+			"the claim covers dates; a document whose createdAt is an ObjectId is outside it"},
+		{"a range of ObjectIds on a date field", bson.D{
+			{Key: "createdAt", Value: bson.D{{Key: "$gte", Value: oid}}}}, false,
+			"the same, as a range"},
 		{"$in with one that is not an instant", bson.D{
 			{Key: "createdAt", Value: bson.D{{Key: "$in", Value: bson.A{when, "yesterday"}}}}}, false,
 			"that member matches documents outside the date bracket, which no claim covers"},
@@ -336,5 +339,19 @@ func TestLowerTimeBoundStopsDescending(t *testing.T) {
 	// recurse. The assertion is that this completes at all.
 	if _, ok := lowerTimeBound(rawDoc(t, nest(filterDepthLimit+50)), "createdAt", true); ok {
 		t.Error("a bound past the depth limit was read")
+	}
+}
+
+// A rule with no date_field ages by the ObjectId inside _id, and claims only
+// ObjectIds. A date bound on _id matches documents whose _id is a date, which
+// that claim does not cover.
+func TestLowerTimeBoundOnIDTakesObjectIDsOnly(t *testing.T) {
+	when := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	oid := bson.NewObjectIDFromTimestamp(when)
+	if got, ok := lowerTimeBound(rawDoc(t, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: oid}}}}), "", true); !ok || !got.Equal(when) {
+		t.Errorf("an ObjectId bound on _id read as %v, %v; want %v", got, ok, when)
+	}
+	if _, ok := lowerTimeBound(rawDoc(t, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: when}}}}), "", true); ok {
+		t.Error("a date bound on _id was read as bounded, outside what an _id rule claims")
 	}
 }

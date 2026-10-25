@@ -190,7 +190,7 @@ func boundInFilter(filter bson.Raw, ageField string, known bool, depth int) (tim
 		if e.Key() != want {
 			continue
 		}
-		if t, ok := boundOf(e.Value()); ok {
+		if t, ok := boundOf(e.Value(), ageType(ageField)); ok {
 			take(t)
 		}
 	}
@@ -227,13 +227,30 @@ func earliestBranchBound(val bson.RawValue, ageField string, known bool, depth i
 	return earliest, true
 }
 
-// boundOf reads a lower bound from one filter value.
+// ageType is the BSON type a rule ages by: the date in date_field, or the
+// ObjectId of an _id when there is none.
+//
+// A bound of the other type is not a bound. mongod brackets a range by type,
+// and the claim covers the type its rule ages by: the evictor and the warmer
+// select dates for a date field and ObjectIds for _id. So {createdAt: {$gte:
+// ObjectId(...)}} read as a date bound inside the claim answered from the fast
+// tier, which holds none of the adopted documents whose createdAt is an
+// ObjectId, where MongoDB returns them.
+func ageType(ageField string) bson.Type {
+	if ageField == "" {
+		return bson.TypeObjectID
+	}
+	return bson.TypeDateTime
+}
+
+// boundOf reads a lower bound from one filter value, of the type the rule ages
+// by.
 //
 // Every operator here is one the document has to satisfy along with the others
 // beside it, so the latest of the bounds they give is the bound on the query.
-func boundOf(val bson.RawValue) (time.Time, bool) {
+func boundOf(val bson.RawValue, typ bson.Type) (time.Time, bool) {
 	// An exact ObjectId or date is its own lower bound.
-	if t, ok := timeOf(val); ok {
+	if t, ok := timeOf(val, typ); ok {
 		return t, true
 	}
 
@@ -259,7 +276,7 @@ func boundOf(val bson.RawValue) (time.Time, bool) {
 		if err != nil {
 			continue
 		}
-		if t, ok := timeOf(v); ok {
+		if t, ok := timeOf(v, typ); ok {
 			take(t)
 		}
 	}
@@ -269,7 +286,7 @@ func boundOf(val bson.RawValue) (time.Time, bool) {
 	// something else, and no claim about time covers those: MongoDB brackets a
 	// range predicate by type, and an equality list is not bracketed at all.
 	if v, err := doc.LookupErr("$in"); err == nil {
-		if t, ok := earliestOf(v); ok {
+		if t, ok := earliestOf(v, typ); ok {
 			take(t)
 		}
 	}
@@ -279,7 +296,7 @@ func boundOf(val bson.RawValue) (time.Time, bool) {
 
 // earliestOf reads the earliest instant from an $in list, or false when the
 // list is empty or holds anything that is not one.
-func earliestOf(val bson.RawValue) (time.Time, bool) {
+func earliestOf(val bson.RawValue, typ bson.Type) (time.Time, bool) {
 	arr, ok := val.ArrayOK()
 	if !ok {
 		return time.Time{}, false
@@ -290,7 +307,7 @@ func earliestOf(val bson.RawValue) (time.Time, bool) {
 	}
 	var earliest time.Time
 	for i, v := range vals {
-		t, ok := timeOf(v)
+		t, ok := timeOf(v, typ)
 		if !ok {
 			return time.Time{}, false
 		}
@@ -301,8 +318,11 @@ func earliestOf(val bson.RawValue) (time.Time, bool) {
 	return earliest, true
 }
 
-// timeOf reads an instant from an ObjectId or a date.
-func timeOf(val bson.RawValue) (time.Time, bool) {
+// timeOf reads an instant from an ObjectId or a date, of type typ only.
+func timeOf(val bson.RawValue, typ bson.Type) (time.Time, bool) {
+	if val.Type != typ {
+		return time.Time{}, false
+	}
 	switch val.Type {
 	case bson.TypeObjectID:
 		oid, ok := val.ObjectIDOK()
