@@ -29,7 +29,7 @@ func TestTouchTracker(t *testing.T) {
 	tr.advance(at(10), false)
 	tr.touch("update", "shop", "orders", val(int32(1)), at(12))
 	tr.touch("delete", "shop", "orders", val("gone"), at(13))
-	tr.advance(at(20), true)
+	tr.advanceIn(at(20), true, 1)
 
 	// rest is where the oplog has to take over; at or past until means none.
 	ask := func(name string, from, until uint32, deletesOnly, want, wantOK bool, wantRest bson.Timestamp, ids ...any) {
@@ -82,21 +82,21 @@ func TestLastWriteIn(t *testing.T) {
 	}
 
 	tr := newTouchTracker()
-	if _, ok := tr.lastWriteIn(short(), "shop", at(5)); ok {
+	if _, ok := tr.lastWriteIn(short(), "shop", at(5), 1); ok {
 		t.Fatal("answered before the tracker had a position")
 	}
-	tr.advance(at(10), true)
+	tr.advanceIn(at(10), true, 1)
 	tr.touch("insert", "shop", "orders", bson.RawValue{}, at(12))
 	tr.touch("insert", "other", "things", bson.RawValue{}, at(14))
-	tr.advance(at(15), true)
+	tr.advanceIn(at(15), true, 1)
 
-	if need, ok := tr.lastWriteIn(short(), "shop", at(15)); !ok || need != at(12) {
+	if need, ok := tr.lastWriteIn(short(), "shop", at(15), 1); !ok || need != at(12) {
 		t.Errorf("shop through 15: need %v ok %v, want the insert at 12", need, ok)
 	}
-	if need, ok := tr.lastWriteIn(short(), "quiet", at(15)); !ok || need != at(10) {
+	if need, ok := tr.lastWriteIn(short(), "quiet", at(15), 1); !ok || need != at(10) {
 		t.Errorf("a database with no write seen: need %v ok %v, want the tracker's start", need, ok)
 	}
-	if _, ok := tr.lastWriteIn(short(), "shop", at(16)); ok {
+	if _, ok := tr.lastWriteIn(short(), "shop", at(16), 1); ok {
 		t.Error("answered for a position the tracker has not read")
 	}
 
@@ -105,20 +105,31 @@ func TestLastWriteIn(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		need, _ := tr.lastWriteIn(ctx, "shop", at(20))
+		need, _ := tr.lastWriteIn(ctx, "shop", at(20), 1)
 		done <- need
 	}()
 	time.Sleep(10 * time.Millisecond)
 	tr.touch("update", "shop", "orders", bson.RawValue{}, at(18))
-	tr.advance(at(20), true)
+	tr.advanceIn(at(20), true, 1)
 	if need := <-done; need != at(18) {
 		t.Errorf("waited for 20: need %v, want the update at 18", need)
 	}
 
 	// Anything that may touch everything is a write to every database.
 	tr.touchAll(at(21))
-	tr.advance(at(22), true)
-	if need, _ := tr.lastWriteIn(short(), "quiet", at(22)); need != at(21) {
+	tr.advanceIn(at(22), true, 1)
+	if need, _ := tr.lastWriteIn(short(), "quiet", at(22), 1); need != at(21) {
 		t.Errorf("after a touch of everything: need %v, want 21", need)
+	}
+
+	// A position from another term is another history: the tracker read the
+	// old primary past where the new one's lastWrite stands, and has not read
+	// the new primary's writes.
+	if _, ok := tr.lastWriteIn(short(), "shop", at(22), 2); ok {
+		t.Error("answered for a position written in a term the tracker has not read")
+	}
+	tr.advanceIn(at(23), true, 2)
+	if _, ok := tr.lastWriteIn(short(), "shop", at(22), 2); !ok {
+		t.Error("refused once the tracker read the same term")
 	}
 }

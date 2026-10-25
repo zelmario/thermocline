@@ -417,8 +417,11 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time, db string)
 	}
 
 	// The newest write this read can see, when it can be had: the bar is then
-	// that write rather than everything up to now. See writesToWaitFor.
-	need, narrow := r.writesToWaitFor(ctx, db)
+	// that write rather than everything up to now. See writesToWaitFor. Asked
+	// only once the ordinary bar has not been met, so a read with mirroring
+	// already past it pays no hello.
+	var need uint64
+	narrow, asked := false, false
 
 	deadline := time.Now().Add(wait)
 	waitBegan := time.Now()
@@ -442,10 +445,14 @@ func (r *Router) waitForArchive(ctx context.Context, until time.Time, db string)
 		r.ckptCache.mu.Unlock()
 
 		got := r.mirroredThrough(ctx)
-		if narrow && got.known && got.ts.T != 0 && checkpoint.PackTS(got.ts) >= need {
+		if got.known && r.caughtUp(ctx, got, until, untilTS) {
 			return true
 		}
-		if got.known && r.caughtUp(ctx, got, until, untilTS) {
+		if !asked {
+			asked = true
+			need, narrow = r.writesToWaitFor(ctx, db)
+		}
+		if narrow && got.known && got.ts.T != 0 && checkpoint.PackTS(got.ts) >= need {
 			return true
 		}
 		// No checkpoint at all means nothing is mirroring. Waiting the full
@@ -562,6 +569,12 @@ func (r *Router) writesToWaitFor(ctx context.Context, db string) (need uint64, o
 	if err != nil {
 		return 0, false
 	}
+	// From the primary or not at all. The driver can still select a node that
+	// has stepped down, and its lastWrite is then older than writes the new
+	// primary has acknowledged to others.
+	if w, _ := raw.Lookup("isWritablePrimary").BooleanOK(); !w {
+		return 0, false
+	}
 	v, err := raw.LookupErr("lastWrite", "opTime", "ts")
 	if err != nil {
 		return 0, false
@@ -570,7 +583,11 @@ func (r *Router) writesToWaitFor(ctx context.Context, db string) (need uint64, o
 	if !ok || t == 0 {
 		return 0, false
 	}
-	return r.touches.lastWriteIn(hctx, db, checkpoint.PackTS(bson.Timestamp{T: t, I: i}))
+	term, ok := raw.Lookup("lastWrite", "opTime", "t").AsInt64OK()
+	if !ok {
+		return 0, false
+	}
+	return r.touches.lastWriteIn(hctx, db, checkpoint.PackTS(bson.Timestamp{T: t, I: i}), term)
 }
 
 // narrowBarrierTimeout bounds what writesToWaitFor spends before the read

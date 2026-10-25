@@ -82,6 +82,9 @@ type touchTracker struct {
 	// moved is closed and replaced every time applied moves, for a read
 	// waiting for the tracker to reach a position. See lastWriteIn.
 	moved chan struct{}
+	// term is the replica set term of the entry at applied, which says whose
+	// history the tracker has read. See lastWriteIn.
+	term int64
 }
 
 func newTouchTracker() *touchTracker {
@@ -106,9 +109,15 @@ func (t *touchTracker) startAt(at uint64) {
 // may be split across batches, nor for an empty poll's token, a mark one past
 // the last entry where a later write can land.
 func (t *touchTracker) advance(at uint64, inclusive bool) {
+	t.advanceIn(at, inclusive, 0)
+}
+
+// advanceIn is advance for an entry written in term, which lastWriteIn holds
+// against the term of the position it is asked to reach.
+func (t *touchTracker) advanceIn(at uint64, inclusive bool, term int64) {
 	t.mu.Lock()
 	if at > t.applied || (at == t.applied && inclusive && !t.inclusive) {
-		t.applied, t.inclusive = at, inclusive
+		t.applied, t.inclusive, t.term = at, inclusive, term
 		if t.start == 0 {
 			t.start = at
 		}
@@ -264,7 +273,16 @@ func (t *touchTracker) ask(ns string, from, until bson.Timestamp, ids []bson.Raw
 // It waits for the tracker to reach through, at most until ctx ends. ok false
 // says it did not, or that the tracker is not reading, and the caller waits
 // the way it always did.
-func (t *touchTracker) lastWriteIn(ctx context.Context, db string, through uint64) (need uint64, ok bool) {
+//
+// term is the term through was written in. The tracker answers only when the
+// entry it has read up to was written in that term too, because only then are
+// the two one history. A position is a timestamp, and two nodes across an
+// election can both hold one at or past it: the tracker still reading the old
+// primary, which carried on as a secondary or holds writes the election will
+// roll back, can be past the new primary's lastWrite without having read the
+// new primary's writes. A term has one primary, so entries of the same term
+// are the same history.
+func (t *touchTracker) lastWriteIn(ctx context.Context, db string, through uint64, term int64) (need uint64, ok bool) {
 	if t == nil {
 		return 0, false
 	}
@@ -283,6 +301,9 @@ func (t *touchTracker) lastWriteIn(ctx context.Context, db string, through uint6
 		case <-moved:
 		}
 		t.mu.Lock()
+	}
+	if t.term != term {
+		return 0, false
 	}
 	return max(t.wrote[db], t.all, t.start), true
 }
@@ -393,8 +414,8 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 		return bson.D{{Key: "$ifNull", Value: bson.A{prefix + "o2._id", prefix + "o._id"}}}
 	}
 	proj := bson.D{
-		{Key: "_id", Value: 0}, {Key: "ts", Value: 1}, {Key: "op", Value: 1}, {Key: "ns", Value: 1},
-		{Key: "prev", Value: "$prevOpTime.ts"},
+		{Key: "_id", Value: 0}, {Key: "ts", Value: 1}, {Key: "t", Value: 1}, {Key: "op", Value: 1}, {Key: "ns", Value: 1},
+		{Key: "prev", Value: "$prevOpTime.ts"}, {Key: "multiOpType", Value: 1},
 		{Key: "id", Value: ifID("$")},
 		{Key: "c", Value: bson.D{{Key: "$cond", Value: bson.A{
 			bson.D{{Key: "$eq", Value: bson.A{"$op", "c"}}},
@@ -437,7 +458,15 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 			// collections. So any entry of such a chain touches everything.
 			// The first has no previous entry, and is not told from a
 			// transaction of one entry; the chain's second entry covers it.
-			if e.Prev.T != 0 {
+			//
+			// A retryable write batched by the server is chained the same way
+			// and marked multiOpType 1, and is not a transaction: each entry
+			// applies its own operations at its own time, which the applyOps
+			// above has recorded. A copy-up writes this way, and taking each
+			// of its entries for a transaction made every database written
+			// at that instant, which sent every read back to the full wait.
+			// On the Docker test server 18,131 of 129,527 applyOps were these.
+			if e.Prev.T != 0 && e.MultiOpType != 1 {
 				r.touches.touchAll(at)
 			}
 		}
@@ -445,7 +474,7 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 			// Each entry has a time of its own, and a forward read of the
 			// oplog returns none past a hole, so everything through this
 			// one has been seen.
-			r.touches.advance(at, true)
+			r.touches.advanceIn(at, true, e.T)
 		}
 	}
 	if err := cur.Err(); err != nil {
@@ -460,13 +489,18 @@ func (r *Router) followTouchesOnce(ctx context.Context) error {
 // oplogTouch is one oplog entry as followTouchesOnce reads it.
 type oplogTouch struct {
 	TS bson.Timestamp `bson:"ts"`
-	Op string         `bson:"op"`
-	NS string         `bson:"ns"`
-	ID bson.RawValue  `bson:"id"`
-	C  bson.Raw       `bson:"c"`
+	// T is the term the entry was written in.
+	T  int64         `bson:"t"`
+	Op string        `bson:"op"`
+	NS string        `bson:"ns"`
+	ID bson.RawValue `bson:"id"`
+	C  bson.Raw      `bson:"c"`
 	// Prev is the previous entry of the same transaction, zero for the first
 	// and for anything else.
 	Prev bson.Timestamp `bson:"prev"`
+	// MultiOpType 1 marks a retryable write the server batched into several
+	// entries, which is not a transaction.
+	MultiOpType int32 `bson:"multiOpType"`
 }
 
 // touchOne records an update or delete of one document, of a tiered
