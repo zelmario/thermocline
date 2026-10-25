@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -595,12 +596,24 @@ func (v viewSpec) passesThrough(field string) bool {
 	if err != nil {
 		return false
 	}
-	names := func(doc bson.Raw) bool {
+	// By path, not by name: the age field may be dotted, and a stage writing
+	// meta, or meta.ts.x, changes meta.ts as surely as one naming it, where a
+	// lookup of "meta.ts" in the stage reads one literal key.
+	touches := func(key string) bool {
 		for _, f := range []string{"_id", field} {
-			if f == "" {
-				continue
+			if f != "" && pathsTouch(key, f) {
+				return true
 			}
-			if _, err := doc.LookupErr(f); err == nil {
+		}
+		return false
+	}
+	names := func(doc bson.Raw) bool {
+		elems, err := doc.Elements()
+		if err != nil {
+			return true
+		}
+		for _, e := range elems {
+			if touches(e.Key()) {
 				return true
 			}
 		}
@@ -629,7 +642,7 @@ func (v viewSpec) passesThrough(field string) bool {
 				list, _ = a.Values()
 			}
 			for _, n := range list {
-				if s, _ := n.StringValueOK(); s == "_id" || s == field {
+				if s, _ := n.StringValueOK(); touches(s) {
 					return false
 				}
 			}
@@ -646,7 +659,13 @@ func (r *Router) viewPassesThrough(ctx context.Context, ns, field string) bool {
 	db, _ := splitNS(ns)
 	at := ns
 	for hop := 0; hop < maxViewHops; hop++ {
-		spec, ok := viewDefinition(ctx, r.hot, at)
+		spec, ok, err := viewLookup(ctx, r.hot, at)
+		if err != nil {
+			// Not knowing what a link is cannot be read as the base: a
+			// grouping view behind it would be judged as passing documents
+			// through, which is the short answer this check exists for.
+			return false
+		}
 		if !ok {
 			return hop > 0
 		}
@@ -729,29 +748,36 @@ func (v viewSpec) equals(o viewSpec) bool {
 // viewDefinition reads one tier's definition of a view, and reports false when
 // the namespace is not a view there at all.
 func viewDefinition(ctx context.Context, client *mongo.Client, ns string) (viewSpec, bool) {
+	spec, ok, _ := viewLookup(ctx, client, ns)
+	return spec, ok
+}
+
+// viewLookup is viewDefinition telling a namespace that is not a view, ok
+// false, from one it could not read, an error.
+func viewLookup(ctx context.Context, client *mongo.Client, ns string) (viewSpec, bool, error) {
 	db, coll := splitNS(ns)
 	cur, err := client.Database(db).ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
 	if err != nil {
-		return viewSpec{}, false
+		return viewSpec{}, false, err
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	if !cur.Next(ctx) {
-		return viewSpec{}, false
+		return viewSpec{}, false, cur.Err()
 	}
 	var raw bson.Raw
 	if err := cur.Decode(&raw); err != nil {
-		return viewSpec{}, false
+		return viewSpec{}, false, err
 	}
 	if kind, _ := raw.Lookup("type").StringValueOK(); kind != "view" {
-		return viewSpec{}, false
+		return viewSpec{}, false, nil
 	}
 	opts, ok := raw.Lookup("options").DocumentOK()
 	if !ok {
-		return viewSpec{}, false
+		return viewSpec{}, false, errors.New("a view with no options")
 	}
 	on, ok := opts.Lookup("viewOn").StringValueOK()
 	if !ok || on == "" {
-		return viewSpec{}, false
+		return viewSpec{}, false, errors.New("a view with no viewOn")
 	}
 	spec := viewSpec{on: on}
 	if v, err := opts.LookupErr("pipeline"); err == nil {
@@ -760,7 +786,7 @@ func viewDefinition(ctx context.Context, client *mongo.Client, ns string) (viewS
 	if v, err := opts.LookupErr("collation"); err == nil {
 		spec.collation = append([]byte(nil), v.Value...)
 	}
-	return spec, true
+	return spec, true, nil
 }
 
 // refuseView says why a view over an incomplete collection is not answered.
