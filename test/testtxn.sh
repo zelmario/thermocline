@@ -114,6 +114,21 @@ chk "duplicate of an archived key refused inside a txn" "11000" "$(R "
   catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.codeName||e.message.substring(0,40)); }")"
 chk "and the duplicate did not land"                    "0"     "$(H "print(db.getSiblingDB(process.env.TC_DB).ttxa.countDocuments({email:'a@x.com'}))")"
 
+echo "== a write the router refuses inside a transaction aborts it =="
+# mongod aborts a transaction on a write error, so the commit after one fails.
+# A write the router refuses never reaches mongod, and the transaction stayed
+# open: a debit, then an insert refused E11000 here and ignored by the
+# application, and the commit succeeded with the debit in it.
+R "db.getSiblingDB(process.env.TC_DB).ttxa.insertOne({_id:3, email:'c@x.com', bal:100})" >/dev/null
+chk "the commit after a refused insert fails"           "COMMIT FAILED" "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
+  s.startTransaction();
+  c.updateOne({_id:3},{\$inc:{bal:-100}});
+  try { c.insertOne({_id:4,email:'a@x.com'}); } catch(e) {}
+  try { s.commitTransaction(); print('COMMITTED'); } catch(e) { print('COMMIT FAILED'); }")"
+chk "  and the debit before it did not land"            "100" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).ttxa.findOne({_id:3}).bal)")"
+
 echo "== an aborted transaction leaves no false duplicate =="
 # The claim is written by the router's own client, so an abort cannot roll it
 # back. What must not happen is the orphaned claim rejecting the next honest

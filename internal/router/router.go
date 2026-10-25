@@ -1186,10 +1186,43 @@ func (c *conn) pump(ctx context.Context) error {
 // command is simply not performed. A dropped write is what w:0 already means to
 // an application: it asked not to be told.
 func (c *conn) answer(msg, out *wire.Message) error {
+	c.abortIfRefusedInTxn(msg, out)
 	if msg.MoreToCome() {
 		return nil
 	}
 	return c.send(out)
+}
+
+// abortIfRefusedInTxn aborts the caller's transaction when this router answered
+// one of its commands with an error.
+//
+// mongod aborts a transaction on a write error inside it, so a commit after
+// one fails. A command the router refuses never reaches mongod, and the
+// transaction stayed open: a debit, then an insert of an _id only the archive
+// holds answered E11000 here, caught and ignored by the application, and the
+// commit then succeeded with the debit in it, where MongoDB fails it. Only
+// the update path aborted, in verifyTxnKeys. An abort mongod no longer has a
+// transaction for answers NoSuchTransaction, which changes nothing.
+func (c *conn) abortIfRefusedInTxn(msg, out *wire.Message) {
+	name, _, nerr := msg.CommandName()
+	if nerr != nil || name == "commitTransaction" || name == "abortTransaction" {
+		return
+	}
+	cmd, err := msg.CommandDoc()
+	if err != nil {
+		return
+	}
+	t, in := txnOf(cmd)
+	if !in {
+		return
+	}
+	rdoc, rerr := out.ReplyDoc()
+	if rerr != nil || (replyOK(rdoc) && !writeFailed(rdoc)) {
+		return
+	}
+	if aerr := c.abortCallerTxn(t); aerr != nil {
+		c.log.Debug("could not abort a transaction this router refused a command of", "command", name, "err", aerr)
+	}
 }
 
 func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
