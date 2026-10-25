@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 func limits() config.BackoffConfig {
@@ -192,5 +194,50 @@ func TestFeederLagFromTheFastTiersClock(t *testing.T) {
 	}
 	if _, ok := c.behindFastTier(ctx, bson.Timestamp{}); ok {
 		t.Error("a record with no cluster time was judged, want it left to the wall-clock reading")
+	}
+}
+
+// The checkpoint is the fallback when no position is published (position_every
+// 0) or the one there is left from an earlier run. Its EventAt is moved to now
+// each time a batch is used up, exactly as the position's At was, so it read
+// about 0s behind during a backlog until it was judged by its cluster time too.
+func TestFeederLagFromTheCheckpointsClusterTime(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two replica sets")
+	}
+	ctx := context.Background()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hot.Disconnect(ctx) }()
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cold.Disconnect(ctx) }()
+	if _, err := hot.Database("tc_health").Collection("w").InsertOne(ctx, bson.D{{Key: "n", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hot.Database("tc_health").Drop(context.Background()) }()
+
+	id := fmt.Sprintf("lagtest-%d", time.Now().UnixNano())
+	cps := cold.Database(meta.DB).Collection(meta.Checkpoints)
+	defer func() { _, _ = cps.DeleteOne(context.Background(), bson.D{{Key: "_id", Value: id}}) }()
+	threeHoursAgo := bson.Timestamp{T: uint32(time.Now().Add(-3 * time.Hour).Unix())}
+	now := time.Now()
+	if _, err := cps.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: id}, {Key: "token", Value: bson.D{{Key: "_data", Value: "x"}}},
+		{Key: "savedAt", Value: now}, {Key: "eventAt", Value: now}, {Key: "ts", Value: threeHoursAgo},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := New(hot, cold, id)
+	var r Reading
+	c.sampleFeederLag(ctx, &r)
+	if r.isMissing("feeder lag") || r.FeederLag < 2*time.Hour {
+		t.Errorf("a checkpoint saved now at a position three hours old read as %s behind (missing %v), want about three hours",
+			r.FeederLag, r.isMissing("feeder lag"))
 	}
 }

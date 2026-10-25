@@ -188,9 +188,7 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 				latest = pos.SavedAt
 			}
 			r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
-			if behind, ok := c.behindFastTier(ctx, pos.TS); ok && behind > r.FeederLag {
-				r.FeederLag = behind
-			}
+			c.atLeastBehind(ctx, r, pos.TS)
 			return
 		}
 	}
@@ -212,6 +210,31 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 	theirs, theirsKnown := rec.Skew()
 	mine, mineKnown := c.archiveSkew(ctx)
 	r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
+	// The same correction as for the position: EventAt is moved to now each
+	// time a batch is used up, so during a backlog this read about 0s behind.
+	// This is the path for position_every: 0, and for a position record left
+	// by an earlier run, which Observe reads as not moving.
+	if rec.TS != nil {
+		c.atLeastBehind(ctx, r, *rec.TS)
+	}
+}
+
+// atLeastBehind raises r.FeederLag to how far ts trails the fast tier's last
+// write, and marks the lag missing when the fast tier cannot be asked: the
+// wall-clock reading alone says the feeder is publishing, not that it is
+// caught up, and the evictor goes on whatever it says.
+func (c *Checker) atLeastBehind(ctx context.Context, r *Reading, ts bson.Timestamp) {
+	if ts.T == 0 || c.hot == nil {
+		return
+	}
+	behind, ok := c.behindFastTier(ctx, ts)
+	if !ok {
+		r.missing("feeder lag")
+		return
+	}
+	if behind > r.FeederLag {
+		r.FeederLag = behind
+	}
 }
 
 // behindFastTier is how far the published cluster time trails the fast tier's
