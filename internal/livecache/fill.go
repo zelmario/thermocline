@@ -405,6 +405,7 @@ func (c *Cache) mergeFill(ctx context.Context, out fillResult, filter bson.D, fa
 func (c *Cache) plain(ctx context.Context, hot *mongo.Client, ns string) (bool, bool) {
 	c.plainMu.Lock()
 	ok, seen := c.plainNS[ns]
+	gen := c.plainGen
 	c.plainMu.Unlock()
 	if seen {
 		return ok, true
@@ -438,7 +439,12 @@ func (c *Cache) plain(ctx context.Context, hot *mongo.Client, ns string) (bool, 
 		return false, true
 	}
 	c.plainMu.Lock()
-	c.plainNS[ns] = ok
+	// A drop forgotten while this listed may have come after the listing,
+	// and then what it saw is the collection before the drop: kept, a
+	// collection created again with a collation was answered as plain.
+	if c.plainGen == gen {
+		c.plainNS[ns] = ok
+	}
 	c.plainMu.Unlock()
 	return ok, true
 }

@@ -92,6 +92,9 @@ type Cache struct {
 	// a view. Read and written by the fill workers, under plainMu.
 	plainMu sync.Mutex
 	plainNS map[string]bool
+	// plainGen counts what forgetPlain and Reset forgot, so a listing that a
+	// drop overtook does not store its answer. See plain.
+	plainGen uint64
 
 	// tiered says a namespace is tiered, and prove how much of the fast tier's
 	// answer for one is the whole answer's. See Tiers.
@@ -1541,6 +1544,7 @@ func (c *Cache) DropNS(ns string) {
 func (c *Cache) forgetPlain(ns string) {
 	c.plainMu.Lock()
 	defer c.plainMu.Unlock()
+	c.plainGen++
 	if strings.HasSuffix(ns, ".") {
 		for k := range c.plainNS {
 			if strings.HasPrefix(k, ns) {
@@ -1564,6 +1568,7 @@ func (c *Cache) Reset() {
 	// What it missed may have been a drop and a create.
 	c.plainMu.Lock()
 	c.plainNS = map[string]bool{}
+	c.plainGen++
 	c.plainMu.Unlock()
 }
 
