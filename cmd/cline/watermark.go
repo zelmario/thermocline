@@ -231,6 +231,35 @@ func describe(m watermark.Mark) string {
 // work done under it stops: a renewal that failed was ignored, and a backfill
 // paused past the lease went on marking while the evictor, having taken the
 // lease back, deleted the same documents.
+// fenceKey carries, in a hold's context, the lease a write under it is
+// fenced on. See markFenced.
+type fenceKey struct{}
+
+// markFenced runs one write in an archive transaction that also marks the
+// held lease, the way the feeder fences a flush: a hold that lost its lease
+// to the evictor writes nothing, where noticing at the next renewal, up to
+// five seconds later, let a backfill resumed from a pause tombstone a
+// document the evictor had just removed. Without a hold in ctx it writes
+// plainly.
+func markFenced(ctx context.Context, cold *mongo.Client, write func(context.Context) error) error {
+	l, ok := ctx.Value(fenceKey{}).(*lease.Lease)
+	if !ok || l == nil {
+		return write(ctx)
+	}
+	sess, err := cold.StartSession()
+	if err != nil {
+		return err
+	}
+	defer sess.EndSession(context.WithoutCancel(ctx))
+	_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+		if ferr := l.Fence(sc); ferr != nil {
+			return nil, ferr
+		}
+		return nil, write(sc)
+	})
+	return err
+}
+
 func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) (context.Context, func(), error) {
 	l := lease.New(cold, "evictor", feederID)
 	deadline := time.Now().Add(2 * time.Minute)
@@ -258,7 +287,7 @@ func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) 
 		case <-time.After(time.Second):
 		}
 	}
-	held, lost := context.WithCancelCause(ctx)
+	held, lost := context.WithCancelCause(context.WithValue(ctx, fenceKey{}, l))
 	kctx, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {

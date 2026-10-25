@@ -503,8 +503,10 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	for _, id := range candidates {
 		marked++
 		if apply {
-			if _, uerr := dst.UpdateOne(ctx,
-				bson.D{{Key: "_id", Value: id}}, meta.Tombstone(now)); uerr != nil {
+			if uerr := markFenced(ctx, cold, func(wc context.Context) error {
+				_, err := dst.UpdateOne(wc, bson.D{{Key: "_id", Value: id}}, meta.Tombstone(now))
+				return err
+			}); uerr != nil {
 				return marked, fmt.Sprintf("could not mark %s: %v", id.String(), uerr), true
 			}
 		}
