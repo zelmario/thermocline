@@ -499,9 +499,43 @@ func (c *Cache) inherit(e *entry, p0 bson.Timestamp) {
 	}
 }
 
-// sweep forgets queues the stream has passed that no Get has looked at since.
-// Called with mu held, every so often.
+// sweep forgets queues the stream has passed that no Get has looked at since,
+// and what Allowed and Apply would otherwise keep for ever. Called with mu
+// held, every so often.
+//
+// readers gained an entry per user per namespace and lost none. Without SCRAM
+// the user is the connection, so every connection that ever read a namespace
+// stayed, and an application that churns connections grew it without bound.
+// shapes gained one per distinct shape, a $limit or a batchSize being part of
+// one, and every change event walks a namespace's shapes. A shape no entry uses
+// is dropped; the next fill that needs it makes it again.
 func (c *Cache) sweep() {
+	cut := time.Now().Add(-readerTTL)
+	for ns, m := range c.readers {
+		for u, at := range m {
+			if at.Before(cut) {
+				delete(m, u)
+			}
+		}
+		if len(m) == 0 {
+			delete(c.readers, ns)
+		}
+	}
+	used := make(map[*shape]bool, len(c.entries))
+	for _, e := range c.entries {
+		used[e.shape] = true
+	}
+	for ns, m := range c.shapes {
+		for id, sh := range m {
+			if !used[sh] {
+				delete(m, id)
+			}
+		}
+		if len(m) == 0 {
+			delete(c.shapes, ns)
+		}
+	}
+
 	for _, m := range []map[string][]pendingWrite{c.pendingEntry, c.pendingDoc, c.pendingCount, c.classified} {
 		for k, q := range m {
 			stale := true

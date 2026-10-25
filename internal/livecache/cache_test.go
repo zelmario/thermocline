@@ -810,3 +810,36 @@ func TestInsertWithAnUnkeyableValueHoldsTheNamespace(t *testing.T) {
 		t.Fatal("still held back after the stream applied the write")
 	}
 }
+
+// Neither map lost anything: a user per connection per namespace, and a shape
+// per distinct $limit, each kept for good.
+func TestSweepPrunesReadersAndUnusedShapes(t *testing.T) {
+	c := New(1 << 20)
+	c.Proved("shop.products", "conn:1")
+	c.Proved("shop.products", "conn:2")
+	qa := listQuery(t, "a", 2)
+	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+	c.mu.Lock()
+	c.readers["shop.products"]["conn:1"] = time.Now().Add(-2 * readerTTL)
+	cq, ok := ParseCount("shop.products", raw(t, bson.D{{Key: "count", Value: "products"}, {Key: "query", Value: bson.D{{Key: "category", Value: "a"}}}}))
+	if !ok {
+		c.mu.Unlock()
+		t.Fatal("count not understood")
+	}
+	c.shapeFor(cq) // a shape nothing was ever installed under
+	before := len(c.shapes["shop.products"])
+	c.sweep()
+	after := len(c.shapes["shop.products"])
+	_, stale := c.readers["shop.products"]["conn:1"]
+	_, fresh := c.readers["shop.products"]["conn:2"]
+	c.mu.Unlock()
+	if stale || !fresh {
+		t.Errorf("after a sweep the expired reader is kept %v and the recent one %v; want false, true", stale, fresh)
+	}
+	if before != 2 || after != 1 {
+		t.Errorf("shapes %d before and %d after a sweep, want 2 and 1: the unused one goes, the used one stays", before, after)
+	}
+	if _, hit := c.Get(qa); !hit {
+		t.Error("the entry whose shape stayed is no longer answered")
+	}
+}
