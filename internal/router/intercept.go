@@ -46,7 +46,7 @@ func (c *conn) intercept(ctx context.Context, msg *wire.Message, name, db string
 		// claims are registered against that cursor so a getMore can be refused
 		// once they no longer hold. Nil for anything the guard did not
 		// authorise, which registers nothing.
-		c.noteTieredCursor(c.aggAuth, reply)
+		c.noteTieredCursor(c.aggAuth, msg, reply)
 		// Otherwise only a pipeline led by $collStats, which is what
 		// db.coll.stats() sends. Everything else an aggregate can be is
 		// decided before it runs.
@@ -586,12 +586,12 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		}
 		switch {
 		case bounded && mark.Complete(bound):
-			c.noteTieredCursorOn(judged, mark, reply)
+			c.noteTieredCursorOn(judged, mark, msg, reply)
 			return reply, nil
 		case !bounded && mark.CoversAll():
 			// No lower bound, so the query may reach arbitrarily far back. Only
 			// a tier claiming all of history can answer that on its own.
-			c.noteTieredCursorOn(judged, mark, reply)
+			c.noteTieredCursorOn(judged, mark, msg, reply)
 			return reply, nil
 		}
 
@@ -606,7 +606,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 				c.r.Stats.NewestFirst.Add(1)
 				// The proof needs no bound, and the rule is the same: it rests
 				// on this claim, so it lasts as long as this claim does.
-				c.noteTieredCursorOn(judged, mark, reply)
+				c.noteTieredCursorOn(judged, mark, msg, reply)
 				return reply, nil
 			}
 		}

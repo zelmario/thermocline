@@ -62,6 +62,11 @@ type tieredRead struct {
 	// eleven, and the getMores after that were forwarded unchecked while the
 	// evictor narrowed the claim under them.
 	used time.Time
+	// pinned is a cursor opened with noCursorTimeout, which mongod never
+	// times out: reaped after ten idle minutes, its later getMores went to the
+	// fast tier unchecked. It is forgotten when it is drained or killed, as
+	// mongod forgets it.
+	pinned bool
 }
 
 // tieredCursors remembers them, per router.
@@ -112,13 +117,20 @@ func (reg *tieredCursors) drop(id int64) {
 // when that query left a cursor open.
 //
 // A reply with cursor id nought is the whole answer and has nothing to outlive.
-func (c *conn) noteTieredCursor(on []nsClaim, reply *wire.Message) {
+func (c *conn) noteTieredCursor(on []nsClaim, msg, reply *wire.Message) {
 	if len(on) == 0 {
 		return
 	}
 	if id, live := liveCursorOf(reply, on[0].ns); live {
-		c.r.tiered.add(id, tieredRead{on: on, at: time.Now()})
+		c.r.tiered.add(id, tieredRead{on: on, at: time.Now(), pinned: noCursorTimeout(msg)})
 	}
+}
+
+// noCursorTimeout reports whether a command asked for a cursor mongod never
+// times out.
+func noCursorTimeout(msg *wire.Message) bool {
+	cmd, err := msg.CommandDoc()
+	return err == nil && safeBool(cmd.Lookup("noCursorTimeout"))
 }
 
 // noteTieredCursorOn is the one-claim case, which is every find.
@@ -127,14 +139,15 @@ func (c *conn) noteTieredCursor(on []nsClaim, reply *wire.Message) {
 // Most replies do not, and a find on a tiered collection is the hot path this
 // whole system is for: one allocation per read, thrown away unread, is not
 // something to add to it.
-func (c *conn) noteTieredCursorOn(ns string, mark watermark.Mark, reply *wire.Message) {
+func (c *conn) noteTieredCursorOn(ns string, mark watermark.Mark, msg, reply *wire.Message) {
 	id, live := liveCursorOf(reply, ns)
 	if !live {
 		return
 	}
 	c.r.tiered.add(id, tieredRead{
-		on: []nsClaim{{ns: ns, from: mark.From, claimed: mark.Claimed}},
-		at: time.Now(),
+		on:     []nsClaim{{ns: ns, from: mark.From, claimed: mark.Claimed}},
+		at:     time.Now(),
+		pinned: noCursorTimeout(msg),
 	})
 }
 
@@ -246,6 +259,9 @@ func (reg *tieredCursors) reapIdle(idle time.Duration) {
 	cut := time.Now().Add(-idle)
 	reg.mu.Lock()
 	for id, r := range reg.by {
+		if r.pinned {
+			continue
+		}
 		last := r.used
 		if r.at.After(last) {
 			last = r.at

@@ -149,6 +149,9 @@ type archiveCursor struct {
 	owner    cursorOwner
 	lastUsed time.Time
 	closed   bool
+	// pinned is a cursor the client opened with noCursorTimeout, which is
+	// not reaped for idling. See tieredRead.pinned.
+	pinned bool
 }
 
 // read pulls the next batch under the cursor's own lock.
@@ -249,7 +252,7 @@ func (reg *cursorRegistry) reapIdle(ctx context.Context, idle time.Duration) {
 	var dead []*archiveCursor
 	reg.mu.Lock()
 	for id, ac := range reg.open {
-		if time.Since(ac.lastUsed) > idle {
+		if !ac.pinned && time.Since(ac.lastUsed) > idle {
 			dead = append(dead, ac)
 			delete(reg.open, id)
 		}
@@ -355,7 +358,8 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 
 	var id int64
 	if more {
-		id = c.r.cursors.add(&archiveCursor{cur: cur, ns: ns, owner: c.owner(cmd)})
+		id = c.r.cursors.add(&archiveCursor{cur: cur, ns: ns, owner: c.owner(cmd),
+			pinned: safeBool(cmd.Lookup("noCursorTimeout"))})
 	} else {
 		_ = cur.Close(ctx)
 	}

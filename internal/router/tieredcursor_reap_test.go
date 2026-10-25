@@ -24,3 +24,16 @@ func TestTieredCursorIdlesFromItsLastUse(t *testing.T) {
 		t.Error("a cursor idle for eleven minutes was kept")
 	}
 }
+
+// A cursor opened with noCursorTimeout is never timed out by mongod, and a
+// batch job pausing on one for longer than ten minutes still reads it. Its
+// guard was reaped like any other and the getMores after the pause went to
+// the fast tier unchecked.
+func TestTieredCursorWithNoTimeoutIsKept(t *testing.T) {
+	var reg tieredCursors
+	reg.add(1, tieredRead{at: time.Now().Add(-time.Hour), pinned: true})
+	reg.reapIdle(10 * time.Minute)
+	if _, ok := reg.get(1); !ok {
+		t.Error("a noCursorTimeout cursor idle for an hour was reaped")
+	}
+}

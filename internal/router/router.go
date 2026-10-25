@@ -786,6 +786,22 @@ func (r *Router) Listen(ctx context.Context) error {
 // archive cursor is cleaned up on the same schedule mongod would use.
 const cursorIdle = 10 * time.Minute
 
+// cursorTimeout is the fast tier's own cursorTimeoutMillis, when it is longer
+// than the default: a deployment that raised it keeps cursors that long, and
+// a guard reaped at ten minutes let the getMores after it through unchecked.
+func (r *Router) cursorTimeout(ctx context.Context) time.Duration {
+	var p struct {
+		Millis int64 `bson:"cursorTimeoutMillis"`
+	}
+	err := r.hot.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "getParameter", Value: 1}, {Key: "cursorTimeoutMillis", Value: 1},
+	}).Decode(&p)
+	if err != nil || time.Duration(p.Millis)*time.Millisecond <= cursorIdle {
+		return cursorIdle
+	}
+	return time.Duration(p.Millis) * time.Millisecond
+}
+
 func (r *Router) reapCursors(ctx context.Context) {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -794,6 +810,7 @@ func (r *Router) reapCursors(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			cursorIdle := r.cursorTimeout(ctx)
 			r.cursors.reapIdle(ctx, cursorIdle)
 			// The same sweep, for the registrations that remember which claim
 			// authorised a fast tier cursor. A client that walks away from one
