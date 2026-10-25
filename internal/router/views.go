@@ -144,6 +144,20 @@ func (r *Router) viewOn(ctx context.Context, ns string) (string, bool) {
 				unreadable = true
 			}
 		}
+		if cerr := cur.Err(); cerr != nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		// Not cached: a listing that failed says nothing about the
+		// collection, and recorded as "not a view" it sent every read through
+		// a view over a tiered collection to the fast tier unchecked for the
+		// next minute. What was known before stands; with nothing known, the
+		// next read asks again.
+		if seen {
+			return on, has && on != ""
+		}
+		return "", false
 	}
 
 	r.viewCache.mu.Lock()
