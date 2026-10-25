@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -17,8 +18,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
-	"github.com/zelmario/thermocline/internal/pairing"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/pairing"
 )
 
 // runRollback prepares the archive to be used directly again.
@@ -118,7 +120,7 @@ func runRollback(args []string) error {
 
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
 	if *clear && alive && !*force {
-		fmt.Printf("A feeder published %s ago, so it is still mirroring.\n\n", since.Round(time.Second))
+		fmt.Printf("%s\n\n", feederSays(since))
 		fmt.Print(`Clearing now would leave fresh marks behind the ones it removed: every delete
 that reaches the archive after this point writes another. Stop the application
 and the feeder first, let mirroring finish, then run this again.
@@ -209,26 +211,74 @@ it, with the application and the feeder stopped so nothing writes more.
 // The position record carries the interval it is written at, so "recently" is
 // read from the deployment rather than guessed: four missed publications is the
 // same threshold the evictor's health check uses to decide a feeder has gone.
+//
+// And the feeder's lease, which it renews every few seconds whatever
+// position_every says: a feeder told to publish no position wrote none, and
+// this read its absence as no feeder at all, so rollback --clear went ahead
+// beside one that was still writing. Both are judged against the archive's own
+// clock, which is where both were stamped.
+//
+// When neither can be read the answer is yes, with since negative: refusing
+// to clear beside a feeder that may be running is the side to err on, and
+// --force is there for an operator who knows better.
 func feederPublishing(ctx context.Context, cold *mongo.Client, id string) (bool, time.Duration) {
+	var clock struct {
+		LocalTime time.Time `bson:"localTime"`
+	}
+	if err := cold.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&clock); err != nil ||
+		clock.LocalTime.IsZero() {
+		return true, -1
+	}
+	now := clock.LocalTime
+
 	var pos struct {
 		SavedAt time.Time `bson:"savedAt"`
 		EveryMS int64     `bson:"everyMS"`
 	}
 	err := cold.Database(meta.DB).Collection(meta.PositionsColl).
 		FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&pos)
-	if err != nil || pos.SavedAt.IsZero() {
-		return false, 0
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		return true, -1
 	}
-	every := time.Duration(pos.EveryMS) * time.Millisecond
-	if every <= 0 {
-		every = time.Second
+	if err == nil && !pos.SavedAt.IsZero() {
+		every := time.Duration(pos.EveryMS) * time.Millisecond
+		if every <= 0 {
+			every = time.Second
+		}
+		stale := 4 * every
+		if stale < 2*time.Second {
+			stale = 2 * time.Second
+		}
+		if age := now.Sub(pos.SavedAt); age <= stale {
+			return true, age
+		}
 	}
-	stale := 4 * every
-	if stale < 2*time.Second {
-		stale = 2 * time.Second
+
+	var held struct {
+		Seen time.Time `bson:"seen"`
 	}
-	age := time.Since(pos.SavedAt)
-	return age <= stale, age
+	err = cold.Database(meta.DB).Collection(meta.Markers).
+		FindOne(ctx, bson.D{{Key: "_id", Value: "lease:feeder:" + id}}).Decode(&held)
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		return true, -1
+	}
+	if err == nil && !held.Seen.IsZero() {
+		if age := now.Sub(held.Seen); age <= lease.Stale {
+			return true, age
+		}
+	}
+	if !pos.SavedAt.IsZero() {
+		return false, now.Sub(pos.SavedAt)
+	}
+	return false, 0
+}
+
+// feederSays is how a caller of feederPublishing names what it found.
+func feederSays(since time.Duration) string {
+	if since < 0 {
+		return "Whether a feeder is still running could not be read, so this assumes one is."
+	}
+	return fmt.Sprintf("A feeder was last seen %s ago, so it is still mirroring.", since.Round(time.Second))
 }
 
 // splitNS divides db.collection at the first dot, because a collection name may

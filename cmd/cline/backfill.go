@@ -112,7 +112,7 @@ func runBackfill(args []string) error {
 	alive, since := feederPublishing(ctx, cold, cfg.Feeder.ID)
 	markingHeld := alive && !*force
 	if markingHeld {
-		fmt.Printf("A feeder published %s ago, so it is still mirroring.\n", since.Round(time.Second))
+		fmt.Println(feederSays(since))
 		fmt.Println("Documents are copied anyway. Deletes are not marked, because the feeder may be")
 		fmt.Println("writing back the very document this would mark. Stop it, or --force, to mark them.")
 		fmt.Println()

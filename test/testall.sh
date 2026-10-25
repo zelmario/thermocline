@@ -541,6 +541,14 @@ chkrb "and the archive answers as the router did" "1" \
 C "db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
 ok "with nothing left it says so"                0 "Nothing is marked deleted" \
     -- cline rollback --config $CFG --ns $DB.$RBNS
+# A feeder told to publish no position writes none, and that read as no feeder
+# at all; its lease, which it renews whatever position_every says, was never
+# asked.
+C "db.getSiblingDB(process.env.TC_META).markers.updateOne({_id:'lease:feeder:test'},
+     {\$set:{seen:new Date(), owner:'elsewhere', host:'elsewhere', pid:1}},{upsert:true})" >/dev/null
+ok "a feeder seen only by its lease stops a clear"  1 "still mirroring" \
+    -- cline rollback --config $CFG --ns $DB.$RBNS --clear
+C "db.getSiblingDB(process.env.TC_META).markers.deleteOne({_id:'lease:feeder:test', owner:'elsewhere'})" >/dev/null
 # A misspelt --ns counted nought and printed the reassuring ending, about a
 # collection nothing had looked at, with status 0.
 ok "a --ns the archive does not hold is refused" 1 "holds no collection" \
