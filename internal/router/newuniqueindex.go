@@ -53,11 +53,49 @@ func (c *conn) guardNewUniqueIndex(ctx context.Context, msg *wire.Message, cmd b
 	if !c.r.cfg.Manages(ns) {
 		return nil, false
 	}
-	idxs := proposedUniqueIndexes(msg)
+	idxs := c.r.notYetUnique(ctx, ns, proposedUniqueIndexes(msg))
 	if len(idxs) == 0 {
 		return nil, false
 	}
 	return c.claimForUniqueIndex(ctx, msg, ns, idxs)
+}
+
+// notYetUnique drops the indexes the fast tier already has, unique and under
+// the same name, which mongod's createIndexes leaves as they are.
+//
+// An application or an ODM issues createIndexes for its unique indexes on
+// every start. Each was walked as if new, and a walk that ended in a refusal
+// gave back every claim filed under the index's name, those of the live index
+// included: until something claimed them again, a write duplicating a value
+// only the archive held was accepted. There is nothing to walk for an index
+// that is already there.
+func (r *Router) notYetUnique(ctx context.Context, ns string, idxs []uniqueIndex) []uniqueIndex {
+	if len(idxs) == 0 {
+		return idxs
+	}
+	db, coll := splitNS(ns)
+	cur, err := r.hot.Database(db).Collection(coll).Indexes().List(ctx)
+	if err != nil {
+		// Not known, so walked: the walk is what a new one needs.
+		return idxs
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	have := map[string]bool{}
+	for cur.Next(ctx) {
+		if u, _ := cur.Current.Lookup("unique").BooleanOK(); !u {
+			continue
+		}
+		if name, ok := cur.Current.Lookup("name").StringValueOK(); ok {
+			have[name] = true
+		}
+	}
+	out := idxs[:0:0]
+	for _, idx := range idxs {
+		if !have[idx.name] {
+			out = append(out, idx)
+		}
+	}
+	return out
 }
 
 // claimForUniqueIndex walks both tiers, claims the keys of every document ns

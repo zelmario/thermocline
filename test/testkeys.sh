@@ -1613,6 +1613,16 @@ chk "and issuing the same collMod again is fine"     "ACCEPTED" \
     "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
 chk "and the claims are still the same two"          "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+# An ODM issues createIndexes for its unique indexes on every start. It was
+# walked as if new, and a walk that refused gave back every claim filed under
+# the index's name, the live index's included. Here the archive alone holds a
+# second b@x, so the walk would refuse.
+C "db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:9,email:'b@x'})" >/dev/null
+chk "createIndexes of the index it already has is a no-op" "ACCEPTED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1',unique:true}]});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "  and its claims are left where they were"      "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+C "db.getSiblingDB(process.env.TC_DB).$MNS.deleteOne({_id:9})" >/dev/null
 chk "a collMod that touches no index still works"    "ACCEPTED" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',validationLevel:'off'});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"
 chk "and one naming an index that is not there"      "true" \
