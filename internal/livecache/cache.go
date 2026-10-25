@@ -1390,6 +1390,20 @@ func sameSortValue(a, b bson.Raw, field string) bool {
 	if ea != nil || eb != nil {
 		return (ea != nil) == (eb != nil)
 	}
+	// One type: the bytes say it, except a double, where -0 and 0 are one
+	// value and NaN is not keyed. Asked for every member on every change, so
+	// the exact key, which builds a big.Rat, is kept for mixed numbers.
+	if va.Type == vb.Type {
+		switch va.Type {
+		case bson.TypeString, bson.TypeInt32, bson.TypeInt64, bson.TypeObjectID, bson.TypeDateTime, bson.TypeBoolean:
+			return bytes.Equal(va.Value, vb.Value)
+		case bson.TypeDouble:
+			x, y := va.Double(), vb.Double()
+			if x == x && y == y {
+				return x == y
+			}
+		}
+	}
 	ka, oka := valueKey(va)
 	kb, okb := valueKey(vb)
 	if !oka || !okb {

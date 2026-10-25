@@ -920,3 +920,27 @@ func TestSortTieDropsTheList(t *testing.T) {
 		t.Error("p3 moved onto p2's price and the list was still answered; their order is mongod's plan's")
 	}
 }
+
+// The fill's replay of changes buffered while it read is the other way a
+// change reaches an entry, and it re-placed an updated member after its equals
+// in an unsorted list: find({category: "a"}).limit(2) was served p2, p3 where
+// mongod, keeping p1 where it stands under a collection scan, answers p1, p2.
+func TestFillReplayDoesNotGuessThePlansOrder(t *testing.T) {
+	q, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"},
+		{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
+		{Key: "limit", Value: int32(2)},
+	}))
+	if !ok {
+		t.Fatal("an unsorted listing was not understood")
+	}
+	c := New(1 << 20)
+	f := &inflight{q: q, key: q.entryKey(), p0: bson.Timestamp{T: 10}, buf: []Change{
+		{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
+			Updated: []string{"price"}, At: bson.Timestamp{T: 11}},
+	}}
+	c.installAt(f, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0, time.Time{})
+	if got, hit := c.Get(q); hit {
+		t.Errorf("served %v after a buffered update to a member; its place is mongod's plan's to decide", ids(t, got))
+	}
+}

@@ -491,6 +491,13 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		c.drop(e)
 		return false
 	}
+	// The same rule Apply keeps: where a member goes in an order mongod's plan
+	// decides is not this cache's to say, and replaying a fill's buffered
+	// changes re-placed it after its equals. See planOrdered.
+	if holds && ch.Doc != nil && planOrdered(e, id, ch.Doc) {
+		c.drop(e)
+		return false
+	}
 	if holds {
 		c.removeDoc(e, id)
 	}
@@ -529,6 +536,10 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		return c.addToGroup(sh, e, id, ch.Doc)
 	}
 	if c.fits(sh, e, ch.Doc) {
+		if planOrdered(e, id, ch.Doc) {
+			c.drop(e)
+			return false
+		}
 		c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 	}
 	_, live := c.entries[e.key]
