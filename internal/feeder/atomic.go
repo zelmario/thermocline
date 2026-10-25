@@ -73,6 +73,13 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 			if err := sess.StartTransaction(); err != nil {
 				return err
 			}
+			// Only while this process holds the lease. See lease.Fence.
+			if f.hold != nil {
+				if err := f.hold.Fence(sc); err != nil {
+					_ = sess.AbortTransaction(context.WithoutCancel(sc))
+					return err
+				}
+			}
 			for _, ns := range order {
 				if len(models[ns]) == 0 {
 					out[ns] = &mongo.BulkWriteResult{}

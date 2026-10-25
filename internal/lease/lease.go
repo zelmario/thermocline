@@ -318,6 +318,29 @@ func (l *Lease) Keep(ctx context.Context) error {
 	return nil
 }
 
+// Fence marks the lease row inside the caller's transaction, and reports
+// ErrLost when this process no longer holds it.
+//
+// A holder paused longer than Stale is replaced, and a write it had in flight
+// lands after its successor's: a replacement over a tombstone the successor
+// wrote leaves a deleted document live. Written in the same archive
+// transaction as the writes it guards, the mark makes them conditional on the
+// lease: a row that has another owner matches nothing and the transaction is
+// abandoned, and a successor taking the row while it runs writes the same
+// document, so one of the two transactions fails to commit.
+func (l *Lease) Fence(ctx context.Context) error {
+	res, err := l.coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: l.docID()}, {Key: "owner", Value: l.owner}},
+		bson.D{{Key: "$currentDate", Value: bson.D{{Key: "fenced", Value: true}}}})
+	if err != nil {
+		return fmt.Errorf("fence the %s lease for %q: %w", l.kind, l.id, err)
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("%w: the %s lease for %q has another owner", ErrLost, l.kind, l.id)
+	}
+	return nil
+}
+
 // Release gives the lease up, so a restart does not have to wait it out.
 //
 // Best effort by design: a daemon that is killed never gets here, and the

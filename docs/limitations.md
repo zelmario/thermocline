@@ -59,18 +59,6 @@ Part of [Thermocline](../README.md).
   Stop the evictor with SIGTERM (`systemctl stop` does), give its unit room
   for a step to finish (30 seconds is the bound), and restart it after a crash.
 
-- **A feeder paused for longer than its lease in the middle of writing can
-  land that write after its standby's.** The lease is what keeps one feeder of
-  an id mirroring, and a standby takes over thirty seconds after the holder
-  stops renewing. The holder asks for the lease again before each write and
-  writes nothing once it has lost it, so the window is a pause inside the
-  bulk write itself: a VM frozen for half a minute mid-write. Its write then
-  lands after the standby's newer ones, and a replacement over a tombstone the
-  standby wrote leaves a deleted document live in the archive until something
-  writes it again. Nothing fences writes to the application's own collections,
-  which is what closing it would take. One feeder with no standby has no
-  second writer and no window.
-
 - **Two feeders with different ids are not refused, and they double the work.**
   The lease stops two of the same daemon with the same id; two with different
   ids watching the same namespaces are not detected by anything, because nothing

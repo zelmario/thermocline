@@ -404,9 +404,8 @@ func (f *Feeder) flush(ctx context.Context) error {
 	// whose newer writes these would land after: a replacement over a
 	// tombstone the standby wrote leaves a deleted document live in the
 	// archive. So the lease is asked again before writing once a renewal is
-	// due, and a lost one writes nothing. What is left is a pause inside the
-	// write itself; nothing here fences writes to the application's
-	// collections, which docs/limitations.md says.
+	// due, and a lost one writes nothing. A pause inside the write itself is
+	// what lease.Fence, in the flush's own transaction, is for.
 	if f.hold != nil && time.Since(f.heldAt) >= lease.Renew {
 		if err := f.hold.Keep(ctx); errors.Is(err, lease.ErrLost) {
 			f.log.Error("another feeder took over while this one was flushing, so the flush is not written",
