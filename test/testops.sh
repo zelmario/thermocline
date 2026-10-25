@@ -54,6 +54,10 @@ pkill -f "cline feeder --config $WDIR/|cline router --config $WDIR/"; sleep 2
 H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})' >/dev/null
+# From now, not from where an earlier run stopped: resuming an hour and a half
+# back on this busy oplog took the feeder longer than the first archive read
+# waits, and that read was refused as behind.
+C 'db.getSiblingDB(process.env.TC_META).checkpoints.deleteOne({_id:"test"})' >/dev/null
 cline feeder --config $CFG --log-file $LOGDIR/ops_f.log & FP=$!
 cline router --config $CFG --log-file $LOGDIR/ops_r.log & RP=$!
 # Until it answers, not a fixed six seconds: on 2026-09-28, with other
