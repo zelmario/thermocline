@@ -2,12 +2,10 @@ package router
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/wire"
@@ -97,7 +95,7 @@ func (c *conn) guardOneUpsert(ctx context.Context, msg *wire.Message, cmd bson.R
 	// The fast tier deciding it has a match is the end of it: the update
 	// applies there and no document is created. Asking it first also keeps
 	// the archive out of the common path, where the document is hot.
-	has, herr := c.r.fastTierMatchesHeld(ctx, ns, st.filter, st.collation)
+	has, herr := c.r.fastTierMatchesHeld(ctx, ns, st.filter, st.collation, letOf(cmd))
 	if herr != nil {
 		c.log.Warn("could not check the fast tier before an upsert, letting it through",
 			"ns", ns, "err", herr)
@@ -273,8 +271,8 @@ func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStat
 // A no from the hold, the eviction having taken the match while it waited, is
 // reported as no match here, and the caller goes on to the archive as it does
 // for any miss.
-func (r *Router) fastTierMatchesHeld(ctx context.Context, ns string, filter, collation bson.Raw) (bool, error) {
-	match, found, err := r.fastTierMatch(ctx, ns, filter, collation)
+func (r *Router) fastTierMatchesHeld(ctx context.Context, ns string, filter, collation, let bson.Raw) (bool, error) {
+	match, found, err := r.fastTierMatch(ctx, ns, filter, collation, let)
 	if err != nil || !found {
 		return found, err
 	}
@@ -327,13 +325,21 @@ func (r *Router) notYetEvictable(ctx context.Context, ns string, match bson.Raw)
 
 // fastTierMatch returns the _id and age field of one document the fast tier
 // matches for filter.
-func (r *Router) fastTierMatch(ctx context.Context, ns string, filter, collation bson.Raw) (bson.Raw, bool, error) {
+//
+// let carries the command's variables. A filter may refer to them with $expr,
+// and asked without them mongod refuses it as an undefined variable, which the
+// upsert guard read as "could not check" and let through: an upsert matching an
+// archived document by $$t created a second record. See copyUpMatching.
+func (r *Router) fastTierMatch(ctx context.Context, ns string, filter, collation, let bson.Raw) (bson.Raw, bool, error) {
 	proj := bson.D{{Key: "_id", Value: 1}}
 	if f, ok := r.ageFieldOf(ns); ok && f != "_id" {
 		proj = append(proj, bson.E{Key: f, Value: 1})
 	}
 	db, coll := splitNS(ns)
-	opts := options.FindOne().SetProjection(proj)
+	opts := options.Find().SetProjection(proj).SetLimit(1)
+	if len(let) > 0 {
+		opts.SetLet(let)
+	}
 	if len(collation) > 0 {
 		// The same question the client's own statement will ask, asked the same
 		// way. Without this the fast tier is searched case-sensitively for a
@@ -344,15 +350,5 @@ func (r *Router) fastTierMatch(ctx context.Context, ns string, filter, collation
 			opts = opts.SetCollation(&c)
 		}
 	}
-	var match bson.Raw
-	err := r.hot.Database(db).Collection(coll).
-		FindOne(ctx, filter, opts).
-		Decode(&match)
-	if err == nil {
-		return match, true, nil
-	}
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		return nil, false, nil
-	}
-	return nil, false, err
+	return findFirst(ctx, r.hot.Database(db).Collection(coll), filter, opts)
 }

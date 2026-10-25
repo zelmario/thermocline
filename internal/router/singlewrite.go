@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -44,7 +43,7 @@ import (
 // It returns the _id to copy up. Everything after that is the path the _id case
 // already takes, which is deliberate: the copy-up, the transaction replay and
 // the retry are all the same problem once the document is named.
-func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
+func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort, collation, let bson.Raw) (bson.RawValue, bool, error) {
 	// A collection Thermocline does not tier is whole on the fast tier, so its
 	// zero is the truth and no archive lookup is owed.
 	if !c.r.cfg.Manages(ns) {
@@ -64,7 +63,7 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort,
 		}
 	}
 
-	return c.r.oneArchivedMatch(ctx, ns, filter, sort, collation)
+	return c.r.oneArchivedMatch(ctx, ns, filter, sort, collation, let)
 }
 
 // oneArchivedMatch returns the _id of one live archived document matching
@@ -75,8 +74,8 @@ func (c *conn) resolveMissByFilter(ctx context.Context, ns string, filter, sort,
 // nothing here, so every document the statement matches is in the archive, and
 // the archive's own first match is therefore the document the statement would
 // have found with nothing tiered underneath it.
-func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation bson.Raw) (bson.RawValue, bool, error) {
-	doc, found, err := r.oneArchivedMatchDoc(ctx, ns, filter, sort, collation, nil)
+func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, collation, let bson.Raw) (bson.RawValue, bool, error) {
+	doc, found, err := r.oneArchivedMatchDoc(ctx, ns, filter, sort, collation, let, nil)
 	if err != nil || !found {
 		return bson.RawValue{}, found, err
 	}
@@ -89,7 +88,8 @@ func (r *Router) oneArchivedMatch(ctx context.Context, ns string, filter, sort, 
 
 // oneArchivedMatchDoc is oneArchivedMatch returning the document with _id and
 // the fields in also, which a caller deciding more than which document needs.
-func (r *Router) oneArchivedMatchDoc(ctx context.Context, ns string, filter, sort, collation bson.Raw, also []string) (bson.Raw, bool, error) {
+func (r *Router) oneArchivedMatchDoc(ctx context.Context, ns string, filter, sort, collation, let bson.Raw,
+	also []string) (bson.Raw, bool, error) {
 	proj := bson.D{{Key: "_id", Value: 1}}
 	for _, f := range also {
 		if f != "" && f != "_id" {
@@ -109,9 +109,13 @@ func (r *Router) oneArchivedMatchDoc(ctx context.Context, ns string, filter, sor
 		return nil, false, err
 	}
 	db, coll := splitNS(ns)
-	opts := options.FindOne().SetProjection(proj)
+	opts := options.Find().SetProjection(proj).SetLimit(1)
 	if len(sort) > 0 {
 		opts.SetSort(sort)
+	}
+	// The command's variables, which the filter may name. See fastTierMatch.
+	if len(let) > 0 {
+		opts.SetLet(let)
 	}
 	// In the comparison the fast tier already made: the caller's own collation
 	// when the command carried one, the collection's when it did not. See
@@ -129,19 +133,29 @@ func (r *Router) oneArchivedMatchDoc(ctx context.Context, ns string, filter, sor
 			opts.SetCollation(c)
 		}
 	}
-	var doc bson.Raw
-	err := r.cold.Database(db).Collection(coll).FindOne(ctx, liveOnly(bson.RawValue{
+	doc, found, err := findFirst(ctx, r.cold.Database(db).Collection(coll), liveOnly(bson.RawValue{
 		Type:  bson.TypeEmbeddedDocument,
 		Value: filter,
-	}), opts).Decode(&doc)
-	if errors.Is(err, mongo.ErrNoDocuments) {
+	}), opts)
+	if err != nil || !found {
 		// Not in the archive either, so matching nothing was the truth.
-		return nil, false, nil
-	}
-	if err != nil {
 		return nil, false, err
 	}
 	return doc, true, nil
+}
+
+// findFirst is FindOne for options FindOne has no setter for: a find limited
+// to one, returning the document and whether there was one.
+func findFirst(ctx context.Context, c *mongo.Collection, filter any, opts *options.FindOptionsBuilder) (bson.Raw, bool, error) {
+	cur, err := c.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	if !cur.Next(ctx) {
+		return nil, false, cur.Err()
+	}
+	return append(bson.Raw(nil), cur.Current...), true, nil
 }
 
 // A sort says which of several matches the caller means, and the fast tier
@@ -228,7 +242,7 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 	// With a sort the question is which document, not whether there is one, and
 	// the fast tier's own best match is exactly what cannot be trusted.
 	if !sorted {
-		if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, docField(cmd, "collation")); herr == nil && has {
+		if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, docField(cmd, "collation"), letOf(cmd)); herr == nil && has {
 			return nil, false
 		}
 	}
@@ -244,7 +258,7 @@ func (c *conn) guardSortedFindAndModify(ctx context.Context, msg *wire.Message, 
 
 	t0 := time.Now()
 	af, aok := c.r.ageFieldOf(ns)
-	match, found, err := c.r.oneArchivedMatchDoc(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"), []string{af})
+	match, found, err := c.r.oneArchivedMatchDoc(ctx, ns, fdoc, sortDoc, docField(cmd, "collation"), letOf(cmd), []string{af})
 	c.r.Metrics.RecordStage(stageFamMatch, time.Since(t0))
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this sort means, so the fast tier's answer stands",

@@ -137,6 +137,18 @@ sleep 5
 chk "and the archive still holds all five as they were" "5" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).tups.countDocuments({_id:{\$in:[10,11,12,13,14]}, name:'alice', x:{\$exists:false}}))")"
 
+echo "== a write whose filter names a let variable =="
+# The archive and the fast tier were asked the filter without the command's
+# let, and mongod refused it as an undefined variable, so a valid update of an
+# archived document by $$t was refused through the router. (An upsert cannot
+# carry $expr at all: mongod refuses it with 224, through the router or not.)
+C "db.getSiblingDB(process.env.TC_DB).tups.insertOne({_id:20, name:'alice', tier:'gold'})" >/dev/null
+chk "an update by \$\$t reaches the archived document"   "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({update:'tups', let:{t:20},
+     updates:[{q:{\$expr:{\$eq:['\$_id','\$\$t']}}, u:{\$set:{x:1}}}]}).nModified)")"
+chk "  and keeps what it held"                          "alice-gold-1" \
+    "$(R "const d=db.getSiblingDB(process.env.TC_DB).tups.findOne({_id:20}); print(d?d.name+'-'+d.tier+'-'+d.x:'MISSING')")"
+
 echo "== a genuinely new document still upserts =="
 # The guard must not turn every upsert into a lookup that refuses to create.
 NEW=$(R "const r=db.getSiblingDB(process.env.TC_DB).tups.updateOne({_id:99},{\$set:{balance:1}},{upsert:true}); print(r.upsertedCount)")

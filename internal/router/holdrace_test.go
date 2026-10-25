@@ -157,7 +157,7 @@ func TestAMatchOldEnoughToEvictIsHeldBeforeAWriteRelies(t *testing.T) {
 	t.Cleanup(func() { promote.HeldForTest = nil })
 
 	filter, _ := bson.Marshal(bson.D{{Key: "_id", Value: 1}})
-	has, err := r.fastTierMatchesHeld(ctx, ns, filter, nil)
+	has, err := r.fastTierMatchesHeld(ctx, ns, filter, nil, nil)
 	if err != nil {
 		t.Fatalf("fastTierMatchesHeld: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestARecentMatchCostsNoHold(t *testing.T) {
 		held bool
 	}{{1, false}, {2, true}, {3, true}} {
 		filter, _ := bson.Marshal(bson.D{{Key: "_id", Value: c.id}})
-		has, err := r.fastTierMatchesHeld(ctx, ns, filter, nil)
+		has, err := r.fastTierMatchesHeld(ctx, ns, filter, nil, nil)
 		if err != nil || !has {
 			t.Fatalf("_id %d: has=%v err=%v, want a match", c.id, has, err)
 		}

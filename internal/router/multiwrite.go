@@ -141,7 +141,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		// produces, every statement of one being answered, so this leaves it
 		// where it was rather than inventing a behaviour for it.
 		if !multi {
-			c.bringUpOneForUnacked(ctx, ns, fdoc, docField(st, "collation"), name)
+			c.bringUpOneForUnacked(ctx, ns, fdoc, docField(st, "collation"), letOf(cmd), name)
 			continue
 		}
 
@@ -618,14 +618,14 @@ func aboutTheQuery(code int) bool {
 // Failures are logged and the write goes on. The alternative is dropping a
 // write because the archive was slow, and an unacknowledged write that reaches
 // only the fast tier is the behaviour this system had all along.
-func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collation bson.Raw, name string) {
+func (c *conn) bringUpOneForUnacked(ctx context.Context, ns string, fdoc, collation, let bson.Raw, name string) {
 	// An error here is not a match: it means the fast tier could not be asked,
 	// and going on to the archive costs a lookup while believing it would cost
 	// the write.
-	if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, collation); herr == nil && has {
+	if has, herr := c.r.fastTierMatchesHeld(ctx, ns, fdoc, collation, let); herr == nil && has {
 		return
 	}
-	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil, collation)
+	id, found, err := c.resolveMissByFilter(ctx, ns, fdoc, nil, collation, let)
 	if err != nil {
 		c.log.Warn("could not ask the archive which document this unacknowledged write means, so it reaches only the fast tier",
 			"ns", ns, "command", name, "err", err)
