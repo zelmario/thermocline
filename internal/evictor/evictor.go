@@ -1341,8 +1341,19 @@ func (e *Evictor) deletedSince(ctx context.Context, ns string, ids bson.A, since
 		return nil, false, err
 	}
 	// A minute's margin, for the evictor's clock that stamped the step and the
-	// primary's that stamped the oplog.
-	from := since.Add(-time.Minute)
+	// primary's that stamped the oplog, and the skew this process measured
+	// against the archive on top. With a clock more than a minute ahead the
+	// window began after the predecessor's delete, the delete was not found,
+	// and the notice was withdrawn before the feeder spent it: the feeder then
+	// read the delete as the application's and tombstoned the archive's copy.
+	margin := time.Minute
+	if skew, ok := e.lastSkew(); ok {
+		if skew < 0 {
+			skew = -skew
+		}
+		margin += skew
+	}
+	from := since.Add(-margin)
 	if first.Wall.After(from) {
 		return nil, false, nil
 	}
