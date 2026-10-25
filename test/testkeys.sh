@@ -492,6 +492,14 @@ cline keys --config $CFG --rebuild >/dev/null 2>&1
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 startRouter
 chk "rebuild claims the archived key" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tklate.insertOne({_id:2,email:"late@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
+# Two statements, the second taking the archived key. Nothing was forwarded,
+# and the reply, ok: 1 with one write error at index 1, said the first had run:
+# a client retrying only the failed statement lost the other.
+R 'db.getSiblingDB(process.env.TC_DB).tklate.insertMany([{_id:3,email:"three@x.com"},{_id:4,email:"four@x.com"}])' >/dev/null
+chk "two statements, one taking an archived key, are refused whole" "REFUSED" \
+    "$(R 'try{const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:"tklate", updates:[{q:{_id:3},u:{$set:{v:1}}},{q:{_id:4},u:{$set:{email:"late@x.com"}}}]}); print(r.ok===0 && /Nothing was applied/.test(r.errmsg) ? "REFUSED" : JSON.stringify(r).substring(0,80))}catch(e){print(/Nothing was applied/.test(e.message)?"REFUSED":e.message.substring(0,60))}')"
+chk "  and the first did not run either" "false" \
+    "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:3}).v===1)')"
 
 echo "== sparse unique index: only the documents it indexes =="
 # A sparse index does not index a document missing the field, so any number of

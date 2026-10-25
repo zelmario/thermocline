@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"errors"
 	"strings"
 
@@ -556,6 +557,27 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 				c.r.Stats.DuplicateKeys.Add(1)
 				c.log.Debug("update would duplicate an archived document",
 					"ns", ns, "index", idxs[i].name)
+				// With more than one statement nothing is forwarded, and a
+				// reply of ok: 1 with one write error at s said the others had
+				// run: an ordered update of [A, B] whose B takes an archived
+				// key applied neither, and the client was told A had gone in.
+				// mongod applies A. Applying it here means a trimmed command
+				// and its reply put back together, which this does not do, so
+				// the whole command is refused, saying nothing was applied.
+				if len(stmts) > 1 {
+					c.r.Stats.Refused.Add(1)
+					c.cls = ClassRefused
+					out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+						fmt.Sprintf("thermocline: refusing this update because statement %d would take a key "+
+							"held by a document in the archive (index %s), which mongod would refuse with "+
+							"E11000, and this router cannot apply the other statements without it. Nothing "+
+							"was applied. Send that statement on its own to get the duplicate key error, and "+
+							"the others separately.", s, idxs[i].name))
+					if rerr != nil {
+						return nil, false
+					}
+					return out, true
+				}
 				out, rerr := c.r.updateDuplicateKeyReply(msg, name, ns, idxs[i].name, s)
 				if rerr != nil {
 					return nil, false
