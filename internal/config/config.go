@@ -1254,7 +1254,7 @@ func tlsFromURI(uri string) (uriTLS, error) {
 	if err != nil {
 		return out, nil
 	}
-	q := u.Query()
+	q := uriOptions(u)
 	// The option as written, and whether it was written at all: mongodb+srv
 	// turns TLS on unless the string turns it off, which a plain "is it
 	// true" read as off.
@@ -1289,6 +1289,27 @@ func tlsFromURI(uri string) (uriTLS, error) {
 	return out, nil
 }
 
+// uriOptions is a connection string's options with case-insensitive names,
+// which is how the driver reads them: tlscertificatekeyfile=... works for the
+// driver's own connections, and read case-sensitively here the router's raw
+// connection to the fast tier presented no certificate and every client read
+// through it failed.
+type uriOpts map[string]string
+
+func uriOptions(u *url.URL) uriOpts {
+	out := uriOpts{}
+	for k, vs := range u.Query() {
+		lk := strings.ToLower(k)
+		if _, seen := out[lk]; !seen && len(vs) > 0 {
+			out[lk] = vs[0]
+		}
+	}
+	return out
+}
+
+// Get is the option's value under any case of its name.
+func (o uriOpts) Get(name string) string { return o[strings.ToLower(name)] }
+
 func credentialsFromURI(uri string) (user, pass, authDB string) {
 	u, err := url.Parse(uri)
 	if err != nil || u.User == nil {
@@ -1296,7 +1317,7 @@ func credentialsFromURI(uri string) (user, pass, authDB string) {
 	}
 	user = u.User.Username()
 	pass, _ = u.User.Password()
-	authDB = u.Query().Get("authSource")
+	authDB = uriOptions(u).Get("authSource")
 	if authDB == "" {
 		// The driver's own default: the database named in the path, or admin.
 		authDB = strings.TrimPrefix(u.Path, "/")

@@ -756,4 +756,13 @@ func TestTLSFromURIReadsWhatTheDriverReads(t *testing.T) {
 	if _, err := tlsFromURI("mongodb://h:27017/?tls=true&tlsCertificateKeyFile=/k.pem&tlsCertificateKeyFilePassword=x"); err == nil {
 		t.Error("a key file password, which the raw connection cannot use, was accepted")
 	}
+	// The driver reads option names in any case, so these work for its
+	// connections, and read case-sensitively the raw one had no TLS at all.
+	lower, err := tlsFromURI("mongodb://h:27017/?TLS=true&tlscertificatekeyfile=/etc/client.pem&TLSCAFILE=/etc/ca.pem")
+	if err != nil || !lower.enabled || lower.certKeyFile != "/etc/client.pem" || lower.caFile != "/etc/ca.pem" {
+		t.Errorf("options in another case read as %+v (%v)", lower, err)
+	}
+	if _, _, auth := credentialsFromURI("mongodb://u:p@h:27017/app?authsource=admin"); auth != "admin" {
+		t.Errorf("authsource in lower case read as %q, want admin", auth)
+	}
 }
