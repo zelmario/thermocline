@@ -100,11 +100,12 @@ func runWatermark(args []string) error {
 		// about to remove and wrote the claim back over them. Measured: three
 		// of three declarations of complete-for-all-history made that way left
 		// the fast tier holding 150 of 300 under the claim.
-		release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+		held, release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
 		if err != nil {
 			return err
 		}
 		defer release()
+		ctx = held
 	}
 
 	// verify counts both tiers and refuses a claim they contradict. --force
@@ -225,7 +226,12 @@ func describe(m watermark.Mark) string {
 // two minutes for a sweep in progress to finish, and keeps it renewed until
 // the returned release is called. The evictor skips its sweeps while it is
 // held, so a declaration delays eviction by one sweep at most.
-func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) (func(), error) {
+//
+// The returned context is the caller's, cancelled when the lease is lost, so
+// work done under it stops: a renewal that failed was ignored, and a backfill
+// paused past the lease went on marking while the evictor, having taken the
+// lease back, deleted the same documents.
+func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) (context.Context, func(), error) {
 	l := lease.New(cold, "evictor", feederID)
 	deadline := time.Now().Add(2 * time.Minute)
 	said := false
@@ -236,10 +242,10 @@ func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) 
 		}
 		var held *lease.ErrHeld
 		if !errors.As(err, &held) {
-			return nil, fmt.Errorf("take the evictor's lease: %w", err)
+			return nil, nil, fmt.Errorf("take the evictor's lease: %w", err)
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("an eviction sweep has held the evictor's lease for two minutes, "+
+			return nil, nil, fmt.Errorf("an eviction sweep has held the evictor's lease for two minutes, "+
 				"and this cannot go ahead while one is removing documents: %w", err)
 		}
 		if !said {
@@ -248,10 +254,11 @@ func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) 
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
+	held, lost := context.WithCancelCause(ctx)
 	kctx, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -261,13 +268,17 @@ func holdEvictorLease(ctx context.Context, cold *mongo.Client, feederID string) 
 			case <-kctx.Done():
 				return
 			case <-time.After(lease.Renew):
-				_ = l.Keep(kctx)
+				if err := l.Keep(kctx); errors.Is(err, lease.ErrLost) {
+					lost(err)
+					return
+				}
 			}
 		}
 	}()
-	return func() {
+	return held, func() {
 		stop()
 		<-done
+		lost(nil)
 		_ = l.Release(context.WithoutCancel(ctx))
 	}, nil
 }

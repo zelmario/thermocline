@@ -29,8 +29,8 @@ import (
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/evictor"
 	"github.com/zelmario/thermocline/internal/feeder"
-	"github.com/zelmario/thermocline/internal/router"
 	"github.com/zelmario/thermocline/internal/pairing"
+	"github.com/zelmario/thermocline/internal/router"
 	"github.com/zelmario/thermocline/internal/tierver"
 	"github.com/zelmario/thermocline/internal/warmer"
 )

@@ -63,7 +63,7 @@ func runPause(args []string, on bool) error {
 	// the fast tier. The operator's next step is usually restoring the archive,
 	// so "paused" is said only once no sweep is in progress: the evictor holds
 	// its lease for the whole of a sweep, and taking it here waits that out.
-	release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+	_, release, err := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
 	if err != nil {
 		return fatal(log, "pause", fmt.Errorf("the hold is recorded, but a sweep may still be running: %w", err))
 	}

@@ -18,8 +18,9 @@ import (
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
-	"github.com/zelmario/thermocline/internal/pairing"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/pairing"
 	"github.com/zelmario/thermocline/internal/watermark"
 )
 
@@ -187,16 +188,21 @@ func runBackfill(args []string) error {
 		// namespace, so a long backfill holds eviction back one namespace at a
 		// time.
 		release := func() {}
+		mctx := ctx
 		if *apply && !markingHeld {
-			r, lerr := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
+			h, r, lerr := holdEvictorLease(ctx, cold, cfg.Evictor.FeederID)
 			if lerr != nil {
 				fmt.Printf("  %-40s deletes not marked: %v\n", ns, lerr)
 				failed++
 				continue
 			}
-			release = r
+			mctx, release = h, r
 		}
-		marked, why, dfailed := backfillDeletes(ctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
+		marked, why, dfailed := backfillDeletes(mctx, cfg, marks, hot, cold, ns, db, coll, *apply, markingHeld)
+		if cause := context.Cause(mctx); cause != nil && errors.Is(cause, lease.ErrLost) {
+			fmt.Printf("  %-40s stopped marking deletes: %v\n", ns, cause)
+			dfailed = true
+		}
 		release()
 		if dfailed {
 			failed++
