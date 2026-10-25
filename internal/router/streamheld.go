@@ -123,12 +123,8 @@ func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTai
 		end := min(start+fillChunk, len(events))
 		chunk, _ := r.fillLookups(ctx, events[start:end])
 		if tail.applies() {
-			for a := 0; a < len(chunk); {
-				b, piece := a, 0
-				for b < len(chunk) && (b == a || piece+eventSize(chunk[b]) <= tailChunkBytes) {
-					piece += eventSize(chunk[b])
-					b++
-				}
+			for _, p := range tailPieces(chunk, tailChunkBytes) {
+				a, b := p[0], p[1]
 				shaped, err := r.applyStreamTail(ctx, db, tail, chunk[a:b])
 				if err != nil {
 					return nil, nil, 0, err
@@ -147,7 +143,6 @@ func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTai
 						filled++
 					}
 				}
-				a = b
 			}
 			continue
 		}
@@ -165,6 +160,24 @@ func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTai
 		}
 	}
 	return out, nil, filled, nil
+}
+
+// tailPieces cuts filled events into runs of at most limit bytes, in order,
+// each run a [from, to) pair; a single event larger than limit is a run of its
+// own. Each run is sent to the fast tier as one command, which mongod caps at
+// 16MB.
+func tailPieces(events bson.A, limit int) [][2]int {
+	var out [][2]int
+	for a := 0; a < len(events); {
+		b, piece := a, 0
+		for b < len(events) && (b == a || piece+eventSize(events[b]) <= limit) {
+			piece += eventSize(events[b])
+			b++
+		}
+		out = append(out, [2]int{a, b})
+		a = b
+	}
+	return out
 }
 
 // streamDB is the database a stream reply's cursor names.
@@ -207,8 +220,17 @@ func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail *streamTail, r
 		}
 		out, filled := c.r.fillLookups(ctx, keep)
 		if tail.applies() {
-			shaped, err := c.r.applyStreamTail(ctx, db, tail, out)
-			return shaped, bson.RawValue{}, filled, true, err
+			// In pieces, as fillBounded runs them: one command over a whole
+			// filled batch can pass mongod's 16MB.
+			shaped := bson.A{}
+			for _, p := range tailPieces(out, tailChunkBytes) {
+				part, err := c.r.applyStreamTail(ctx, db, tail, out[p[0]:p[1]])
+				if err != nil {
+					return nil, bson.RawValue{}, filled, true, err
+				}
+				shaped = append(shaped, part...)
+			}
+			return shaped, bson.RawValue{}, filled, true, nil
 		}
 		return out, bson.RawValue{}, filled, filled > 0, nil
 	}

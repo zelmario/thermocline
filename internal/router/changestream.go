@@ -180,10 +180,21 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if !ok || len(stages) < 2 {
 		return
 	}
+	// Only a stream that asked for the document has one to fill.
+	if !bytes.Contains(stages[0].Value, []byte("fullDocument")) {
+		return
+	}
+	// The stages mongod may keep are the leading $match stages that cannot
+	// see the document: none names fullDocument, $$ROOT or $$CURRENT, or
+	// reads through $expr. Everything from the first other stage on runs
+	// here, after the fill. Split at the first stage naming fullDocument, a
+	// $redact deciding on $$ROOT, or a $project dropping it by leaving it out,
+	// ran before the fill and the fill put back what it had taken.
 	at := -1
 	for i, st := range stages[1:] {
-		if at < 0 && bytes.Contains(st.Value, []byte("fullDocument")) {
+		if !blindMatch(st) {
 			at = i + 1
+			break
 		}
 	}
 	if at < 0 {
@@ -231,6 +242,21 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	}
 	c.sendInstead = out
 	c.csTail = &streamTail{stages: tail, collation: collation, let: let}
+}
+
+// blindMatch reports whether a stage is a $match that cannot see a change
+// event's document, so running it before the fill changes nothing.
+func blindMatch(st bson.RawValue) bool {
+	name, _ := changeStreamStage(st)
+	if name != "$match" {
+		return false
+	}
+	for _, w := range []string{"fullDocument", "$$ROOT", "$$CURRENT", "$expr"} {
+		if bytes.Contains(st.Value, []byte(w)) {
+			return false
+		}
+	}
+	return true
 }
 
 // changeStreamStage names a stage and reports whether mongod allows it after

@@ -582,6 +582,19 @@ COLLATED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin 
   }
   cs.close(); print(out);" 2>&1 | tail -1)
 chk "  and a collated \$match keeps the stream's collation" "HAS looked up" "$COLLATED"
+# A stage that reads the document without naming it: $$ROOT copies the event
+# with its fullDocument. Run before the fill, the copy kept mongod's null.
+ROOTED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$set:{copy:'\$\$ROOT'}}],
+    {fullDocument:'updateLookup', startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  for (let i=0;i<40;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = (e.copy && e.copy.fullDocument) ? 'HAS '+e.copy.fullDocument.v : 'NULL'; break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "  and a stage reading \$\$ROOT sees it filled"     "HAS looked up" "$ROOTED"
 # A stream ending in $changeStreamSplitLargeEvent is left to mongod, and so is
 # not filled: filled after mongod's $project, the field it removed came back.
 SPLIT=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
