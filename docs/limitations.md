@@ -1047,6 +1047,14 @@ Part of [Thermocline](../README.md).
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
 
+- **Inside a transaction, a unique value its own earlier statement freed
+  cannot be taken.** The claim registry reads a key's owner on the router's own
+  client, outside the caller's transaction, so it sees the value as still
+  held: `updateOne({_id: A}, {$set: {email: "new"}})` and then giving A's old
+  email to B, in one transaction, is refused E11000 and the transaction
+  aborted, where MongoDB commits both. Nothing wrong is written. Free and
+  reuse the value in two transactions, or in one statement.
+
 - **A batch with one statement taking a key only the archive holds is refused
   whole.** mongod applies the other statements of an `update` command or a
   `bulkWrite` and reports the one duplicate. The router decides the duplicate
