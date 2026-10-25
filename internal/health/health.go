@@ -188,6 +188,9 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 				latest = pos.SavedAt
 			}
 			r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
+			if behind, ok := c.behindFastTier(ctx, pos.TS); ok && behind > r.FeederLag {
+				r.FeederLag = behind
+			}
 			return
 		}
 	}
@@ -209,6 +212,44 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 	theirs, theirsKnown := rec.Skew()
 	mine, mineKnown := c.archiveSkew(ctx)
 	r.FeederLag = LagFrom(time.Now(), latest, mine, theirs, mineKnown && theirsKnown)
+}
+
+// behindFastTier is how far the published cluster time trails the fast tier's
+// own last write, both read from the fast tier's clock.
+//
+// The wall-clock reading above says whether the feeder is publishing, not how
+// far behind it is: SavedAt is the moment of publishing, and At is set to now
+// every time a batch of the stream is used up, not only when the stream is
+// empty. So a feeder replaying a three hour backlog read as about 0s behind
+// from its first batch, and the evictor went on. Its eviction notices last
+// NoticeTTL; a delete the feeder reaches after that reads as an application
+// delete and tombstones the archive's copy, and the document is then in
+// neither tier. That is the loss max_feeder_lag < NoticeTTL is refused to
+// prevent, and it was judged on a number that could not show it.
+//
+// A cluster time is exact and in one frame: the published TS is a position in
+// the fast tier's oplog, and lastWrite is the newest one. The primary writes a
+// no-op every ten seconds when idle, and the stream's resume tokens move past
+// those too, so an idle pair reads a few seconds at most.
+func (c *Checker) behindFastTier(ctx context.Context, ts bson.Timestamp) (time.Duration, bool) {
+	if ts.T == 0 || c.hot == nil {
+		return 0, false
+	}
+	var h struct {
+		LastWrite struct {
+			OpTime struct {
+				TS bson.Timestamp `bson:"ts"`
+			} `bson:"opTime"`
+		} `bson:"lastWrite"`
+	}
+	if err := c.hot.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&h); err != nil {
+		return 0, false
+	}
+	newest := h.LastWrite.OpTime.TS
+	if newest.T <= ts.T {
+		return 0, true
+	}
+	return time.Duration(newest.T-ts.T) * time.Second, true
 }
 
 func (c *Checker) sampleServerStatus(ctx context.Context, r *Reading) {

@@ -1,9 +1,15 @@
 package health
 
 import (
+	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
 )
@@ -150,5 +156,41 @@ func TestFeederLagAcrossTwoClocks(t *testing.T) {
 	}
 	if got := LagFrom(now, behind, -30*time.Second, 0, false); got != 0 {
 		t.Errorf("uncorrected lag = %v, want the zero the clamp used to report", got)
+	}
+}
+
+// A feeder replaying a backlog publishes all the time, so the wall-clock
+// reading, which is the moment it published, said about 0s while it was hours
+// behind, and the evictor went on removing documents whose notices would
+// expire before the feeder reached their deletes. The published cluster time
+// against the fast tier's own last write says how far behind it really is.
+func TestFeederLagFromTheFastTiersClock(t *testing.T) {
+	uri := os.Getenv("TC_TEST_HOT")
+	if uri == "" {
+		t.Skip("set TC_TEST_HOT to a replica set")
+	}
+	ctx := context.Background()
+	cl, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cl.Disconnect(ctx) }()
+	if _, err := cl.Database("tc_health").Collection("w").InsertOne(ctx, bson.D{{Key: "n", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cl.Database("tc_health").Drop(context.Background()) }()
+	c := New(cl, nil, "test")
+
+	threeHoursAgo := bson.Timestamp{T: uint32(time.Now().Add(-3 * time.Hour).Unix())}
+	behind, ok := c.behindFastTier(ctx, threeHoursAgo)
+	if !ok || behind < 2*time.Hour {
+		t.Errorf("a position three hours old read as %s behind (known %v), want about three hours", behind, ok)
+	}
+	future := bson.Timestamp{T: uint32(time.Now().Add(time.Minute).Unix())}
+	if behind, ok := c.behindFastTier(ctx, future); !ok || behind != 0 {
+		t.Errorf("a position past the newest write read as %s behind (known %v), want 0", behind, ok)
+	}
+	if _, ok := c.behindFastTier(ctx, bson.Timestamp{}); ok {
+		t.Error("a record with no cluster time was judged, want it left to the wall-clock reading")
 	}
 }

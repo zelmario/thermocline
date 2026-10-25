@@ -53,6 +53,28 @@ func (f *Feeder) markCaughtUp(tok bson.Raw) {
 	}
 }
 
+// markBatchEnd is markCaughtUp for a batch that was used up, unless the batch
+// may have ended partway through one commit.
+//
+// A transaction, and on 8.0 a batched write logged as chained applyOps, puts
+// every one of its events at one cluster time. A getMore batch can end
+// anywhere among them, and the batch's token then carries that shared time:
+// claiming it said every event of the commit was in the archive when the rest
+// had not been read. A read waiting for the commit's operationTime passed, and
+// the archive still held as live documents the unread tail had deleted. handle
+// publishes justBefore an event's time for exactly this reason, and this path
+// went round it.
+//
+// So a batch whose last event shares its time with the event before it, or is
+// part of a transaction, leaves the position where handle put it. The next
+// batch, or the next empty poll, moves it on.
+func (f *Feeder) markBatchEnd(tok bson.Raw) {
+	if ts, ok := clusterTimeFromToken(tok); ok && ts == f.lastCT && (f.lastInTxn || f.lastCTRun > 1) {
+		return
+	}
+	f.markCaughtUp(tok)
+}
+
 // noteEventTS records how far mirroring has got as a cluster time, and never
 // lets that go backwards.
 //

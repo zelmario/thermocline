@@ -154,3 +154,56 @@ func TestAnEventProvesOnlyWhatCameBeforeIt(t *testing.T) {
 		t.Error("the time before the first increment of a second is the last increment of the one before")
 	}
 }
+
+// A batch can end partway through one commit, and its token then carries the
+// commit's shared time. Claiming that time said the whole commit was in the
+// archive. The tokens are the two events of a two-insert transaction, as an
+// 8.0 primary returned them: the same time, txnOpIndex 0 and 1.
+func TestBatchEndInsideACommitClaimsNothing(t *testing.T) {
+	const second = "826ADDEAD1000000012B042C01002B026E5A1004"
+	ct := bson.Timestamp{T: 0x6ADDEAD1, I: 1}
+	txnEvent := func(lsid bool) bson.Raw {
+		doc := bson.D{
+			{Key: "_id", Value: bson.D{{Key: "_data", Value: second}}},
+			{Key: "operationType", Value: "insert"},
+			{Key: "ns", Value: bson.D{{Key: "db", Value: "app"}, {Key: "coll", Value: "orders"}}},
+			{Key: "documentKey", Value: bson.D{{Key: "_id", Value: 1}}},
+			{Key: "fullDocument", Value: bson.D{{Key: "_id", Value: 1}}},
+			{Key: "clusterTime", Value: ct},
+		}
+		if lsid {
+			doc = append(doc, bson.E{Key: "lsid", Value: bson.D{{Key: "id", Value: "s"}}})
+		}
+		raw, err := bson.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	for _, tc := range []struct {
+		name   string
+		events []bson.Raw
+		want   bool
+	}{
+		{"a transaction's event", []bson.Raw{txnEvent(true)}, false},
+		{"two events at one time", []bson.Raw{txnEvent(false), txnEvent(false)}, false},
+		{"one event on its own", []bson.Raw{txnEvent(false)}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := testFeeder()
+			f.cfg.Namespaces = []string{"app.orders"}
+			for _, ev := range tc.events {
+				if err := f.handle(context.Background(), ev); err != nil {
+					t.Fatalf("handle: %v", err)
+				}
+			}
+			f.markBatchEnd(tokenRaw(t, second))
+			claimed := f.lastEventTS == ct
+			if claimed != tc.want {
+				t.Errorf("position after the batch = %v, claimed the commit's time: %v, want %v",
+					f.lastEventTS, claimed, tc.want)
+			}
+		})
+	}
+}

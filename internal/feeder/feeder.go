@@ -169,6 +169,13 @@ type Feeder struct {
 	// are empty when it names none. See checkpoint.Record.NS.
 	lastTokenNS string
 	lastTokenTS bson.Timestamp
+	// lastCT is the cluster time of the newest event handled, lastCTRun how
+	// many events in a row have carried it, and lastInTxn whether the newest
+	// was part of a transaction. Together they say whether a batch that ends on
+	// that event may have ended partway through one commit. See markBatchEnd.
+	lastCT    bson.Timestamp
+	lastCTRun int
+	lastInTxn bool
 	// lookupMissed are documents whose last change reached this feeder with
 	// nothing for updateLookup to find, awaiting the delete that explains it.
 	// See noteLookupMissed.
@@ -362,6 +369,9 @@ type changeEvent struct {
 	DocumentKey  bson.Raw       `bson:"documentKey"`
 	FullDocument bson.Raw       `bson:"fullDocument"`
 	ClusterTime  bson.Timestamp `bson:"clusterTime"`
+	// LSID is present only on an event that is part of a multi-document
+	// transaction.
+	LSID bson.Raw `bson:"lsid"`
 }
 
 // New builds a Feeder. It does not contact either cluster.
@@ -830,7 +840,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 				if err := f.flush(ctx); err != nil {
 					return err
 				}
-				f.markCaughtUp(f.lastToken)
+				f.markBatchEnd(f.lastToken)
 				if err := f.flushAndCheckpoint(ctx); err != nil {
 					return err
 				}
@@ -1157,6 +1167,14 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 	if err := bson.Unmarshal(raw, &ev); err != nil {
 		return fmt.Errorf("decode change event: %w", err)
 	}
+	// Before the namespace is judged: an event this skips can still be part of
+	// the commit whose end markBatchEnd has to find.
+	if ev.ClusterTime == f.lastCT {
+		f.lastCTRun++
+	} else {
+		f.lastCT, f.lastCTRun = ev.ClusterTime, 1
+	}
+	f.lastInTxn = len(ev.LSID) > 0
 	if skipNamespace(ev.NS.DB) {
 		return nil
 	}
