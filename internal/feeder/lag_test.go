@@ -198,7 +198,7 @@ func TestBatchEndInsideACommitClaimsNothing(t *testing.T) {
 					t.Fatalf("handle: %v", err)
 				}
 			}
-			f.markBatchEnd(tokenRaw(t, second))
+			f.markBatchEnd(context.Background(), tokenRaw(t, second))
 			claimed := f.lastEventTS == ct
 			if claimed != tc.want {
 				t.Errorf("position after the batch = %v, claimed the commit's time: %v, want %v",

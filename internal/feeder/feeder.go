@@ -840,7 +840,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 				if err := f.flush(ctx); err != nil {
 					return err
 				}
-				f.markBatchEnd(f.lastToken)
+				f.markBatchEnd(ctx, f.lastToken)
 				if err := f.flushAndCheckpoint(ctx); err != nil {
 					return err
 				}

@@ -68,11 +68,50 @@ func (f *Feeder) markCaughtUp(tok bson.Raw) {
 // So a batch whose last event shares its time with the event before it, or is
 // part of a transaction, leaves the position where handle put it. The next
 // batch, or the next empty poll, moves it on.
-func (f *Feeder) markBatchEnd(tok bson.Raw) {
-	if ts, ok := clusterTimeFromToken(tok); ok && ts == f.lastCT && (f.lastInTxn || f.lastCTRun > 1) {
-		return
+//
+// And a batch that ends on the first event of a time, outside a transaction,
+// when the oplog entry at that time is an applyOps: a deleteMany is never a
+// retryable write, so it carries no lsid, and 8.0 logs it as one applyOps
+// whose events all share its time. Ended after the first of them, the run is
+// one and the event has no lsid, and the time was claimed with the rest
+// unread. Asked of the oplog only in that case, which is one lookup by ts at a
+// batch end, so the barrier keeps its claim at the end of every other batch.
+func (f *Feeder) markBatchEnd(ctx context.Context, tok bson.Raw) {
+	if ts, ok := clusterTimeFromToken(tok); ok && ts == f.lastCT {
+		if f.lastInTxn || f.lastCTRun > 1 {
+			return
+		}
+		if grouped, err := f.groupedAt(ctx, ts); err != nil || grouped {
+			return
+		}
 	}
 	f.markCaughtUp(tok)
+}
+
+// groupedAt reports whether the fast tier's oplog entry at ts is an applyOps,
+// several events at one time. Without a fast tier client to ask, as in a unit
+// test, it says no.
+func (f *Feeder) groupedAt(ctx context.Context, ts bson.Timestamp) (bool, error) {
+	if f.hot == nil {
+		return false, nil
+	}
+	var entry struct {
+		Op string   `bson:"op"`
+		O  bson.Raw `bson:"o"`
+	}
+	err := f.hot.Database("local").Collection("oplog.rs").FindOne(ctx, bson.D{{Key: "ts", Value: ts}},
+		options.FindOne().SetProjection(bson.D{{Key: "op", Value: 1}, {Key: "o.applyOps", Value: 1}})).Decode(&entry)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if entry.Op != "c" {
+		return false, nil
+	}
+	_, lerr := entry.O.LookupErr("applyOps")
+	return lerr == nil, nil
 }
 
 // noteEventTS records how far mirroring has got as a cluster time, and never
