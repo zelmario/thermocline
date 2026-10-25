@@ -889,8 +889,10 @@ func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, ki
 	if coldErr == nil {
 		// The owner is gone from the fast tier and live in the archive, which
 		// is also what a delete looks like before its tombstone lands. Asked
-		// again once mirroring has caught up. See clashIsFresh.
-		r.clashIsFresh(ctx, ns)
+		// again once mirroring has caught up. See clashIsFreshOrBehind.
+		if ferr := r.clashIsFreshOrBehind(ctx, ns); ferr != nil {
+			return true, ferr
+		}
 		coldErr = coldOwner()
 	}
 	if coldErr == nil {
@@ -1154,6 +1156,9 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 	if len(idxs) > 0 {
 		var kerr error
 		claimed, clashes, kerr = c.r.claimKeys(ctx, ns, docs, idxs, ordered)
+		if out, done := c.refusedAsBehind(ctx, msg, kerr, claimed); done {
+			return out, true
+		}
 		if kerr != nil {
 			// Never block a write because the registry is unhappy. Losing the
 			// cross-tier half of a unique index is bad; refusing every insert
@@ -1166,6 +1171,10 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 
 	idRes := <-idCh
 	idClashes, ierr := idRes.clashes, idRes.err
+	// Counted and logged by refuseStale. See archivedIDClashes.
+	if out, done := c.refusedAsBehind(ctx, msg, ierr, claimed); done {
+		return out, true
+	}
 	if ierr != nil {
 		// An insert that cannot be checked is refused, because the failure this
 		// check exists to stop destroys data that is already safe.

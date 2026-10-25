@@ -49,7 +49,17 @@ func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.R
 	}
 	// About to refuse. Asked again once mirroring has caught up, because an _id
 	// deleted a moment ago is still live in the archive. See clashIsFresh.
-	r.clashIsFresh(ctx, ns)
+	//
+	// Under router.freshness: strict a wait that runs out is a refusal, not a
+	// duplicate key. The archive's answer is the one it is behind on, and
+	// E11000 says the _id is taken when the application may have just freed
+	// it: an idempotent loader that reads 11000 as "already there" skips the
+	// document and loses it. Measured on 2026-10-25 with the feeder stopped and
+	// six documents deleted through the router: each re-insert came back
+	// E11000, and a $merge of the same six was refused as behind.
+	if err := r.clashIsFreshOrBehind(ctx, ns); err != nil {
+		return nil, err
+	}
 	return r.archivedIDClashesNow(ctx, ns, docs)
 }
 

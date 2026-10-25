@@ -914,6 +914,110 @@ H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 stopDaemons
 
+echo "== a delete, then the same _ids written again =="
+# The archive holds a deleted document live until the feeder carries the delete
+# across, and the router cannot tell that from an eviction: both are documents
+# the archive has and the fast tier does not. A plain MongoDB has no such state.
+# Its answer is the one to give once mirroring catches up, and while it cannot,
+# strict refuses as behind: not E11000, which says the _id is taken when the
+# application has just freed it.
+#
+# Two collections, both tiered in cline.yaml: tmdel's six stay on the fast tier
+# for the application to delete, tmdelev's six are evicted, not deleted.
+MNS=tmdel
+for t in $MNS ${MNS}src ${MNS}ev ${MNS}evsrc; do
+  H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$t.drop(); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({ns:process.env.TC_DB+'.$t'})" >/dev/null
+done
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$MNS')" >/dev/null
+startFeeder
+startRouter "$STRICTCFG"
+# Dated now, so the sweep below leaves them on the fast tier.
+# A sparse unique ref as well, so freeing a unique value is asked too; _id 7 is
+# the document an update moves onto a freed one.
+R "db.getSiblingDB(process.env.TC_DB).$MNS.createIndex({ref:1},{unique:true, sparse:true})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$MNS.insertMany(Array.from({length:7},(_,i)=>({_id:i+1, ref:'r'+(i+1), old:true, when:new Date()})))" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).${MNS}ev.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, old:true, when:new Date(Date.UTC(2024,0,1+i))})))" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).${MNS}src.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, fresh:true})))" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).${MNS}evsrc.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, fresh:true})))" >/dev/null
+for t in $MNS ${MNS}ev; do
+  for _ in $(seq 1 40); do
+    [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$t.countDocuments({_id:{\$lte:6}}))")" = "6" ] && break
+    sleep 0.5
+  done
+  cline watermark --config $STRICTCFG --ns $DB.$t --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+done
+sleep 7
+cline evictor --config $STRICTCFG --once --log-file $LOGDIR/fresh_mdel_ev.log >/dev/null 2>&1
+liveIn() { # $1 H or C, $2 collection: how many of _id 1..6 that tier holds live
+  $1 "print(db.getSiblingDB(process.env.TC_DB).$2.countDocuments({_id:{\$lte:6}, _tcDeletedAt:{\$exists:false}}))"
+}
+chk "tmdel's six on both tiers"                 "6 6" "$(liveIn H $MNS) $(liveIn C $MNS)"
+chk "tmdelev's six evicted, live in the archive" "0 6" "$(liveIn H ${MNS}ev) $(liveIn C ${MNS}ev)"
+
+insertSix() { # $1 collection: inserts _id 1..6 through the router, prints n or the error code
+  R "try { print('n='+Object.keys(db.getSiblingDB(process.env.TC_DB).$1.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, again:true})),{ordered:false}).insertedIds).length) } \
+     catch(e) { print('error '+(e.code || (e.writeErrors && e.writeErrors[0].code))) }"
+}
+mergeSix() { # $1 target, $2 the $merge options: prints what the target holds after, or the error code
+  R "try { db.getSiblingDB(process.env.TC_DB).$1src.aggregate([{\$merge:Object.assign({into:'$1'},$2)}]).toArray(); \
+     const d=db.getSiblingDB(process.env.TC_DB).$1.find({_id:{\$in:[1,2,3,4,5,6]}}).toArray(); \
+     print('n='+d.length+' old='+d.filter(x=>x.old).length+' fresh='+d.filter(x=>x.fresh).length) } catch(e) { print('error '+e.code) }"
+}
+deleteSix() { R "print(db.getSiblingDB(process.env.TC_DB).$MNS.deleteMany({_id:{\$in:[1,2,3,4,5,6]}}).deletedCount)"; }
+
+kill -STOP $FP
+chk "stopped: the application deletes the six"        "6"         "$(deleteSix)"
+chk "stopped: the archive still holds them live"      "0 6"       "$(liveIn H $MNS) $(liveIn C $MNS)"
+chk "stopped: re-inserting them is refused as behind" "error 125" "$(insertSix $MNS)"
+chk "stopped: a bulkWrite re-insert, the same"       "error 125 behind" \
+    "$(R "try { db.adminCommand({bulkWrite:1, ops:[{insert:0, document:{_id:1, again:true}}], nsInfo:[{ns:process.env.TC_DB+'.$MNS'}]}); print('accepted') } catch(e) { print('error '+e.code+(/has not caught up/.test(e.message) && !/could not be asked/.test(e.message)?' behind':' '+e.message.slice(0,60))) }")"
+chk "stopped: a \$merge onto them is refused as behind" "error 125" "$(mergeSix $MNS "{whenMatched:'merge', whenNotMatched:'insert'}")"
+chk "stopped: a \$merge onto the evicted six, the same" "error 125" "$(mergeSix ${MNS}ev "{whenMatched:'merge', whenNotMatched:'discard'}")"
+chk "stopped: a new document taking a freed ref"      "error 125" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:101, ref:'r1'}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "stopped: an update moving onto a freed ref"     "error 125" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.updateOne({_id:7},{\$set:{ref:'r2'}}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "stopped: nothing written to either tier"         "0 6 0 6"   "$(liveIn H $MNS) $(liveIn C $MNS) $(liveIn H ${MNS}ev) $(liveIn C ${MNS}ev)"
+# The same re-insert under router.freshness: permissive, which answers from the
+# archive as it stands once the wait runs out and counts it.
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+startRouter "$CFG"
+chk "stopped, permissive: the re-insert is a duplicate" "error 11000" "$(insertSix $MNS)"
+chk "stopped, permissive: and a freed ref is taken"    "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:101, ref:'r1'}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "stopped, permissive: nothing written"             "0 6"         "$(liveIn H $MNS) $(liveIn C $MNS)"
+kill $RP 2>/dev/null; wait $RP 2>/dev/null
+startRouter "$STRICTCFG"
+kill -CONT $FP
+for _ in $(seq 1 40); do
+  [ "$(liveIn C $MNS)" = "0" ] && break
+  sleep 0.5
+done
+chk "running: the deletes reached the archive"        "0"         "$(liveIn C $MNS)"
+chk "running: re-inserting them is accepted"          "n=6"       "$(insertSix $MNS)"
+chk "running: a new document taking a freed ref"      "accepted" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:101, ref:'r1'}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "running: an update moving onto a freed ref"     "accepted" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.updateOne({_id:7},{\$set:{ref:'r2'}}); print('accepted') } catch(e) { print('error '+e.code) }")"
+# Delete and write again at once each time, so the delete is still in flight.
+deleteSix >/dev/null
+chk "running: whenMatched merge, six fresh, none old"  "n=6 old=0 fresh=6" "$(mergeSix $MNS "{whenMatched:'merge', whenNotMatched:'insert'}")"
+deleteSix >/dev/null
+chk "running: whenNotMatched discard, nothing back"    "n=0 old=0 fresh=0" "$(mergeSix $MNS "{whenMatched:'merge', whenNotMatched:'discard'}")"
+deleteSix >/dev/null
+chk "running: whenMatched fail, nothing matched"       "n=6 old=0 fresh=6" "$(mergeSix $MNS "{whenMatched:'fail', whenNotMatched:'insert'}")"
+deleteSix >/dev/null
+chk "running: insert right after the delete"           "n=6"       "$(insertSix $MNS)"
+# The other side of the same question: evicted is not deleted.
+chk "running: the evicted six keep their old fields"   "n=6 old=6 fresh=6" "$(mergeSix ${MNS}ev "{whenMatched:'merge', whenNotMatched:'discard'}")"
+chk "running: an evicted _id is still taken"           "error 11000" "$(insertSix ${MNS}ev)"
+for t in $MNS ${MNS}src ${MNS}ev ${MNS}evsrc; do
+  H "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
+  C "db.getSiblingDB(process.env.TC_DB).$t.drop()" >/dev/null
+done
+stopDaemons
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

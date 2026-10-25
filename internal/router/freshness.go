@@ -765,10 +765,46 @@ func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Durat
 // on every insert into a collection the fast tier does not hold in full.
 //
 // Never refused under router.freshness: strict. Going ahead stale here errs
-// toward refusing the write as a duplicate, which is already the safe side.
+// toward refusing the write as a duplicate, which writes nothing, though the
+// error names the wrong reason. Left to the collated paths, which return a
+// verdict rather than an error; the _id and registry paths use
+// clashIsFreshOrBehind and refuse as behind.
 func (r *Router) clashIsFresh(ctx context.Context, ns string) {
 	_ = r.archiveIsFreshAnyway(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
 		"a key freed by a delete in the last moments may be refused as taken")
+}
+
+// clashIsFreshOrBehind is clashIsFresh under the configured policy: under
+// router.freshness: strict a wait that runs out returns errArchiveBehind, and
+// the write is refused as behind rather than as a duplicate. See
+// archivedIDClashes.
+//
+// For an _id and for a registry claim whose owner is live only in the archive.
+// Every caller has to refuse on errArchiveBehind before its own "letting it
+// through" branch: most of the unique key paths let a write through when the
+// registry cannot be asked, and doing that here would admit the duplicate the
+// refusal stands for. See refusedAsBehind.
+//
+// The collated paths, collatedArchiveClash and stillHoldsKey, keep
+// clashIsFresh and answer E11000 when the wait runs out.
+func (r *Router) clashIsFreshOrBehind(ctx context.Context, ns string) error {
+	return r.archiveIsFresh(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
+		"a key freed by a delete in the last moments may be refused as taken")
+}
+
+// refusedAsBehind is the reply for a write whose key check ran out of time
+// waiting for mirroring under router.freshness: strict, or false when err is
+// something else. The claims made so far go back first.
+func (c *conn) refusedAsBehind(ctx context.Context, msg *wire.Message, err error, claimed []string) (*wire.Message, bool) {
+	if !errors.Is(err, errArchiveBehind) {
+		return nil, false
+	}
+	c.r.releaseKeys(ctx, claimed)
+	out, rerr := c.staleRefusal(msg, err)
+	if rerr != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // archiveIsFresh waits for mirroring to reach this router's cluster time, the

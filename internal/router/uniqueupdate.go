@@ -523,6 +523,9 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 				continue
 			}
 			clash, kids, cerr := c.claimStatement(ctx, ns, idxs[i], sh, st)
+			if out, done := c.refusedAsBehind(ctx, msg, cerr, append(claimed, kids...)); done {
+				return out, true
+			}
 			if cerr != nil {
 				c.r.releaseKeys(ctx, claimed)
 				c.log.Warn("could not check unique keys, letting the update through",

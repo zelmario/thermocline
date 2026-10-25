@@ -74,6 +74,9 @@ func (c *conn) guardMergeKeys(ctx context.Context, msg *wire.Message, ns, db str
 			taken := true
 			for k, kid := range kids {
 				got, terr := c.r.tryClaim(ctx, ns, idxs[i], kid, owner, tuples[k])
+				if out, done := c.refusedAsBehind(ctx, msg, terr, claimed); done {
+					return out, true
+				}
 				if terr != nil {
 					c.r.releaseKeys(ctx, claimed)
 					c.log.Warn("could not check a $merge against the key registry, letting it through",

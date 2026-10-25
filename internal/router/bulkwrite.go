@@ -320,6 +320,10 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 	}
 	for _, ns := range idOrder {
 		clashes, err := c.r.archivedIDClashes(ctx, ns, idDocs[ns])
+		// Counted and logged by refuseStale. See archivedIDClashes.
+		if out, done := c.refusedAsBehind(ctx, msg, err, nil); done {
+			return out, true
+		}
 		if err != nil {
 			// An insert that cannot be checked is refused, the way the ordinary
 			// path refuses one, and for the same reason: what this check stops
@@ -369,6 +373,9 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		case "insert":
 			got, clashes, err := c.r.claimKeys(ctx, op.ns, []bson.Raw{op.doc}, idxs, true)
 			claimed = append(claimed, got...)
+			if out, done := c.refusedAsBehind(ctx, msg, err, claimed); done {
+				return out, true
+			}
 			if err != nil {
 				c.log.Warn("could not check unique keys for this bulkWrite, letting it through",
 					"ns", op.ns, "err", err)
@@ -388,6 +395,9 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 				}
 				clash, kids, cerr := c.claimStatement(ctx, op.ns, idxs[i], sh, op.stmt)
 				claimed = append(claimed, kids...)
+				if out, done := c.refusedAsBehind(ctx, msg, cerr, claimed); done {
+					return out, true
+				}
 				if cerr != nil {
 					c.log.Warn("could not check unique keys for this bulkWrite, letting it through",
 						"ns", op.ns, "err", cerr)

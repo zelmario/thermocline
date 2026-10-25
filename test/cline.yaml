@@ -151,6 +151,10 @@ feeder:
     # testfresh.sh: a merged read asked ahead while a document is mirrored and
     # evicted between its two halves. Aged by `when`, so a sweep takes it.
     - "shop.tmspec"
+    # testfresh.sh: a $merge onto documents just deleted, and onto documents
+    # just evicted, with the feeder stopped.
+    - "shop.tmdel"
+    - "shop.tmdelev"
     # testevict.sh: a claim narrowed and acted on in the same sweep.
     - "shop.tevclaim"
     # testevict.sh: a cursor held open while a sweep takes its documents off the
@@ -514,6 +518,12 @@ evictor:
       date_field: "when"
     # testfresh.sh: the document evicted between a merged read's two halves.
     - ns: "shop.tmspec"
+      older_than: 40m
+      date_field: "when"
+    - ns: "shop.tmdel"
+      older_than: 40m
+      date_field: "when"
+    - ns: "shop.tmdelev"
       older_than: 40m
       date_field: "when"
     # testevict.sh: the aggregation half of the same section.

@@ -1000,36 +1000,52 @@ Part of [Thermocline](../README.md).
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
 
-- **Deleting a document and immediately re-inserting the same `_id` can be
-  refused, for as long as the delete takes to reach the archive.** Clearing a
-  collection and reloading it is the shape that meets this.
+- **A key freed by a delete cannot be used again until the delete reaches the
+  archive.** Clearing a collection and reloading it is the shape that meets
+  this, and so is a unique value given to a new document right after its last
+  holder was deleted.
 
   A delete reaches the fast tier at once and the archive only when the feeder
   carries it across. In between, the archive still holds that document as live,
   and the router cannot tell it apart from one that was evicted: both are
-  documents the archive has and the fast tier does not. It treats it as a real
-  conflict, which is the safe direction, because the other choice is letting a
-  second document take an `_id` the archive still holds. `staleArchiveCopy` says
-  so in as many words: when the fast tier does not hold the document, the
-  archive's copy is the only one there is.
+  documents the archive has and the fast tier does not. So before an insert, an
+  update, a `bulkWrite` or a `$merge` is refused over a key only the archive
+  holds, the router waits for mirroring the way a read does, and asks again.
+  With a feeder running the wait is the mirroring lag, milliseconds on this
+  pair, and the write is accepted, as MongoDB accepts it.
 
-  Measured with the feeder stopped, so the window is held open rather than
-  raced: six documents deleted through the router, the archive still holding all
-  six live and the fast tier none.
+  When the wait runs out, what happens depends on `router.freshness`. Measured
+  on 2026-10-25 with the feeder stopped, six documents deleted through the
+  router, the archive still holding all six live and the fast tier none:
 
   ```
-  re-inserting those _ids      E11000, refused by the router
-  an untiered reference        accepted
+                                          strict (default)   permissive
+  re-inserting those _ids                 refused, 125       E11000
+  the same through bulkWrite              refused, 125
+  a $merge onto them                      refused, 125
+  a new document taking a freed ref       refused, 125       E11000
+  an update moving onto a freed ref       refused, 125
+  written to either tier                  nothing            nothing
   ```
 
-  With a feeder running normally the window is the mirroring lag, milliseconds
-  on this pair, and the same insert is accepted. With a feeder stopped or badly
-  behind it lasts as long as the lag does, which is one more thing a stopped
-  feeder costs. `ThermoclineDaemonStopped` is the alert that names it.
+  Under strict the refusal is the one every read gets while mirroring is
+  behind, "mirroring to the archive has not caught up", and not a duplicate key
+  error. E11000 would say the key is taken when the application has just freed
+  it, and an idempotent loader that reads 11000 as "already there" skips the
+  document and loses it. Under permissive the router answers from the archive
+  as it stands, which is E11000, and counts it as a stale read. A write inside a
+  transaction that is refused this way aborts the transaction, as a duplicate
+  key does.
 
-  A `$merge` writing the same `_id`s in the same state is accepted rather than
-  refused. The two paths disagree about one question and one of them is wrong,
-  which is not yet settled and is recorded here rather than claimed.
+  One kind of index keeps E11000 under strict: a unique index with a collation,
+  whose clash is judged in the archive by the index's own comparison rather
+  than by the claim registry. Nothing is written either way.
+
+  An evicted document is not a deleted one, and the same section checks that
+  too: with the feeder running, an insert of an evicted `_id` is E11000, and a
+  `$merge` onto evicted documents finds them and keeps their fields. These are
+  the checks in `test/testfresh.sh`, "a delete, then the same _ids written
+  again". `ThermoclineDaemonStopped` is the alert that names a stopped feeder.
 
 - **A document deleted while a copy-up is moving it comes back for a few
   milliseconds.** A copy-up reads the archive and then inserts, and a delete

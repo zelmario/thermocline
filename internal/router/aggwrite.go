@@ -798,6 +798,11 @@ func (s *writeSink) claim(ctx context.Context, batch []any) error {
 		docs = append(docs, raw)
 	}
 	_, clashes, err := s.r.claimKeys(ctx, s.claimNS, docs, idxs, false)
+	if errors.Is(err, errArchiveBehind) {
+		// Not written unclaimed: an owner the archive alone still holds may be
+		// a real duplicate. See clashIsFreshOrBehind.
+		return err
+	}
 	if err != nil {
 		s.r.log.Warn("could not claim the keys a $out writes",
 			"ns", s.claimNS, "err", err,

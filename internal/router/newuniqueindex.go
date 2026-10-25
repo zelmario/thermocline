@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -85,6 +86,14 @@ func (c *conn) claimForUniqueIndex(ctx context.Context, msg *wire.Message, ns st
 		"note", "this walks both tiers, so the command waits for it")
 
 	claimed, conflicts, clash, err := c.r.claimExistingKeys(bg, ns, idxs)
+	if errors.Is(err, errArchiveBehind) {
+		// Not built over keys it could not judge. See clashIsFreshOrBehind.
+		c.r.releaseIndexClaims(ns, indexNames(idxs))
+		if out, rerr := c.staleRefusal(msg, err); rerr == nil {
+			return out, true
+		}
+		return nil, false
+	}
 	if err != nil {
 		// The same stance the write paths take when the registry cannot be
 		// reached: refusing a command because a bookkeeping collection could

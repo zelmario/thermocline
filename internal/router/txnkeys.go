@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -130,6 +131,18 @@ func (c *conn) verifyTxnKeys(ctx context.Context, msg *wire.Message, reply *wire
 	for i := range idxs {
 		clash, kids, cerr := c.claimEvaluated(ctx, chk.ns, idxs[i], after)
 		claimed = append(claimed, kids...)
+		if errors.Is(cerr, errArchiveBehind) {
+			// The write is in the transaction already, so refusing it means
+			// aborting it, as for a duplicate below. See clashIsFreshOrBehind.
+			if err := c.abortCallerTxn(chk.txn); err != nil {
+				c.log.Warn("could not abort a transaction whose keys could not be judged",
+					"ns", chk.ns, "err", err)
+			}
+			if out, done := c.refusedAsBehind(ctx, msg, cerr, claimed); done {
+				return out, true
+			}
+			return nil, false
+		}
 		if cerr != nil {
 			c.r.releaseKeys(ctx, claimed)
 			c.log.Warn("could not check unique keys, letting the update stand",
