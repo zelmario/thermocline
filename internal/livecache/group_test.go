@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -330,5 +331,36 @@ func TestLargeIntegerKeys(t *testing.T) {
 	ki, _ := valueKey(bson.RawValue{Type: bson.TypeInt32, Value: i32(1)})
 	if kh == ki {
 		t.Errorf("0.5 and 1 share the key %q", kh)
+	}
+}
+
+// An $unwind gives a document one contribution per element, and each is held.
+// The size was counted per document, so twenty items cost what one did.
+func TestGroupSizeCountsEachUnwoundElement(t *testing.T) {
+	q := groupQuery(t, bson.A{
+		bson.D{{Key: "$unwind", Value: "$items"}},
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$items.sku"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: "$items.qty"}}}}}},
+	})
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	one, many := newGroupState(q.Group), newGroupState(q.Group)
+	one.add("o1", raw(t, order("o1", now, 1, item("s0", 1))))
+	var items []bson.D
+	for i := 0; i < 20; i++ {
+		items = append(items, item(fmt.Sprintf("s%d", i), 1))
+	}
+	many.add("o1", raw(t, order("o1", now, 1, items...)))
+	// Twenty groups are counted either way; the twenty contributions are what
+	// the per-document count left out.
+	groupsOnly := 20 * (64 + 48*len(q.Group.Accs))
+	if got := many.bytes() - groupsOnly; got < 20*64 {
+		t.Errorf("one document of twenty unwound items is counted at %d bytes beyond its groups, want at least %d",
+			got, 20*64)
+	}
+	if one.bytes() >= many.bytes() {
+		t.Errorf("one item %d, twenty %d: the size did not grow with the elements", one.bytes(), many.bytes())
+	}
+	many.remove("o1")
+	if many.held != 0 {
+		t.Errorf("after the document went, %d bytes are still counted for its contributions", many.held)
 	}
 }

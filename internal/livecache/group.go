@@ -590,8 +590,21 @@ type groupState struct {
 	spec   *GroupSpec
 	groups map[string]*groupAcc
 	byDoc  map[string][]contrib
+	// held is what the contributions in byDoc take, kept as they come and go.
+	// See bytes.
+	held int
 	// refused is set when a document showed a value this cannot reproduce.
 	refused bool
+}
+
+// contribBytes is roughly what one contribution holds: its key, the _id and
+// the values summed, and the slice and map overhead around them.
+func contribBytes(c contrib) int {
+	n := 64 + len(c.key) + len(c.id.Value) + 24*len(c.vals)
+	for _, v := range c.vals {
+		n += len(v.Value)
+	}
+	return n
 }
 
 func newGroupState(spec *GroupSpec) *groupState {
@@ -605,6 +618,9 @@ func (s *groupState) remove(id string) bool {
 		return false
 	}
 	delete(s.byDoc, id)
+	for _, c := range cs {
+		s.held -= contribBytes(c)
+	}
 	for _, c := range cs {
 		a := s.groups[c.key]
 		if a == nil {
@@ -651,6 +667,9 @@ func (s *groupState) add(id string, d bson.Raw) bool {
 	}
 	if len(cs) > 0 {
 		s.byDoc[id] = cs
+		for _, c := range cs {
+			s.held += contribBytes(c)
+		}
 	}
 	return true
 }
@@ -726,8 +745,14 @@ func (s *groupState) output() ([]bson.Raw, bool) {
 }
 
 // bytes is roughly what the state holds in memory.
+//
+// Per contribution, not per document. An $unwind gives a document one per
+// element, and each keeps its key, _id and values: a report unwinding 200,000
+// orders of twenty items held about four million and was counted as 200,000
+// documents at 96 bytes each, a few of them far past max_bytes while the cache
+// believed itself well inside it.
 func (s *groupState) bytes() int {
-	return len(s.byDoc)*96 + len(s.groups)*(64+48*len(s.spec.Accs))
+	return len(s.byDoc)*48 + s.held + len(s.groups)*(64+48*len(s.spec.Accs))
 }
 
 // SameGroupAnswer says whether two replies to a grouping are the same answer:
