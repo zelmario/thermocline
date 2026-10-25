@@ -595,7 +595,13 @@ func valueKey(v bson.RawValue) (string, bool) {
 			// the two in separate groups where mongod returns one.
 			return "n0", true
 		}
-		return "n" + x.Text('g', -1), true
+		// The exact rational, not Text('g', -1): that writes the shortest
+		// form at the value's own precision, 64 bits for an integer and 53 for
+		// a double, so NumberLong(2^60) and the double 2^60 were two keys for
+		// one value. mongod compares numbers by value, and a document holding
+		// the double was missed by an entry keyed on the long.
+		r, _ := x.Rat(nil)
+		return "n" + r.RatString(), true
 	case bson.TypeBoolean:
 		if v.Boolean() {
 			return "bt", true

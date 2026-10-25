@@ -310,3 +310,25 @@ func bsoncoreDouble(f float64) []byte {
 	}
 	return b
 }
+
+// mongod compares numbers by value, so NumberLong(2^60) and the double 2^60 are
+// one value. The key was the shortest form at each type's own precision, which
+// wrote them differently, and a document holding the double was missed by an
+// entry keyed on the long.
+func TestLargeIntegerKeys(t *testing.T) {
+	const big = int64(1) << 60
+	kl, _ := valueKey(bson.RawValue{Type: bson.TypeInt64, Value: i64(big)})
+	kd, _ := valueKey(bson.RawValue{Type: bson.TypeDouble, Value: bsoncoreDouble(float64(big))})
+	if kl != kd {
+		t.Errorf("NumberLong(2^60) keys %q and the double 2^60 %q: want one", kl, kd)
+	}
+	k1, _ := valueKey(bson.RawValue{Type: bson.TypeInt64, Value: i64(big + 1)})
+	if k1 == kd {
+		t.Errorf("2^60+1 and 2^60 share the key %q", k1)
+	}
+	kh, _ := valueKey(bson.RawValue{Type: bson.TypeDouble, Value: bsoncoreDouble(0.5)})
+	ki, _ := valueKey(bson.RawValue{Type: bson.TypeInt32, Value: i32(1)})
+	if kh == ki {
+		t.Errorf("0.5 and 1 share the key %q", kh)
+	}
+}
