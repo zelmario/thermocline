@@ -111,6 +111,14 @@ func (s *shop) resync(ctx context.Context) (bson.Timestamp, bool) {
 	s.idxMu.Lock()
 	s.index = fresh
 	s.idxMu.Unlock()
+	// The next resync is due resyncEvery after this one ends, not after it
+	// began. Counted from the start, a resync that took longer than the
+	// interval left the stream it opened due for the next one at once, and
+	// the consumer closed every stream before reading from it. On the Docker
+	// test box, whose fast tier oplog held 7.6 million entries and had never
+	// rolled, a stream from cluster time 1 took mongod 21 seconds to open,
+	// asked twice per resync: a one-hour shared run read no events at all.
+	s.lastResync = time.Now()
 	return t0, true
 }
 
