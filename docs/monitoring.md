@@ -269,6 +269,17 @@ the whole reason it is a gauge from the last published report rather than a
 heartbeat. The feeder stopping is the serious one: mirroring stops, the evictor
 halts behind it, and every fall-through read pays the freshness barrier.
 
+The warmer is the exception. It runs from `cline-warmer.timer`, hourly, and
+reports once at the end of each run, so ten minutes after a run its gauge is
+past ten minutes for the rest of the hour. The shipped rules page on the
+feeder and the evictor at ten minutes and open a ticket on the warmer at two
+hours and ten minutes, two missed runs. Change that bar with the timer. A
+single pass longer than ten minutes also fires, which is what a first sweep
+after an adoption can be: expected then, and the log says the sweep is
+working. A `--dry-run` no longer resets the gauge of a daemon that reported
+real work, so running one to look into a stuck evictor leaves the page
+standing.
+
 **6. `thermocline_daemon_gauge{gauge="clock_skew_seconds"}` past a minute.
 Investigate.** Nothing here loses data over it any more: everything the
 archive's own TTL monitor dates is now stamped by the archive as it is written,
@@ -353,10 +364,15 @@ groups:
         annotations:
           summary: "mirroring is far enough behind that eviction has stopped"
       - alert: ThermoclineDaemonStopped
-        expr: thermocline_daemon_seconds_since_pass > 600
+        expr: thermocline_daemon_seconds_since_pass{daemon!="warmer"} > 600
         labels: {severity: page}
         annotations:
           summary: "{{ $labels.daemon }} has not finished a pass in ten minutes"
+      - alert: ThermoclineWarmerStopped
+        expr: thermocline_daemon_seconds_since_pass{daemon="warmer"} > 7800
+        labels: {severity: ticket}
+        annotations:
+          summary: "the warmer has not finished a run in over two hours; cline-warmer.timer runs it hourly"
       - alert: ThermoclineEvictionHeld
         expr: thermocline_eviction_paused_seconds > 3600
         labels: {severity: ticket}

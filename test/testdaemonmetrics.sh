@@ -102,6 +102,18 @@ chk "the counter is a number"                          "true" \
 chk "and a later pass moves the timestamp on"          "true" \
     "$(awk -v a="$FIRSTAT" -v b="$LATERAT" 'BEGIN{print (b+0 > a+0) ? "true" : "false"}')"
 
+# But a dry run does not stand in for real work. It shares the daemon's id, and
+# one run to look into a stuck evictor reset the gauge the page is on.
+C "db.getSiblingDB(process.env.TC_META).daemonstats.updateOne({_id:'evictor'},
+     {\$set:{dryRun:false, at:new Date(Date.now()-3600*1000)}})" >/dev/null
+REALAT=$(C "print(db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}).at.getTime())")
+cline evictor --config $CFG --dry-run --once >/dev/null 2>&1
+chk "a dry run leaves a real pass's report alone"      "$REALAT false" \
+    "$(C "const d=db.getSiblingDB(process.env.TC_META).daemonstats.findOne({_id:'evictor'}); print(d.at.getTime()+' '+d.dryRun)")"
+# Back to the dry run's own, for the checks below that read it as one.
+C "db.getSiblingDB(process.env.TC_META).daemonstats.deleteOne({_id:'evictor'})" >/dev/null
+cline evictor --config $CFG --dry-run --once >/dev/null 2>&1
+
 echo "== the router exports them =="
 cline router --config $CFG --log-file $LOGDIR/dmet_r.log &
 for _ in $(seq 1 30); do

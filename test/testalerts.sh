@@ -403,6 +403,31 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 docker exec $NODE mongosh "$COLD" --quiet --eval '
   db.getSiblingDB("_thermocline").daemonstats.deleteOne({_id:"evictor"})' >/dev/null 2>&1
 
+sec "the warmer, which runs hourly"
+# It reports once per run, so an hour after a healthy run its gauge reads an
+# hour, and the ten minute rule paged on it for most of every hour. It has a
+# rule of its own at two missed runs.
+docker exec $NODE mongosh "$COLD" --quiet --eval '
+  db.getSiblingDB("_thermocline").daemonstats.updateOne({_id:"warmer"},
+    {$set:{at: new Date(Date.now() - 3*3600*1000), dryRun:false}}, {upsert:true})' >/dev/null 2>&1
+for _ in $(seq 1 40); do
+  PQ rules | grep -q '"ThermoclineWarmerStopped","state":"firing"' && break
+  sleep 5
+done
+chk "ThermoclineWarmerStopped fires on three hours" "firing" \
+    "$(PQ rules | python3 -c '
+import json,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == "ThermoclineWarmerStopped": print(r.get("state"))' 2>/dev/null)"
+chk "and the ten minute rule does not name it"    "0" \
+    "$(PQ alerts | python3 -c '
+import json,sys
+print(sum(1 for a in json.load(sys.stdin)["data"]["alerts"]
+          if a["labels"].get("alertname") == "ThermoclineDaemonStopped" and a["labels"].get("daemon") == "warmer"))' 2>/dev/null)"
+docker exec $NODE mongosh "$COLD" --quiet --eval '
+  db.getSiblingDB("_thermocline").daemonstats.deleteOne({_id:"warmer"})' >/dev/null 2>&1
+
 sec "an alert that should fire, does"
 # The router is stopped, so up{job="thermocline"} goes to 0. Its rule waits two
 # minutes, and waiting for it is the whole point: a rule that only ever gets

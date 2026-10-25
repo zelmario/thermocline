@@ -1426,12 +1426,26 @@ type DaemonReport struct {
 }
 
 // PublishDaemonReport records what a daemon has done so far.
+//
+// A dry run does not replace a report of real work. It shares the daemon's id,
+// and the report is what ThermoclineDaemonStopped reads: an operator running
+// cline evictor --dry-run to look into a stuck evictor reset its
+// seconds_since_pass, which held the alert off for ten minutes while the
+// daemon stayed stuck, and marked the daemon dry. So a dry run writes only
+// where there is no report or the report is another dry run's.
 func PublishDaemonReport(ctx context.Context, cold *mongo.Client, id string, dryRun bool,
 	counters map[string]int64, gauges map[string]float64) error {
-	_, err := cold.Database(DB).Collection(DaemonStats).UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: id}},
+	filter := bson.D{{Key: "_id", Value: id}}
+	if dryRun {
+		filter = append(filter, bson.E{Key: "dryRun", Value: bson.D{{Key: "$ne", Value: false}}})
+	}
+	_, err := cold.Database(DB).Collection(DaemonStats).UpdateOne(ctx, filter,
 		DaemonReportUpdate(dryRun, counters, gauges),
 		options.UpdateOne().SetUpsert(true))
+	if dryRun && mongo.IsDuplicateKeyError(err) {
+		// A report of real work is there, and it stays.
+		return nil
+	}
 	return err
 }
 
