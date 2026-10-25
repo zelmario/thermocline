@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -539,6 +540,22 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 			}
 			if cerr != nil {
 				c.r.releaseKeys(ctx, append(claimed, mine...))
+				if len(clashes) > 0 {
+					// A statement already found to clash cannot go through
+					// with the rest, and this one cannot be judged, so
+					// nothing goes: forwarding the command whole wrote the
+					// clashing statement as a duplicate across the tiers.
+					c.r.Stats.Refused.Add(1)
+					c.cls = ClassRefused
+					out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+						"thermocline: refusing this update because statement "+fmt.Sprint(clashes[0].doc)+
+							" would take a key held by a document in the archive and statement "+fmt.Sprint(s)+
+							"'s keys could not be checked: "+cerr.Error()+". Nothing was applied.")
+					if rerr != nil {
+						return nil, false
+					}
+					return out, true
+				}
 				c.log.Warn("could not check unique keys, letting the update through",
 					"ns", ns, "err", cerr)
 				return nil, false

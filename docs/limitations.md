@@ -31,10 +31,10 @@ Part of [Thermocline](../README.md).
   statement gets mongod's answer: before saying E11000 the router has the fast
   tier run it in a transaction that is thrown away, and forwards it if mongod
   refuses it on its own. An update command with several statements, a
-  `bulkWrite`, and an update inside a transaction still get E11000 first,
-  because forwarding one of those would run statements around it that were not
-  checked. Nothing is written either way; the difference is which error the
-  client reads.
+  `bulkWrite`, and an update inside a transaction still get E11000 first for
+  that statement. The other statements of a batch are applied, as mongod
+  applies them; the statement itself is not written either way, and the
+  difference is which error the client reads.
 
 - **An evictor killed without warning leaves its last steps announced until
   the next evictor starts.** A step announces its documents to the feeder and

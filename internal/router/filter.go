@@ -415,7 +415,15 @@ func matched(reply bson.Raw) int {
 
 // writeFailed reports whether a write reply carries per-statement errors, which
 // a command can do while still reporting ok:1.
+//
+// A bulkWrite reports its failures as nErrors beside a cursor of results
+// rather than as writeErrors, so a reply with nErrors above 0 failed too: read
+// only for writeErrors, a bulkWrite answered with one duplicate inside a
+// transaction did not abort it, and the transaction committed the rest.
 func writeFailed(reply bson.Raw) bool {
+	if n, ok := intOf(reply.Lookup("nErrors")); ok && n > 0 {
+		return true
+	}
 	val, err := reply.LookupErr("writeErrors")
 	if err != nil {
 		return false

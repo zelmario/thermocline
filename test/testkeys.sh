@@ -517,6 +517,16 @@ chk "  and they are there"                               "5,7" \
     "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.find({_id:{$in:[5,6,7]}}).sort({_id:1}).toArray().map(d=>d._id).join(","))')"
 chk "  and it is there"                                 "2 four@x.com" \
     "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:3}).v+" "+db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:4}).email)')"
+# Inside a transaction a bulkWrite answered in parts is still a write that
+# failed, and mongod aborts the transaction on it: the commit fails and the op
+# that went in is not kept. The reply carries the failure as nErrors, not
+# writeErrors, and only writeErrors aborted it.
+chk "bulkWrite in a transaction: the commit fails"       "251 0" \
+    "$(R 'const s=db.getMongo().startSession(); s.startTransaction();
+  s.getDatabase("admin").runCommand({bulkWrite:1, ordered:false, nsInfo:[{ns:process.env.TC_DB+".tklate"}], ops:[
+    {insert:0, document:{_id:8,email:"eight@x.com"}}, {insert:0, document:{_id:9,email:"late@x.com"}}]});
+  let code="COMMITTED"; try { s.commitTransaction() } catch(e) { code=e.code } s.endSession();
+  print(code+" "+db.getSiblingDB(process.env.TC_DB).tklate.countDocuments({_id:8}))')"
 
 echo "== sparse unique index: only the documents it indexes =="
 # A sparse index does not index a document missing the field, so any number of
