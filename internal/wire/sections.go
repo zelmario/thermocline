@@ -3,6 +3,7 @@ package wire
 import (
 	"bytes"
 	"encoding/binary"
+	"sort"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -184,4 +185,48 @@ func (m *Message) CountOf(field string) int {
 		return 0
 	}
 	return len(vals)
+}
+
+// Inlined returns the command document with every payload sequence the
+// message carries added to it as an array field, so code that reads a command
+// as one document sees all of it.
+//
+// A driver sends a bulkWrite's ops and nsInfo as payload sequences, which the
+// bulkWrite specification requires, and CommandDoc returns the body alone.
+// Read from the body, a driver's bulkWrite had no nsInfo, so it went through
+// with no guard at all; only mongosh, which inlines both, was ever checked.
+// A field the body already has is left as it is.
+func (m *Message) Inlined() (bson.Raw, error) {
+	doc, err := m.CommandDoc()
+	if err != nil {
+		return nil, err
+	}
+	payloads := m.Payloads()
+	if len(payloads) == 0 {
+		return doc, nil
+	}
+	elems, err := doc.Elements()
+	if err != nil {
+		return nil, err
+	}
+	out := make(bson.D, 0, len(elems)+len(payloads))
+	for _, e := range elems {
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	names := make([]string, 0, len(payloads))
+	for name := range payloads {
+		if _, lerr := doc.LookupErr(name); lerr == nil {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		arr := make(bson.A, 0, len(payloads[name]))
+		for _, d := range payloads[name] {
+			arr = append(arr, d)
+		}
+		out = append(out, bson.E{Key: name, Value: arr})
+	}
+	return bson.Marshal(out)
 }

@@ -1512,7 +1512,20 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// operations point at them by position, so none of the per-command guards
 	// can find a collection to act on.
 	if nameErr == nil && name == "bulkWrite" {
-		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+		// An update op whose pipeline replaces the document gets the same
+		// appended check as an update command; see guardReplacedRoots. Taken
+		// as the command before guardBulkWrite, which may rebuild it.
+		//
+		// Read with its payload sequences folded in: a driver sends ops and
+		// nsInfo as sequences, and read from the body alone the command had
+		// no nsInfo and every guard below let it through. See wire.Inlined.
+		if cmd, cerr := msg.Inlined(); cerr == nil {
+			c.guardReplacedRoots(msg, cmd, name)
+			if c.sendInstead != nil {
+				msg, c.sendInstead = c.sendInstead, nil
+			}
+		}
+		if cmd, cerr := msg.Inlined(); cerr == nil {
 			if out, done := c.guardBulkWrite(ctx, msg, cmd); done {
 				return c.answer(msg, out)
 			}
@@ -1527,6 +1540,13 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		case "insert", "update", "findAndModify", "findandmodify":
 			if out, done := c.guardReservedField(msg, db, name); done {
 				return c.answer(msg, out)
+			}
+			// A pipeline update guardReplacedRoots appended its check to is the
+			// command from here on, so the guards below see what will be sent:
+			// guardUpdateKeys rebuilds a batch it answers in parts from the
+			// message it is given, and with the original the check was lost.
+			if c.sendInstead != nil {
+				msg, c.sendInstead = c.sendInstead, nil
 			}
 			if out, done := c.guardLargeID(msg, db, name); done {
 				return c.answer(msg, out)

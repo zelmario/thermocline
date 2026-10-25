@@ -317,7 +317,7 @@ func (c *conn) cacheInvalidate(msg *wire.Message, name, db string, cmd bson.Raw)
 		return
 	}
 	w := writeOf(msg, name)
-	for _, ns := range writtenNamespaces(name, db, cmd) {
+	for _, ns := range writtenNamespaces(name, db, withSequences(msg, name, cmd)) {
 		// A whole database, which is what a dropDatabase and an unreadable
 		// target both come back as: forgetting too much costs a lookup and
 		// forgetting too little costs a wrong answer.
@@ -353,6 +353,20 @@ func writeOf(msg *wire.Message, name string) cache.Write {
 		return cache.WriteOfUpdate(sts)
 	}
 	return cache.AnyWrite
+}
+
+// withSequences is cmd with the message's payload sequences folded in, for a
+// bulkWrite, whose nsInfo a driver sends as one: read from the body alone, a
+// driver's bulkWrite named no namespace, so neither cache forgot anything and
+// the live cache held nothing for read-your-writes. See wire.Inlined.
+func withSequences(msg *wire.Message, name string, cmd bson.Raw) bson.Raw {
+	if name != "bulkWrite" || msg == nil {
+		return cmd
+	}
+	if in, err := msg.Inlined(); err == nil {
+		return in
+	}
+	return cmd
 }
 
 // writtenNamespaces lists what a command changes, so the cache can forget

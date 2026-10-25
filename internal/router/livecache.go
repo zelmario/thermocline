@@ -165,14 +165,14 @@ func (c *conn) liveNoteWrites(msg *wire.Message, name, db string, cmd bson.Raw) 
 	if inTransaction(cmd) {
 		// Its changes reach the stream at the commit's time, which the
 		// commit notes; held whole meanwhile, as before.
-		c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, cmd)...)
+		c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, withSequences(msg, name, cmd))...)
 		return
 	}
 	if note, ok := classifyWrite(msg, name, db, cmd); ok {
 		c.liveNotes = append(c.liveNotes, note)
 		return
 	}
-	c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, cmd)...)
+	c.liveWrites = append(c.liveWrites, writtenNamespaces(name, db, withSequences(msg, name, cmd))...)
 }
 
 // classifyWrite says what an insert, update, delete or findAndModify can have

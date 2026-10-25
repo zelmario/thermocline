@@ -343,8 +343,8 @@ Part of [Thermocline](../README.md).
   or another expression builds its keys from the document itself, so
   `[{$replaceWith: {$mergeObjects: ["$$ROOT", "$payload"]}}]` would lift a
   nested `payload._tcDeletedAt`, which an insert is allowed to carry, to the top
-  level. The router appends one stage to every `update` and `findAndModify`
-  pipeline that replaces the document: a document without either reserved field
+  level. The router appends one stage to every `update`, `findAndModify` and
+  `bulkWrite` update pipeline that replaces the document: a document without either reserved field
   passes through unchanged, and one carrying either fails the statement with an
   error naming the field. The other statements of a batch run as mongod runs
   them.

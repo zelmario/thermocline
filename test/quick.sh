@@ -90,10 +90,14 @@ W=${WORKERS:-$(( N < 6 ? N : 6 ))}
 echo "quick: $N suite(s) on $W worker(s): $SUITES"
 
 make -s build >/dev/null || exit 2
+# seqwrite is the one driver a suite runs by path (testkeys, sequenced writes).
+# The node kept an old build, which ignored the bulk mode added later and ran
+# its insert instead, so the check passed for the wrong reason.
+CGO_ENABLED=0 go build -buildvcs=false -o bin/seqwrite ./test/seqwrite || exit 2
 # cline.yaml too: a suite that adds a namespace to it otherwise runs against the
 # node's old copy, where that namespace is not tiered and every check on it
 # passes for the wrong reason.
-put bin/cline test/psweep.sh test/mkworker.sh test/fuzz.js test/cline.yaml "$BOX:/tmp/" || exit 2
+put bin/cline bin/seqwrite test/psweep.sh test/mkworker.sh test/fuzz.js test/cline.yaml "$BOX:/tmp/" || exit 2
 # A part, suite@n, is a run of the suite's own file.
 SFILES=$(printf '%s\n' $SUITES | sed 's/@.*//' | sort -u)
 for s in $SFILES; do put "test/$s.sh" "$BOX:/tmp/" || exit 2; done
@@ -101,8 +105,9 @@ FILES="psweep.sh mkworker.sh fuzz.js cline.yaml $(printf '%s.sh ' $SFILES)"
 rsh "set -e
   docker exec $NODE sh -c 'pgrep -f \"[p]sweep.sh\" >/dev/null' && { echo 'quick: a sweep is already running in $NODE'; exit 3; }
   docker cp /tmp/cline $NODE:/usr/local/bin/cline
+  docker cp /tmp/seqwrite $NODE:/root/seqwrite
   for f in $FILES; do docker cp /tmp/\$f $NODE:/root/\$f; done
-  docker exec $NODE sh -c 'chmod +x /usr/local/bin/cline; cd /root && sed -i s/172\\.24\\./172.18./g $FILES'
+  docker exec $NODE sh -c 'chmod +x /usr/local/bin/cline /root/seqwrite; cd /root && sed -i s/172\\.24\\./172.18./g $FILES'
   docker exec -d $NODE bash -c 'OUT=$OUT WORKERS=$W LIVE=${LIVE:-} SUITES=\"$SUITES\" bash /root/psweep.sh > $OUT.out 2>&1'" || exit 2
 
 # Waited on the summary's last line, which psweep writes only once every worker

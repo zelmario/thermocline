@@ -583,6 +583,50 @@ func (c *conn) guardReplacedRoots(msg *wire.Message, cmd bson.Raw, name string) 
 			}
 			rewritten = append(rewritten, bson.E{Key: e.Key(), Value: e.Value()})
 		}
+	case "bulkWrite":
+		// The same check on each update op whose updateMods replace the
+		// document, for the ops on a collection this system tiers.
+		var nsInfo []string
+		for _, d := range msg.AllOf("nsInfo") {
+			ns, _ := d.Lookup("ns").StringValueOK()
+			nsInfo = append(nsInfo, ns)
+		}
+		ops := msg.AllOf("ops")
+		keep := make([]bson.Raw, 0, len(ops))
+		any := false
+		for _, op := range ops {
+			at, aok := intOf(op.Lookup("update"))
+			mods := op.Lookup("updateMods")
+			if !aok || at < 0 || at >= len(nsInfo) || !c.r.cfg.Manages(nsInfo[at]) || !replaces(mods) {
+				keep = append(keep, op)
+				continue
+			}
+			elems, err := op.Elements()
+			if err != nil {
+				return
+			}
+			d := bson.D{}
+			for _, e := range elems {
+				if e.Key() == "updateMods" {
+					d = append(d, bson.E{Key: "updateMods", Value: guarded(mods)})
+					continue
+				}
+				d = append(d, bson.E{Key: e.Key(), Value: e.Value()})
+			}
+			raw, err := bson.Marshal(d)
+			if err != nil {
+				return
+			}
+			keep = append(keep, raw)
+			any = true
+		}
+		if !any {
+			return
+		}
+		var err error
+		if rewritten, err = rebuildStatements(cmd, "ops", keep); err != nil {
+			return
+		}
 	default:
 		return
 	}

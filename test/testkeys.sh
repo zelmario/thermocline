@@ -1221,11 +1221,18 @@ else
     sleep 1
   done
   SEQOUT=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" "$SNS" 2>&1 | tail -1)
+  # The bulkWrite command, as a driver sends it: ops and nsInfo as sequences.
+  H "db.getSiblingDB(process.env.TC_DB).$SNS.deleteMany({_id:{\$in:['seq-new-1','seq-new-2']}})" >/dev/null
+  SEQBULK=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" "$SNS" bulk 2>&1 | tail -1)
   kill $SRP 2>/dev/null; wait $SRP 2>/dev/null
   chk "a sequenced insert of an archived _id is refused" "true" \
       "$(grep -q 'REFUSED with a duplicate key' <<<"$SEQOUT" && echo true || echo "false ($SEQOUT)")"
   chk "and the archived document is untouched"           "precious" \
       "$(C "const d=db.getSiblingDB(process.env.TC_DB).$SNS.findOne({_id:'archived'}); print(d?d.v:'MISSING')")"
+  chk "a driver's bulkWrite of an archived _id is refused" "true" \
+      "$(grep -q 'REFUSED with a duplicate key' <<<"$SEQBULK" && echo true || echo "false ($SEQBULK)")"
+  chk "  and the fast tier did not take it"               "0" \
+      "$(H "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({_id:'archived'}))")"
   H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 fi
@@ -1570,6 +1577,12 @@ chk "  and the document keeps it nested only"          "false" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:200}).hasOwnProperty('_tcDeletedAt'))")"
 chk "  while the same pipeline on other data runs"     "1" \
     "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:201},[{\$replaceWith:{\$mergeObjects:['\$\$ROOT','\$payload']}}]); print(db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:201}).x)")"
+# The same pipeline as a bulkWrite update op, which only literals were read in.
+R "db.getSiblingDB(process.env.TC_DB).$RNS.insertOne({_id:202, payload:{_tcDeletedAt:new Date()}})" >/dev/null
+chk "  and as a bulkWrite update op it is refused too"   "1 0" \
+    "$(R "const r=db.adminCommand({bulkWrite:1, nsInfo:[{ns:process.env.TC_DB+'.$RNS'}], ops:[{update:0, filter:{_id:202}, updateMods:[{\$replaceWith:{\$mergeObjects:['\$\$ROOT','\$payload']}}]}]}); print(r.nErrors+' '+r.nModified)")"
+chk "  and that document keeps it nested only"         "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:202}).hasOwnProperty('_tcDeletedAt'))")"
 kill $RFP 2>/dev/null; wait $RFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null

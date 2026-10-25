@@ -8,7 +8,12 @@
 // the shape a hand-written test cannot produce by accident and mongosh may
 // never send.
 //
-//	go run ./test/seqwrite "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" shop tseq
+//	go run ./test/seqwrite "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" shop tseq [bulk]
+//
+// With bulk it sends the same through client.BulkWrite, the bulkWrite command,
+// whose ops and nsInfo a driver sends as two sequences. The router read nsInfo
+// from the body only, so a driver's bulkWrite went through every guard
+// unchecked while mongosh's, which inlines both, was refused.
 //
 // It writes an _id the archive holds live. Through the router that must be
 // refused as a duplicate key, which is what one cluster would do; accepted is
@@ -17,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -28,7 +34,7 @@ import (
 
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("usage: seqwrite URI DB COLL")
+		fmt.Println("usage: seqwrite URI DB COLL [bulk]")
 		os.Exit(2)
 	}
 	uri, db, coll := os.Args[1], os.Args[2], os.Args[3]
@@ -50,6 +56,29 @@ func main() {
 		bson.D{{Key: "_id", Value: "seq-new-1"}, {Key: "v", Value: "new"}},
 		bson.D{{Key: "_id", Value: "archived"}, {Key: "v", Value: "clobber"}},
 		bson.D{{Key: "_id", Value: "seq-new-2"}, {Key: "v", Value: "new"}},
+	}
+	if len(os.Args) > 4 && os.Args[4] == "bulk" {
+		var models []mongo.ClientBulkWrite
+		for _, d := range docs {
+			models = append(models, mongo.ClientBulkWrite{Database: db, Collection: coll,
+				Model: mongo.NewClientInsertOneModel().SetDocument(d)})
+		}
+		_, err = cl.BulkWrite(ctx, models, options.ClientBulkWrite().SetOrdered(false))
+		if err == nil {
+			fmt.Println("ACCEPTED all three")
+			return
+		}
+		var cbe mongo.ClientBulkWriteException
+		if errors.As(err, &cbe) {
+			for _, we := range cbe.WriteErrors {
+				if we.Code == 11000 {
+					fmt.Println("REFUSED with a duplicate key, which is what one cluster would do")
+					return
+				}
+			}
+		}
+		fmt.Println("FAILED for another reason:", err)
+		return
 	}
 	_, err = c.InsertMany(ctx, docs, options.InsertMany().SetOrdered(false))
 	if err == nil {
