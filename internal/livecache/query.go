@@ -135,7 +135,6 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 		return q, false
 	}
 	batchSize := -1
-	singleBatch := false
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
 		switch k {
@@ -201,11 +200,11 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 			}
 			batchSize = n
 		case "singleBatch":
-			b, ok := v.BooleanOK()
-			if !ok {
+			// Read for its type only: whether the cursor closes after one
+			// batch changes nothing here. See the batchSize check below.
+			if _, ok := v.BooleanOK(); !ok {
 				return q, false
 			}
-			singleBatch = b
 		default:
 			// hint, collation, min, max, returnKey, showRecordId, tailable,
 			// allowPartialResults, let, and anything a later server adds.
@@ -219,8 +218,10 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 	}
 	// The reply has to be one batch with the cursor closed, which is what the
 	// client then expects: a batch smaller than the answer leaves a cursor this
-	// cache does not have.
-	if batchSize >= 0 && batchSize < q.Limit && !singleBatch {
+	// cache does not have. With singleBatch the cursor closes after that one
+	// batch instead, and the answer is the batchSize documents: limit(-10)
+	// with batchSize 3 is three documents from mongod, and this returned ten.
+	if batchSize >= 0 && batchSize < q.Limit {
 		return q, false
 	}
 	return q, true

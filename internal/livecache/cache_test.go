@@ -697,3 +697,22 @@ func TestCompareNumbersIsExact(t *testing.T) {
 // exactCmp is the comparison compareNumbers shortcuts. big.Float holds
 // infinities and orders them too.
 func exactCmp(a, b bson.RawValue) int { return exact(a).Cmp(exact(b)) }
+
+// limit(-10).batchSize(3) is sent as limit 10, batchSize 3, singleBatch: mongod
+// returns three documents and closes the cursor. The cache returned ten.
+func TestSingleBatchShorterThanTheLimitIsNotCached(t *testing.T) {
+	find := func(single bool) bson.Raw {
+		return raw(t, bson.D{{Key: "find", Value: "c"}, {Key: "filter", Value: bson.D{{Key: "n", Value: int32(1)}}},
+			{Key: "sort", Value: bson.D{{Key: "a", Value: int32(1)}}}, {Key: "limit", Value: int32(10)},
+			{Key: "batchSize", Value: int32(3)}, {Key: "singleBatch", Value: single}})
+	}
+	for _, single := range []bool{true, false} {
+		if _, ok := ParseFind("s.c", find(single)); ok {
+			t.Errorf("singleBatch %v with batchSize 3 under limit 10 was taken", single)
+		}
+	}
+	if _, ok := ParseFind("s.c", raw(t, bson.D{{Key: "find", Value: "c"}, {Key: "filter", Value: bson.D{{Key: "n", Value: int32(1)}}},
+		{Key: "limit", Value: int32(10)}, {Key: "batchSize", Value: int32(10)}, {Key: "singleBatch", Value: true}})); !ok {
+		t.Error("a single batch that holds the whole limit was refused")
+	}
+}
