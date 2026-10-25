@@ -48,7 +48,7 @@ func (r *Router) archivedIDClashes(ctx context.Context, ns string, docs []bson.R
 		return out, err
 	}
 	// About to refuse. Asked again once mirroring has caught up, because an _id
-	// deleted a moment ago is still live in the archive. See clashIsFresh.
+	// deleted a moment ago is still live in the archive. See clashIsFreshOrBehind.
 	//
 	// Under router.freshness: strict a wait that runs out is a refusal, not a
 	// duplicate key. The archive's answer is the one it is behind on, and

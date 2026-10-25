@@ -936,7 +936,12 @@ startRouter "$STRICTCFG"
 # A sparse unique ref as well, so freeing a unique value is asked too; _id 7 is
 # the document an update moves onto a freed one.
 R "db.getSiblingDB(process.env.TC_DB).$MNS.createIndex({ref:1},{unique:true, sparse:true})" >/dev/null
-R "db.getSiblingDB(process.env.TC_DB).$MNS.insertMany(Array.from({length:7},(_,i)=>({_id:i+1, ref:'r'+(i+1), old:true, when:new Date()})))" >/dev/null
+# And a collated one, whose clash the archive judges in its own comparison.
+R "db.getSiblingDB(process.env.TC_DB).$MNS.createIndex({nick:1},{unique:true, sparse:true, collation:{locale:'en', strength:2}})" >/dev/null
+# On the archive too: without it the archive cannot be asked in the index's
+# comparison, and the check is not made at all. See collatedArchiveClash.
+C "db.getSiblingDB(process.env.TC_DB).$MNS.createIndex({nick:1},{unique:true, sparse:true, collation:{locale:'en', strength:2}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$MNS.insertMany(Array.from({length:7},(_,i)=>({_id:i+1, ref:'r'+(i+1), nick:'n'+(i+1), old:true, when:new Date()})))" >/dev/null
 R "db.getSiblingDB(process.env.TC_DB).${MNS}ev.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, old:true, when:new Date(Date.UTC(2024,0,1+i))})))" >/dev/null
 R "db.getSiblingDB(process.env.TC_DB).${MNS}src.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, fresh:true})))" >/dev/null
 R "db.getSiblingDB(process.env.TC_DB).${MNS}evsrc.insertMany(Array.from({length:6},(_,i)=>({_id:i+1, fresh:true})))" >/dev/null
@@ -978,6 +983,8 @@ chk "stopped: a new document taking a freed ref"      "error 125" \
     "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:101, ref:'r1'}); print('accepted') } catch(e) { print('error '+e.code) }")"
 chk "stopped: an update moving onto a freed ref"     "error 125" \
     "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.updateOne({_id:7},{\$set:{ref:'r2'}}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "stopped: a freed nick, by its collation"         "error 125" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:103, nick:'N3'}); print('accepted') } catch(e) { print('error '+e.code) }")"
 chk "stopped: nothing written to either tier"         "0 6 0 6"   "$(liveIn H $MNS) $(liveIn C $MNS) $(liveIn H ${MNS}ev) $(liveIn C ${MNS}ev)"
 # The same re-insert under router.freshness: permissive, which answers from the
 # archive as it stands once the wait runs out and counts it.
@@ -998,6 +1005,8 @@ chk "running: the deletes reached the archive"        "0"         "$(liveIn C $M
 chk "running: re-inserting them is accepted"          "n=6"       "$(insertSix $MNS)"
 chk "running: a new document taking a freed ref"      "accepted" \
     "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:101, ref:'r1'}); print('accepted') } catch(e) { print('error '+e.code) }")"
+chk "running: a freed nick, by its collation"         "accepted" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:103, nick:'N3'}); print('accepted') } catch(e) { print('error '+e.code) }")"
 chk "running: an update moving onto a freed ref"     "accepted" \
     "$(R "try { db.getSiblingDB(process.env.TC_DB).$MNS.updateOne({_id:7},{\$set:{ref:'r2'}}); print('accepted') } catch(e) { print('error '+e.code) }")"
 # Delete and write again at once each time, so the delete is still in flight.

@@ -35,15 +35,20 @@ import (
 // be asked, the write is not refused. Rejecting a write because bookkeeping is
 // unreachable is a visible failure caused by the proxy, and the case this
 // guards is one the fast tier's own index cannot see anyway.
-func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) bool {
+//
+// Under router.freshness: strict a wait that runs out is errArchiveBehind, as
+// for every other key check, rather than a clash. See clashIsFreshOrBehind.
+func (r *Router) collatedArchiveClash(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) (bool, error) {
 	if !r.collatedArchiveClashNow(ctx, ns, idx, vals, owner) {
-		return false
+		return false, nil
 	}
 	// About to refuse, so asked again once mirroring has caught up: a document
 	// deleted a moment ago still holds its value in the archive until its
-	// tombstone lands. See clashIsFresh.
-	r.clashIsFresh(ctx, ns)
-	return r.collatedArchiveClashNow(ctx, ns, idx, vals, owner)
+	// tombstone lands. See clashIsFreshOrBehind.
+	if err := r.clashIsFreshOrBehind(ctx, ns); err != nil {
+		return true, err
+	}
+	return r.collatedArchiveClashNow(ctx, ns, idx, vals, owner), nil
 }
 
 // collatedArchiveClashNow is collatedArchiveClash asked of the archive as it

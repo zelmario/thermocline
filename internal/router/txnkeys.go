@@ -127,6 +127,7 @@ func (c *conn) verifyTxnKeys(ctx context.Context, msg *wire.Message, reply *wire
 	}
 
 	idxs := c.r.uniqueIndexes(ctx, chk.ns)
+	ctx = c.withTxnView(ctx, chk.txn)
 	var claimed []string
 	for i := range idxs {
 		clash, kids, cerr := c.claimEvaluated(ctx, chk.ns, idxs[i], after)

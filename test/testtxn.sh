@@ -129,6 +129,31 @@ chk "the commit after a refused insert fails"           "COMMIT FAILED" "$(R "
 chk "  and the debit before it did not land"            "100" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).ttxa.findOne({_id:3}).bal)")"
 
+echo "== a value the transaction itself freed can be taken again in it =="
+# The registry read a key's owner outside the caller's transaction, so a value
+# the transaction's own earlier statement freed still read as held: the second
+# statement was refused E11000 and the transaction aborted, where MongoDB
+# commits both.
+fresh ttxa '{email:1}'
+R "db.getSiblingDB(process.env.TC_DB).ttxa.insertMany([{_id:1,email:'a1'},{_id:2,email:'b1'},{_id:3,email:'c1'}])" >/dev/null
+chk "an update frees a value and another takes it"      "COMMITTED" "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
+  s.startTransaction();
+  try { c.updateOne({_id:1},{\$set:{email:'a2'}}); c.updateOne({_id:2},{\$set:{email:'a1'}}); s.commitTransaction(); print('COMMITTED'); }
+  catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.message.substring(0,60)); }")"
+chk "  and both changed"                                "a2 a1" \
+    "$(R "const c=db.getSiblingDB(process.env.TC_DB).ttxa; print(c.findOne({_id:1}).email+' '+c.findOne({_id:2}).email)")"
+chk "a delete frees a value and an insert takes it"     "COMMITTED" "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
+  s.startTransaction();
+  try { c.deleteOne({_id:3}); c.insertOne({_id:4,email:'c1'}); s.commitTransaction(); print('COMMITTED'); }
+  catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.message.substring(0,60)); }")"
+chk "  while a value still held is refused"             "11000" "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
+  s.startTransaction();
+  try { c.insertOne({_id:5,email:'a2'}); s.commitTransaction(); print('COMMITTED'); }
+  catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.message.substring(0,60)); }")"
+
 echo "== an aborted transaction leaves no false duplicate =="
 # The claim is written by the router's own client, so an abort cannot roll it
 # back. What must not happen is the orphaned claim rejecting the next honest

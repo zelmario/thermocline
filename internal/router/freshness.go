@@ -749,8 +749,8 @@ func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Durat
 		"a document deleted in the last moments may be copied back to the fast tier")
 }
 
-// clashIsFresh is the same barrier for a write about to be refused because the
-// archive says its key is taken.
+// clashIsFreshOrBehind is the freshness barrier for a write about to be refused
+// because the archive says its key is taken.
 //
 // The archive is asked whether an _id or a unique value is already held, and a
 // document the application deleted a moment ago is still live there until its
@@ -764,29 +764,16 @@ func (r *Router) copyUpIsFresh(ctx context.Context, ns string, budget time.Durat
 // clash is the rare case, and waiting before every check would put the barrier
 // on every insert into a collection the fast tier does not hold in full.
 //
-// Never refused under router.freshness: strict. Going ahead stale here errs
-// toward refusing the write as a duplicate, which writes nothing, though the
-// error names the wrong reason. Left to the collated paths, which return a
-// verdict rather than an error; the _id and registry paths use
-// clashIsFreshOrBehind and refuse as behind.
-func (r *Router) clashIsFresh(ctx context.Context, ns string) {
-	_ = r.archiveIsFreshAnyway(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
-		"a key freed by a delete in the last moments may be refused as taken")
-}
-
-// clashIsFreshOrBehind is clashIsFresh under the configured policy: under
-// router.freshness: strict a wait that runs out returns errArchiveBehind, and
+// Under the configured policy: under router.freshness: strict a wait that runs out returns errArchiveBehind, and
 // the write is refused as behind rather than as a duplicate. See
 // archivedIDClashes.
 //
-// For an _id and for a registry claim whose owner is live only in the archive.
+// For an _id, a registry claim whose owner is live only in the archive, and a
+// collated index's clash, which the archive judges in the index's comparison.
 // Every caller has to refuse on errArchiveBehind before its own "letting it
 // through" branch: most of the unique key paths let a write through when the
 // registry cannot be asked, and doing that here would admit the duplicate the
 // refusal stands for. See refusedAsBehind.
-//
-// The collated paths, collatedArchiveClash and stillHoldsKey, keep
-// clashIsFresh and answer E11000 when the wait runs out.
 func (r *Router) clashIsFreshOrBehind(ctx context.Context, ns string) error {
 	return r.archiveIsFresh(ctx, ns, 0, "judging a duplicate key from the archive before mirroring caught up",
 		"a key freed by a delete in the last moments may be refused as taken")

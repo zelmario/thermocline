@@ -1103,10 +1103,6 @@ Part of [Thermocline](../README.md).
   transaction that is refused this way aborts the transaction, as a duplicate
   key does.
 
-  One kind of index keeps E11000 under strict: a unique index with a collation,
-  whose clash is judged in the archive by the index's own comparison rather
-  than by the claim registry. Nothing is written either way.
-
   An evicted document is not a deleted one, and the same section checks that
   too: with the feeder running, an insert of an evicted `_id` is E11000, and a
   `$merge` onto evicted documents finds them and keeps their fields. These are

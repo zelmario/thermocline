@@ -775,7 +775,9 @@ func (r *Router) tryClaimFresh(ctx context.Context, ns string, idx uniqueIndex, 
 	// keeps apart, so the archive is asked in the comparison the index itself
 	// uses. See collatedkeys.go. This costs one indexed lookup, and only on an
 	// index that carries a collation.
-	if r.collatedArchiveClash(ctx, ns, idx, vals, owner) {
+	if clash, cerr := r.collatedArchiveClash(ctx, ns, idx, vals, owner); cerr != nil {
+		return false, false, cerr
+	} else if clash {
 		return false, false, nil
 	}
 
@@ -861,10 +863,26 @@ func (r *Router) claimIsLive(ctx context.Context, ns string, idx uniqueIndex, ki
 		// does any live document hold this value? Treating it as taken without
 		// asking would block the value for ever, since nothing could ever prove
 		// it free again.
-		return r.keyHeldByLiveDocument(ctx, ns, idx, vals, newOwner), nil
+		return r.keyHeldByLiveDocument(ctx, ns, idx, vals, newOwner)
 	}
 
 	db, coll := splitNS(ns)
+
+	// Inside the caller's transaction, the owner is what the transaction sees:
+	// its own earlier statement may have moved it off the value or deleted it.
+	// Not there for the transaction and there as committed means it deleted
+	// it. See withTxnView.
+	if view := txnViewFrom(ctx); view != nil {
+		if doc, found, verr := view(ns, claim.Doc); verr == nil {
+			if found {
+				return r.stillHoldsKey(ctx, ns, idx, kid, doc), nil
+			}
+			cerr := r.hot.Database(db).Collection(coll).FindOne(ctx, bson.D{{Key: "_id", Value: claim.Doc}}).Err()
+			if cerr == nil {
+				return false, nil
+			}
+		}
+	}
 
 	// The fast tier is authoritative where it holds the document: the archive
 	// trails it by the feeder's mirroring lag and may still show the old value.
@@ -1153,6 +1171,9 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 	idxs := c.r.uniqueIndexes(ctx, ns)
 	var claimed []string
 	var clashes []keyClash
+	if t, in := txnOf(cmd); in {
+		ctx = c.withTxnView(ctx, t)
+	}
 	if len(idxs) > 0 {
 		var kerr error
 		claimed, clashes, kerr = c.r.claimKeys(ctx, ns, docs, idxs, ordered)
@@ -1604,7 +1625,8 @@ func (r *Router) claimBatch(ctx context.Context, ns string, idxs []uniqueIndex, 
 			kids, tuples := docKeys(ns, idxs[i], doc)
 			for k, kid := range kids {
 				c := cand{doc: doc, id: id, idx: i, kid: kid, tuple: tuples[k]}
-				if id.IsZero() || r.collatedArchiveClash(ctx, ns, idxs[i], tuples[k], id) {
+				// An error goes the slow way too, where tryClaim reports it.
+				if clash, cerr := r.collatedArchiveClash(ctx, ns, idxs[i], tuples[k], id); id.IsZero() || clash || cerr != nil {
 					slow = append(slow, c)
 					continue
 				}
@@ -1920,10 +1942,12 @@ func indexScope(idx uniqueIndex) bson.A {
 // this key, in the comparison the index itself uses.
 //
 // It answers for a claim that records no owner. Errors read as held: a value
-// that cannot be checked is one this must not hand to a second document.
-func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) bool {
+// that cannot be checked is one this must not hand to a second document. Under
+// router.freshness: strict an archive that has not caught up is errArchiveBehind
+// beside held, as from claimIsLive.
+func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqueIndex, vals []any, owner bson.RawValue) (bool, error) {
 	if len(vals) != len(idx.fields) {
-		return true
+		return true, nil
 	}
 	filter := bson.D{}
 	for i, f := range idx.fields {
@@ -1949,12 +1973,12 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 	var doc bson.Raw
 	err := r.hot.Database(db).Collection(coll).FindOne(ctx, filter, opts).Decode(&doc)
 	if err == nil {
-		return true
+		return true, nil
 	}
 	if !errors.Is(err, mongo.ErrNoDocuments) {
 		r.log.Warn("could not ask the fast tier whether a unique key is still held",
 			"ns", ns, "index", idx.name, "err", err)
-		return true
+		return true, nil
 	}
 
 	cold := append(bson.D{meta.NotArchivedDeleted()}, filter...)
@@ -1962,19 +1986,21 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 	if err == nil {
 		// Held in the archive and not on the fast tier, which a delete looks
 		// like until its tombstone lands. Asked again once mirroring has
-		// caught up. See clashIsFresh.
-		r.clashIsFresh(ctx, ns)
+		// caught up. See clashIsFreshOrBehind.
+		if ferr := r.clashIsFreshOrBehind(ctx, ns); ferr != nil {
+			return true, ferr
+		}
 		err = r.cold.Database(db).Collection(coll).FindOne(ctx, cold, opts).Decode(&doc)
 	}
 	if err == nil {
-		return true
+		return true, nil
 	}
 	if !errors.Is(err, mongo.ErrNoDocuments) {
 		r.log.Warn("could not ask the archive whether a unique key is still held",
 			"ns", ns, "index", idx.name, "err", err)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // constrainsBatch reports, for each document, whether idx covers it, asking the

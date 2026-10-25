@@ -1,6 +1,8 @@
 package router
 
 import (
+	"context"
+
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -179,4 +181,34 @@ func errmsgOf(doc bson.Raw) string {
 		}
 	}
 	return "no error message"
+}
+
+// txnViewKey carries, in a context, how the caller's transaction sees a
+// document. See withTxnView.
+type txnViewKey struct{}
+
+// txnView reads one document by _id as the caller's transaction sees it.
+type txnView func(ns string, id bson.RawValue) (bson.Raw, bool, error)
+
+// withTxnView makes the key registry read a claim's owner inside the caller's
+// transaction rather than as committed.
+//
+// The registry asked the fast tier with the router's own client, which sees
+// what is committed, so a unique value the transaction's own earlier
+// statement had freed still read as held: an update giving A a new email and
+// then B A's old one, in one transaction, was refused E11000 and the
+// transaction aborted, where MongoDB commits both. See claimIsLive.
+func (c *conn) withTxnView(ctx context.Context, t txnFields) context.Context {
+	return context.WithValue(ctx, txnViewKey{}, txnView(func(ns string, id bson.RawValue) (bson.Raw, bool, error) {
+		docs, err := c.findInCallerTxn(t, ns, bson.D{{Key: "_id", Value: id}}, nil, 1, false)
+		if err != nil || len(docs) == 0 {
+			return nil, false, err
+		}
+		return docs[0], true, nil
+	}))
+}
+
+func txnViewFrom(ctx context.Context) txnView {
+	v, _ := ctx.Value(txnViewKey{}).(txnView)
+	return v
 }
