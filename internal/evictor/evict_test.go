@@ -523,7 +523,7 @@ func TestFailedDeleteBehindWithdrawsTheNextStep(t *testing.T) {
 	failed := errors.New("delete refused")
 	behind.start(func() (int, error) { return 0, failed })
 
-	if _, err := e.evictBehind(ctx, ns, hc, cands, &behind); !errors.Is(err, failed) {
+	if _, err := e.evictBehind(ctx, ns, hc, cands, nil, &behind); !errors.Is(err, failed) {
 		t.Fatalf("evictBehind returned %v, want the failed delete behind it", err)
 	}
 	if n, _ := hc.CountDocuments(ctx, bson.D{}); n != 3 {
@@ -605,5 +605,91 @@ func TestStartTakesBackOnlyWhatNoDeleteAnswered(t *testing.T) {
 	if have[idS] != 0 {
 		t.Errorf("the announcement no delete answers still stands at %d; the application's next "+
 			"delete of that document would be read as an eviction", have[idS])
+	}
+}
+
+// A document whose date the application moved to now after the scan read it as
+// old, and whose new version the feeder had already mirrored. Every check after
+// the scan worked by _id and by bytes, so it matched its archived copy and was
+// removed, dated inside the range the claim says the fast tier holds in full.
+func TestEvictionLeavesADocumentWhoseDateMovedAfterTheScan(t *testing.T) {
+	hotURI, coldURI := os.Getenv("TC_TEST_HOT"), os.Getenv("TC_TEST_COLD")
+	if hotURI == "" || coldURI == "" {
+		t.Skip("set TC_TEST_HOT and TC_TEST_COLD to two tiers to run the moved-date test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	hot, err := mongo.Connect(options.Client().ApplyURI(hotURI))
+	if err != nil {
+		t.Fatalf("connect hot: %v", err)
+	}
+	t.Cleanup(func() { _ = hot.Disconnect(context.WithoutCancel(ctx)) })
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatalf("connect cold: %v", err)
+	}
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
+
+	const ns = "tc_moved.docs"
+	hc := hot.Database("tc_moved").Collection("docs")
+	cc := cold.Database("tc_moved").Collection("docs")
+	notices := cold.Database(meta.DB).Collection(meta.Evicting)
+	t.Cleanup(func() {
+		c := context.WithoutCancel(ctx)
+		_ = hc.Drop(c)
+		_ = cc.Drop(c)
+		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
+	})
+	_ = hc.Drop(ctx)
+	_ = cc.Drop(ctx)
+
+	rule := config.EvictionRule{NS: ns, DateField: "at"}
+	boundary := time.Now().Add(-time.Hour)
+	old, moved := bson.NewObjectID(), bson.NewObjectID()
+	// Both as the scan saw them: old.
+	for _, id := range []bson.ObjectID{old, moved} {
+		if _, err := hc.InsertOne(ctx, bson.D{{Key: "_id", Value: id}, {Key: "at", Value: boundary.Add(-time.Hour)}}); err != nil {
+			t.Fatalf("insert hot: %v", err)
+		}
+	}
+	age, err := candidateFilter(rule, boundary, bson.RawValue{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands, err := (&Evictor{log: slog.New(slog.NewTextHandler(io.Discard, nil))}).scan(ctx, hc, ns, age)
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("scan found %d candidates (%v), want 2", len(cands), err)
+	}
+	// Then the date moves, and the feeder mirrors both as they now stand.
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if _, err := hc.UpdateOne(ctx, bson.D{{Key: "_id", Value: moved}}, bson.D{{Key: "$set", Value: bson.D{{Key: "at", Value: now}}}}); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := hc.Find(ctx, bson.D{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cur.Next(ctx) {
+		if _, err := cc.InsertOne(ctx, cur.Current); err != nil {
+			t.Fatalf("mirror: %v", err)
+		}
+	}
+
+	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "test"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	var behind removal
+	removed, err := e.evictBehind(ctx, ns, hc, cands, age, &behind)
+	n, werr := behind.wait()
+	if err != nil || werr != nil {
+		t.Fatalf("evict: %v, %v", err, werr)
+	}
+	if removed+n != 1 {
+		t.Errorf("removed %d, want 1: only the document still older than the boundary", removed+n)
+	}
+	if c, _ := hc.CountDocuments(ctx, bson.D{{Key: "_id", Value: moved}}); c != 1 {
+		t.Error("a document dated now was evicted because the scan had read it as old")
+	}
+	if c, _ := hc.CountDocuments(ctx, bson.D{{Key: "_id", Value: old}}); c != 0 {
+		t.Error("the document still older than the boundary was not evicted")
 	}
 }

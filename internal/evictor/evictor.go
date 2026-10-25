@@ -413,6 +413,10 @@ func (e *Evictor) sweepRule(ctx context.Context, rule config.EvictionRule, bound
 		if err != nil {
 			return stats, err
 		}
+		age, err := candidateFilter(rule, boundary, bson.RawValue{})
+		if err != nil {
+			return stats, err
+		}
 
 		cands, err := e.scan(ctx, hotColl, rule.NS, filter)
 		if err != nil {
@@ -454,7 +458,7 @@ func (e *Evictor) sweepRule(ctx context.Context, rule config.EvictionRule, bound
 			return stats, nil
 		}
 		if len(out.evict) > 0 {
-			removed, err := e.evictBehind(ctx, rule.NS, hotColl, out.evict, behind)
+			removed, err := e.evictBehind(ctx, rule.NS, hotColl, out.evict, age, behind)
 			if err != nil {
 				return stats, err
 			}
@@ -604,7 +608,7 @@ func (e *Evictor) evict(ctx context.Context, ns string, hotColl *mongo.Collectio
 		return 0, nil
 	}
 	var behind removal
-	removed, err := e.evictBehind(ctx, ns, hotColl, docs, &behind)
+	removed, err := e.evictBehind(ctx, ns, hotColl, docs, nil, &behind)
 	n, werr := behind.wait()
 	removed += n
 	if err == nil {
@@ -655,7 +659,11 @@ func (r *removal) wait() (int, error) {
 // evictBehind confirms and announces each step, then leaves its delete running
 // in behind and returns. What it reports removed is what the deletes it waited
 // for removed; the caller waits for the last one.
-func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate, behind *removal) (int, error) {
+//
+// age is the rule's own predicate, asked again of each document as it is
+// confirmed. See presentOnFastTier.
+func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Collection, docs []candidate,
+	age bson.D, behind *removal) (int, error) {
 	chunks, err := e.bySize(ctx, hotColl, docs)
 	if err != nil {
 		return 0, err
@@ -663,7 +671,7 @@ func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Col
 	removed := 0
 	for _, chunk := range chunks {
 		step, endStep := stepContext(ctx)
-		present, err := e.prepareChunk(ctx, step, ns, hotColl, chunk)
+		present, err := e.prepareChunk(ctx, step, ns, hotColl, chunk, age)
 		if err != nil {
 			endStep()
 			return removed, err
@@ -804,7 +812,8 @@ func (e *Evictor) bySize(ctx context.Context, hotColl *mongo.Collection, docs []
 //
 // The checks before the announcement run on ctx and the announcement onwards on
 // step. See stepContext.
-func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
+func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mongo.Collection, docs []candidate,
+	age bson.D) ([]candidate, error) {
 
 	// Announce only what is actually there, so the announcements and the
 	// deletes cover the same documents.
@@ -816,7 +825,7 @@ func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mo
 	// id it missed. That withdrew announcements belonging to documents it had
 	// just evicted, and the feeder tombstoned them: 141 documents lost across
 	// two collections on the pilot, by the fix meant to stop exactly that.
-	present, err := e.presentOnFastTier(ctx, hotColl, docs)
+	present, err := e.presentOnFastTier(ctx, hotColl, docs, age)
 	if err != nil {
 		return nil, err
 	}
@@ -1047,15 +1056,29 @@ func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Col
 //
 // One indexed lookup by _id, so that what is announced and what is deleted are
 // the same set. See evict for what happens when they are not.
-func (e *Evictor) presentOnFastTier(ctx context.Context, hotColl *mongo.Collection, docs []candidate) ([]candidate, error) {
+//
+// And only those still old enough. The scan read the age, kept the _id, and
+// nothing after it asked again: everything from here on works by _id and by
+// the document's bytes. A document whose date the application moved to now
+// between the scan and this read was read in its new version, matched its
+// mirrored copy byte for byte, and was removed, dated inside the range the
+// claim says the fast tier holds in full. Reads bounded in that range then
+// answered without it. age is the scan's predicate without its paging, and the
+// delete compares against what this read returned, so a document that moves
+// after this is left alone by the delete.
+func (e *Evictor) presentOnFastTier(ctx context.Context, hotColl *mongo.Collection, docs []candidate,
+	age bson.D) ([]candidate, error) {
 	ids := make([]bson.RawValue, len(docs))
 	for i, d := range docs {
 		ids[i] = d.id
 	}
 	// Whole documents, not only the _id: what the fast tier holds is what the
 	// archive's copy has to equal. See currentInArchive.
-	cur, err := hotColl.Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}
+	if len(age) > 0 {
+		filter = bson.D{{Key: "$and", Value: bson.A{filter, age}}}
+	}
+	cur, err := hotColl.Find(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("check the fast tier before evicting: %w", err)
 	}
