@@ -64,15 +64,27 @@ stopAll() {
   pkill -9 -f "^$X (router|feeder|evictor) --config $CFG"
 }
 stopAll
+# A run ended by ssh dropping or ^C stops its daemons too: started with setsid
+# they outlived the script and kept running against the next run's data.
+trap stopAll EXIT
 
 # Reset: what earlier runs inserted, Thermocline's state, the fast tier.
 PAD=$(printf "user%012d" "$RECORDS")
+# By _id range only. YCSB deletes nothing, so a run leaves no deletion marks,
+# and clearing them with an updateMany read all 100M records before every run:
+# the archive started each one warm on the newest keys, which favours alone, and
+# vmstat recorded the scan. Looking for a mark costs the same scan, so nothing
+# looks; the router's own counters in each run's snapshot say whether it
+# deleted anything.
 mongosh "$COLD" --quiet --eval "
   const c = db.getSiblingDB('ycsb').usertable;
   print('removed ' + c.deleteMany({_id: {\$gte: '$PAD'}}).deletedCount + ' records inserted by earlier runs');
-  c.updateMany({_tcDeletedAt: {\$exists: true}}, {\$unset: {_tcDeletedAt: 1}});
   db.getSiblingDB('_thermocline_ycsb').dropDatabase();" | tee -a "$OUT/progress.out"
-mongosh "$HOT" --quiet --eval 'for (const n of ["ycsb","_thermocline_ycsb"]) db.getSiblingDB(n).dropDatabase()' >/dev/null
+[ "${PIPESTATUS[0]}" = 0 ] || { t "$LABEL: the reset failed, not running"; exit 3; }
+mongosh "$HOT" --quiet --eval 'for (const n of ["ycsb","_thermocline_ycsb"]) db.getSiblingDB(n).dropDatabase()' >/dev/null ||
+  { t "$LABEL: could not empty the fast tier, not running"; exit 3; }
+# Let the archive's cache and disk settle after the deletes before measuring.
+sleep "${SETTLE:-30}"
 
 if [ "$MODE" = alone ]; then
   t "$LABEL: alone, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
@@ -124,7 +136,8 @@ setsid nohup $X feeder --config $CFG --log-file "$OUT/$LABEL.feeder.log" >/dev/n
 sleep 3
 setsid nohup $X router --config $CFG --log-file "$OUT/$LABEL.router.log" >/dev/null 2>&1 < /dev/null &
 for _ in $(seq 1 60); do mongosh "$RT" --quiet --eval "db.adminCommand({ping:1}).ok" 2>/dev/null | grep -q 1 && break; sleep 1; done
-$X watermark --config $CFG --ns ycsb.usertable --complete-from "$T0" > "$OUT/$LABEL.watermark.out" 2>&1
+$X watermark --config $CFG --ns ycsb.usertable --complete-from "$T0" > "$OUT/$LABEL.watermark.out" 2>&1 ||
+  { t "$LABEL: cline watermark failed, see $LABEL.watermark.out"; exit 3; }
 setsid nohup $X evictor --config $CFG --log-file "$OUT/$LABEL.evictor.log" >/dev/null 2>&1 < /dev/null &
 t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
 ycsb run "$RT" -p operationcount=0 -p maxexecutiontime="$SECS"
