@@ -630,24 +630,39 @@ func (c *Cache) entryFresh(e *entry, q Query, now time.Time) bool {
 
 // Get answers q from memory, or reports a miss and asks for a fill.
 func (c *Cache) Get(q Query) (bson.Raw, bool) {
+	reply, _, ok := c.GetAt(q)
+	return reply, ok
+}
+
+// Position is where in the stream an answer stands: every event up to Closed
+// applied, and some at Applied when a group of events sharing one time has
+// been applied in part. An answer equals the database at Closed, or at
+// Applied, or it is wrong; verify mode reads mongod at both to tell.
+type Position struct {
+	Applied, Closed bson.Timestamp
+}
+
+// GetAt is Get, with the position the answer stands for, read under the same
+// lock as the answer itself.
+func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	key := q.entryKey()
 	c.mu.Lock()
 	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
 		c.mu.Unlock()
-		return nil, false
+		return nil, Position{}, false
 	}
 	// A grouping on a tiered namespace is filled from both tiers, once the
 	// router lets it. See readGroup.
 	if c.isTiered(q.NS) && q.Kind == KindGroup && c.archive == nil {
 		c.mu.Unlock()
-		return nil, false
+		return nil, Position{}, false
 	}
 	db, _ := splitNS(q.NS)
 	now := c.now()
 	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) || !c.fresh(c.pendingDB, allKey, now) {
 		c.mu.Unlock()
 		c.Behind.Add(1)
-		return nil, false
+		return nil, Position{}, false
 	}
 	e, ok := c.entries[key]
 	if ok && !e.expires.IsZero() && now.After(e.expires) {
@@ -665,14 +680,15 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		if q.Kind == KindFind || q.Kind == KindGroup || !c.isTiered(q.NS) {
 			c.requestFill(q)
 		}
-		return nil, false
+		return nil, Position{}, false
 	}
 	if !c.entryFresh(e, q, now) {
 		c.mu.Unlock()
 		c.Behind.Add(1)
-		return nil, false
+		return nil, Position{}, false
 	}
 	c.lru.MoveToFront(e.el)
+	pos := Position{Applied: c.applied, Closed: c.closed}
 	var reply bson.Raw
 	if q.Kind == KindFind {
 		end := min(q.Skip+q.Limit, len(e.docs))
@@ -690,7 +706,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 			// mongod's own answer would depend on an order this does not
 			// know. See groupState.output.
 			c.Misses.Add(1)
-			return nil, false
+			return nil, Position{}, false
 		}
 		reply = findReply(q, out)
 	} else {
@@ -699,7 +715,7 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 		reply = countReply(q, n)
 	}
 	c.Hits.Add(1)
-	return reply, true
+	return reply, pos, true
 }
 
 func (c *Cache) requestFill(q Query) {
