@@ -148,6 +148,14 @@ chk "a delete frees a value and an insert takes it"     "COMMITTED" "$(R "
   s.startTransaction();
   try { c.deleteOne({_id:3}); c.insertOne({_id:4,email:'c1'}); s.commitTransaction(); print('COMMITTED'); }
   catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.message.substring(0,60)); }")"
+chk "a bulkWrite takes a value freed earlier in it"     "COMMITTED" "$(R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
+  s.startTransaction();
+  try { c.updateOne({_id:4},{\$set:{email:'c2'}});
+        const r=s.getDatabase('admin').runCommand({bulkWrite:1, nsInfo:[{ns:process.env.TC_DB+'.ttxa'}], ops:[{insert:0, document:{_id:6,email:'c1'}}]});
+        if (r.nErrors) throw new Error('bulkWrite '+r.cursor.firstBatch.filter(x=>!x.ok).map(x=>x.code).join(','));
+        s.commitTransaction(); print('COMMITTED'); }
+  catch(e) { try{s.abortTransaction()}catch(_){} print(e.code||e.message.substring(0,60)); }")"
 chk "  while a value still held is refused"             "11000" "$(R "
   const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxa;
   s.startTransaction();

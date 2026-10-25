@@ -154,6 +154,12 @@ func boolField(doc bson.Raw, key string) bool {
 // It reports true when it has answered the client itself, which happens only
 // when the command is refused.
 func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.Raw) (*wire.Message, bool) {
+	// Inside a transaction a key's owner is read as the transaction sees it,
+	// as guardInsert does: an earlier statement of it may have freed the
+	// value. See withTxnView.
+	if t, in := txnOf(cmd); in {
+		ctx = c.withTxnView(ctx, t)
+	}
 	ops, ok := parseBulkWrite(cmd, msg)
 	if !ok {
 		c.log.Warn("could not read this bulkWrite, forwarding it unguarded",
