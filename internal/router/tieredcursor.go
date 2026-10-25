@@ -55,6 +55,13 @@ type nsClaim struct {
 type tieredRead struct {
 	on []nsClaim
 	at time.Time
+	// used is the last time a getMore asked about this cursor, which is what
+	// idles it out. mongod times a cursor out ten minutes after its last use,
+	// not after it was opened, and reaping by at forgot the guard on a cursor
+	// still being read: a 20 minute walk over a large result lost it at minute
+	// eleven, and the getMores after that were forwarded unchecked while the
+	// evictor narrowed the claim under them.
+	used time.Time
 }
 
 // tieredCursors remembers them, per router.
@@ -83,6 +90,16 @@ func (reg *tieredCursors) get(id int64) (tieredRead, bool) {
 	defer reg.mu.RUnlock()
 	r, ok := reg.by[id]
 	return r, ok
+}
+
+// touch records a getMore on a registered cursor. See tieredRead.used.
+func (reg *tieredCursors) touch(id int64) {
+	reg.mu.Lock()
+	if r, ok := reg.by[id]; ok {
+		r.used = time.Now()
+		reg.by[id] = r
+	}
+	reg.mu.Unlock()
 }
 
 func (reg *tieredCursors) drop(id int64) {
@@ -174,6 +191,7 @@ func (c *conn) guardTieredGetMore(ctx context.Context, msg *wire.Message) (*wire
 	if !known {
 		return nil, false
 	}
+	c.r.tiered.touch(id)
 
 	// The claims as they stand. A read, so one held under router.claim_grace
 	// answers here too: an archive that cannot be reached has not narrowed
@@ -228,7 +246,11 @@ func (reg *tieredCursors) reapIdle(idle time.Duration) {
 	cut := time.Now().Add(-idle)
 	reg.mu.Lock()
 	for id, r := range reg.by {
-		if r.at.Before(cut) {
+		last := r.used
+		if r.at.After(last) {
+			last = r.at
+		}
+		if last.Before(cut) {
 			delete(reg.by, id)
 		}
 	}
