@@ -170,7 +170,7 @@ C "db.getSiblingDB(process.env.TC_DB).tqview.drop()" >/dev/null
 # archive by any router starting afterwards, so one left there by an earlier run
 # makes "the archive has never heard of this view" false before the run begins,
 # and every check that rests on it then passes or fails for that reason instead.
-for v in vqview vqview2 vqchain vqchainbad vqjoin vqproj; do
+for v in vqview vqview2 vqchain vqchainbad vqjoin vqproj vqgrp; do
   H "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
 done
@@ -272,6 +272,16 @@ chk "  while one that keeps it counts the delete"      "9" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.countDocuments({}))}catch(e){print('REFUSED')}")"
 # Put back, because the sections below count what the fast tier holds.
 R "db.getSiblingDB(process.env.TC_DB).tqview.insertOne({_id:8, n:8, grp:'g'})" >/dev/null
+
+# Through a view that groups, an _id names a group rather than one document,
+# and a read of it was taken as a point read: answered from the fast tier
+# alone whenever that returned anything, counting only what the fast tier
+# held of the group.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqgrp','tqview',[{\$group:{_id:'\$grp', n:{\$sum:1}}}])" >/dev/null
+chk "the fast tier alone would count part of the group" "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tqview.countDocuments({grp:'g'}))")"
+chk "a read by _id through a grouping view is judged"  "REFUSED" \
+    "$(R "try{const d=db.getSiblingDB(process.env.TC_DB).vqgrp.findOne({_id:'g'}); print(d?('n='+d.n):'NOTHING')}catch(e){print('REFUSED')}")"
 
 echo "== a view dropped through the router is dropped in the archive too =="
 # A view created through the router is mirrored down, so the archive can answer

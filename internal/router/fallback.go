@@ -1127,6 +1127,11 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 	if known && mark.Claimed {
 		af, aok := c.r.ageFieldOf(judged)
 		bound, bounded := boundOfQueryField(cmd, af, aok)
+		// Through a view, the base's bound judges the read only when the view
+		// hands base documents on as they are. See viewPassesThrough.
+		if viaView && !c.r.viewPassesThrough(ctx, ns, af) {
+			bounded = false
+		}
 		if (bounded && mark.Complete(bound)) || (!bounded && mark.CoversAll()) {
 			return nil, false
 		}

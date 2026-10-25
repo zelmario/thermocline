@@ -117,6 +117,14 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	if !hasID {
 		return c.guardCompleteness(ctx, ns, fdoc, msg, reply)
 	}
+	// Through a view that groups or recomputes _id, an _id names a group, not
+	// one base document, and the exemption above does not hold.
+	if readingAView {
+		af, _ := c.r.ageFieldOf(nsBase)
+		if !c.r.viewPassesThrough(ctx, ns, af) {
+			return c.guardCompleteness(ctx, ns, fdoc, msg, reply)
+		}
+	}
 	if len(batch) > 0 {
 		c.r.notePointRead(ns, false)
 		if c.spec != nil {
@@ -569,6 +577,13 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 
 		af, aok := c.r.ageFieldOf(judged)
 		bound, bounded := lowerTimeBound(filter, af, aok)
+		// Through a view, the filter applies to what the view returns, and the
+		// base's claim judges it only when the view hands base documents on
+		// as they are. Otherwise only a claim on all of history will do.
+		transparent := !viaView || c.r.viewPassesThrough(ctx, ns, af)
+		if !transparent {
+			bounded = false
+		}
 		switch {
 		case bounded && mark.Complete(bound):
 			c.noteTieredCursorOn(judged, mark, reply)
@@ -587,7 +602,7 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		rdoc, derr := reply.ReplyDoc()
 		if cerr == nil && derr == nil && replyOK(rdoc) {
 			af, aok := c.r.ageFieldOf(judged)
-			if provenNewestFirst(cmd, rdoc, af, aok, mark) && c.r.sortSafeAges(ctx, judged, af) {
+			if transparent && provenNewestFirst(cmd, rdoc, af, aok, mark) && c.r.sortSafeAges(ctx, judged, af) {
 				c.r.Stats.NewestFirst.Add(1)
 				// The proof needs no bound, and the rule is the same: it rests
 				// on this claim, so it lasts as long as this claim does.

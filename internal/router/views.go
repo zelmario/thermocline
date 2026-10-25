@@ -580,6 +580,84 @@ func (v viewSpec) keepsTombstones() bool {
 	return true
 }
 
+// passesThrough reports whether the view's pipeline hands each base document
+// on unchanged in _id and in field, one for one: the condition for judging a
+// read through it by the base collection's claim.
+//
+// A read through a view was judged as if its filter applied to the base
+// collection: its bound read in the base's age field, and an _id equality
+// taken to name one base document. A view that groups, limits or recomputes
+// either field breaks both. Measured on 2026-10-25: a view grouping ten
+// documents by one field answered findOne({_id: "g"}) from the fast tier alone
+// with n: 3, the three the fast tier held.
+func (v viewSpec) passesThrough(field string) bool {
+	arr, err := bson.Raw(v.pipeline).Values()
+	if err != nil {
+		return false
+	}
+	names := func(doc bson.Raw) bool {
+		for _, f := range []string{"_id", field} {
+			if f == "" {
+				continue
+			}
+			if _, err := doc.LookupErr(f); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	for _, st := range arr {
+		doc, ok := st.DocumentOK()
+		if !ok {
+			return false
+		}
+		elems, err := doc.Elements()
+		if err != nil || len(elems) != 1 {
+			return false
+		}
+		name, val := elems[0].Key(), elems[0].Value()
+		switch name {
+		case "$match", "$sort":
+		case "$addFields", "$set", "$project":
+			fields, ok := val.DocumentOK()
+			if !ok || names(fields) {
+				return false
+			}
+		case "$unset":
+			list := []bson.RawValue{val}
+			if a, ok := val.ArrayOK(); ok {
+				list, _ = a.Values()
+			}
+			for _, n := range list {
+				if s, _ := n.StringValueOK(); s == "_id" || s == field {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// viewPassesThrough is passesThrough for every link of the chain ns names, on
+// the fast tier, where the read it judges runs.
+func (r *Router) viewPassesThrough(ctx context.Context, ns, field string) bool {
+	db, _ := splitNS(ns)
+	at := ns
+	for hop := 0; hop < maxViewHops; hop++ {
+		spec, ok := viewDefinition(ctx, r.hot, at)
+		if !ok {
+			return hop > 0
+		}
+		if !spec.passesThrough(field) {
+			return false
+		}
+		at = db + "." + spec.on
+	}
+	return false
+}
+
 // joins reports whether the view's own pipeline reads another collection.
 //
 // Such a view cannot be answered from the archive, whatever its definition says,
