@@ -541,6 +541,12 @@ chkrb "and the archive answers as the router did" "1" \
 C "db.getSiblingDB(process.env.TC_META).positions.deleteMany({})" >/dev/null
 ok "with nothing left it says so"                0 "Nothing is marked deleted" \
     -- cline rollback --config $CFG --ns $DB.$RBNS
+# A misspelt --ns counted nought and printed the reassuring ending, about a
+# collection nothing had looked at, with status 0.
+ok "a --ns the archive does not hold is refused" 1 "holds no collection" \
+    -- cline rollback --config $CFG --ns $DB.${RBNS}typo
+ok "and one that is not db.collection"           1 "is not db.collection" \
+    -- cline rollback --config $CFG --ns $RBNS
 C "db.getSiblingDB(process.env.TC_DB).$RBNS.drop()" >/dev/null
 
 # The fixture this suite leaves behind, dropped last and then checked.

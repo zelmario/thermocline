@@ -71,6 +71,20 @@ func runRollback(args []string) error {
 	namespaces := cfg.Feeder.Namespaces
 	switch {
 	case *nsFlag != "":
+		// One the archive does not hold is a typo, not a clean namespace: it
+		// counted nought and printed that the archive already answers the way
+		// the router does, about a collection nothing had looked at.
+		db, coll := splitNS(*nsFlag)
+		if db == "" || coll == "" {
+			return fmt.Errorf("--ns %q is not db.collection", *nsFlag)
+		}
+		names, lerr := cold.Database(db).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
+		if lerr != nil {
+			return fmt.Errorf("could not ask the archive whether it holds %s: %w", *nsFlag, lerr)
+		}
+		if len(names) == 0 {
+			return fmt.Errorf("the archive holds no collection %s; check the name", *nsFlag)
+		}
 		namespaces = []string{*nsFlag}
 	case len(namespaces) == 0:
 		// An empty feeder.namespaces means every collection is tiered, which is
@@ -115,9 +129,17 @@ and the feeder first, let mirroring finish, then run this again.
 	}
 
 	total := int64(0)
+	// Every namespace that could not be read or cleared. Either reassuring
+	// ending below used to be printed whatever happened here: a count that
+	// failed added nothing to the total, so "nothing is marked deleted" was
+	// printed over a namespace nobody had looked at, and "point the
+	// application at it" over one whose clear had failed, with exit status 0.
+	failed := 0
 	for _, ns := range namespaces {
 		db, coll := splitNS(ns)
 		if db == "" || coll == "" {
+			fmt.Printf("  %-40s is not db.collection, so nothing was read\n", ns)
+			failed++
 			continue
 		}
 		c := cold.Database(db).Collection(coll)
@@ -125,6 +147,7 @@ and the feeder first, let mirroring finish, then run this again.
 		n, cerr := c.CountDocuments(ctx, filter)
 		if cerr != nil {
 			fmt.Printf("  %-40s could not be read: %v\n", ns, cerr)
+			failed++
 			continue
 		}
 		total += n
@@ -139,12 +162,18 @@ and the feeder first, let mirroring finish, then run this again.
 		res, derr := c.DeleteMany(ctx, filter)
 		if derr != nil {
 			fmt.Printf("  %-40s could not be cleared: %v\n", ns, derr)
+			failed++
 			continue
 		}
 		fmt.Printf("  %-40s cleared %d\n", ns, res.DeletedCount)
 	}
 
 	fmt.Print("\n")
+	if failed > 0 {
+		fmt.Printf("%d namespace(s) above could not be read or cleared, so the archive is not ready.\n", failed)
+		fmt.Println("Fix what each line says and run this again; do not point the application at it yet.")
+		return fmt.Errorf("%d namespace(s) could not be read or cleared", failed)
+	}
 	// Both of the reassuring endings are about delete marks alone, and they used
 	// to be printed whatever else was missing: "the archive already answers the
 	// way the router does" appeared directly under a list of collections it has
