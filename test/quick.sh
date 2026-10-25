@@ -53,9 +53,16 @@ if [ -n "$PKGS" ]; then
   done
   if ls "$STAGE"/*.test >/dev/null 2>&1; then
     put "$STAGE"/*.test "$BOX:/tmp/" || { echo "quick: could not copy the tests to $BOX"; exit 2; }
+    # Each runs in its own package directory, as go test runs it, beside the
+    # repository's config files and testdata: config_test.go loads every shipped
+    # config by a path like ../../cline.example.yaml, and failed from /tmp.
+    git ls-files '*.yaml' '*.yml' '*/testdata/*' | tar -cz -T - |
+      rsh "rm -rf /tmp/quickrepo && mkdir -p /tmp/quickrepo && tar -xz -C /tmp/quickrepo" ||
+      { echo "quick: could not copy the test files to $BOX"; exit 2; }
     for t in "$STAGE"/*.test; do
       n=$(basename "$t")
-      res=$(rsh "cd /tmp && TC_TEST_HOT='$HOT' TC_TEST_COLD='$COLD' ./$n -test.count=1 -test.timeout=5m 2>&1 | tail -15")
+      d=$(echo "${n%.test}" | tr _ /)
+      res=$(rsh "mkdir -p /tmp/quickrepo/$d && cd /tmp/quickrepo/$d && TC_TEST_HOT='$HOT' TC_TEST_COLD='$COLD' /tmp/$n -test.count=1 -test.timeout=5m 2>&1 | tail -15")
       if echo "$res" | grep -q '^PASS$'; then
         echo "  $n: PASS"
       else
