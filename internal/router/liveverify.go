@@ -140,6 +140,13 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
 	}
+	if verdict := c.judgeDocument(chk, real, why); verdict != "" {
+		if verdict == "race" {
+			c.r.liveVerify.write(fmt.Sprintf("RACE\t%s\t%s\t%s\t%s\n", chk.ns, took, chk.shape, why))
+			return
+		}
+		why += ", " + verdict
+	}
 	c.log.Warn("the live cache would have answered differently", "ns", chk.ns, "why", why)
 	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\tcmd=%s\tcache=%s\treal=%s\n",
 		chk.ns, took, why, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(real)))
@@ -357,4 +364,50 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 	}
 	c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\texact\n", chk.ns, took, chk.shape))
 	return true
+}
+
+// judgeDocument decides a difference in one document of a find against the
+// client's answer, where the whole answer could not be read at the cache's
+// position. The document is read alone, by _id, on the fast tier at that
+// position: if it is there, that is the truth for it. "race" is a cache that
+// matched it, the client having read a later write by another connection;
+// "wrong at its position" is a defect. "" is a difference this cannot judge:
+// two different documents at that place, or one the fast tier did not hold.
+func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
+	var i int
+	if chk.q.Kind != livecache.KindFind || chk.pos.Closed.T == 0 {
+		return ""
+	}
+	if _, err := fmt.Sscanf(why, "document %d", &i); err != nil {
+		return ""
+	}
+	cb, ok1 := rawBatch(chk.cached.Lookup("cursor", "firstBatch"))
+	rb, ok2 := rawBatch(real.Lookup("cursor", "firstBatch"))
+	if !ok1 || !ok2 || i >= len(cb) || i >= len(rb) {
+		return ""
+	}
+	id := cb[i].Lookup("_id")
+	if !bytes.Equal(id.Value, rb[i].Lookup("_id").Value) || id.Type != rb[i].Lookup("_id").Type {
+		return ""
+	}
+	db, coll := splitNS(chk.ns)
+	find := bson.D{{Key: "find", Value: coll}, {Key: "filter", Value: bson.D{{Key: "_id", Value: id}}}, {Key: "limit", Value: 1}}
+	if pv, err := chk.cmd.LookupErr("projection"); err == nil {
+		find = append(find, bson.E{Key: "projection", Value: pv})
+	}
+	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: chk.pos.Closed}}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := c.r.hot.Database(db).RunCommand(ctx, find).Raw()
+	if err != nil {
+		return ""
+	}
+	sb, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	if !ok || len(sb) != 1 {
+		return ""
+	}
+	if bytes.Equal(sb[0], cb[i]) {
+		return "race"
+	}
+	return "wrong at its position"
 }
