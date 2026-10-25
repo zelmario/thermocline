@@ -172,6 +172,35 @@ C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
 H "db.getSiblingDB('admin').dropUser('onecoll')" >/dev/null 2>&1
 H "db.getSiblingDB('admin').dropRole('onecollrole')" >/dev/null 2>&1
 
+echo "== and a pipeline this router runs itself must be one the client may run =="
+# A tiered $out, and an aggregation answered from the archive, run on this
+# router's own clients. Nothing asked the fast tier whether the client may write
+# the target or read what the pipeline joins, so a client allowed to read
+# nothing replaced a tiered collection with its own documents.
+H "db.getSiblingDB('admin').dropUser('outuser')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').dropRole('outrole')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').createRole({role:'outrole', privileges:[{resource:{db:process.env.TC_DB, collection:'$NS'}, actions:['find']}], roles:[]})" >/dev/null
+H "db.getSiblingDB('admin').createUser({user:'outuser', pwd:'outuser', roles:[{role:'outrole', db:'admin'}]})" >/dev/null
+U() { mongosh "mongodb://outuser:outuser@127.0.0.1:$PORT/?authSource=admin&directConnection=true" --quiet --eval "$1" 2>&1 | tail -1; }
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop(); db.getSiblingDB(process.env.TC_DB).$CATNS.insertMany([{_id:1, secret:true},{_id:2, secret:true}])" >/dev/null
+DENY="catch(e) { print(/not authorized|Unauthorized/i.test(e.message)?'DENIED':'other: '+e.message.substring(0,60)); }"
+chk "a client that may read nothing cannot \$out over it" "DENIED" "$(L "
+  try { db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:'x'}]},{\$out:'$NS'}]); print('WROTE'); } $DENY")"
+chk "a reader of it cannot \$out over it either"         "DENIED" "$(U "
+  try { db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$match:{}},{\$out:'$NS'}]); print('WROTE'); } $DENY")"
+chk "nor \$merge into it"                                "DENIED" "$(U "
+  try { db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{_id:'x'}]},{\$merge:{into:'$NS'}}]); print('WROTE'); } $DENY")"
+chk "nor join a collection it may not read"              "DENIED" "$(U "
+  try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$unionWith:'$CATNS'},{\$match:{secret:true}}]).toArray().length); } $DENY")"
+chk "the collection is untouched"                        "10 0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({})+' '+db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:'x'}))")"
+# The control: the same reader still gets the aggregation it is allowed.
+chk "and the reader still reads it from the archive"     "10" \
+    "$(U "try { print(db.getSiblingDB(process.env.TC_DB).$NS.aggregate([{\$group:{_id:null,n:{\$sum:1}}}]).toArray()[0].n); } $DENY")"
+C "db.getSiblingDB(process.env.TC_DB).$CATNS.drop()" >/dev/null
+H "db.getSiblingDB('admin').dropUser('outuser')" >/dev/null 2>&1
+H "db.getSiblingDB('admin').dropRole('outrole')" >/dev/null 2>&1
+
 echo "== an account the archive has and the fast tier does not =="
 # Certain in an adoption rather than merely possible. The existing cluster
 # carries the application's users; the fast tier is a new replica set and

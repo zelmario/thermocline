@@ -117,6 +117,11 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		return nil, false
 	}
 
+	// mergeKeys runs the pipeline on this router's own client and copies up
+	// what it finds, before the client's command reaches mongod. See mayRun.
+	if denied, ok := c.mayRun(msg, cmd, db); !ok {
+		return denied, true
+	}
 	idxs := c.r.uniqueIndexes(ctx, target)
 	keys, produced, err := c.mergeKeys(ctx, cmd, stages, db, onFields, uniqueFields(idxs))
 	if err != nil {

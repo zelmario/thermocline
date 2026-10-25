@@ -695,6 +695,10 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 		// $out is not allowed in a transaction, so mongod refuses it for us.
 		return nil, false
 	}
+	// Everything below runs on this router's own clients. See mayRun.
+	if denied, ok := c.mayRun(msg, cmd, db); !ok {
+		return denied, true
+	}
 
 	// Where the input comes from is a separate question, and the same one a
 	// read-only pipeline asks. A pipeline with no input collection reads

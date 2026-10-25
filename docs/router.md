@@ -954,6 +954,20 @@ refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
 a short answer is a wrong number on somebody's screen; writing one makes it the
 input to everything downstream.
 
+**A pipeline the router runs itself is first explained on the client's own
+connection.** A tiered `$out`, a `$merge` whose target has archived documents,
+and an aggregation answered from the archive all run on the router's own
+clients, with its own credentials. Until 2026-10-25 nothing asked whether the
+client could have run them. Measured through the router with proxied
+authentication: a user with no privilege on the database replaced a ten
+document tiered collection with one document of its own, and a user allowed to
+read one collection read another through `$unionWith`. mongod authorises an
+`explain` exactly as it authorises the command explained, and `queryPlanner`
+verbosity runs nothing, so one explain covers the target and every collection
+the pipeline joins. An authorisation error is returned to the client as the
+fast tier sent it; any other failure of the explain is not an answer about
+privileges and the command goes on. `testauth.sh` checks both cases.
+
 ### A view is a query somebody else wrote down
 
 A view is a saved pipeline over another collection. What makes it different from

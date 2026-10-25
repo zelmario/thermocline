@@ -633,8 +633,10 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 		}
 
 		// Judged before it runs, so the fast tier has not seen it and nothing
-		// has consulted this client's permissions yet.
-		if denied, ok := c.mayRead(msg, db, coll); !ok {
+		// has consulted this client's permissions yet. The whole command, not
+		// the collection it names: a $lookup or $unionWith reads others, on the
+		// archive, with this router's credentials. See mayRun.
+		if denied, ok := c.mayRun(msg, cmd, db); !ok {
 			return denied, true
 		}
 

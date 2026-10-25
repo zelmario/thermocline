@@ -57,6 +57,76 @@ func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool)
 	return out, false
 }
 
+// mayRun asks the fast tier whether this client may run a whole aggregate
+// command, by explaining it on the client's own connection.
+//
+// mayRead asks about one collection, and an aggregation the router runs itself
+// reaches more than that: $lookup, $unionWith and $graphLookup read others,
+// and $out and $merge write a target. guardTieredOut ran the whole pipeline on
+// this router's own clients with no question asked, so a client allowed to read
+// nothing could $out a list of its own documents over a tiered collection, and
+// one allowed to write a target could copy into it a collection it could not
+// read. mongod authorises an explain exactly as it would the command
+// explained, and queryPlanner verbosity runs nothing, so one probe answers for
+// every namespace the command names, the target included.
+//
+// Only an authorisation refusal counts, as for mayRead: an explain that fails
+// for any other reason is not an answer about privileges. Under terminate_auth
+// the gate decided this command before it ran and the connection carries the
+// router's identity, so the probe would ask the wrong question.
+func (c *conn) mayRun(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	if c.r.cfg.TerminateAuth {
+		return nil, true
+	}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, true
+	}
+	inner := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		if explainDrops(e.Key()) {
+			continue
+		}
+		inner = append(inner, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	probe, err := wire.NewMsg(0, 0, bson.D{
+		{Key: "explain", Value: inner},
+		{Key: "verbosity", Value: "queryPlanner"},
+		{Key: "$db", Value: db},
+	})
+	if err != nil {
+		return nil, true
+	}
+	rdoc, got := c.probe(probe)
+	if !got || replyOK(rdoc) || !isAuthError(rdoc) {
+		return nil, true
+	}
+
+	c.r.Stats.Unauthorized.Add(1)
+	c.log.Warn("refused a command this router would have run with its own credentials, "+
+		"which the fast tier would not have run for this client", "db", db)
+	out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, rewriteReplyIDs(rdoc))
+	if berr != nil {
+		return nil, true
+	}
+	return out, false
+}
+
+// explainDrops reports whether a command field stays out of the command an
+// explain wraps: the generic arguments mongod takes only at the top level, or
+// refuses inside an explain, such as a session or a transaction.
+func explainDrops(key string) bool {
+	if strings.HasPrefix(key, "$") {
+		return true
+	}
+	switch key {
+	case "lsid", "txnNumber", "autocommit", "startTransaction", "readConcern", "writeConcern",
+		"apiVersion", "apiStrict", "apiDeprecationErrors", "maxTimeMS", "comment":
+		return true
+	}
+	return false
+}
+
 // probeRead runs a bounded find on the client's own connection and returns the
 // reply, or false if there was no usable one.
 func (c *conn) probeRead(db, coll string) (bson.Raw, bool) {
@@ -70,6 +140,12 @@ func (c *conn) probeRead(db, coll string) (bson.Raw, bool) {
 	if err != nil {
 		return nil, false
 	}
+	return c.probe(probe)
+}
+
+// probe sends one command on the client's own connection and returns the reply
+// document, or false if there was no usable one.
+func (c *conn) probe(probe *wire.Message) (bson.Raw, bool) {
 	if werr := wire.Write(c.upstream, probe); werr != nil {
 		c.upstreamBroke()
 		return nil, false
