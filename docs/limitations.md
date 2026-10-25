@@ -1047,25 +1047,6 @@ Part of [Thermocline](../README.md).
   work; it means the one failure whose symptom is silence has a line somewhere
   that mentions it.
 
-- **Inside a transaction, a unique value its own earlier statement freed
-  cannot be taken.** The claim registry reads a key's owner on the router's own
-  client, outside the caller's transaction, so it sees the value as still
-  held: `updateOne({_id: A}, {$set: {email: "new"}})` and then giving A's old
-  email to B, in one transaction, is refused E11000 and the transaction
-  aborted, where MongoDB commits both. Nothing wrong is written. Free and
-  reuse the value in two transactions, or in one statement.
-
-- **A batch with one statement taking a key only the archive holds is refused
-  whole.** mongod applies the other statements of an `update` command or a
-  `bulkWrite` and reports the one duplicate. The router decides the duplicate
-  before anything runs and cannot apply the rest without it, so it refuses the
-  command and says nothing was applied. Until 2026-10-25 a multi-statement
-  `update` answered `ok: 1` with one write error at that statement's index and
-  had applied none of the others, which a client retrying only the failed
-  statement read as the rest having gone in. A single statement still gets
-  mongod's E11000, and an `insert` batch is applied in part the way mongod
-  applies it.
-
 - **A key freed by a delete cannot be used again until the delete reaches the
   archive.** Clearing a collection and reloading it is the shape that meets
   this, and so is a unique value given to a new document right after its last

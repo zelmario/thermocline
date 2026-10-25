@@ -2,8 +2,8 @@ package router
 
 import (
 	"context"
-	"fmt"
 	"errors"
+	"sort"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -516,81 +516,302 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 		return nil, false
 	}
 
+	ordered := true
+	if v, lerr := cmd.LookupErr("ordered"); lerr == nil {
+		if b, bok := v.BooleanOK(); bok {
+			ordered = b
+		}
+	}
+
 	var claimed []string
+	var clashes []keyClash
 	for s, st := range stmts {
 		sh := parseUpdate(st.update)
+		var mine []string
+		clashed := false
 		for i := range idxs {
 			if !sh.affects(idxs[i]) && !st.upsert {
 				continue
 			}
 			clash, kids, cerr := c.claimStatement(ctx, ns, idxs[i], sh, st)
-			if out, done := c.refusedAsBehind(ctx, msg, cerr, append(claimed, kids...)); done {
+			if out, done := c.refusedAsBehind(ctx, msg, cerr, append(append(claimed, mine...), kids...)); done {
 				return out, true
 			}
 			if cerr != nil {
-				c.r.releaseKeys(ctx, claimed)
+				c.r.releaseKeys(ctx, append(claimed, mine...))
 				c.log.Warn("could not check unique keys, letting the update through",
 					"ns", ns, "err", cerr)
 				return nil, false
 			}
-			claimed = append(claimed, kids...)
+			mine = append(mine, kids...)
 			if clash {
-				c.r.releaseKeys(ctx, claimed)
-				// mongod refuses an update for its own reasons before it ever
-				// reaches an index: $[] on a path that does not exist, $inc on
-				// a string. The key was read off the command without running
-				// it, so a statement that could never have written was answered
-				// E11000 where mongod says "The path 'tags' must exist", found
-				// by the fuzzer on 2026-10-07. A client that reads 11000 as
-				// "taken, pick another" acts on an answer MongoDB never gives.
-				//
-				// So before saying duplicate, the fast tier runs the statement
-				// in a transaction that is thrown away. If it fails on its own,
-				// the command goes through and fails the same way, writing
-				// nothing. One statement only: with more, forwarding would run
-				// the ones around it, and those are not all checked here.
-				if len(stmts) == 1 && c.failsOnItsOwn(ctx, ns, coll, st) {
-					c.log.Debug("an update whose key is taken fails for another reason first, letting mongod say which",
-						"ns", ns, "index", idxs[i].name)
-					return nil, false
-				}
-				c.r.Stats.DuplicateKeys.Add(1)
-				c.log.Debug("update would duplicate an archived document",
-					"ns", ns, "index", idxs[i].name)
-				// With more than one statement nothing is forwarded, and a
-				// reply of ok: 1 with one write error at s said the others had
-				// run: an ordered update of [A, B] whose B takes an archived
-				// key applied neither, and the client was told A had gone in.
-				// mongod applies A. Applying it here means a trimmed command
-				// and its reply put back together, which this does not do, so
-				// the whole command is refused, saying nothing was applied.
-				if len(stmts) > 1 {
-					c.r.Stats.Refused.Add(1)
-					c.cls = ClassRefused
-					out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-						fmt.Sprintf("thermocline: refusing this update because statement %d would take a key "+
-							"held by a document in the archive (index %s), which mongod would refuse with "+
-							"E11000, and this router cannot apply the other statements without it. Nothing "+
-							"was applied. Send that statement on its own to get the duplicate key error, and "+
-							"the others separately.", s, idxs[i].name))
-					if rerr != nil {
-						return nil, false
-					}
-					return out, true
-				}
-				out, rerr := c.r.updateDuplicateKeyReply(msg, name, ns, idxs[i].name, s)
-				if rerr != nil {
-					return nil, false
-				}
-				return out, true
+				// This statement's keys go back; the others' stay with them.
+				c.r.releaseKeys(ctx, mine)
+				mine = nil
+				clashes = append(clashes, keyClash{doc: s, index: idxs[i].name})
+				clashed = true
+				break
 			}
+		}
+		if !clashed {
+			claimed = append(claimed, mine...)
+			continue
+		}
+		if ordered {
+			// mongod stops at the first error of an ordered batch, so nothing
+			// after it is asked about.
+			break
 		}
 	}
 
-	// Held until the reply comes back, so a write the fast tier rejects gives
-	// its keys back instead of blocking that value until something collides.
-	c.pendingKeys = append(c.pendingKeys, claimed...)
-	return nil, false
+	if len(clashes) == 0 {
+		// Held until the reply comes back, so a write the fast tier rejects
+		// gives its keys back instead of blocking that value until something
+		// collides.
+		c.pendingKeys = append(c.pendingKeys, claimed...)
+		return nil, false
+	}
+	c.r.Stats.DuplicateKeys.Add(int64(len(clashes)))
+	c.log.Debug("update would duplicate an archived document",
+		"ns", ns, "statements", len(clashes), "of", len(stmts))
+
+	if len(stmts) == 1 {
+		// mongod refuses an update for its own reasons before it ever
+		// reaches an index: $[] on a path that does not exist, $inc on
+		// a string. The key was read off the command without running
+		// it, so a statement that could never have written was answered
+		// E11000 where mongod says "The path 'tags' must exist", found
+		// by the fuzzer on 2026-10-07. A client that reads 11000 as
+		// "taken, pick another" acts on an answer MongoDB never gives.
+		//
+		// So before saying duplicate, the fast tier runs the statement
+		// in a transaction that is thrown away. If it fails on its own,
+		// the command goes through and fails the same way, writing
+		// nothing.
+		if c.failsOnItsOwn(ctx, ns, coll, stmts[0]) {
+			c.log.Debug("an update whose key is taken fails for another reason first, letting mongod say which",
+				"ns", ns, "index", clashes[0].index)
+			return nil, false
+		}
+		out, rerr := c.r.updateDuplicateKeyReply(msg, name, ns, clashes[0].index, 0)
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+
+	// Several statements: the others are applied, the way mongod applies them,
+	// and the reply put back together with each refusal at its own index. Until
+	// 2026-10-25 nothing was forwarded and the reply said only the clashing
+	// statement had failed, so a client retrying that one lost the rest; then
+	// the whole command was refused. Ordered stops at the first clash, as mongod
+	// does; unordered applies everything else.
+	out, done := c.applyOthers(ctx, msg, cmd, ns, ordered, clashes, claimed)
+	if !done {
+		c.r.releaseKeys(ctx, claimed)
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this update because a statement would take a key held by a document "+
+				"in the archive (index "+clashes[0].index+"), and the others could not be applied without "+
+				"it. Nothing was applied.")
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return out, true
+}
+
+// applyOthers forwards the statements of an update that do not clash and
+// answers with mongod's reply for them and a duplicate key error for each that
+// does, at the indexes the client sent. done false means nothing was forwarded.
+func (c *conn) applyOthers(ctx context.Context, msg *wire.Message, cmd bson.Raw, ns string,
+	ordered bool, clashes []keyClash, claimed []string) (*wire.Message, bool) {
+	raw := msg.AllOf("updates")
+	refused := map[int]string{}
+	for _, cl := range clashes {
+		refused[cl.doc] = cl.index
+	}
+	limit := len(raw)
+	if ordered {
+		limit = clashes[0].doc
+	}
+	var keep []bson.Raw
+	var keepAt []int
+	for i := 0; i < limit; i++ {
+		if _, bad := refused[i]; bad {
+			continue
+		}
+		keep = append(keep, raw[i])
+		keepAt = append(keepAt, i)
+	}
+
+	var up bson.Raw
+	if len(keep) > 0 {
+		trimmed, err := rebuildStatements(cmd, "updates", keep)
+		if err != nil {
+			return nil, false
+		}
+		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+		if err != nil {
+			return nil, false
+		}
+		if werr := wire.Write(c.upstream, fwd); werr != nil {
+			c.upstreamBroke()
+			return nil, false
+		}
+		reply, rerr := wire.Read(c.upstream)
+		if rerr != nil {
+			// Sent and not answered: it may have run, so this answers rather
+			// than pretending nothing was applied.
+			c.upstreamBroke()
+			out, _ := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: lost the fast tier's reply to the statements of this update that did not "+
+					"take an archived key; they may have been applied")
+			return out, true
+		}
+		c.r.noteOpTime(reply)
+		up, err = reply.ReplyDoc()
+		if err != nil || !replyOK(up) {
+			out := reply
+			out.Header.ResponseTo = msg.Header.RequestID
+			return out, true
+		}
+		c.pendingKeys = append(c.pendingKeys, claimed...)
+	}
+	out, err := c.r.updateMergedReply(msg, ns, up, keepAt, clashes, ordered)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// updateMergedReply is an update's reply for a batch the router split: mongod's
+// counts and errors for the statements it ran, mapped back to the client's
+// indexes, and a duplicate key error for each statement refused here.
+func (r *Router) updateMergedReply(msg *wire.Message, ns string, up bson.Raw, keepAt []int,
+	clashes []keyClash, ordered bool) (*wire.Message, error) {
+	var n, nModified int
+	var upserted bson.A
+	var errs []bson.D
+	stoppedEarly := false
+	out := bson.D{}
+	if up != nil {
+		n, _ = intOf(up.Lookup("n"))
+		nModified, _ = intOf(up.Lookup("nModified"))
+		if arr, ok := up.Lookup("upserted").ArrayOK(); ok {
+			vals, _ := arr.Values()
+			for _, v := range vals {
+				d, dok := v.DocumentOK()
+				if !dok {
+					continue
+				}
+				idx, _ := intOf(d.Lookup("index"))
+				if idx >= 0 && idx < len(keepAt) {
+					upserted = append(upserted, bson.D{{Key: "index", Value: int32(keepAt[idx])}, {Key: "_id", Value: d.Lookup("_id")}})
+				}
+			}
+		}
+		if arr, ok := up.Lookup("writeErrors").ArrayOK(); ok {
+			vals, _ := arr.Values()
+			for _, v := range vals {
+				d, dok := v.DocumentOK()
+				if !dok {
+					continue
+				}
+				e := bson.D{}
+				elems, _ := d.Elements()
+				for _, el := range elems {
+					if el.Key() == "index" {
+						idx, _ := intOf(el.Value())
+						if idx >= 0 && idx < len(keepAt) {
+							e = append(e, bson.E{Key: "index", Value: int32(keepAt[idx])})
+						}
+						continue
+					}
+					e = append(e, bson.E{Key: el.Key(), Value: el.Value()})
+				}
+				errs = append(errs, e)
+				stoppedEarly = ordered
+			}
+		}
+		// Everything else mongod said: its clock, a write concern error.
+		elems, _ := up.Elements()
+		for _, el := range elems {
+			switch el.Key() {
+			case "n", "nModified", "upserted", "writeErrors", "ok":
+				continue
+			}
+			out = append(out, bson.E{Key: el.Key(), Value: el.Value()})
+		}
+	}
+	// An ordered batch that failed before the clash never reached it.
+	if !stoppedEarly {
+		for _, cl := range clashes {
+			errs = append(errs, bson.D{
+				{Key: "index", Value: int32(cl.doc)},
+				{Key: "code", Value: int32(11000)},
+				{Key: "errmsg", Value: "E11000 duplicate key error collection: " + ns + " index: " + cl.index +
+					" :: thermocline: this update would take a key held by a document in the archive, " +
+					"where the fast tier's unique index cannot see it"},
+			})
+		}
+	}
+	sort.SliceStable(errs, func(i, j int) bool { return errIndex(errs[i]) < errIndex(errs[j]) })
+	body := bson.D{{Key: "n", Value: int32(n)}, {Key: "nModified", Value: int32(nModified)}}
+	if len(upserted) > 0 {
+		body = append(body, bson.E{Key: "upserted", Value: upserted})
+	}
+	if len(errs) > 0 {
+		ea := make(bson.A, len(errs))
+		for i, e := range errs {
+			ea[i] = e
+		}
+		body = append(body, bson.E{Key: "writeErrors", Value: ea})
+	}
+	body = append(body, out...)
+	body = append(body, bson.E{Key: "ok", Value: 1.0})
+	return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, body)
+}
+
+// errIndex is a write error's index, as built above.
+func errIndex(e bson.D) int32 {
+	for _, el := range e {
+		if el.Key == "index" {
+			if n, ok := el.Value.(int32); ok {
+				return n
+			}
+		}
+	}
+	return -1
+}
+
+// rebuildStatements is a write command carrying only the statements in keep,
+// in field, inline. See rebuildInsert.
+func rebuildStatements(cmd bson.Raw, field string, keep []bson.Raw) (bson.D, error) {
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, err
+	}
+	arr := make(bson.A, 0, len(keep))
+	for _, d := range keep {
+		arr = append(arr, d)
+	}
+	out := make(bson.D, 0, len(elems)+1)
+	replaced := false
+	for _, e := range elems {
+		if e.Key() == field {
+			out = append(out, bson.E{Key: field, Value: arr})
+			replaced = true
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	if !replaced {
+		out = append(out, bson.E{Key: field, Value: arr})
+	}
+	return out, nil
 }
 
 // claimStatement claims the key every document this statement touches will end

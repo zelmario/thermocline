@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"sort"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -34,6 +35,7 @@ type bulkOp struct {
 	ns   string
 	doc  bson.Raw        // insert
 	stmt updateStatement // update and delete
+	raw  bson.Raw        // the operation as sent, for a trimmed command
 }
 
 // parseBulkWrite reads the command into namespaces and operations.
@@ -85,7 +87,7 @@ func parseBulkWrite(cmd bson.Raw, msg *wire.Message) ([]bulkOp, bool) {
 
 	out := make([]bulkOp, 0, len(ops))
 	for _, op := range ops {
-		var b bulkOp
+		b := bulkOp{raw: op}
 		switch {
 		case hasKey(op, "insert"):
 			b.kind = "insert"
@@ -317,8 +319,9 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 	// Before the key claims below, because mongod reports _id first and because
 	// a refusal here has nothing to give back yet.
 	idDocs := map[string][]bson.Raw{}
+	idAt := map[string][]int{}
 	var idOrder []string
-	for _, op := range ops {
+	for i, op := range ops {
 		if op.kind != "insert" || !c.r.cfg.Manages(op.ns) {
 			continue
 		}
@@ -326,7 +329,11 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			idOrder = append(idOrder, op.ns)
 		}
 		idDocs[op.ns] = append(idDocs[op.ns], op.doc)
+		idAt[op.ns] = append(idAt[op.ns], i)
 	}
+	// Every operation refused here, by its position and the index it would
+	// have duplicated. See applyOtherOps.
+	refused := map[int]string{}
 	for _, ns := range idOrder {
 		clashes, err := c.r.archivedIDClashes(ctx, ns, idDocs[ns])
 		// Counted and logged by refuseStale. See archivedIDClashes.
@@ -357,16 +364,36 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 			}
 			return out, true
 		}
-		if len(clashes) > 0 {
-			return c.refuseBulk(ctx, msg, nil, ns, "_id_")
+		for _, cl := range clashes {
+			if cl.doc >= 0 && cl.doc < len(idAt[ns]) {
+				refused[idAt[ns][cl.doc]] = "_id_"
+			}
+		}
+	}
+	ordered := true
+	if v, lerr := cmd.LookupErr("ordered"); lerr == nil {
+		if b, bok := v.BooleanOK(); bok {
+			ordered = b
+		}
+	}
+	// An ordered bulkWrite stops at its first error, so nothing after the first
+	// refusal runs, and nothing after it claims a key.
+	stopAt := len(ops)
+	if ordered {
+		for i := range ops {
+			if _, bad := refused[i]; bad {
+				stopAt = i
+				break
+			}
 		}
 	}
 
 	// Then the unique keys, for the same reason and in the same way as an
 	// ordinary insert or update.
 	var claimed []string
-	for _, op := range ops {
-		if !c.r.cfg.Manages(op.ns) {
+	for oi := 0; oi < stopAt; oi++ {
+		op := ops[oi]
+		if _, bad := refused[oi]; bad || !c.r.cfg.Manages(op.ns) {
 			continue
 		}
 		// This write may be what creates the collection on the fast tier, and a
@@ -391,7 +418,11 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 				continue
 			}
 			if len(clashes) > 0 {
-				return c.refuseBulk(ctx, msg, claimed, op.ns, clashes[0].index)
+				c.r.releaseKeys(ctx, got)
+				refused[oi] = clashes[0].index
+				if ordered {
+					stopAt = oi
+				}
 			}
 		case "update":
 			sh := parseUpdate(op.stmt.update)
@@ -413,16 +444,230 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 					continue
 				}
 				if clash {
-					return c.refuseBulk(ctx, msg, claimed, op.ns, idxs[i].name)
+					c.r.releaseKeys(ctx, kids)
+					refused[oi] = idxs[i].name
+					if ordered {
+						stopAt = oi
+					}
+					break
 				}
 			}
 		}
 	}
 
-	// Held until the reply, so a command the fast tier rejects gives its keys
-	// back rather than blocking those values until something collides.
-	c.pendingKeys = append(c.pendingKeys, claimed...)
-	return nil, false
+	if len(refused) == 0 {
+		// Held until the reply, so a command the fast tier rejects gives its
+		// keys back rather than blocking those values until something collides.
+		c.pendingKeys = append(c.pendingKeys, claimed...)
+		return nil, false
+	}
+	c.r.Stats.DuplicateKeys.Add(int64(len(refused)))
+	if out, done := c.applyOtherOps(ctx, msg, cmd, ops, refused, stopAt, ordered, claimed); done {
+		return out, true
+	}
+	var first string
+	for i := range ops {
+		if idx, bad := refused[i]; bad {
+			first = idx
+			break
+		}
+	}
+	return c.refuseBulk(ctx, msg, claimed, ops[0].ns, first)
+}
+
+// applyOtherOps runs the operations of a bulkWrite that were not refused and
+// answers with mongod's results for them and a duplicate key error for each
+// that was, at the positions the client sent.
+//
+// The whole command used to be refused over one archived duplicate. mongod
+// runs the rest and reports the one, ordered stopping at it and unordered going
+// on, and an application loading a thousand documents expects the other nine
+// hundred and ninety-nine to land. done false means nothing was sent.
+func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Raw, ops []bulkOp,
+	refused map[int]string, stopAt int, ordered bool, claimed []string) (*wire.Message, bool) {
+	var keep bson.A
+	var keepAt []int
+	for i := 0; i < stopAt; i++ {
+		if _, bad := refused[i]; bad {
+			continue
+		}
+		keep = append(keep, ops[i].raw)
+		keepAt = append(keepAt, i)
+	}
+	errorsOnly := boolField(cmd, "errorsOnly")
+
+	var up bson.Raw
+	var results []bson.D
+	if len(keep) > 0 {
+		elems, err := cmd.Elements()
+		if err != nil {
+			return nil, false
+		}
+		trimmed := bson.D{}
+		for _, e := range elems {
+			switch e.Key() {
+			case "ops", "cursor":
+				continue
+			}
+			trimmed = append(trimmed, bson.E{Key: e.Key(), Value: e.Value()})
+		}
+		// Every result in the first batch, so each can be put back at its own
+		// position; a later batch would come back by getMore with positions
+		// this would not see.
+		trimmed = append(trimmed, bson.E{Key: "ops", Value: keep},
+			bson.E{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(len(keep) + 1)}}})
+		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+		if err != nil {
+			return nil, false
+		}
+		if werr := wire.Write(c.upstream, fwd); werr != nil {
+			c.upstreamBroke()
+			return nil, false
+		}
+		reply, rerr := wire.Read(c.upstream)
+		if rerr != nil {
+			c.upstreamBroke()
+			out, _ := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: lost the fast tier's reply to the operations of this bulkWrite that did not "+
+					"take an archived key; they may have been applied")
+			return out, true
+		}
+		c.r.noteOpTime(reply)
+		up, err = reply.ReplyDoc()
+		if err != nil || !replyOK(up) {
+			out := reply
+			out.Header.ResponseTo = msg.Header.RequestID
+			return out, true
+		}
+		if id, ok := intOf64(up.Lookup("cursor", "id")); ok && id != 0 {
+			c.log.Warn("a split bulkWrite's results did not fit one batch; positions after it are mongod's",
+				"results", len(keep))
+		}
+		if arr, ok := up.Lookup("cursor", "firstBatch").ArrayOK(); ok {
+			vals, _ := arr.Values()
+			for _, v := range vals {
+				d, dok := v.DocumentOK()
+				if !dok {
+					continue
+				}
+				r := bson.D{}
+				els, _ := d.Elements()
+				for _, el := range els {
+					if el.Key() == "idx" {
+						i, _ := intOf(el.Value())
+						if i >= 0 && i < len(keepAt) {
+							r = append(r, bson.E{Key: "idx", Value: int32(keepAt[i])})
+						}
+						continue
+					}
+					r = append(r, bson.E{Key: el.Key(), Value: el.Value()})
+				}
+				results = append(results, r)
+			}
+		}
+		c.pendingKeys = append(c.pendingKeys, claimed...)
+	}
+
+	nErrors, _ := intOf(up.Lookup("nErrors"))
+	// An ordered batch that failed before the first refusal never reached it.
+	if !(ordered && nErrors > 0) {
+		for i := range ops {
+			idx, bad := refused[i]
+			if !bad {
+				continue
+			}
+			results = append(results, bson.D{
+				{Key: "ok", Value: 0.0},
+				{Key: "idx", Value: int32(i)},
+				{Key: "code", Value: int32(11000)},
+				{Key: "codeName", Value: "DuplicateKey"},
+				{Key: "errmsg", Value: "E11000 duplicate key error collection: " + ops[i].ns + " index: " + idx +
+					" :: thermocline: the existing document with this key is in the archive, where the fast " +
+					"tier's unique index cannot see it"},
+				{Key: "n", Value: int32(0)},
+			})
+			nErrors++
+			if ordered {
+				break
+			}
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool { return resultIdx(results[i]) < resultIdx(results[j]) })
+	batch := bson.A{}
+	for _, r := range results {
+		if errorsOnly && resultOK(r) {
+			continue
+		}
+		batch = append(batch, r)
+	}
+	count := func(k string) int32 {
+		n, _ := intOf(up.Lookup(k))
+		return int32(n)
+	}
+	body := bson.D{
+		{Key: "cursor", Value: bson.D{
+			{Key: "id", Value: int64(0)},
+			{Key: "firstBatch", Value: batch},
+			{Key: "ns", Value: "admin.$cmd.bulkWrite"},
+		}},
+		{Key: "nErrors", Value: int32(nErrors)},
+		{Key: "nInserted", Value: count("nInserted")},
+		{Key: "nMatched", Value: count("nMatched")},
+		{Key: "nModified", Value: count("nModified")},
+		{Key: "nUpserted", Value: count("nUpserted")},
+		{Key: "nDeleted", Value: count("nDeleted")},
+	}
+	if up != nil {
+		els, _ := up.Elements()
+		for _, el := range els {
+			switch el.Key() {
+			case "cursor", "nErrors", "nInserted", "nMatched", "nModified", "nUpserted", "nDeleted", "ok":
+				continue
+			}
+			body = append(body, bson.E{Key: el.Key(), Value: el.Value()})
+		}
+	}
+	body = append(body, bson.E{Key: "ok", Value: 1.0})
+	c.cls = ClassRefused
+	out, err := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, body)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// resultIdx and resultOK read a bulkWrite result built above.
+func resultIdx(r bson.D) int32 {
+	for _, e := range r {
+		if e.Key == "idx" {
+			switch v := e.Value.(type) {
+			case int32:
+				return v
+			case bson.RawValue:
+				n, _ := intOf(v)
+				return int32(n)
+			}
+		}
+	}
+	return -1
+}
+
+func resultOK(r bson.D) bool {
+	for _, e := range r {
+		if e.Key == "ok" {
+			switch v := e.Value.(type) {
+			case float64:
+				return v == 1
+			case bson.RawValue:
+				if f, ok := v.DoubleOK(); ok {
+					return f == 1
+				}
+				n, _ := intOf(v)
+				return n == 1
+			}
+		}
+	}
+	return false
 }
 
 // refuseBulk turns down a whole bulkWrite because one of its operations would

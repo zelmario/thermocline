@@ -492,14 +492,31 @@ cline keys --config $CFG --rebuild >/dev/null 2>&1
 kill $RP 2>/dev/null; wait $RP 2>/dev/null
 startRouter
 chk "rebuild claims the archived key" "11000" "$(R 'try{db.getSiblingDB(process.env.TC_DB).tklate.insertOne({_id:2,email:"late@x.com"});print("ACCEPTED")}catch(e){print(e.code||e.message.substring(0,40))}')"
-# Two statements, the second taking the archived key. Nothing was forwarded,
-# and the reply, ok: 1 with one write error at index 1, said the first had run:
-# a client retrying only the failed statement lost the other.
+# Two statements, one taking the archived key. mongod applies the other and
+# reports the one, at its own index. The router forwarded nothing and said only
+# the clashing one failed, then refused the whole command; now it applies the
+# rest and puts the reply back together.
 R 'db.getSiblingDB(process.env.TC_DB).tklate.insertMany([{_id:3,email:"three@x.com"},{_id:4,email:"four@x.com"}])' >/dev/null
-chk "two statements, one taking an archived key, are refused whole" "REFUSED" \
-    "$(R 'try{const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:"tklate", updates:[{q:{_id:3},u:{$set:{v:1}}},{q:{_id:4},u:{$set:{email:"late@x.com"}}}]}); print(r.ok===0 && /Nothing was applied/.test(r.errmsg) ? "REFUSED" : JSON.stringify(r).substring(0,80))}catch(e){print(/Nothing was applied/.test(e.message)?"REFUSED":e.message.substring(0,60))}')"
-chk "  and the first did not run either" "false" \
-    "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:3}).v===1)')"
+chk "ordered: the first applied, the second refused at 1" "1 1 11000" \
+    "$(R 'const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:"tklate", updates:[{q:{_id:3},u:{$set:{v:1}}},{q:{_id:4},u:{$set:{email:"late@x.com"}}}]}); print(r.n+" "+(r.writeErrors||[{}])[0].index+" "+(r.writeErrors||[{}])[0].code)')"
+chk "  and the first is there"                          "1" \
+    "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:3}).v)')"
+chk "unordered: the one after the clash applied too"    "1 0 11000" \
+    "$(R 'const r=db.getSiblingDB(process.env.TC_DB).runCommand({update:"tklate", ordered:false, updates:[{q:{_id:4},u:{$set:{email:"late@x.com"}}},{q:{_id:3},u:{$set:{v:2}}}]}); print(r.n+" "+(r.writeErrors||[{}])[0].index+" "+(r.writeErrors||[{}])[0].code)')"
+# bulkWrite, the same: refused whole until now.
+BW='const r=db.adminCommand({bulkWrite:1, ordered:ORD, nsInfo:[{ns:process.env.TC_DB+".tklate"}], ops:[
+    {insert:0, document:{_id:5,email:"five@x.com"}},
+    {insert:0, document:{_id:6,email:"late@x.com"}},
+    {insert:0, document:{_id:7,email:"seven@x.com"}}]});
+  const errs=r.cursor.firstBatch.filter(x=>!x.ok);
+  print(r.nInserted+" "+r.nErrors+" "+errs.map(e=>e.idx+":"+e.code).join(","))'
+chk "bulkWrite ordered: the first in, the second refused" "1 1 1:11000" "$(R "${BW//ORD/true}")"
+R 'db.getSiblingDB(process.env.TC_DB).tklate.deleteMany({_id:{$in:[5,6,7]}})' >/dev/null
+chk "bulkWrite unordered: the third in as well"          "2 1 1:11000" "$(R "${BW//ORD/false}")"
+chk "  and they are there"                               "5,7" \
+    "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.find({_id:{$in:[5,6,7]}}).sort({_id:1}).toArray().map(d=>d._id).join(","))')"
+chk "  and it is there"                                 "2 four@x.com" \
+    "$(R 'print(db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:3}).v+" "+db.getSiblingDB(process.env.TC_DB).tklate.findOne({_id:4}).email)')"
 
 echo "== sparse unique index: only the documents it indexes =="
 # A sparse index does not index a document missing the field, so any number of

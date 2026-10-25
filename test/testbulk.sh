@@ -105,14 +105,15 @@ R "db.getSiblingDB(process.env.TC_DB).tbwu.insertOne({_id:1,email:'taken@x.com'}
 waitMirrored tbwu 1
 evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).tbwu.deleteMany({})"
 chk "the owner is in the archive only"                  "0" "$(H "print(db.getSiblingDB(process.env.TC_DB).tbwu.countDocuments({}))")"
-DUP=$(R "
+# mongod answers a bulkWrite holding a duplicate with ok: 1 and the error in
+# that operation's result, and inserts nothing for it.
+BWDUP="
   try {
-    db.adminCommand({bulkWrite:1,
-      ops:[{insert:0, document:{_id:2, email:'taken@x.com'}}],
-      nsInfo:[{ns:process.env.TC_DB+'.tbwu'}]});
-    print('ACCEPTED');
-  } catch(e) { print(e.code===11000?'11000':('other:'+(e.code||e.message.substring(0,40)))); }")
-chk "the duplicate is refused"                          "11000" "$DUP"
+    const r=db.adminCommand({bulkWrite:1, ops:[OPS], nsInfo:[{ns:process.env.TC_DB+'.NSX'}]});
+    print(r.nInserted+' '+r.nErrors+' '+(r.cursor.firstBatch.find(x=>!x.ok)||{}).code);
+  } catch(e) { print('other:'+(e.code||e.message.substring(0,40))); }"
+DUP=$(R "$(sed "s/OPS/{insert:0, document:{_id:2, email:'taken@x.com'}}/; s/NSX/tbwu/" <<<"$BWDUP")")
+chk "the duplicate is refused"                          "0 1 11000" "$DUP"
 LH=$(H "print(db.getSiblingDB(process.env.TC_DB).tbwu.countDocuments({email:'taken@x.com'}))")
 LC=$(C "print(db.getSiblingDB(process.env.TC_DB).tbwu.countDocuments({email:'taken@x.com',_tcDeletedAt:{\$exists:false}}))")
 chk "one live holder of the key across both tiers"      "1" "$((LH + LC))"
@@ -134,14 +135,8 @@ C "db.getSiblingDB(process.env.TC_DB).$IDNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$IDNS.insertOne({_id:500, v:'archived, precious', tier:'gold'})" >/dev/null
 chk "the archive holds it and the fast tier does not"   "1/0" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$IDNS.countDocuments({}))")/$(H "print(db.getSiblingDB(process.env.TC_DB).$IDNS.countDocuments({}))")"
-BID=$(R "
-  try {
-    db.adminCommand({bulkWrite:1,
-      ops:[{insert:0, document:{_id:500, v:'clobber via bulkWrite'}}],
-      nsInfo:[{ns:process.env.TC_DB+'.$IDNS'}]});
-    print('ACCEPTED');
-  } catch(e) { print(e.code===11000?'11000':('other:'+(e.code||e.message.substring(0,40)))); }")
-chk "the bulkWrite is refused as a duplicate"           "11000" "$BID"
+BID=$(R "$(sed "s/OPS/{insert:0, document:{_id:500, v:'clobber via bulkWrite'}}/; s/NSX/$IDNS/" <<<"$BWDUP")")
+chk "the bulkWrite is refused as a duplicate"           "0 1 11000" "$BID"
 sleep 6
 chk "and the archived document is untouched"            "archived, precious/gold" \
     "$(C "const d=db.getSiblingDB(process.env.TC_DB).$IDNS.findOne({_id:500}); print(d?d.v+'/'+d.tier:'MISSING')")"
