@@ -734,3 +734,26 @@ func TestArchiveWaitZeroNeedsPermissive(t *testing.T) {
 		t.Error("a negative archive_wait was accepted")
 	}
 }
+
+// The router's raw connection to the fast tier is wrapped from what hot.uri
+// says, and it has to read it the way the driver does: mongodb+srv turns TLS on
+// unless told otherwise, and a client certificate and a name check that is
+// switched off are both options the driver honours.
+func TestTLSFromURIReadsWhatTheDriverReads(t *testing.T) {
+	srv, err := tlsFromURI("mongodb+srv://u:p@cluster.example.net/")
+	if err != nil || !srv.enabled {
+		t.Errorf("mongodb+srv read as TLS %v (%v), want on", srv.enabled, err)
+	}
+	off, _ := tlsFromURI("mongodb+srv://u:p@cluster.example.net/?tls=false")
+	if off.enabled {
+		t.Error("mongodb+srv with tls=false read as TLS on")
+	}
+	full, err := tlsFromURI("mongodb://h:27017/?tls=true&tlsCertificateKeyFile=/etc/client.pem&tlsAllowInvalidHostnames=true&tlsCAFile=/etc/ca.pem")
+	if err != nil || !full.enabled || full.certKeyFile != "/etc/client.pem" || !full.allowInvalidHostnames ||
+		full.caFile != "/etc/ca.pem" || full.insecure {
+		t.Errorf("read %+v (%v)", full, err)
+	}
+	if _, err := tlsFromURI("mongodb://h:27017/?tls=true&tlsCertificateKeyFile=/k.pem&tlsCertificateKeyFilePassword=x"); err == nil {
+		t.Error("a key file password, which the raw connection cannot use, was accepted")
+	}
+}

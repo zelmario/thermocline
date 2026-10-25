@@ -246,6 +246,15 @@ type RouterConfig struct {
 	// HotTLSCAFile is the authority the fast tier's certificate is checked
 	// against, from tlsCAFile in hot.uri.
 	HotTLSCAFile string `yaml:"-"`
+	// HotTLSCertKeyFile is the client certificate and key the router presents
+	// to the fast tier, from tlsCertificateKeyFile, and
+	// HotTLSAllowInvalidHostnames skips only the name check, from
+	// tlsAllowInvalidHostnames. The driver honours both for its own
+	// connections, and the raw one sent no certificate and checked the name,
+	// so every client through the router failed against a deployment that
+	// requires either.
+	HotTLSCertKeyFile           string `yaml:"-"`
+	HotTLSAllowInvalidHostnames bool   `yaml:"-"`
 	// ServiceUser, ServicePass and ServiceAuthDB are the router's own
 	// credentials, copied from hot.uri at load time rather than configured
 	// twice. They are only used when TerminateAuth is on.
@@ -616,7 +625,12 @@ func Load(path string) (Config, error) {
 	// upstream connection is the router's rather than the client's, so the
 	// router has to authenticate it itself.
 	cfg.Router.ServiceUser, cfg.Router.ServicePass, cfg.Router.ServiceAuthDB = credentialsFromURI(cfg.Hot.URI)
-	cfg.Router.HotTLS, cfg.Router.HotTLSInsecure, cfg.Router.HotTLSCAFile = tlsFromURI(cfg.Hot.URI)
+	ut, terr := tlsFromURI(cfg.Hot.URI)
+	if terr != nil {
+		return cfg, terr
+	}
+	cfg.Router.HotTLS, cfg.Router.HotTLSInsecure, cfg.Router.HotTLSCAFile = ut.enabled, ut.insecure, ut.caFile
+	cfg.Router.HotTLSCertKeyFile, cfg.Router.HotTLSAllowInvalidHostnames = ut.certKeyFile, ut.allowInvalidHostnames
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -1227,27 +1241,52 @@ func (t TLSConfig) Enabled() bool { return t.Cert != "" || t.Key != "" }
 // afterwards, so it is read here for the raw connection the router opens
 // itself. Both spellings, because tls and ssl are the same option and drivers
 // have accepted either for years.
-func tlsFromURI(uri string) (enabled, insecure bool, caFile string) {
+// uriTLS is what a connection string says about TLS, read the way the driver
+// reads it.
+type uriTLS struct {
+	enabled, insecure, allowInvalidHostnames bool
+	caFile, certKeyFile                      string
+}
+
+func tlsFromURI(uri string) (uriTLS, error) {
+	var out uriTLS
 	u, err := url.Parse(uri)
 	if err != nil {
-		return false, false, ""
+		return out, nil
 	}
 	q := u.Query()
-	yes := func(keys ...string) bool {
+	// The option as written, and whether it was written at all: mongodb+srv
+	// turns TLS on unless the string turns it off, which a plain "is it
+	// true" read as off.
+	flag := func(keys ...string) (bool, bool) {
 		for _, k := range keys {
 			if v := q.Get(k); v != "" {
-				return strings.EqualFold(v, "true")
+				return strings.EqualFold(v, "true"), true
 			}
 		}
-		return false
+		return false, false
 	}
-	enabled = yes("tls", "ssl")
-	insecure = yes("tlsInsecure", "tlsAllowInvalidCertificates", "sslInsecure")
-	caFile = q.Get("tlsCAFile")
-	if caFile == "" {
-		caFile = q.Get("sslCAFile")
+	enabled, said := flag("tls", "ssl")
+	if !said && u.Scheme == "mongodb+srv" {
+		enabled = true
 	}
-	return enabled, insecure, caFile
+	out.enabled = enabled
+	out.insecure, _ = flag("tlsInsecure", "tlsAllowInvalidCertificates", "sslInsecure")
+	out.allowInvalidHostnames, _ = flag("tlsAllowInvalidHostnames", "sslAllowInvalidHostnames")
+	out.caFile = q.Get("tlsCAFile")
+	if out.caFile == "" {
+		out.caFile = q.Get("sslCAFile")
+	}
+	out.certKeyFile = q.Get("tlsCertificateKeyFile")
+	if out.certKeyFile == "" {
+		out.certKeyFile = q.Get("sslPEMKeyFile")
+	}
+	if q.Get("tlsCertificateKeyFilePassword") != "" || q.Get("sslPEMKeyPassword") != "" {
+		return out, errors.New("hot.uri: tlsCertificateKeyFilePassword is not supported by the router's own " +
+			"connection to the fast tier, which would then present no certificate; give it a key file " +
+			"without a password")
+	}
+	return out, nil
 }
 
 func credentialsFromURI(uri string) (user, pass, authDB string) {

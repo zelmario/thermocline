@@ -102,6 +102,32 @@ func (r *Router) upstreamTLS(conn net.Conn, addr string) (net.Conn, error) {
 		}
 		tc.RootCAs = pool
 	}
+	if r.cfg.HotTLSCertKeyFile != "" {
+		// One PEM file holding both, which is how mongod and the driver take it.
+		cert, err := tls.LoadX509KeyPair(r.cfg.HotTLSCertKeyFile, r.cfg.HotTLSCertKeyFile)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("read the client certificate %s: %w", r.cfg.HotTLSCertKeyFile, err)
+		}
+		tc.Certificates = []tls.Certificate{cert}
+	}
+	if r.cfg.HotTLSAllowInvalidHostnames && !r.cfg.HotTLSInsecure {
+		// The chain is still checked; only the name is not. crypto/tls has no
+		// switch for that alone, so verification is done here instead.
+		roots := tc.RootCAs
+		tc.InsecureSkipVerify = true //nolint:gosec // the chain is verified below
+		tc.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("the fast tier presented no certificate")
+			}
+			inter := x509.NewCertPool()
+			for _, c := range cs.PeerCertificates[1:] {
+				inter.AddCert(c)
+			}
+			_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter})
+			return err
+		}
+	}
 	out := tls.Client(conn, tc)
 	if err := out.Handshake(); err != nil {
 		_ = conn.Close()

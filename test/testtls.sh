@@ -29,7 +29,7 @@ chk() {
 }
 cleanup() {
   pkill -9 -f "cline.*$DIR" 2>/dev/null
-  mongosh --tls --tlsCAFile "$DIR/ca.pem" --quiet --port $HOTPORT --eval 'db.getSiblingDB("admin").shutdownServer()' >/dev/null 2>&1
+  mongosh --tls --tlsCAFile "$DIR/ca.pem" --tlsCertificateKeyFile "$DIR/srv-combined.pem" --quiet --port $HOTPORT --eval 'db.getSiblingDB("admin").shutdownServer()' >/dev/null 2>&1
   mongosh --quiet --port $COLDPORT --eval 'db.getSiblingDB("admin").shutdownServer()' >/dev/null 2>&1
   sleep 1
   rm -rf "$DIR"
@@ -127,6 +127,31 @@ chk "and it landed on the fast tier"      "written" \
 echo "== and a plaintext client is not answered =="
 chk "plaintext gets no answer"            "true" \
     "$(timeout 20 mongosh "mongodb://127.0.0.1:$PORT/?directConnection=true" --quiet --eval 'print("connected")' >/dev/null 2>&1 && echo false || echo true)"
+
+echo "== a fast tier that requires a client certificate =="
+# The driver presents tlsCertificateKeyFile from hot.uri on its own
+# connections; the router's raw one presented nothing, so against a fast tier
+# that requires a certificate every client through the router failed.
+pkill -f "router --config $DIR/cline.yaml" 2>/dev/null
+mongosh --tls --tlsCAFile "$DIR/ca.pem" --quiet --port $HOTPORT --eval 'db.getSiblingDB("admin").shutdownServer({force:true})' >/dev/null 2>&1
+sleep 3
+mongod --replSet tlshot --port $HOTPORT --dbpath "$DIR/hot" --bind_ip 127.0.0.1 --fork \
+  --logpath "$DIR/hot2.log" --wiredTigerCacheSizeGB 0.25 --tlsMode requireTLS \
+  --tlsCertificateKeyFile "$DIR/srv-combined.pem" --tlsCAFile "$DIR/ca.pem" >/dev/null 2>&1
+sleep 6
+chk "it refuses a client with no certificate" "true" \
+    "$(timeout 20 mongosh --tls --tlsCAFile "$DIR/ca.pem" --quiet --port $HOTPORT --eval 'print(db.hello().ok)' >/dev/null 2>&1 && echo false || echo true)"
+sed "s#tls=true&tlsCAFile=$DIR/ca.pem#tls=true\&tlsCAFile=$DIR/ca.pem\&tlsCertificateKeyFile=$DIR/srv-combined.pem#" \
+  "$DIR/cline.yaml" > "$DIR/cline-cert.yaml"
+rm -f "$DIR/router2.log"
+$BIN router --config "$DIR/cline-cert.yaml" --log-file "$DIR/router2.log" >/dev/null 2>&1 &
+for _ in $(seq 1 30); do
+  grep -q 'router listening' "$DIR/router2.log" 2>/dev/null && break
+  sleep 1
+done
+chk "a read through the router presents the certificate" "4" \
+    "$(mongosh "$TLSURI" --quiet --eval 'print(db.getSiblingDB("probe").tiered.countDocuments({_id:{$lte:4}}))' 2>&1 | tail -1)"
+pkill -f "router --config $DIR/cline-cert.yaml" 2>/dev/null
 
 echo
 echo "================================"
