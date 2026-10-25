@@ -95,14 +95,14 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 
 	var n int
 	if fromArchive {
-		n, err = c.streamFromArchive(ctx, db, coll, read, docField(cmd, "collation"), sink.write)
+		n, err = c.streamFromArchive(ctx, db, coll, read, docField(cmd, "collation"), letOf(cmd), sink.write)
 	} else {
 		aggVal, verr := cmd.LookupErr("aggregate")
 		if verr != nil {
 			sink.abandon(ctx)
 			return c.writePipelineError(msg, s, "reading the aggregate target failed", false, verr)
 		}
-		n, err = c.streamFromFastTier(ctx, db, aggVal, read, sink.write)
+		n, err = c.streamFromFastTier(ctx, db, aggVal, read, cmd, sink.write)
 	}
 	if err != nil {
 		sink.abandon(ctx)
@@ -585,7 +585,8 @@ func splitColl(ns string) string { _, coll := splitNS(ns); return coll }
 
 // streamFromArchive runs the reading part of a pipeline against the archive and
 // hands its output to sink in batches.
-func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bson.Raw, collation bson.Raw, sink func(context.Context, []any) error) (int, error) {
+func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bson.Raw, collation, let bson.Raw,
+	sink func(context.Context, []any) error) (int, error) {
 	// Tombstoned documents are records the application deleted. Excluding them
 	// first means the pipeline sees the same collection the fast tier would
 	// have shown it.
@@ -617,6 +618,12 @@ func (c *conn) streamFromArchive(ctx context.Context, db, coll string, read []bs
 	// out of here is not an answer a client can ask again, it is written into
 	// the collection $out or $merge names.
 	aopts := options.Aggregate()
+	// The command's variables, which a stage may name. Without them a $match
+	// on $$x was refused by the archive, and the $out failed on a pipeline the
+	// client wrote correctly.
+	if len(let) > 0 {
+		aopts.SetLet(let)
+	}
 	if ec, ok := c.r.askingCollation(ctx, db+"."+coll, collation); ok {
 		if col := collationFromSpec(ec); col != nil {
 			aopts.SetCollation(col)
@@ -705,8 +712,13 @@ func outTarget(stage bson.Raw, db string) (string, string, bool) {
 // It takes the aggregate target as the client wrote it, because a pipeline
 // beginning with $documents names no collection: its target is the number 1, and
 // asking for a collection called "1" is not the same command.
+//
+// With the options of the client's own command that decide what the pipeline
+// reads. Built with only the pipeline, a tiered $out under {locale: "en",
+// strength: 2} matched "alice" and not "ALICE", writing a different result
+// from mongod's, and a stage naming a let variable failed.
 func (c *conn) streamFromFastTier(ctx context.Context, db string, aggVal bson.RawValue, read []bson.Raw,
-	sink func(context.Context, []any) error) (int, error) {
+	cmd bson.Raw, sink func(context.Context, []any) error) (int, error) {
 	pipeline := bson.A{}
 	for _, st := range read {
 		pipeline = append(pipeline, st)
@@ -716,11 +728,17 @@ func (c *conn) streamFromFastTier(ctx context.Context, db string, aggVal bson.Ra
 	if err := aggVal.Unmarshal(&target); err != nil {
 		return 0, fmt.Errorf("read the aggregate target: %w", err)
 	}
-	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, bson.D{
+	run := bson.D{
 		{Key: "aggregate", Value: target},
 		{Key: "pipeline", Value: pipeline},
 		{Key: "cursor", Value: bson.D{}},
-	})
+	}
+	for _, k := range []string{"collation", "let", "hint", "allowDiskUse"} {
+		if v, err := cmd.LookupErr(k); err == nil {
+			run = append(run, bson.E{Key: k, Value: v})
+		}
+	}
+	cur, err := c.r.hot.Database(db).RunCommandCursor(ctx, run)
 	if err != nil {
 		return 0, err
 	}

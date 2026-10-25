@@ -387,7 +387,7 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 			}
 			readRaw = append(readRaw, raw)
 		}
-		_, serr := c.streamFromArchive(ctx, db, coll, readRaw, docField(cmd, "collation"),
+		_, serr := c.streamFromArchive(ctx, db, coll, readRaw, docField(cmd, "collation"), letOf(cmd),
 			func(_ context.Context, batch []any) error {
 				for _, d := range batch {
 					if raw, ok := d.(bson.Raw); ok {

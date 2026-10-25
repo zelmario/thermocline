@@ -354,6 +354,21 @@ chk "and through \$unionWith"                          "refused" \
 chk "while one that joins nothing tiered is answered"  "1" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{k:'x'}]}]).toArray().length)")"
 
+echo "== a tiered \$out keeps the command's collation and let =="
+# A $out into a tiered target is performed here, and when the fast tier can
+# answer its input the pipeline was rerun with nothing but its stages: under
+# {locale: "en", strength: 2} it matched "alice" and not "ALICE", and a stage
+# naming a let variable failed.
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop(); db.getSiblingDB(process.env.TC_DB).toutsrc.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).toutsrc.insertMany([{_id:1,name:'alice'},{_id:2,name:'ALICE'},{_id:3,name:'bob'}])" >/dev/null
+chk "under the command's collation, both spellings"    "2" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).toutsrc.aggregate([{\$match:{name:'alice'}},{\$out:'rollup'}],{collation:{locale:'en',strength:2}}).toArray(); print(db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({}))")"
+chk "with a let variable, the one it names"           "3" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({aggregate:'toutsrc', pipeline:[{\$match:{\$expr:{\$eq:['\$name','\$\$who']}}},{\$out:'rollup'}], cursor:{}, let:{who:'bob'}}); print(db.getSiblingDB(process.env.TC_DB).rollup.findOne({}, {_id:1})._id) } catch(e) { print(e.message.substring(0,60)) }")"
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop(); db.getSiblingDB(process.env.TC_DB).toutsrc.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+
 echo "== \$out into a tiered target whose result mongod would refuse =="
 # fill clears both tiers before it writes the result, and the result used to be
 # built in a collection with none of the target's unique indexes or validator.
