@@ -50,7 +50,11 @@ R() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval "$1" 2>&1 | tail -1; 
 routerUp() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 H() { docker exec "$NODE" mongosh "$HOT" --quiet --eval "$1" 2>&1 | tail -1; }
 C() { docker exec "$NODE" mongosh "$COLD" --quiet --eval "$1" 2>&1 | tail -1; }
-stopAll() { N "for p in \$(pgrep -f 'config /root/tw[o]'); do kill -9 \$p 2>/dev/null; done" >/dev/null 2>&1; rm -f "$TMPJS"; }
+# Stopped the way an operator stops them, so the feeder releases its lease on
+# the way out: after a kill -9 the lease stays held for 30s and rollback --clear
+# refuses beside a feeder that may still be writing, which is right for a crash
+# and not what this suite is about.
+stopAll() { N "pkill -TERM -f 'config /root/tw[o]'; for i in \$(seq 50); do pgrep -f 'config /root/tw[o]' >/dev/null || break; sleep 0.2; done; pkill -9 -f 'config /root/tw[o]'" >/dev/null 2>&1; rm -f "$TMPJS"; }
 trap stopAll EXIT
 
 echo "== a shop running on the tiers =="

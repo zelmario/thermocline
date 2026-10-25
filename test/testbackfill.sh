@@ -27,6 +27,15 @@ chk() {
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  PASS  %-52s %s\n' "$1" "$3"
   else FAIL=$((FAIL+1)); FAILED+=("$1"); printf '  FAIL  %-52s got=%.80s want=%s\n' "$1" "$3" "$2"; fi
 }
+# stopCline stops the daemons the way an operator does, so each releases its
+# lease on the way out. A kill -9 leaves the lease held for lease.Stale, 30s,
+# and rollback and backfill refuse beside a feeder that may still be writing.
+# Only the sections that mean a crash kill with -9.
+stopCline() {
+  pkill -TERM -f "$1" 2>/dev/null
+  for _ in $(seq 50); do pgrep -f "$1" >/dev/null || return 0; sleep 0.2; done
+  pkill -9 -f "$1" 2>/dev/null
+}
 cleanup() {
   pkill -9 -f "cline.*$DIR" 2>/dev/null
   docker rm -f tc-bf-hot tc-bf-cold >/dev/null 2>&1
@@ -89,7 +98,7 @@ for _ in $(seq 1 30); do
 done
 chk "ten documents are mirrored"                      "10" \
     "$(M $COLDPORT 'print(db.getSiblingDB("shop").orders.countDocuments({}))')"
-pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+stopCline "cline.*$DIR"
 
 echo "== the window where nothing was mirroring =="
 M $HOTPORT 'const c=db.getSiblingDB("shop").orders;
@@ -220,7 +229,7 @@ RNS=trestore
 # goes to the old one, which does not tier this namespace. That is what the first
 # run of this section measured, and it reported the archive holding nought and
 # the client reading all fifteen as though nothing were wrong.
-pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+stopCline "cline.*$DIR"
 M $HOTPORT "db.getSiblingDB('shop').$RNS.drop()" >/dev/null
 M $COLDPORT "db.getSiblingDB('shop').$RNS.drop()" >/dev/null
 sed 's|    - "shop.orders"|    - "shop.orders"\n    - "shop.'"$RNS"'"|' "$DIR/bf.yaml" > "$DIR/bf3.yaml"
@@ -261,7 +270,7 @@ echo "== a feeder restarted without the namespace its checkpoint names =="
 # made while it was down never mirrored. It now resumes from that event's
 # cluster time.
 DNS=tresdel
-pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+stopCline "cline.*$DIR"
 M $HOTPORT "db.getSiblingDB('shop').$DNS.drop()" >/dev/null
 M $COLDPORT "db.getSiblingDB('shop').$DNS.drop()" >/dev/null
 M $HOTPORT "db.getSiblingDB('shop').$DNS.insertOne({_id:1,v:'written while no feeder ran'})" >/dev/null
@@ -390,7 +399,7 @@ chk "it refuses while a feeder is still publishing"   "true" \
     "$(grep -q 'still publishing' <<<"$ALIVE" && echo true || echo false)"
 chk "and says how to get the marking done"             "true" \
     "$(grep -q 'Stop it, or --force, to mark them' <<<"$ALIVE" && echo true || echo false)"
-pkill -9 -f "cline.*$DIR" 2>/dev/null
+stopCline "cline.*$DIR"
 
 echo "== the other thing this is for: tiering a collection that already has data =="
 # Adding a collection to feeder.namespaces is an ordinary operation and it hides
@@ -413,7 +422,7 @@ M $HOTPORT 'const c=db.getSiblingDB("shop").invoices;
   for (let i=1;i<=20;i++) c.insertOne({_id:i,v:"existing",at:new Date()});' >/dev/null
 "$BIN" feeder --config "$DIR/bf.yaml" --log-file "$DIR/f3b.log" >/dev/null 2>&1 & disown
 sleep 6
-pkill -9 -f "cline.*$DIR/bf.yaml" 2>/dev/null; sleep 1
+stopCline "cline.*$DIR/bf.yaml"
 sed 's|    - "shop.orders"|    - "shop.orders"\n    - "shop.invoices"|' "$DIR/bf.yaml" > "$DIR/bf2.yaml"
 "$BIN" feeder --config "$DIR/bf2.yaml" --log-file "$DIR/f4.log" >/dev/null 2>&1 & disown
 "$BIN" router --config "$DIR/bf2.yaml" --log-file "$DIR/r2.log" >/dev/null 2>&1 & disown
@@ -456,7 +465,7 @@ echo "== a document the archive will not take, met by the copy =="
 # the archive filled itself: the check on what the archive holds passed while
 # backfill was failing to run at all, which is a check passing for a reason that
 # has nothing to do with it.
-pkill -9 -f "cline.*$DIR" 2>/dev/null; sleep 1
+stopCline "cline.*$DIR"
 M $COLDPORT "db.getSiblingDB('shop').bfrefused.drop();
              db.getSiblingDB('shop').bfrefused.createIndex({sku:1},{unique:true});
              db.getSiblingDB('shop').bfrefused.insertOne({_id:9,sku:'DUP',v:'already here'})" >/dev/null
@@ -493,7 +502,7 @@ chk "an ordinary namespace copies and says so"         "2" \
 chk "and says nothing about documents left behind"     "false" \
     "$(echo "$BFOK" | grep -q 'still short by them' && echo true || echo false)"
 
-pkill -9 -f "cline.*$DIR" 2>/dev/null
+stopCline "cline.*$DIR"
 
 echo
 echo "================================"
