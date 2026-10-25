@@ -1262,7 +1262,7 @@ func uniqueIndexNames(ctx context.Context, client *mongo.Client, db, coll string
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	out := map[string]string{}
 	for cur.Next(ctx) {
-		if unique, ok := cur.Current.Lookup("unique").BooleanOK(); !ok || !unique {
+		if !safeBool(cur.Current.Lookup("unique")) {
 			continue
 		}
 		name, ok := cur.Current.Lookup("name").StringValueOK()

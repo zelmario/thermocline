@@ -82,7 +82,7 @@ func (r *Router) notYetUnique(ctx context.Context, ns string, idxs []uniqueIndex
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	have := map[string]bool{}
 	for cur.Next(ctx) {
-		if u, _ := cur.Current.Lookup("unique").BooleanOK(); !u {
+		if !safeBool(cur.Current.Lookup("unique")) {
 			continue
 		}
 		if name, ok := cur.Current.Lookup("name").StringValueOK(); ok {

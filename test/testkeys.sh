@@ -1673,6 +1673,12 @@ chk "createIndexes of the index it already has is a no-op" "ACCEPTED" \
     "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1',unique:true}]});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
 chk "  and its claims are left where they were"      "2" \
     "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
+# The collMod twin: turning unique an index that already is was walked too,
+# and the same refusal gave the same claims back.
+chk "collMod making it unique again is a no-op too"   "ACCEPTED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "  and its claims are still left where they were" "2" \
+    "$(H "print(db.getSiblingDB(process.env.TC_META).keys.countDocuments({ns:process.env.TC_DB+'.$MNS'}))")"
 C "db.getSiblingDB(process.env.TC_DB).$MNS.deleteOne({_id:9})" >/dev/null
 chk "a collMod that touches no index still works"    "ACCEPTED" \
     "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',validationLevel:'off'});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")"

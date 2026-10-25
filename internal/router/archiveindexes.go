@@ -98,9 +98,7 @@ func listIndexFields(ctx context.Context, c *mongo.Client, db, coll string) ([]n
 		if v, ok := cur.Current.Lookup("name").StringValueOK(); ok {
 			idx.name = v
 		}
-		if v, ok := cur.Current.Lookup("unique").BooleanOK(); ok {
-			idx.unique = v
-		}
+		idx.unique = safeBool(cur.Current.Lookup("unique"))
 		if _, err := cur.Current.LookupErr("expireAfterSeconds"); err == nil {
 			idx.ttl = true
 		}

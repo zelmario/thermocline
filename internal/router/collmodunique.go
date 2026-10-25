@@ -53,7 +53,15 @@ func (c *conn) guardCollModUnique(ctx context.Context, msg *wire.Message, cmd bs
 		// changes nothing for it to protect.
 		return nil, false
 	}
-	return c.claimForUniqueIndex(ctx, msg, ns, []uniqueIndex{idx})
+	// An index that is unique already changes nothing, and walking it is
+	// what createIndexes did before notYetUnique: a walk refused over a
+	// duplicate the two tiers hold gave back every claim filed under the
+	// index's name, the live index's included.
+	idxs := c.r.notYetUnique(ctx, ns, []uniqueIndex{idx})
+	if len(idxs) == 0 {
+		return nil, false
+	}
+	return c.claimForUniqueIndex(ctx, msg, ns, idxs)
 }
 
 // collModAsksUnique reports whether this collMod turns an index unique, and
