@@ -1559,6 +1559,17 @@ chk "and the collection never took a mark"             "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
 chk "and the archive did not either"                   "0" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$RNS.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+# A pipeline that builds the document from its own data. A nested field of the
+# reserved name is allowed, and $mergeObjects with "$payload" lifts it to the
+# top, which no literal in the command shows. A check appended to the pipeline
+# fails the statement on the built document instead.
+R "db.getSiblingDB(process.env.TC_DB).$RNS.insertMany([{_id:200, payload:{_tcDeletedAt:new Date()}}, {_id:201, payload:{x:1}}])" >/dev/null
+chk "a pipeline lifting a nested mark is refused"      "REFUSED" \
+    "$(R "try{db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:200},[{\$replaceWith:{\$mergeObjects:['\$\$ROOT','\$payload']}}]);print('ACCEPTED')}catch(e){print(/thermocline: refusing this update/.test(e.message)?'REFUSED':e.message.substring(0,60))}")"
+chk "  and the document keeps it nested only"          "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:200}).hasOwnProperty('_tcDeletedAt'))")"
+chk "  while the same pipeline on other data runs"     "1" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).$RNS.updateOne({_id:201},[{\$replaceWith:{\$mergeObjects:['\$\$ROOT','\$payload']}}]); print(db.getSiblingDB(process.env.TC_DB).$RNS.findOne({_id:201}).x)")"
 kill $RFP 2>/dev/null; wait $RFP 2>/dev/null
 H "db.getSiblingDB(process.env.TC_DB).$RNS.drop(); db.getSiblingDB(process.env.TC_DB2).tkfree.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$RNS.drop()" >/dev/null

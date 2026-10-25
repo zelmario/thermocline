@@ -304,3 +304,20 @@ func (m *Message) ClearExhaustAllowed() *Message {
 	out.Raw = raw
 	return &out
 }
+
+// WithMoreToCome returns the message with the moreToCome bit set, for a
+// command this proxy rebuilt from one the client sent unacknowledged. NewMsg
+// writes no flags, and a rebuilt fire-and-forget write sent without the bit is
+// answered, which leaves the connection a reply out of step.
+func (m *Message) WithMoreToCome() *Message {
+	if m.Header.OpCode != OpMsg || len(m.Raw) < HeaderLen+4 {
+		return m
+	}
+	raw := make([]byte, len(m.Raw))
+	copy(raw, m.Raw)
+	flags := binary.LittleEndian.Uint32(raw[HeaderLen : HeaderLen+4])
+	binary.LittleEndian.PutUint32(raw[HeaderLen:HeaderLen+4], flags|flagMoreToCome)
+	out := *m
+	out.Raw = raw
+	return &out
+}

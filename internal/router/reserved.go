@@ -445,6 +445,7 @@ func (c *conn) guardReservedField(msg *wire.Message, db, name string) (*wire.Mes
 		}
 	}
 	if field == "" {
+		c.guardReplacedRoots(msg, cmd, name)
 		return nil, false
 	}
 
@@ -467,4 +468,130 @@ func (c *conn) guardReservedField(msg *wire.Message, db, name string) (*wire.Mes
 		return nil, false
 	}
 	return out, true
+}
+
+// guardReplacedRoots appends a check to every pipeline update that replaces the
+// document, so the statement fails rather than leave a reserved field at the top
+// level.
+//
+// reservedInNewRoot reads what a replacing stage writes where it is spelled out.
+// A field path or another expression builds the keys from the document itself:
+// [{$replaceWith: {$mergeObjects: ["$$ROOT", "$payload"]}}] lifts a nested
+// payload._tcDeletedAt, which an insert is allowed to carry, to the top, and the
+// document then reads as deleted in the archive. Refusing every such pipeline
+// would refuse most that legitimately write a document, so the check runs where
+// the document is known: after the client's own stages, a document carrying
+// neither field is passed on unchanged, and one carrying either fails the
+// statement with an error naming the field. No write this system accepts leaves
+// either at the top level of a fast tier document, so nothing else is touched.
+func (c *conn) guardReplacedRoots(msg *wire.Message, cmd bson.Raw, name string) {
+	guard := bson.D{{Key: "$replaceWith", Value: bson.D{{Key: "$cond", Value: bson.D{
+		{Key: "if", Value: bson.D{{Key: "$and", Value: bson.A{
+			bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$" + meta.TombstoneField}}, "missing"}}},
+			bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$" + meta.BodyDroppedField}}, "missing"}}},
+		}}}},
+		{Key: "then", Value: "$$ROOT"},
+		{Key: "else", Value: bson.D{{Key: "$toDate", Value: "thermocline: refusing this update because the " +
+			"document it builds carries " + meta.TombstoneField + " or " + meta.BodyDroppedField + " at the top " +
+			"level, which this system marks archived documents with; rename the field"}}},
+	}}}}}
+	replaces := func(v bson.RawValue) bool {
+		arr, ok := v.ArrayOK()
+		if !ok {
+			return false
+		}
+		vals, _ := arr.Values()
+		for _, st := range vals {
+			d, dok := st.DocumentOK()
+			if !dok {
+				continue
+			}
+			for _, k := range []string{"$replaceWith", "$replaceRoot"} {
+				if _, err := d.LookupErr(k); err == nil {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	guarded := func(v bson.RawValue) bson.A {
+		arr, _ := v.ArrayOK()
+		vals, _ := arr.Values()
+		out := make(bson.A, 0, len(vals)+1)
+		for _, st := range vals {
+			out = append(out, st)
+		}
+		return append(out, guard)
+	}
+
+	var rewritten bson.D
+	switch name {
+	case "update":
+		stmts := msg.AllOf("updates")
+		any := false
+		for _, st := range stmts {
+			if replaces(st.Lookup("u")) {
+				any = true
+				break
+			}
+		}
+		if !any {
+			return
+		}
+		keep := make([]bson.Raw, 0, len(stmts))
+		for _, st := range stmts {
+			u := st.Lookup("u")
+			if !replaces(u) {
+				keep = append(keep, st)
+				continue
+			}
+			elems, err := st.Elements()
+			if err != nil {
+				return
+			}
+			d := bson.D{}
+			for _, e := range elems {
+				if e.Key() == "u" {
+					d = append(d, bson.E{Key: "u", Value: guarded(u)})
+					continue
+				}
+				d = append(d, bson.E{Key: e.Key(), Value: e.Value()})
+			}
+			raw, err := bson.Marshal(d)
+			if err != nil {
+				return
+			}
+			keep = append(keep, raw)
+		}
+		var err error
+		if rewritten, err = rebuildStatements(cmd, "updates", keep); err != nil {
+			return
+		}
+	case "findAndModify", "findandmodify":
+		u := cmd.Lookup("update")
+		if !replaces(u) {
+			return
+		}
+		elems, err := cmd.Elements()
+		if err != nil {
+			return
+		}
+		for _, e := range elems {
+			if e.Key() == "update" {
+				rewritten = append(rewritten, bson.E{Key: "update", Value: guarded(u)})
+				continue
+			}
+			rewritten = append(rewritten, bson.E{Key: e.Key(), Value: e.Value()})
+		}
+	default:
+		return
+	}
+	out, err := wire.NewMsg(msg.Header.RequestID, 0, rewritten)
+	if err != nil {
+		return
+	}
+	if msg.MoreToCome() {
+		out = out.WithMoreToCome()
+	}
+	c.sendInstead = out
 }

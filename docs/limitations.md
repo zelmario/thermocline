@@ -336,17 +336,18 @@ Part of [Thermocline](../README.md).
   batch until the field is renamed, and a partial success would let a bulk load
   report progress while quietly dropping the same document every time.
 
-  **A pipeline update that builds the new document from data is not read.**
-  `$replaceWith`, `$replaceRoot` and `$mergeObjects` are read where their
-  arguments are literal documents, `$literal` or `$setField`, which is how a
-  pipeline names the fields it writes. A field path or another expression
-  builds its keys from the document itself, so `[{$replaceWith: {$mergeObjects:
-  ["$$ROOT", "$payload"]}}]` lifts a nested `payload._tcDeletedAt`, which an
-  insert is allowed to carry, to the top level, and the document then reads as
-  deleted in the archive. Refusing every expression that can evaluate to a
-  document would refuse most pipelines that legitimately write one. The
-  feeder's warning names the collection when it mirrors such a document, and
-  `cline preflight` counts them.
+  **A pipeline update that builds the new document from data is checked on
+  the document it builds.** `$replaceWith`, `$replaceRoot` and `$mergeObjects`
+  are read where their arguments are literal documents, `$literal` or
+  `$setField`, which is how a pipeline names the fields it writes. A field path
+  or another expression builds its keys from the document itself, so
+  `[{$replaceWith: {$mergeObjects: ["$$ROOT", "$payload"]}}]` would lift a
+  nested `payload._tcDeletedAt`, which an insert is allowed to carry, to the top
+  level. The router appends one stage to every `update` and `findAndModify`
+  pipeline that replaces the document: a document without either reserved field
+  passes through unchanged, and one carrying either fails the statement with an
+  error naming the field. The other statements of a batch run as mongod runs
+  them.
 
   **One path is not covered**, and it follows from that split: a `$merge` into a
   tiered collection, of documents that already carry the field, taken from a
@@ -356,26 +357,19 @@ Part of [Thermocline](../README.md).
   tiered collection rather than forwarding the ones the fast tier can answer,
   which is a large cost for a narrow case.
 
-  **A second one has the same shape, one level down.** A replacing stage says
-  what the whole document becomes, as an expression rather than as a list of
-  field names:
+  The appended check is what closes the update half of this. A replacing stage
+  says what the whole document becomes as an expression, and these are read
+  from the command or checked on the result:
 
   ```
-  {$replaceWith: {$mergeObjects: ["$$ROOT", {_tcDeletedAt: "$$NOW"}]}}   read
-  {$replaceRoot: {newRoot: {_id: "$_id", _tcDeletedAt: "$$NOW"}}}        read
-  {$replaceWith: {$setField: {field: "_tcDeletedAt", input: "$$ROOT", ...}}}  read
-  {$replaceWith: "$sub"}                                                 not read
-  {$replaceWith: {$arrayToObject: "$pairs"}}                             not read
+  {$replaceWith: {$mergeObjects: ["$$ROOT", {_tcDeletedAt: "$$NOW"}]}}   read, refused
+  {$replaceRoot: {newRoot: {_id: "$_id", _tcDeletedAt: "$$NOW"}}}        read, refused
+  {$replaceWith: "$sub"}                                                 checked on the result
+  {$replaceWith: {$arrayToObject: "$pairs"}}                             checked on the result
   ```
 
-  A literal document shows its keys, `$mergeObjects` shows the keys of whichever
-  arguments are literal, and `$setField` names its field in a value. An
-  expression that builds keys from data does not show them to anything but
-  mongod, so a pipeline promoting a subdocument that happens to hold the field,
-  or building one from an array of pairs, goes through. It is the same trade as
-  the `$merge` above: reading the stages is what makes the guard cheap, and
-  refusing every expression that can evaluate to a document would refuse most of
-  the pipelines that legitimately write one.
+  A `$merge` has no such stage to append, because mongod performs the write
+  after the client's pipeline ends, which is why it is the one path left.
 
   It is not silent, though, and that is the difference between a path nothing
   covers and a path nothing reports. Measured on exactly that shape, two
