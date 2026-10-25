@@ -39,7 +39,7 @@ import (
 var metadataStages = map[string]bool{
 	"$collStats": true, "$indexStats": true, "$planCacheStats": true,
 	"$currentOp": true, "$listSessions": true, "$listLocalSessions": true,
-	"$shardedDataDistribution": true, "$documents": true,
+	"$shardedDataDistribution": true,
 	// A change stream reads events, not documents, so there is no set of
 	// documents for the answer to be short of and the completeness question
 	// does not arise. Sending it to the archive instead is not merely wrong,
@@ -156,6 +156,19 @@ func scopeOfAggregate(cmd bson.Raw, db string, ageOf func(string) (string, bool)
 		// documents, whatever it does afterwards.
 		if i == 0 && metadataStages[name] {
 			return aggScope{}, false
+		}
+		// $documents supplies the input instead of the collection, so nothing
+		// at the front bounds a read of it. What follows can still join a
+		// collection, and that is read: it was in the list above, and a
+		// $lookup after it was never judged. See guardDBAggregate.
+		if i == 0 && name == "$documents" {
+			if coll != dbAggregateName {
+				// Named on a collection, which mongod refuses; forwarded so
+				// the client gets mongod's words.
+				return aggScope{}, false
+			}
+			leading = false
+			continue
 		}
 
 		// Every $match at the front of the pipeline, not only the first.
@@ -493,7 +506,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 
 	scope, ok := scopeOfAggregate(cmd, db, c.r.ageFieldOf)
 	if !ok {
-		return nil, false
+		return c.guardDBAggregate(ctx, msg, cmd, db)
 	}
 	// A joined view is as invisible to the completeness check as a queried one,
 	// and it is reached by the same kind of name.
@@ -688,6 +701,72 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 
 	out, err := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
 		"thermocline: refusing this aggregation because "+because+". "+remedy+"."+note)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// dbAggregateName stands in for the collection of an aggregate: 1, so its scope
+// can be read like any other. No rule can tier it: it is not a collection name
+// mongod accepts.
+const dbAggregateName = "$cmd.aggregate"
+
+// guardDBAggregate judges an aggregate: 1 by the collections it joins.
+//
+// A pipeline with no collection, beginning with $documents, was not judged at
+// all: scopeOfAggregate needs a collection name, and without one the command
+// was forwarded. Its $lookup and $unionWith still read tiered collections, on
+// the fast tier alone, so [{$documents: [{cid: "c1"}]}, {$lookup: {from:
+// "orders", ...}}] joined only the orders the fast tier held and returned the
+// rest short, with ok: 1.
+//
+// Refused when a joined collection is not whole on the fast tier, as the same
+// join from a collection is under strict, and forwarded under permissive. Not
+// sent to the archive: there is no collection to read there, and the archive
+// path is built around one.
+func (c *conn) guardDBAggregate(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+	if n, isNum := intOf(cmd.Lookup("aggregate")); !isNum || n != 1 {
+		return nil, false
+	}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return nil, false
+	}
+	// A primary no rule can tier, so only what the pipeline joins is judged.
+	named := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		if e.Key() == "aggregate" {
+			named = append(named, bson.E{Key: "aggregate", Value: dbAggregateName})
+			continue
+		}
+		named = append(named, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	raw, err := bson.Marshal(named)
+	if err != nil {
+		return nil, false
+	}
+	scope, ok := scopeOfAggregate(raw, db, c.r.ageFieldOf)
+	if !ok {
+		return nil, false
+	}
+	c.r.resolveJoinedViews(ctx, &scope)
+	because, remedy, authorised, fine := c.r.checkAggregate(ctx, scope)
+	if fine {
+		c.aggAuth = authorised
+		return nil, false
+	}
+	c.r.Stats.Incomplete.Add(1)
+	if c.r.cfg.Completeness == config.Permissive && !scope.writes {
+		c.log.Warn("aggregation may be short", "db", db, "because", because)
+		return nil, false
+	}
+	c.r.Stats.Refused.Add(1)
+	c.cls = ClassRefused
+	c.log.Warn("refused an aggregation with no collection that joins one the fast tier does not hold in full",
+		"db", db, "because", because)
+	out, err := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+		"thermocline: refusing this aggregation because "+because+". "+remedy+".")
 	if err != nil {
 		return nil, false
 	}

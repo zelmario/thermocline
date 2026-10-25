@@ -338,6 +338,22 @@ chk "and the archive holds only that"    "[99]" \
 chk "the evicted one is tombstoned, not gone" "true" \
     "$(C "print(!!db.getSiblingDB(process.env.TC_DB).rollup.findOne({_id:1,_tcDeletedAt:{\$exists:true}}))")"
 
+echo "== a pipeline with no collection that joins a tiered one =="
+# aggregate: 1 has no collection for the completeness check to read, and it was
+# forwarded unjudged: its $lookup joined only what the fast tier held of
+# tprobe, and the rows whose partners were archived came back short with ok: 1.
+R "db.getSiblingDB(process.env.TC_DB).tprobe.insertOne({_id:520, k:'join'})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_id:520}))")" = "1" ] && break
+  sleep 1
+done
+chk "a \$documents join of a collection held in part"  "refused" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{k:'join'}]},{\$lookup:{from:'tprobe', localField:'k', foreignField:'k', as:'m'}}]).toArray(); print('answered') } catch(e) { print(/refusing this aggregation/.test(e.message)?'refused':e.message.substring(0,60)) }")"
+chk "and through \$unionWith"                          "refused" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{k:'x'}]},{\$unionWith:'tprobe'}]).toArray(); print('answered') } catch(e) { print(/refusing this aggregation/.test(e.message)?'refused':e.message.substring(0,60)) }")"
+chk "while one that joins nothing tiered is answered"  "1" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{k:'x'}]}]).toArray().length)")"
+
 echo "== \$out into a tiered target whose result mongod would refuse =="
 # fill clears both tiers before it writes the result, and the result used to be
 # built in a collection with none of the target's unique indexes or validator.

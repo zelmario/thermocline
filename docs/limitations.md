@@ -914,6 +914,16 @@ Part of [Thermocline](../README.md).
   all nineteen aggregations agree with the archive: `bash test/pilot/setup.sh
   join`.
 
+- **A pipeline with no collection that joins a tiered one is refused unless
+  the fast tier holds that collection in full.** An `aggregate: 1` beginning
+  with `$documents` reads no collection of its own, and until 2026-10-25 it
+  was forwarded unjudged: measured, a `$lookup` and a `$unionWith` from one
+  joined only what the fast tier held and answered with `ok: 1`. It is judged
+  now by what it joins, and refused under `completeness: strict` and
+  `archive` alike, because the archive path is built around a collection and
+  this has none. Under `permissive` it is forwarded with a warning. Warm the
+  joined collection to have it answered.
+
 - **A view whose own pipeline joins a tiered collection is refused unless the
   fast tier holds that collection in full.** A view's `$lookup` is in the view's
   definition, not in the query, so nothing about the query says the join is
