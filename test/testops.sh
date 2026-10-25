@@ -222,18 +222,20 @@ BEFORE=$(grep -c "own maxTimeMS ran out" "$LOGDIR/ops_r.log" 2>/dev/null); BEFOR
 # miss and the check below would pass for the wrong reason.
 chk "the fast tier is short of these to begin with" "true" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'c'}))" | awk '{print ($1+0 < 13) ? "true" : "false"}')"
+# With the feeder stopped and a write after it, so the freshness barrier
+# cannot clear and the copy-up is certain to meet the deadline. Left as it was,
+# this measured the barrier's speed instead: once the barrier answered a caught
+# up archive in a hello's round trip, the copy-up of thirteen documents fitted
+# in the budget, the write went on to mongod with its own 1ms, and mongod cut
+# it after 12 documents, which is what one cluster does with a multi-document
+# update out of time. Three runs in four on the Docker test box. A stopped
+# feeder alone is not enough: with nothing written since its last position the
+# barrier rightly says the archive is current.
+kill -STOP $FP
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:'deadline-marker'})" >/dev/null
 EXPIRED=$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({update: '$NS',
     updates: [{q: {grp: 'c'}, u: {\$set: {mt: 1}}, multi: true}], maxTimeMS: 1});
     print('accepted') } catch (e) { print(e.code) }")
-chk "a deadlined write says MaxTimeMSExpired"  "50" "$EXPIRED"
-sleep 1
-AFTER=$(grep -c "own maxTimeMS ran out" "$LOGDIR/ops_r.log" 2>/dev/null); AFTER=${AFTER:-0}
-chk "and the copy-up is what the deadline cut" "true" \
-    "$([ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && echo true || echo false)"
-# Nothing applied, because the write never ran: a deadline that stops half a
-# multi-document write would be worse than one that means nothing.
-chk "and nothing was half applied"             "0" \
-    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({mt:1}))")"
 # Every write path that brings archived documents up shares the deadline, and
 # they have to answer alike: the same condition reaching a driver as
 # MaxTimeMSExpired from an update and as CommandFailed from a bulkWrite is a
@@ -245,7 +247,18 @@ chk "and nothing was half applied"             "0" \
 UPS=$(R "try { db.getSiblingDB(process.env.TC_DB).runCommand({update: '$NS',
     updates: [{q: {grp: 'c', n: {\$gte: 0}}, u: {\$set: {mt3: 1}}, upsert: true}], maxTimeMS: 1});
     print('accepted') } catch (e) { print(e.code) }")
+kill -CONT $FP
+chk "a deadlined write says MaxTimeMSExpired"  "50" "$EXPIRED"
+sleep 1
+AFTER=$(grep -c "own maxTimeMS ran out" "$LOGDIR/ops_r.log" 2>/dev/null); AFTER=${AFTER:-0}
+chk "and the copy-up is what the deadline cut" "true" \
+    "$([ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && echo true || echo false)"
+# Nothing applied, because the write never ran: a deadline that stops half a
+# multi-document write would be worse than one that means nothing.
+chk "and nothing was half applied"             "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({mt:1}))")"
 chk "the upsert path says the same thing"      "50" "$UPS"
+R "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:'deadline-marker'})" >/dev/null
 # And the ordinary case is untouched: no deadline, the copy-up runs, every
 # matching document is reached.
 WANT=$(R "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({grp:'c'}))")
