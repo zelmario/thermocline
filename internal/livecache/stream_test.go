@@ -430,8 +430,25 @@ func direct(t *testing.T, ctx context.Context, co *mongo.Collection, q Query) an
 		}
 		fo.SetSort(s)
 	}
+	// The query's own projection. This used {stock: 0} for any projection,
+	// written when that was the only one the test asked; the in-flight rounds
+	// below include price, category and r<n>, so mongod's side carried tags
+	// and the cache's, rightly, did not. Under load more of those rounds hit
+	// the cache, and each read as "a fill lost a change" with the price, the
+	// change in question, equal on both sides.
 	if q.Proj.Set {
-		fo.SetProjection(bson.D{{Key: "stock", Value: 0}})
+		pd := bson.D{}
+		v := 0
+		if q.Proj.Include {
+			v = 1
+		}
+		for f := range q.Proj.Fields {
+			pd = append(pd, bson.E{Key: f, Value: v})
+		}
+		if q.Proj.NoID {
+			pd = append(pd, bson.E{Key: "_id", Value: 0})
+		}
+		fo.SetProjection(pd)
 	}
 	cur, err := co.Find(ctx, filter, fo)
 	if err != nil {
