@@ -78,9 +78,10 @@ Usage:
                                           can be read directly again
   cline version
 
-Every subcommand takes --log-file PATH to append logs to a file instead of
-stderr, overriding log.file in the config. Rotate it with logrotate and send
-SIGHUP; the daemon reopens the file.
+The feeder, evictor, warmer and router, and keys, preflight and watermark,
+take --log-file PATH to append logs to a file instead of stderr, overriding
+log.file in the config. Rotate it with logrotate and send SIGHUP; the daemon
+reopens the file, and every other subcommand ignores the signal.
 
 The feeder must be running before the evictor will remove anything.
 `
@@ -93,6 +94,12 @@ func main() {
 }
 
 func run() error {
+	// The shipped logrotate configuration sends SIGHUP to every process whose
+	// command line starts with the binary, and Go ends a process on an
+	// unhandled one. setupLogging catches it for the subcommands that write a
+	// log file; indexes and cache, run by an operator during a rotation, were
+	// killed by it. Ignored here, and caught again wherever it is wanted.
+	signal.Ignore(syscall.SIGHUP)
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
 		return errors.New("no subcommand given")
