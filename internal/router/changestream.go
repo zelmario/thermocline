@@ -84,23 +84,41 @@ type changeStreamRegistry struct {
 	// held is what a cursor was sent and has not yet been given. See
 	// streamheld.go.
 	held map[int64]*heldStream
-	// tail is, per stream, the client's stages this router applies itself.
-	// See splitStreamPipeline.
-	tail map[int64]bson.A
+	// tail is, per stream, the client's stages this router applies itself,
+	// or a stream it must not fill. See splitStreamPipeline.
+	tail map[int64]*streamTail
 }
 
-// setTail records the stages a stream's cursor is to have applied here.
-func (reg *changeStreamRegistry) setTail(id int64, tail bson.A) {
+// streamTail is what this router does to a stream's batches beyond sieving
+// them: the client's own stages it runs after filling, with the stream's
+// collation and let, or, with noFill, nothing filled at all.
+type streamTail struct {
+	stages    bson.A
+	collation bson.RawValue
+	let       bson.RawValue
+	// noFill is a stream whose own stages read fullDocument and are left to
+	// mongod. Filling after them would put back what they took out.
+	noFill bool
+}
+
+// applies reports whether the tail has stages to run here.
+func (t *streamTail) applies() bool { return t != nil && len(t.stages) > 0 }
+
+// fills reports whether a null lookup may be filled from the archive.
+func (t *streamTail) fills() bool { return t == nil || !t.noFill }
+
+// setTail records what a stream's cursor is to have done here.
+func (reg *changeStreamRegistry) setTail(id int64, tail *streamTail) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	if reg.tail == nil {
-		reg.tail = map[int64]bson.A{}
+		reg.tail = map[int64]*streamTail{}
 	}
 	reg.tail[id] = tail
 }
 
-// tailOf is what setTail recorded for a stream.
-func (reg *changeStreamRegistry) tailOf(id int64) bson.A {
+// tailOf is what setTail recorded for a stream, nil for none.
+func (reg *changeStreamRegistry) tailOf(id int64) *streamTail {
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
 	return reg.tail[id]
@@ -146,10 +164,17 @@ func (reg *changeStreamRegistry) drop(id int64) {
 // a $match on a field of it dropped the event on mongod's null before this
 // router saw it, so those updates were lost.
 //
-// Run here, the stages see what MongoDB's would. They are tried once at open on
-// an empty input, so a stage mongod would refuse is left for mongod to refuse;
-// and a stream ending in $changeStreamSplitLargeEvent, which only the server
-// can apply, is left whole.
+// Run here, the stages see what MongoDB's would. Only the stages mongod allows
+// in a change stream are taken: anything else, a $lookup or a $merge, is left
+// in the command for mongod to refuse, which it does at open, and was otherwise
+// run here on the router's own client. The rest are tried once at open on an
+// empty input with the stream's collation and let, so a stage mongod would
+// refuse is still mongod's to refuse.
+//
+// A stream whose stages read fullDocument and that cannot be split, because it
+// ends in $changeStreamSplitLargeEvent, which only the server can apply, or
+// because the trial failed, is recorded as not to be filled: filling after
+// mongod's stages put back a field a $project took out.
 func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) {
 	stages, ok := pipelineStages(cmd)
 	if !ok || len(stages) < 2 {
@@ -157,9 +182,6 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	}
 	at := -1
 	for i, st := range stages[1:] {
-		if bytes.Contains(st.Value, []byte("$changeStreamSplitLargeEvent")) {
-			return
-		}
 		if at < 0 && bytes.Contains(st.Value, []byte("fullDocument")) {
 			at = i + 1
 		}
@@ -167,14 +189,24 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if at < 0 {
 		return
 	}
+	keep := &streamTail{noFill: true}
+	c.csTail = keep
 	tail := make(bson.A, 0, len(stages)-at)
 	for _, st := range stages[at:] {
+		name, legal := changeStreamStage(st)
+		if !legal || name == "$changeStreamSplitLargeEvent" {
+			return
+		}
 		tail = append(tail, st)
 	}
-	try := append(bson.A{bson.D{{Key: "$documents", Value: bson.A{}}}}, tail...)
-	if err := c.r.hot.Database(db).RunCommand(ctx, bson.D{
-		{Key: "aggregate", Value: 1}, {Key: "pipeline", Value: try}, {Key: "cursor", Value: bson.D{}},
-	}).Err(); err != nil {
+	collation, let := cmd.Lookup("collation"), cmd.Lookup("let")
+	trial := bson.D{
+		{Key: "aggregate", Value: 1},
+		{Key: "pipeline", Value: append(bson.A{bson.D{{Key: "$documents", Value: bson.A{}}}}, tail...)},
+		{Key: "cursor", Value: bson.D{}},
+	}
+	trial = withStreamOptions(trial, collation, let)
+	if err := c.r.hot.Database(db).RunCommand(ctx, trial).Err(); err != nil {
 		return
 	}
 	elems, err := cmd.Elements()
@@ -197,14 +229,47 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if err != nil {
 		return
 	}
-	c.sendInstead, c.csTail = out, tail
+	c.sendInstead = out
+	c.csTail = &streamTail{stages: tail, collation: collation, let: let}
+}
+
+// changeStreamStage names a stage and reports whether mongod allows it after
+// $changeStream. The list is mongod's own, from the change streams manual.
+func changeStreamStage(st bson.RawValue) (string, bool) {
+	d, ok := st.DocumentOK()
+	if !ok {
+		return "", false
+	}
+	elems, err := d.Elements()
+	if err != nil || len(elems) != 1 {
+		return "", false
+	}
+	switch name := elems[0].Key(); name {
+	case "$match", "$project", "$addFields", "$set", "$unset", "$replaceRoot", "$replaceWith",
+		"$redact", "$changeStreamSplitLargeEvent":
+		return name, true
+	default:
+		return name, false
+	}
+}
+
+// withStreamOptions adds a stream's collation and let to a command run on its
+// behalf, where the stream had them.
+func withStreamOptions(cmd bson.D, collation, let bson.RawValue) bson.D {
+	if collation.Type != 0 {
+		cmd = append(cmd, bson.E{Key: "collation", Value: collation})
+	}
+	if let.Type != 0 {
+		cmd = append(cmd, bson.E{Key: "let", Value: let})
+	}
+	return cmd
 }
 
 // applyStreamTail runs a stream's own stages over a batch this router filled.
 // See splitStreamPipeline. The resume token is each event's _id, and a stage
 // that changed it is the error mongod gives for one.
-func (r *Router) applyStreamTail(ctx context.Context, db string, tail bson.A, events bson.A) (bson.A, error) {
-	if len(tail) == 0 || len(events) == 0 {
+func (r *Router) applyStreamTail(ctx context.Context, db string, tail *streamTail, events bson.A) (bson.A, error) {
+	if !tail.applies() || len(events) == 0 {
 		return events, nil
 	}
 	ids := make(map[string]bool, len(events))
@@ -221,10 +286,15 @@ func (r *Router) applyStreamTail(ctx context.Context, db string, tail bson.A, ev
 		ids[string(d.Lookup("_id").Value)] = true
 		docs = append(docs, d)
 	}
-	pipeline := append(bson.A{bson.D{{Key: "$documents", Value: docs}}}, tail...)
-	cur, err := r.hot.Database(db).RunCommandCursor(ctx, bson.D{
+	// $documents evaluates its argument as an expression, so the events go in
+	// as a literal: an update's updatedFields has dotted names, which an
+	// expression object refuses with 16412, and a string such as "$5" would be
+	// read as a field path.
+	pipeline := append(bson.A{bson.D{{Key: "$documents", Value: bson.D{{Key: "$literal", Value: docs}}}}}, tail.stages...)
+	cmd := withStreamOptions(bson.D{
 		{Key: "aggregate", Value: 1}, {Key: "pipeline", Value: pipeline}, {Key: "cursor", Value: bson.D{}},
-	})
+	}, tail.collation, tail.let)
+	cur, err := r.hot.Database(db).RunCommandCursor(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -298,15 +368,22 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	id, ok := cursorIDOf(rdoc)
-	if !ok || id == 0 {
+	if !ok {
 		return nil, false
 	}
-	c.r.changeStreams.add(id, watching)
-	if c.csTail != nil {
-		c.r.changeStreams.setTail(id, c.csTail)
-		c.csTail = nil
+	// An id of 0 is a stream mongod closed in its first reply, a resume
+	// before a drop delivering its events and the invalidate at once. Its
+	// batch is still sieved and still has the client's stages applied; there
+	// is only no cursor to remember.
+	tail := c.csTail
+	c.csTail = nil
+	if id != 0 {
+		c.r.changeStreams.add(id, watching)
+		if tail != nil {
+			c.r.changeStreams.setTail(id, tail)
+		}
+		c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
 	}
-	c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
 
 	// And this reply's own batch, which was passed through untouched.
 	//
@@ -332,7 +409,7 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	keep, dropped := c.r.sieveEvents(ctx, events)
-	keep, token, _, changed, terr := c.cutStreamBatch(ctx, id, c.r.changeStreams.tailOf(id), rdoc, c.owner(cmd), keep)
+	keep, token, _, changed, terr := c.cutStreamBatch(ctx, id, tail, rdoc, c.owner(cmd), keep)
 	if terr != nil {
 		out, rerr := c.streamTailErrorTo(reply.Header.ResponseTo, terr)
 		if rerr != nil {

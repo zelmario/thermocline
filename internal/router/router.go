@@ -1031,7 +1031,7 @@ type conn struct {
 	// the client sent, and csTail the change stream stages it took out of it,
 	// for the cursor the reply opens. See splitStreamPipeline.
 	sendInstead *wire.Message
-	csTail      bson.A
+	csTail      *streamTail
 
 	// aggAuth are the completeness claims that let the fast tier run the
 	// aggregation now in flight, held until the reply says whether it left a

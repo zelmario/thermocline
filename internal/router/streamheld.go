@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/wire"
 )
@@ -41,6 +42,11 @@ const streamBatchBytes = 16 << 20
 // fillChunk is how many events are filled at a time on the way to the cut, so
 // that finding where to stop does not mean reading every document first.
 const fillChunk = 32
+
+// tailChunkBytes bounds the filled events one run of a stream's own stages is
+// given, so the command carrying them stays under mongod's 16MB. A single event
+// larger than this goes alone.
+const tailChunkBytes = 8 << 20
 
 // heldStream is what one change stream cursor has been sent by the fast tier
 // and not yet handed to the client.
@@ -101,31 +107,48 @@ func (reg *changeStreamRegistry) release(id int64) {
 // past streamBatchBytes, and returns the filled ones and the rest as they came.
 // At least one event is always returned, so a single large one still goes.
 //
-// tail is the stream's own stages this router applies, after the fill, to each
-// chunk as a whole; with them the batch is cut between chunks, so what is held
-// for the next getMore is still events as mongod sent them. See
-// splitStreamPipeline.
-func (r *Router) fillBounded(ctx context.Context, events, tail bson.A, db string) (bson.A, bson.A, int, error) {
+// tail is what this router does beyond sieving; see splitStreamPipeline. A
+// stream it must not fill is returned as mongod sent it. With stages, they run
+// over pieces of at most tailChunkBytes of filled events, each sent to the fast
+// tier as one command, which mongod caps at 16MB; the batch is cut between
+// pieces, so what is held for the next getMore is still events as mongod sent
+// them.
+func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTail, db string) (bson.A, bson.A, int, error) {
+	if !tail.fills() {
+		return events, nil, 0, nil
+	}
 	out := make(bson.A, 0, len(events))
 	used, filled := 0, 0
 	for start := 0; start < len(events); start += fillChunk {
 		end := min(start+fillChunk, len(events))
-		chunk, n := r.fillLookups(ctx, events[start:end])
-		if len(tail) > 0 {
-			shaped, err := r.applyStreamTail(ctx, db, tail, chunk)
-			if err != nil {
-				return nil, nil, 0, err
+		chunk, _ := r.fillLookups(ctx, events[start:end])
+		if tail.applies() {
+			for a := 0; a < len(chunk); {
+				b, piece := a, 0
+				for b < len(chunk) && (b == a || piece+eventSize(chunk[b]) <= tailChunkBytes) {
+					piece += eventSize(chunk[b])
+					b++
+				}
+				shaped, err := r.applyStreamTail(ctx, db, tail, chunk[a:b])
+				if err != nil {
+					return nil, nil, 0, err
+				}
+				size := 0
+				for _, ev := range shaped {
+					size += eventSize(ev)
+				}
+				if len(out) > 0 && used+size > streamBatchBytes {
+					return out, events[start+a:], filled, nil
+				}
+				out = append(out, shaped...)
+				used += size
+				for k := a; k < b; k++ {
+					if eventSize(events[start+k]) != eventSize(chunk[k]) {
+						filled++
+					}
+				}
+				a = b
 			}
-			size := 0
-			for _, ev := range shaped {
-				size += eventSize(ev)
-			}
-			if len(out) > 0 && used+size > streamBatchBytes {
-				return out, events[start:], filled, nil
-			}
-			out = append(out, shaped...)
-			used += size
-			filled += n
 			continue
 		}
 		for i, ev := range chunk {
@@ -174,13 +197,16 @@ func eventSize(ev any) int {
 // tail is the stream's own stages this router applies; see
 // splitStreamPipeline. A batch they changed is reported as changed whether or
 // not anything was filled, and an error from them is the getMore's.
-func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail bson.A, rdoc bson.Raw, owner cursorOwner,
+func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail *streamTail, rdoc bson.Raw, owner cursorOwner,
 	keep bson.A) (bson.A, bson.RawValue, int, bool, error) {
 	db := streamDB(rdoc)
 	if id == 0 {
 		// A cursor mongod has closed has no getMore to hand the rest to.
+		if !tail.fills() {
+			return keep, bson.RawValue{}, 0, false, nil
+		}
 		out, filled := c.r.fillLookups(ctx, keep)
-		if len(tail) > 0 {
+		if tail.applies() {
 			shaped, err := c.r.applyStreamTail(ctx, db, tail, out)
 			return shaped, bson.RawValue{}, filled, true, err
 		}
@@ -190,7 +216,7 @@ func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail bson.A, rdoc b
 	if err != nil {
 		return nil, bson.RawValue{}, 0, false, err
 	}
-	changed := filled > 0 || len(tail) > 0
+	changed := filled > 0 || tail.applies()
 	if len(rest) == 0 {
 		return out, bson.RawValue{}, filled, changed, nil
 	}
@@ -372,6 +398,21 @@ func (c *conn) streamTailError(msg *wire.Message, err error) (*wire.Message, err
 func (c *conn) streamTailErrorTo(requestID int32, err error) (*wire.Message, error) {
 	if errors.Is(err, errResumeTokenModified) {
 		return c.r.commandErrorWithCode(requestID, requestID, err.Error(), 280, "ChangeStreamFatalError")
+	}
+	// A fast tier that could not be reached or stepped down is what a driver
+	// resumes after, from the last token it was given. mongod's cursor has
+	// moved past this batch, but a resume opens a new one from that token, so
+	// nothing is lost; without the label the stream would end on an election.
+	var ce mongo.CommandError
+	if mongo.IsNetworkError(err) || mongo.IsTimeout(err) || (errors.As(err, &ce) && isStateChangeCode(int(ce.Code))) {
+		return wire.NewMsg(requestID, requestID, bson.D{
+			{Key: "ok", Value: 0.0},
+			{Key: "errmsg", Value: "thermocline: this change stream's own stages, run here after its documents " +
+				"were filled from the archive, could not reach the fast tier: " + err.Error()},
+			{Key: "code", Value: int32(6)},
+			{Key: "codeName", Value: "HostUnreachable"},
+			{Key: "errorLabels", Value: bson.A{"ResumableChangeStreamError"}},
+		})
 	}
 	return c.r.relayedError(requestID, requestID,
 		"thermocline: this change stream's own stages, run here after its documents were filled from the "+

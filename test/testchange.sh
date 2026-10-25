@@ -184,7 +184,9 @@ echo "== an eviction must not look like a deletion =="
 # copy.
 R "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({_id:{\$not:{\$type:'objectId'}}})" >/dev/null
 OID=$(printf '%08x%016x' $(( $(date +%s) - 7200 )) 771)
-R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID'), v:'old'})" >/dev/null
+# addr is there so a later update of addr.city reports a dotted name in
+# updatedFields: mongod writes {"addr.city": ...} only when addr exists.
+R "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:ObjectId('$OID'), v:'old', addr:{zip:1}})" >/dev/null
 waitMirrored 1
 
 rm -f /tmp/cs_events.txt
@@ -508,7 +510,7 @@ T0=$(R "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
 sleep 3
 # Update it, let that reach the archive, then take it off the fast tier the way
 # an eviction does, with the feeder blind to it so the archive keeps it live.
-R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up', secret:'s'}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up', secret:'s', 'addr.city':'x', price:'\$5'}})" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'')")" = "looked up" ] && break
   sleep 0.5
@@ -550,6 +552,70 @@ MATCHED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin -
   }
   cs.close(); print(out);" 2>&1 | tail -1)
 chk "and a \$match on the document still sees the update" "HAS looked up" "$MATCHED"
+# The stages run over the events as data. The update set a dotted path, so
+# updatedFields has a dotted name, which an expression object refuses (16412),
+# and a string "$5", which an expression reads as a field path.
+LITERAL=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$match:{'fullDocument.v':'looked up'}}],
+    {fullDocument:'updateLookup', startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  try {
+    for (let i=0;i<40;i++) {
+      const e=cs.tryNext();
+      if (e && e.operationType==='update') { out = e.fullDocument.price+' '+e.updateDescription.updatedFields['addr.city']; break; }
+      sleep(250);
+    }
+  } catch(err) { out='ERROR '+err.code; }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "  and the event's own values arrive as they are"    "\$5 x" "$LITERAL"
+# The stream's collation is the stages' collation: mongod's match on
+# "LOOKED UP" at strength 2 takes "looked up".
+COLLATED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$match:{'fullDocument.v':'LOOKED UP'}}],
+    {fullDocument:'updateLookup', collation:{locale:'en', strength:2},
+     startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  for (let i=0;i<40;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = e.fullDocument ? 'HAS '+e.fullDocument.v : 'NULL'; break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "  and a collated \$match keeps the stream's collation" "HAS looked up" "$COLLATED"
+# A stream ending in $changeStreamSplitLargeEvent is left to mongod, and so is
+# not filled: filled after mongod's $project, the field it removed came back.
+SPLIT=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$project:{'fullDocument.secret':0}}, {\$changeStreamSplitLargeEvent:{}}],
+    {fullDocument:'updateLookup', startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  for (let i=0;i<40;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = !e.fullDocument ? 'NULL' : (e.fullDocument.secret ? 'LEAKED' : 'CLEAN'); break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "  and one ending in a split is left unfilled"        "NULL" "$SPLIT"
+# Only the stages mongod allows in a change stream are run here. A $lookup
+# after a stage reading fullDocument is mongod's to refuse at open; taken out
+# of the command, it ran on the router's own client.
+LOOKUPSTAGE=$(R "try { db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$match:{'fullDocument.v':'x'}}, {\$lookup:{from:'$NS', localField:'a', foreignField:'b', as:'y'}}]).tryNext(); print('OPENED') } catch(e) { print(/not permitted in a .changeStream pipeline/.test(e.message) ? 'REFUSED' : e.message.substring(0,60)) }")
+chk "  and a stage mongod refuses in a stream is refused" "REFUSED" "$LOOKUPSTAGE"
+# A stream mongod closes in its first reply: resumed before a drop, the
+# insert, the drop and the invalidate come at once with cursor id 0. The
+# stages still run on that batch.
+H "db.getSiblingDB(process.env.TC_DB).tcs7.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tcs7.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tcs7.insertOne({_id:0})" >/dev/null
+CLOSED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const d=db.getSiblingDB(process.env.TC_DB);
+  const cs=d.tcs7.watch(); d.tcs7.insertOne({_id:1});
+  let tok; for (let i=0;i<40 && !tok;i++) { const e=cs.tryNext(); if (e) tok=e._id; else sleep(250); }
+  cs.close();
+  d.tcs7.insertOne({_id:2, secret:'s'}); d.tcs7.drop();
+  const r=d.runCommand({aggregate:'tcs7', pipeline:[{\$changeStream:{resumeAfter:tok}}, {\$project:{'fullDocument.secret':0}}], cursor:{}});
+  const ins=r.cursor.firstBatch.filter(e=>e.operationType==='insert');
+  print('id='+r.cursor.id+' '+(ins.length ? (ins[0].fullDocument.secret ? 'LEAKED' : 'CLEAN') : 'none'));" 2>&1 | tail -1)
+chk "  and a stream closed in its first reply is shaped" "id=0 CLEAN" "$CLOSED"
 
 fi
 if inpart 2; then
