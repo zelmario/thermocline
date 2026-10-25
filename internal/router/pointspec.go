@@ -136,7 +136,12 @@ func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string)
 		c.startMergeSpec(ctx, cmd, db, ns, msg.Header.RequestID)
 		return
 	}
-	if c.r.specScore(ns).Load() <= 0 || inTransaction(cmd) {
+	// Only a filter that is the _id alone. The oplog check asks whether the
+	// document was deleted, and that is the only write that can make the
+	// archive's copy wrong when the fast tier does not hold it. With more in the
+	// filter, the fast tier can hold it and not match, after an update the
+	// archive has not seen yet. See answerPointRead.
+	if !filterIsOnlyID(fdoc) || c.r.specScore(ns).Load() <= 0 || inTransaction(cmd) {
 		return
 	}
 	if _, honourable := archiveLevel(cmd); !honourable {

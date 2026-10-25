@@ -246,7 +246,17 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	// answerFromArchive with every other archive read.
 	c.r.Metrics.RecordStage(stagePointFast, time.Since(c.cmdStarted))
 	c.r.notePointRead(ns, true)
-	c.archivePoint = &id
+	// The quick check a point read gets asks the oplog only about deletes.
+	// That holds when the filter is the _id alone: an empty answer means the
+	// fast tier does not hold the document, and only a delete can then make
+	// the archive's copy wrong. {_id: 5, status: "open"} comes back empty too
+	// when the fast tier holds 5 and an update just closed it, and the archive
+	// still holds the open version: answered from it, the router returned the
+	// order the client had closed, where MongoDB returns nothing. Such a read
+	// waits for mirroring like any other.
+	if filterIsOnlyID(fdoc) {
+		c.archivePoint = &id
+	}
 	out, err := c.answerFromArchive(ctx, msg, db, coll, false)
 	c.archivePoint = nil
 	c.r.Metrics.RecordStage(stagePointTotal, time.Since(c.cmdStarted))

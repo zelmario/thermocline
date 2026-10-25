@@ -1018,6 +1018,38 @@ for t in $MNS ${MNS}src ${MNS}ev ${MNS}evsrc; do
 done
 stopDaemons
 
+echo "== a read by _id and more, of a document just changed =="
+# A read whose filter names an _id took the quick point path, which asks the
+# oplog only about deletes. With more in the filter, an empty fast tier answer
+# can mean the document is there and no longer matches, and the archive still
+# holds the version that did: the router returned the order the client had
+# just closed, where MongoDB returns nothing.
+PNS=tmdel
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop(); db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({ns:process.env.TC_DB+'.$PNS'})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).createCollection('$PNS')" >/dev/null
+startFeeder
+startRouter "$STRICTCFG"
+R "db.getSiblingDB(process.env.TC_DB).$PNS.insertOne({_id:5, status:'open', when:new Date()})" >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).$PNS.countDocuments({_id:5}))")" = "1" ] && break
+  sleep 0.5
+done
+cline watermark --config $STRICTCFG --ns $DB.$PNS --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+sleep 7
+kill -STOP $FP
+R "db.getSiblingDB(process.env.TC_DB).$PNS.updateOne({_id:5},{\$set:{status:'closed'}})" >/dev/null
+chk "the archive still holds it open"                  "open" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$PNS.findOne({_id:5}).status)")"
+chk "a read of it as open is not answered from there"  "error 125" \
+    "$(R "try { print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$PNS.find({_id:5, status:'open'}).toArray())) } catch(e) { print('error '+e.code) }")"
+kill -CONT $FP
+chk "and once mirrored it is the answer MongoDB gives"  "[]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$PNS.find({_id:5, status:'open'}).toArray()))")"
+H "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$PNS.drop()" >/dev/null
+stopDaemons
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
