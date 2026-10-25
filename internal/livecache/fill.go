@@ -455,6 +455,7 @@ func (c *Cache) installAt(f *inflight, docs []bson.Raw, complete bool, n int64, 
 	if !until.IsZero() && (e.expires.IsZero() || until.Before(e.expires)) {
 		e.expires = until
 	}
+	e.from = f.p0
 	c.inherit(e, f.p0)
 	for _, ch := range f.buf {
 		if !after(ch.At, f.p0) {

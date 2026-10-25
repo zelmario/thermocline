@@ -734,3 +734,57 @@ func TestCountPipelineTakesOnlyAnInt32One(t *testing.T) {
 		}
 	}
 }
+
+// A batched insertMany, or a transaction, puts many events at one cluster
+// time. A fill read at that time holds all of them while the stream has
+// applied only the first, and the rest were counted again; and a write noted
+// at that time was taken as applied once the first arrived.
+func TestEventsSharingOneTime(t *testing.T) {
+	c := New(1 << 20)
+	q, ok := ParseCountAgg("shop.products", raw(t, bson.D{
+		{Key: "aggregate", Value: "products"},
+		{Key: "pipeline", Value: bson.A{
+			bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: "a"}}}},
+			bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+		}},
+		{Key: "cursor", Value: bson.D{}},
+	}))
+	if !ok {
+		t.Fatal("countDocuments was not understood")
+	}
+	T := bson.Timestamp{T: 10, I: 1}
+	// The stream has applied the first of three inserts at T, and a fill read
+	// at T counted all three.
+	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 3)), At: T})
+	c.install(q, nil, true, 3)
+	c.mu.Lock()
+	for _, e := range c.entries {
+		e.from = T
+	}
+	c.mu.Unlock()
+	for _, id := range []string{"p2", "p3"} {
+		c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, id), Doc: raw(t, product(id, "a", 3)), At: T})
+	}
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("miss")
+	}
+	if n := got.Lookup("cursor", "firstBatch", "0", "n").Int32(); n != 3 {
+		t.Errorf("count %d, want 3: the inserts the fill had read were counted again", n)
+	}
+
+	// A write noted at a time whose events have only begun to arrive.
+	c2 := New(1 << 20)
+	c2.install(q, nil, true, 0)
+	U := bson.Timestamp{T: 20, I: 1}
+	c2.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "q0"), Doc: raw(t, product("q0", "b", 3)), At: bson.Timestamp{T: 19}})
+	c2.NoteWrite("shop.products", U)
+	c2.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "q1"), Doc: raw(t, product("q1", "a", 3)), At: U})
+	if _, hit := c2.Get(q); hit {
+		t.Error("answered after the first event of a write's time, with the rest of it still to come")
+	}
+	c2.Advance(U)
+	if _, hit := c2.Get(q); !hit {
+		t.Error("still waiting once the stream said it had sent everything up to the write")
+	}
+}

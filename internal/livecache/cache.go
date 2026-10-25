@@ -46,6 +46,13 @@ type Cache struct {
 	// applied, oldest first. A namespace is served while none of them is older
 	// than maxStale. See fresh.
 	applied bson.Timestamp
+	// closed is how far every event is known applied, which trails applied
+	// by the events that share its cluster time. A transaction, and on 8.0 a
+	// batched write, puts many events at one time, and the first of them set
+	// applied: a write noted at that time was then taken as applied with the
+	// rest still to come, and a count read right after an insertMany was
+	// short. A later event, the end of a batch or an empty poll closes it.
+	closed  bson.Timestamp
 	pending map[string][]pendingWrite
 	// pendingDB is the same for writes naming a whole database.
 	pendingDB map[string][]pendingWrite
@@ -235,6 +242,9 @@ type entry struct {
 	// expires is when an entry on a tiered namespace is asked for again. See
 	// tieredTTL.
 	expires time.Time
+	// from is the position the entry was read at. Everything at or before it
+	// is in what was read, so an insert there is not counted again. See Apply.
+	from bson.Timestamp
 }
 
 // tieredTTL is how long an entry on a tiered namespace is kept before it is
@@ -471,7 +481,7 @@ func sortFields(sh *shape) []string {
 // namespace later than the position it was read at. Called with mu held.
 func (c *Cache) inherit(e *entry, p0 bson.Timestamp) {
 	for _, w := range c.classified[e.shape.ns] {
-		if after(w.ts, p0) && after(w.ts, c.applied) {
+		if after(w.ts, p0) && after(w.ts, c.closed) {
 			c.pendingEntry[e.key] = append(c.pendingEntry[e.key], w)
 		}
 	}
@@ -484,7 +494,7 @@ func (c *Cache) sweep() {
 		for k, q := range m {
 			stale := true
 			for _, w := range q {
-				if after(w.ts, c.applied) {
+				if after(w.ts, c.closed) {
 					stale = false
 					break
 				}
@@ -497,7 +507,7 @@ func (c *Cache) sweep() {
 }
 
 func (c *Cache) noteWrite(q []pendingWrite, ts bson.Timestamp) []pendingWrite {
-	if !after(ts, c.applied) {
+	if !after(ts, c.closed) {
 		return q
 	}
 	now := c.now()
@@ -527,7 +537,7 @@ func (c *Cache) fresh(m map[string][]pendingWrite, key string, now time.Time) bo
 	i := 0
 	// Positions only go up along the queue, but a merge can raise one
 	// above its successor's, so this stops at the first unapplied write.
-	for i < len(q) && !after(q[i].ts, c.applied) {
+	for i < len(q) && !after(q[i].ts, c.closed) {
 		i++
 	}
 	if i == len(q) {
@@ -1092,6 +1102,10 @@ func (c *Cache) Apply(ch Change) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if after(ch.At, c.applied) {
+		// A later time: every event at the one before has been applied.
+		if after(c.applied, c.closed) {
+			c.closed = c.applied
+		}
 		c.applied = ch.At
 	}
 	shapes := c.shapes[ch.NS]
@@ -1151,7 +1165,12 @@ func (c *Cache) Apply(ch Change) {
 				continue
 			}
 			if sh.kind == KindCount {
-				if ch.Op == "insert" {
+				// Not an insert the read already counted. A fill reads at the
+				// stream's position, and when that falls among the events of
+				// one commit the read holds all of them while the stream has
+				// applied only some: each one after that was counted twice,
+				// and a count read after an insertMany came back too high.
+				if ch.Op == "insert" && after(ch.At, e.from) {
 					e.n++
 				}
 				continue
@@ -1355,7 +1374,7 @@ func (c *Cache) Reset() {
 	for _, e := range c.entries {
 		c.drop(e)
 	}
-	c.applied = bson.Timestamp{}
+	c.applied, c.closed = bson.Timestamp{}, bson.Timestamp{}
 	c.mu.Unlock()
 	// What it missed may have been a drop and a create.
 	c.plainMu.Lock()
@@ -1370,6 +1389,12 @@ func (c *Cache) Advance(at bson.Timestamp) {
 	defer c.mu.Unlock()
 	if after(at, c.applied) {
 		c.applied = at
+	}
+	// The end of a batch, or a poll with nothing in it: the server sent all it
+	// had up to here. A batch cut at 16MB inside one commit is the case this
+	// cannot see, and it is the size of one batch.
+	if after(at, c.closed) {
+		c.closed = at
 	}
 	if c.sweeps++; c.sweeps >= 1024 {
 		c.sweeps = 0
