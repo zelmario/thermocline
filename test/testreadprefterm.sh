@@ -100,10 +100,12 @@ for n in $NODES; do
 done
 chk "the profiler is recording on every node"           "3" "$ON"
 
+# A count, and only a count. See landed in testreadpref.sh.
 landed() {
-  local where="none"
+  local where="none" c
   for n in $NODES; do
-    if [ "$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")" != "0" ]; then
+    c=$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")
+    if [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
       where=$(N "$n" 'print(db.hello().isWritablePrimary ? "PRIMARY" : "secondary")')
     fi
   done

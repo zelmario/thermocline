@@ -85,10 +85,15 @@ for n in $NODES; do
 done
 chk "the profiler is recording on every node"           "3" "$ON"
 
+# A count, and only a count: compared with "0", a call that failed under load
+# printed an error, which is not "0", and the node it failed on was named as
+# the one that ran the read. Measured once in a sweep, the control's primary
+# read named a secondary with no election in the replica set.
 landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
-  local where="none"
+  local where="none" c
   for n in $NODES; do
-    if [ "$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")" != "0" ]; then
+    c=$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")
+    if [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
       where=$(N "$n" 'print(db.hello().isWritablePrimary ? "PRIMARY" : "secondary")')
     fi
   done
