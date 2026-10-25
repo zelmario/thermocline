@@ -338,6 +338,41 @@ chk "and the archive holds only that"    "[99]" \
 chk "the evicted one is tombstoned, not gone" "true" \
     "$(C "print(!!db.getSiblingDB(process.env.TC_DB).rollup.findOne({_id:1,_tcDeletedAt:{\$exists:true}}))")"
 
+echo "== \$out into a tiered target whose result mongod would refuse =="
+# fill clears both tiers before it writes the result, and the result used to be
+# built in a collection with none of the target's unique indexes or validator.
+# So a result mongod refuses failed only once the clear was done, and the
+# target read as empty. mongod's own $out fails first and leaves it as it was.
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).rollup.createIndex({sku:1},{unique:true});
+   db.getSiblingDB(process.env.TC_DB).rollup.insertMany([{_id:1, sku:'a'},{_id:2, sku:'b'}])" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tprobe.drop();
+   db.getSiblingDB(process.env.TC_DB).tprobe.insertMany([{_id:510, sku:'x'},{_id:511, sku:'x'},{_id:512, sku:5}])" >/dev/null
+for _ in $(seq 1 30); do
+  # By _id, and _ids no earlier section used: a drop is not mirrored, so the
+  # archive's tprobe still holds what they wrote, and an insert of one of those
+  # _ids is refused as a duplicate.
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_id:{\$in:[510,511,512]}})+db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({}))")" = "5" ] && break
+  sleep 1
+done
+chk "the input and the target are mirrored"          "3 2 3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_id:{\$in:[510,511,512]}})+' '+db.getSiblingDB(process.env.TC_DB).rollup.countDocuments({}))") $(R "print(db.getSiblingDB(process.env.TC_DB).tprobe.countDocuments({_id:{\$in:[510,511,512]}}))")"
+OUTCODE="catch(e) { print('error '+e.code) }"
+chk "two results with one unique value are refused"   "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{\$match:{_id:{\$in:[510,511]}}},{\$out:'rollup'}]).toArray(); print('accepted') } $OUTCODE")"
+chk "  and the target is as it was"                   "[1,2] [1,2]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))") $(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+R "db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'rollup', validator:{sku:{\$type:'string'}}})" >/dev/null
+chk "a result the validator rejects is refused"       "error 121" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{\$match:{_id:512}},{\$out:'rollup'}]).toArray(); print('accepted') } $OUTCODE")"
+chk "  and the target is as it was"                   "[1,2] [1,2]" \
+    "$(R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).sort({_id:1}).toArray().map(d=>d._id)))") $(C "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({_tcDeletedAt:{\$exists:false}}).sort({_id:1}).toArray().map(d=>d._id)))")"
+chk "  unless the command bypasses it, as in mongod"  "[512]" \
+    "$(R "db.getSiblingDB(process.env.TC_DB).tprobe.aggregate([{\$match:{_id:512}},{\$out:'rollup'}],{bypassDocumentValidation:true}).toArray(); print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).rollup.find({}).toArray().map(d=>d._id)))")"
+H "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).rollup.drop()" >/dev/null
+
 echo "== \$out into a tiered target that could have been forwarded =="
 # Every section above makes the fast tier unable to answer the input, which is
 # what sends the whole pipeline through the router. A $out whose input the fast

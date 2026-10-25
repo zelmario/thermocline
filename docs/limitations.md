@@ -1591,8 +1591,20 @@ Part of [Thermocline](../README.md).
   destroy it; a `$out` is not an accident, it is an application saying what this
   collection should now contain. The archived documents are tombstoned rather
   than removed, so what they were is still there to look at, and the archive is
-  cleared after the fast tier, so a failure leaves the collection reading as
-  what it held rather than half replaced. It is the expensive half as well:
+  cleared after the fast tier, so a failure there leaves the collection reading
+  as what it held rather than half replaced.
+
+  A result mongod would refuse is refused before anything is cleared. The
+  result is built in a collection carrying the target's unique indexes and
+  validator, as mongod's own `$out` builds it, and the router waits for
+  mirroring before it clears. Until 2026-10-25 it was built in a bare
+  collection: measured, a result with two documents sharing a unique value,
+  and one the validator rejected, each failed only once both tiers were
+  cleared, and the target read as empty. Now each fails with mongod's code,
+  11000 or 121, and the target is untouched. What is left is a failure while
+  the result is being written in, such as a lost connection to the fast tier,
+  which leaves the target partly filled and says so in the error. It is the
+  expensive half as well:
   clearing the fast tier reaches only the working set, while this reaches every
   live document the archive holds for that namespace, so a `$out` over a
   collection with years behind it is a large write. The router logs how many it

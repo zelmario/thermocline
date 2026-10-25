@@ -88,7 +88,7 @@ func (c *conn) runWritePipeline(ctx context.Context, msg *wire.Message, cmd bson
 	// failed write may have landed in part, the router's clock is brought
 	// past them. See catchUpOpTime.
 	defer c.r.catchUpOpTime(ctx)
-	sink, err := c.newWriteSink(ctx, final, db)
+	sink, err := c.newWriteSink(ctx, final, db, boolField(cmd, "bypassDocumentValidation"))
 	if err != nil {
 		return c.writePipelineError(msg, s, "preparing the target failed", false, err)
 	}
@@ -242,10 +242,13 @@ type writeSink struct {
 	// last step cannot be a rename, because a rename is not mirrored.
 	tieredColl    *mongo.Collection
 	tieredArchive *mongo.Collection
+	// bypass is the command's bypassDocumentValidation, which the fill's
+	// inserts have to carry as mongod's own $out would.
+	bypass bool
 }
 
 // newWriteSink prepares the destination and reports how the write will be done.
-func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*writeSink, error) {
+func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string, bypass bool) (*writeSink, error) {
 	outDB, outColl, isOut := outTarget(final, db)
 	if !isOut {
 		// A $merge writes documents too, and its target is named inside the
@@ -287,6 +290,9 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 		// end, because clearing the target is part of this write and the
 		// pipeline is allowed to be reading the target. See writeSink.
 		temp := fmt.Sprintf("%sout.%d", meta.ScratchPrefix, time.Now().UnixNano())
+		if err := c.r.shapeLike(ctx, outDB, outColl, temp, bypass); err != nil {
+			return nil, err
+		}
 		return &writeSink{
 			r: c.r, how: "replaced on both tiers, so the result is all that is left",
 			target: target, claimNS: target,
@@ -295,6 +301,7 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 			tieredColl:    c.r.hot.Database(outDB).Collection(outColl),
 			tieredArchive: c.r.cold.Database(outDB).Collection(outColl),
 			guardReserved: true,
+			bypass:        bypass,
 		}, nil
 	}
 
@@ -308,9 +315,97 @@ func (c *conn) newWriteSink(ctx context.Context, final bson.Raw, db string) (*wr
 	}, nil
 }
 
+// shapeLike creates the temporary collection a tiered $out builds its result
+// in with the target's validator and unique indexes.
+//
+// fill clears both tiers before it writes the result into the target, so
+// whatever refuses the result has to refuse it before then. mongod's own $out
+// builds into a temporary collection that carries the target's indexes and
+// validator, and a result breaking either fails there and leaves the target as
+// it was. This one carried neither: a result with two documents sharing a
+// unique value, or one the validator rejects, failed only once fill was
+// writing it, with the fast tier's copy deleted and the archive's history
+// marked deleted, and the target read as empty.
+//
+// Without the validator when the command asked to bypass it, as mongod does.
+func (r *Router) shapeLike(ctx context.Context, db, target, temp string, bypass bool) error {
+	hdb := r.hot.Database(db)
+	create := options.CreateCollection()
+	specs, err := hdb.ListCollectionSpecifications(ctx, bson.D{{Key: "name", Value: target}})
+	if err != nil {
+		return fmt.Errorf("read the options of %s.%s: %w", db, target, err)
+	}
+	if len(specs) == 1 && !bypass {
+		opts := specs[0].Options
+		if v, ok := opts.Lookup("validator").DocumentOK(); ok {
+			create.SetValidator(v)
+		}
+		if v, ok := opts.Lookup("validationLevel").StringValueOK(); ok {
+			create.SetValidationLevel(v)
+		}
+		if v, ok := opts.Lookup("validationAction").StringValueOK(); ok {
+			create.SetValidationAction(v)
+		}
+	}
+	if err := hdb.CreateCollection(ctx, temp, create); err != nil {
+		return fmt.Errorf("create the result collection for %s.%s: %w", db, target, err)
+	}
+	cur, err := hdb.Collection(target).Indexes().List(ctx)
+	if err != nil {
+		return fmt.Errorf("read the indexes of %s.%s: %w", db, target, err)
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	var models []mongo.IndexModel
+	for cur.Next(ctx) {
+		spec := cur.Current
+		if unique, _ := spec.Lookup("unique").BooleanOK(); !unique {
+			continue
+		}
+		key, ok := spec.Lookup("key").DocumentOK()
+		if !ok {
+			continue
+		}
+		io := options.Index().SetUnique(true)
+		if name, nok := spec.Lookup("name").StringValueOK(); nok {
+			io.SetName(name)
+		}
+		if v, pok := spec.Lookup("partialFilterExpression").DocumentOK(); pok {
+			io.SetPartialFilterExpression(v)
+		}
+		if v, sok := spec.Lookup("sparse").BooleanOK(); sok {
+			io.SetSparse(v)
+		}
+		if v, cok := spec.Lookup("collation").DocumentOK(); cok {
+			var c options.Collation
+			if bson.Unmarshal(v, &c) == nil {
+				io.SetCollation(&c)
+			}
+		}
+		models = append(models, mongo.IndexModel{Keys: key, Options: io})
+	}
+	if err := cur.Err(); err != nil {
+		return fmt.Errorf("read the indexes of %s.%s: %w", db, target, err)
+	}
+	if len(models) > 0 {
+		if _, err := hdb.Collection(temp).Indexes().CreateMany(ctx, models); err != nil {
+			_ = hdb.Collection(temp).Drop(context.WithoutCancel(ctx))
+			return fmt.Errorf("give the result collection the unique indexes of %s.%s: %w", db, target, err)
+		}
+	}
+	return nil
+}
+
 // fill moves a tiered $out's result from the temporary collection into the
 // target, having first cleared what the target held on both tiers.
 func (s *writeSink) fill(ctx context.Context) error {
+	// Mirroring has to have caught up before the clear, for the same reason a
+	// copy-up waits: a claim this fill makes is judged against owners the
+	// archive may not yet know are gone, and a refusal after the clear leaves
+	// the target empty. Before it, nothing has changed.
+	if err := s.r.archiveIsFresh(ctx, s.target, 0, "replacing a collection before mirroring caught up",
+		"the keys this result claims may be judged against documents already deleted"); err != nil {
+		return err
+	}
 	if _, err := s.tieredColl.DeleteMany(ctx, bson.D{}); err != nil {
 		return fmt.Errorf("clear %s: %w", s.target, err)
 	}
@@ -363,7 +458,8 @@ func (s *writeSink) fill(ctx context.Context) error {
 		if cerr := s.claim(ctx, batch); cerr != nil {
 			return cerr
 		}
-		if _, ierr := s.tieredColl.InsertMany(ctx, batch); ierr != nil {
+		if _, ierr := s.tieredColl.InsertMany(ctx, batch,
+			options.InsertMany().SetBypassDocumentValidation(s.bypass)); ierr != nil {
 			return ierr
 		}
 		batch = batch[:0]
@@ -801,12 +897,9 @@ func (s *writeSink) claim(ctx context.Context, batch []any) error {
 		}
 		docs = append(docs, raw)
 	}
+	// errArchiveBehind is logged with the rest: fill waited for mirroring
+	// before it cleared the target, and an error from here leaves it empty.
 	_, clashes, err := s.r.claimKeys(ctx, s.claimNS, docs, idxs, false)
-	if errors.Is(err, errArchiveBehind) {
-		// Not written unclaimed: an owner the archive alone still holds may be
-		// a real duplicate. See clashIsFreshOrBehind.
-		return err
-	}
 	if err != nil {
 		s.r.log.Warn("could not claim the keys a $out writes",
 			"ns", s.claimNS, "err", err,

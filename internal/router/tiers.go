@@ -1905,6 +1905,15 @@ func (r *Router) relayedError(requestID, responseTo int32, errmsg string, err er
 			return r.commandErrorWithCode(requestID, responseTo, errmsg, int32(c), "")
 		}
 	}
+	// What InsertMany returns, and so what a $out's result collection refusing
+	// a document comes back as: E11000 from a unique index, 121 from the
+	// validator. Both are mongod's answer to the client's own pipeline.
+	var bwe mongo.BulkWriteException
+	if errors.As(err, &bwe) && len(bwe.WriteErrors) > 0 {
+		if c := bwe.WriteErrors[0].Code; c != 0 && !isStateChangeCode(c) {
+			return r.commandErrorWithCode(requestID, responseTo, errmsg, int32(c), "")
+		}
+	}
 	return r.commandError(requestID, responseTo, errmsg)
 }
 
