@@ -11,8 +11,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/meta"
+	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 

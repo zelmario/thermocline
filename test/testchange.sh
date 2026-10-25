@@ -533,8 +533,23 @@ SHAPED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --
     sleep(250);
   }
   cs.close(); print(out);" 2>&1 | tail -1)
-chk "and a field the stream's own stage removed stays out" "NULL" "$SHAPED"
+# What MongoDB gives: the document, without the field the stage removed. The
+# stage runs here, after the fill; see splitStreamPipeline.
+chk "and a field the stream's own stage removed stays out" "CLEAN" "$SHAPED"
 grep -q "LEAKED" <<<"$SHAPED" && echo "  (the archive's copy was filled in past the stream's own \$project)"
+# And a $match on the document: mongod dropped the event on its null lookup,
+# before this router could fill it, and the update was lost.
+MATCHED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$match:{'fullDocument.v':'looked up'}}],
+    {fullDocument:'updateLookup', startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  for (let i=0;i<40;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = e.fullDocument ? 'HAS '+e.fullDocument.v : 'NULL'; break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "and a \$match on the document still sees the update" "HAS looked up" "$MATCHED"
 
 fi
 if inpart 2; then

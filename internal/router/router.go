@@ -1027,6 +1027,12 @@ type conn struct {
 	// until the reply says whether it did. See finishIndexDrop.
 	indexDrop *pendingIndexDrop
 
+	// sendInstead is a command a guard rewrote, forwarded in place of the one
+	// the client sent, and csTail the change stream stages it took out of it,
+	// for the cursor the reply opens. See splitStreamPipeline.
+	sendInstead *wire.Message
+	csTail      bson.A
+
 	// aggAuth are the completeness claims that let the fast tier run the
 	// aggregation now in flight, held until the reply says whether it left a
 	// cursor open. An aggregation is judged before it runs, unlike a find, so
@@ -1245,6 +1251,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	c.spec, c.mspec = nil, nil
 	c.rename = nil
 	c.indexDrop = nil
+	c.sendInstead, c.csTail = nil, nil
 
 	// A handshake is answered here rather than forwarded, because a pooled
 	// connection can only carry one. See answerHello.
@@ -1596,6 +1603,10 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			msg = c.dropSpeculativeAuth(msg)
 			msg = c.dropClientMetadata(msg)
 		}
+	}
+
+	if c.sendInstead != nil {
+		msg, c.sendInstead = c.sendInstead, nil
 	}
 
 	// A read that asked for a secondary goes to one, when there is one to use

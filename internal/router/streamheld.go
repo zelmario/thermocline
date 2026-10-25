@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -99,16 +100,38 @@ func (reg *changeStreamRegistry) release(id int64) {
 // fillBounded fills events in order until the next one would take the batch
 // past streamBatchBytes, and returns the filled ones and the rest as they came.
 // At least one event is always returned, so a single large one still goes.
-func (r *Router) fillBounded(ctx context.Context, events bson.A) (bson.A, bson.A, int) {
+//
+// tail is the stream's own stages this router applies, after the fill, to each
+// chunk as a whole; with them the batch is cut between chunks, so what is held
+// for the next getMore is still events as mongod sent them. See
+// splitStreamPipeline.
+func (r *Router) fillBounded(ctx context.Context, events, tail bson.A, db string) (bson.A, bson.A, int, error) {
 	out := make(bson.A, 0, len(events))
 	used, filled := 0, 0
 	for start := 0; start < len(events); start += fillChunk {
 		end := min(start+fillChunk, len(events))
-		chunk, _ := r.fillLookups(ctx, events[start:end])
+		chunk, n := r.fillLookups(ctx, events[start:end])
+		if len(tail) > 0 {
+			shaped, err := r.applyStreamTail(ctx, db, tail, chunk)
+			if err != nil {
+				return nil, nil, 0, err
+			}
+			size := 0
+			for _, ev := range shaped {
+				size += eventSize(ev)
+			}
+			if len(out) > 0 && used+size > streamBatchBytes {
+				return out, events[start:], filled, nil
+			}
+			out = append(out, shaped...)
+			used += size
+			filled += n
+			continue
+		}
 		for i, ev := range chunk {
 			size := eventSize(ev)
 			if len(out) > 0 && used+size > streamBatchBytes {
-				return out, events[start+i:], filled
+				return out, events[start+i:], filled, nil
 			}
 			out = append(out, ev)
 			used += size
@@ -118,7 +141,14 @@ func (r *Router) fillBounded(ctx context.Context, events bson.A) (bson.A, bson.A
 			}
 		}
 	}
-	return out, nil, filled
+	return out, nil, filled, nil
+}
+
+// streamDB is the database a stream reply's cursor names.
+func streamDB(rdoc bson.Raw) string {
+	ns, _ := rdoc.Lookup("cursor", "ns").StringValueOK()
+	db, _ := splitNS(ns)
+	return db
 }
 
 // eventSize is an event's size as a document in the reply.
@@ -140,20 +170,29 @@ func eventSize(ev any) int {
 // the rest for the cursor's next getMore. It returns the events to send and
 // the token the reply should carry, which is the zero value when the batch
 // went whole and the reply's own token stands.
-func (c *conn) cutStreamBatch(ctx context.Context, id int64, rdoc bson.Raw, owner cursorOwner, keep bson.A) (bson.A, bson.RawValue, int) {
-	// Not filled, so nothing grows past what mongod already sized the batch
-	// to. See shapesFullDocument.
-	if c.r.changeStreams.isShaped(id) {
-		return keep, bson.RawValue{}, 0
-	}
+//
+// tail is the stream's own stages this router applies; see
+// splitStreamPipeline. A batch they changed is reported as changed whether or
+// not anything was filled, and an error from them is the getMore's.
+func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail bson.A, rdoc bson.Raw, owner cursorOwner,
+	keep bson.A) (bson.A, bson.RawValue, int, bool, error) {
+	db := streamDB(rdoc)
 	if id == 0 {
 		// A cursor mongod has closed has no getMore to hand the rest to.
 		out, filled := c.r.fillLookups(ctx, keep)
-		return out, bson.RawValue{}, filled
+		if len(tail) > 0 {
+			shaped, err := c.r.applyStreamTail(ctx, db, tail, out)
+			return shaped, bson.RawValue{}, filled, true, err
+		}
+		return out, bson.RawValue{}, filled, filled > 0, nil
 	}
-	out, rest, filled := c.r.fillBounded(ctx, keep)
+	out, rest, filled, err := c.r.fillBounded(ctx, keep, tail, db)
+	if err != nil {
+		return nil, bson.RawValue{}, 0, false, err
+	}
+	changed := filled > 0 || len(tail) > 0
 	if len(rest) == 0 {
-		return out, bson.RawValue{}, filled
+		return out, bson.RawValue{}, filled, changed, nil
 	}
 	h := &heldStream{
 		events: append(bson.A(nil), rest...),
@@ -175,7 +214,7 @@ func (c *conn) cutStreamBatch(ctx context.Context, id int64, rdoc bson.Raw, owne
 	c.r.changeStreams.hold(id, h)
 	c.log.Info("a change stream batch filled from the archive was past 16MB, handing it out over several getMores",
 		"cursor", id, "sent", len(out), "held", len(rest))
-	return out, lastEventID(out), filled
+	return out, lastEventID(out), filled, true, nil
 }
 
 // lastEventID is the resume token of the last event in a batch.
@@ -245,7 +284,15 @@ func (c *conn) serveHeldStream(ctx context.Context, msg *wire.Message, name stri
 			take = take[:n]
 		}
 	}
-	out, rest, _ := c.r.fillBounded(ctx, take)
+	out, rest, _, ferr := c.r.fillBounded(ctx, take, c.r.changeStreams.tailOf(id), splitDBOf(h.ns))
+	if ferr != nil {
+		h.mu.Unlock()
+		reply, rerr := c.streamTailError(msg, ferr)
+		if rerr != nil {
+			return true, rerr
+		}
+		return true, c.send(reply)
+	}
 	remaining := append(append(bson.A(nil), rest...), h.events[len(take):]...)
 	token := h.pbrt
 	if len(remaining) > 0 {
@@ -306,4 +353,27 @@ func replaceStreamBatch(reply bson.Raw, field string, keep bson.A, token bson.Ra
 		out = append(out, bson.E{Key: "cursor", Value: cursor})
 	}
 	return wire.NewMsg(requestID, requestID, out)
+}
+
+// splitDBOf is the database of a namespace string.
+func splitDBOf(ns string) string {
+	db, _ := splitNS(ns)
+	return db
+}
+
+// streamTailError is the reply for a getMore whose own stages failed here, the
+// way mongod would have answered them: 280 for a changed resume token, and
+// mongod's own code for anything it refused.
+func (c *conn) streamTailError(msg *wire.Message, err error) (*wire.Message, error) {
+	return c.streamTailErrorTo(msg.Header.RequestID, err)
+}
+
+// streamTailErrorTo is streamTailError answering the request with this id.
+func (c *conn) streamTailErrorTo(requestID int32, err error) (*wire.Message, error) {
+	if errors.Is(err, errResumeTokenModified) {
+		return c.r.commandErrorWithCode(requestID, requestID, err.Error(), 280, "ChangeStreamFatalError")
+	}
+	return c.r.relayedError(requestID, requestID,
+		"thermocline: this change stream's own stages, run here after its documents were filled from the "+
+			"archive, failed: "+err.Error(), err)
 }

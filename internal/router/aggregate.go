@@ -472,6 +472,7 @@ func (c *conn) guardAggregate(ctx context.Context, msg *wire.Message, db string)
 					"action", "start consumers fresh after a cutover, and check this stream is "+
 						"delivering rather than merely open")
 			}
+			c.splitStreamPipeline(ctx, msg, cmd, db)
 			c.log.Info("a change stream was opened on tiered data",
 				"watching", watching,
 				"note", "eviction and copy-up move documents in and out of the fast tier, and the "+

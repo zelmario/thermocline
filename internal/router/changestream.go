@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -83,26 +84,26 @@ type changeStreamRegistry struct {
 	// held is what a cursor was sent and has not yet been given. See
 	// streamheld.go.
 	held map[int64]*heldStream
-	// shaped records the streams whose own pipeline reads fullDocument, which
-	// are not filled from the archive. See shapesFullDocument.
-	shaped map[int64]bool
+	// tail is, per stream, the client's stages this router applies itself.
+	// See splitStreamPipeline.
+	tail map[int64]bson.A
 }
 
-// markShaped records a stream whose pipeline reads fullDocument.
-func (reg *changeStreamRegistry) markShaped(id int64) {
+// setTail records the stages a stream's cursor is to have applied here.
+func (reg *changeStreamRegistry) setTail(id int64, tail bson.A) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
-	if reg.shaped == nil {
-		reg.shaped = map[int64]bool{}
+	if reg.tail == nil {
+		reg.tail = map[int64]bson.A{}
 	}
-	reg.shaped[id] = true
+	reg.tail[id] = tail
 }
 
-// isShaped reports whether markShaped recorded this stream.
-func (reg *changeStreamRegistry) isShaped(id int64) bool {
+// tailOf is what setTail recorded for a stream.
+func (reg *changeStreamRegistry) tailOf(id int64) bson.A {
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
-	return reg.shaped[id]
+	return reg.tail[id]
 }
 
 func (reg *changeStreamRegistry) add(id int64, ns string) {
@@ -129,32 +130,121 @@ func (reg *changeStreamRegistry) drop(id int64) {
 	defer reg.mu.Unlock()
 	delete(reg.ns, id)
 	delete(reg.held, id)
-	delete(reg.shaped, id)
+	delete(reg.tail, id)
 }
 
-// shapesFullDocument reports whether a change stream's own stages, after
-// $changeStream, name fullDocument.
+// splitStreamPipeline takes the client's stages from the first that reads
+// fullDocument onwards out of a change stream the fast tier is asked to open,
+// for this router to apply to each batch once it has filled it.
 //
-// fillLookups puts the archive's copy into a null fullDocument after mongod has
-// run those stages, so they never saw it. With watch([{$project:
-// {"fullDocument.ssn": 0}}], {fullDocument: "updateLookup"}) mongod kept null
-// as null, and the fill put the whole document back, ssn included. Such a
-// stream is left as mongod answered it, null where the document was evicted:
-// a gap against an untiered collection, where it would carry the document,
-// but not a field the client removed. Read as bytes, so a stage naming it
-// anywhere, as a field or a "$fullDocument" path, counts.
-func shapesFullDocument(cmd bson.Raw) bool {
+// With fullDocument: "updateLookup" the lookup runs on the fast tier, and an
+// update to a document evicted before the event is read comes back null, which
+// fillLookups fills from the archive. That runs after mongod has applied the
+// stream's own stages, so they never saw the document. Two things went wrong:
+// a $project removing a field of it was undone, measured as watch([{$project:
+// {"fullDocument.secret": 0}}]) handed the whole document, secret included; and
+// a $match on a field of it dropped the event on mongod's null before this
+// router saw it, so those updates were lost.
+//
+// Run here, the stages see what MongoDB's would. They are tried once at open on
+// an empty input, so a stage mongod would refuse is left for mongod to refuse;
+// and a stream ending in $changeStreamSplitLargeEvent, which only the server
+// can apply, is left whole.
+func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) {
 	stages, ok := pipelineStages(cmd)
-	if !ok {
-		return false
+	if !ok || len(stages) < 2 {
+		return
 	}
-	for _, st := range stages[min(1, len(stages)):] {
-		if bytes.Contains(st.Value, []byte("fullDocument")) {
-			return true
+	at := -1
+	for i, st := range stages[1:] {
+		if bytes.Contains(st.Value, []byte("$changeStreamSplitLargeEvent")) {
+			return
+		}
+		if at < 0 && bytes.Contains(st.Value, []byte("fullDocument")) {
+			at = i + 1
 		}
 	}
-	return false
+	if at < 0 {
+		return
+	}
+	tail := make(bson.A, 0, len(stages)-at)
+	for _, st := range stages[at:] {
+		tail = append(tail, st)
+	}
+	try := append(bson.A{bson.D{{Key: "$documents", Value: bson.A{}}}}, tail...)
+	if err := c.r.hot.Database(db).RunCommand(ctx, bson.D{
+		{Key: "aggregate", Value: 1}, {Key: "pipeline", Value: try}, {Key: "cursor", Value: bson.D{}},
+	}).Err(); err != nil {
+		return
+	}
+	elems, err := cmd.Elements()
+	if err != nil {
+		return
+	}
+	head := make(bson.A, 0, at)
+	for _, st := range stages[:at] {
+		head = append(head, st)
+	}
+	rewritten := make(bson.D, 0, len(elems))
+	for _, e := range elems {
+		if e.Key() == "pipeline" {
+			rewritten = append(rewritten, bson.E{Key: "pipeline", Value: head})
+			continue
+		}
+		rewritten = append(rewritten, bson.E{Key: e.Key(), Value: e.Value()})
+	}
+	out, err := wire.NewMsg(msg.Header.RequestID, 0, rewritten)
+	if err != nil {
+		return
+	}
+	c.sendInstead, c.csTail = out, tail
 }
+
+// applyStreamTail runs a stream's own stages over a batch this router filled.
+// See splitStreamPipeline. The resume token is each event's _id, and a stage
+// that changed it is the error mongod gives for one.
+func (r *Router) applyStreamTail(ctx context.Context, db string, tail bson.A, events bson.A) (bson.A, error) {
+	if len(tail) == 0 || len(events) == 0 {
+		return events, nil
+	}
+	ids := make(map[string]bool, len(events))
+	docs := make(bson.A, 0, len(events))
+	for _, ev := range events {
+		raw, ok := ev.(bson.RawValue)
+		if !ok {
+			return events, nil
+		}
+		d, dok := raw.DocumentOK()
+		if !dok {
+			return events, nil
+		}
+		ids[string(d.Lookup("_id").Value)] = true
+		docs = append(docs, d)
+	}
+	pipeline := append(bson.A{bson.D{{Key: "$documents", Value: docs}}}, tail...)
+	cur, err := r.hot.Database(db).RunCommandCursor(ctx, bson.D{
+		{Key: "aggregate", Value: 1}, {Key: "pipeline", Value: pipeline}, {Key: "cursor", Value: bson.D{}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	out := bson.A{}
+	for cur.Next(ctx) {
+		d := append(bson.Raw(nil), cur.Current...)
+		if !ids[string(d.Lookup("_id").Value)] {
+			return nil, errResumeTokenModified
+		}
+		out = append(out, bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: d})
+	}
+	return out, cur.Err()
+}
+
+// errResumeTokenModified is mongod's 280 for a stage that changed an event's
+// _id, which is its resume token.
+var errResumeTokenModified = errors.New("Encountered an event whose _id field, which contains the resume token, " +
+	"was modified by the pipeline. Modifying the _id field of an event makes it impossible to resume the stream " +
+	"from that point. Only transformations that retain the unmodified _id field are allowed.")
 
 // streamScope names what a change stream is watching, and reports whether any
 // event it delivers could be about a collection this system tiers.
@@ -212,8 +302,9 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	c.r.changeStreams.add(id, watching)
-	if shapesFullDocument(cmd) {
-		c.r.changeStreams.markShaped(id)
+	if c.csTail != nil {
+		c.r.changeStreams.setTail(id, c.csTail)
+		c.csTail = nil
 	}
 	c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
 
@@ -241,8 +332,15 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	keep, dropped := c.r.sieveEvents(ctx, events)
-	keep, token, filled := c.cutStreamBatch(ctx, id, rdoc, c.owner(cmd), keep)
-	if dropped == 0 && filled == 0 && token.Type == 0 {
+	keep, token, _, changed, terr := c.cutStreamBatch(ctx, id, c.r.changeStreams.tailOf(id), rdoc, c.owner(cmd), keep)
+	if terr != nil {
+		out, rerr := c.streamTailErrorTo(reply.Header.ResponseTo, terr)
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	if dropped == 0 && !changed && token.Type == 0 {
 		return nil, false
 	}
 	if dropped > 0 {
@@ -293,8 +391,16 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	keep, dropped := c.r.sieveEvents(ctx, events)
 	// A lookup the fast tier could not answer is asked of the archive, because
 	// null means deleted and this document is not. See fillLookups.
-	keep, token, filled := c.cutStreamBatch(ctx, rid, rdoc, c.owner(cmd), keep)
-	if dropped == 0 && filled == 0 && token.Type == 0 {
+	gid, _ := intOf64(cmd.Lookup("getMore"))
+	keep, token, filled, changed, terr := c.cutStreamBatch(ctx, rid, c.r.changeStreams.tailOf(gid), rdoc, c.owner(cmd), keep)
+	if terr != nil {
+		out, rerr := c.streamTailError(msg, terr)
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	if dropped == 0 && !changed && token.Type == 0 {
 		return nil, false
 	}
 	if dropped > 0 {
