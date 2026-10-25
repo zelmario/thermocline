@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"encoding/binary"
@@ -1166,9 +1167,20 @@ func (c *Cache) Apply(ch Change) {
 	// Out of every list it was in. On a tiered namespace a document that left
 	// may only have been evicted, so the lists holding it go. See Tiers.
 	tiered := c.isTiered(ch.NS)
+	// A list with no sort, or a tie in one, is in mongod's own order, which for
+	// a document updated where it is does not change: its record id stays.
+	// Taken out and put back, it went after all its equals, so find({status:
+	// "new"}).limit(10) returned documents 2 to 11 after an update to the
+	// first, where mongod still returns 1 to 10. Where it still belongs and
+	// the sort cannot have moved it, it is replaced where it stands.
+	inPlace := map[*entry]bool{}
 	for e := range c.rev[id] {
 		if tiered && ch.Doc == nil {
 			c.drop(e)
+			continue
+		}
+		if c.replaceInPlace(e, id, ch.Doc) {
+			inPlace[e] = true
 			continue
 		}
 		c.removeDoc(e, id)
@@ -1206,6 +1218,9 @@ func (c *Cache) Apply(ch Change) {
 			if _, live := c.entries[e.key]; !live {
 				// Refused, and so dropped, by an earlier candidate.
 				break
+			}
+			if inPlace[e] {
+				continue
 			}
 			if !inBounds(e.bounds, values) {
 				continue
@@ -1312,6 +1327,53 @@ func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
 		b = append(b, k...)
 	}
 	return string(b), true
+}
+
+// replaceInPlace puts a document's new version where its old one stood in a
+// list, when it still belongs to that list and nothing it is sorted by has
+// changed. It reports whether it did. See Apply.
+func (c *Cache) replaceInPlace(e *entry, id string, d bson.Raw) bool {
+	sh := e.shape
+	if d == nil || sh.kind != KindFind || e.grp != nil {
+		return false
+	}
+	at := -1
+	for i, x := range e.docs {
+		if x.id == id {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return false
+	}
+	key, ok := c.keyOf(sh, d)
+	if !ok || key != e.group {
+		return false
+	}
+	values, ok := c.rangeValues(sh, d)
+	if !ok || !inBounds(e.bounds, values) || !c.fits(sh, e, d) {
+		return false
+	}
+	for _, s := range sh.sort {
+		if !bytes.Equal(rawField(e.docs[at].raw, s.Field), rawField(d, s.Field)) {
+			return false
+		}
+	}
+	nd := trimDoc(sh, d)
+	e.bytes += len(nd) - len(e.docs[at].raw)
+	c.bytes += len(nd) - len(e.docs[at].raw)
+	e.docs[at] = doc{id: id, raw: nd}
+	return true
+}
+
+// rawField is a field's type and bytes, for telling whether a value changed.
+func rawField(d bson.Raw, f string) []byte {
+	v, err := d.LookupErr(f)
+	if err != nil {
+		return nil
+	}
+	return append([]byte{byte(v.Type)}, v.Value...)
 }
 
 func (c *Cache) removeDoc(e *entry, id string) {

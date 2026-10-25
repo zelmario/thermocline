@@ -843,3 +843,29 @@ func TestSweepPrunesReadersAndUnusedShapes(t *testing.T) {
 		t.Error("the entry whose shape stayed is no longer answered")
 	}
 }
+
+// A list with no sort is in mongod's own order, and an update where the
+// document stands does not change that order. Taken out and put back at the
+// end, the first document moved past the others and limit(2) returned another
+// pair than mongod's.
+func TestUnsortedUpdateKeepsItsPlace(t *testing.T) {
+	q, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"},
+		{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
+		{Key: "limit", Value: int32(2)},
+	}))
+	if !ok {
+		t.Fatal("an unsorted listing was not understood")
+	}
+	c := New(1 << 20)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
+		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("miss")
+	}
+	if ids := ids(t, got); fmt.Sprint(ids) != "[p1 p2]" {
+		t.Errorf("after an update to p1 the list is %v, want [p1 p2] as mongod keeps it", ids)
+	}
+}
