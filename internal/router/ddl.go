@@ -160,6 +160,10 @@ const renameMaxLag = 2 * time.Second
 type pendingRename struct {
 	from string
 	to   string
+	// dropTarget says the archive has a collection under the new name holding
+	// only documents the application deleted, which the archive's rename has
+	// to replace. See guardRename.
+	dropTarget bool
 }
 
 func (c *conn) guardRename(ctx context.Context, msg *wire.Message, cmd bson.Raw) (*wire.Message, bool) {
@@ -203,17 +207,43 @@ func (c *conn) guardRename(ctx context.Context, msg *wire.Message, cmd bson.Raw)
 		}
 	}
 
-	// dropTarget replaces whatever is at the new name. On the fast tier that is
-	// the client's business; in the archive it is the one thing that must never
-	// happen by accident.
-	if boolField(cmd, "dropTarget") {
-		if held, err := c.r.archiveHolds(ctx, to); err != nil {
-			return refuse("the archive could not be checked, and a dropTarget rename that cannot be " +
-				"checked could destroy archived documents: " + err.Error())
-		} else if held {
-			return refuse("dropTarget would destroy the archived documents of " + to +
-				", which no fast tier command is allowed to do. Move or remove them first")
-		}
+	// The archive's half runs on the reply. Unacknowledged, there is none: the
+	// fast tier renamed, and the archive, the claim and the residency records
+	// stayed under the old name, so reads of the new name missed its archived
+	// history and reads of the old one still found it. The same family as an
+	// unacknowledged dropIndexes, refused the same way.
+	if msg.MoreToCome() {
+		return refuse("the command asks for no acknowledgement, and the archive is renamed only once " +
+			"the reply says the fast tier was. Send it without writeConcern {w: 0}")
+	}
+
+	// What the archive holds under the new name decides whether its half can
+	// follow the fast tier's. Live documents there are refused with or without
+	// dropTarget. With it they would be destroyed, which no fast tier command
+	// is allowed to do. Without it the fast tier renames, having no collection
+	// of that name, and the archive's rename fails on the one it has: a drop
+	// through the router leaves the archive's copy in place, so this is the
+	// ordinary way to get there, and the client was told ok over two tiers
+	// left under different names.
+	held, herr := c.r.archiveHolds(ctx, to)
+	switch {
+	case herr != nil:
+		return refuse("the archive could not be checked for documents under the new name, and a rename " +
+			"it cannot follow splits the tiers: " + herr.Error())
+	case held && boolField(cmd, "dropTarget"):
+		return refuse("dropTarget would destroy the archived documents of " + to +
+			", which no fast tier command is allowed to do. Move or remove them first")
+	case held:
+		return refuse("the archive still holds documents under " + to + ", which a drop through this " +
+			"router leaves in place, so the fast tier would rename and the archive could not. Move or " +
+			"remove them first")
+	}
+	// Nothing live, but a collection may still be there holding the documents
+	// the application deleted, which the archive's rename has to replace.
+	toDB, toColl := splitNS(to)
+	names, nerr := c.r.cold.Database(toDB).ListCollectionNames(ctx, bson.D{{Key: "name", Value: toColl}})
+	if nerr != nil {
+		return refuse("the archive could not be checked for a collection under the new name: " + nerr.Error())
 	}
 
 	if mirroring := c.r.mirroringLag(ctx); !mirroring.known {
@@ -227,7 +257,7 @@ func (c *conn) guardRename(ctx context.Context, msg *wire.Message, cmd bson.Raw)
 
 	// Everything the archive needs is decided; the fast tier decides the rest,
 	// including whether this client may do it at all.
-	c.rename = &pendingRename{from: from, to: to}
+	c.rename = &pendingRename{from: from, to: to, dropTarget: len(names) > 0}
 	return nil, false
 }
 
@@ -264,10 +294,15 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 	}
 
 	fromDB, fromColl := splitNS(op.from)
-	err := c.r.cold.Database("admin").RunCommand(ctx, bson.D{
+	rename := bson.D{
 		{Key: "renameCollection", Value: op.from},
 		{Key: "to", Value: op.to},
-	}).Err()
+	}
+	if op.dropTarget {
+		// Only documents the application deleted are there; see guardRename.
+		rename = append(rename, bson.E{Key: "dropTarget", Value: true})
+	}
+	err := c.r.cold.Database("admin").RunCommand(ctx, rename).Err()
 	switch {
 	case err == nil:
 		c.log.Info("renamed the archive to follow the fast tier", "from", op.from, "to", op.to)

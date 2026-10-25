@@ -201,6 +201,37 @@ DT=$(R "
 chk "dropTarget over archived documents is refused"     "REFUSED" "$DT"
 chk "and they are still there"                          "1"     "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 
+echo "== a rename onto a name the archive still holds =="
+# A drop through the router leaves the archive's copy in place, so the fast tier
+# then has no collection under that name and the archive has one. Without
+# dropTarget the fast tier renamed, the archive's rename failed NamespaceExists
+# and was only logged, and the client was told ok over two split tiers.
+R "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+chk "the archive keeps the dropped collection"          "1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
+chk "a rename onto it is refused"                       "REFUSED" "$(R "
+  try { db.adminCommand({renameCollection:'$DB.${NS}2', to:'$DB.$NS'}); print('ALLOWED'); }
+  catch(e) { print(/still holds documents/.test(e.message)?'REFUSED':e.message.substring(0,60)); }")"
+chk "  and nothing moved on the fast tier"              "3" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).${NS}2.countDocuments({}))")"
+# Holding only documents the application deleted, the archive's collection is
+# replaced, and the tiers follow each other.
+C "db.getSiblingDB(process.env.TC_DB).$NS.updateMany({},{\$set:{_tcDeletedAt:new Date()}})" >/dev/null
+chk "over one holding only deletions it goes ahead"     "MOVED" "$(R "
+  try { const r=db.adminCommand({renameCollection:'$DB.${NS}2', to:'$DB.$NS'}); print(r.ok===1?'MOVED':'ok='+r.ok); }
+  catch(e) { print('REFUSED: '+e.message.substring(0,60)); }")"
+sleep 2
+chk "  and the archive followed"                        "10 0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}})+' '+db.getSiblingDB(process.env.TC_DB).${NS}2.countDocuments({}))")"
+
+echo "== an unacknowledged rename =="
+# The archive's half runs on the reply, and w: 0 has none: the fast tier
+# renamed and the archive, the claim and the residency stayed behind.
+R "db.adminCommand({renameCollection:'$DB.$NS', to:'$DB.${NS}2', writeConcern:{w:0}})" >/dev/null 2>&1
+sleep 2
+chk "it is not performed"                               "3 0" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({})+' '+db.getSiblingDB(process.env.TC_DB).${NS}2.countDocuments({}))")"
+
 echo "== mapReduce over a tiered collection =="
 # Deprecated, rare, and it reads every document it is pointed at. Run against a
 # fast tier holding three of ten it produces a total of three and reports
@@ -224,6 +255,9 @@ chk "mapReduce does not silently count three"           "true" \
 # per document against a tier holding part of the collection. The input here is
 # untiered on purpose, so the check above cannot be what refuses it.
 H "db.getSiblingDB(process.env.TC_DB).umrsrc.drop(); db.getSiblingDB(process.env.TC_DB).umrsrc.insertMany([{_id:1,n:1},{_id:2,n:2}])" >/dev/null
+# What the archive holds there now, so the check below is about what mapReduce
+# did rather than what the sections before it left.
+MRBEFORE=$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")
 MRO() { # MRO OUTSPEC
   R "
   try {
@@ -238,7 +272,7 @@ MRO() { # MRO OUTSPEC
 chk "mapReduce replacing a tiered collection refused"   "REFUSED" "$(MRO "{replace:'$NS'}")"
 chk "mapReduce merging into one refused"                "REFUSED" "$(MRO "{merge:'$NS'}")"
 chk "mapReduce reducing into one refused"               "REFUSED" "$(MRO "{reduce:'$NS'}")"
-chk "  and it wrote nothing there"                      "1" \
+chk "  and it wrote nothing there"                      "$MRBEFORE" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_tcDeletedAt:{\$exists:false}}))")"
 chk "an untiered output is still allowed"               "ALLOWED" "$(MRO "{replace:'umrout'}")"
 chk "  and it wrote the total there"                    "2" \
