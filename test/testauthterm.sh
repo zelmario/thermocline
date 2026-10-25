@@ -98,6 +98,18 @@ for _ in $(seq 1 30); do
     --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && break
   sleep 1
 done
+
+# A driver's bulkWrite, which sends ops and nsInfo as payload sequences. The
+# gate read nsInfo from the body and refused every one as unreadable; mongosh
+# inlines both and was let through.
+if [ -x /root/seqwrite ]; then
+  BW=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" tatbw bulk 2>&1 | tail -1)
+  chk "a driver's bulkWrite is authorized"              "ACCEPTED all three" "$BW"
+  mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
+    --eval 'db.getSiblingDB(process.env.TC_DB).tatbw.drop()' >/dev/null 2>&1
+else
+  echo "      SKIP  /root/seqwrite is not built (1 check)"
+fi
 if ! mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet \
       --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
   echo "  FATAL  the router never came up on $PORT"; exit 2

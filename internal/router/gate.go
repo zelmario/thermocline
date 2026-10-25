@@ -52,7 +52,14 @@ func (c *conn) gate(msg *wire.Message, name, db string) (*wire.Message, bool) {
 	// where authorization would look for one. See bulkWriteNeeds.
 	var needs []authz.Need
 	if name == "bulkWrite" {
-		bn, readable := bulkWriteNeeds(cmd, msg)
+		// With its payload sequences: a driver sends nsInfo as one, and read
+		// from the body every driver bulkWrite was refused as unreadable.
+		// See wire.Inlined.
+		bcmd := cmd
+		if in, ierr := msg.Inlined(); ierr == nil {
+			bcmd = in
+		}
+		bn, readable := bulkWriteNeeds(bcmd, msg)
 		if !readable {
 			c.r.Stats.Refused.Add(1)
 			c.cls = ClassRefused
