@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/promote"
+	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/wire"
 )
 
@@ -473,7 +474,7 @@ func (r *Router) viewChainMatches(ctx context.Context, ns string) bool {
 			return hop > 0
 		}
 		cold, coldOK := viewDefinition(ctx, r.cold, at)
-		if !coldOK || !hot.equals(cold) || hot.joins() {
+		if !coldOK || !hot.equals(cold) || hot.joins() || !hot.keepsTombstones() {
 			return false
 		}
 		at = db + "." + hot.on
@@ -500,6 +501,83 @@ type viewSpec struct {
 	on        string
 	pipeline  []byte
 	collation []byte
+}
+
+// keepsTombstones reports whether the view's pipeline leaves the archive's
+// deletion mark where the router's filter can see it.
+//
+// The archive's copy of a view is the same definition, so its pipeline runs
+// over every document the archive holds, the ones marked deleted included, and
+// the router's filter that hides those is applied to what the view returns.
+// That holds only while each stage passes documents through one for one with
+// the mark on them. An inclusion $project drops the mark, a $group or
+// $replaceRoot builds new documents, and a $limit counts deleted ones against
+// its number. Measured: a view projecting three fields, read from the archive,
+// returned an order deleted through the router, where MongoDB returns none.
+//
+// So only stages known to keep it are answered there; any other view is
+// refused when the fast tier cannot answer it, as a joining one is.
+func (v viewSpec) keepsTombstones() bool {
+	arr, err := bson.Raw(v.pipeline).Values()
+	if err != nil {
+		return false
+	}
+	for _, st := range arr {
+		doc, ok := st.DocumentOK()
+		if !ok {
+			return false
+		}
+		elems, err := doc.Elements()
+		if err != nil || len(elems) != 1 {
+			return false
+		}
+		name, val := elems[0].Key(), elems[0].Value()
+		switch name {
+		case "$match", "$sort":
+		case "$addFields", "$set":
+			fields, ok := val.DocumentOK()
+			if !ok {
+				return false
+			}
+			if _, err := fields.LookupErr(meta.TombstoneField); err == nil {
+				return false
+			}
+		case "$unset":
+			names := []bson.RawValue{val}
+			if a, ok := val.ArrayOK(); ok {
+				names, _ = a.Values()
+			}
+			for _, n := range names {
+				if s, _ := n.StringValueOK(); s == meta.TombstoneField {
+					return false
+				}
+			}
+		case "$project":
+			fields, ok := val.DocumentOK()
+			if !ok {
+				return false
+			}
+			pe, err := fields.Elements()
+			if err != nil {
+				return false
+			}
+			// Exclusions only: an inclusion keeps the fields it names and
+			// drops the mark.
+			for _, f := range pe {
+				if f.Key() == meta.TombstoneField || safeBool(f.Value()) {
+					return false
+				}
+				if _, isNum := intOf64(f.Value()); !isNum {
+					if _, isBool := f.Value().BooleanOK(); !isBool {
+						return false
+					}
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // joins reports whether the view's own pipeline reads another collection.

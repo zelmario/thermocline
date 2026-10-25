@@ -170,7 +170,7 @@ C "db.getSiblingDB(process.env.TC_DB).tqview.drop()" >/dev/null
 # archive by any router starting afterwards, so one left there by an earlier run
 # makes "the archive has never heard of this view" false before the run begins,
 # and every check that rests on it then passes or fails for that reason instead.
-for v in vqview vqview2 vqchain vqchainbad vqjoin; do
+for v in vqview vqview2 vqchain vqchainbad vqjoin vqproj; do
   H "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$v.drop()" >/dev/null
 done
@@ -255,6 +255,23 @@ chk "a view over a view answers in full"               "10" \
 R "db.getSiblingDB(process.env.TC_DB).createView('vqchainbad','vqview',[])" >/dev/null
 chk "a chain whose second link is missing is refused"  "REFUSED" \
     "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqchainbad.countDocuments({}))}catch(e){print('REFUSED')}")"
+
+# The archive's copy of a view runs over every document the archive holds,
+# deleted ones included, and the router hides those by their mark on what the
+# view returns. A view that drops the mark returns them: an inclusion $project
+# answered 10 here after a delete through the router, where MongoDB says 9.
+R "db.getSiblingDB(process.env.TC_DB).createView('vqproj','tqview',[{\$project:{n:1, grp:1}}])" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).tqview.deleteOne({_id:8})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).tqview.countDocuments({_id:8, _tcDeletedAt:{\$exists:true}}))")" = "1" ] && break
+  sleep 0.5
+done
+chk "a view that drops the deletion mark is refused"   "REFUSED" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqproj.countDocuments({}))}catch(e){print('REFUSED')}")"
+chk "  while one that keeps it counts the delete"      "9" \
+    "$(R "try{print(db.getSiblingDB(process.env.TC_DB).vqview2.countDocuments({}))}catch(e){print('REFUSED')}")"
+# Put back, because the sections below count what the fast tier holds.
+R "db.getSiblingDB(process.env.TC_DB).tqview.insertOne({_id:8, n:8, grp:'g'})" >/dev/null
 
 echo "== a view dropped through the router is dropped in the archive too =="
 # A view created through the router is mirrored down, so the archive can answer

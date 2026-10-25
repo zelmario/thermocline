@@ -924,6 +924,17 @@ Part of [Thermocline](../README.md).
   this has none. Under `permissive` it is forwarded with a warning. Warm the
   joined collection to have it answered.
 
+- **A view that reshapes documents is answered from the fast tier only.** The
+  archive's copy of a view runs over every document the archive holds, the
+  ones marked deleted included, and the router hides those by their mark on
+  what the view returns. A view whose stages drop the mark or build new
+  documents, such as an inclusion `$project`, `$group`, `$replaceRoot` or
+  `$limit`, would return them. Measured on 2026-10-25: a view projecting two
+  fields counted 10 after a delete through the router, where MongoDB counts 9.
+  Such a view is now refused when the fast tier cannot answer it. A view made
+  of `$match`, `$sort`, `$set`, `$addFields`, `$unset` and exclusion
+  `$project` stages keeps the mark and is still answered from the archive.
+
 - **A view whose own pipeline joins a tiered collection is refused unless the
   fast tier holds that collection in full.** A view's `$lookup` is in the view's
   definition, not in the query, so nothing about the query says the join is
