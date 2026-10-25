@@ -63,6 +63,14 @@ func provenNewestFirst(cmd, reply bson.Raw, ageField string, known bool, mark wa
 		// this cannot speak for.
 		return false
 	}
+	// The proof reads the age off the last returned document, and the sort
+	// ran on the stored field. A find takes computed projections (4.4+), so
+	// {createdAt: "$updatedAt"} returned a recent value in place of an old
+	// one and the proof passed over an archived document the page should have
+	// held. The aggregate path checks the same thing: see reshapeKeepsAge.
+	if proj, has := cmd.Lookup("projection").DocumentOK(); has && !reshapeKeepsAge("$project", proj, ageField) {
+		return false
+	}
 	return provenBatch(reply, limit, ageField, mark)
 }
 

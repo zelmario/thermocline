@@ -63,6 +63,10 @@ func TestProvenNewestFirst(t *testing.T) {
 			find(bson.D{{Key: "other", Value: -1}, {Key: "at", Value: -1}}, 2), replyOf(inside, inside)},
 		{"no sort at all", find(nil, 2), replyOf(inside, inside)},
 		{"an empty batch", find(desc, 2), replyOf()},
+		// The sort runs on the stored field and the proof reads the returned
+		// one, which a computed projection can replace.
+		{"a projection computing the age field", withProjection(t, find(desc, 2),
+			bson.D{{Key: "at", Value: "$updatedAt"}}), replyOf(inside, inside)},
 	}
 	for _, c := range bad {
 		t.Run(c.name, func(t *testing.T) {
@@ -151,5 +155,28 @@ func TestProvenNewestFirstRefusesANegativeLimit(t *testing.T) {
 		{Key: "ok", Value: 1.0}})
 	if provenNewestFirst(cmd, reply, "at", true, mark) {
 		t.Error("a negative limit was read as a count")
+	}
+}
+
+func withProjection(t *testing.T, cmd bson.Raw, proj bson.D) bson.Raw {
+	t.Helper()
+	var d bson.D
+	if err := bson.Unmarshal(cmd, &d); err != nil {
+		t.Fatal(err)
+	}
+	return rawDoc(t, append(d, bson.E{Key: "projection", Value: proj}))
+}
+
+func TestProvenNewestFirstKeepsAPlainProjection(t *testing.T) {
+	from := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	mark := watermark.Mark{Claimed: true, From: from}
+	cmd := withProjection(t, rawDoc(t, bson.D{{Key: "find", Value: "orders"}, {Key: "filter", Value: bson.D{}},
+		{Key: "sort", Value: bson.D{{Key: "at", Value: -1}}}, {Key: "limit", Value: 1}}),
+		bson.D{{Key: "at", Value: 1}, {Key: "n", Value: 1}})
+	reply := rawDoc(t, bson.D{{Key: "cursor", Value: bson.D{{Key: "id", Value: int64(0)}, {Key: "ns", Value: "shop.orders"},
+		{Key: "firstBatch", Value: bson.A{bson.D{{Key: "_id", Value: 1}, {Key: "at", Value: from.Add(time.Hour)}}}}}},
+		{Key: "ok", Value: 1.0}})
+	if !provenNewestFirst(cmd, reply, "at", true, mark) {
+		t.Error("an include of the age field changes nothing about its value, and should still prove")
 	}
 }
