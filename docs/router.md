@@ -826,6 +826,15 @@ A database rather than a collection, because a pipeline's `$lookup` and
 `$unionWith` and a view's definition name collections of their own database
 only. When any step cannot be had the read clears the two bars as before.
 
+Two conditions keep the shortcut to one history. `hello` must come from a node
+that says it is the writable primary, because the driver can still select one
+that has stepped down, and its `lastWrite` is older than writes the new primary
+has acknowledged. And the tail must have read up to that position in the same
+term `hello` reports. Across an election the tail can still be reading the old
+primary, past the new one's `lastWrite` by timestamp without having read any of
+its writes, and a term has one primary. A read that already clears the ordinary
+bar never asks `hello` at all.
+
 | | sales report, p50 | barrier wait, mean |
 |---|---|---|
 | waiting for the present | 18.8 ms | 22.5 ms |
