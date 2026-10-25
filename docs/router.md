@@ -46,9 +46,14 @@ Range queries are governed by the watermark below.
   What remains is the application's own writes, and nothing else is added or
   reordered. See below for how far behind a consumer may be before this stops
   holding.
-- **Bulk writes are only miss-resolved one statement at a time.** A batch that
-  matched nothing is left as the fast tier answered it. Unique keys and
-  multi-document writes are handled across the whole batch.
+- **A batch of single-document statements is resolved before it runs, one
+  statement at a time.** The reply's count is the batch's total, so it cannot
+  say which statement missed; until 2026-10-25 a batch of two `deleteOne`s of
+  archived documents answered `deletedCount: 0` and left both readable. Each
+  statement's document is now brought up first, the way an unacknowledged
+  write's is, which costs a fast tier lookup per statement and an archive
+  lookup for each that misses. A command of one statement is still resolved on
+  its reply, at no cost when it hits.
 - **Authentication is proxied by default, and can be terminated.** Everything in
   the next two bullets describes the default. Setting `router.terminate_auth`
   changes the architecture: the router verifies the client's password itself,

@@ -118,6 +118,24 @@ chk "it returns the archived document"                  "d@x" \
 sleep 5
 chk "and the archive stops returning it"                "false" "$(liveInCold tsdel 3)"
 
+echo "== several single-document statements in one command =="
+# The reply resolves a single-document statement only when it is the command's
+# only one, because n says whether that one missed. With several, n is their
+# total: two deleteOnes by _id of archived documents answered deletedCount 0
+# and both stayed readable. A driver's bulkWrite sends exactly this.
+seed tsdel "{_id:10, email:'m1@x'}"
+seed tsdel "{_id:11, email:'m2@x'}"
+seed tsupd "{_id:10, email:'u1@x', balance:1}"
+seed tsupd "{_id:11, email:'u2@x', balance:1}"
+chk "two deleteOnes of archived documents delete both"  "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tsdel.bulkWrite([{deleteOne:{filter:{_id:10}}},{deleteOne:{filter:{email:'m2@x'}}}]).deletedCount)")"
+chk "  and neither is readable after"                   "0" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tsdel.countDocuments({_id:{\$in:[10,11]}}))")"
+chk "two updateOnes of archived documents modify both"  "2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tsupd.bulkWrite([{updateOne:{filter:{_id:10},update:{\$inc:{balance:1}}}},{updateOne:{filter:{email:'u2@x'},update:{\$inc:{balance:1}}}}]).modifiedCount)")"
+chk "  each once"                                       "2,2" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).tsupd.find({_id:{\$in:[10,11]}}).sort({_id:1}).toArray().map(d=>d.balance).join(','))")"
+
 echo "== insert of an _id the archive still holds =="
 # One cluster answers E11000 here. Anything else both hides the collision and
 # lets the feeder mirror the new document over the archived one.

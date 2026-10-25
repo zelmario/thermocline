@@ -82,10 +82,16 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 	// An unacknowledged write is judged here whatever it names, because nothing
 	// downstream will judge it. See the note above this function.
 	repliable := !msg.MoreToCome()
+	// And so is a command of more than one statement. The reply resolves a
+	// single-document statement only when it is the command's only one: its n
+	// says whether that one missed. With several, n is their total, so a miss
+	// was never resolved: two deleteOnes by _id of archived documents answered
+	// deletedCount 0 and both stayed readable, where MongoDB deletes both.
+	answeredAfter := repliable && len(stmts) == 1
 
 	for _, st := range stmts {
 		multi := statementIsMulti(st, name)
-		if !multi && repliable {
+		if !multi && answeredAfter {
 			continue
 		}
 		fval, ferr := st.LookupErr(filterKey)
@@ -111,7 +117,7 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		// before the write and no resolution after it, so an archived document
 		// the statement matched was never touched and the write reported
 		// success. See filterIsOnlyID.
-		if _, hasID := idFromFilter(fdoc); hasID && filterIsOnlyID(fdoc) && repliable {
+		if _, hasID := idFromFilter(fdoc); hasID && filterIsOnlyID(fdoc) && answeredAfter {
 			continue
 		}
 
@@ -140,7 +146,11 @@ func (c *conn) guardMultiWrite(ctx context.Context, msg *wire.Message, db, name 
 		// unacknowledged inside a transaction is not a shape a driver
 		// produces, every statement of one being answered, so this leaves it
 		// where it was rather than inventing a behaviour for it.
-		if !multi {
+		//
+		// Inside a transaction a statement of an answered command goes to the
+		// transaction branch below instead, which replays it once the document
+		// is up.
+		if !multi && !(repliable && inTransaction(cmd)) {
 			c.bringUpOneForUnacked(ctx, ns, fdoc, docField(st, "collation"), letOf(cmd), name)
 			continue
 		}
