@@ -80,71 +80,84 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 	}
 
 	for _, st := range upsertStatements(msg, cmd, name) {
-		// The fast tier deciding it has a match is the end of it: the update
-		// applies there and no document is created. Asking it first also keeps
-		// the archive out of the common path, where the document is hot.
-		has, herr := c.r.fastTierMatchesHeld(ctx, ns, st.filter, st.collation)
-		if herr != nil {
-			c.log.Warn("could not check the fast tier before an upsert, letting it through",
-				"ns", ns, "err", herr)
-			continue
-		}
-		if has {
-			continue
-		}
-
-		if inTransaction(cmd) {
-			// The copy-up is an ordinary write outside the transaction, so the
-			// caller's snapshot was taken before it landed and the statement
-			// would still match nothing. Replaying is what makes it visible.
-			switch out, res := c.warmForTxn(ctx, ns, st.filter, copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
-				"the document this transaction upserts"); res {
-			case txnWarmReplay:
-				c.r.Stats.TxnReplays.Add(1)
-				c.cls = ClassTxnWarm
+		for _, filter := range st.filters() {
+			if out, done := c.guardOneUpsert(ctx, msg, cmd, ns, filter, st.collation); done {
 				return out, true
-			case txnWarmComplete:
-				continue
 			}
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, ns,
-				"an upsert inside a transaction cannot reach a document the fast tier does not hold, "+
-					"and creating one instead would overwrite the archived record")
-			if terr != nil {
-				return nil, false
-			}
-			return out, true
 		}
+	}
+	return nil, false
+}
 
-		// An upsert's filter may refer to the command's let variables just as a
-		// multi-document write's may, and this asks the archive that filter.
-		n, cerr := c.r.copyUpMatching(ctx, ns, st.filter,
-			copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)})
-		if cerr != nil {
-			if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, ns, "upsert", cerr); isDeadline {
-				return out, ok
-			}
-			// Letting it through would write the stub. Refusing is the honest
-			// answer: the alternative is silent loss of an archived record.
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			c.log.Warn("refused an upsert that could have overwritten an archived document",
-				"ns", ns, "err", cerr)
-			out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-				"thermocline: refusing this upsert because the archive could not be checked, and an "+
-					"upsert that does not find the archived document creates a new one in its place "+
-					"and overwrites it: "+cerr.Error())
-			if rerr != nil {
-				return nil, false
-			}
+// guardOneUpsert is guardUpsert for one filter of one statement. See
+// upsertStatement.filters.
+func (c *conn) guardOneUpsert(ctx context.Context, msg *wire.Message, cmd bson.Raw, ns string,
+	filter, collation bson.Raw) (*wire.Message, bool) {
+	st := upsertStatement{filter: filter, collation: collation}
+	// The fast tier deciding it has a match is the end of it: the update
+	// applies there and no document is created. Asking it first also keeps
+	// the archive out of the common path, where the document is hot.
+	has, herr := c.r.fastTierMatchesHeld(ctx, ns, st.filter, st.collation)
+	if herr != nil {
+		c.log.Warn("could not check the fast tier before an upsert, letting it through",
+			"ns", ns, "err", herr)
+		return nil, false
+	}
+	if has {
+		return nil, false
+	}
+
+	if inTransaction(cmd) {
+		// The copy-up is an ordinary write outside the transaction, so the
+		// caller's snapshot was taken before it landed and the statement
+		// would still match nothing. Replaying is what makes it visible.
+		switch out, res := c.warmForTxn(ctx, ns, st.filter, copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
+			"the document this transaction upserts"); res {
+		case txnWarmReplay:
+			c.r.Stats.TxnReplays.Add(1)
+			c.cls = ClassTxnWarm
 			return out, true
+		case txnWarmComplete:
+			return nil, false
 		}
-		if n > 0 {
-			c.cls = ClassMiss
-			c.log.Info("copied documents up so an upsert would find them rather than replace them",
-				"ns", ns, "documents", n)
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, ns,
+			"an upsert inside a transaction cannot reach a document the fast tier does not hold, "+
+				"and creating one instead would overwrite the archived record")
+		if terr != nil {
+			return nil, false
 		}
+		return out, true
+	}
+
+	// An upsert's filter may refer to the command's let variables just as a
+	// multi-document write's may, and this asks the archive that filter.
+	n, cerr := c.r.copyUpMatching(ctx, ns, st.filter,
+		copyUpOptions{let: letOf(cmd), collation: st.collation, budget: maxTimeBudget(cmd)})
+	if cerr != nil {
+		if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, ns, "upsert", cerr); isDeadline {
+			return out, ok
+		}
+		// Letting it through would write the stub. Refusing is the honest
+		// answer: the alternative is silent loss of an archived record.
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused an upsert that could have overwritten an archived document",
+			"ns", ns, "err", cerr)
+		out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this upsert because the archive could not be checked, and an "+
+				"upsert that does not find the archived document creates a new one in its place "+
+				"and overwrites it: "+cerr.Error())
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	if n > 0 {
+		c.cls = ClassMiss
+		c.log.Info("copied documents up so an upsert would find them rather than replace them",
+			"ns", ns, "documents", n)
 	}
 	return nil, false
 }
@@ -157,6 +170,58 @@ func (c *conn) guardUpsert(ctx context.Context, msg *wire.Message, db, name stri
 type upsertStatement struct {
 	filter    bson.Raw
 	collation bson.Raw
+	// update is the statement's u, or findAndModify's update: what the
+	// document an upsert creates is built from besides the filter.
+	update bson.RawValue
+}
+
+// filters is what the archive is asked before this upsert runs: its own
+// filter, and the _id it would create when that can be read.
+//
+// The filter alone was not enough. An upsert that matches nothing creates a
+// document whose _id comes from the filter's equality, the replacement or
+// $setOnInsert, and the archive may hold that _id under a document the filter
+// does not match: {_id: 5, name: "bob"} against an archived {_id: 5, name:
+// "alice"}. MongoDB answers E11000 and writes nothing. Here the fast tier
+// matched nothing, the archive matched nothing for the whole filter, the
+// upsert created {_id: 5, name: "bob"}, and the feeder mirrored it over alice.
+// Bringing _id 5 up first lets the fast tier's own _id index give mongod's
+// answer.
+func (st upsertStatement) filters() []bson.Raw {
+	out := []bson.Raw{st.filter}
+	id, ok := upsertCreatesID(st)
+	if !ok {
+		return out
+	}
+	if only, isOnly := idFromFilter(st.filter); isOnly && filterIsOnlyID(st.filter) && only.Equal(id) {
+		return out
+	}
+	byID, err := bson.Marshal(bson.D{{Key: "_id", Value: id}})
+	if err != nil {
+		return out
+	}
+	return append(out, byID)
+}
+
+// upsertCreatesID reads the _id an upsert creates when it matches nothing, as
+// mongod builds it: the replacement's own _id, else $setOnInsert's or $set's,
+// else the filter's equality on _id.
+func upsertCreatesID(st upsertStatement) (bson.RawValue, bool) {
+	if u, ok := st.update.DocumentOK(); ok {
+		elems, _ := u.Elements()
+		if len(elems) > 0 && !strings.HasPrefix(elems[0].Key(), "$") {
+			if v, err := u.LookupErr("_id"); err == nil {
+				return v, true
+			}
+		} else {
+			for _, op := range []string{"$setOnInsert", "$set"} {
+				if v, err := u.LookupErr(op, "_id"); err == nil {
+					return v, true
+				}
+			}
+		}
+	}
+	return idFromFilter(st.filter)
 }
 
 func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStatement {
@@ -169,7 +234,7 @@ func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStat
 		if !ok {
 			return nil
 		}
-		return []upsertStatement{{filter: doc, collation: docField(cmd, "collation")}}
+		return []upsertStatement{{filter: doc, collation: docField(cmd, "collation"), update: cmd.Lookup("update")}}
 	}
 
 	var out []upsertStatement
@@ -181,7 +246,7 @@ func upsertStatements(msg *wire.Message, cmd bson.Raw, name string) []upsertStat
 		if !ok {
 			continue
 		}
-		out = append(out, upsertStatement{filter: doc, collation: docField(st, "collation")})
+		out = append(out, upsertStatement{filter: doc, collation: docField(st, "collation"), update: st.Lookup("u")})
 	}
 	return out
 }

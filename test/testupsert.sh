@@ -113,6 +113,30 @@ R "db.adminCommand({bulkWrite:1, nsInfo:[{ns:process.env.TC_DB+'.tups'}], ops:[
 chk "a bulkWrite upsert keeps the archived fields"      "carol-silver-400" \
     "$(R "const d=db.getSiblingDB(process.env.TC_DB).tups.findOne({_id:6}); print(d?d.name+'-'+d.tier+'-'+d.balance:'MISSING')")"
 
+echo "== an upsert whose filter misses an archived document but takes its _id =="
+# The filter matches nothing on either tier, so the upsert creates a document,
+# and the _id it takes is one the archive holds under another document. MongoDB
+# answers E11000 and writes nothing. The guard asked the archive the filter and
+# nothing else, the fast tier created the document, and the feeder mirrored it
+# over the archived one.
+C "db.getSiblingDB(process.env.TC_DB).tups.insertMany([10,11,12,13,14].map(i=>({_id:i, name:'alice', tier:'gold'})))" >/dev/null
+CODE="catch(e) { print('error '+(e.code || (e.writeErrors && e.writeErrors[0].code) || (e.errorResponse && e.errorResponse.code))) }"
+chk "updateOne with the _id in its filter"              "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tups.updateOne({_id:10, name:'bob'},{\$set:{x:1}},{upsert:true}); print('accepted') } $CODE")"
+chk "replaceOne with the _id in the replacement"        "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tups.replaceOne({name:'nobody'},{_id:11, name:'bob'},{upsert:true}); print('accepted') } $CODE")"
+chk "updateOne with the _id in \$setOnInsert"           "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tups.updateOne({name:'nobody'},{\$setOnInsert:{_id:12}},{upsert:true}); print('accepted') } $CODE")"
+chk "findOneAndUpdate with the _id in its filter"       "error 11000" \
+    "$(R "try { db.getSiblingDB(process.env.TC_DB).tups.findOneAndUpdate({_id:13, name:'bob'},{\$set:{x:1}},{upsert:true}); print('accepted') } $CODE")"
+chk "a bulkWrite upsert with the _id in its filter"     "1 11000" \
+    "$(R "const r=db.adminCommand({bulkWrite:1, nsInfo:[{ns:process.env.TC_DB+'.tups'}], ops:[
+       {update:0, filter:{_id:14, name:'bob'}, updateMods:{\$set:{x:1}}, upsert:true}]});
+       print(r.nErrors+' '+(r.cursor.firstBatch.find(x=>!x.ok)||{}).code)")"
+sleep 5
+chk "and the archive still holds all five as they were" "5" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).tups.countDocuments({_id:{\$in:[10,11,12,13,14]}, name:'alice', x:{\$exists:false}}))")"
+
 echo "== a genuinely new document still upserts =="
 # The guard must not turn every upsert into a lookup that refuses to create.
 NEW=$(R "const r=db.getSiblingDB(process.env.TC_DB).tups.updateOne({_id:99},{\$set:{balance:1}},{upsert:true}); print(r.upsertedCount)")

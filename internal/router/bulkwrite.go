@@ -251,44 +251,53 @@ func (c *conn) guardBulkWrite(ctx context.Context, msg *wire.Message, cmd bson.R
 		if len(op.stmt.filter) == 0 {
 			continue
 		}
-		if inTxn {
-			switch out, res := c.warmForTxn(ctx, op.ns, op.stmt.filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
-				"the documents this transaction writes"); res {
-			case txnWarmReplay:
-				c.r.Stats.TxnReplays.Add(1)
-				c.cls = ClassTxnWarm
-				return out, true
-			case txnWarmComplete:
-				continue
-			}
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, op.ns,
-				"a bulkWrite inside a transaction cannot reach documents the fast tier does not hold")
-			if terr != nil {
-				return nil, false
-			}
-			return out, true
+		// An upsert also asks for the _id it would create. See
+		// upsertStatement.filters.
+		filters := []bson.Raw{op.stmt.filter}
+		if op.stmt.upsert {
+			filters = upsertStatement{filter: op.stmt.filter, collation: op.stmt.collation,
+				update: op.stmt.update}.filters()
 		}
-		if n, cerr := c.r.copyUpMatching(ctx, op.ns, op.stmt.filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}); cerr != nil {
-			// The caller's own deadline, reported the way MongoDB reports it
-			// rather than as a refusal by this router.
-			if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, op.ns, "bulkWrite", cerr); isDeadline {
-				return out, ok
+		for _, filter := range filters {
+			if inTxn {
+				switch out, res := c.warmForTxn(ctx, op.ns, filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}, msg.Header.RequestID, msg.Header.RequestID,
+					"the documents this transaction writes"); res {
+				case txnWarmReplay:
+					c.r.Stats.TxnReplays.Add(1)
+					c.cls = ClassTxnWarm
+					return out, true
+				case txnWarmComplete:
+					continue
+				}
+				c.r.Stats.Refused.Add(1)
+				c.cls = ClassRefused
+				out, terr := c.r.txnCannotSpanTiers(msg.Header.RequestID, msg.Header.RequestID, op.ns,
+					"a bulkWrite inside a transaction cannot reach documents the fast tier does not hold")
+				if terr != nil {
+					return nil, false
+				}
+				return out, true
 			}
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			c.log.Warn("refused a bulkWrite that would only partly apply", "ns", op.ns, "err", cerr)
-			out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-				"thermocline: refusing this bulkWrite because it matches documents the fast tier does not hold, "+
-					"and applying it to only some of them would report success for a change that did not happen: "+
-					cerr.Error())
-			if rerr != nil {
-				return nil, false
+			if n, cerr := c.r.copyUpMatching(ctx, op.ns, filter, copyUpOptions{let: letOf(cmd), collation: op.stmt.collation, budget: maxTimeBudget(cmd)}); cerr != nil {
+				// The caller's own deadline, reported the way MongoDB reports it
+				// rather than as a refusal by this router.
+				if out, isDeadline, ok := c.deadlineExpired(msg.Header.RequestID, msg.Header.RequestID, op.ns, "bulkWrite", cerr); isDeadline {
+					return out, ok
+				}
+				c.r.Stats.Refused.Add(1)
+				c.cls = ClassRefused
+				c.log.Warn("refused a bulkWrite that would only partly apply", "ns", op.ns, "err", cerr)
+				out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+					"thermocline: refusing this bulkWrite because it matches documents the fast tier does not hold, "+
+						"and applying it to only some of them would report success for a change that did not happen: "+
+						cerr.Error())
+				if rerr != nil {
+					return nil, false
+				}
+				return out, true
+			} else if n > 0 {
+				c.log.Info("copied documents up so a bulkWrite could reach them", "ns", op.ns, "documents", n)
 			}
-			return out, true
-		} else if n > 0 {
-			c.log.Info("copied documents up so a bulkWrite could reach them", "ns", op.ns, "documents", n)
 		}
 	}
 
