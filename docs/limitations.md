@@ -1005,6 +1005,20 @@ Part of [Thermocline](../README.md).
   43, because a driver decides what to retry from the code rather than from the
   words.
 
+- **A change stream whose own stages read `fullDocument` is not filled from the
+  archive.** With `fullDocument: "updateLookup"` the lookup runs on the fast
+  tier, and an update to a document evicted before the event is read comes back
+  null. The router fills that from the archive, after mongod has run the
+  stream's stages, so they never saw it: measured, `watch([{$project:
+  {"fullDocument.secret": 0}}], {fullDocument: "updateLookup"})` was handed
+  the whole document, `secret` included. A stream with a stage naming
+  `fullDocument` is now left as mongod answered it, null where the document was
+  evicted, which an untiered collection would have filled. And a stream whose
+  `$match` reads `fullDocument` loses those updates outright: mongod drops the
+  event on the null before the router sees it. A stream with no stages of its
+  own, or with stages on other fields such as `operationType`, is filled as
+  before.
+
 - **A change stream cannot be resumed across the cutover, and the router says
   so rather than letting it be discovered.**
   A resume token is a position in one replica set's oplog. The router serves

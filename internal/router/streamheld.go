@@ -141,6 +141,11 @@ func eventSize(ev any) int {
 // the token the reply should carry, which is the zero value when the batch
 // went whole and the reply's own token stands.
 func (c *conn) cutStreamBatch(ctx context.Context, id int64, rdoc bson.Raw, owner cursorOwner, keep bson.A) (bson.A, bson.RawValue, int) {
+	// Not filled, so nothing grows past what mongod already sized the batch
+	// to. See shapesFullDocument.
+	if c.r.changeStreams.isShaped(id) {
+		return keep, bson.RawValue{}, 0
+	}
 	if id == 0 {
 		// A cursor mongod has closed has no getMore to hand the rest to.
 		out, filled := c.r.fillLookups(ctx, keep)

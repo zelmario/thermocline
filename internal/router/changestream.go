@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -82,6 +83,26 @@ type changeStreamRegistry struct {
 	// held is what a cursor was sent and has not yet been given. See
 	// streamheld.go.
 	held map[int64]*heldStream
+	// shaped records the streams whose own pipeline reads fullDocument, which
+	// are not filled from the archive. See shapesFullDocument.
+	shaped map[int64]bool
+}
+
+// markShaped records a stream whose pipeline reads fullDocument.
+func (reg *changeStreamRegistry) markShaped(id int64) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if reg.shaped == nil {
+		reg.shaped = map[int64]bool{}
+	}
+	reg.shaped[id] = true
+}
+
+// isShaped reports whether markShaped recorded this stream.
+func (reg *changeStreamRegistry) isShaped(id int64) bool {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	return reg.shaped[id]
 }
 
 func (reg *changeStreamRegistry) add(id int64, ns string) {
@@ -108,6 +129,31 @@ func (reg *changeStreamRegistry) drop(id int64) {
 	defer reg.mu.Unlock()
 	delete(reg.ns, id)
 	delete(reg.held, id)
+	delete(reg.shaped, id)
+}
+
+// shapesFullDocument reports whether a change stream's own stages, after
+// $changeStream, name fullDocument.
+//
+// fillLookups puts the archive's copy into a null fullDocument after mongod has
+// run those stages, so they never saw it. With watch([{$project:
+// {"fullDocument.ssn": 0}}], {fullDocument: "updateLookup"}) mongod kept null
+// as null, and the fill put the whole document back, ssn included. Such a
+// stream is left as mongod answered it, null where the document was evicted:
+// a gap against an untiered collection, where it would carry the document,
+// but not a field the client removed. Read as bytes, so a stage naming it
+// anywhere, as a field or a "$fullDocument" path, counts.
+func shapesFullDocument(cmd bson.Raw) bool {
+	stages, ok := pipelineStages(cmd)
+	if !ok {
+		return false
+	}
+	for _, st := range stages[min(1, len(stages)):] {
+		if bytes.Contains(st.Value, []byte("fullDocument")) {
+			return true
+		}
+	}
+	return false
 }
 
 // streamScope names what a change stream is watching, and reports whether any
@@ -166,6 +212,9 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 		return nil, false
 	}
 	c.r.changeStreams.add(id, watching)
+	if shapesFullDocument(cmd) {
+		c.r.changeStreams.markShaped(id)
+	}
 	c.log.Info("filtering tiering events out of a change stream", "watching", watching, "cursor", id)
 
 	// And this reply's own batch, which was passed through untouched.

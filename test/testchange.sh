@@ -501,10 +501,14 @@ mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --e
   }
   cs.close(); print(out);" > /tmp/cs_events3.txt 2>&1 &
 WATCHER3=$!
+# Where the watcher below starts, taken before the update so its event is in
+# the stream, and the watcher run only once the document has left the fast tier
+# and the feeder is back, so the lookup misses there and the fill can run.
+T0=$(R "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
 sleep 3
 # Update it, let that reach the archive, then take it off the fast tier the way
 # an eviction does, with the feeder blind to it so the archive keeps it live.
-R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up'}})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:ObjectId('$OID')},{\$set:{v:'looked up', secret:'s'}})" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID')}); print(d?d.v:'')")" = "looked up" ] && break
   sleep 0.5
@@ -516,6 +520,21 @@ LOOKUP=$(awaitWatcher /tmp/cs_events3.txt $WATCHER3)
 echo "  the watcher saw: ${LOOKUP:-nothing}"
 chk "a lookup is answered from the archive"            "HAS looked up" "$LOOKUP"
 startFeeder
+# The same stream with a stage of its own that removes a field. The fill runs
+# after mongod has applied it, so filling put the field back.
+sleep 5
+SHAPED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$project:{'fullDocument.secret':0}}],
+    {fullDocument:'updateLookup', startAtOperationTime:Timestamp({t:${T0%,*}, i:${T0#*,}})});
+  let out='no event';
+  for (let i=0;i<60;i++) {
+    const e=cs.tryNext();
+    if (e && e.operationType==='update') { out = !e.fullDocument ? 'NULL' : (e.fullDocument.secret ? 'LEAKED' : 'CLEAN'); break; }
+    sleep(250);
+  }
+  cs.close(); print(out);" 2>&1 | tail -1)
+chk "and a field the stream's own stage removed stays out" "NULL" "$SHAPED"
+grep -q "LEAKED" <<<"$SHAPED" && echo "  (the archive's copy was filled in past the stream's own \$project)"
 
 fi
 if inpart 2; then
