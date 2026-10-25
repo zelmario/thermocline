@@ -11,6 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
@@ -99,10 +100,17 @@ func (f *Feeder) groupedAt(ctx context.Context, ts bson.Timestamp) (bool, error)
 		Op string   `bson:"op"`
 		O  bson.Raw `bson:"o"`
 	}
-	err := f.hot.Database("local").Collection("oplog.rs").FindOne(ctx, bson.D{{Key: "ts", Value: ts}},
+	// From the primary, whose oplog has every entry the stream delivered: a
+	// secondary behind it, through a hot.uri read preference, answered "not
+	// there" for a time the stream had already returned. Not there is read as
+	// grouped, which costs one poll, max_await; read as alone it claimed the
+	// time with a batched delete's tail unread.
+	oplog := f.hot.Database("local").Collection("oplog.rs",
+		options.Collection().SetReadPreference(readpref.Primary()))
+	err := oplog.FindOne(ctx, bson.D{{Key: "ts", Value: ts}},
 		options.FindOne().SetProjection(bson.D{{Key: "op", Value: 1}, {Key: "o.applyOps", Value: 1}})).Decode(&entry)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		return false, nil
+		return true, nil
 	}
 	if err != nil {
 		return false, err
