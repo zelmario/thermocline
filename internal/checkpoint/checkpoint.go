@@ -7,6 +7,7 @@ package checkpoint
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -171,4 +172,27 @@ func (s *Store) Mark(ctx context.Context, id string) (Record, bool, error) {
 		return Record{}, false, fmt.Errorf("read checkpoint %q: %w", id, err)
 	}
 	return rec, !rec.EventAt.IsZero(), nil
+}
+
+// TokenTime is the cluster time the record's resume token marks, read the way
+// the feeder reads it: a v1 token opens with a KeyString timestamp, 0x82 and
+// eight bytes. False for a token this cannot read, which is a reason to treat
+// the position as unknown, never to guess one.
+//
+// For a record whose TS is absent: a post-batch token names no event, and the
+// lag check had nothing to judge it by, so it fell back to the wall-clock
+// reading that reads a backlog as caught up.
+func (r Record) TokenTime() (bson.Timestamp, bool) {
+	data, ok := r.Token.Lookup("_data").StringValueOK()
+	if len(r.Token) == 0 || !ok || len(data) < 18 {
+		return bson.Timestamp{}, false
+	}
+	raw, err := hex.DecodeString(data[:18])
+	if err != nil || raw[0] != 0x82 {
+		return bson.Timestamp{}, false
+	}
+	return bson.Timestamp{
+		T: uint32(raw[1])<<24 | uint32(raw[2])<<16 | uint32(raw[3])<<8 | uint32(raw[4]),
+		I: uint32(raw[5])<<24 | uint32(raw[6])<<16 | uint32(raw[7])<<8 | uint32(raw[8]),
+	}, true
 }

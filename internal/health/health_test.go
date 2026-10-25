@@ -240,4 +240,20 @@ func TestFeederLagFromTheCheckpointsClusterTime(t *testing.T) {
 		t.Errorf("a checkpoint saved now at a position three hours old read as %s behind (missing %v), want about three hours",
 			r.FeederLag, r.isMissing("feeder lag"))
 	}
+
+	// A post-batch token names no event, so the record has no ts; its token
+	// still carries the time, and it is the same three hours.
+	tok := fmt.Sprintf("82%08X%08X2B0229296E04", threeHoursAgo.T, threeHoursAgo.I)
+	if _, err := cps.ReplaceOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		{Key: "_id", Value: id}, {Key: "token", Value: bson.D{{Key: "_data", Value: tok}}},
+		{Key: "savedAt", Value: now}, {Key: "eventAt", Value: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var r2 Reading
+	c.sampleFeederLag(ctx, &r2)
+	if r2.isMissing("feeder lag") || r2.FeederLag < 2*time.Hour {
+		t.Errorf("a checkpoint with no ts and a token three hours old read as %s behind (missing %v), want about three hours",
+			r2.FeederLag, r2.isMissing("feeder lag"))
+	}
 }

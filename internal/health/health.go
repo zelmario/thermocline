@@ -214,9 +214,19 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 	// time a batch is used up, so during a backlog this read about 0s behind.
 	// This is the path for position_every: 0, and for a position record left
 	// by an earlier run, which Observe reads as not moving.
+	ts, known := bson.Timestamp{}, false
 	if rec.TS != nil {
-		c.atLeastBehind(ctx, r, *rec.TS)
+		ts, known = *rec.TS, true
+	} else {
+		ts, known = rec.TokenTime()
 	}
+	if !known {
+		if c.hot != nil {
+			r.missing("feeder lag")
+		}
+		return
+	}
+	c.atLeastBehind(ctx, r, ts)
 }
 
 // atLeastBehind raises r.FeederLag to how far ts trails the fast tier's last
@@ -224,7 +234,13 @@ func (c *Checker) sampleFeederLag(ctx context.Context, r *Reading) {
 // wall-clock reading alone says the feeder is publishing, not that it is
 // caught up, and the evictor goes on whatever it says.
 func (c *Checker) atLeastBehind(ctx context.Context, r *Reading, ts bson.Timestamp) {
-	if ts.T == 0 || c.hot == nil {
+	if c.hot == nil {
+		return
+	}
+	// No cluster time is a feeder that has not polled yet, or one this cannot
+	// read, and either way not one known to be caught up.
+	if ts.T == 0 {
+		r.missing("feeder lag")
 		return
 	}
 	behind, ok := c.behindFastTier(ctx, ts)
