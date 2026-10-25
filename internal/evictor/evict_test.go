@@ -3,6 +3,7 @@ package evictor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -575,37 +576,49 @@ func TestStartTakesBackOnlyWhatNoDeleteAnswered(t *testing.T) {
 		_, _ = notices.DeleteMany(c, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}})
 	})
 
-	evicted, stayed := bson.NewObjectID(), bson.NewObjectID()
-	for _, id := range []bson.ObjectID{evicted, stayed} {
-		if _, err := hc.InsertOne(ctx, bson.D{{Key: "_id", Value: id}}); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-	e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "tcorphans"},
-		log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	// The step the killed evictor was running: both announced, one deleted.
-	step := e.stepPrefix() + bson.NewObjectID().Hex()
-	idE, idS := meta.DocID(ns, rawIDValue(t, evicted)), meta.DocID(ns, rawIDValue(t, stayed))
-	if err := meta.AnnounceEviction(ctx, cold, []string{idE, idS}, step); err != nil {
-		t.Fatalf("announce: %v", err)
-	}
-	if _, err := hc.DeleteOne(ctx, bson.D{{Key: "_id", Value: evicted}}); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
+	// The predecessor ran on another host, and that host's clock stamped its
+	// step: three minutes ahead, the window began after its own delete, which
+	// was then not found, and the notice the delete answers was taken back.
+	for _, ahead := range []time.Duration{0, 3 * time.Minute} {
+		t.Run(fmt.Sprintf("step clock ahead %s", ahead), func(t *testing.T) {
+			// Alone: the case before left a notice standing, and notices of one
+			// namespace are scanned from the earliest step among them.
+			if _, err := notices.DeleteMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$regex", Value: "^" + ns + "\\|"}}}}); err != nil {
+				t.Fatalf("clear notices: %v", err)
+			}
+			evicted, stayed := bson.NewObjectID(), bson.NewObjectID()
+			for _, id := range []bson.ObjectID{evicted, stayed} {
+				if _, err := hc.InsertOne(ctx, bson.D{{Key: "_id", Value: id}}); err != nil {
+					t.Fatalf("insert: %v", err)
+				}
+			}
+			e := &Evictor{hot: hot, cold: cold, cfg: config.EvictorConfig{FeederID: "tcorphans"},
+				log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			// The step the killed evictor was running: both announced, one deleted.
+			step := e.stepPrefix() + bson.NewObjectIDFromTimestamp(time.Now().Add(ahead)).Hex()
+			idE, idS := meta.DocID(ns, rawIDValue(t, evicted)), meta.DocID(ns, rawIDValue(t, stayed))
+			if err := meta.AnnounceEviction(ctx, cold, []string{idE, idS}, step); err != nil {
+				t.Fatalf("announce: %v", err)
+			}
+			if _, err := hc.DeleteOne(ctx, bson.D{{Key: "_id", Value: evicted}}); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
 
-	e.takeBackOrphans(ctx)
+			e.takeBackOrphans(ctx)
 
-	have, err := meta.ReadEvictionNotices(ctx, cold, []string{idE, idS}, nil)
-	if err != nil {
-		t.Fatalf("read notices: %v", err)
-	}
-	if have[idE] != 1 {
-		t.Errorf("the announcement a delete answers was taken back (%d left); the feeder would "+
-			"tombstone a document already gone from the fast tier", have[idE])
-	}
-	if have[idS] != 0 {
-		t.Errorf("the announcement no delete answers still stands at %d; the application's next "+
-			"delete of that document would be read as an eviction", have[idS])
+			have, err := meta.ReadEvictionNotices(ctx, cold, []string{idE, idS}, nil)
+			if err != nil {
+				t.Fatalf("read notices: %v", err)
+			}
+			if have[idE] != 1 {
+				t.Errorf("the announcement a delete answers was taken back (%d left); the feeder would "+
+					"tombstone a document already gone from the fast tier", have[idE])
+			}
+			if have[idS] != 0 {
+				t.Errorf("the announcement no delete answers still stands at %d; the application's next "+
+					"delete of that document would be read as an eviction", have[idS])
+			}
+		})
 	}
 }
 

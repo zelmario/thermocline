@@ -1270,7 +1270,11 @@ func (e *Evictor) takeBackOrphans(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		m := mine{docID: r.ID, id: id}
+		// The notice's at is the archive's own clock, set when it was last
+		// announced. The step's ObjectID is the predecessor's host clock, which
+		// may run minutes ahead; the earlier of the two starts the window. See
+		// deletedSince.
+		m := mine{docID: r.ID, id: id, since: r.At}
 		for _, b := range r.By {
 			if !strings.HasPrefix(b, prefix) {
 				continue
@@ -1328,6 +1332,33 @@ func (e *Evictor) takeBackOrphans(ctx context.Context) {
 	}
 }
 
+// archiveFromFastTier is how far apart the archive's and the fast tier's
+// clocks read, as an absolute value, give or take the round trips. An hour
+// when either cannot be read: the window is only widened by it, and a wider
+// window costs a longer oplog scan, where a narrower one loses a document.
+func (e *Evictor) archiveFromFastTier(ctx context.Context) time.Duration {
+	clock := func(c *mongo.Client) (time.Time, bool) {
+		var h struct {
+			LocalTime time.Time `bson:"localTime"`
+		}
+		if c == nil || c.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&h) != nil ||
+			h.LocalTime.IsZero() {
+			return time.Time{}, false
+		}
+		return h.LocalTime, true
+	}
+	hot, hok := clock(e.hot)
+	cold, cok := clock(e.cold)
+	if !hok || !cok {
+		return time.Hour
+	}
+	d := cold.Sub(hot)
+	if d < 0 {
+		d = -d
+	}
+	return d
+}
+
 // deletedSince reports which of ids the fast tier's oplog shows deleted from ns
 // since a moment, and whether the oplog reaches back that far at all. A delete
 // may be its own entry or one operation of an applyOps, which is how 8.0 logs
@@ -1340,19 +1371,16 @@ func (e *Evictor) deletedSince(ctx context.Context, ns string, ids bson.A, since
 	if err := oplog.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: 1}})).Decode(&first); err != nil {
 		return nil, false, err
 	}
-	// A minute's margin, for the evictor's clock that stamped the step and the
-	// primary's that stamped the oplog, and the skew this process measured
-	// against the archive on top. With a clock more than a minute ahead the
-	// window began after the predecessor's delete, the delete was not found,
-	// and the notice was withdrawn before the feeder spent it: the feeder then
-	// read the delete as the application's and tombstoned the archive's copy.
-	margin := time.Minute
-	if skew, ok := e.lastSkew(); ok {
-		if skew < 0 {
-			skew = -skew
-		}
-		margin += skew
-	}
+	// since is the earlier of the archive's clock, on the notice, and the
+	// predecessor's, on its step, so neither one running late moves it past the
+	// delete. The oplog's wall is the fast tier primary's clock, so the margin
+	// is a minute and how far the archive's clock is from the fast tier's,
+	// measured here on both servers. It used to add this process's skew against
+	// the archive, which is a third clock: a predecessor on a host three minutes
+	// ahead stamped a step after its own delete, the window began after it, the
+	// delete was not found, and the notice was withdrawn before the feeder spent
+	// it, which then tombstoned the archive's copy of an evicted document.
+	margin := time.Minute + e.archiveFromFastTier(ctx)
 	from := since.Add(-margin)
 	if first.Wall.After(from) {
 		return nil, false, nil
