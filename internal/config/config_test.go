@@ -715,3 +715,22 @@ func TestMinFreeDiskMustBeAFraction(t *testing.T) {
 		})
 	}
 }
+
+// archive_wait: 0 turns off the wait strict refuses on, so under strict it
+// answered every fall-through from the archive as it stood, nothing refused and
+// nothing counted.
+func TestArchiveWaitZeroNeedsPermissive(t *testing.T) {
+	c := valid()
+	c.Router.ArchiveWait = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "archive_wait") {
+		t.Errorf("archive_wait 0 under strict was accepted: %v", err)
+	}
+	c.Router.Freshness = FreshnessPermissive
+	if err := c.Validate(); err != nil {
+		t.Errorf("archive_wait 0 under permissive was refused: %v", err)
+	}
+	c.Router.ArchiveWait = Duration(-time.Second)
+	if err := c.Validate(); err == nil {
+		t.Error("a negative archive_wait was accepted")
+	}
+}

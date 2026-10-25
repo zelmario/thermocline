@@ -136,7 +136,7 @@ echo "== the same reads with the freshness barrier off =="
 # that a fallback read sees your own last write, and isolates the query cost.
 python3 - <<'PY'
 s = open('/root/cline.yaml').read()
-s = s.replace('  completeness: archive', '  completeness: archive\n  archive_wait: 0s')
+s = s.replace('  completeness: archive', '  completeness: archive\n  archive_wait: 0s\n  freshness: permissive')
 open('/root/bench_nowait.yaml', 'w').write(s)
 PY
 pkill -f 'cline router' 2>/dev/null

@@ -162,8 +162,9 @@ type RouterConfig struct {
 	// The archive trails the fast tier by the feeder's lag, so without this a
 	// fallback read can miss a write that already returned, or return a
 	// document that was already deleted. Waiting costs nothing while the feeder
-	// keeps up, which is the normal case. Set it to zero to answer immediately
-	// and accept secondary-read freshness.
+	// keeps up, which is the normal case. Set it to zero, with freshness:
+	// permissive, to answer immediately and accept secondary-read freshness;
+	// zero under strict is refused, see RouterConfig.Validate.
 	ArchiveWait Duration `yaml:"archive_wait"`
 	// Freshness is what happens when that wait runs out. See Freshness.
 	Freshness Freshness `yaml:"freshness"`
@@ -918,6 +919,18 @@ func (r RouterConfig) Validate() error {
 	case FreshnessStrict, FreshnessPermissive:
 	default:
 		return fmt.Errorf("router.freshness must be strict or permissive, got %q", r.Freshness)
+	}
+	// Zero turns the freshness wait off, and the wait is what strict refuses
+	// on: with it off every read that falls through answers from the archive as
+	// it stands, deleted documents included, nothing is refused and nothing is
+	// counted as stale, so ThermoclineStaleRead cannot fire. Accepted as zero
+	// with permissive, which says that out loud.
+	switch {
+	case r.ArchiveWait < 0:
+		return fmt.Errorf("router.archive_wait must not be negative, got %s", r.ArchiveWait.D())
+	case r.ArchiveWait == 0 && r.Freshness != FreshnessPermissive:
+		return errors.New("router.archive_wait: 0 turns off the wait that router.freshness: strict refuses on, " +
+			"so nothing would be refused or counted; set router.freshness: permissive to answer without waiting")
 	}
 	switch r.CopyUpReads {
 	case CopyUpAlways, CopyUpRepeated, CopyUpNever:
