@@ -1284,7 +1284,10 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 		c.r.releaseKeys(ctx, claimed)
 		return nil, false
 	}
-	fwd, ferr := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+	// Numbered as the client sent them, or a retry after a lost reply reads a
+	// left-out document as already inserted. See withStmtIDs.
+	trimmed = withStmtIDs(trimmed, cmd, keepAt)
+	fwd, ferr := wire.NewMsgSequenced(msg.Header.RequestID, 0, trimmed, "documents")
 	if ferr != nil {
 		c.r.releaseKeys(ctx, claimed)
 		return nil, false

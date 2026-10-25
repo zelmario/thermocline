@@ -630,7 +630,16 @@ func (c *conn) guardReplacedRoots(msg *wire.Message, cmd bson.Raw, name string) 
 	default:
 		return
 	}
-	out, err := wire.NewMsg(msg.Header.RequestID, 0, rewritten)
+	// The batch as a payload sequence, as the driver sent it: in the body it
+	// is capped at 16MB. findAndModify has none.
+	seqField := map[string]string{"update": "updates", "bulkWrite": "ops"}[name]
+	var out *wire.Message
+	var err error
+	if seqField != "" {
+		out, err = wire.NewMsgSequenced(msg.Header.RequestID, 0, rewritten, seqField)
+	} else {
+		out, err = wire.NewMsg(msg.Header.RequestID, 0, rewritten)
+	}
 	if err != nil {
 		return
 	}

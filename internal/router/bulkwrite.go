@@ -523,7 +523,7 @@ func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Ra
 		trimmed = append(trimmed, bson.E{Key: "ops", Value: keep},
 			bson.E{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(len(keep) + 1)}}})
 		trimmed = withStmtIDs(trimmed, cmd, keepAt)
-		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+		fwd, err := wire.NewMsgSequenced(msg.Header.RequestID, 0, trimmed, "ops")
 		if err != nil {
 			return nil, false
 		}
@@ -542,6 +542,9 @@ func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Ra
 		c.r.noteOpTime(reply)
 		up, err = reply.ReplyDoc()
 		if err != nil || !replyOK(up) {
+			// Refused whole: the claims it took go back, as the settle in
+			// handle would have given them back for a forwarded command.
+			c.r.releaseUnheld(ctx, claimed)
 			out := reply
 			out.Header.ResponseTo = msg.Header.RequestID
 			return out, true

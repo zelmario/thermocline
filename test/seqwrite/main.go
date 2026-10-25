@@ -8,7 +8,7 @@
 // the shape a hand-written test cannot produce by accident and mongosh may
 // never send.
 //
-//	go run ./test/seqwrite "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" shop tseq [bulk]
+//	go run ./test/seqwrite "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin" shop tseq [bulk|big]
 //
 // With bulk it sends the same through client.BulkWrite, the bulkWrite command,
 // whose ops and nsInfo a driver sends as two sequences. The router read nsInfo
@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -56,6 +57,25 @@ func main() {
 		bson.D{{Key: "_id", Value: "seq-new-1"}, {Key: "v", Value: "new"}},
 		bson.D{{Key: "_id", Value: "archived"}, {Key: "v", Value: "clobber"}},
 		bson.D{{Key: "_id", Value: "seq-new-2"}, {Key: "v", Value: "new"}},
+	}
+	if len(os.Args) > 4 && os.Args[4] == "big" {
+		// About 17MB in one insert, past the 16MB a command body may be and
+		// within what a driver puts in one payload sequence. The router
+		// rebuilds the batch without the archived _id, and rebuilt as one body
+		// mongod refused the whole of it as too large.
+		pad := strings.Repeat("x", 1<<20)
+		big := []any{bson.D{{Key: "_id", Value: "archived"}, {Key: "v", Value: "clobber"}}}
+		for i := 0; i < 17; i++ {
+			big = append(big, bson.D{{Key: "_id", Value: fmt.Sprintf("seq-big-%d", i)}, {Key: "pad", Value: pad}})
+		}
+		_, err := c.InsertMany(ctx, big, options.InsertMany().SetOrdered(false))
+		var bwe mongo.BulkWriteException
+		if err != nil && asBulk(err, &bwe) && len(bwe.WriteErrors) == 1 && bwe.WriteErrors[0].Code == 11000 {
+			fmt.Println("REFUSED the archived one")
+			return
+		}
+		fmt.Println("FAILED:", err)
+		return
 	}
 	if len(os.Args) > 4 && os.Args[4] == "bulk" {
 		var models []mongo.ClientBulkWrite

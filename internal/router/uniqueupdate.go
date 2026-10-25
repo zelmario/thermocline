@@ -526,6 +526,12 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 
 	var claimed []string
 	var clashes []keyClash
+	// A statement whose keys could not be checked, and why. Not acted on until
+	// every statement has been asked: a clash after it is as much a reason to
+	// forward nothing as a clash before it, and returning at the error
+	// forwarded the whole command, the later clashing statement included.
+	var checkErr error
+	unchecked := -1
 	for s, st := range stmts {
 		sh := parseUpdate(st.update)
 		var mine []string
@@ -539,26 +545,12 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 				return out, true
 			}
 			if cerr != nil {
-				c.r.releaseKeys(ctx, append(claimed, mine...))
-				if len(clashes) > 0 {
-					// A statement already found to clash cannot go through
-					// with the rest, and this one cannot be judged, so
-					// nothing goes: forwarding the command whole wrote the
-					// clashing statement as a duplicate across the tiers.
-					c.r.Stats.Refused.Add(1)
-					c.cls = ClassRefused
-					out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
-						"thermocline: refusing this update because statement "+fmt.Sprint(clashes[0].doc)+
-							" would take a key held by a document in the archive and statement "+fmt.Sprint(s)+
-							"'s keys could not be checked: "+cerr.Error()+". Nothing was applied.")
-					if rerr != nil {
-						return nil, false
-					}
-					return out, true
+				c.r.releaseKeys(ctx, mine)
+				mine = nil
+				if checkErr == nil {
+					checkErr, unchecked = cerr, s
 				}
-				c.log.Warn("could not check unique keys, letting the update through",
-					"ns", ns, "err", cerr)
-				return nil, false
+				break
 			}
 			mine = append(mine, kids...)
 			if clash {
@@ -579,6 +571,27 @@ func (c *conn) guardUpdateKeys(ctx context.Context, msg *wire.Message, db, name 
 			// after it is asked about.
 			break
 		}
+	}
+
+	if checkErr != nil {
+		c.r.releaseKeys(ctx, claimed)
+		if len(clashes) == 0 {
+			c.log.Warn("could not check unique keys, letting the update through",
+				"ns", ns, "err", checkErr)
+			return nil, false
+		}
+		// A statement known to clash cannot go through with the rest, and
+		// one could not be judged, so nothing goes.
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this update because statement "+fmt.Sprint(clashes[0].doc)+
+				" would take a key held by a document in the archive and statement "+fmt.Sprint(unchecked)+
+				"'s keys could not be checked: "+checkErr.Error()+". Nothing was applied.")
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
 	}
 
 	if len(clashes) == 0 {
@@ -671,7 +684,7 @@ func (c *conn) applyOthers(ctx context.Context, msg *wire.Message, cmd bson.Raw,
 			return nil, false
 		}
 		trimmed = withStmtIDs(trimmed, cmd, keepAt)
-		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
+		fwd, err := wire.NewMsgSequenced(msg.Header.RequestID, 0, trimmed, "updates")
 		if err != nil {
 			return nil, false
 		}
@@ -692,6 +705,9 @@ func (c *conn) applyOthers(ctx context.Context, msg *wire.Message, cmd bson.Raw,
 		c.r.noteOpTime(reply)
 		up, err = reply.ReplyDoc()
 		if err != nil || !replyOK(up) {
+			// Refused whole: the claims it took go back, as the settle in
+			// handle would have given them back for a forwarded command.
+			c.r.releaseUnheld(ctx, claimed)
 			out := reply
 			out.Header.ResponseTo = msg.Header.RequestID
 			return out, true

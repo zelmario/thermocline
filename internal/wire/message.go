@@ -321,3 +321,74 @@ func (m *Message) WithMoreToCome() *Message {
 	out.Raw = raw
 	return &out
 }
+
+// NewMsgSequenced is NewMsg with one array field of the document sent as a
+// payload sequence, the way a driver sends a batch, instead of in the body.
+//
+// mongod caps the body of a command at 16MB and a payload sequence at the
+// message size, 48MB, and drivers fill sequences up to that. A batch the
+// router rebuilt, minus a statement it refused, went back as one body, so a
+// 30MB insertMany or bulkWrite with one archived key in it was refused whole
+// with BSONObjectTooLarge where mongod applies the rest. Each element of the
+// field must be a document.
+func NewMsgSequenced(requestID, responseTo int32, doc bson.D, field string) (*Message, error) {
+	body := make(bson.D, 0, len(doc))
+	var items bson.A
+	found := false
+	for _, e := range doc {
+		if e.Key == field {
+			arr, ok := e.Value.(bson.A)
+			if !ok {
+				return nil, fmt.Errorf("wire: %s is not an array", field)
+			}
+			items, found = arr, true
+			continue
+		}
+		body = append(body, e)
+	}
+	if !found {
+		return NewMsg(requestID, responseTo, doc)
+	}
+	payload, err := bson.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("wire: marshal command: %w", err)
+	}
+	seq := make([]byte, 4, 64)
+	seq = append(seq, field...)
+	seq = append(seq, 0)
+	for _, it := range items {
+		var b []byte
+		switch v := it.(type) {
+		case bson.Raw:
+			b = v
+		case bson.RawValue:
+			if v.Type != bson.TypeEmbeddedDocument {
+				return nil, fmt.Errorf("wire: an element of %s is not a document", field)
+			}
+			b = v.Value
+		default:
+			b, err = bson.Marshal(v)
+			if err != nil {
+				return nil, fmt.Errorf("wire: marshal %s: %w", field, err)
+			}
+		}
+		seq = append(seq, b...)
+	}
+	binary.LittleEndian.PutUint32(seq[0:4], uint32(len(seq)))
+
+	length := HeaderLen + 4 + 1 + len(payload) + 1 + len(seq)
+	raw := make([]byte, 0, length)
+	raw = binary.LittleEndian.AppendUint32(raw, uint32(length))
+	raw = binary.LittleEndian.AppendUint32(raw, uint32(requestID))
+	raw = binary.LittleEndian.AppendUint32(raw, uint32(responseTo))
+	raw = binary.LittleEndian.AppendUint32(raw, uint32(OpMsg))
+	raw = binary.LittleEndian.AppendUint32(raw, 0) // flags
+	raw = append(raw, 0)
+	raw = append(raw, payload...)
+	raw = append(raw, 1)
+	raw = append(raw, seq...)
+	return &Message{
+		Header: Header{Length: int32(length), RequestID: requestID, ResponseTo: responseTo, OpCode: OpMsg},
+		Raw:    raw,
+	}, nil
+}

@@ -1234,6 +1234,9 @@ else
   # The bulkWrite command, as a driver sends it: ops and nsInfo as sequences.
   H "db.getSiblingDB(process.env.TC_DB).$SNS.deleteMany({_id:{\$in:['seq-new-1','seq-new-2']}})" >/dev/null
   SEQBULK=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" "$SNS" bulk 2>&1 | tail -1)
+  # A batch past 16MB with the archived _id in it: rebuilt without it, it went
+  # back as one body and mongod refused all of it as too large.
+  SEQBIG=$(/root/seqwrite "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" "$DB" "$SNS" big 2>&1 | tail -1)
   kill $SRP 2>/dev/null; wait $SRP 2>/dev/null
   chk "a sequenced insert of an archived _id is refused" "true" \
       "$(grep -q 'REFUSED with a duplicate key' <<<"$SEQOUT" && echo true || echo "false ($SEQOUT)")"
@@ -1243,6 +1246,8 @@ else
       "$(grep -q 'REFUSED with a duplicate key' <<<"$SEQBULK" && echo true || echo "false ($SEQBULK)")"
   chk "  and the fast tier did not take it"               "0" \
       "$(H "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({_id:'archived'}))")"
+  chk "a 17MB batch is applied but the archived _id"     "REFUSED the archived one 17" \
+      "$SEQBIG $(H "print(db.getSiblingDB(process.env.TC_DB).$SNS.countDocuments({_id:/^seq-big-/}))")"
   H "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
   C "db.getSiblingDB(process.env.TC_DB).$SNS.drop()" >/dev/null
 fi
