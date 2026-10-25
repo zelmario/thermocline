@@ -202,12 +202,6 @@ worker() {
     # something is wrong rather than slow.
     # A part carries its name as an argument, which the suite ignores, so the
     # pkill below can tell testchange@2 from testchange@3 on another worker.
-    # The suite's feeder starts from now, not from where the last suite on
-    # this worker stopped. Twelve suites never clear the checkpoint, and one
-    # that does clears it after its first start: resuming an hour back on this
-    # busy oplog took the feeder longer than a first archive read waits.
-    mongosh "${COLD:-mongodb://dba:secret@172.24.0.3:27017,172.24.0.4:27017,172.24.0.2:27017/?replicaSet=rsCold&authSource=admin}" \
-      --quiet --eval "db.getSiblingDB('$META').checkpoints.deleteMany({}); db.getSiblingDB('$META').positions.deleteMany({})" >/dev/null 2>&1
     PART=$part timeout --kill-after=30s "$SUITE_TIMEOUT" bash "/root/$f.sh" ${part:+"@$part"} > "$OUT/$s.log" 2>&1 &
     local spid=$!
     # When each section started, for deciding where a long suite splits. Read
