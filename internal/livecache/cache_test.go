@@ -788,3 +788,25 @@ func TestEventsSharingOneTime(t *testing.T) {
 		t.Error("still waiting once the stream said it had sent everything up to the write")
 	}
 }
+
+// An inserted document whose filtered field holds an array matches the
+// entries for each element, and its key cannot be read. It was noted against
+// nothing, so a read right after the insert was answered without it.
+func TestInsertWithAnUnkeyableValueHoldsTheNamespace(t *testing.T) {
+	c := New(1 << 20)
+	c.SetMaxStaleness(0)
+	qa := listQuery(t, "a", 2)
+	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+	c.Advance(bson.Timestamp{T: 10})
+	served := func(q Query) bool { _, hit := c.Get(q); return hit }
+
+	doc := raw(t, bson.D{{Key: "_id", Value: "p9"}, {Key: "category", Value: bson.A{"a", "z"}}, {Key: "price", Value: 1}})
+	c.NoteWrites([]WriteNote{{NS: "shop.products", Docs: []bson.Raw{doc}}}, bson.Timestamp{T: 20})
+	if served(qa) {
+		t.Fatal("a listing the inserted document belongs in was served before the stream applied it")
+	}
+	c.Advance(bson.Timestamp{T: 20})
+	if !served(qa) {
+		t.Fatal("still held back after the stream applied the write")
+	}
+}

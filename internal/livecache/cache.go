@@ -449,8 +449,20 @@ func (c *Cache) NoteWrites(notes []WriteNote, at bson.Timestamp) {
 		}
 		for _, d := range n.Docs {
 			for _, sh := range shapes {
-				if key, ok := c.keyOfQuiet(sh, d); ok {
+				key, ok := c.keyOfQuiet(sh, d)
+				if ok {
 					c.pendingEntry[key] = c.noteWrite(c.pendingEntry[key], at)
+					continue
+				}
+				// A filtered field present with a value this cannot key, an
+				// array or a decimal, still matches entries mongod would put
+				// the document in: {tag: ["a", "b"]} is in {tag: "a"}. Noted
+				// against nothing, a read right after the insert was answered
+				// without it until the stream refused the shape. So the whole
+				// namespace waits for the stream instead. A field that is
+				// missing puts the document in no entry and needs nothing.
+				if c.fieldsPresent(sh, d) {
+					c.pending[n.NS] = c.noteWrite(c.pending[n.NS], at)
 				}
 			}
 		}
@@ -1236,6 +1248,17 @@ func (c *Cache) keyOf(sh *shape, d bson.Raw) (string, bool) {
 
 // keyOfQuiet is keyOf without refusing the shape: for a write being noted,
 // whose document need not be one the cache would ever hold.
+// fieldsPresent reports whether a document carries every field a shape
+// filters by for equality, whatever their values.
+func (c *Cache) fieldsPresent(sh *shape, d bson.Raw) bool {
+	for _, f := range sh.fields {
+		if _, err := d.LookupErr(f); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
 	keys := make([]string, 0, len(sh.fields))
 	for _, f := range sh.fields {
