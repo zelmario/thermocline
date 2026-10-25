@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1325,19 +1326,41 @@ func (c *Cache) less(sh *shape, a, b bson.Raw) bool {
 // DropNS forgets a namespace, for a drop or rename seen on the stream.
 func (c *Cache) DropNS(ns string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.dropNS(ns)
+	c.mu.Unlock()
+	c.forgetPlain(ns)
+}
+
+// forgetPlain drops what plain learned about a namespace, or about every
+// namespace in a database when ns is one ending in a dot. A collection dropped
+// and created again may come back with a collation, or as a view.
+func (c *Cache) forgetPlain(ns string) {
+	c.plainMu.Lock()
+	defer c.plainMu.Unlock()
+	if strings.HasSuffix(ns, ".") {
+		for k := range c.plainNS {
+			if strings.HasPrefix(k, ns) {
+				delete(c.plainNS, k)
+			}
+		}
+		return
+	}
+	delete(c.plainNS, ns)
 }
 
 // Reset forgets everything, for a change stream that had to start again and
 // cannot say what it missed.
 func (c *Cache) Reset() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, e := range c.entries {
 		c.drop(e)
 	}
 	c.applied = bson.Timestamp{}
+	c.mu.Unlock()
+	// What it missed may have been a drop and a create.
+	c.plainMu.Lock()
+	c.plainNS = map[string]bool{}
+	c.plainMu.Unlock()
 }
 
 // Advance records how far the stream has read when it has no event to give,

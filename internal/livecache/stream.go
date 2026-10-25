@@ -168,6 +168,7 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {
 		return
 	case "dropDatabase":
 		fs.forget("")
+		c.forgetPlain(e.NS.DB + ".")
 		c.mu.Lock()
 		for _, en := range c.entries {
 			if len(en.shape.ns) > len(e.NS.DB) && en.shape.ns[:len(e.NS.DB)+1] == e.NS.DB+"." {

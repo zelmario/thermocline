@@ -415,15 +415,28 @@ func (c *Cache) plain(ctx context.Context, hot *mongo.Client, ns string) (bool, 
 		return false, false
 	}
 	ok = true
+	found := false
 	for cur.Next(ctx) {
+		found = true
 		if _, cerr := cur.Current.LookupErr("options", "collation"); cerr == nil {
 			ok = false
 		}
-		if t, _ := cur.Current.Lookup("type").StringValueOK(); t == "view" {
+		// A view's documents change under the base collection's name, and a
+		// time series collection's under system.buckets, which the stream
+		// this cache follows does not deliver. An entry for either is never
+		// brought up to date.
+		if t, _ := cur.Current.Lookup("type").StringValueOK(); t == "view" || t == "timeseries" {
 			ok = false
 		}
 	}
 	_ = cur.Close(ctx)
+	if !found {
+		// Not there yet, so what it will be is not known: created with a
+		// collation, or as a view, it is not plain, and nothing in the stream
+		// says when it is created. An empty entry recorded as plain stayed
+		// empty while mongod returned what was written after.
+		return false, true
+	}
 	c.plainMu.Lock()
 	c.plainNS[ns] = ok
 	c.plainMu.Unlock()
