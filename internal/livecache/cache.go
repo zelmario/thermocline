@@ -1167,15 +1167,23 @@ func (c *Cache) Apply(ch Change) {
 	// Out of every list it was in. On a tiered namespace a document that left
 	// may only have been evicted, so the lists holding it go. See Tiers.
 	tiered := c.isTiered(ch.NS)
-	// A list with no sort, or a tie in one, is in mongod's own order, which for
-	// a document updated where it is does not change: its record id stays.
-	// Taken out and put back, it went after all its equals, so find({status:
-	// "new"}).limit(10) returned documents 2 to 11 after an update to the
-	// first, where mongod still returns 1 to 10. Where it still belongs and
-	// the sort cannot have moved it, it is replaced where it stands.
+	// A list with no sort, or one whose sort can tie, is in an order mongod's
+	// plan decides: record id order under a collection scan, index order
+	// under an index scan. Taken out and put back, an updated document went
+	// after its equals, so find({status: "new"}).limit(10) returned documents
+	// 2 to 11 after an update to the first, where mongod still returns 1 to
+	// 10; kept where it stood, it stayed first where an index on {status,
+	// priority} had moved it. Neither guess is mongod's, so such a list goes
+	// when a member changes and is read again. A list sorted to the end, by
+	// _id last, has the one order mongod gives it, and a member whose sort
+	// fields did not change is replaced where it stands.
 	inPlace := map[*entry]bool{}
 	for e := range c.rev[id] {
 		if tiered && ch.Doc == nil {
+			c.drop(e)
+			continue
+		}
+		if ch.Doc != nil && planOrdered(e, id, ch.Doc) {
 			c.drop(e)
 			continue
 		}
@@ -1244,6 +1252,12 @@ func (c *Cache) Apply(ch Change) {
 			}
 			if !c.fits(sh, e, ch.Doc) {
 				break
+			}
+			// Where a new member goes in an order mongod's plan decides is
+			// mongod's to say. See planOrdered.
+			if planOrdered(e, id, ch.Doc) {
+				c.drop(e)
+				continue
 			}
 			c.insertDoc(e, doc{id: id, raw: trimDoc(sh, ch.Doc)})
 		}
@@ -1327,6 +1341,58 @@ func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
 		b = append(b, k...)
 	}
 	return string(b), true
+}
+
+// planOrdered reports whether where d goes in a listing is left to mongod's
+// plan rather than decided by the sort: the listing has no sort, or d's sort
+// fields equal another member's. Ties are ordered by record id under a
+// collection scan and by the index's other keys under an index scan, and this
+// cannot tell which mongod chose. A sort ending in _id cannot tie.
+func planOrdered(e *entry, id string, d bson.Raw) bool {
+	sh := e.shape
+	if sh.kind != KindFind {
+		return false
+	}
+	if len(sh.sort) == 0 {
+		return true
+	}
+	if sh.sort[len(sh.sort)-1].Field == "_id" {
+		return false
+	}
+	for _, x := range e.docs {
+		if x.id == id {
+			continue
+		}
+		same := true
+		for _, s := range sh.sort {
+			if !sameSortValue(x.raw, d, s.Field) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
+}
+
+// sameSortValue reports whether two documents tie on a sort field as mongod
+// compares it: by value, so 1 and 1.0 tie although their bytes differ. A value
+// this cannot key, an array or a document, is read as a tie, which only costs
+// a refill.
+func sameSortValue(a, b bson.Raw, field string) bool {
+	va, ea := a.LookupErr(field)
+	vb, eb := b.LookupErr(field)
+	if ea != nil || eb != nil {
+		return (ea != nil) == (eb != nil)
+	}
+	ka, oka := valueKey(va)
+	kb, okb := valueKey(vb)
+	if !oka || !okb {
+		return true
+	}
+	return ka == kb
 }
 
 // replaceInPlace puts a document's new version where its old one stood in a

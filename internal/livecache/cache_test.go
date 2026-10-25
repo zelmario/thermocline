@@ -844,11 +844,11 @@ func TestSweepPrunesReadersAndUnusedShapes(t *testing.T) {
 	}
 }
 
-// A list with no sort is in mongod's own order, and an update where the
-// document stands does not change that order. Taken out and put back at the
-// end, the first document moved past the others and limit(2) returned another
-// pair than mongod's.
-func TestUnsortedUpdateKeepsItsPlace(t *testing.T) {
+// A list with no sort is in an order mongod's plan decides. An update where
+// the document stands keeps its record id, but under an index scan it may move,
+// and taken out and put back at the end it moved where mongod's collection scan
+// would not. Neither is mongod's order for certain, so the list is read again.
+func TestUnsortedUpdateDropsTheList(t *testing.T) {
 	q, ok := ParseFind("shop.products", raw(t, bson.D{
 		{Key: "find", Value: "products"},
 		{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
@@ -861,11 +861,62 @@ func TestUnsortedUpdateKeepsItsPlace(t *testing.T) {
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
 	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
 		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
+	if _, hit := c.Get(q); hit {
+		t.Error("an unsorted list was answered after a member changed; its order is mongod's plan's to decide")
+	}
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 9)), raw(t, product("p2", "a", 2))}, true, 0)
+	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p4"), Doc: raw(t, product("p4", "a", 4)),
+		At: bson.Timestamp{T: 6}})
+	if _, hit := c.Get(q); hit {
+		t.Error("an unsorted list was answered after an insert into it")
+	}
+}
+
+// A list sorted to the end, by _id last, has one order, and a member updated
+// without its sort fields changing keeps its place.
+func TestTotallySortedUpdateKeepsItsPlace(t *testing.T) {
+	q, ok := ParseFind("shop.products", raw(t, bson.D{
+		{Key: "find", Value: "products"},
+		{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
+		{Key: "sort", Value: bson.D{{Key: "_id", Value: 1}}},
+		{Key: "limit", Value: int32(2)},
+	}))
+	if !ok {
+		t.Fatal("a listing sorted by _id was not understood")
+	}
+	c := New(1 << 20)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
+		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("miss")
 	}
 	if ids := ids(t, got); fmt.Sprint(ids) != "[p1 p2]" {
 		t.Errorf("after an update to p1 the list is %v, want [p1 p2] as mongod keeps it", ids)
+	}
+}
+
+// A sort by price leaves documents of one price in an order mongod's plan
+// decides. A document moving onto another's price ties with it, and where it
+// goes among its equal is not this cache's to say; one moving onto a price of
+// its own has the place the sort gives it.
+func TestSortTieDropsTheList(t *testing.T) {
+	q := listQuery(t, "a", 10)
+	c := New(1 << 20)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 5)),
+		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
+	got, hit := c.Get(q)
+	if !hit {
+		t.Fatal("a move onto a price of its own dropped the list")
+	}
+	if ids := ids(t, got); fmt.Sprint(ids) != "[p2 p3 p1]" {
+		t.Errorf("after p1 moved to 5 the list is %v, want [p2 p3 p1]", ids)
+	}
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p3"), Doc: raw(t, product("p3", "a", 2)),
+		Updated: []string{"price"}, At: bson.Timestamp{T: 6}})
+	if _, hit := c.Get(q); hit {
+		t.Error("p3 moved onto p2's price and the list was still answered; their order is mongod's plan's")
 	}
 }
