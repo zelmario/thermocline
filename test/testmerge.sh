@@ -205,6 +205,50 @@ sleep 8
 chk "the unacknowledged merge matches the reference"  "$(doc $REF)" "$(doc $NS)"
 chk "and the archive kept the fields it had"          "$(doc $REF)" "$(cold5)"
 
+echo "== a \$merge whose input only the archive holds =="
+# The fast tier cannot answer the input, so guardAggregate reads it from the
+# archive and feeds it to the $merge. The pre-pass that brings the targets up
+# ran on the fast tier regardless, found nothing there, and brought nothing up,
+# so the archived target was created anew and mirrored over.
+reseed
+H "db.getSiblingDB(process.env.TC_DB).tmrgin.drop(); db.getSiblingDB(process.env.TC_DB).tmrginref.drop();
+   db.getSiblingDB(process.env.TC_DB).tmrginref.insertOne({_id:5, balance:700})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).tmrgin.drop(); db.getSiblingDB(process.env.TC_DB).tmrgin.insertOne({_id:5, balance:700})" >/dev/null
+cline watermark --config $CFG --ns $DB.tmrgin --complete-from 2030-01-01T00:00:00Z >/dev/null 2>&1
+sleep 1
+chk "the input is in the archive alone"               "0 1" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).tmrgin.countDocuments({}))") $(C "print(db.getSiblingDB(process.env.TC_DB).tmrgin.countDocuments({}))")"
+for pair in "tmrginref $REF" "tmrgin $NS"; do
+  set -- $pair
+  R "db.getSiblingDB(process.env.TC_DB).$1.aggregate([{\$match:{balance:{\$gt:0}}},
+       {\$merge:{into:'$2', whenMatched:'merge', whenNotMatched:'insert'}}]).toArray()" >/dev/null 2>&1
+done
+sleep 6
+chk "the merged document matches the reference"       "$(doc $REF)" "$(doc $NS)"
+chk "and the archive kept the fields it had"          "$(doc $REF)" "$(cold5)"
+
+echo "== a \$merge on a nested field, over a document only the archive holds =="
+# on: "x.y" names a nested field. The pre-pass looked the field up as a plain
+# name, read every document as missing it, and brought nothing up.
+# Empty first: two documents without x would collide on the unique index as
+# two nulls, and mongod requires the index for on.
+H "db.getSiblingDB(process.env.TC_DB).$REF.deleteMany({}); db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.deleteMany({})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$REF.createIndex({'x.y':1},{unique:true}); db.getSiblingDB(process.env.TC_DB).$REF.insertOne({_id:7, x:{y:'k'}, keep:true})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({'x.y':1},{unique:true})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:7, x:{y:'k'}, keep:true})" >/dev/null
+for t in $REF $NS; do
+  R "db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{x:{y:'k'}, add:1}]},
+       {\$merge:{into:'$t', on:'x.y', whenMatched:'merge', whenNotMatched:'insert'}}]).toArray()" >/dev/null 2>&1
+done
+sleep 6
+nested() { R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$1.find({'x.y':'k'},{_tcDeletedAt:0}).toArray()))"; }
+chk "the nested merge matches the reference"          "$(nested $REF)" "$(nested $NS)"
+chk "and the archive kept the document it had"        "1 1" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({'x.y':'k', _tcDeletedAt:{\$exists:false}})+' '+db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({_id:7, keep:true, add:1}))")"
+H "db.getSiblingDB(process.env.TC_DB).$REF.dropIndex('x.y_1')" >/dev/null 2>&1
+R "db.getSiblingDB(process.env.TC_DB).$NS.dropIndex('x.y_1')" >/dev/null 2>&1
+
 echo "== \$merge into a tiered collection in another database =="
 reseedX
 chk "the cross-database fast tier lacks it"           "0" "$(H "print(db.getSiblingDB(process.env.TC_DB2).$XNS.countDocuments({_id:5}))")"

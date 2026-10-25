@@ -289,6 +289,9 @@ feeder:
     - "shop.techo"
     # testmerge.sh: tmref is deliberately NOT here, it is the untiered reference
     - "shop.tmrg"
+    # testmerge.sh: the input of a $merge the fast tier cannot answer, so it is
+    # read from the archive. tmrginref is its untiered reference.
+    - "shop.tmrgin"
     # testkeys.sh: a $merge writes documents, so it claims their unique keys.
     # Its own collection, because the router caches a namespace's unique indexes
     # and a name shared with another section is enforced under the wrong one.

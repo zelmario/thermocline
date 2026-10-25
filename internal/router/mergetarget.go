@@ -123,7 +123,7 @@ func (c *conn) guardMergeTarget(ctx context.Context, msg *wire.Message, cmd bson
 		return denied, true
 	}
 	idxs := c.r.uniqueIndexes(ctx, target)
-	keys, produced, err := c.mergeKeys(ctx, cmd, stages, db, onFields, uniqueFields(idxs))
+	keys, produced, err := c.mergeKeys(ctx, cmd, stages, db, onFields, uniqueFields(idxs), c.mergeReadsArchive(ctx, cmd, db))
 	if err != nil {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
@@ -265,15 +265,44 @@ func mergeTarget(v bson.RawValue, db string) (ns string, on []string, ok bool) {
 	return outDB + "." + outColl, on, true
 }
 
+// mergeReadsArchive reports whether this $merge's input may be read from the
+// archive, which is where its pre-pass then has to read it too.
+//
+// guardAggregate decides that after this guard has run: when the fast tier
+// cannot answer the input, the pipeline is run on the archive and its output
+// fed to the $merge. The pre-pass read the fast tier regardless, so the
+// targets of everything only the archive produced were never brought up, and
+// with whenNotMatched: insert the $merge created each one beside its archived
+// document, which the feeder then mirrored over it. Measured with an
+// incomplete input and completeness: archive, the default.
+//
+// Erring toward the archive costs a read and brings up more than needed;
+// erring the other way loses records. A view as input stays on the fast tier,
+// because the archive cannot be asked a view's pipeline here.
+func (c *conn) mergeReadsArchive(ctx context.Context, cmd bson.Raw, db string) bool {
+	if inTransaction(cmd) {
+		return false
+	}
+	scope, ok := scopeOfAggregate(cmd, db, c.r.ageFieldOf)
+	if !ok {
+		return false
+	}
+	c.r.resolveJoinedViews(ctx, &scope)
+	_, viaView, tiered := c.r.tieredBase(ctx, scope.primary)
+	if c.r.isViewNS(ctx, scope.primary, viaView, tiered) {
+		return false
+	}
+	_, _, _, fine := c.r.checkAggregate(ctx, scope)
+	return !fine
+}
+
 // mergeKeys runs the pipeline without its final stage and returns a filter
 // matching every document the $merge could act on.
 //
-// The pipeline runs on the fast tier, which is where it would have run anyway.
-// This is deliberately not the archive: the input's own completeness is a
-// separate question that the aggregate guard has already decided, and reading it
-// from somewhere else here would answer a question nobody asked.
+// The pipeline runs where the $merge's input will be read: the fast tier, or
+// the archive when the fast tier cannot answer it. See mergeReadsArchive.
 func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawValue, db string,
-	on []string, extra []string) (bson.Raw, []bson.Raw, error) {
+	on []string, extra []string, fromArchive bool) (bson.Raw, []bson.Raw, error) {
 	aggVal, err := cmd.LookupErr("aggregate")
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the aggregate target: %w", err)
@@ -305,6 +334,76 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 		read = append(read, bson.D{{Key: "$project", Value: proj}})
 	}
 
+	var clauses bson.A
+	var produced []bson.Raw
+	seen := 0
+	held := 0
+	take := func(cur bson.Raw) error {
+		if seen >= maxCopyUpForWrite {
+			return fmt.Errorf("this $merge would touch more than %d documents; warm the target first",
+				maxCopyUpForWrite)
+		}
+		// In bytes as well as in documents. Every document the pipeline
+		// produces is held until the pass ends, and ten thousand near the
+		// 16MB limit is far beyond any router's memory; refused the same way
+		// the count is, since warming the target is the same answer.
+		held += len(cur)
+		if held > maxMergePassBytes {
+			return fmt.Errorf("this $merge would hold more than %dMB of documents to check; warm the target first",
+				maxMergePassBytes>>20)
+		}
+		doc := make(bson.Raw, len(cur))
+		copy(doc, cur)
+		clause := bson.D{}
+		for _, f := range on {
+			// By path: on: "x.y" names a nested field, and mongod matches it
+			// that way. A plain lookup read every such document as missing
+			// the field, so nothing was brought up and nothing checked, and
+			// the merge inserted a second document beside the archived one.
+			v, found := lookupPath(doc, f)
+			if !found {
+				// A document missing one of the fields matched on cannot match
+				// an existing one either, so there is nothing to bring up.
+				return nil
+			}
+			var av any
+			if uerr := v.Unmarshal(&av); uerr != nil {
+				return nil
+			}
+			clause = append(clause, bson.E{Key: f, Value: av})
+		}
+		clauses = append(clauses, clause)
+		produced = append(produced, doc)
+		seen++
+		return nil
+	}
+
+	if coll, named := aggVal.StringValueOK(); named && fromArchive {
+		readRaw := make([]bson.Raw, 0, len(read))
+		for _, st := range read {
+			raw, merr := bson.Marshal(st)
+			if merr != nil {
+				return nil, nil, fmt.Errorf("build the pipeline: %w", merr)
+			}
+			readRaw = append(readRaw, raw)
+		}
+		_, serr := c.streamFromArchive(ctx, db, coll, readRaw, docField(cmd, "collation"),
+			func(_ context.Context, batch []any) error {
+				for _, d := range batch {
+					if raw, ok := d.(bson.Raw); ok {
+						if terr := take(raw); terr != nil {
+							return terr
+						}
+					}
+				}
+				return nil
+			})
+		if serr != nil {
+			return nil, nil, fmt.Errorf("run the pipeline on the archive to find what it would merge: %w", serr)
+		}
+		return mergeFilter(clauses, produced)
+	}
+
 	var aggAny any
 	if err := aggVal.Unmarshal(&aggAny); err != nil {
 		return nil, nil, fmt.Errorf("read the aggregate target: %w", err)
@@ -325,58 +424,22 @@ func (c *conn) mergeKeys(ctx context.Context, cmd bson.Raw, stages []bson.RawVal
 		return nil, nil, fmt.Errorf("run the pipeline to find what it would merge: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
-
-	var clauses bson.A
-	var produced []bson.Raw
-	seen := 0
-	held := 0
 	for cur.Next(ctx) {
-		if seen >= maxCopyUpForWrite {
-			return nil, nil, fmt.Errorf("this $merge would touch more than %d documents; warm the target first",
-				maxCopyUpForWrite)
+		if terr := take(cur.Current); terr != nil {
+			return nil, nil, terr
 		}
-		// In bytes as well as in documents. Every document the pipeline
-		// produces is held until the pass ends, and ten thousand near the
-		// 16MB limit is far beyond any router's memory; refused the same way
-		// the count is, since warming the target is the same answer.
-		held += len(cur.Current)
-		if held > maxMergePassBytes {
-			return nil, nil, fmt.Errorf("this $merge would hold more than %dMB of documents to check; warm the target first",
-				maxMergePassBytes>>20)
-		}
-		doc := make(bson.Raw, len(cur.Current))
-		copy(doc, cur.Current)
-		clause := bson.D{}
-		complete := true
-		for _, f := range on {
-			v, lerr := doc.LookupErr(f)
-			if lerr != nil {
-				complete = false
-				break
-			}
-			var av any
-			if uerr := v.Unmarshal(&av); uerr != nil {
-				complete = false
-				break
-			}
-			clause = append(clause, bson.E{Key: f, Value: av})
-		}
-		if !complete {
-			// A document missing one of the fields matched on cannot match an
-			// existing one either, so there is nothing to bring up for it.
-			continue
-		}
-		clauses = append(clauses, clause)
-		produced = append(produced, doc)
-		seen++
 	}
 	if err := cur.Err(); err != nil {
 		return nil, nil, fmt.Errorf("read what the pipeline would merge: %w", err)
 	}
+	return mergeFilter(clauses, produced)
+}
+
+// mergeFilter is the filter matching every document the pre-pass produced.
+func mergeFilter(clauses bson.A, produced []bson.Raw) (bson.Raw, []bson.Raw, error) {
 	if len(clauses) == 0 {
 		return nil, nil, nil
 	}
-
 	filter, err := bson.Marshal(bson.D{{Key: "$or", Value: clauses}})
 	if err != nil {
 		return nil, nil, fmt.Errorf("build the filter: %w", err)
