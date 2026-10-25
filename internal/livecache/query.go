@@ -385,7 +385,12 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 	if !ok {
 		return q, false
 	}
-	if n, ok := asInt(one); !ok || n != 1 {
+	// The int32 1 alone, which is what every driver's countDocuments sends.
+	// mongod's total takes the type of what is summed: {$sum: 1.0} answers a
+	// double and {$sum: NumberLong(1)} a long, and the reply built here is an
+	// int32, so those were answered with the wrong type. ParseGroupAgg asks
+	// the same.
+	if n, ok := one.Int32OK(); !ok || n != 1 {
 		return q, false
 	}
 	q.GroupID, q.CountField = id, ge[1].Key()

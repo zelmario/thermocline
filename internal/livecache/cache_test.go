@@ -716,3 +716,21 @@ func TestSingleBatchShorterThanTheLimitIsNotCached(t *testing.T) {
 		t.Error("a single batch that holds the whole limit was refused")
 	}
 }
+
+// mongod's total takes the type of what it sums, and the cache answers an
+// int32. {$sum: 1.0} is a double from mongod and {$sum: NumberLong(1)} a long.
+func TestCountPipelineTakesOnlyAnInt32One(t *testing.T) {
+	for _, one := range []any{1.0, int64(1)} {
+		_, ok := ParseCountAgg("shop.products", raw(t, bson.D{
+			{Key: "aggregate", Value: "products"},
+			{Key: "pipeline", Value: bson.A{
+				bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: "a"}}}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: one}}}}}},
+			}},
+			{Key: "cursor", Value: bson.D{}},
+		}))
+		if ok {
+			t.Errorf("a count summing %T was taken, and would be answered as an int32", one)
+		}
+	}
+}
