@@ -1250,11 +1250,8 @@ type uriTLS struct {
 
 func tlsFromURI(uri string) (uriTLS, error) {
 	var out uriTLS
-	u, err := url.Parse(uri)
-	if err != nil {
-		return out, nil
-	}
-	q := uriOptions(u)
+	u := splitURI(uri)
+	q := u.opts
 	// The option as written, and whether it was written at all: mongodb+srv
 	// turns TLS on unless the string turns it off, which a plain "is it
 	// true" read as off.
@@ -1267,7 +1264,7 @@ func tlsFromURI(uri string) (uriTLS, error) {
 		return false, false
 	}
 	enabled, said := flag("tls", "ssl")
-	if !said && u.Scheme == "mongodb+srv" {
+	if !said && u.scheme == "mongodb+srv" {
 		enabled = true
 	}
 	out.enabled = enabled
@@ -1296,31 +1293,56 @@ func tlsFromURI(uri string) (uriTLS, error) {
 // through it failed.
 type uriOpts map[string]string
 
-func uriOptions(u *url.URL) uriOpts {
-	out := uriOpts{}
-	for k, vs := range u.Query() {
-		lk := strings.ToLower(k)
-		if _, seen := out[lk]; !seen && len(vs) > 0 {
-			out[lk] = vs[0]
+// mongoURI is a connection string in its parts, taken apart by hand: a
+// multi-host URI with an IPv6 address, mongodb://[::1]:27017,[::2]:27017/,
+// is not one url.Parse accepts, and failing to parse it read as no TLS at all.
+type mongoURI struct {
+	scheme   string
+	userinfo string
+	path     string
+	opts     uriOpts
+}
+
+func splitURI(uri string) mongoURI {
+	var u mongoURI
+	scheme, rest, ok := strings.Cut(uri, "://")
+	if !ok {
+		return mongoURI{opts: uriOpts{}}
+	}
+	u.scheme = scheme
+	rest, query, _ := strings.Cut(rest, "?")
+	authority, path, _ := strings.Cut(rest, "/")
+	u.path = path
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		u.userinfo = authority[:at]
+	}
+	u.opts = uriOpts{}
+	if vals, err := url.ParseQuery(query); err == nil {
+		for k, vs := range vals {
+			lk := strings.ToLower(k)
+			if _, seen := u.opts[lk]; !seen && len(vs) > 0 {
+				u.opts[lk] = vs[0]
+			}
 		}
 	}
-	return out
+	return u
 }
 
 // Get is the option's value under any case of its name.
 func (o uriOpts) Get(name string) string { return o[strings.ToLower(name)] }
 
 func credentialsFromURI(uri string) (user, pass, authDB string) {
-	u, err := url.Parse(uri)
-	if err != nil || u.User == nil {
+	u := splitURI(uri)
+	if u.userinfo == "" {
 		return "", "", ""
 	}
-	user = u.User.Username()
-	pass, _ = u.User.Password()
-	authDB = uriOptions(u).Get("authSource")
+	name, secret, _ := strings.Cut(u.userinfo, ":")
+	user, _ = url.PathUnescape(name)
+	pass, _ = url.PathUnescape(secret)
+	authDB = u.opts.Get("authSource")
 	if authDB == "" {
 		// The driver's own default: the database named in the path, or admin.
-		authDB = strings.TrimPrefix(u.Path, "/")
+		authDB = u.path
 		if authDB == "" {
 			authDB = "admin"
 		}

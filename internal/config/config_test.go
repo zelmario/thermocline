@@ -765,4 +765,14 @@ func TestTLSFromURIReadsWhatTheDriverReads(t *testing.T) {
 	if _, _, auth := credentialsFromURI("mongodb://u:p@h:27017/app?authsource=admin"); auth != "admin" {
 		t.Errorf("authsource in lower case read as %q, want admin", auth)
 	}
+	// A multi-host URI whose first host is an IPv6 address with a zone is not one
+	// url.Parse accepts ("invalid port"), and
+	// failing to parse it read as no TLS.
+	v6, err := tlsFromURI("mongodb://u:p@[fe80::1%25eth0]:27017,h2:27017/?replicaSet=rs&tls=true&tlsCAFile=/ca.pem")
+	if err != nil || !v6.enabled || v6.caFile != "/ca.pem" {
+		t.Errorf("an IPv6 multi-host URI read as %+v (%v)", v6, err)
+	}
+	if u, p, a := credentialsFromURI("mongodb://dba:p%40ss%3Aw@[fe80::1%25eth0]:27017,h2:27017/shop?replicaSet=rs"); u != "dba" || p != "p@ss:w" || a != "shop" {
+		t.Errorf("credentials read as %q %q %q, want dba p@ss:w shop", u, p, a)
+	}
 }
