@@ -522,6 +522,7 @@ func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Ra
 		// this would not see.
 		trimmed = append(trimmed, bson.E{Key: "ops", Value: keep},
 			bson.E{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(len(keep) + 1)}}})
+		trimmed = withStmtIDs(trimmed, cmd, keepAt)
 		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
 		if err != nil {
 			return nil, false

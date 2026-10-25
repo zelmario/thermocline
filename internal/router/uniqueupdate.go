@@ -670,6 +670,7 @@ func (c *conn) applyOthers(ctx context.Context, msg *wire.Message, cmd bson.Raw,
 		if err != nil {
 			return nil, false
 		}
+		trimmed = withStmtIDs(trimmed, cmd, keepAt)
 		fwd, err := wire.NewMsg(msg.Header.RequestID, 0, trimmed)
 		if err != nil {
 			return nil, false
@@ -802,6 +803,53 @@ func errIndex(e bson.D) int32 {
 		}
 	}
 	return -1
+}
+
+// withStmtIDs numbers a trimmed retryable write's statements by their places
+// in the command the client sent.
+//
+// mongod numbers a retryable write's statements by position and remembers
+// which ran under the client's lsid and txnNumber. Sent [A, C] for [A, B, C],
+// it recorded A and C as statements 0 and 1, and a retry of the whole command
+// after a lost reply then read B as already done and ran C again: a $inc twice.
+// stmtIds is the field mongos sends shards for the same reason, and mongod
+// takes it from a client: measured, [A, C] sent with stmtIds [0, 2] and then
+// [A, B, C] retried reported retriedStmtIds [0, 2] and ran B once.
+//
+// Only for a retryable write outside a transaction, which is what a txnNumber
+// without autocommit is.
+func withStmtIDs(cmd bson.D, sent bson.Raw, keepAt []int) bson.D {
+	if _, err := sent.LookupErr("txnNumber"); err != nil {
+		return cmd
+	}
+	if _, err := sent.LookupErr("autocommit"); err == nil {
+		return cmd
+	}
+	var given []int32
+	if v, err := sent.LookupErr("stmtIds"); err == nil {
+		if arr, ok := v.ArrayOK(); ok {
+			vals, _ := arr.Values()
+			for _, x := range vals {
+				n, _ := intOf(x)
+				given = append(given, int32(n))
+			}
+		}
+	}
+	ids := make(bson.A, 0, len(keepAt))
+	for _, at := range keepAt {
+		if given != nil && at < len(given) {
+			ids = append(ids, given[at])
+			continue
+		}
+		ids = append(ids, int32(at))
+	}
+	out := make(bson.D, 0, len(cmd)+1)
+	for _, e := range cmd {
+		if e.Key != "stmtIds" {
+			out = append(out, e)
+		}
+	}
+	return append(out, bson.E{Key: "stmtIds", Value: ids})
 }
 
 // rebuildStatements is a write command carrying only the statements in keep,
