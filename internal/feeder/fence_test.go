@@ -31,7 +31,10 @@ func TestFlushWritesNothingWithoutTheLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) }()
+	// A cleanup, registered first so it runs last: deferred, it closed the
+	// client before the cleanups below ran, every drop failed unread, and what
+	// one run wrote was counted by the next.
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
 	const ns = "tc_fence.docs"
 	cc := cold.Database("tc_fence").Collection("docs")
 	markers := cold.Database(meta.DB).Collection(meta.Markers)
@@ -80,6 +83,7 @@ func TestFlushWritesNothingWithoutTheLease(t *testing.T) {
 	// was plain bulk writes, and it is the slowest path, the one most likely
 	// to outlast the lease.
 	const ns2 = "tc_fence.more"
+	_ = cold.Database("tc_fence").Collection("more").Drop(ctx)
 	t.Cleanup(func() { _ = cold.Database("tc_fence").Collection("more").Drop(context.WithoutCancel(ctx)) })
 	split := map[string][]mongo.WriteModel{}
 	splitOps := map[string][]pendingOp{}

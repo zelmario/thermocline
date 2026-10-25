@@ -238,8 +238,12 @@ H "db.getSiblingDB(process.env.TC_DB).$REF.createIndex({'x.y':1},{unique:true});
 R "db.getSiblingDB(process.env.TC_DB).$NS.createIndex({'x.y':1},{unique:true})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:7, x:{y:'k'}, keep:true})" >/dev/null
 for t in $REF $NS; do
-  R "db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{x:{y:'k'}, add:1}]},
-       {\$merge:{into:'$t', on:'x.y', whenMatched:'merge', whenNotMatched:'insert'}}]).toArray()" >/dev/null 2>&1
+  # Said when it fails: discarded, a merge that failed under load left only
+  # "add is missing" to go on, which is a different question.
+  MOUT=$(R "try { db.getSiblingDB(process.env.TC_DB).aggregate([{\$documents:[{x:{y:'k'}, add:1}]},
+       {\$merge:{into:'$t', on:'x.y', whenMatched:'merge', whenNotMatched:'insert'}}]).toArray(); print('MERGED') }
+     catch(e) { print('merge into $t failed: '+e.code+' '+e.message.substring(0,160)) }")
+  [ "$MOUT" = "MERGED" ] || echo "  note: ${MOUT:-mongosh printed nothing}"
 done
 sleep 6
 nested() { R "print(JSON.stringify(db.getSiblingDB(process.env.TC_DB).$1.find({'x.y':'k'},{_tcDeletedAt:0}).toArray()))"; }

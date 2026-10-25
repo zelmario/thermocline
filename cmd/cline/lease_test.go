@@ -30,7 +30,7 @@ func TestEvictorHoldEndsWhenTheLeaseIsLost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) }()
+	t.Cleanup(func() { _ = cold.Disconnect(context.WithoutCancel(ctx)) })
 	markers := cold.Database(meta.DB).Collection(meta.Markers)
 	row := bson.D{{Key: "_id", Value: "lease:evictor:hold-test"}}
 	_, _ = markers.DeleteOne(ctx, row)

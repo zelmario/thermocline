@@ -32,7 +32,7 @@ func TestAgainstMongoUnderWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cl.Disconnect(context.Background()) }()
+	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
 	const ns = "tc_live.products"
 	co := cl.Database("tc_live").Collection("products")
 	_ = co.Drop(ctx)

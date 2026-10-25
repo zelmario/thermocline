@@ -43,7 +43,7 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = cl.Disconnect(context.Background()) }()
+	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
 	const ns = "tc_livet.orders"
 	db := cl.Database("tc_livet")
 	fast, archive := db.Collection("orders"), db.Collection("archive")
