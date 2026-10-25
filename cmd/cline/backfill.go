@@ -455,10 +455,12 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	if cerr != nil {
 		return 0, fmt.Sprintf("could not read the archive for the claimed range: %v", cerr), true
 	}
+	// Both refusals below are failures: nothing was marked, and a backfill
+	// that reported success moved the checkpoint past the gap and exited 0.
 	if inCold > 0 && inFast == 0 {
 		return 0, fmt.Sprintf("no deletes marked: the claim says the fast tier holds this range in full "+
 			"and it holds none of it, so the claim is wrong rather than the archive; "+
-			"withdraw it with cline watermark --ns %s --clear, or warm the range first", ns), false
+			"withdraw it with cline watermark --ns %s --clear, or warm the range first", ns), true
 	}
 
 	// And the softer half of the same doubt. A claim can be wrong without being
@@ -495,7 +497,7 @@ func backfillDeletes(ctx context.Context, cfg config.Config, marks *watermark.St
 	if inCold > 0 && float64(len(candidates)) > mostOfIt*float64(inCold) {
 		return 0, fmt.Sprintf("no deletes marked: %d of the %d live documents the archive holds in the "+
 			"claimed range are missing from the fast tier, which is most of it and not the shape of a "+
-			"feeder's gap; check the claim before trusting it", len(candidates), inCold), false
+			"feeder's gap; check the claim before trusting it", len(candidates), inCold), true
 	}
 
 	for _, id := range candidates {

@@ -171,6 +171,17 @@ chk "and the checkpoint is still there"               "1" \
 BAD=$("$BIN" backfill --config "$DIR/bf.yaml" --ns orders --apply 2>&1); BADRC=$?
 chk "a namespace it could not do fails the command"   "1 true" \
     "$BADRC $(grep -q 'were not backfilled' <<<"$BAD" && echo true || echo false)"
+# And a claim the guard refuses is one too: no deletes were marked, and moving
+# the checkpoint past the gap with status 0 sealed it in.
+M $HOTPORT 'db.getSiblingDB("shop").orders.renameCollection("orders_aside")' >/dev/null
+CP0=$(M $COLDPORT 'print(JSON.stringify(db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"bf"})))')
+REF=$("$BIN" backfill --config "$DIR/bf.yaml" --ns shop.orders --apply 2>&1); REFRC=$?
+CP1=$(M $COLDPORT 'print(JSON.stringify(db.getSiblingDB("_thermocline").checkpoints.findOne({_id:"bf"})))')
+M $HOTPORT 'db.getSiblingDB("shop").orders_aside.renameCollection("orders")' >/dev/null
+chk "a refused claim fails the command too"           "1 true" \
+    "$REFRC $(grep -q 'the claim is wrong rather than the archive' <<<"$REF" && echo true || echo false)"
+chk "  and leaves the checkpoint where it was"        "true" \
+    "$([ "$CP0" = "$CP1" ] && echo true || echo "false ($CP0 -> $CP1)")"
 
 echo "== and then applied =="
 APPLIED=$("$BIN" backfill --config "$DIR/bf.yaml" --apply --clear-checkpoint 2>&1)
