@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -691,5 +692,63 @@ func TestEvictionLeavesADocumentWhoseDateMovedAfterTheScan(t *testing.T) {
 	}
 	if c, _ := hc.CountDocuments(ctx, bson.D{{Key: "_id", Value: old}}); c != 0 {
 		t.Error("the document still older than the boundary was not evicted")
+	}
+}
+
+// One batch can outlast the lease, and keepLease renewed only between batches.
+// A second evictor then took the lease and withdrew the running sweep's
+// announcements. The heartbeat renews while the sweep works, and cancels it
+// once somebody else holds the lease.
+func TestSweepHeartbeatKeepsAndLosesTheLease(t *testing.T) {
+	coldURI := os.Getenv("TC_TEST_COLD")
+	if coldURI == "" {
+		t.Skip("set TC_TEST_COLD to run the lease heartbeat test")
+	}
+	ctx := context.Background()
+	cold, err := mongo.Connect(options.Client().ApplyURI(coldURI))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cold.Disconnect(ctx) }()
+	const id = "heartbeat-test"
+	markers := cold.Database(meta.DB).Collection(meta.Markers)
+	row := bson.D{{Key: "_id", Value: "lease:evictor:" + id}}
+	defer func() { _, _ = markers.DeleteOne(context.Background(), row) }()
+
+	hold := lease.New(cold, "evictor", id)
+	if err := hold.Take(ctx); err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	seen := func() time.Time {
+		var r struct {
+			Seen time.Time `bson:"seen"`
+		}
+		_ = markers.FindOne(ctx, row).Decode(&r)
+		return r.Seen
+	}
+	e := &Evictor{hold: hold, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	beat, stop := e.heartbeat(ctx)
+	defer stop()
+
+	first := seen()
+	time.Sleep(lease.Renew + time.Second)
+	if !seen().After(first) {
+		t.Fatalf("the lease was not renewed while the sweep ran: seen stayed at %v", first)
+	}
+	if beat.Err() != nil {
+		t.Fatalf("the sweep was cancelled while it still held the lease: %v", context.Cause(beat))
+	}
+
+	// Somebody else takes it.
+	if _, err := markers.UpdateOne(ctx, row, bson.D{{Key: "$set", Value: bson.D{{Key: "owner", Value: "another"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-beat.Done():
+		if !errors.Is(context.Cause(beat), lease.ErrLost) {
+			t.Errorf("the sweep stopped for %v, want the lease being lost", context.Cause(beat))
+		}
+	case <-time.After(lease.Renew + 2*time.Second):
+		t.Error("the sweep went on after another evictor took the lease")
 	}
 }

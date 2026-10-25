@@ -327,6 +327,8 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 	// The lease is held until this returns, and cline pause takes the lease to
 	// know no sweep is in progress, so a delete outliving the sweep would be
 	// one the operator was told had stopped.
+	ctx, stopBeat := e.heartbeat(ctx)
+	defer stopBeat()
 	var behind removal
 	stats, err := e.sweepRule(ctx, rule, boundary, &behind)
 	n, werr := behind.wait()
@@ -334,7 +336,48 @@ func (e *Evictor) runRule(ctx context.Context, rule config.EvictionRule, boundar
 	if err == nil {
 		err = werr
 	}
+	if cause := context.Cause(ctx); errors.Is(cause, lease.ErrLost) {
+		err = cause
+	}
 	return stats, err
+}
+
+// heartbeat keeps the lease renewed for as long as a sweep runs, whatever the
+// sweep is doing, and cancels it if somebody else takes the lease.
+//
+// keepLease renews between batches, and one batch can take longer than the
+// lease outlives a holder: a scan, the archive comparison and every 64MB step
+// of evictBehind, each waiting on the delete before it, against a slow archive
+// or with large documents. A second evictor, such as cline evictor --once run
+// beside the daemon, then took the lease, and takeBackOrphans found the running
+// sweep's announcements with no delete in the oplog yet, its very next step,
+// and withdrew them. The delete went ahead unannounced, the feeder read it as
+// the application's, and the archive's copies were tombstoned.
+func (e *Evictor) heartbeat(ctx context.Context) (context.Context, func()) {
+	if e.dryRun || e.hold == nil {
+		return ctx, func() {}
+	}
+	beat, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(lease.Renew)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-beat.Done():
+				return
+			case <-t.C:
+				if err := e.hold.Keep(beat); errors.Is(err, lease.ErrLost) {
+					e.log.Warn("another sweep took over, stopping this one", "err", err)
+					cancel(err)
+					return
+				}
+			}
+		}
+	}()
+	return beat, func() { close(done); cancel(nil) }
 }
 
 func (e *Evictor) sweepRule(ctx context.Context, rule config.EvictionRule, boundary time.Time, behind *removal) (Stats, error) {
