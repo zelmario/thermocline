@@ -185,11 +185,12 @@ func proposedUniqueIndexes(msg *wire.Message) []uniqueIndex {
 	}
 	var out []uniqueIndex
 	for _, spec := range msg.AllOf("indexes") {
+		// unique: 1 is as unique as unique: true to mongod, and reading only
+		// a boolean skipped the walk of both tiers for it: an index built over
+		// a duplicate split across the tiers, and nothing claimed. safeBool
+		// reads a flag the way mongod does.
 		u, uerr := spec.LookupErr("unique")
-		if uerr != nil {
-			continue
-		}
-		if b, ok := u.BooleanOK(); !ok || !b {
+		if uerr != nil || !safeBool(u) {
 			continue
 		}
 		key, kok := spec.Lookup("key").DocumentOK()
@@ -212,7 +213,7 @@ func proposedUniqueIndexes(msg *wire.Message) []uniqueIndex {
 			idx.fields = append(idx.fields, e.Key())
 		}
 		if v, err := spec.LookupErr("sparse"); err == nil {
-			idx.sparse, _ = v.BooleanOK()
+			idx.sparse = safeBool(v)
 		}
 		if v, err := spec.LookupErr("partialFilterExpression"); err == nil {
 			if d, ok := v.DocumentOK(); ok {

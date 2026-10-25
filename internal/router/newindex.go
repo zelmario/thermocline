@@ -177,7 +177,7 @@ func requestedUniqueIndexes(cmd bson.Raw) map[string]bool {
 		if !ok {
 			continue
 		}
-		if u, uok := spec.Lookup("unique").BooleanOK(); !uok || !u {
+		if !safeBool(spec.Lookup("unique")) {
 			continue
 		}
 		key, kok := spec.Lookup("key").DocumentOK()

@@ -1569,12 +1569,18 @@ chk "the archive still holds the evicted one"        "true" \
 # A second live a@x on the fast tier. No unique index yet, so nothing refuses it,
 # and the two halves of the duplicate are now one per tier.
 R "db.getSiblingDB(process.env.TC_DB).$MNS.insertOne({_id:3,email:'a@x'})" >/dev/null
-R "db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1'}]})" >/dev/null
 cm() { case "$1" in *E11000*) echo "REFUSED" ;; *) echo "$1" ;; esac; }
+# unique: 1 is unique to mongod. Read only as a boolean, it skipped the walk and
+# the index was built over the split duplicate.
+chk "createIndexes with unique: 1 is refused too"    "REFUSED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1',unique:1}]});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+R "db.getSiblingDB(process.env.TC_DB).runCommand({createIndexes:'$MNS',indexes:[{key:{email:1},name:'tkem_1'}]})" >/dev/null
 chk "prepareUnique on its own is allowed"            "ACCEPTED" \
     "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},prepareUnique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
 chk "collMod unique by key pattern is refused"       "REFUSED" \
     "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
+chk "and with unique: 1"                             "REFUSED" \
+    "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{keyPattern:{email:1},unique:1}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
 chk "and by index name"                              "REFUSED" \
     "$(cm "$(R "try{db.getSiblingDB(process.env.TC_DB).runCommand({collMod:'$MNS',index:{name:'tkem_1',unique:true}});print('ACCEPTED')}catch(e){print(e.message.substring(0,60))}")")"
 chk "the index is still not unique"                  "false" \

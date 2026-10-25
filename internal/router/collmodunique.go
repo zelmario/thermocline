@@ -71,7 +71,8 @@ func collModAsksUnique(cmd bson.Raw) (bson.Raw, bool) {
 	if err != nil {
 		return nil, false
 	}
-	if b, bok := u.BooleanOK(); !bok || !b {
+	// A number too, as mongod reads it. See proposedUniqueIndexes.
+	if !safeBool(u) {
 		return nil, false
 	}
 	return spec, true
