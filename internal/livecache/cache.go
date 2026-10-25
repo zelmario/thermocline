@@ -104,8 +104,10 @@ type ProveFunc func(ctx context.Context, ns string, sort []SortKey, docs []bson.
 // MergeFunc completes what the fast tier's answer does not prove: fast is the
 // fast tier's head of the answer to a query on a tiered namespace, eq its
 // filter and sort its sort, and it returns the head of the answer over both
-// tiers, at most window long. ok false means it cannot be told now.
-type MergeFunc func(ctx context.Context, ns string, eq bson.D, sort []SortKey, fast []bson.Raw, window int) (docs []bson.Raw, ok bool)
+// tiers, at most window long. ok false means it cannot be told now. at is the
+// position fast was read at, so a write the fast tier's snapshot already
+// reflects is one the archive's answer is checked against too.
+type MergeFunc func(ctx context.Context, ns string, at bson.Timestamp, eq bson.D, sort []SortKey, fast []bson.Raw, window int) (docs []bson.Raw, ok bool)
 
 // Tiers lets the cache hold tiered namespaces. Called before Run.
 //
@@ -127,8 +129,9 @@ func (c *Cache) Tiers(tiered func(ns string) bool, prove ProveFunc, merge MergeF
 // ArchiveFunc reads, for a grouping on a tiered namespace, the documents of
 // the archive that filter takes, live ones only, with only proj's fields. ok
 // false means it cannot be told now: the archive's answer could hold a copy
-// the fast tier has since changed or deleted.
-type ArchiveFunc func(ctx context.Context, ns string, filter, proj bson.D) (docs []bson.Raw, ok bool)
+// the fast tier has since changed or deleted. at is the position the fast
+// tier's half was read at, as for MergeFunc.
+type ArchiveFunc func(ctx context.Context, ns string, at bson.Timestamp, filter, proj bson.D) (docs []bson.Raw, ok bool)
 
 // GroupArchive lets groupings on tiered namespaces be filled. Called before
 // Run. See readGroup.

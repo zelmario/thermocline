@@ -119,7 +119,7 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 			}
 		}
 		return len(docs), time.Time{}
-	}, func(ctx context.Context, _ string, eq bson.D, sort []SortKey, _ []bson.Raw, window int) ([]bson.Raw, bool) {
+	}, func(ctx context.Context, _ string, _ bson.Timestamp, eq bson.D, sort []SortKey, _ []bson.Raw, window int) ([]bson.Raw, bool) {
 		// The archive is written in the same step as the fast tier here, so
 		// it is always current, and the merge over both tiers is its answer.
 		// Held under mu, so it sees no write half done.
@@ -148,7 +148,7 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 		_ = cur.Close(ctx)
 		return out, cur.Err() == nil
 	})
-	c.GroupArchive(func(ctx context.Context, _ string, filter, proj bson.D) ([]bson.Raw, bool) {
+	c.GroupArchive(func(ctx context.Context, _ string, _ bson.Timestamp, filter, proj bson.D) ([]bson.Raw, bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		cur, err := archive.Find(ctx, filter, options.Find().SetProjection(proj))

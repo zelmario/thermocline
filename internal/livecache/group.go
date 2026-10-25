@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"bytes"
 	"math"
 	"math/big"
 	"sort"
@@ -70,9 +71,9 @@ type accSpec struct {
 	path  string
 }
 
-// maxGroupDocs bounds the documents a grouped entry remembers. A $match that
+// MaxGroupDocs bounds the documents a grouped entry remembers. A $match that
 // takes more is answered by mongod.
-const maxGroupDocs = 200_000
+const MaxGroupDocs = 200_000
 
 // ParseGroupAgg takes a grouping pipeline apart, or reports that it cannot be
 // answered here.
@@ -84,6 +85,7 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 		return q, false
 	}
 	var pipe bson.Raw
+	hasCursor := false
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
 		switch k {
@@ -97,22 +99,13 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 				return q, false
 			}
 		case "cursor":
-			d, ok := v.DocumentOK()
-			if !ok {
+			// Required: mongod refuses an aggregate without it, "The 'cursor'
+			// option is required", and this answered one.
+			if !cursorFits(v, 0) {
 				return q, false
 			}
-			ce, err := d.Elements()
-			if err != nil {
-				return q, false
-			}
-			for _, c := range ce {
-				if c.Key() != "batchSize" {
-					return q, false
-				}
-				n, ok := asInt(c.Value())
-				if !ok || n < 0 {
-					return q, false
-				}
+			hasCursor = true
+			if n, ok := asInt(v.Document().Lookup("batchSize")); ok {
 				g.Batch = n
 			}
 		case "pipeline":
@@ -124,6 +117,9 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 		default:
 			return q, false
 		}
+	}
+	if !hasCursor {
+		return q, false
 	}
 	stages, err := pipe.Values()
 	if err != nil || len(stages) == 0 {
@@ -501,7 +497,7 @@ func (g *GroupSpec) contribs(d bson.Raw) ([]contrib, bool) {
 // maxSummand bounds an integer added to a $sum. mongod's running total turns
 // into a double when it overflows a long and stays one, so the type of the
 // answer would depend on the order documents were read in; with every summand
-// under 2^40 and at most maxGroupDocs of them per group, nothing gets near.
+// under 2^40 and at most MaxGroupDocs of them per group, nothing gets near.
 const maxSummand = 1 << 40
 
 func datePart(part string, ms int64) bson.RawValue {
@@ -633,7 +629,7 @@ func (s *groupState) add(id string, d bson.Raw) bool {
 		s.refused = true
 		return false
 	}
-	if len(s.byDoc) >= maxGroupDocs {
+	if len(s.byDoc) >= MaxGroupDocs {
 		s.refused = true
 		return false
 	}
@@ -642,9 +638,9 @@ func (s *groupState) add(id string, d bson.Raw) bool {
 		if a == nil {
 			a = &groupAcc{id: c.id, sums: make([]exactSum, len(s.spec.Accs))}
 			s.groups[c.key] = a
-		} else if a.id.Type != c.id.Type {
-			// One group _id seen as two numeric types: mongod keeps whichever
-			// it read first.
+		} else if a.id.Type != c.id.Type || !bytes.Equal(a.id.Value, c.id.Value) {
+			// One group _id seen as two numeric types, or as 0.0 and -0.0:
+			// mongod keeps whichever it read first.
 			s.refused = true
 			return false
 		}

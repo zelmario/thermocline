@@ -252,3 +252,61 @@ func TestSameGroupAnswerRounding(t *testing.T) {
 		}
 	}
 }
+
+// -0.0 is 0 to mongod: one key for equality, one group, and a group whose _id
+// was seen both ways is mongod's choice of whichever it read first.
+func TestNegativeZero(t *testing.T) {
+	nz := bson.RawValue{Type: bson.TypeDouble, Value: bsoncoreDouble(math.Copysign(0, -1))}
+	z := bson.RawValue{Type: bson.TypeDouble, Value: bsoncoreDouble(0)}
+	zi := bson.RawValue{Type: bson.TypeInt32, Value: i32(0)}
+	kn, _ := valueKey(nz)
+	kz, _ := valueKey(z)
+	ki, _ := valueKey(zi)
+	if kn != kz || kz != ki {
+		t.Errorf("keys -0.0 %q, 0.0 %q, 0 %q: want one", kn, kz, ki)
+	}
+
+	q := groupQuery(t, bson.A{
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$total"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+	})
+	c := New(1 << 20)
+	day := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	c.install(q, []bson.Raw{
+		raw(t, order("o1", day, 0.0)),
+		raw(t, order("o2", day, math.Copysign(0, -1))),
+	}, true, 0)
+	if _, hit := c.Get(q); hit {
+		t.Error("answered a group whose _id was seen as 0.0 and -0.0")
+	}
+}
+
+// mongod refuses an aggregate without a cursor option, and answers
+// {batchSize: 0} with an empty first batch.
+func TestAggregateNeedsCursor(t *testing.T) {
+	grp := bson.A{bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: nil}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}
+	if _, ok := ParseGroupAgg("shop.orders", raw(t, bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: grp}})); ok {
+		t.Error("grouping without cursor accepted")
+	}
+	cnt := bson.A{bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}
+	if _, ok := ParseCountAgg("shop.orders", raw(t, bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: cnt}, {Key: "cursor", Value: bson.D{}}})); !ok {
+		t.Fatal("the driver's count pipeline is not recognised; the cases below would prove nothing")
+	}
+	for _, cur := range []any{nil, bson.D{{Key: "batchSize", Value: int32(0)}}, int32(1)} {
+		cmd := bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: cnt}}
+		if cur != nil {
+			cmd = append(cmd, bson.E{Key: "cursor", Value: cur})
+		}
+		if _, ok := ParseCountAgg("shop.orders", raw(t, cmd)); ok {
+			t.Errorf("count with cursor %v accepted", cur)
+		}
+	}
+}
+
+func bsoncoreDouble(f float64) []byte {
+	b := make([]byte, 8)
+	u := math.Float64bits(f)
+	for i := 0; i < 8; i++ {
+		b[i] = byte(u >> (8 * i))
+	}
+	return b
+}

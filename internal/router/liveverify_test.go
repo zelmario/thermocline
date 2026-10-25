@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/zelmario/thermocline/internal/checkpoint"
 )
 
 func TestLiveDiffer(t *testing.T) {
@@ -40,5 +42,21 @@ func TestLiveDiffer(t *testing.T) {
 		if got := liveDiffer(c.cached, c.real) == ""; got != c.same {
 			t.Errorf("%s: same=%v, want %v (%q)", c.name, got, c.same, liveDiffer(c.cached, c.real))
 		}
+	}
+}
+
+// The oplog check of a fill's archive half reaches the fill's own position
+// when that is past this router's cluster time: the fast tier's snapshot
+// reflects every write before it, and the stream brings none of them.
+func TestLiveWindowEnd(t *testing.T) {
+	seen := checkpoint.PackTS(bson.Timestamp{T: 100, I: 1})
+	if got := liveWindowEnd(seen, bson.Timestamp{T: 105, I: 3}); got != (bson.Timestamp{T: 105, I: 3}) {
+		t.Errorf("fill read after the cluster time: window ends at %v, want the fill's position", got)
+	}
+	if got := liveWindowEnd(seen, bson.Timestamp{T: 90, I: 1}); got != (bson.Timestamp{T: 100, I: 1}) {
+		t.Errorf("fill read before the cluster time: window ends at %v, want the cluster time", got)
+	}
+	if got := liveWindowEnd(0, bson.Timestamp{}); !got.IsZero() {
+		t.Errorf("nothing known: %v, want zero", got)
 	}
 }

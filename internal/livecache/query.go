@@ -263,6 +263,29 @@ func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
 	return q, true
 }
 
+// cursorFits reports whether an aggregate's cursor option is a document this
+// cache can answer: at most a batchSize, and that at least min.
+func cursorFits(v bson.RawValue, min int) bool {
+	d, ok := v.DocumentOK()
+	if !ok {
+		return false
+	}
+	ce, err := d.Elements()
+	if err != nil {
+		return false
+	}
+	for _, c := range ce {
+		if c.Key() != "batchSize" {
+			return false
+		}
+		n, ok := asInt(c.Value())
+		if !ok || n < min {
+			return false
+		}
+	}
+	return true
+}
+
 // ParseCountAgg recognises the counting pipeline drivers send for
 // countDocuments, and nothing else.
 func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
@@ -272,10 +295,20 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 		return q, false
 	}
 	var pipe bson.Raw
+	hasCursor := false
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
 		switch k {
-		case "aggregate", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference", "cursor":
+		case "aggregate", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference":
+		case "cursor":
+			// Required, as mongod requires it, and a batch of at least the one
+			// document the answer is: {batchSize: 0} gets an empty first
+			// batch and an open cursor from mongod, and was answered here
+			// with the count.
+			if !cursorFits(v, 1) {
+				return q, false
+			}
+			hasCursor = true
 		case "readConcern":
 			if !plainReadConcern(v) {
 				return q, false
@@ -289,6 +322,9 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 		default:
 			return q, false
 		}
+	}
+	if !hasCursor {
+		return q, false
 	}
 	stages, err := pipe.Values()
 	if err != nil || len(stages) < 1 || len(stages) > 2 {
@@ -552,7 +588,14 @@ func valueKey(v bson.RawValue) (string, bool) {
 		if v.Type == bson.TypeDouble && (math.IsNaN(v.Double()) || math.IsInf(v.Double(), 0)) {
 			return "", false
 		}
-		return "n" + exact(v).Text('g', -1), true
+		x := exact(v)
+		if x.Sign() == 0 {
+			// -0.0 is 0 to mongod. big.Float keeps the sign and wrote it "-0",
+			// so {x: 0} missed a document holding -0.0, and a grouping put
+			// the two in separate groups where mongod returns one.
+			return "n0", true
+		}
+		return "n" + x.Text('g', -1), true
 	case bson.TypeBoolean:
 		if v.Boolean() {
 			return "bt", true

@@ -378,7 +378,7 @@ func (c *Cache) mergeFill(ctx context.Context, out fillResult, filter bson.D, fa
 		out.unproven, out.ok = true, true
 		return out
 	}
-	docs, ok := c.merge(ctx, q.NS, filter, q.Sort, fast, window)
+	docs, ok := c.merge(ctx, q.NS, out.f.p0, filter, q.Sort, fast, window)
 	if !ok {
 		out.unproven, out.ok = true, true
 		return out
@@ -533,7 +533,7 @@ func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, 
 		{Key: "find", Value: coll},
 		{Key: "filter", Value: filter},
 		{Key: "projection", Value: proj},
-		{Key: "limit", Value: int64(maxGroupDocs + 1)},
+		{Key: "limit", Value: int64(MaxGroupDocs + 1)},
 		{Key: "batchSize", Value: int64(10000)},
 	}
 	cur, err := snapshotCursor(ctx, db, cmd, out.f.p0)
@@ -543,7 +543,7 @@ func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, 
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 	for cur.Next(ctx) {
-		if len(out.docs) == maxGroupDocs {
+		if len(out.docs) == MaxGroupDocs {
 			out.why = "group: the $match takes more documents than an entry remembers"
 			return out
 		}
@@ -575,7 +575,7 @@ func (c *Cache) withArchive(ctx context.Context, out fillResult, filter, proj bs
 		out.unproven, out.ok = true, true
 		return out
 	}
-	archived, ok := c.archive(ctx, out.f.q.NS, filter, proj)
+	archived, ok := c.archive(ctx, out.f.q.NS, out.f.p0, filter, proj)
 	if !ok {
 		out.unproven, out.ok = true, true
 		out.docs = nil
@@ -597,7 +597,7 @@ func (c *Cache) withArchive(ctx context.Context, out fillResult, filter, proj bs
 		if have[id] {
 			continue
 		}
-		if len(out.docs) == maxGroupDocs {
+		if len(out.docs) == MaxGroupDocs {
 			out.why = "group: the $match takes more documents than an entry remembers"
 			out.docs = nil
 			return out

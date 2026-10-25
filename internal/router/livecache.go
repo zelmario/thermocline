@@ -362,7 +362,7 @@ func (r *Router) liveStreamFrom() string {
 // The fast tier's head here is a snapshot at the fill's position, not now;
 // what changed since is applied to the entry from the stream, as every fill's
 // is.
-func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []livecache.SortKey, fast []bson.Raw, window int) ([]bson.Raw, bool) {
+func (r *Router) liveMerge(ctx context.Context, ns string, at bson.Timestamp, eq bson.D, sort []livecache.SortKey, fast []bson.Raw, window int) ([]bson.Raw, bool) {
 	if _, has := r.defaultCollation(ctx, ns); has {
 		return nil, false
 	}
@@ -370,7 +370,7 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 	if !got.known || got.ts.IsZero() {
 		return nil, false
 	}
-	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	until := liveWindowEnd(r.seenOpTime.Load(), at)
 	if until.IsZero() {
 		return nil, false
 	}
@@ -444,13 +444,29 @@ func (r *Router) liveMerge(ctx context.Context, ns string, eq bson.D, sort []liv
 	return out, true
 }
 
+// liveWindowEnd is where the oplog check of an archive half ends: the newest
+// of this router's cluster time and the position the fast tier's half was read
+// at. Ending at the cluster time alone missed a write made through another
+// router or straight at the fast tier after it and before the fill's position:
+// the fast tier's snapshot already reflected it, so the stream would never
+// bring it, and the archive's older copy was taken without the check seeing
+// it. A document deleted that way stayed counted in a grouping until the
+// entry's tieredTTL.
+func liveWindowEnd(seen uint64, at bson.Timestamp) bson.Timestamp {
+	until := checkpoint.UnpackTS(seen)
+	if checkpoint.PackTS(at) > seen {
+		until = at
+	}
+	return until
+}
+
 // liveArchive reads the archive's half of a grouping on a tiered namespace:
 // every live document filter takes, with proj's fields. It is the merged
 // read's guard without its sort: the feeder's position is read first, so the
 // archive holds everything mirrored up to it, and a document it returns that
 // the fast tier's oplog shows changed since then refuses the fill, since the
 // archive's copy may be one the fast tier has deleted.
-func (r *Router) liveArchive(ctx context.Context, ns string, filter, proj bson.D) ([]bson.Raw, bool) {
+func (r *Router) liveArchive(ctx context.Context, ns string, at bson.Timestamp, filter, proj bson.D) ([]bson.Raw, bool) {
 	if _, has := r.defaultCollation(ctx, ns); has || r.notSupersetCached(ns) != 0 {
 		return nil, false
 	}
@@ -458,7 +474,7 @@ func (r *Router) liveArchive(ctx context.Context, ns string, filter, proj bson.D
 	if !got.known || got.ts.IsZero() {
 		return nil, false
 	}
-	until := checkpoint.UnpackTS(r.seenOpTime.Load())
+	until := liveWindowEnd(r.seenOpTime.Load(), at)
 	if until.IsZero() {
 		return nil, false
 	}
@@ -478,12 +494,20 @@ func (r *Router) liveArchive(ctx context.Context, ns string, filter, proj bson.D
 		tc = r.startTailCheck(cctx, ns, got.ts, until)
 	}
 	cur, err := r.cold.Database(db).Collection(coll).Find(cctx, liveOnly(bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw}),
-		options.Find().SetProjection(proj).SetBatchSize(10000))
+		options.Find().SetProjection(proj).SetBatchSize(10000).SetLimit(livecache.MaxGroupDocs+1))
 	if err != nil {
 		return nil, false
 	}
 	var archived []bson.Raw
 	for cur.Next(cctx) {
+		// Bounded as it is read. The fast tier's half stops at the same count
+		// and the fill refuses past it, but this half used to read every
+		// document the filter took first: a grouping with no $match over a
+		// 200 million document archive held it all in memory to be refused.
+		if len(archived) == livecache.MaxGroupDocs {
+			_ = cur.Close(cctx)
+			return nil, false
+		}
 		archived = append(archived, append(bson.Raw(nil), cur.Current...))
 	}
 	cerr := cur.Err()
