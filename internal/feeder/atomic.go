@@ -127,7 +127,7 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 				"effect", "for the length of this one flush a reader of the archive can see a write to one "+
 					"collection without an earlier write to another",
 				"why", "retrying the same transaction fails the same way, and mirroring would stop for every namespace behind it")
-			return f.writeEach(ctx, order, byNS, opsByNS, now)
+			return f.writeSplit(ctx, order, models, ops, now)
 		}
 		if transient(err) {
 			continue
@@ -159,13 +159,91 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 	return nil, errors.New("mirroring made no progress")
 }
 
+// writeSplit writes a flush too large for one transaction in smaller ones,
+// each fenced on the lease the way the whole flush is: one namespace at a time,
+// then a namespace's operations in halves, in order.
+//
+// It used to fall back to writeEach, plain bulk writes with no fence, and that
+// is the slowest path there is: a flush of large documents that has just spent
+// most of the lease's 30s on a transaction the cache refused, then writes them
+// again one collection at a time. A standby that took the lease meanwhile and
+// marked a document deleted had the mark overwritten by the stale write. Only a
+// single operation the cache cannot hold is written without a transaction, and
+// only after the lease is renewed.
+func (f *Feeder) writeSplit(ctx context.Context, order []string,
+	byNS map[string][]mongo.WriteModel, opsByNS map[string][]pendingOp,
+	now time.Time) (map[string]*mongo.BulkWriteResult, error) {
+	out := make(map[string]*mongo.BulkWriteResult, len(order))
+	for _, ns := range order {
+		models, ops := byNS[ns], opsByNS[ns]
+		var res *mongo.BulkWriteResult
+		var err error
+		switch {
+		case len(order) > 1:
+			var r map[string]*mongo.BulkWriteResult
+			r, err = f.writeFlush(ctx, []string{ns},
+				map[string][]mongo.WriteModel{ns: models}, map[string][]pendingOp{ns: ops}, now)
+			res = r[ns]
+		case len(models) > 1:
+			half := len(models) / 2
+			res = &mongo.BulkWriteResult{}
+			for _, part := range [][2]int{{0, half}, {half, len(models)}} {
+				r, perr := f.writeFlush(ctx, []string{ns},
+					map[string][]mongo.WriteModel{ns: models[part[0]:part[1]]},
+					map[string][]pendingOp{ns: ops[part[0]:part[1]]}, now)
+				if perr != nil {
+					err = perr
+					break
+				}
+				addResult(res, r[ns])
+			}
+		default:
+			if err = f.keepLease(ctx); err == nil {
+				res, err = f.writeBatch(ctx, ns, models, ops, now)
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("mirror %s: %w", ns, err)
+		}
+		out[ns] = res
+	}
+	return out, nil
+}
+
+// addResult adds one bulk write's counts to another's, for a flush written in
+// parts. The counts are only reported; each part's own result is what its
+// writes were judged by.
+func addResult(to, from *mongo.BulkWriteResult) {
+	if from == nil {
+		return
+	}
+	to.InsertedCount += from.InsertedCount
+	to.MatchedCount += from.MatchedCount
+	to.ModifiedCount += from.ModifiedCount
+	to.DeletedCount += from.DeletedCount
+	to.UpsertedCount += from.UpsertedCount
+}
+
+// keepLease renews the lease before a write no transaction can fence, and
+// fails when another process holds it. It narrows the window to the write
+// itself; it does not close it the way Fence does.
+func (f *Feeder) keepLease(ctx context.Context) error {
+	if f.hold == nil {
+		return nil
+	}
+	return f.hold.Keep(ctx)
+}
+
 // writeEach is the flush one namespace at a time, which is all an archive that
-// cannot run transactions allows.
+// cannot run transactions allows, each write after renewing the lease.
 func (f *Feeder) writeEach(ctx context.Context, order []string,
 	byNS map[string][]mongo.WriteModel, opsByNS map[string][]pendingOp,
 	now time.Time) (map[string]*mongo.BulkWriteResult, error) {
 	out := make(map[string]*mongo.BulkWriteResult, len(order))
 	for _, ns := range order {
+		if err := f.keepLease(ctx); err != nil {
+			return nil, fmt.Errorf("mirror %s: %w", ns, err)
+		}
 		res, err := f.writeBatch(ctx, ns, byNS[ns], opsByNS[ns], now)
 		if err != nil {
 			return nil, fmt.Errorf("mirror %s: %w", ns, err)

@@ -59,6 +59,19 @@ Part of [Thermocline](../README.md).
   Stop the evictor with SIGTERM (`systemctl stop` does), give its unit room
   for a step to finish (30 seconds is the bound), and restart it after a crash.
 
+- **One write the feeder cannot fence: a single operation the archive's cache
+  cannot hold in a transaction.** Every flush is written in an archive
+  transaction that also marks the feeder's lease row, so a feeder that lost
+  its lease to a standby writes nothing. A flush too large for one transaction
+  is written in smaller ones, each fenced the same way, down to a single
+  operation. Only that last case, one document the cache cannot hold in a
+  transaction, is written without one, after the lease is renewed; a feeder
+  paused for thirty seconds inside that one write can land it after its
+  standby's, and a replacement over a tombstone the standby wrote leaves a
+  deleted document live until something writes it again. An archive that is
+  not a replica set runs no transactions, so every write there is in that
+  position. One feeder with no standby has no second writer and no window.
+
 - **Two feeders with different ids are not refused, and they double the work.**
   The lease stops two of the same daemon with the same id; two with different
   ids watching the same namespaces are not detected by anything, because nothing

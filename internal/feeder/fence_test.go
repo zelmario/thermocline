@@ -74,4 +74,34 @@ func TestFlushWritesNothingWithoutTheLease(t *testing.T) {
 	if n, _ := cc.CountDocuments(ctx, bson.D{{Key: "_id", Value: 2}}); n != 0 {
 		t.Error("the flush written without the lease reached the archive")
 	}
+
+	// The fallback for a flush the archive's cache cannot hold in one
+	// transaction, two namespaces and then halves of one, is fenced too: it
+	// was plain bulk writes, and it is the slowest path, the one most likely
+	// to outlast the lease.
+	const ns2 = "tc_fence.more"
+	t.Cleanup(func() { _ = cold.Database("tc_fence").Collection("more").Drop(context.WithoutCancel(ctx)) })
+	split := map[string][]mongo.WriteModel{}
+	splitOps := map[string][]pendingOp{}
+	for _, n := range []string{ns, ns2} {
+		for id := 10; id < 14; id++ {
+			doc := bson.D{{Key: "_id", Value: id}, {Key: "v", Value: "stale"}}
+			split[n] = append(split[n], mongo.NewReplaceOneModel().
+				SetFilter(bson.D{{Key: "_id", Value: id}}).SetReplacement(doc).SetUpsert(true))
+			raw, _ := bson.Marshal(doc)
+			splitOps[n] = append(splitOps[n], pendingOp{ns: n, id: bson.Raw(raw).Lookup("_id"), doc: raw, kind: actionUpsert})
+		}
+	}
+	if _, err := f.writeSplit(ctx, []string{ns, ns2}, split, splitOps, time.Now().UTC()); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("the split flush after the standby took the lease returned %v, want ErrLost", err)
+	}
+	if _, err := f.writeSplit(ctx, []string{ns2}, map[string][]mongo.WriteModel{ns2: split[ns2]},
+		map[string][]pendingOp{ns2: splitOps[ns2]}, time.Now().UTC()); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("a namespace written in halves after the standby took the lease returned %v, want ErrLost", err)
+	}
+	for _, c := range []*mongo.Collection{cc, cold.Database("tc_fence").Collection("more")} {
+		if n, _ := c.CountDocuments(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: 10}}}}); n != 0 {
+			t.Errorf("the split flush written without the lease reached %s: %d documents", c.Name(), n)
+		}
+	}
 }
