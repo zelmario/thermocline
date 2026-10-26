@@ -413,3 +413,32 @@ func TestAnnouncedDocumentDeletedByTheApplicationIsShown(t *testing.T) {
 		t.Error("a notice naming no session no longer hides its eviction")
 	}
 }
+
+// A stage stays at mongod, ahead of the sieve, only when it leaves every field
+// the sieve reads as mongod wrote it.
+func TestKeepsSieveFields(t *testing.T) {
+	stage := func(d bson.D) bson.RawValue {
+		b, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: b}
+	}
+	for _, c := range []struct {
+		st   bson.D
+		want bool
+	}{
+		{bson.D{{Key: "$match", Value: bson.D{{Key: "operationType", Value: "insert"}}}}, true},
+		{bson.D{{Key: "$set", Value: bson.D{{Key: "seen", Value: true}}}}, true},
+		{bson.D{{Key: "$addFields", Value: bson.D{{Key: "fullDocument.x", Value: 1}}}}, true},
+		{bson.D{{Key: "$set", Value: bson.D{{Key: "ns", Value: "$ns.coll"}}}}, false},
+		{bson.D{{Key: "$addFields", Value: bson.D{{Key: "documentKey", Value: "$documentKey._id"}}}}, false},
+		{bson.D{{Key: "$set", Value: bson.D{{Key: "lsid.id", Value: 1}}}}, false},
+		{bson.D{{Key: "$set", Value: bson.D{{Key: "wallTime", Value: "$$NOW"}}}}, false},
+		{bson.D{{Key: "$project", Value: bson.D{{Key: "ns", Value: 1}}}}, false},
+	} {
+		if got := keepsSieveFields(stage(c.st)); got != c.want {
+			t.Errorf("%v: kept %v, want %v", c.st, got, c.want)
+		}
+	}
+}

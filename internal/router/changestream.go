@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -201,10 +202,10 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	// first, it left an application's delete hidden as an eviction. See
 	// meta.EvictionNotice.Accepts.
 	//
-	// Only a stage that can take lsid away moves for the sieve's sake:
-	// $match, $addFields and $set that do not name it leave it in the event,
-	// and keeping them at mongod keeps a stream that filters most events from
-	// shipping every one of them here.
+	// Only a stage that can change what the sieve reads moves for its sake:
+	// $match, and $addFields and $set writing none of sieveFields, leave
+	// those in the event, and keeping them at mongod keeps a stream that
+	// filters most events from shipping every one of them here.
 	at := -1
 	for i, st := range stages[1:] {
 		if !keepsAtMongod(st, lookup) {
@@ -221,7 +222,7 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	// old way. See isEviction.
 	hides := false
 	for _, st := range stages[at:] {
-		if !keepsLsid(st) {
+		if !keepsSieveFields(st) {
 			hides = true
 		}
 	}
@@ -270,21 +271,49 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	c.csTail = &streamTail{stages: tail, collation: collation, let: let}
 }
 
-// keepsLsid reports whether a change stream stage leaves an event's lsid as
-// mongod wrote it: a $match, or an $addFields or $set that does not name it.
-func keepsLsid(st bson.RawValue) bool {
+// sieveFields are the fields of an event the sieve reads to tell this
+// system's own writes from the application's. See sieveEvents.
+var sieveFields = map[string]bool{
+	"_id": true, "operationType": true, "ns": true, "documentKey": true,
+	"clusterTime": true, "wallTime": true, "lsid": true,
+}
+
+// keepsSieveFields reports whether a change stream stage leaves every field the
+// sieve reads as mongod wrote it: a $match, or an $addFields or $set none of
+// whose outputs is one of them. Checked by the paths the stage writes, not by
+// its text: {$set: {ns: "$ns.coll"}} names no lsid and still turned the
+// evictor's deletes into the application's, because the sieve could no longer
+// read which collection an event was in.
+func keepsSieveFields(st bson.RawValue) bool {
 	name, _ := changeStreamStage(st)
 	switch name {
-	case "$match", "$addFields", "$set":
-		return !bytes.Contains(st.Value, []byte("lsid"))
+	case "$match":
+		return true
+	case "$addFields", "$set":
+		spec, ok := st.Document().Lookup(name).DocumentOK()
+		if !ok {
+			return false
+		}
+		elems, err := spec.Elements()
+		if err != nil {
+			return false
+		}
+		for _, e := range elems {
+			root, _, _ := strings.Cut(e.Key(), ".")
+			if sieveFields[root] {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }
 
 // keepsAtMongod reports whether a stage may run at mongod, before the sieve and
-// the fill: it leaves lsid, and with a lookup it cannot see the document.
+// the fill: it leaves what the sieve reads, and with a lookup it cannot see
+// the document.
 func keepsAtMongod(st bson.RawValue, lookup bool) bool {
-	if !keepsLsid(st) {
+	if !keepsSieveFields(st) {
 		return false
 	}
 	if !lookup {

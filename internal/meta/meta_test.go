@@ -844,4 +844,53 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 	if n := read(); !n.Accepts("") {
 		t.Error("a session's announcement narrowed a notice an older evictor's announcement left open")
 	}
+
+	// Sent again after a lost reply: the act counts once, and so does its
+	// session.
+	other := noticeID + "x"
+	named := func(n EvictionNotice) int {
+		if n.Named == nil {
+			return -1
+		}
+		return *n.Named
+	}
+	readOther := func() EvictionNotice {
+		_, notes, err := ReadEvictionNoticesIn(ctx, c, []string{other}, nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return notes[other]
+	}
+	for i := 0; i < 2; i++ {
+		if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:c", "cc33"); err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	}
+	if n := readOther(); named(n) != n.Left() || n.Accepts("") || !n.Accepts("cc33") {
+		t.Errorf("an announcement sent twice: named %d, pending %d, accepts none %v; want named = pending and only cc33",
+			named(n), n.Left(), n.Accepts(""))
+	}
+	// A second announcement, withdrawn: named comes down with pending.
+	if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:d", "dd44"); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if err := WithdrawEviction(ctx, c, []string{other}, "step:d"); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	if n := readOther(); named(n) != n.Left() || n.Accepts("") {
+		t.Errorf("after a withdrawal: named %d, pending %d, accepts none %v; want named = pending and closed",
+			named(n), n.Left(), n.Accepts(""))
+	}
+	// Spent to nothing: no session survives for an older evictor to inherit.
+	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{other: {{T: 200, I: 1}}}); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	if _, err := c.Database(DB).Collection(Evicting).UpdateOne(ctx, bson.D{{Key: "_id", Value: other}},
+		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}}, {Key: "$push", Value: bson.D{{Key: "by", Value: "old:2"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := readOther(); !n.Accepts("") {
+		t.Errorf("an older evictor's announcement inherited spent sessions (named %d, pending %d); its delete would be tombstoned",
+			named(n), n.Left())
+	}
 }

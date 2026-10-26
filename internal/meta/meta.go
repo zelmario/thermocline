@@ -964,7 +964,14 @@ func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string, 
 				{Key: "as", Value: "b"},
 				{Key: "cond", Value: bson.D{{Key: "$ne", Value: bson.A{"$$b", by}}}},
 			}}}},
-		}}}})
+			// Down with pending, as a spend takes it: a withdrawn
+			// announcement left named above pending and the notice open.
+			{Key: "named", Value: bson.D{{Key: "$cond", Value: bson.A{
+				bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$named"}}, "missing"}}},
+				"$$REMOVE",
+				bson.D{{Key: "$max", Value: bson.A{0, bson.D{{Key: "$add", Value: bson.A{"$named", -1}}}}}},
+			}}}},
+		}}}, forgetSessionsWhenIdle})
 	if err != nil {
 		return fmt.Errorf("withdraw eviction announcement: %w", err)
 	}
@@ -986,6 +993,16 @@ func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string, 
 	}
 	return nil
 }
+
+// forgetSessionsWhenIdle is the last stage of every write that lowers pending:
+// a notice with nothing pending names no session. Left behind, the sessions of
+// spent announcements made the next announcement from an evictor that writes
+// no session read as named, and its delete, made outside any of them, was
+// refused and the archive's copy tombstoned.
+var forgetSessionsWhenIdle = bson.D{{Key: "$set", Value: bson.D{
+	{Key: "sessions", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$gt", Value: bson.A{"$pending", 0}}}, "$sessions", "$$REMOVE"}}}},
+	{Key: "named", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$gt", Value: bson.A{"$pending", 0}}}, "$named", "$$REMOVE"}}}},
+}}}
 
 // EvictionAnnouncement is the write that announces one eviction: another one
 // pending, and the row's life restarted.
@@ -1044,11 +1061,17 @@ func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
 			}}},
 		}}}
 	}
+	// Only for an act not already recorded, like pending: an announcement
+	// sent again after a lost reply moved named a second time, named then
+	// stood above pending, and the notice accepted any delete.
+	keep := func(v any, field string) bson.D {
+		return bson.D{{Key: "$cond", Value: bson.A{"$_fresh", v, "$" + field}}}
+	}
 	return mongo.Pipeline{
-		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: sessions}, {Key: "named", Value: named}}}},
 		{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: bson.D{{Key: "$not", Value: bson.A{
 			bson.D{{Key: "$in", Value: bson.A{by, byNow}}},
 		}}}}}}},
+		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: keep(sessions, "sessions")}, {Key: "named", Value: keep(named, "named")}}}},
 		{{Key: "$set", Value: bson.D{
 			// At least one, not simply one more.
 			//
@@ -1257,6 +1280,7 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 						bson.D{{Key: "$max", Value: bson.A{0, bson.D{{Key: "$subtract", Value: bson.A{"$named", bson.D{{Key: "$size", Value: "$_fresh"}}}}}}}},
 					}}}},
 				}}},
+				forgetSessionsWhenIdle,
 				{{Key: "$unset", Value: "_fresh"}},
 			}))
 	}
