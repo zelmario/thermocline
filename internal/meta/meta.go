@@ -791,6 +791,9 @@ type EvictionNotice struct {
 	// entries share one. wallTime would have done as well from 6.0 and this
 	// supports 4.2.
 	Spent []bson.Timestamp `bson:"spent,omitempty"`
+	// Sessions names the sessions the announced deletes are made in, when
+	// every announcement still pending named one. See Accepts.
+	Sessions []string `bson:"sessions,omitempty"`
 	// By names the acts that announced this notice, newest last and capped,
 	// so one act is counted once however often it is sent and can take back
 	// exactly what it raised. See AnnounceEviction.
@@ -829,6 +832,41 @@ func (n EvictionNotice) Left() int {
 	return *n.Pending
 }
 
+// SessionHex names a session by its lsid, as a change event or a session
+// carries it: the hex of the id. "" when there is none.
+func SessionHex(lsid bson.Raw) string {
+	if len(lsid) == 0 {
+		return ""
+	}
+	_, data, ok := lsid.Lookup("id").BinaryOK()
+	if !ok {
+		return ""
+	}
+	return hex.EncodeToString(data)
+}
+
+// Accepts reports whether a delete made in the session named by lsid, the hex
+// of its lsid id or "" for a delete outside a transaction, is one this notice
+// announced.
+//
+// An application's delete of a document the evictor had announced, landing
+// between the announcement and the evictor's own delete, was read as the
+// eviction: the evictor's delete then matched nothing, the notice stayed, the
+// feeder spent it on the application's delete, and the archive kept the
+// document live. The next write to it copied it back up, and a document the
+// application had deleted came back. Measured with test/tierstress, the
+// evictor sweeping every two seconds: a few runs in ten, one document each.
+// The evictor now deletes in a transaction of its own session, a delete's
+// change event carries the session of a transaction, and only those deletes
+// spend its notices. A notice that names no session accepts any delete, as
+// every notice did before.
+func (n EvictionNotice) Accepts(lsid string) bool {
+	if len(n.Sessions) == 0 {
+		return true
+	}
+	return lsid != "" && slices.Contains(n.Sessions, lsid)
+}
+
 // AnnounceEviction records that these documents are about to leave the fast
 // tier, so the feeder can tell those deletes apart from an application's.
 //
@@ -860,6 +898,15 @@ func (n EvictionNotice) Left() int {
 // next delete of one of them as an eviction and keeps it alive in the archive,
 // or was taken back blind and took another eviction's announcement with it.
 func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string, by string) error {
+	return AnnounceEvictionIn(ctx, cold, docIDs, by, "")
+}
+
+// AnnounceEvictionIn is AnnounceEviction for deletes made in a transaction of
+// the session named by session, the hex of its lsid id. A notice every
+// announcement of which named a session is spent only by a delete made in one
+// of those sessions; see EvictionNotice.Accepts. An empty session announces a
+// delete made anywhere, which is what every announcement was before.
+func AnnounceEvictionIn(ctx context.Context, cold *mongo.Client, docIDs []string, by, session string) error {
 	if len(docIDs) == 0 {
 		return nil
 	}
@@ -870,7 +917,7 @@ func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string, 
 	for i, id := range docIDs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(EvictionAnnouncement(by)).
+			SetUpdate(EvictionAnnouncementIn(by, session)).
 			SetUpsert(true)
 	}
 	if _, err := ParallelBulkWrite(ctx, cold.Database(DB).Collection(Evicting), models); err != nil {
@@ -949,8 +996,41 @@ func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string, 
 // Counted once per act: by is recorded on the notice, and a notice that already
 // records it is left as it is. See AnnounceEviction.
 func EvictionAnnouncement(by string) mongo.Pipeline {
+	return EvictionAnnouncementIn(by, "")
+}
+
+// MaxSessionsRecorded caps the sessions a notice names. A notice is spent
+// by the delete of one of its own announcements, and an older session than
+// this many announcements back has long been spent or withdrawn.
+const MaxSessionsRecorded = 16
+
+// EvictionAnnouncementIn is EvictionAnnouncement naming the session the
+// delete will be made in. See AnnounceEvictionIn.
+//
+// Before the pending count moves, because the rule reads the count as it was:
+// a notice with an announcement still pending that named no session accepts
+// any delete, and naming one now would narrow what that earlier announcement
+// promised. Only a notice with nothing pending, or one that already names
+// sessions, starts or extends the list. An announcement naming none removes
+// it, so the notice accepts any delete again.
+func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
 	byNow := bson.D{{Key: "$ifNull", Value: bson.A{"$by", bson.A{}}}}
+	var sessions any = "$$REMOVE"
+	if session != "" {
+		sessions = bson.D{{Key: "$cond", Value: bson.A{
+			bson.D{{Key: "$and", Value: bson.A{
+				bson.D{{Key: "$gt", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 0}}},
+				bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$sessions"}}, "missing"}}},
+			}}},
+			"$$REMOVE",
+			bson.D{{Key: "$slice", Value: bson.A{
+				bson.D{{Key: "$concatArrays", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$sessions", bson.A{}}}}, bson.A{session}}}},
+				-MaxSessionsRecorded,
+			}}},
+		}}}
+	}
 	return mongo.Pipeline{
+		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: sessions}}}},
 		{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: bson.D{{Key: "$not", Value: bson.A{
 			bson.D{{Key: "$in", Value: bson.A{by, byNow}}},
 		}}}}}}},
@@ -1028,24 +1108,33 @@ func PendingAnnouncedBy(ctx context.Context, cold *mongo.Client, prefix string) 
 // same document with no announcement to claim. It was tombstoned in the
 // archive after leaving the fast tier.
 func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []string, owed map[string][]bson.Timestamp) (map[string]int, error) {
+	have, _, err := ReadEvictionNoticesIn(ctx, cold, docIDs, owed)
+	return have, err
+}
+
+// ReadEvictionNoticesIn is ReadEvictionNotices with each notice as read, so
+// the caller can ask which deletes it accepts. See EvictionNotice.Accepts.
+func ReadEvictionNoticesIn(ctx context.Context, cold *mongo.Client, docIDs []string, owed map[string][]bson.Timestamp) (map[string]int, map[string]EvictionNotice, error) {
 	if len(docIDs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	coll := cold.Database(DB).Collection(Evicting)
 	cur, err := coll.Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}}))
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}, {Key: "sessions", Value: 1}}))
 	if err != nil {
-		return nil, fmt.Errorf("read eviction notices: %w", err)
+		return nil, nil, fmt.Errorf("read eviction notices: %w", err)
 	}
 	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
 
 	have := map[string]int{}
+	notes := map[string]EvictionNotice{}
 	for cur.Next(ctx) {
 		var rec EvictionNotice
 		if derr := cur.Decode(&rec); derr != nil {
-			return nil, fmt.Errorf("decode eviction notice: %w", derr)
+			return nil, nil, fmt.Errorf("decode eviction notice: %w", derr)
 		}
+		notes[rec.ID] = rec
 		// A spent notice is not an announcement. It stays in the collection
 		// until its TTL now, for the change stream sieve to read, and the
 		// feeder must not claim it: doing so would treat an application's own
@@ -1062,9 +1151,9 @@ func ReadEvictionNotices(ctx context.Context, cold *mongo.Client, docIDs []strin
 		}
 	}
 	if cerr := cur.Err(); cerr != nil {
-		return nil, fmt.Errorf("read eviction notices: %w", cerr)
+		return nil, nil, fmt.Errorf("read eviction notices: %w", cerr)
 	}
-	return have, nil
+	return have, notes, nil
 }
 
 // SpendEvictionNotices writes down the announcements a batch actually used, and

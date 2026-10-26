@@ -180,19 +180,26 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if !ok || len(stages) < 2 {
 		return
 	}
-	// Only a stream that asked for the document has one to fill.
-	if !bytes.Contains(stages[0].Value, []byte("fullDocument")) {
-		return
-	}
-	// The stages mongod may keep are the leading $match stages that cannot
-	// see the document: none names fullDocument, $$ROOT or $$CURRENT, or
-	// reads through $expr. Everything from the first other stage on runs
-	// here, after the fill. Split at the first stage naming fullDocument, a
-	// $redact deciding on $$ROOT, or a $project dropping it by leaving it out,
-	// ran before the fill and the fill put back what it had taken.
+	// A stream that asked for the document has one to fill, and its stages
+	// that can see the document run after the fill.
+	lookup := bytes.Contains(stages[0].Value, []byte("fullDocument"))
+	// The stages mongod may keep are the leading $match stages, which leave
+	// an event whole, and with a lookup only those that cannot see the
+	// document: none names fullDocument, $$ROOT or $$CURRENT, or reads
+	// through $expr. Everything from the first other stage on runs here.
+	//
+	// Two reasons, one for each half. A stage that can see the document, a
+	// $redact deciding on $$ROOT or a $project dropping fullDocument, ran
+	// before the fill, and the fill put back what it had taken. And a stage
+	// that reshapes the event, $project of the fields a consumer wants, took
+	// away the lsid the sieve reads to tell the evictor's delete, made in its
+	// own session, from the application's delete of the same document: run
+	// first, it left an application's delete hidden as an eviction. See
+	// meta.EvictionNotice.Accepts.
 	at := -1
 	for i, st := range stages[1:] {
-		if !blindMatch(st) {
+		name, _ := changeStreamStage(st)
+		if name != "$match" || (lookup && !blindMatch(st)) {
 			at = i + 1
 			break
 		}
@@ -200,7 +207,10 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if at < 0 {
 		return
 	}
-	keep := &streamTail{noFill: true}
+	var keep *streamTail
+	if lookup {
+		keep = &streamTail{noFill: true}
+	}
 	c.csTail = keep
 	tail := make(bson.A, 0, len(stages)-at)
 	for _, st := range stages[at:] {
@@ -646,7 +656,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 			r.log.Debug("hiding this system's own catalog repair from a change stream",
 				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
-		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev)):
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev)):
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), eventPosition(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
@@ -764,9 +774,10 @@ const evictionWindow = 30 * time.Second
 
 // evictionNote is what the sieve needs to know about one announcement.
 type evictionNote struct {
-	left  int
-	at    time.Time
-	spent []bson.Timestamp
+	left     int
+	at       time.Time
+	spent    []bson.Timestamp
+	sessions []string
 }
 
 // isEviction reports whether this delete is the evictor making room rather than
@@ -785,9 +796,16 @@ type evictionNote struct {
 //
 // pos is the delete's own position in the fast tier's oplog, which is the same
 // value the feeder wrote down, because both read it off the same event.
-func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp) bool {
+//
+// session names the transaction the delete was made in, "" for none. A notice
+// naming sessions is the evictor's own delete only in one of them; anything
+// else is the application's, announced or not. See meta.EvictionNotice.Accepts.
+func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp, session string) bool {
 	note, ok := notes[id]
 	if !ok {
+		return false
+	}
+	if !(meta.EvictionNotice{Sessions: note.sessions}).Accepts(session) {
 		return false
 	}
 	// Unclaimed: announced, and the feeder has not applied it yet, so this
@@ -824,6 +842,19 @@ func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson
 // Its cluster time, which is exact: no two oplog entries share one, and the
 // feeder reads the same field off the same event. wallTime would have done from
 // MongoDB 6.0 and this supports 4.2.
+// eventSession names the transaction an event was made in, "" for none.
+func eventSession(ev bson.RawValue) string {
+	doc, ok := ev.DocumentOK()
+	if !ok {
+		return ""
+	}
+	lsid, ok := doc.Lookup("lsid").DocumentOK()
+	if !ok {
+		return ""
+	}
+	return meta.SessionHex(lsid)
+}
+
 func eventPosition(ev bson.RawValue) bson.Timestamp {
 	doc, ok := ev.DocumentOK()
 	if !ok {
@@ -859,7 +890,7 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 	for cur.Next(ctx) {
 		var rec meta.EvictionNotice
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent}
+			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent, sessions: rec.Sessions}
 		}
 	}
 	return out

@@ -29,13 +29,13 @@ func TestASpentNoticeAnswersForOneDeleteOnly(t *testing.T) {
 		"shop.orders|x": {left: 0, at: announced, spent: []bson.Timestamp{eviction}},
 	}
 
-	if !isEviction(notes, "shop.orders|x", announced, eviction) {
+	if !isEviction(notes, "shop.orders|x", announced, eviction, "") {
 		t.Error("the eviction the notice was spent on was not recognised")
 	}
 	// The application's own delete, well inside the window and a different
 	// oplog entry.
 	later := bson.Timestamp{T: 1022, I: 1}
-	if isEviction(notes, "shop.orders|x", time.Now(), later) {
+	if isEviction(notes, "shop.orders|x", time.Now(), later, "") {
 		t.Error("a delete the notice was not spent on was read as an eviction")
 	}
 }
@@ -47,7 +47,7 @@ func TestAnUnclaimedNoticeStillSuppresses(t *testing.T) {
 	notes := map[string]evictionNote{
 		"shop.orders|x": {left: 1, at: time.Now()},
 	}
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 9, I: 9}) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 9, I: 9}, "") {
 		t.Error("an eviction the feeder has not applied yet was let through as a delete")
 	}
 }
@@ -59,18 +59,18 @@ func TestANoticeWithoutPositionsFallsBackToTheWindow(t *testing.T) {
 	notes := map[string]evictionNote{
 		"shop.orders|x": {left: 0, at: time.Now().Add(-5 * time.Second)},
 	}
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "") {
 		t.Error("a notice from before the upgrade stopped recognising its own eviction")
 	}
 	notes["shop.orders|x"] = evictionNote{left: 0, at: time.Now().Add(-2 * time.Hour)}
-	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}) {
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "") {
 		t.Error("a notice from two hours ago still answered for a delete")
 	}
 }
 
 // And a document nothing announced is never an eviction.
 func TestADeleteWithNoNoticeIsNotAnEviction(t *testing.T) {
-	if isEviction(map[string]evictionNote{}, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}) {
+	if isEviction(map[string]evictionNote{}, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "") {
 		t.Error("a delete with no announcement behind it was read as an eviction")
 	}
 }
@@ -384,5 +384,26 @@ func TestARecordedEchoIsHiddenWhateverTheClocksSay(t *testing.T) {
 	promoted := map[string]promotion{"shop.orders|x": {at: promotedAt, ended: ended, echoed: []bson.Timestamp{echo}}}
 	if !isPromotion(promoted, "shop.orders|x", ended.Add(18*time.Millisecond), echo, time.Now().Add(-promotionWindow)) {
 		t.Error("a copy-up the feeder recorded was shown as an insert because its wall time fell after the record's end")
+	}
+}
+
+// An application's delete of a document the evictor has announced and not yet
+// removed is the application's: the notice names the evictor's session, and
+// only a delete in that session is the eviction. It used to be hidden from the
+// stream as one, and the archive kept the document.
+func TestAnnouncedDocumentDeletedByTheApplicationIsShown(t *testing.T) {
+	notes := map[string]evictionNote{"shop.orders|x": {left: 1, at: time.Now(), sessions: []string{"aa11"}}}
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "") {
+		t.Error("a delete made outside any transaction was hidden as the evictor's")
+	}
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "bb22") {
+		t.Error("a delete in another session was hidden as the evictor's")
+	}
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "aa11") {
+		t.Error("the evictor's own delete was shown")
+	}
+	legacy := map[string]evictionNote{"shop.orders|x": {left: 1, at: time.Now()}}
+	if !isEviction(legacy, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "") {
+		t.Error("a notice naming no session no longer hides its eviction")
 	}
 }

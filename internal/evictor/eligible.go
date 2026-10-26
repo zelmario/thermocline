@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
 )
@@ -21,6 +22,11 @@ type candidate struct {
 	// that step can take back exactly the announcements it made. See
 	// meta.AnnounceEviction.
 	announcedAs string
+	// session is the step's own, which its delete is made in, a transaction
+	// whose change events carry it, so that only that delete spends the
+	// announcement. Shared by every candidate of the step. See
+	// meta.EvictionNotice.Accepts.
+	session *mongo.Session
 }
 
 // candidateFilter builds the query that selects removable documents.

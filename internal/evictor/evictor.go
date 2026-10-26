@@ -734,6 +734,7 @@ func (e *Evictor) evictBehind(ctx context.Context, ns string, hotColl *mongo.Col
 					e.log.Warn("could not withdraw announcements for documents not evicted",
 						"ns", ns, "count", len(present), "err", err)
 				}
+				endSession(ctx, present)
 			}
 			return removed, werr
 		}
@@ -996,7 +997,21 @@ func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Col
 		}
 		models[i] = mongo.NewDeleteOneModel().SetFilter(filter).SetCollation(simpleCollation)
 	}
-	res, err := meta.ParallelBulkWrite(ctx, hotColl, models)
+	var res *mongo.BulkWriteResult
+	var err error
+	if sess := present[0].session; sess != nil {
+		// In a transaction of the step's own session, so the delete events
+		// carry it and the feeder can tell them from an application's delete
+		// of the same document. See meta.EvictionNotice.Accepts.
+		defer endSession(ctx, present)
+		_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+			r, berr := hotColl.BulkWrite(sc, models, options.BulkWrite().SetOrdered(false))
+			res = r
+			return nil, berr
+		})
+	} else {
+		res, err = meta.ParallelBulkWrite(ctx, hotColl, models)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("delete from fast tier %s: %w", ns, err)
 	}
@@ -1016,9 +1031,14 @@ func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Col
 		// not take; and the withdrawal carries this step's name, so it takes
 		// back only this step's announcement and never another eviction's.
 		//
-		// One something else removed stays announced, and its delete will be
-		// read as this eviction: the archive keeps it. That is the cost the
-		// moment between the check and the delete has always had.
+		// One something else removed stays announced, and that used to be the
+		// cost the moment between the check and the delete had: its delete was
+		// read as this eviction, the archive kept the document, and the next
+		// write copied it back up, a deleted document alive again. Measured
+		// with test/tierstress: "announced=41 deleted=40" at the second the
+		// application deleted the 41st. The notice now names this step's
+		// session, which the delete above is made in, so a delete outside it
+		// does not spend it. See meta.EvictionNotice.Accepts.
 		left := e.stillHeld(ctx, ns, hotColl, present)
 		if len(left) > 0 {
 			if werr := e.withdraw(ctx, left); werr != nil {
@@ -1212,14 +1232,34 @@ func (e *Evictor) nsOf(docs []candidate) string {
 
 // announce names the step on every candidate before announcing them, so the
 // step can take back what it raised whatever happens to the write.
+//
+// And opens the session the step's delete is made in, named on each notice,
+// so the feeder spends them only on that delete. See meta.EvictionNotice.Accepts.
 func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
 	by := e.stepPrefix() + bson.NewObjectID().Hex()
+	sess, err := e.hot.StartSession()
+	if err != nil {
+		return fmt.Errorf("start the step's session: %w", err)
+	}
+	session := meta.SessionHex(sess.ID())
 	docIDs := make([]string, len(docs))
 	for i := range docs {
 		docs[i].announcedAs = by
+		docs[i].session = sess
 		docIDs[i] = docs[i].docID
 	}
-	return meta.AnnounceEviction(ctx, e.cold, docIDs, by)
+	if err := meta.AnnounceEvictionIn(ctx, e.cold, docIDs, by, session); err != nil {
+		endSession(ctx, docs)
+		return err
+	}
+	return nil
+}
+
+// endSession ends the step's session, which every candidate of it shares.
+func endSession(ctx context.Context, docs []candidate) {
+	if len(docs) > 0 && docs[0].session != nil {
+		docs[0].session.EndSession(context.WithoutCancel(ctx))
+	}
 }
 
 // stepPrefix starts the name of every step this evictor announces under. The

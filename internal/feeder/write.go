@@ -604,7 +604,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 	// announced as the first.
 	// The owed ones are taken off there, against what the archive records, so
 	// a spend that landed without its reply is not counted twice.
-	announced, err := meta.ReadEvictionNotices(ctx, f.cold, ids, f.owedNow())
+	announced, notes, err := meta.ReadEvictionNoticesIn(ctx, f.cold, ids, f.owedNow())
 	if err != nil {
 		return err
 	}
@@ -669,7 +669,11 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 			}
 			continue
 		}
-		ok := avail[ids[n]] > 0
+		// And only a delete the announcement was for: the evictor's own, in
+		// its session, when the notice names one. An application's delete of
+		// the same document between the announcement and the evictor's delete
+		// is the application's. See meta.EvictionNotice.Accepts.
+		ok := avail[ids[n]] > 0 && notes[ids[n]].Accepts(f.pending[slot].session)
 		if ok {
 			avail[ids[n]]--
 			// The position of the delete this announcement answers for, so the

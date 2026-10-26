@@ -356,6 +356,11 @@ type pendingOp struct {
 	// is still recognised after the document has been evicted and promoted
 	// again. See meta.ResidencyRecord.Echoed.
 	at bson.Timestamp
+
+	// session names the transaction a delete was made in, "" for one made
+	// outside a transaction. Only a delete in the evictor's own session spends
+	// its announcement. See meta.EvictionNotice.Accepts.
+	session string
 }
 
 // changeEvent is the subset of a change stream document the feeder reads.
@@ -1122,12 +1127,18 @@ func (f *Feeder) pipeline() mongo.Pipeline {
 	// never reads updateDescription, because it mirrors an update by replacing
 	// the whole document. Without it an event is one document of at most 16MB
 	// and a few fields, which mongod's limit allows for.
+	//
+	// lsid too, the transaction an event was made in. It was left out, so
+	// changeEvent.LSID was never set: the rule that a batch ending inside a
+	// transaction claims no position never fired, and a delete could not be
+	// told to be the evictor's own. See meta.EvictionNotice.Accepts.
 	project := bson.D{
 		{Key: "operationType", Value: 1},
 		{Key: "ns", Value: 1},
 		{Key: "documentKey", Value: 1},
 		{Key: "fullDocument", Value: 1},
 		{Key: "clusterTime", Value: 1},
+		{Key: "lsid", Value: 1},
 	}
 	return mongo.Pipeline{{{Key: "$match", Value: match}}, {{Key: "$project", Value: project}}}
 }
@@ -1236,7 +1247,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// evictor is running.
 		f.pending = append(f.pending, pendingOp{
 			ns: ns, key: ev.DocumentKey, id: id, kind: actionDeletePending,
-			at: ev.ClusterTime,
+			at: ev.ClusterTime, session: meta.SessionHex(ev.LSID),
 		})
 		return nil
 	}
