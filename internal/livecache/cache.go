@@ -56,7 +56,12 @@ type Cache struct {
 	// applied: a write noted at that time was then taken as applied with the
 	// rest still to come, and a count read right after an insertMany was
 	// short. A later event, the end of a batch or an empty poll closes it.
-	closed  bson.Timestamp
+	closed bson.Timestamp
+	// openNS are the namespaces the open group, the events at applied while
+	// it is after closed, has changed so far. Only their answers can show
+	// part of it: a namespace the group has not reached yet still stands
+	// where it stood at closed.
+	openNS  map[string]bool
 	pending map[string][]pendingWrite
 	// pendingDB is the same for writes naming a whole database.
 	pendingDB map[string][]pendingWrite
@@ -283,6 +288,7 @@ func New(maxBytes int) *Cache {
 		rev:          map[string]map[*entry]struct{}{},
 		refused:      map[string]bool{},
 		refusedNS:    map[string]bool{},
+		openNS:       map[string]bool{},
 		pending:      map[string][]pendingWrite{},
 		pendingDB:    map[string][]pendingWrite{},
 		pendingEntry: map[string][]pendingWrite{},
@@ -698,8 +704,10 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	// whose events share one time and which mongod shows all or none of. An
 	// answer now could hold half of it, a state no read of mongod returns.
 	// The group closes at the next time or the end of the batch, so this
-	// refuses only while a batch is being applied.
-	if after(c.applied, c.closed) {
+	// refuses only while a batch is being applied, and only the namespaces
+	// the group has reached: refusing every one cost 45% of cachestress's
+	// hits, where each client writes a collection of its own.
+	if after(c.applied, c.closed) && c.openNS[q.NS] {
 		c.mu.Unlock()
 		c.Behind.Add(1)
 		return nil, Position{}, false
@@ -1190,6 +1198,7 @@ func (c *Cache) Apply(ch Change) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sawLocked(ch.At)
+	c.openNS[ch.NS] = true
 	shapes := c.shapes[ch.NS]
 	if len(shapes) == 0 {
 		return
@@ -1633,6 +1642,7 @@ func (c *Cache) Reset() {
 		c.drop(e)
 	}
 	c.applied, c.closed = bson.Timestamp{}, bson.Timestamp{}
+	clear(c.openNS)
 	c.mu.Unlock()
 	// What it missed may have been a drop and a create.
 	c.plainMu.Lock()
@@ -1657,6 +1667,7 @@ func (c *Cache) sawLocked(at bson.Timestamp) {
 			c.closed = c.applied
 		}
 		c.applied = at
+		clear(c.openNS)
 	}
 }
 
@@ -1673,6 +1684,9 @@ func (c *Cache) Advance(at bson.Timestamp) {
 	// cannot see, and it is the size of one batch.
 	if after(at, c.closed) {
 		c.closed = at
+	}
+	if !after(c.applied, c.closed) {
+		clear(c.openNS)
 	}
 	if c.sweeps++; c.sweeps >= 1024 {
 		c.sweeps = 0

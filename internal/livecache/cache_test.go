@@ -772,6 +772,19 @@ func TestEventsSharingOneTime(t *testing.T) {
 	if _, hit := c.Get(q); hit {
 		t.Error("answered with a group of events at one time still open")
 	}
+	// A namespace the open group has not changed stands where it stood.
+	other, _ := ParseCountAgg("shop.other", raw(t, bson.D{
+		{Key: "aggregate", Value: "other"},
+		{Key: "pipeline", Value: bson.A{
+			bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: "a"}}}},
+			bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+		}},
+		{Key: "cursor", Value: bson.D{}},
+	}))
+	c.install(other, nil, true, 7)
+	if _, hit := c.Get(other); !hit {
+		t.Error("a namespace the open group never touched was refused too")
+	}
 	c.Advance(T)
 	got, hit := c.Get(q)
 	if !hit {
