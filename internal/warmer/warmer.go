@@ -21,6 +21,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
@@ -58,7 +59,20 @@ type Warmer struct {
 	// can seek for the reads the archive was already seeking for. See
 	// promote/indexes.go.
 	indexer *promote.Indexer
+
+	// pace is where a pass's time went, said with each progress report at
+	// debug. See warmPace.
+	pace warmPace
 }
+
+// warmPace splits a warm's time by what it was waiting on, the way the
+// feeder's mirrorPace does: timing the whole pass cannot tell a slow archive
+// from a slow fast tier from a wait on mirroring, and one run of this can.
+type warmPace struct {
+	health, mirrored, read, hold, announce, residency, insert, mark, limit time.Duration
+}
+
+func since(d *time.Duration, t time.Time) { *d += time.Since(t) }
 
 // publish records what this warmer has done so far.
 //
@@ -456,7 +470,10 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		if backedOff, err := w.waitForHealth(ctx); err != nil {
+		t := time.Now()
+		backedOff, err := w.waitForHealth(ctx)
+		since(&w.pace.health, t)
+		if err != nil {
 			return stats, err
 		} else if backedOff {
 			stats.Backoffs++
@@ -467,7 +484,10 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			return stats, err
 		}
 
-		if !w.dryRun && !w.mirroredToNow(ctx) {
+		t = time.Now()
+		current := w.dryRun || w.mirroredToNow(ctx, rule.NS)
+		since(&w.pace.mirrored, t)
+		if !current {
 			w.log.Warn("not warming while mirroring is behind the fast tier",
 				"ns", rule.NS,
 				"waited", mirroredWait.String(),
@@ -476,7 +496,9 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 				"effect", "this rule stops here for this run and resumes on the next one")
 			return stats, nil
 		}
+		t = time.Now()
 		docs, cut, err := w.read(ctx, rule.NS, filter, scanSort(rule))
+		since(&w.pace.read, t)
 		if err != nil {
 			return stats, err
 		}
@@ -514,7 +536,9 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 		}
 		if !w.dryRun {
 			next := watermarkAfter(oldest).UTC().Truncate(time.Millisecond)
+			t = time.Now()
 			wrote, err := w.marks.LowerFrom(ctx, rule.NS, next, rule.DateField, claim.From, claim.Claimed)
+			since(&w.pace.mark, t)
 			if err != nil {
 				return stats, err
 			}
@@ -525,7 +549,9 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 			claim = watermark.Mark{From: next, Claimed: true}
 		}
 
+		t = time.Now()
 		w.limiter.spend(ctx, len(docs))
+		since(&w.pace.limit, t)
 
 		// Progress, at a rate a person can read.
 		//
@@ -547,6 +573,14 @@ func (w *Warmer) runRule(ctx context.Context, rule config.WarmRule) (Stats, erro
 				"already_present", stats.Present,
 				"reached_back_to", oldest.UTC().Format(time.RFC3339),
 				"target", floor.UTC().Format(time.RFC3339))
+			p := w.pace
+			w.log.Debug("warming pace", "ns", rule.NS,
+				"health_ms", p.health.Milliseconds(), "mirrored_ms", p.mirrored.Milliseconds(),
+				"read_ms", p.read.Milliseconds(), "hold_ms", p.hold.Milliseconds(),
+				"announce_ms", p.announce.Milliseconds(), "residency_ms", p.residency.Milliseconds(),
+				"insert_ms", p.insert.Milliseconds(), "mark_ms", p.mark.Milliseconds(),
+				"limit_ms", p.limit.Milliseconds())
+			w.pace = warmPace{}
 		}
 
 		// Short and not cut for size: the range has run out. See read.
@@ -644,7 +678,10 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	// document, and the claim then covers a document the fast tier does not
 	// hold. See promote.HoldPresent.
 	asked := false
-	if have, left, holdErr, herr := promote.HoldPresent(ctx, hot, w.cold, ns, ids, w.cfg.Residency.D()); herr != nil {
+	th := time.Now()
+	have, left, holdErr, herr := promote.HoldPresent(ctx, hot, w.cold, ns, ids, w.cfg.Residency.D())
+	since(&w.pace.hold, th)
+	if herr != nil {
 		w.log.Debug("could not ask the fast tier which documents it holds, warming all of them",
 			"ns", ns, "err", herr)
 	} else {
@@ -685,9 +722,17 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 
 	// Announce first, for the same reason the evictor does: the feeder must be
 	// able to recognise the resulting inserts before it sees them.
-	if err := w.announce(ctx, ns, docs); err != nil {
-		return 0, err
-	}
+	// The announcement and the residency below are two bulk writes to the
+	// archive's metadata that only have to land before the insert, not before
+	// each other, so they go together: measured on staging they were 20% and
+	// 44% of a warm's time, one after the other.
+	ta := time.Now()
+	announced := make(chan error, 1)
+	go func() {
+		err := w.announce(ctx, ns, docs)
+		since(&w.pace.announce, ta)
+		announced <- err
+	}()
 
 	// An insert, never a replace. The fast tier is authoritative: if it already
 	// holds this document, its copy is the newer one and the archive's must not
@@ -706,11 +751,19 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	// years-old document was just created. Recording first for a warm that then
 	// fails costs nothing: residency for a document that is not there protects
 	// nothing.
-	if err := w.recordResidency(ctx, ns, docs, asked); err != nil {
-		return 0, err
+	tr := time.Now()
+	rerr := w.recordResidency(ctx, ns, docs, asked)
+	since(&w.pace.residency, tr)
+	if aerr := <-announced; aerr != nil {
+		return 0, aerr
+	}
+	if rerr != nil {
+		return 0, rerr
 	}
 
+	ti := time.Now()
 	inserted, skipped, err := promote.Many(ctx, hot, raw)
+	since(&w.pace.insert, ti)
 	if err != nil {
 		return 0, fmt.Errorf("warm %s: %w", ns, err)
 	}
@@ -1149,7 +1202,16 @@ const mirroredWait = 30 * time.Second
 // The fast tier's own last write is the bar, read here rather than assumed,
 // and the feeder's published cluster time has to reach it. Once per batch, so
 // a long warm is never working from a view older than one batch.
-func (w *Warmer) mirroredToNow(ctx context.Context) bool {
+//
+// The bar is everything the fast tier has written, and that includes the batch
+// this warm inserted a moment ago: each batch waited for the feeder to read the
+// previous one's own inserts. Measured on staging, 100M records on the archive,
+// that wait was 14 of every 30 seconds and the warm ran at 2,300 documents a
+// second. What the wait protects against is a delete, so when the feeder is
+// short of the bar the oplog between them is asked for one: none in this
+// namespace, its database's commands or a transaction, and the batch goes on.
+// Anything that cannot be answered quickly waits as before.
+func (w *Warmer) mirroredToNow(ctx context.Context, ns string) bool {
 	if w.feederID == "" {
 		return true
 	}
@@ -1164,6 +1226,10 @@ func (w *Warmer) mirroredToNow(ctx context.Context) bool {
 		return false
 	}
 	want := checkpoint.PackTS(h.LastWrite.OpTime.TS)
+	if rec, ok, err := w.positions.At(ctx, w.feederID); err == nil && ok && rec.TS.T > 0 &&
+		checkpoint.PackTS(rec.TS) < want && w.noDeleteSince(ctx, ns, rec.TS, h.LastWrite.OpTime.TS) {
+		return true
+	}
 	deadline := time.Now().Add(mirroredWait)
 	for {
 		rec, ok, err := w.positions.At(ctx, w.feederID)
@@ -1179,6 +1245,53 @@ func (w *Warmer) mirroredToNow(ctx context.Context) bool {
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+// noDeleteSince reports that nothing in the fast tier's oplog after from could
+// have deleted a document of ns: no delete in it, no command on its database
+// (a drop, a rename), no admin command but a transaction's, and no transaction
+// holding anything on ns but inserts and updates. The same window the router's
+// point reads ask (see router.oplogWindow), for the whole namespace rather than
+// one _id, because a batch is a range.
+//
+// False whenever it cannot tell: an oplog that no longer reaches from, a slow
+// or failed query.
+func (w *Warmer) noDeleteSince(ctx context.Context, ns string, from, until bson.Timestamp) bool {
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	oplog := w.hot.Database("local", options.Database().SetReadPreference(readpref.Primary())).Collection("oplog.rs")
+	var first struct {
+		TS bson.Timestamp `bson:"ts"`
+	}
+	if err := oplog.FindOne(cctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: 1}}).
+		SetProjection(bson.D{{Key: "ts", Value: 1}})).Decode(&first); err != nil ||
+		checkpoint.PackTS(first.TS) > checkpoint.PackTS(from) {
+		return false
+	}
+	db, _ := splitNS(ns)
+	filter := bson.D{
+		{Key: "ts", Value: bson.D{{Key: "$gt", Value: from}}},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: "d"}},
+			bson.D{{Key: "op", Value: "c"}, {Key: "ns", Value: db + ".$cmd"}},
+			bson.D{{Key: "op", Value: "c"}, {Key: "ns", Value: "admin.$cmd"}, {Key: "o.applyOps", Value: bson.D{{Key: "$exists", Value: false}}}},
+			bson.D{{Key: "op", Value: "c"}, {Key: "ns", Value: "admin.$cmd"}, {Key: "o.applyOps", Value: bson.D{{Key: "$elemMatch",
+				Value: bson.D{{Key: "ns", Value: ns}, {Key: "op", Value: bson.D{{Key: "$nin", Value: bson.A{"i", "u"}}}}}}}}},
+		}},
+	}
+	var out struct {
+		Cursor struct {
+			FirstBatch []bson.Raw `bson:"firstBatch"`
+		} `bson:"cursor"`
+	}
+	err := w.hot.Database("local").RunCommand(cctx, bson.D{
+		{Key: "find", Value: "oplog.rs"},
+		{Key: "filter", Value: filter},
+		{Key: "projection", Value: bson.D{{Key: "ts", Value: 1}}},
+		{Key: "limit", Value: int32(1)},
+		{Key: "readConcern", Value: bson.D{{Key: "level", Value: "local"}, {Key: "afterClusterTime", Value: until}}},
+	}, options.RunCmd().SetReadPreference(readpref.Primary())).Decode(&out)
+	return err == nil && len(out.Cursor.FirstBatch) == 0
 }
 
 // claimMoved says that something else moved this namespace's claim during the
