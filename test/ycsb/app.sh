@@ -241,8 +241,19 @@ t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS thre
 for d in feeder evictor; do
   pgrep -f "^$X $d --config $CFG" >/dev/null || { t "$LABEL: the $d is not running, see $LABEL.$d.log"; exit 3; }
 done
+# Mirroring's lag every 10s through the run: the feeder is the ceiling on the
+# write rate the fast tier can take before archive reads wait, so a tc result
+# is read with this beside it. Lag and cluster-time lag as the router sees them.
+( while :; do
+    echo "$(date -u +%T) $(curl -s http://127.0.0.1:27811/metrics |
+      grep -E '^thermocline_mirroring_(lag|cluster_time_behind)_seconds ' | awk '{printf "%s=%s ", $1, $2}')"
+    sleep 10
+  done ) > "$OUT/$LABEL.lag" 2>&1 &
+LAGP=$!
 ycsb run "$RT" -p operationcount=2000000000 -p maxexecutiontime="$SECS"
 rc=$?
+kill $LAGP 2>/dev/null; wait $LAGP 2>/dev/null
+t "$LABEL: mirroring lag max $(awk '{for (i=2;i<=NF;i++) if ($i ~ /^thermocline_mirroring_lag_seconds=/) {split($i,a,"="); if (a[2]+0>m) m=a[2]+0}} END{printf "%.1fs", m}' "$OUT/$LABEL.lag")"
 curl -s http://127.0.0.1:27811/api/snapshot > "$OUT/$LABEL.snapshot.json"
 t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
 # What the router did for those numbers: a refusal is a YCSB ERROR as well, and
