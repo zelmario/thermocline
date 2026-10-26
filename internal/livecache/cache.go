@@ -1390,6 +1390,29 @@ func planOrdered(e *entry, id string, d bson.Raw) bool {
 	if sh.sort[len(sh.sort)-1].Field == "_id" {
 		return false
 	}
+	// Past the end of a head that is not the whole list there are documents
+	// this does not hold, and one equal to the last member may be among them:
+	// with an index on {cat, price, rank} the head A, B under sort price can
+	// become A, C when B's rank moves, both B and C at price 2. So a tie with
+	// the last member of an incomplete entry is a tie too.
+	if !e.complete && len(e.docs) > 0 {
+		last := e.docs[len(e.docs)-1]
+		if last.id != id {
+			edge := true
+			for _, s := range sh.sort {
+				if !sameSortValue(last.raw, d, s.Field) {
+					edge = false
+					break
+				}
+			}
+			if edge {
+				return true
+			}
+		} else {
+			// The last member itself: what follows it may tie with it.
+			return true
+		}
+	}
 	for _, x := range e.docs {
 		if x.id == id {
 			continue

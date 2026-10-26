@@ -984,3 +984,19 @@ func TestSameIDInTwoCollectionsIsTwoDocuments(t *testing.T) {
 		}
 	}
 }
+
+// A head that is not the whole list ends where the documents it does not
+// hold begin, and one of them may tie with its last member: with an index on
+// {cat, price, rank}, A, B at prices 1 and 2 becomes A, C when B's rank moves
+// past C's, both at price 2. The last member changing is a place the plan
+// decides, not the cache.
+func TestIncompleteHeadEdgeIsATie(t *testing.T) {
+	q := listQuery(t, "a", 2)
+	c := New(1 << 20)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, false, 0)
+	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 2)),
+		Updated: []string{"stock"}, At: bson.Timestamp{T: 5}})
+	if got, hit := c.Get(q); hit {
+		t.Errorf("served %v after the last member of an incomplete head changed; what follows it may tie", ids(t, got))
+	}
+}
