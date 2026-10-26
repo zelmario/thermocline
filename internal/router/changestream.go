@@ -289,6 +289,12 @@ func keepsSieveFields(st bson.RawValue) bool {
 	switch name {
 	case "$match":
 		return true
+	case "$changeStreamSplitLargeEvent":
+		// It changes only an event over 16MB, into pieces, and a piece
+		// without lsid is judged on its own: see splitWithoutSession. Counted
+		// as hiding lsid, it turned the session check off for every delete
+		// on a stream that used the documented way to read large events.
+		return true
 	case "$addFields", "$set":
 		spec, ok := st.Document().Lookup(name).DocumentOK()
 		if !ok {
@@ -730,7 +736,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHi
 			r.log.Debug("hiding this system's own catalog repair from a change stream",
 				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
-		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden):
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden || splitWithoutSession(ev)):
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), eventPosition(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
@@ -922,6 +928,22 @@ func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson
 // feeder reads the same field off the same event. wallTime would have done from
 // MongoDB 6.0 and this supports 4.2.
 // eventSession names the transaction an event was made in, "" for none.
+// splitWithoutSession reports a fragment of an event $changeStreamSplitLargeEvent
+// cut, which carries lsid in only one of its pieces: a delete with a large
+// pre-image is split, and the piece without lsid cannot say which session it
+// was made in, so it is judged without one, as a stream that hid lsid is.
+func splitWithoutSession(ev bson.RawValue) bool {
+	doc, ok := ev.DocumentOK()
+	if !ok {
+		return false
+	}
+	if _, split := doc.Lookup("splitEvent").DocumentOK(); !split {
+		return false
+	}
+	_, has := doc.Lookup("lsid").DocumentOK()
+	return !has
+}
+
 func eventSession(ev bson.RawValue) string {
 	doc, ok := ev.DocumentOK()
 	if !ok {

@@ -436,9 +436,36 @@ func TestKeepsSieveFields(t *testing.T) {
 		{bson.D{{Key: "$set", Value: bson.D{{Key: "lsid.id", Value: 1}}}}, false},
 		{bson.D{{Key: "$set", Value: bson.D{{Key: "wallTime", Value: "$$NOW"}}}}, false},
 		{bson.D{{Key: "$project", Value: bson.D{{Key: "ns", Value: 1}}}}, false},
+		{bson.D{{Key: "$changeStreamSplitLargeEvent", Value: bson.D{}}}, true},
 	} {
 		if got := keepsSieveFields(stage(c.st)); got != c.want {
 			t.Errorf("%v: kept %v, want %v", c.st, got, c.want)
+		}
+	}
+}
+
+func TestSplitWithoutSession(t *testing.T) {
+	ev := func(d bson.D) bson.RawValue {
+		b, err := bson.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: b}
+	}
+	lsid := bson.E{Key: "lsid", Value: bson.D{{Key: "id", Value: 1}}}
+	split := bson.E{Key: "splitEvent", Value: bson.D{{Key: "fragment", Value: 2}, {Key: "of", Value: 2}}}
+	op := bson.E{Key: "operationType", Value: "delete"}
+	for _, c := range []struct {
+		ev   bson.D
+		want bool
+	}{
+		{bson.D{op}, false},
+		{bson.D{op, lsid}, false},
+		{bson.D{op, split, lsid}, false},
+		{bson.D{op, split}, true},
+	} {
+		if got := splitWithoutSession(ev(c.ev)); got != c.want {
+			t.Errorf("%v: %v, want %v", c.ev, got, c.want)
 		}
 	}
 }
