@@ -944,3 +944,43 @@ func TestFillReplayDoesNotGuessThePlansOrder(t *testing.T) {
 		t.Errorf("served %v after a buffered update to a member; its place is mongod's plan's to decide", ids(t, got))
 	}
 }
+
+// Two collections can hold the same _id, and an application numbering its
+// documents from 1 in each always does. The reverse index named a document by
+// its key alone, so a change to _id 1 in one collection was applied to every
+// list holding _id 1 in another: it was taken out of them, or replaced by the
+// other collection's document. Measured with test/cachestress -ryw, sixteen
+// collections numbered from 1: 34,299 of 91,585 cached answers wrong.
+func TestSameIDInTwoCollectionsIsTwoDocuments(t *testing.T) {
+	list := func(ns string) Query {
+		q, ok := ParseFind(ns, raw(t, bson.D{
+			{Key: "find", Value: ns[len("shop."):]},
+			{Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}},
+			{Key: "sort", Value: bson.D{{Key: "_id", Value: 1}}},
+			{Key: "limit", Value: int32(5)},
+		}))
+		if !ok {
+			t.Fatal("a listing was not understood")
+		}
+		return q
+	}
+	qa, qb := list("shop.alpha"), list("shop.beta")
+	c := New(1 << 20)
+	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+	c.install(qb, []bson.Raw{raw(t, product("p1", "a", 7)), raw(t, product("p2", "a", 8))}, true, 0)
+	// p1 leaves category a in alpha only.
+	c.Apply(Change{NS: "shop.alpha", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "b", 1)),
+		Updated: []string{"category"}, At: bson.Timestamp{T: 5}})
+	got, hit := c.Get(qb)
+	if !hit {
+		t.Fatal("beta's list was dropped by a change in alpha")
+	}
+	if ids := ids(t, got); fmt.Sprint(ids) != "[p1 p2]" {
+		t.Errorf("beta's list is %v after alpha's p1 moved, want [p1 p2]", ids)
+	}
+	if got, hit := c.Get(qa); hit {
+		if ids := ids(t, got); fmt.Sprint(ids) != "[p2]" {
+			t.Errorf("alpha's list is %v, want [p2]", ids)
+		}
+	}
+}

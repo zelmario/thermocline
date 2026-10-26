@@ -34,7 +34,10 @@ type Cache struct {
 	// shapes are every shape asked for, per namespace, which is what an
 	// incoming change is applied against.
 	shapes map[string]map[string]*shape
-	// rev names the list entries each document is in, by docKey.
+	// rev names the list entries each document is in, by revKey: the
+	// namespace and the document's key. By the key alone, _id 5 of one
+	// collection was _id 5 of every other, and a change to it in one was
+	// applied to the lists of all of them.
 	rev map[string]map[*entry]struct{}
 	// refused are shapes a document showed could not be answered exactly: an
 	// array or a missing value where the shape needs a single one.
@@ -423,7 +426,11 @@ func (c *Cache) NoteWrites(notes []WriteNote, at bson.Timestamp) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, n := range notes {
-		if n.Whole {
+		// A note that names no document cannot be placed: an updateMany by
+		// another field changes documents nobody listed. Held per document,
+		// it was held against none, and a grouping over the field it set was
+		// served before the write.
+		if n.Whole || (len(n.IDs) == 0 && len(n.Docs) == 0) {
 			c.pending[n.NS] = c.noteWrite(c.pending[n.NS], at)
 			continue
 		}
@@ -1076,20 +1083,25 @@ func (c *Cache) RefuseNS(ns string) {
 	c.dropNS(ns)
 }
 
+// revKey is a document's key in rev: its namespace and its docKey.
+func revKey(ns, id string) string { return ns + "\x00" + id }
+
 func (c *Cache) addRev(id string, e *entry) {
-	m := c.rev[id]
+	k := revKey(e.shape.ns, id)
+	m := c.rev[k]
 	if m == nil {
 		m = map[*entry]struct{}{}
-		c.rev[id] = m
+		c.rev[k] = m
 	}
 	m[e] = struct{}{}
 }
 
 func (c *Cache) delRev(id string, e *entry) {
-	if m := c.rev[id]; m != nil {
+	k := revKey(e.shape.ns, id)
+	if m := c.rev[k]; m != nil {
 		delete(m, e)
 		if len(m) == 0 {
-			delete(c.rev, id)
+			delete(c.rev, k)
 		}
 	}
 }
@@ -1197,7 +1209,7 @@ func (c *Cache) Apply(ch Change) {
 	// _id last, has the one order mongod gives it, and a member whose sort
 	// fields did not change is replaced where it stands.
 	inPlace := map[*entry]bool{}
-	for e := range c.rev[id] {
+	for e := range c.rev[revKey(ch.NS, id)] {
 		if tiered && ch.Doc == nil {
 			c.drop(e)
 			continue

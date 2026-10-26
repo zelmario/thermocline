@@ -485,7 +485,7 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		c.drop(e)
 		return false
 	}
-	_, holds := c.rev[id][e]
+	_, holds := c.rev[revKey(ch.NS, id)][e]
 	if holds && c.isTiered(ch.NS) && ch.Doc == nil {
 		// May only have been evicted. See Tiers.
 		c.drop(e)
