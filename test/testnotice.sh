@@ -93,8 +93,11 @@ C "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$EVID'), n
 # refuses would leave every check below measuring nothing. The feeder is stopped
 # for this, so its position is stamped by hand immediately before the sweep.
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 
 echo "== the evictor announces before it removes =="
 EVOUT=$(cline evictor --config $CFG --once 2>&1)
@@ -116,8 +119,11 @@ echo "== so does the router's own copy-up =="
 # Evict it again, then read it through a router, which copies it up on the miss.
 C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({})" >/dev/null
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 cline evictor --config $CFG --once >/dev/null 2>&1
 BEFORE=$(notices "$NOTICE")
 chkv "the second eviction is announced too"      "true" \
@@ -182,8 +188,11 @@ C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({});
 H "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$RID'), n:'live'})" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).orders.insertOne({_id:ObjectId('$RID'), n:'live'})" >/dev/null
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 # The feeder starts first and is given time to save its position once. Its very
 # first flush always checkpoints, whatever the interval says, so an eviction
 # arranged before it starts is inside the saved position and the window this
@@ -246,7 +255,10 @@ chkv "ten candidates are on the fast tier" "10" \
 # The feeder runs, so the deletes it sees are the ones under test. Its position
 # is current first, so it does not replay anything older.
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 cline feeder --config $CFG >/dev/null 2>&1 & FP5=$!
 sleep 6
 

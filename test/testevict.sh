@@ -222,8 +222,11 @@ chkv "and the archive holds none"             "0" \
 # suite tests; this one is about what counts as the archive holding a document,
 # so the position is stamped fresh immediately before the sweep.
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 EVOUT=$(cline evictor --config $CFG --once 2>&1)
 # The control. A sweep that refused to run for health reasons would leave the
 # document alone too, and prove nothing at all about tombstones.
@@ -253,8 +256,11 @@ cline watermark --config $CFG --ns $DB.orders --clear >/dev/null 2>&1
 chkv "the claim starts withdrawn"              "true" \
     "$(cline watermark --config $CFG --ns $DB.orders 2>&1 | grep -qc 'claims nothing' && echo true || echo false)"
 NOWMS=$(date +%s000)
-C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}})" >/dev/null
-C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
+C "db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}})" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), ts:Timestamp({t:${HOTTS%,*}, i:${HOTTS#*,}})}},{upsert:true})" >/dev/null
 WMOUT=$(cline evictor --config $CFG --once 2>&1)
 # The control again. A sweep that refused on health would leave the claim
 # withdrawn too, and prove nothing.
@@ -339,6 +345,9 @@ chkv "the router sees all four"                  "4" \
 # this check failed on 2026-09-28 and again on 2026-09-30, both times with the
 # evictor saying mirroring was past its limit.
 NOWMS=$(date +%s000)
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
 C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
    db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
 cline evictor --config $WDIR/evclaim.yaml --once > $LOGDIR/evclaim_e.log 2>&1
@@ -605,6 +614,9 @@ open(wdir + '/evunaged.yaml', 'w').write(head + """evictor:
 """ % db + tail)
 PY
 NOWMS=$(date +%s000)
+# And the fast tier's cluster time, which a real feeder publishes beside the wall
+# time: lag is judged by it, and a record without it reads as lag unknown.
+HOTTS=$(H "const t=db.adminCommand({hello:1}).operationTime; print(t.t+','+t.i)")
 C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
    db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
 rm -f $LOGDIR/ev_unaged.log
