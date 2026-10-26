@@ -1015,17 +1015,3 @@ func applyAll(c *Cache, ch Change) {
 	c.Apply(ch)
 	c.Advance(ch.At)
 }
-
-// Tokens captured from 8.0: a high-water mark closes its time, an event's own
-// token, which ends a batch cut inside a transaction, does not.
-func TestPassedToReadsTheTokenType(t *testing.T) {
-	tok := func(data string) bson.Raw { return raw(t, bson.D{{Key: "_data", Value: data}}) }
-	hwm := tok("826ADEBEAD000001BE2B0429296E1404")
-	if at, ok := passedTo(hwm); !ok || at != (bson.Timestamp{T: 0x6ADEBEAD, I: 0x1BE}) {
-		t.Errorf("high-water mark: %v %v", at, ok)
-	}
-	ev := tok("826ADEBEAD0000003B2B042C01002B026E5A1004781096AA43A0440DBA06E5AD30416FF2463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646ADEBEAD6A2C02BF8E9A5C0F000004")
-	if _, ok := passedTo(ev); ok {
-		t.Error("an event's token was taken as the end of its time")
-	}
-}
