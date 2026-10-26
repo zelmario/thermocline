@@ -378,26 +378,30 @@ func mergeNotices(a, b map[string][]bson.Timestamp) map[string][]bson.Timestamp 
 // document can land in one batch, and an unordered bulk write is free to apply
 // them the wrong way round.
 func (f *Feeder) flush(ctx context.Context) error {
-	if len(f.pending) == 0 {
+	retries := f.dueRetries(ctx)
+	if len(f.pending) == 0 && len(retries) == 0 {
 		return nil
 	}
 	// Three questions to the archive before a single document is written, and
 	// they are asked once per flush rather than once per event. See reportRate:
-	// this is where the split says the time is going.
+	// this is where the split says the time is going. About the stream's
+	// events only: a flush of refused documents alone has nothing to ask.
 	askedFrom := time.Now()
 	f.echoes = f.echoes[:0]
-	if err := f.resolveDeletes(ctx); err != nil {
-		return err
-	}
-	if dropped, err := f.suppressWarmEchoes(ctx); err != nil {
-		return err
-	} else if dropped > 0 {
-		f.log.Debug("suppressed warmed documents", "count", dropped)
-	}
-	if dropped, err := f.suppressPromotionEchoes(ctx); err != nil {
-		return err
-	} else if dropped > 0 {
-		f.log.Debug("suppressed promoted documents", "count", dropped)
+	if len(f.pending) > 0 {
+		if err := f.resolveDeletes(ctx); err != nil {
+			return err
+		}
+		if dropped, err := f.suppressWarmEchoes(ctx); err != nil {
+			return err
+		} else if dropped > 0 {
+			f.log.Debug("suppressed warmed documents", "count", dropped)
+		}
+		if dropped, err := f.suppressPromotionEchoes(ctx); err != nil {
+			return err
+		} else if dropped > 0 {
+			f.log.Debug("suppressed promoted documents", "count", dropped)
+		}
 	}
 	f.pace.asking += time.Since(askedFrom)
 
@@ -408,7 +412,10 @@ func (f *Feeder) flush(ctx context.Context) error {
 	opsByNS := make(map[string][]pendingOp)
 	var order []string
 
-	for _, op := range f.pending {
+	// At the end, after every event this flush holds, so whatever gives their
+	// values up lands before them.
+	ops := append(append([]pendingOp(nil), f.pending...), retries...)
+	for _, op := range ops {
 		var model mongo.WriteModel
 		switch op.kind {
 		case actionUpsert:
@@ -476,10 +483,11 @@ func (f *Feeder) flush(ctx context.Context) error {
 			"modified", res.ModifiedCount,
 			"matched", res.MatchedCount)
 		for _, op := range opsByNS[ns] {
-			switch op.kind {
-			case actionUpsert:
+			switch {
+			case op.retry:
+			case op.kind == actionUpsert:
 				f.counters.mirrored++
-			case actionTombstone:
+			case op.kind == actionTombstone:
 				f.counters.tombstoned++
 			}
 		}
@@ -970,7 +978,7 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 			return res, nil
 		}
 		if i, dup, ok := refusedByUniqueIndex(err, ops); ok {
-			f.refuse(ctx, ns, dup, now)
+			f.refuse(ctx, ns, dup, ops[i].retry, now)
 			models = append(models[:i:i], models[i+1:]...)
 			ops = append(ops[:i:i], ops[i+1:]...)
 			if len(models) == 0 {
@@ -1008,7 +1016,12 @@ func (f *Feeder) writeBatch(ctx context.Context, ns string, models []mongo.Write
 // is empty, and this asks only about the ones in it.
 // refuse records a document the archive's unique index will not take, which
 // no retry can fix. See writeBatch.
-func (f *Feeder) refuse(ctx context.Context, ns string, dup refusedDoc, now time.Time) {
+func (f *Feeder) refuse(ctx context.Context, ns string, dup refusedDoc, again bool, now time.Time) {
+	if again {
+		// Already recorded and already said; the retry found it the same.
+		f.log.Debug("a refused document is still refused", "ns", ns, "id", dup.id.String(), "err", dup.msg)
+		return
+	}
 	f.log.Error("the archive refuses a document the fast tier accepted, leaving it unmirrored",
 		"ns", ns,
 		"id", dup.id.String(),
@@ -1018,9 +1031,11 @@ func (f *Feeder) refuse(ctx context.Context, ns string, dup refusedDoc, now time
 			"from the fast tier; every read of this namespace that falls through to the "+
 			"archive is refused while this stands, because answering would leave the "+
 			"document out, and a lookup by _id still finds it on the fast tier",
-		"action", "resolve the duplicate, then re-run the write; cline preflight lists every "+
+		"action", "none while mirroring is behind: the document is offered to the archive again every minute "+
+			"with its present image, which clears a clash the fast tier's own later writes clear. One that "+
+			"stands is a value only the archive holds: resolve that duplicate; cline preflight lists every "+
 			"document in this state, with the index and the colliding key",
-		"why", "retrying it can never succeed, and retrying it for ever stops mirroring every namespace behind it")
+		"why", "retrying it in this flush cannot succeed, and retrying it for ever stops mirroring every namespace behind it")
 	f.counters.unmirrorable++
 	// Recorded where a reader can see it, not only in this log.
 	//

@@ -118,6 +118,10 @@ type Feeder struct {
 	// the archive about one.
 	unmirroredNS map[string]bool
 
+	// retriedAt is when each namespace's refused documents were last offered
+	// to the archive again. See dueRetries.
+	retriedAt map[string]time.Time
+
 	// counters are what this feeder has done since it started, published into
 	// the archive so the router can export them. The evictor and the warmer
 	// have done this since 2026-09-03 and the feeder had not, which left the
@@ -345,6 +349,14 @@ type pendingOp struct {
 	// mirrored, but only an insert can be the router copying a document up, and
 	// only inserts may be suppressed as promotion echoes.
 	wasInsert bool
+
+	// retry is a refused document offered to the archive again with its
+	// present image, not an event. See dueRetries.
+	retry bool
+
+	// clearFirst is a delete of the archive's copy put ahead of a flush
+	// that clashed on a unique index, not an event. See clearFirst.
+	clearFirst bool
 
 	// at is where this event sits in the fast tier's oplog.
 	//

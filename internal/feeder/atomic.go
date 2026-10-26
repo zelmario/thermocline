@@ -64,9 +64,11 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 	defer sess.EndSession(context.WithoutCancel(ctx))
 
 	bulk := options.BulkWrite().SetOrdered(true).SetBypassDocumentValidation(true)
-	// Each repair removes or replaces one operation, so there can be no more of
-	// them than there are operations; the rest is room for transient retries.
-	for attempt := 0; attempt <= total+10; attempt++ {
+	// Each repair removes or replaces one operation, after one rewrite per
+	// namespace that at most doubles them, so there can be no more of them
+	// than twice the operations; the rest is room for transient retries.
+	cleared := map[string]bool{}
+	for attempt := 0; attempt <= 2*total+10; attempt++ {
 		out := make(map[string]*mongo.BulkWriteResult, len(order))
 		failed := ""
 		err := mongo.WithSession(ctx, sess, func(sc context.Context) error {
@@ -136,9 +138,19 @@ func (f *Feeder) writeFlush(ctx context.Context, order []string,
 			return nil, err
 		}
 		if i, dup, ok := refusedByUniqueIndex(err, ops[failed]); ok {
-			f.refuse(ctx, failed, dup, now)
-			models[failed] = append(models[failed][:i:i], models[failed][i+1:]...)
-			ops[failed] = append(ops[failed][:i:i], ops[failed][i+1:]...)
+			// First the archive's stale copies out of the way, which is every
+			// clash the fast tier's own images make among themselves.
+			if !cleared[failed] {
+				cleared[failed] = true
+				models[failed], ops[failed] = clearFirst(models[failed], ops[failed])
+				continue
+			}
+			v := f.clashVictim(ctx, failed, ops[failed], i, err)
+			if v != i {
+				dup = refusedDoc{id: ops[failed][v].id, msg: dup.msg}
+			}
+			f.refuse(ctx, failed, dup, ops[failed][v].retry, now)
+			models[failed], ops[failed] = dropDoc(models[failed], ops[failed], docKey(ops[failed][v]))
 			continue
 		}
 		if i, ok := oversizedTombstoneAt(err, ops[failed]); ok {
