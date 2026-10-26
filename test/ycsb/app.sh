@@ -52,37 +52,49 @@ if [ "$MODE" = load ]; then
   mongosh "$COLD" --quiet --eval 'db.getSiblingDB("ycsb").dropDatabase()' >/dev/null
   ycsb load "$COLD" -p insertorder=ordered -p batchsize=100 -p operationcount="$RECORDS"
   t "loaded: $(grep -E 'INSERT\], Operations|OVERALL\], RunTime' "$OUT/$LABEL.out" | tr '\n' ' ')"
+  # YCSB 0.17's MongoDB binding never sends a thread's last partial batch:
+  # 20,000 records on 16 threads stored 19,200, and every read of a missing
+  # key is a NOT_FOUND. Each thread's share must be a whole number of batches.
+  HAVE=$(mongosh "$COLD" --quiet --eval "print(db.getSiblingDB('ycsb').usertable.estimatedDocumentCount())")
+  if [ "$HAVE" != "$RECORDS" ]; then
+    t "load: $HAVE records stored of $RECORDS; make RECORDS a multiple of THREADS x 100"
+    exit 3
+  fi
   mongosh "$COLD" --quiet --eval 'var DB="ycsb", COLL="usertable", YEARS=3' --file datehistory.js | tail -2
-  # What was loaded, so a run with another RECORDS refuses rather than reset
-  # by the wrong key: the reset deletes from user<RECORDS> up, and a smaller
-  # number would delete loaded history that only a reload brings back.
-  mongosh "$COLD" --quiet --eval "db.getSiblingDB('ycsb').rig.replaceOne({_id:'load'}, {_id:'load', records:$RECORDS}, {upsert:true})" >/dev/null
   t "dated"
   exit 0
 fi
 
-LOADED=$(mongosh "$COLD" --quiet --eval "const d=db.getSiblingDB('ycsb').rig.findOne({_id:'load'}); print(d ? d.records : 'none')")
-if [ "$LOADED" = none ]; then
-  # An archive loaded before the record existed. Two point reads tell: the
-  # last loaded key is there, and the next one is either absent or a run's
-  # insert, which carries no date (datehistory.js dates only the load).
-  LOADED=$(mongosh "$COLD" --quiet --eval "
-    const c = db.getSiblingDB('ycsb').usertable, k = n => 'user' + String(n).padStart(12, '0');
-    const last = c.findOne({_id: k($RECORDS - 1)}, {at: 1}), next = c.findOne({_id: k($RECORDS)}, {at: 1});
-    const ok = last && (!next || next.at === undefined);
-    if (ok) db.getSiblingDB('ycsb').rig.insertOne({_id: 'load', records: $RECORDS, inferred: true});
-    print(ok ? $RECORDS : 'not $RECORDS');")
-fi
+# What was loaded, so a run with another RECORDS refuses rather than reset by
+# the wrong key: the reset deletes from user<RECORDS> up, and a smaller number
+# would delete loaded history that only a reload brings back. Two point reads
+# tell, with nothing stored beside the data (a collection of the rig's own in
+# the archive is one the router warns nothing tiers): the last loaded key is
+# there, and the next one is either absent or a run's insert, which carries no
+# date (datehistory.js dates only the load).
+LOADED=$(mongosh "$COLD" --quiet --eval "
+  const c = db.getSiblingDB('ycsb').usertable, k = n => 'user' + String(n).padStart(12, '0');
+  const last = c.findOne({_id: k($RECORDS - 1)}, {at: 1}), next = c.findOne({_id: k($RECORDS)}, {at: 1});
+  print(last && last.at !== undefined && (!next || next.at === undefined) ? $RECORDS : 'not $RECORDS');")
 if [ "$LOADED" != "$RECORDS" ]; then
-  t "$LABEL: RECORDS is $RECORDS and the archive was loaded with $LOADED; not running"
+  t "$LABEL: the archive does not hold a load of RECORDS=$RECORDS (user0..user$((RECORDS - 1)), dated); not running"
   exit 3
 fi
 
 # checked LABEL: what a run's own output says went wrong, printed, and a
 # failure when anything did. Throughput alone hid a run of failed operations:
 # a router that was not up yet answers errors fast.
+#
+# YCSB 0.17 reads operationcount=0 as zero threads, not as no limit: a run
+# then ended in 0ms with a throughput of NaN and nothing marked failed. So a
+# run that did nothing, or stopped well short of SECS, fails here too.
 checked() {
   local out="$OUT/$1.out" bad=0 n
+  n=$(grep -E '^\[OVERALL\], RunTime' "$out" | awk -F', ' '{print int($NF)}')
+  if [ -z "$n" ] || [ "$n" -lt $((SECS * 900)) ]; then
+    t "$1: ran ${n:-no}ms of ${SECS}s"; bad=1
+  fi
+  grep -qE '^\[OVERALL\], Throughput\(ops/sec\), [0-9]' "$out" || { t "$1: no throughput"; bad=1; }
   for k in READ-FAILED UPDATE-FAILED INSERT-FAILED; do
     n=$(grep -E "^\[$k\], Operations" "$out" | awk -F', ' '{print $NF}')
     [ -n "$n" ] && [ "$n" != "0" ] && { t "$1: $k $n"; bad=1; }
@@ -125,7 +137,7 @@ sleep "${SETTLE:-30}"
 
 if [ "$MODE" = alone ]; then
   t "$LABEL: alone, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
-  ycsb run "$COLD" -p operationcount=0 -p maxexecutiontime="$SECS" || { t "$LABEL: YCSB exited $?"; exit 4; }
+  ycsb run "$COLD" -p operationcount=2000000000 -p maxexecutiontime="$SECS" || { t "$LABEL: YCSB exited $?"; exit 4; }
   t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
   checked "$LABEL" || exit 4
   exit 0
@@ -183,7 +195,7 @@ t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS thre
 for d in feeder evictor; do
   pgrep -f "^$X $d --config $CFG" >/dev/null || { t "$LABEL: the $d is not running, see $LABEL.$d.log"; exit 3; }
 done
-ycsb run "$RT" -p operationcount=0 -p maxexecutiontime="$SECS"
+ycsb run "$RT" -p operationcount=2000000000 -p maxexecutiontime="$SECS"
 rc=$?
 curl -s http://127.0.0.1:27811/api/snapshot > "$OUT/$LABEL.snapshot.json"
 t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
