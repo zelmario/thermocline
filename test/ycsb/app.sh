@@ -294,9 +294,16 @@ done
 # Mirroring's lag every 10s through the run: the feeder is the ceiling on the
 # write rate the fast tier can take before archive reads wait, so a tc result
 # is read with this beside it. Lag and cluster-time lag as the router sees them.
+# With the router's counters beside it, which make the adoption curve: how many
+# reads still went to the archive and how many records traffic copied up, every
+# 10s from an empty fast tier until it holds what the workload uses.
 ( while :; do
     echo "$(date -u +%T) $(curl -s http://127.0.0.1:27811/metrics |
-      grep -E '^thermocline_mirroring_(lag|cluster_time_behind)_seconds ' | awk '{printf "%s=%s ", $1, $2}')"
+      grep -E '^thermocline_mirroring_(lag|cluster_time_behind)_seconds ' | awk '{printf "%s=%s ", $1, $2}')$(
+      curl -s http://127.0.0.1:27811/api/snapshot | python3 -c '
+import json, sys
+c = json.load(sys.stdin).get("counters", {})
+print(" ".join(f"{k}={c.get(k)}" for k in ("commands", "from_archive", "copied_up", "read_misses", "refused")))' 2>/dev/null)"
     sleep 10
   done ) > "$OUT/$LABEL.lag" 2>&1 &
 LAGP=$!
