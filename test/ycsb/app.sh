@@ -7,6 +7,7 @@
 #   MODE=date FROM=41000000 NOW=... bash app.sh    resume a dating that stopped
 #   MODE=alone LABEL=alone-1 bash app.sh           a run against rsCold directly
 #   MODE=tc    LABEL=tc-1    bash app.sh           a run through a fresh router
+#   WORKLOAD=workloadd MODE=tc LABEL=d-tc bash app.sh   YCSB's own workload D
 #
 # A run lasts SECS seconds at RATE operations a second, or as fast as it can
 # with RATE=0. Every run first removes what earlier runs inserted and
@@ -42,9 +43,17 @@ ycsb() { # ycsb load|run URI [-p k=v ...]
   shift 2
   local tgt=()
   [ "$RATE" -gt 0 ] && tgt=(-target "$RATE")
-  java -cp "/root/ycsb/lib/*" site.ycsb.Client "$what" -db site.ycsb.db.MongoDbClient -P workload_recent \
+  # WORKLOAD names one of YCSB's own (workloada, workloadd, ...), run with its
+  # mix and distribution as shipped. Only the key layout is ours: the stock
+  # files load with insertorder=hashed, and this archive was loaded ordered so
+  # datehistory.js can date it by key, so a stock run names its keys the same
+  # way or every read is a NOT_FOUND.
+  local wl=(-P workload_recent -p requestdistribution="$DIST")
+  [ -n "${WORKLOAD:-}" ] && [ "$what" = -t ] &&
+    wl=(-P "/root/ycsb/workloads/$WORKLOAD" -p insertorder=ordered -p zeropadding=12)
+  java -cp "/root/ycsb/lib/*" site.ycsb.Client "$what" -db site.ycsb.db.MongoDbClient "${wl[@]}" \
     -p mongodb.url="${uri%%\?*}ycsb?${uri#*\?}" -p recordcount="$RECORDS" \
-    -p requestdistribution="$DIST" -threads "$THREADS" "${tgt[@]}" -s "$@" \
+    -threads "$THREADS" "${tgt[@]}" -s "$@" \
     > "$OUT/$LABEL.out" 2> "$OUT/$LABEL.err"
 }
 

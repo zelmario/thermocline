@@ -31,7 +31,7 @@ APP=$(ip app)
 [ -n "$APP" ] && [ "$APP" != null ] || { echo "no app node in the terraform state" >&2; exit 2; }
 DBS=$(echo "$IPS" | jq -r 'keys[] | select(test("^(hot|cold)[0-9]$"))')
 ENV="RECORDS=${RECORDS:-100000000} SECS=${SECS:-600} RATE=${RATE:-0} THREADS=${THREADS:-64} DIST=${DIST:-latest} AGE=${AGE:-365d} LIVE=${LIVE:-true}"
-ENV="$ENV ${OPLOG_MB:+OPLOG_MB=$OPLOG_MB} ${FROM:+FROM=$FROM} ${NOW:+NOW=$NOW}"
+ENV="$ENV ${OPLOG_MB:+OPLOG_MB=$OPLOG_MB} ${FROM:+FROM=$FROM} ${NOW:+NOW=$NOW} ${WORKLOAD:+WORKLOAD=$WORKLOAD}"
 
 ship() {
   tar -cz -C test/ycsb app.sh workload_recent datehistory.js | $SSH root@"$APP" "mkdir -p /root/ycsb-rig /root/ycsb-out && tar -xz -C /root/ycsb-rig"
