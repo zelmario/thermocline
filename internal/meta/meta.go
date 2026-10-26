@@ -791,9 +791,10 @@ type EvictionNotice struct {
 	// entries share one. wallTime would have done as well from 6.0 and this
 	// supports 4.2.
 	Spent []bson.Timestamp `bson:"spent,omitempty"`
-	// Sessions names the sessions the announced deletes are made in, when
-	// every announcement still pending named one. See Accepts.
+	// Sessions names the sessions the announced deletes are made in, and
+	// Named how many of the pending announcements named one. See Accepts.
 	Sessions []string `bson:"sessions,omitempty"`
+	Named    *int     `bson:"named,omitempty"`
 	// By names the acts that announced this notice, newest last and capped,
 	// so one act is counted once however often it is sent and can take back
 	// exactly what it raised. See AnnounceEviction.
@@ -860,8 +861,14 @@ func SessionHex(lsid bson.Raw) string {
 // change event carries the session of a transaction, and only those deletes
 // spend its notices. A notice that names no session accepts any delete, as
 // every notice did before.
+//
+// Only while every pending announcement named a session, which is Named
+// equal to the pending count. An evictor from before sessions announces
+// without touching either field, and its delete, made outside a transaction,
+// must spend its own announcement: judged by the sessions of an earlier one,
+// it was tombstoned, a document lost from both tiers.
 func (n EvictionNotice) Accepts(lsid string) bool {
-	if len(n.Sessions) == 0 {
+	if len(n.Sessions) == 0 || n.Named == nil || *n.Named != n.Left() {
 		return true
 	}
 	return lsid != "" && slices.Contains(n.Sessions, lsid)
@@ -1010,27 +1017,35 @@ const MaxSessionsRecorded = 16
 // Before the pending count moves, because the rule reads the count as it was:
 // a notice with an announcement still pending that named no session accepts
 // any delete, and naming one now would narrow what that earlier announcement
-// promised. Only a notice with nothing pending, or one that already names
-// sessions, starts or extends the list. An announcement naming none removes
-// it, so the notice accepts any delete again.
+// promised. Only a notice with nothing pending starts the list, and one that
+// already names sessions extends it; named counts the announcements that
+// named one, so an announcement that did not touch these fields, from an
+// evictor before them, leaves named below pending and the notice open. An
+// announcement naming none removes both, so the notice accepts any delete.
 func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
 	byNow := bson.D{{Key: "$ifNull", Value: bson.A{"$by", bson.A{}}}}
-	var sessions any = "$$REMOVE"
+	var sessions, named any = "$$REMOVE", "$$REMOVE"
 	if session != "" {
-		sessions = bson.D{{Key: "$cond", Value: bson.A{
-			bson.D{{Key: "$and", Value: bson.A{
-				bson.D{{Key: "$gt", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 0}}},
-				bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$sessions"}}, "missing"}}},
+		nothingPending := bson.D{{Key: "$lte", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 0}}}
+		hasSessions := bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$sessions"}}, "array"}}}
+		sessions = bson.D{{Key: "$cond", Value: bson.A{nothingPending, bson.A{session},
+			bson.D{{Key: "$cond", Value: bson.A{hasSessions,
+				bson.D{{Key: "$slice", Value: bson.A{
+					bson.D{{Key: "$concatArrays", Value: bson.A{"$sessions", bson.A{session}}}},
+					-MaxSessionsRecorded,
+				}}},
+				"$$REMOVE",
 			}}},
-			"$$REMOVE",
-			bson.D{{Key: "$slice", Value: bson.A{
-				bson.D{{Key: "$concatArrays", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$sessions", bson.A{}}}}, bson.A{session}}}},
-				-MaxSessionsRecorded,
+		}}}
+		named = bson.D{{Key: "$cond", Value: bson.A{nothingPending, 1,
+			bson.D{{Key: "$cond", Value: bson.A{hasSessions,
+				bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$named", 0}}}, 1}}},
+				"$$REMOVE",
 			}}},
 		}}}
 	}
 	return mongo.Pipeline{
-		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: sessions}}}},
+		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: sessions}, {Key: "named", Value: named}}}},
 		{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: bson.D{{Key: "$not", Value: bson.A{
 			bson.D{{Key: "$in", Value: bson.A{by, byNow}}},
 		}}}}}}},
@@ -1121,7 +1136,7 @@ func ReadEvictionNoticesIn(ctx context.Context, cold *mongo.Client, docIDs []str
 	coll := cold.Database(DB).Collection(Evicting)
 	cur, err := coll.Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}, {Key: "sessions", Value: 1}}))
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}, {Key: "sessions", Value: 1}, {Key: "named", Value: 1}}))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read eviction notices: %w", err)
 	}
@@ -1232,6 +1247,14 @@ func SpendEvictionNotices(ctx context.Context, cold *mongo.Client, spent map[str
 							"$_fresh",
 						}}},
 						-MaxSpentRecorded,
+					}}}},
+					// Down with pending, so a notice every pending announcement
+					// of which named a session stays judged by them. See
+					// EvictionNotice.Accepts.
+					{Key: "named", Value: bson.D{{Key: "$cond", Value: bson.A{
+						bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$named"}}, "missing"}}},
+						"$$REMOVE",
+						bson.D{{Key: "$max", Value: bson.A{0, bson.D{{Key: "$subtract", Value: bson.A{"$named", bson.D{{Key: "$size", Value: "$_fresh"}}}}}}}},
 					}}}},
 				}}},
 				{{Key: "$unset", Value: "_fresh"}},

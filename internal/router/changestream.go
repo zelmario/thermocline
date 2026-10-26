@@ -99,6 +99,10 @@ type streamTail struct {
 	// noFill is a stream whose own stages read fullDocument and are left to
 	// mongod. Filling after them would put back what they took out.
 	noFill bool
+	// lsidHidden is a stream whose stages left to mongod may take lsid away,
+	// so the sieve cannot ask a delete which session it was made in and
+	// judges it as it did before sessions. See isEviction.
+	lsidHidden bool
 }
 
 // applies reports whether the tail has stages to run here.
@@ -196,10 +200,14 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	// own session, from the application's delete of the same document: run
 	// first, it left an application's delete hidden as an eviction. See
 	// meta.EvictionNotice.Accepts.
+	//
+	// Only a stage that can take lsid away moves for the sieve's sake:
+	// $match, $addFields and $set that do not name it leave it in the event,
+	// and keeping them at mongod keeps a stream that filters most events from
+	// shipping every one of them here.
 	at := -1
 	for i, st := range stages[1:] {
-		name, _ := changeStreamStage(st)
-		if name != "$match" || (lookup && !blindMatch(st)) {
+		if !keepsAtMongod(st, lookup) {
 			at = i + 1
 			break
 		}
@@ -207,11 +215,19 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	if at < 0 {
 		return
 	}
-	var keep *streamTail
-	if lookup {
-		keep = &streamTail{noFill: true}
+	// What is left to mongod if the split cannot be made: no fill past the
+	// stages when the stream asked for one, and, when a stage may have taken
+	// lsid away, a sieve that cannot ask a delete's session and judges it the
+	// old way. See isEviction.
+	hides := false
+	for _, st := range stages[at:] {
+		if !keepsLsid(st) {
+			hides = true
+		}
 	}
-	c.csTail = keep
+	if lookup || hides {
+		c.csTail = &streamTail{noFill: lookup, lsidHidden: hides}
+	}
 	tail := make(bson.A, 0, len(stages)-at)
 	for _, st := range stages[at:] {
 		name, legal := changeStreamStage(st)
@@ -252,6 +268,34 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 	}
 	c.sendInstead = out
 	c.csTail = &streamTail{stages: tail, collation: collation, let: let}
+}
+
+// keepsLsid reports whether a change stream stage leaves an event's lsid as
+// mongod wrote it: a $match, or an $addFields or $set that does not name it.
+func keepsLsid(st bson.RawValue) bool {
+	name, _ := changeStreamStage(st)
+	switch name {
+	case "$match", "$addFields", "$set":
+		return !bytes.Contains(st.Value, []byte("lsid"))
+	}
+	return false
+}
+
+// keepsAtMongod reports whether a stage may run at mongod, before the sieve and
+// the fill: it leaves lsid, and with a lookup it cannot see the document.
+func keepsAtMongod(st bson.RawValue, lookup bool) bool {
+	if !keepsLsid(st) {
+		return false
+	}
+	if !lookup {
+		return true
+	}
+	for _, w := range []string{"fullDocument", "$$ROOT", "$$CURRENT", "$expr"} {
+		if bytes.Contains(st.Value, []byte(w)) {
+			return false
+		}
+	}
+	return true
 }
 
 // blindMatch reports whether a stage is a $match that cannot see a change
@@ -444,7 +488,7 @@ func (c *conn) noteChangeStream(ctx context.Context, cmd bson.Raw, db string, re
 	if !eok || len(events) == 0 {
 		return nil, false
 	}
-	keep, dropped := c.r.sieveEvents(ctx, events)
+	keep, dropped := c.r.sieveEvents(ctx, events, tail != nil && tail.lsidHidden)
 	keep, token, _, changed, terr := c.cutStreamBatch(ctx, id, tail, rdoc, c.owner(cmd), keep)
 	if terr != nil {
 		out, rerr := c.streamTailErrorTo(reply.Header.ResponseTo, terr)
@@ -501,7 +545,8 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	// The id the reply carries, which is 0 once mongod has closed the cursor.
 	rid, _ := cursorIDOf(rdoc)
 
-	keep, dropped := c.r.sieveEvents(ctx, events)
+	gtail := c.r.changeStreams.tailOf(id)
+	keep, dropped := c.r.sieveEvents(ctx, events, gtail != nil && gtail.lsidHidden)
 	// A lookup the fast tier could not answer is asked of the archive, because
 	// null means deleted and this document is not. See fillLookups.
 	gid, _ := intOf64(cmd.Lookup("getMore"))
@@ -534,7 +579,7 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 
 // sieveEvents returns the events an application should see, and how many were
 // this system's own work.
-func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.A, int) {
+func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHidden bool) (bson.A, int) {
 	// Gather the ids to ask about, so one lookup covers the whole batch.
 	var deleteIDs, insertIDs []string
 	kinds := make([]string, len(events))
@@ -656,7 +701,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue) (bson.
 			r.log.Debug("hiding this system's own catalog repair from a change stream",
 				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
-		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev)):
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden):
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), eventPosition(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
@@ -778,6 +823,7 @@ type evictionNote struct {
 	at       time.Time
 	spent    []bson.Timestamp
 	sessions []string
+	named    *int
 }
 
 // isEviction reports whether this delete is the evictor making room rather than
@@ -800,12 +846,16 @@ type evictionNote struct {
 // session names the transaction the delete was made in, "" for none. A notice
 // naming sessions is the evictor's own delete only in one of them; anything
 // else is the application's, announced or not. See meta.EvictionNotice.Accepts.
-func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp, session string) bool {
+//
+// lsidHidden is a stream whose own stages may have taken lsid away; its
+// deletes are judged without the session, as every delete was before.
+func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp, session string, lsidHidden bool) bool {
 	note, ok := notes[id]
 	if !ok {
 		return false
 	}
-	if !(meta.EvictionNotice{Sessions: note.sessions}).Accepts(session) {
+	left := note.left
+	if !lsidHidden && !(meta.EvictionNotice{Sessions: note.sessions, Named: note.named, Pending: &left}).Accepts(session) {
 		return false
 	}
 	// Unclaimed: announced, and the feeder has not applied it yet, so this
@@ -890,7 +940,7 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 	for cur.Next(ctx) {
 		var rec meta.EvictionNotice
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent, sessions: rec.Sessions}
+			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent, sessions: rec.Sessions, named: rec.Named}
 		}
 	}
 	return out

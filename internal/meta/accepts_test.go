@@ -6,7 +6,8 @@ import "testing"
 // delete in one of them; one that names none accepts any delete, which keeps
 // an upgrade from tombstoning evictions announced before it.
 func TestEvictionNoticeAcceptsOnlyItsSessions(t *testing.T) {
-	n := EvictionNotice{Sessions: []string{"aa11", "cc33"}}
+	two := 2
+	n := EvictionNotice{Sessions: []string{"aa11", "cc33"}, Named: &two, Pending: &two}
 	for _, c := range []struct {
 		session string
 		want    bool
@@ -17,5 +18,13 @@ func TestEvictionNoticeAcceptsOnlyItsSessions(t *testing.T) {
 	}
 	if !(EvictionNotice{}).Accepts("") || !(EvictionNotice{}).Accepts("aa11") {
 		t.Error("a notice naming no session refused a delete")
+	}
+	// An evictor from before sessions announced again: pending went up and
+	// named did not, so one pending announcement is not a session's, and its
+	// delete, outside any transaction, must be accepted.
+	one, three := 1, 2
+	old := EvictionNotice{Sessions: []string{"aa11"}, Named: &one, Pending: &three}
+	if !old.Accepts("") {
+		t.Error("an older evictor's delete was refused by an earlier announcement's session; it would be tombstoned")
 	}
 }

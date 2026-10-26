@@ -916,7 +916,12 @@ func (e *Evictor) prepareChunk(ctx, step context.Context, ns string, hotColl *mo
 		// Announced and then stopped before anything was deleted, the same as
 		// an announce that failed above, and taken back the same way.
 		e.withdrawUndeleted(step, ns, present)
+		endSession(step, present)
 		return nil, err
+	}
+	if len(kept) == 0 {
+		// Nothing left to delete, so the step's session is not needed.
+		endSession(step, present)
 	}
 	return kept, nil
 }
@@ -1004,11 +1009,7 @@ func (e *Evictor) removeChunk(ctx context.Context, ns string, hotColl *mongo.Col
 		// carry it and the feeder can tell them from an application's delete
 		// of the same document. See meta.EvictionNotice.Accepts.
 		defer endSession(ctx, present)
-		_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
-			r, berr := hotColl.BulkWrite(sc, models, options.BulkWrite().SetOrdered(false))
-			res = r
-			return nil, berr
-		})
+		res, err = deleteInSession(ctx, sess, hotColl, models)
 	} else {
 		res, err = meta.ParallelBulkWrite(ctx, hotColl, models)
 	}
@@ -1253,6 +1254,33 @@ func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
 		return err
 	}
 	return nil
+}
+
+// deleteInSession runs a step's deletes in transactions of its session,
+// halving any the fast tier's cache cannot hold, as the feeder does with a
+// flush. A chunk of large documents refused whole on every sweep would
+// otherwise stop eviction there; every half is still in the step's session,
+// so its deletes still spend the step's announcements.
+func deleteInSession(ctx context.Context, sess *mongo.Session, coll *mongo.Collection, models []mongo.WriteModel) (*mongo.BulkWriteResult, error) {
+	var res *mongo.BulkWriteResult
+	_, err := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+		r, berr := coll.BulkWrite(sc, models, options.BulkWrite().SetOrdered(false))
+		res = r
+		return nil, berr
+	})
+	if err == nil || len(models) < 2 || !strings.Contains(err.Error(), "TransactionTooLargeForCache") {
+		return res, err
+	}
+	half := len(models) / 2
+	a, err := deleteInSession(ctx, sess, coll, models[:half])
+	if err != nil {
+		return nil, err
+	}
+	b, err := deleteInSession(ctx, sess, coll, models[half:])
+	if err != nil {
+		return nil, err
+	}
+	return &mongo.BulkWriteResult{DeletedCount: a.DeletedCount + b.DeletedCount}, nil
 }
 
 // endSession ends the step's session, which every candidate of it shares.

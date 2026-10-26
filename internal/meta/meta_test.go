@@ -802,3 +802,46 @@ func TestARacingPromotionJoinsTheOneJustOpened(t *testing.T) {
 		t.Errorf("an ended promotion was joined, promotedAt %v; it must open again at %v", got, later)
 	}
 }
+
+// A notice is judged by the sessions its announcements named only while every
+// pending one named a session. The evictor before sessions announced with a
+// pipeline that touched neither field, and its delete, outside a transaction,
+// was refused by an earlier announcement's session and would have been
+// tombstoned. Spent and announced again the old way, the notice is open.
+func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
+	c, cleanup := testCold(t)
+	defer cleanup()
+	ctx := context.Background()
+	read := func() EvictionNotice {
+		_, notes, err := ReadEvictionNoticesIn(ctx, c, []string{noticeID}, nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return notes[noticeID]
+	}
+	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:a", "aa11"); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if n := read(); n.Accepts("") || !n.Accepts("aa11") {
+		t.Fatalf("a notice announced in session aa11 accepts %v / %v, want only aa11", n.Accepts(""), n.Accepts("aa11"))
+	}
+	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{noticeID: {{T: 100, I: 1}}}); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	// The evictor from before sessions: only pending and by move.
+	if _, err := c.Database(DB).Collection(Evicting).UpdateOne(ctx, bson.D{{Key: "_id", Value: noticeID}},
+		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}}, {Key: "$push", Value: bson.D{{Key: "by", Value: "old:1"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if n := read(); !n.Accepts("") {
+		t.Errorf("the older evictor's delete is refused by a spent announcement's session (named %v, pending %d); it would be tombstoned",
+			n.Named, n.Left())
+	}
+	// A new announcement after it extends nothing: the notice stays open.
+	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:b", "bb22"); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if n := read(); !n.Accepts("") {
+		t.Error("a session's announcement narrowed a notice an older evictor's announcement left open")
+	}
+}
