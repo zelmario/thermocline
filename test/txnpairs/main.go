@@ -8,6 +8,15 @@
 // a pair. An odd answer is the cache answering between the two events of one
 // commit, a state the database never had.
 //
+// mongod itself fails this unless its reads cannot yield: a find or count with
+// readConcern local yields every 10ms and resumes on a newer snapshot, and so
+// saw one half of a deleted pair, 9 odd answers in 427,306 reads made straight
+// to the fast tier. Set internalQueryExecYieldIterations and
+// internalQueryExecYieldPeriodMS to 100000000 on every fast tier node first,
+// check a run with -uri pointing at the fast tier gives 0, and set them back
+// to -1 and 10 after. Measured that way on 8.0: a router without the cache 0
+// in 588,956; the cache before b02d9cc 240 in 619,055; after it 0 in 591,299.
+//
 // The writers bypass the router on purpose. A commit through the router holds
 // every namespace until the stream applies it (NoteWriteAll), so the window is
 // only open for writes the router did not see: another router, or an
