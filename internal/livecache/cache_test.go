@@ -62,7 +62,7 @@ func TestChangesAreAppliedInPlace(t *testing.T) {
 	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
 	c.install(qb, []bson.Raw{raw(t, product("p9", "b", 5))}, true, 0)
 
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: bson.RawValue{Type: bson.TypeString, Value: raw(t, bson.D{{Key: "x", Value: "p1"}}).Lookup("x").Value},
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: bson.RawValue{Type: bson.TypeString, Value: raw(t, bson.D{{Key: "x", Value: "p1"}}).Lookup("x").Value},
 		Doc: raw(t, product("p1", "a", 2.5)), Updated: []string{"price"}, At: bson.Timestamp{T: 10}})
 	got, hit := c.Get(qa)
 	if !hit {
@@ -75,7 +75,7 @@ func TestChangesAreAppliedInPlace(t *testing.T) {
 		t.Fatal("the projection did not take stock out")
 	}
 
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "b", 1)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "b", 1)),
 		Updated: []string{"category"}, At: bson.Timestamp{T: 11}})
 	ga, _ := c.Get(qa)
 	gb, _ := c.Get(qb)
@@ -83,7 +83,7 @@ func TestChangesAreAppliedInPlace(t *testing.T) {
 		t.Fatalf("after moving p2 to b: a=%v b=%v", a, b)
 	}
 
-	c.Apply(Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p3"), At: bson.Timestamp{T: 12}})
+	applyAll(c, Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p3"), At: bson.Timestamp{T: 12}})
 	ga, _ = c.Get(qa)
 	if a := ids(t, ga); len(a) != 1 || a[0] != "p1" {
 		t.Fatalf("after deleting p3: %v", a)
@@ -100,7 +100,7 @@ func TestPartialEntryKnowsItsEdge(t *testing.T) {
 	c := New(1 << 20)
 	q := listQuery(t, "a", 2)
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, false, 0)
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p5"), Doc: raw(t, product("p5", "a", 9)), At: bson.Timestamp{T: 5}})
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p5"), Doc: raw(t, product("p5", "a", 9)), At: bson.Timestamp{T: 5}})
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("miss")
@@ -108,7 +108,7 @@ func TestPartialEntryKnowsItsEdge(t *testing.T) {
 	if g := ids(t, got); len(g) != 2 || g[1] != "p2" {
 		t.Fatalf("got %v", g)
 	}
-	c.Apply(Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p2"), At: bson.Timestamp{T: 6}})
+	applyAll(c, Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p2"), At: bson.Timestamp{T: 6}})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("answered two from an entry that holds one of an unknown longer list")
 	}
@@ -190,7 +190,7 @@ func TestCounts(t *testing.T) {
 		t.Fatal("countDocuments was not understood")
 	}
 	c.install(q, nil, true, 4)
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p7"), Doc: raw(t, product("p7", "a", 3)), At: bson.Timestamp{T: 3}})
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p7"), Doc: raw(t, product("p7", "a", 3)), At: bson.Timestamp{T: 3}})
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("miss")
@@ -198,11 +198,11 @@ func TestCounts(t *testing.T) {
 	if n := got.Lookup("cursor", "firstBatch", "0", "n").Int32(); n != 5 {
 		t.Fatalf("count %d, want 5", n)
 	}
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p7"), Doc: raw(t, product("p7", "a", 4)), Updated: []string{"price"}, At: bson.Timestamp{T: 4}})
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p7"), Doc: raw(t, product("p7", "a", 4)), Updated: []string{"price"}, At: bson.Timestamp{T: 4}})
 	if _, hit := c.Get(q); !hit {
 		t.Fatal("a price change dropped a count over category")
 	}
-	c.Apply(Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p7"), At: bson.Timestamp{T: 5}})
+	applyAll(c, Change{NS: "shop.products", Op: "delete", ID: strVal(t, "p7"), At: bson.Timestamp{T: 5}})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("a count survived a delete whose document it cannot see")
 	}
@@ -273,6 +273,7 @@ func TestOversizedUpdateIsNotADelete(t *testing.T) {
 	c := New(1 << 20)
 	q := fill(c)
 	c.handle(event(nil), skip, newFillState())
+	c.Advance(bson.Timestamp{T: 30})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("a listing was still answered after an update too large to see, which may have changed it")
 	}
@@ -280,6 +281,7 @@ func TestOversizedUpdateIsNotADelete(t *testing.T) {
 	c = New(1 << 20)
 	q = fill(c)
 	c.handle(event(primitiveNull{}), skip, newFillState())
+	c.Advance(bson.Timestamp{T: 30})
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("a deleted document's listing was dropped instead of taking it out")
@@ -438,7 +440,7 @@ func TestEntriesKeepOnlyWhatTheyAnswer(t *testing.T) {
 	if s := c.Stats(); s.Bytes > 800 {
 		t.Fatalf("two products held in %d bytes, which is their descriptions as well", s.Bytes)
 	}
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p0"), Doc: withText("p0", 0.5), At: bson.Timestamp{T: 1}})
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p0"), Doc: withText("p0", 0.5), At: bson.Timestamp{T: 1}})
 	if s := c.Stats(); s.Bytes > 1100 {
 		t.Fatalf("three products held in %d bytes after one came from the stream whole", s.Bytes)
 	}
@@ -577,7 +579,7 @@ func TestRangesAsMongoJudgesThem(t *testing.T) {
 		if d != nil {
 			ch.Doc = raw(t, d)
 		}
-		c.Apply(ch)
+		applyAll(c, ch)
 	}
 	list := func(q Query) string {
 		got, hit := c.Get(q)
@@ -625,8 +627,8 @@ func TestRangeCounts(t *testing.T) {
 		t.Fatal("a count over a range was not understood")
 	}
 	c.install(q, nil, true, 3)
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 6)), At: bson.Timestamp{T: 2}})
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 5)), At: bson.Timestamp{T: 3}})
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 6)), At: bson.Timestamp{T: 2}})
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 5)), At: bson.Timestamp{T: 3}})
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("miss")
@@ -634,7 +636,7 @@ func TestRangeCounts(t *testing.T) {
 	if n := got.Lookup("n").Int32(); n != 4 {
 		t.Fatalf("count %d, want 4", n)
 	}
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 7)), Updated: []string{"price"}, At: bson.Timestamp{T: 4}})
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 7)), Updated: []string{"price"}, At: bson.Timestamp{T: 4}})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("a count survived a change to the field it bounds")
 	}
@@ -765,6 +767,12 @@ func TestEventsSharingOneTime(t *testing.T) {
 	for _, id := range []string{"p2", "p3"} {
 		c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, id), Doc: raw(t, product(id, "a", 3)), At: T})
 	}
+	// Until the stream says the time is done, a fourth event at T may follow:
+	// a transaction is shown whole or not at all.
+	if _, hit := c.Get(q); hit {
+		t.Error("answered with a group of events at one time still open")
+	}
+	c.Advance(T)
 	got, hit := c.Get(q)
 	if !hit {
 		t.Fatal("miss")
@@ -859,13 +867,13 @@ func TestUnsortedUpdateDropsTheList(t *testing.T) {
 	}
 	c := New(1 << 20)
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
 		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
 	if _, hit := c.Get(q); hit {
 		t.Error("an unsorted list was answered after a member changed; its order is mongod's plan's to decide")
 	}
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 9)), raw(t, product("p2", "a", 2))}, true, 0)
-	c.Apply(Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p4"), Doc: raw(t, product("p4", "a", 4)),
+	applyAll(c, Change{NS: "shop.products", Op: "insert", ID: strVal(t, "p4"), Doc: raw(t, product("p4", "a", 4)),
 		At: bson.Timestamp{T: 6}})
 	if _, hit := c.Get(q); hit {
 		t.Error("an unsorted list was answered after an insert into it")
@@ -886,7 +894,7 @@ func TestTotallySortedUpdateKeepsItsPlace(t *testing.T) {
 	}
 	c := New(1 << 20)
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 9)),
 		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
 	got, hit := c.Get(q)
 	if !hit {
@@ -905,7 +913,7 @@ func TestSortTieDropsTheList(t *testing.T) {
 	q := listQuery(t, "a", 10)
 	c := New(1 << 20)
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2)), raw(t, product("p3", "a", 3))}, true, 0)
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 5)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "a", 5)),
 		Updated: []string{"price"}, At: bson.Timestamp{T: 5}})
 	got, hit := c.Get(q)
 	if !hit {
@@ -914,7 +922,7 @@ func TestSortTieDropsTheList(t *testing.T) {
 	if ids := ids(t, got); fmt.Sprint(ids) != "[p2 p3 p1]" {
 		t.Errorf("after p1 moved to 5 the list is %v, want [p2 p3 p1]", ids)
 	}
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p3"), Doc: raw(t, product("p3", "a", 2)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p3"), Doc: raw(t, product("p3", "a", 2)),
 		Updated: []string{"price"}, At: bson.Timestamp{T: 6}})
 	if _, hit := c.Get(q); hit {
 		t.Error("p3 moved onto p2's price and the list was still answered; their order is mongod's plan's")
@@ -969,7 +977,7 @@ func TestSameIDInTwoCollectionsIsTwoDocuments(t *testing.T) {
 	c.install(qa, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
 	c.install(qb, []bson.Raw{raw(t, product("p1", "a", 7)), raw(t, product("p2", "a", 8))}, true, 0)
 	// p1 leaves category a in alpha only.
-	c.Apply(Change{NS: "shop.alpha", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "b", 1)),
+	applyAll(c, Change{NS: "shop.alpha", Op: "update", ID: strVal(t, "p1"), Doc: raw(t, product("p1", "b", 1)),
 		Updated: []string{"category"}, At: bson.Timestamp{T: 5}})
 	got, hit := c.Get(qb)
 	if !hit {
@@ -994,9 +1002,30 @@ func TestIncompleteHeadEdgeIsATie(t *testing.T) {
 	q := listQuery(t, "a", 2)
 	c := New(1 << 20)
 	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, false, 0)
-	c.Apply(Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 2)),
+	applyAll(c, Change{NS: "shop.products", Op: "update", ID: strVal(t, "p2"), Doc: raw(t, product("p2", "a", 2)),
 		Updated: []string{"stock"}, At: bson.Timestamp{T: 5}})
 	if got, hit := c.Get(q); hit {
 		t.Errorf("served %v after the last member of an incomplete head changed; what follows it may tie", ids(t, got))
+	}
+}
+
+// applyAll is the stream handing over one change and then the end of its
+// batch, which closes the change's time.
+func applyAll(c *Cache, ch Change) {
+	c.Apply(ch)
+	c.Advance(ch.At)
+}
+
+// Tokens captured from 8.0: a high-water mark closes its time, an event's own
+// token, which ends a batch cut inside a transaction, does not.
+func TestPassedToReadsTheTokenType(t *testing.T) {
+	tok := func(data string) bson.Raw { return raw(t, bson.D{{Key: "_data", Value: data}}) }
+	hwm := tok("826ADEBEAD000001BE2B0429296E1404")
+	if at, ok := passedTo(hwm); !ok || at != (bson.Timestamp{T: 0x6ADEBEAD, I: 0x1BE}) {
+		t.Errorf("high-water mark: %v %v", at, ok)
+	}
+	ev := tok("826ADEBEAD0000003B2B042C01002B026E5A1004781096AA43A0440DBA06E5AD30416FF2463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646ADEBEAD6A2C02BF8E9A5C0F000004")
+	if _, ok := passedTo(ev); ok {
+		t.Error("an event's token was taken as the end of its time")
 	}
 }

@@ -694,6 +694,16 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		c.Behind.Add(1)
 		return nil, Position{}, false
 	}
+	// Part of a group applied: a transaction, or on 8.0 a batched insert,
+	// whose events share one time and which mongod shows all or none of. An
+	// answer now could hold half of it, a state no read of mongod returns.
+	// The group closes at the next time or the end of the batch, so this
+	// refuses only while a batch is being applied.
+	if after(c.applied, c.closed) {
+		c.mu.Unlock()
+		c.Behind.Add(1)
+		return nil, Position{}, false
+	}
 	c.lru.MoveToFront(e.el)
 	pos := Position{Applied: c.applied, Closed: c.closed}
 	var reply bson.Raw
@@ -1179,13 +1189,7 @@ type Change struct {
 func (c *Cache) Apply(ch Change) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if after(ch.At, c.applied) {
-		// A later time: every event at the one before has been applied.
-		if after(c.applied, c.closed) {
-			c.closed = c.applied
-		}
-		c.applied = ch.At
-	}
+	c.sawLocked(ch.At)
 	shapes := c.shapes[ch.NS]
 	if len(shapes) == 0 {
 		return
@@ -1635,6 +1639,25 @@ func (c *Cache) Reset() {
 	c.plainNS = map[string]bool{}
 	c.plainGen++
 	c.plainMu.Unlock()
+}
+
+// saw records an event at at handled, which is not every event at at: a
+// later time closes the one before. A skipped event must not close its group
+// the way Advance does, or the rest of a transaction was taken as applied.
+func (c *Cache) saw(at bson.Timestamp) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sawLocked(at)
+}
+
+func (c *Cache) sawLocked(at bson.Timestamp) {
+	if after(at, c.applied) {
+		// A later time: every event at the one before has been applied.
+		if after(c.applied, c.closed) {
+			c.closed = c.applied
+		}
+		c.applied = at
+	}
 }
 
 // Advance records how far the stream has read when it has no event to give,

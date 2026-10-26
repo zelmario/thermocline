@@ -100,7 +100,7 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			// while it is never empty, which is when the pending marks wait
 			// longest for one. See Advance.
 			if cs.RemainingBatchLength() == 0 {
-				if at, ok := clusterTimeFromToken(cs.ResumeToken()); ok {
+				if at, ok := passedTo(cs.ResumeToken()); ok {
 					c.Advance(at)
 				}
 			}
@@ -112,7 +112,7 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if at, ok := clusterTimeFromToken(cs.ResumeToken()); ok {
+		if at, ok := passedTo(cs.ResumeToken()); ok {
 			c.Advance(at)
 		}
 	}
@@ -164,7 +164,7 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {
 			c.DropNS(e.To.DB + "." + e.To.Coll)
 			fs.forget(e.To.DB + "." + e.To.Coll)
 		}
-		c.Advance(e.At)
+		c.saw(e.At)
 		return
 	case "dropDatabase":
 		fs.forget("")
@@ -176,18 +176,18 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {
 			}
 		}
 		c.mu.Unlock()
-		c.Advance(e.At)
+		c.saw(e.At)
 		return
 	}
 	if e.NS.Coll == "" || skip(ns) {
-		c.Advance(e.At)
+		c.saw(e.At)
 		return
 	}
 	id, err := e.Key.LookupErr("_id")
 	if err != nil {
 		c.DropNS(ns)
 		fs.forget(ns)
-		c.Advance(e.At)
+		c.saw(e.At)
 		return
 	}
 	ch := Change{NS: ns, Op: e.Op, ID: id, Doc: full, Updated: e.Updated, At: e.At}
@@ -195,7 +195,7 @@ func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {
 		// Too large to carry: what changed is unknown.
 		c.DropNS(ns)
 		fs.forget(ns)
-		c.Advance(e.At)
+		c.saw(e.At)
 		return
 	}
 	fs.keep(ch)
@@ -256,6 +256,30 @@ func clusterTimeFromToken(tok bson.Raw) (bson.Timestamp, bool) {
 		T: uint32(raw[1])<<24 | uint32(raw[2])<<16 | uint32(raw[3])<<8 | uint32(raw[4]),
 		I: uint32(raw[5])<<24 | uint32(raw[6])<<16 | uint32(raw[7])<<8 | uint32(raw[8]),
 	}, true
+}
+
+// passedTo is the time a batch's resume token says the stream has passed, and
+// false when it says nothing of the kind. A batch that ends at an event hands
+// back that event's own token, and a batch can end inside a transaction: the
+// token is at the transaction's time with the rest of it in the next batch, so
+// taking it as passed showed half a transaction (test/txnpairs, 30 odd answers
+// in 142,724 reads; 3 with the open group refused and this not yet in). Only a
+// high-water mark token, which mongod sends once it has scanned past every
+// event it returned, closes a time. Measured on 8.0, the byte after the
+// version is 0x29 (type 0) for a high-water mark and 0x2C (type 128) for an
+// event; any other layout is taken as passed, as before.
+func passedTo(tok bson.Raw) (bson.Timestamp, bool) {
+	at, ok := clusterTimeFromToken(tok)
+	if !ok {
+		return at, false
+	}
+	data, _ := tok.Lookup("_data").StringValueOK()
+	if len(data) >= 24 {
+		if b, err := hex.DecodeString(data[18:24]); err == nil && b[0] == 0x2B && b[2] == 0x2C {
+			return at, false
+		}
+	}
+	return at, true
 }
 
 // TokenTime is clusterTimeFromToken for the router's own streams.

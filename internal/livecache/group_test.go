@@ -101,7 +101,7 @@ func TestGroupFollowsTheStream(t *testing.T) {
 		if d != nil {
 			ch.Doc = raw(t, d)
 		}
-		c.Apply(ch)
+		applyAll(c, ch)
 	}
 	check := func(want map[string]string) {
 		t.Helper()
@@ -170,13 +170,13 @@ func TestGroupUnwindSortLimit(t *testing.T) {
 		t.Fatalf("top two %v", b)
 	}
 	// c reaches 3 and ties b at the limit.
-	c.Apply(Change{NS: "shop.orders", Op: "update", ID: strVal(t, "o2"), Doc: raw(t, order("o2", now, 1, item("c", 3), item("a", 1))), At: bson.Timestamp{T: 5}})
+	applyAll(c, Change{NS: "shop.orders", Op: "update", ID: strVal(t, "o2"), Doc: raw(t, order("o2", now, 1, item("c", 3), item("a", 1))), At: bson.Timestamp{T: 5}})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("answered a tie across the limit")
 	}
 	// An array where a single value was expected refuses the shape.
-	c.Apply(Change{NS: "shop.orders", Op: "insert", ID: strVal(t, "o9"), Doc: raw(t, order("o9", now, 1, bson.D{{Key: "sku", Value: bson.A{"x"}}, {Key: "qty", Value: int32(1)}})), At: bson.Timestamp{T: 6}})
-	c.Apply(Change{NS: "shop.orders", Op: "delete", ID: strVal(t, "o2"), At: bson.Timestamp{T: 7}})
+	applyAll(c, Change{NS: "shop.orders", Op: "insert", ID: strVal(t, "o9"), Doc: raw(t, order("o9", now, 1, bson.D{{Key: "sku", Value: bson.A{"x"}}, {Key: "qty", Value: int32(1)}})), At: bson.Timestamp{T: 6}})
+	applyAll(c, Change{NS: "shop.orders", Op: "delete", ID: strVal(t, "o2"), At: bson.Timestamp{T: 7}})
 	if _, hit := c.Get(q); hit {
 		t.Fatal("answered after an array group key arrived")
 	}
