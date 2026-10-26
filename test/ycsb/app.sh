@@ -4,6 +4,7 @@
 # rig.sh is the same measurement on the Docker box.
 #
 #   MODE=load RECORDS=100000000 bash app.sh        once: load and date the archive
+#   MODE=date FROM=41000000 NOW=... bash app.sh    resume a dating that stopped
 #   MODE=alone LABEL=alone-1 bash app.sh           a run against rsCold directly
 #   MODE=tc    LABEL=tc-1    bash app.sh           a run through a fresh router
 #
@@ -47,9 +48,31 @@ ycsb() { # ycsb load|run URI [-p k=v ...]
     > "$OUT/$LABEL.out" 2> "$OUT/$LABEL.err"
 }
 
+# health SET: every member of a set PRIMARY or SECONDARY and within a minute of
+# its primary. 100M records push about 110GB through the oplog, and a member
+# that fell off the end of it during the load is a degraded set every later run
+# would measure without saying so.
+health() {
+  mongosh "$1" --quiet --eval '
+    const s = rs.status(), p = s.members.find(m => m.stateStr === "PRIMARY");
+    const bad = s.members.filter(m => !["PRIMARY", "SECONDARY"].includes(m.stateStr) ||
+      (p && (p.optimeDate - m.optimeDate) > 60000)).map(m => m.name + " " + m.stateStr);
+    print(p && bad.length === 0 ? "ok" : "unhealthy: " + (p ? bad.join(", ") : "no primary"))'
+}
+
 if [ "$MODE" = load ]; then
   t "loading $RECORDS records into rsCold"
   mongosh "$COLD" --quiet --eval 'db.getSiblingDB("ycsb").dropDatabase()' >/dev/null
+  # OPLOG_MB sizes every cold member's oplog before the load, so a secondary
+  # that falls behind while 100M records go in has room to catch up.
+  if [ -n "${OPLOG_MB:-}" ]; then
+    for m in $(mongosh "$COLD" --quiet --eval 'print(rs.status().members.map(m => m.name).join(" "))'); do
+      u="${COLD%%@*}@$m/?directConnection=true&authSource=admin"
+      mongosh "$u" --quiet --eval "printjson(db.adminCommand({replSetResizeOplog: 1, size: $OPLOG_MB}).ok)" |
+        grep -q 1 || { t "load: could not resize the oplog on $m"; exit 3; }
+    done
+    t "oplog: ${OPLOG_MB}MB on every cold member"
+  fi
   ycsb load "$COLD" -p insertorder=ordered -p batchsize=100 -p operationcount="$RECORDS"
   t "loaded: $(grep -E 'INSERT\], Operations|OVERALL\], RunTime' "$OUT/$LABEL.out" | tr '\n' ' ')"
   # YCSB 0.17's MongoDB binding never sends a thread's last partial batch:
@@ -60,8 +83,18 @@ if [ "$MODE" = load ]; then
     t "load: $HAVE records stored of $RECORDS; make RECORDS a multiple of THREADS x 100"
     exit 3
   fi
-  mongosh "$COLD" --quiet --eval 'var DB="ycsb", COLL="usertable", YEARS=3' --file datehistory.js | tail -2
+fi
+# MODE=date dates a loaded archive again, or the rest of it: FROM and NOW
+# from the first attempt's dating.out resume it where it stopped.
+if [ "$MODE" = load ] || [ "$MODE" = date ]; then
+  mongosh "$COLD" --quiet --eval "var DB='ycsb', COLL='usertable', YEARS=3, LAST=$((RECORDS - 1)), FROM=${FROM:-0}${NOW:+, NOW='$NOW'}" --file datehistory.js |
+    tee -a "$OUT/dating.out" | tail -2
+  [ "${PIPESTATUS[0]}" = 0 ] && tail -1 "$OUT/dating.out" | grep -q "index at_1 built" ||
+    { t "dating stopped part way, see dating.out; resume with MODE=date FROM=<first undated key> NOW=<its NOW>"; exit 3; }
   t "dated"
+  h=$(health "$COLD")
+  [ "$h" = ok ] || { t "load: rsCold is $h after the load"; exit 3; }
+  t "load: rsCold healthy"
   exit 0
 fi
 
@@ -117,6 +150,11 @@ stopAll
 # they outlived the script and kept running against the next run's data.
 trap stopAll EXIT
 
+for set in "$COLD" "$HOT"; do
+  h=$(health "$set")
+  [ "$h" = ok ] || { t "$LABEL: a replica set is $h, not running"; exit 3; }
+done
+
 # Reset: what earlier runs inserted, Thermocline's state, the fast tier.
 PAD=$(printf "user%012d" "$RECORDS")
 # By _id range only. YCSB deletes nothing, so a run leaves no deletion marks,
@@ -147,6 +185,9 @@ fi
 # router on loopback where YCSB runs. The live cache runs read-your-writes,
 # max_staleness 0, because YCSB cannot read a staleness contract: with latest it
 # reads records inserted milliseconds ago (rig.sh has the measurement).
+# LIVE=0 is rig.sh's spelling; the config wants a YAML bool, and "0" there
+# stopped the router at load with an unmarshal error.
+case "${LIVE:-true}" in 0|false|no) LIVEB=false;; *) LIVEB=true;; esac
 cat > "$CFG" <<EOF
 hot:
   uri: "$HOT"
@@ -165,6 +206,11 @@ evictor:
   rate: 5000
   batch_size: 500
   max_feeder_lag: 30s
+  # Off: a fast tier built the same day has an oplog window under the 1d
+  # default, so the evictor paused for the first day and swept from then on,
+  # and runs a day apart would have measured two different systems.
+  backoff:
+    min_oplog_window: 0s
   rules:
     - ns: "ycsb.usertable"
       older_than: $AGE
@@ -176,7 +222,7 @@ router:
   freshness: strict
   copy_up_reads: repeated
   live_cache:
-    enabled: ${LIVE:-true}
+    enabled: $LIVEB
     max_staleness: 0s
     stream_from: secondary
 EOF
@@ -199,6 +245,12 @@ ycsb run "$RT" -p operationcount=2000000000 -p maxexecutiontime="$SECS"
 rc=$?
 curl -s http://127.0.0.1:27811/api/snapshot > "$OUT/$LABEL.snapshot.json"
 t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
+# What the router did for those numbers: a refusal is a YCSB ERROR as well, and
+# copy-ups and archive reads say how much of the run the archive carried.
+t "$LABEL: router $(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1])).get("counters", {})
+print(" ".join(f"{k}={c.get(k)}" for k in ("from_archive", "copied_up", "refused", "stale_reads")))' "$OUT/$LABEL.snapshot.json" 2>&1)"
 [ "$rc" = 0 ] || { t "$LABEL: YCSB exited $rc"; exit 4; }
 # A daemon that died during the run measured a different system.
 for d in feeder router evictor; do
