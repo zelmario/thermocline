@@ -287,6 +287,23 @@ if [ "$MODE" = warm ]; then
   exit 0
 fi
 setsid nohup $X evictor --config $CFG --log-file "$OUT/$LABEL.evictor.log" >/dev/null 2>&1 < /dev/null &
+# A fast tier kept from earlier runs had their inserts deleted by the reset
+# above, and every one of those deletes is the feeder's to mirror: after a
+# 45-minute adoption at 10,000 ops/s that is 1.35 million, and a run started
+# on top of it measured the feeder working through that backlog, 63s behind,
+# with 832 reads and updates refused. A deployment in its steady state has a
+# feeder that is current, so the run waits for it, and says how long it took.
+if [ "${KEEPHOT:-0}" = 1 ]; then
+  D0=$(date +%s); calm=0
+  for _ in $(seq 1 360); do
+    lag=$(curl -s http://127.0.0.1:27811/metrics | awk '/^thermocline_mirroring_lag_seconds /{print $2}')
+    if [ -n "$lag" ] && awk -v l="$lag" 'BEGIN{exit !(l < 1)}'; then calm=$((calm + 1)); else calm=0; fi
+    [ $calm -ge 3 ] && break
+    sleep 5
+  done
+  [ $calm -ge 3 ] || { t "$LABEL: the feeder did not catch up in 30 minutes, see $LABEL.feeder.log"; exit 3; }
+  t "$LABEL: the feeder caught up with the reset in $(( $(date +%s) - D0 ))s"
+fi
 t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
 for d in feeder evictor; do
   pgrep -f "^$X $d --config $CFG" >/dev/null || { t "$LABEL: the $d is not running, see $LABEL.$d.log"; exit 3; }
