@@ -185,6 +185,10 @@ func main() {
 	for msg, n := range errSeen {
 		fmt.Printf("  error x%d: %s\n", n, msg)
 	}
+	// The workload asks nothing mongod refuses, so an error is a finding too.
+	if failed.Load() > 0 || selfWrong.Load() > 0 {
+		os.Exit(1)
+	}
 }
 
 // read asks one of the shapes the cache takes, about group g.

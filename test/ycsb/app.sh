@@ -53,9 +53,35 @@ if [ "$MODE" = load ]; then
   ycsb load "$COLD" -p insertorder=ordered -p batchsize=100 -p operationcount="$RECORDS"
   t "loaded: $(grep -E 'INSERT\], Operations|OVERALL\], RunTime' "$OUT/$LABEL.out" | tr '\n' ' ')"
   mongosh "$COLD" --quiet --eval 'var DB="ycsb", COLL="usertable", YEARS=3' --file datehistory.js | tail -2
+  # What was loaded, so a run with another RECORDS refuses rather than reset
+  # by the wrong key: the reset deletes from user<RECORDS> up, and a smaller
+  # number would delete loaded history that only a reload brings back.
+  mongosh "$COLD" --quiet --eval "db.getSiblingDB('ycsb').rig.replaceOne({_id:'load'}, {_id:'load', records:$RECORDS}, {upsert:true})" >/dev/null
   t "dated"
   exit 0
 fi
+
+LOADED=$(mongosh "$COLD" --quiet --eval "const d=db.getSiblingDB('ycsb').rig.findOne({_id:'load'}); print(d ? d.records : 'none')")
+if [ "$LOADED" != "$RECORDS" ]; then
+  t "$LABEL: RECORDS is $RECORDS and the archive was loaded with $LOADED; not running"
+  exit 3
+fi
+
+# checked LABEL: what a run's own output says went wrong, printed, and a
+# failure when anything did. Throughput alone hid a run of failed operations:
+# a router that was not up yet answers errors fast.
+checked() {
+  local out="$OUT/$1.out" bad=0 n
+  for k in READ-FAILED UPDATE-FAILED INSERT-FAILED; do
+    n=$(grep -E "^\[$k\], Operations" "$out" | awk -F', ' '{print $NF}')
+    [ -n "$n" ] && [ "$n" != "0" ] && { t "$1: $k $n"; bad=1; }
+  done
+  for k in ERROR NOT_FOUND; do
+    n=$(grep -E "Return=$k" "$out" | awk -F', ' '{s+=$NF} END{print s+0}')
+    [ "$n" != "0" ] && { t "$1: Return=$k $n"; bad=1; }
+  done
+  [ "$bad" = 0 ] || { t "$1: FAILED, the numbers above are not a measurement"; return 4; }
+}
 
 X=/usr/local/bin/cline
 stopAll() {
@@ -88,8 +114,9 @@ sleep "${SETTLE:-30}"
 
 if [ "$MODE" = alone ]; then
   t "$LABEL: alone, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
-  ycsb run "$COLD" -p operationcount=0 -p maxexecutiontime="$SECS"
+  ycsb run "$COLD" -p operationcount=0 -p maxexecutiontime="$SECS" || { t "$LABEL: YCSB exited $?"; exit 4; }
   t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
+  checked "$LABEL" || exit 4
   exit 0
 fi
 
@@ -135,12 +162,24 @@ T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 setsid nohup $X feeder --config $CFG --log-file "$OUT/$LABEL.feeder.log" >/dev/null 2>&1 < /dev/null &
 sleep 3
 setsid nohup $X router --config $CFG --log-file "$OUT/$LABEL.router.log" >/dev/null 2>&1 < /dev/null &
-for _ in $(seq 1 60); do mongosh "$RT" --quiet --eval "db.adminCommand({ping:1}).ok" 2>/dev/null | grep -q 1 && break; sleep 1; done
+up=0
+for _ in $(seq 1 60); do mongosh "$RT" --quiet --eval "db.adminCommand({ping:1}).ok" 2>/dev/null | grep -q 1 && { up=1; break; }; sleep 1; done
+[ "$up" = 1 ] || { t "$LABEL: the router did not answer in 60s, see $LABEL.router.log"; exit 3; }
 $X watermark --config $CFG --ns ycsb.usertable --complete-from "$T0" > "$OUT/$LABEL.watermark.out" 2>&1 ||
   { t "$LABEL: cline watermark failed, see $LABEL.watermark.out"; exit 3; }
 setsid nohup $X evictor --config $CFG --log-file "$OUT/$LABEL.evictor.log" >/dev/null 2>&1 < /dev/null &
 t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
+for d in feeder evictor; do
+  pgrep -f "^$X $d --config $CFG" >/dev/null || { t "$LABEL: the $d is not running, see $LABEL.$d.log"; exit 3; }
+done
 ycsb run "$RT" -p operationcount=0 -p maxexecutiontime="$SECS"
+rc=$?
 curl -s http://127.0.0.1:27811/api/snapshot > "$OUT/$LABEL.snapshot.json"
 t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
+[ "$rc" = 0 ] || { t "$LABEL: YCSB exited $rc"; exit 4; }
+# A daemon that died during the run measured a different system.
+for d in feeder router evictor; do
+  pgrep -f "^$X $d --config $CFG" >/dev/null || { t "$LABEL: the $d stopped during the run, see $LABEL.$d.log"; exit 4; }
+done
+checked "$LABEL" || exit 4
 stopAll

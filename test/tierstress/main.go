@@ -209,7 +209,9 @@ func main() {
 				reads.Add(1)
 				kind, qa, qb, err := ask(ctx, a, b, r, g, next)
 				if err != nil {
-					failed.Add(1)
+					// Counted as a difference: the workload asks nothing mongod refuses,
+					// so a failed read is a finding whichever side failed.
+					differ.Add(1)
 					note("read error: "+kind+": "+err.Error(), "")
 					continue
 				}
