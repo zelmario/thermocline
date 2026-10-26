@@ -8,6 +8,8 @@
 #   MODE=alone LABEL=alone-1 bash app.sh           a run against rsCold directly
 #   MODE=tc    LABEL=tc-1    bash app.sh           a run through a fresh router
 #   WORKLOAD=workloadd MODE=tc LABEL=d-tc bash app.sh   YCSB's own workload D
+#   MODE=warm LABEL=warm bash app.sh               fill the fast tier with the last AGE
+#   KEEPHOT=1 MODE=tc LABEL=tc-hot bash app.sh     a run on that, not on an empty one
 #
 # A run lasts SECS seconds at RATE operations a second, or as fast as it can
 # with RATE=0. Every run first removes what earlier runs inserted and
@@ -98,7 +100,7 @@ fi
 if [ "$MODE" = load ] || [ "$MODE" = date ]; then
   mongosh "$COLD" --quiet --eval "var DB='ycsb', COLL='usertable', YEARS=3, LAST=$((RECORDS - 1)), FROM=${FROM:-0}${NOW:+, NOW='$NOW'}" --file datehistory.js |
     tee -a "$OUT/dating.out" | tail -2
-  [ "${PIPESTATUS[0]}" = 0 ] && tail -1 "$OUT/dating.out" | grep -q "index at_1 built" ||
+  [ "${PIPESTATUS[0]}" = 0 ] && tail -1 "$OUT/dating.out" | grep -q "index at_1__id_1 built" ||
     { t "dating stopped part way, see dating.out; resume with MODE=date FROM=<first undated key> NOW=<its NOW>"; exit 3; }
   t "dated"
   h=$(health "$COLD")
@@ -172,13 +174,30 @@ PAD=$(printf "user%012d" "$RECORDS")
 # vmstat recorded the scan. Looking for a mark costs the same scan, so nothing
 # looks; the router's own counters in each run's snapshot say whether it
 # deleted anything.
-mongosh "$COLD" --quiet --eval "
-  const c = db.getSiblingDB('ycsb').usertable;
-  print('removed ' + c.deleteMany({_id: {\$gte: '$PAD'}}).deletedCount + ' records inserted by earlier runs');
-  db.getSiblingDB('_thermocline_ycsb').dropDatabase();" | tee -a "$OUT/progress.out"
-[ "${PIPESTATUS[0]}" = 0 ] || { t "$LABEL: the reset failed, not running"; exit 3; }
-mongosh "$HOT" --quiet --eval 'for (const n of ["ycsb","_thermocline_ycsb"]) db.getSiblingDB(n).dropDatabase()' >/dev/null ||
-  { t "$LABEL: could not empty the fast tier, not running"; exit 3; }
+#
+# KEEPHOT=1 keeps the fast tier as MODE=warm left it, with Thermocline's state:
+# the steady state of a deployment that has run for a while, where the recent
+# year is on the fast tier and the archive answers only for older data. Then
+# only the earlier runs' inserts go, from both tiers.
+if [ "${KEEPHOT:-0}" = 1 ] && [ "$MODE" != warm ]; then
+  for set in "$COLD" "$HOT"; do
+    mongosh "$set" --quiet --eval "
+      print('removed ' + db.getSiblingDB('ycsb').usertable.deleteMany({_id: {\$gte: '$PAD'}}).deletedCount + ' records inserted by earlier runs')" |
+      tee -a "$OUT/progress.out"
+    [ "${PIPESTATUS[0]}" = 0 ] || { t "$LABEL: the reset failed, not running"; exit 3; }
+  done
+  HOTN=$(mongosh "$HOT" --quiet --eval "print(db.getSiblingDB('ycsb').usertable.estimatedDocumentCount())")
+  [ "${HOTN:-0}" -gt 0 ] || { t "$LABEL: KEEPHOT=1 but the fast tier holds nothing; run MODE=warm first"; exit 3; }
+  t "$LABEL: the fast tier holds $HOTN records"
+else
+  mongosh "$COLD" --quiet --eval "
+    const c = db.getSiblingDB('ycsb').usertable;
+    print('removed ' + c.deleteMany({_id: {\$gte: '$PAD'}}).deletedCount + ' records inserted by earlier runs');
+    db.getSiblingDB('_thermocline_ycsb').dropDatabase();" | tee -a "$OUT/progress.out"
+  [ "${PIPESTATUS[0]}" = 0 ] || { t "$LABEL: the reset failed, not running"; exit 3; }
+  mongosh "$HOT" --quiet --eval 'for (const n of ["ycsb","_thermocline_ycsb"]) db.getSiblingDB(n).dropDatabase()' >/dev/null ||
+    { t "$LABEL: could not empty the fast tier, not running"; exit 3; }
+fi
 # Let the archive's cache and disk settle after the deletes before measuring.
 sleep "${SETTLE:-30}"
 
@@ -224,6 +243,18 @@ evictor:
     - ns: "ycsb.usertable"
       older_than: $AGE
       date_field: "at"
+warmer:
+  rate: 100000
+  batch_size: 1000
+  min_free_disk: 0.1
+  # Off for the same reason as the evictor's: the warmer paused on a fast
+  # tier whose oplog had not yet lived a day.
+  backoff:
+    min_oplog_window: 0s
+  rules:
+    - ns: "ycsb.usertable"
+      back: $AGE
+      date_field: "at"
 router:
   listen: "127.0.0.1:27801"
   dashboard: "127.0.0.1:27811"
@@ -245,6 +276,16 @@ for _ in $(seq 1 60); do mongosh "$RT" --quiet --eval "db.adminCommand({ping:1})
 [ "$up" = 1 ] || { t "$LABEL: the router did not answer in 60s, see $LABEL.router.log"; exit 3; }
 $X watermark --config $CFG --ns ycsb.usertable --complete-from "$T0" > "$OUT/$LABEL.watermark.out" 2>&1 ||
   { t "$LABEL: cline watermark failed, see $LABEL.watermark.out"; exit 3; }
+# MODE=warm fills the fast tier with the recent AGE of history, one pass of the
+# warmer, and leaves it for the KEEPHOT=1 runs.
+if [ "$MODE" = warm ]; then
+  t "$LABEL: warming the fast tier with the last $AGE"
+  W0=$(date +%s)
+  $X warmer --config $CFG --log-file "$OUT/$LABEL.warmer.log" > "$OUT/$LABEL.warmer.out" 2>&1 ||
+    { t "$LABEL: the warmer failed, see $LABEL.warmer.log"; exit 3; }
+  t "$LABEL: warmed in $(( $(date +%s) - W0 ))s, the fast tier holds $(mongosh "$HOT" --quiet --eval "print(db.getSiblingDB('ycsb').usertable.estimatedDocumentCount())") records"
+  exit 0
+fi
 setsid nohup $X evictor --config $CFG --log-file "$OUT/$LABEL.evictor.log" >/dev/null 2>&1 < /dev/null &
 t "$LABEL: thermocline adopted at $T0, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
 for d in feeder evictor; do

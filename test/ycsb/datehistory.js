@@ -46,5 +46,9 @@ for (let lo = from - (from % chunk); lo <= maxN; lo += chunk) {
     [{ $set: { at: { $subtract: [now, { $toLong: { $multiply: [{ $subtract: [maxN, num] }, step] } }] } } }]);
   print(`  ${pad(lo)} to ${pad(hi)}: ${r.modifiedCount} dated`);
 }
-c.createIndex({ at: 1 });
-print("done; index at_1 built");
+// {at, _id}, not {at}: the warmer reads the archive newest first sorted on
+// both, and with the date alone every batch is a blocking sort, which over 100M
+// records makes one warm pass quadratic. The evictor's reads of the fast tier
+// use the same index by its prefix.
+c.createIndex({ at: 1, _id: 1 });
+print("done; index at_1__id_1 built");

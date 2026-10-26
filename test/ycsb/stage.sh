@@ -31,7 +31,7 @@ APP=$(ip app)
 [ -n "$APP" ] && [ "$APP" != null ] || { echo "no app node in the terraform state" >&2; exit 2; }
 DBS=$(echo "$IPS" | jq -r 'keys[] | select(test("^(hot|cold)[0-9]$"))')
 ENV="RECORDS=${RECORDS:-100000000} SECS=${SECS:-600} RATE=${RATE:-0} THREADS=${THREADS:-64} DIST=${DIST:-latest} AGE=${AGE:-365d} LIVE=${LIVE:-true}"
-ENV="$ENV ${OPLOG_MB:+OPLOG_MB=$OPLOG_MB} ${FROM:+FROM=$FROM} ${NOW:+NOW=$NOW} ${WORKLOAD:+WORKLOAD=$WORKLOAD}"
+ENV="$ENV ${OPLOG_MB:+OPLOG_MB=$OPLOG_MB} ${FROM:+FROM=$FROM} ${NOW:+NOW=$NOW} ${WORKLOAD:+WORKLOAD=$WORKLOAD} ${KEEPHOT:+KEEPHOT=$KEEPHOT}"
 
 ship() {
   tar -cz -C test/ycsb app.sh workload_recent datehistory.js | $SSH root@"$APP" "mkdir -p /root/ycsb-rig /root/ycsb-out && tar -xz -C /root/ycsb-rig"
@@ -101,7 +101,7 @@ run)
   for n in app $DBS; do
     $SSH root@"$(ip "$n")" "mkdir -p /root/mon && cd /root/mon && pkill -x vmstat; pkill -x iostat; pkill -x pidstat;
       setsid nohup vmstat -t 5 > $L-$n.vmstat 2>&1 < /dev/null & setsid nohup iostat -xmt 5 > $L-$n.iostat 2>&1 < /dev/null &
-      [ $n = app ] && setsid nohup pidstat -u -r -h -C 'cline|java' 5 > $L-$n.pidstat 2>&1 < /dev/null &
+      if [ $n = app ]; then setsid nohup pidstat -u -r -h -C 'cline|java' 5 > $L-$n.pidstat 2>&1 < /dev/null & fi
       true" || echo "run: no monitoring on $n" >&2
   done
   detach "$L" "${MODE:-alone}"
