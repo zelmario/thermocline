@@ -83,9 +83,11 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		workers.Wait()
 	}()
 	said := time.Now()
-	// What the batch being read has held so far, to tell one mongod may have
-	// cut short. See cutShort.
-	batchN, batchBytes := 0, 0
+	// What the batch being read has held so far, whether it is a cursor's
+	// first, and the largest event the stream has carried, to tell a batch
+	// mongod may have cut short. See cutShort.
+	batchN, batchBytes, biggest := 0, 0, 0
+	var batchCursor int64
 	for {
 		if time.Since(said) >= 30*time.Second {
 			said = time.Now()
@@ -100,6 +102,7 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		if cs.TryNext(ctx) {
 			batchN++
 			batchBytes += len(cs.Current)
+			biggest = max(biggest, len(cs.Current))
 			c.handle(cs.Current, skip, fs)
 			// The end of a batch is a position the stream has passed even
 			// while it is never empty, which is when the pending marks wait
@@ -119,9 +122,16 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			// batch holds 101 events. A batch that may have been cut that way
 			// and ends at an event's own token closes nothing: the next event,
 			// or the next poll, does.
+			//
+			// Only a cursor's first batch stops at 101. A getMore stops at
+			// 16MB alone, and under steady writes holds more than 101 events
+			// as a matter of course: counted against every batch, the rule
+			// kept the busiest namespace refused through every round trip.
 			if cs.RemainingBatchLength() == 0 {
 				tok := cs.ResumeToken()
-				if at, ok := clusterTimeFromToken(tok); ok && !(cutShort(batchN, batchBytes) && eventToken(tok)) {
+				first := cs.ID() != batchCursor
+				batchCursor = cs.ID()
+				if at, ok := clusterTimeFromToken(tok); ok && !(cutShort(batchN, batchBytes, first, biggest) && eventToken(tok)) {
 					c.Advance(at)
 				}
 				batchN, batchBytes = 0, 0
@@ -134,8 +144,15 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if at, ok := clusterTimeFromToken(cs.ResumeToken()); ok {
-			c.Advance(at)
+		// An empty batch's token is a high-water mark, except where the stream
+		// has not yet read past where it resumed: then it is the resume point,
+		// an event's own token, and that event may be the middle of a commit
+		// the batch before was cut in. Closing on it answered the commit half
+		// applied, so only a high-water mark closes from here.
+		if tok := cs.ResumeToken(); !eventToken(tok) {
+			if at, ok := clusterTimeFromToken(tok); ok {
+				c.Advance(at)
+			}
 		}
 	}
 }
@@ -281,11 +298,14 @@ func clusterTimeFromToken(tok bson.Raw) (bson.Timestamp, bool) {
 }
 
 // cutShort reports whether a batch of n events and size bytes may have been
-// ended by mongod's limits rather than by running out of events: the 101 of
-// an aggregate's first batch, or 16MB less the largest event this stream
-// carries.
-func cutShort(n, size int) bool {
-	return n >= 101 || size >= 16<<20-maxEventDoc-(1<<20)
+// ended by mongod's limits rather than by running out of events: the 101 of a
+// cursor's first batch, or 16MB less room for one more event. An event holds
+// its document up to maxEventDoc, but its _id and documentKey both carry the
+// document's _id, which nothing bounds, so the room is the larger of that and
+// the biggest event the stream has carried.
+func cutShort(n, size int, first bool, biggest int) bool {
+	room := max(maxEventDoc+(1<<20), biggest)
+	return (first && n >= 101) || size+room >= 16<<20
 }
 
 // eventToken reports whether a resume token is an event's own rather than a

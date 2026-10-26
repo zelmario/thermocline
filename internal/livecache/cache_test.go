@@ -1038,7 +1038,22 @@ func TestEventToken(t *testing.T) {
 	if !eventToken(tok("826ADEBEAD0000003B2B042C01002B026E5A1004781096AA43A0440DBA06E5AD30416FF2463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646ADEBEAD6A2C02BF8E9A5C0F000004")) {
 		t.Error("an event's token read as a high-water mark")
 	}
-	if cutShort(100, 1<<20) || !cutShort(101, 0) || !cutShort(1, 12<<20) {
-		t.Error("cutShort misjudged a batch")
+	for _, c := range []struct {
+		n, size int
+		first   bool
+		biggest int
+		want    bool
+		why     string
+	}{
+		{100, 1 << 20, true, 1 << 10, false, "a first batch short of 101"},
+		{101, 0, true, 1 << 10, true, "a first batch of 101"},
+		{500, 1 << 20, false, 1 << 10, false, "a getMore of 500 small events"},
+		{1, 12 << 20, false, 1 << 10, true, "a batch within one event of 16MB"},
+		{1, 9 << 20, false, 9 << 20, true, "one 9MB event, with an _id of megabytes"},
+		{1, 9 << 20, false, 1 << 10, false, "9MB of small events"},
+	} {
+		if got := cutShort(c.n, c.size, c.first, c.biggest); got != c.want {
+			t.Errorf("%s: cutShort %v, want %v", c.why, got, c.want)
+		}
 	}
 }
