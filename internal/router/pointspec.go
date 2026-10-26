@@ -75,13 +75,13 @@ type specResult struct {
 	err   error
 }
 
-// specScoreLimit bounds the score, so a namespace that has missed for an hour
-// stops speculating after this many hits in a row, and the other way round.
-const specScoreLimit = 8
+// specScoreScale is a whole miss rate in specScore's units, parts in ten
+// thousand.
+const specScoreScale = 10000
 
-// specScore is how a namespace's recent point reads went: up one for each
-// that went to the archive, down one for each the fast tier answered. Positive
-// means most recent ones missed, and the archive is asked ahead.
+// specScore is a namespace's recent point read miss rate, a moving average in
+// parts of specScoreScale: each read moves it a sixteenth of the way towards
+// all or none. See speculates for the rate that asks the archive ahead.
 func (r *Router) specScore(ns string) *atomic.Int32 {
 	if v, ok := r.pointSpecScores.Load(ns); ok {
 		return v.(*atomic.Int32)
@@ -90,16 +90,31 @@ func (r *Router) specScore(ns string) *atomic.Int32 {
 	return v.(*atomic.Int32)
 }
 
+// speculates says the recent miss rate is high enough to ask the archive
+// ahead: three reads in four.
+//
+// It was a score up one per miss and down one per hit, speculating while
+// positive. Half the reads that reach it missing is a fair coin, and a fair
+// coin's walk spends half its time above zero, so the archive was asked ahead
+// of half the reads with an even chance of wasting each. Measured on staging,
+// YCSB latest over 100M records adopting from an empty fast tier: 1.0 million
+// reads speculated, 499,781 wasted, an archive read each on a volume already
+// 99% busy, about a tenth of everything that archive read. The gain from
+// speculating is one round trip on a read that misses; the cost of a wasted
+// one is a disk read on the tier with the least to spare.
+func speculates(rate int32) bool { return rate >= specScoreScale*3/4 }
+
 func (r *Router) notePointRead(ns string, missed bool) {
 	s := r.specScore(ns)
+	var target int32
+	if missed {
+		target = specScoreScale
+	}
 	for {
 		old := s.Load()
-		next := old - 1
-		if missed {
-			next = old + 1
-		}
-		if next > specScoreLimit || next < -specScoreLimit {
-			return
+		next := old + (target-old)/16
+		if next == old && old != target {
+			next = target
 		}
 		if s.CompareAndSwap(old, next) {
 			return
@@ -141,7 +156,7 @@ func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string)
 	// archive's copy wrong when the fast tier does not hold it. With more in the
 	// filter, the fast tier can hold it and not match, after an update the
 	// archive has not seen yet. See answerPointRead.
-	if !filterIsOnlyID(fdoc) || c.r.specScore(ns).Load() <= 0 || inTransaction(cmd) {
+	if !filterIsOnlyID(fdoc) || !speculates(c.r.specScore(ns).Load()) || inTransaction(cmd) {
 		return
 	}
 	if _, honourable := archiveLevel(cmd); !honourable {
