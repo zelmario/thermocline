@@ -197,9 +197,22 @@ mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --e
   cs.close();
   print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events.txt 2>&1 &
 WATCHER=$!
+# And one whose own stage rewrites a field the router reads to recognise an
+# eviction. Kept at mongod, {$set: {ns: "$ns.coll"}} ran before the router
+# looked, the event no longer said which collection it was in, and the
+# eviction reached this client as a delete.
+rm -f /tmp/cs_events_ns.txt
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})}; const cs=db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$set:{ns:'\$ns.coll'}}], {startAtOperationTime:tcNow()});
+  let ops=[];
+  for (let i=0;i<40 && ops.length===0;i++) { const e=cs.tryNext(); if (e) ops.push(e.operationType); else sleep(250); }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_events_ns.txt 2>&1 &
+WATCHERNS=$!
 sleep 3
 cline evictor --config $CFG --once >/dev/null 2>&1
 EVENTS=$(awaitWatcher /tmp/cs_events.txt $WATCHER)
+EVENTSNS=$(awaitWatcher /tmp/cs_events_ns.txt $WATCHERNS)
 LEFT=$(H "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({}))")
 echo "  the fast tier now holds $LEFT of 1, the watcher saw: ${EVENTS:-nothing}"
 # First, that there was an eviction at all. An eviction that did not happen
@@ -215,6 +228,7 @@ chk "the watcher was actually watching"                "true" \
     "$(echo "${EVENTS:-none}" | grep -qi "error\|refus" && echo false || echo true)"
 chk "an eviction is not reported as a delete"          "true" \
     "$(echo "${EVENTS:-none}" | grep -q delete && echo false || echo true)"
+chk "  nor to a stream whose \$set rewrites ns"         "none" "${EVENTSNS:-nothing}"
 
 echo "== a copy-up must not look like an insert =="
 # The other half of the same problem. The document has existed for two hours and

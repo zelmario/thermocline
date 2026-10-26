@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,8 @@ func main() {
 	writers := flag.Int("writers", 4, "concurrent writers")
 	dur := flag.Duration("for", 2*time.Minute, "how long to run")
 	how := flag.String("how", "both", "how a pair is committed: txn, batch (one insertMany) or both")
+	k := flag.Int("k", 2, "documents per commit; every answer must hold a multiple of it")
+	pad := flag.Int("pad", 0, "bytes of padding per document; 200 documents of 100KB fill more than one 16MB batch")
 	flag.Parse()
 	if *uri == "" || *direct == "" {
 		fmt.Fprintln(os.Stderr, "need -uri and -direct")
@@ -97,17 +100,21 @@ func main() {
 			for time.Now().Before(stop) {
 				useTxn := *how == "txn" || (*how == "both" && rnd.Intn(2) == 0)
 				if len(live) > 20 || (len(live) > 0 && rnd.Intn(3) == 0) {
-					k := rnd.Intn(len(live))
-					a := live[k]
-					live = append(live[:k], live[k+1:]...)
-					filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: bson.A{a, a + 1}}}}}
+					at := rnd.Intn(len(live))
+					a := live[at]
+					live = append(live[:at], live[at+1:]...)
+					ids := bson.A{}
+					for j := 0; j < *k; j++ {
+						ids = append(ids, a+int64(j))
+					}
+					filter := bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}
 					var err error
 					if useTxn {
 						err = inTxn(ctx, hot, func(sc context.Context) error { _, e := w.DeleteMany(sc, filter); return e })
 					} else {
 						// The same pair, one statement per document.
 						err = inTxn(ctx, hot, func(sc context.Context) error {
-							for _, id := range []int64{a, a + 1} {
+							for _, id := range ids {
 								if _, e := w.DeleteOne(sc, bson.D{{Key: "_id", Value: id}}); e != nil {
 									return e
 								}
@@ -122,8 +129,15 @@ func main() {
 				}
 				g := int32(rnd.Intn(*groups))
 				a := next
-				next += 2
-				docs := []any{bson.D{{Key: "_id", Value: a}, {Key: "g", Value: g}}, bson.D{{Key: "_id", Value: a + 1}, {Key: "g", Value: g}}}
+				next += int64(*k)
+				docs := make([]any, 0, *k)
+				for j := 0; j < *k; j++ {
+					d := bson.D{{Key: "_id", Value: a + int64(j)}, {Key: "g", Value: g}}
+					if *pad > 0 {
+						d = append(d, bson.E{Key: "pad", Value: strings.Repeat("x", *pad)})
+					}
+					docs = append(docs, d)
+				}
 				var err error
 				if useTxn {
 					txns.Add(1)
@@ -153,7 +167,11 @@ func main() {
 				var what string
 				if rnd.Intn(2) == 0 {
 					what = "find"
-					cur, err := r.Find(ctx, bson.D{{Key: "g", Value: g}}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetLimit(1000))
+					// One batch, without the padding: a getMore is not read at
+					// the first batch's snapshot, so mongod itself can answer a
+					// find split across batches with half a commit.
+					cur, err := r.Find(ctx, bson.D{{Key: "g", Value: g}}, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).
+						SetLimit(1000).SetBatchSize(1000).SetProjection(bson.D{{Key: "pad", Value: 0}}))
 					if err != nil {
 						fail("find", err)
 						continue
@@ -174,7 +192,7 @@ func main() {
 					}
 					n = c
 				}
-				if n%2 != 0 {
+				if n%int64(*k) != 0 {
 					odd.Add(1)
 					mu.Lock()
 					if len(samples) < 8 {

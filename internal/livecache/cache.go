@@ -807,7 +807,7 @@ func (c *Cache) admitTiered(q Query, key string) bool {
 
 // State says why Get would not answer q now, or "hit" when it would. For the
 // router's verify mode, which waits out the states that pass on their own:
-// "filling", "behind" and "entry behind".
+// "filling", "behind", "entry behind" and "group open".
 func (c *Cache) State(q Query) string {
 	key := q.entryKey()
 	c.mu.Lock()
@@ -841,6 +841,8 @@ func (c *Cache) State(q Query) string {
 		return "short"
 	case !c.entryFresh(e, q, now):
 		return "entry behind"
+	case after(c.applied, c.closed) && c.openNS[q.NS]:
+		return "group open"
 	}
 	return "hit"
 }

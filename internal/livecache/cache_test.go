@@ -1028,3 +1028,17 @@ func applyAll(c *Cache, ch Change) {
 	c.Apply(ch)
 	c.Advance(ch.At)
 }
+
+// Tokens captured from 8.0: a high-water mark and an event's own.
+func TestEventToken(t *testing.T) {
+	tok := func(data string) bson.Raw { return raw(t, bson.D{{Key: "_data", Value: data}}) }
+	if eventToken(tok("826ADEBEAD000001BE2B0429296E1404")) {
+		t.Error("a high-water mark read as an event's token")
+	}
+	if !eventToken(tok("826ADEBEAD0000003B2B042C01002B026E5A1004781096AA43A0440DBA06E5AD30416FF2463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046645F696400646ADEBEAD6A2C02BF8E9A5C0F000004")) {
+		t.Error("an event's token read as a high-water mark")
+	}
+	if cutShort(100, 1<<20) || !cutShort(101, 0) || !cutShort(1, 12<<20) {
+		t.Error("cutShort misjudged a batch")
+	}
+}

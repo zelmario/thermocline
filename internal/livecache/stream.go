@@ -83,6 +83,9 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		workers.Wait()
 	}()
 	said := time.Now()
+	// What the batch being read has held so far, to tell one mongod may have
+	// cut short. See cutShort.
+	batchN, batchBytes := 0, 0
 	for {
 		if time.Since(said) >= 30*time.Second {
 			said = time.Now()
@@ -95,6 +98,8 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 		c.collect(fs)
 		c.dispatch(fs)
 		if cs.TryNext(ctx) {
+			batchN++
+			batchBytes += len(cs.Current)
 			c.handle(cs.Current, skip, fs)
 			// The end of a batch is a position the stream has passed even
 			// while it is never empty, which is when the pending marks wait
@@ -106,10 +111,20 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			// three minutes and made no read more correct: mongod returns a
 			// transaction's events in one batch, short of the 16MB cut that
 			// Advance already names.
+			//
+			// Short of that cut is not never. Each update carries its looked-up
+			// document, up to maxEventDoc, so a transaction updating 200
+			// documents of 100KB fills a batch past 16MB; and the driver resumes
+			// on its own after a failover with a fresh aggregate, whose first
+			// batch holds 101 events. A batch that may have been cut that way
+			// and ends at an event's own token closes nothing: the next event,
+			// or the next poll, does.
 			if cs.RemainingBatchLength() == 0 {
-				if at, ok := clusterTimeFromToken(cs.ResumeToken()); ok {
+				tok := cs.ResumeToken()
+				if at, ok := clusterTimeFromToken(tok); ok && !(cutShort(batchN, batchBytes) && eventToken(tok)) {
 					c.Advance(at)
 				}
+				batchN, batchBytes = 0, 0
 			}
 			continue
 		}
@@ -263,6 +278,31 @@ func clusterTimeFromToken(tok bson.Raw) (bson.Timestamp, bool) {
 		T: uint32(raw[1])<<24 | uint32(raw[2])<<16 | uint32(raw[3])<<8 | uint32(raw[4]),
 		I: uint32(raw[5])<<24 | uint32(raw[6])<<16 | uint32(raw[7])<<8 | uint32(raw[8]),
 	}, true
+}
+
+// cutShort reports whether a batch of n events and size bytes may have been
+// ended by mongod's limits rather than by running out of events: the 101 of
+// an aggregate's first batch, or 16MB less the largest event this stream
+// carries.
+func cutShort(n, size int) bool {
+	return n >= 101 || size >= 16<<20-maxEventDoc-(1<<20)
+}
+
+// eventToken reports whether a resume token is an event's own rather than a
+// high-water mark. Measured on 8.0: the byte after the token's version is
+// 0x29 (type 0) for a high-water mark and 0x2C (type 128) for an event. A
+// layout this does not know reads as an event, which only means a batch end
+// closes nothing and the next event does.
+func eventToken(tok bson.Raw) bool {
+	data, ok := tok.Lookup("_data").StringValueOK()
+	if !ok || len(data) < 24 {
+		return true
+	}
+	b, err := hex.DecodeString(data[18:24])
+	if err != nil || b[0] != 0x2B {
+		return true
+	}
+	return b[2] != 0x29
 }
 
 // TokenTime is clusterTimeFromToken for the router's own streams.

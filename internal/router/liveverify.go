@@ -123,7 +123,7 @@ func (c *conn) liveVerifyGet(q livecache.Query) (bson.Raw, livecache.Position, b
 			continue
 		}
 		switch st {
-		case "filling", "behind", "entry behind":
+		case "filling", "behind", "entry behind", "group open":
 			if time.Now().Before(deadline) {
 				time.Sleep(2 * time.Millisecond)
 				continue
