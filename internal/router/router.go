@@ -1012,6 +1012,11 @@ type conn struct {
 	// the archive for, set only around that call, so answerFromArchive can ask
 	// the oplog instead of waiting. See pointfresh.go.
 	archivePoint *bson.RawValue
+	// archivedPoint is the document a parallel point read took from the
+	// archive and the feeder position its oplog check started at, for the
+	// copy-up that follows to use instead of reading it again. See
+	// copyUpFrom.
+	archivedPoint *archivedRead
 	// spec is the archive read a point read started ahead of the fast tier's
 	// answer, for answerFromArchive to take. See pointspec.go.
 	spec *pointSpec

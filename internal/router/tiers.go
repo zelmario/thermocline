@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
@@ -58,22 +60,58 @@ func (r *Router) readArchived(ctx context.Context, ns string, id bson.RawValue, 
 // should, and this brought the archive's old cart back and changed it. It
 // reports not found, which is the fast tier's answer and the right one.
 func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool, error) {
+	return r.copyUpFrom(ctx, ns, id, nil)
+}
+
+// archivedRead is a document a point read took from the archive, and the
+// feeder position its oplog check started from: everything mirrored up to
+// there is in the document.
+type archivedRead struct {
+	doc  bson.Raw
+	from bson.Timestamp
+}
+
+// copyUpFrom is copyUp with the document a point read already took from the
+// archive, when there is one, so the archive is not asked for it twice.
+//
+// The second read was the costliest thing the archive did for a copy-up:
+// measured on staging, YCSB latest over 100M records, 18.6ms on average on a
+// volume 99% busy, 8% of everything that archive read. The read already holds
+// the document, and what reading it again protected against is a delete since:
+// so the oplog is asked about one from where that read's own check started,
+// not from where the feeder is now, which would leave out a delete mirrored in
+// between. Any delete, or a window that cannot be asked, and it reads again as
+// before. A tombstone written straight to the archive comes only from a $out,
+// whose rename on the fast tier is a command the same check sees.
+func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, seen *archivedRead) (bool, error) {
 	if !r.cfg.Manages(ns) {
 		return false, nil
 	}
-	// Waiting for mirroring protects against copying up a document the
-	// application has just deleted, and the fast tier's oplog says whether it
-	// has. See pointfresh.go. Shipping an archived order waited here a second
-	// time after choosing it, a whole publication cycle each.
-	if !r.noDeletePending(ctx, ns, id) {
-		if err := r.copyUpIsFresh(ctx, ns, 0); err != nil {
+	var doc bson.Raw
+	found := false
+	if seen != nil && bytes.Equal(seen.doc.Lookup("_id").Value, id.Value) && seen.doc.Lookup("_id").Type == id.Type {
+		if until := checkpoint.UnpackTS(r.seenOpTime.Load()); !until.IsZero() &&
+			r.noDeletePendingIn(ctx, ns, id, seen.from, until) {
+			doc, found = seen.doc, true
+		}
+	}
+	if !found {
+		// Waiting for mirroring protects against copying up a document the
+		// application has just deleted, and the fast tier's oplog says whether
+		// it has. See pointfresh.go. Shipping an archived order waited here a
+		// second time after choosing it, a whole publication cycle each.
+		if !r.noDeletePending(ctx, ns, id) {
+			if err := r.copyUpIsFresh(ctx, ns, 0); err != nil {
+				return false, err
+			}
+		}
+		var err error
+		doc, found, err = r.readArchived(ctx, ns, id, "")
+		if err != nil || !found {
 			return false, err
 		}
 	}
-	doc, found, err := r.readArchived(ctx, ns, id, "")
-	if err != nil || !found {
-		return false, err
-	}
+	var err error
 
 	// Residency is recorded before the write, not after, the same way the
 	// evictor announces a removal before making it.
@@ -153,13 +191,13 @@ func (r *Router) copyUp(ctx context.Context, ns string, id bson.RawValue) (bool,
 }
 
 // copyUpAsync copies a document up behind the reply that already went out.
-func (r *Router) copyUpAsync(ns string, id bson.RawValue) {
+func (r *Router) copyUpAsync(ns string, id bson.RawValue, seen *archivedRead) {
 	// Detached from the client's context on purpose: the reply has been sent,
 	// and the client hanging up must not abandon a half-finished copy.
 	r.goSafely("copying a document up", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := r.copyUp(ctx, ns, id); err != nil {
+		if _, err := r.copyUpFrom(ctx, ns, id, seen); err != nil {
 			r.log.Warn("copy up failed", "ns", ns, "err", err)
 		}
 	})

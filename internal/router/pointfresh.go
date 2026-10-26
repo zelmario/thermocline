@@ -147,7 +147,33 @@ func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, c
 	if err != nil {
 		return nil, false
 	}
+	// The whole document, as the client was given it, for the copy-up a second
+	// read starts. Not with a projection: what came back is then part of one.
+	if len(batch) == 1 && !hasProjection(rewritten) {
+		if raw, merr := bson.Marshal(batch[0]); merr == nil {
+			c.archivedPoint = &archivedRead{doc: raw, from: from}
+		}
+	}
 	return out, true
+}
+
+// hasProjection reports whether a find names a projection that is not empty.
+func hasProjection(cmd bson.D) bool {
+	for _, e := range cmd {
+		if e.Key != "projection" {
+			continue
+		}
+		switch p := e.Value.(type) {
+		case bson.D:
+			return len(p) > 0
+		case bson.Raw:
+			elems, err := p.Elements()
+			return err != nil || len(elems) > 0
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // noDeletePending reports whether the archive's copy of the document with this

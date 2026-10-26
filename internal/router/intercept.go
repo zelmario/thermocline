@@ -265,8 +265,11 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	if filterIsOnlyID(fdoc) {
 		c.archivePoint = &id
 	}
+	c.archivedPoint = nil
 	out, err := c.answerFromArchive(ctx, msg, db, coll, false)
 	c.archivePoint = nil
+	seen := c.archivedPoint
+	c.archivedPoint = nil
 	c.r.Metrics.RecordStage(stagePointTotal, time.Since(c.cmdStarted))
 	if err != nil {
 		return nil, err
@@ -303,7 +306,7 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 				"view", ns, "why", "a view is not a namespace a document can be written to, and "+
 					"the _id a view produces need not be one the collection underneath has")
 		} else if c.r.copyUpRead(meta.DocID(ns, id)) {
-			c.r.copyUpAsync(ns, id)
+			c.r.copyUpAsync(ns, id, seen)
 		}
 	} else {
 		// Nothing to promote, so this was an ordinary archive read and is
