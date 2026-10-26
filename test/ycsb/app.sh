@@ -62,6 +62,17 @@ if [ "$MODE" = load ]; then
 fi
 
 LOADED=$(mongosh "$COLD" --quiet --eval "const d=db.getSiblingDB('ycsb').rig.findOne({_id:'load'}); print(d ? d.records : 'none')")
+if [ "$LOADED" = none ]; then
+  # An archive loaded before the record existed. Two point reads tell: the
+  # last loaded key is there, and the next one is either absent or a run's
+  # insert, which carries no date (datehistory.js dates only the load).
+  LOADED=$(mongosh "$COLD" --quiet --eval "
+    const c = db.getSiblingDB('ycsb').usertable, k = n => 'user' + String(n).padStart(12, '0');
+    const last = c.findOne({_id: k($RECORDS - 1)}, {at: 1}), next = c.findOne({_id: k($RECORDS)}, {at: 1});
+    const ok = last && (!next || next.at === undefined);
+    if (ok) db.getSiblingDB('ycsb').rig.insertOne({_id: 'load', records: $RECORDS, inferred: true});
+    print(ok ? $RECORDS : 'not $RECORDS');")
+fi
 if [ "$LOADED" != "$RECORDS" ]; then
   t "$LABEL: RECORDS is $RECORDS and the archive was loaded with $LOADED; not running"
   exit 3
