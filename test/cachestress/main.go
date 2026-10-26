@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -45,6 +46,8 @@ func main() {
 	dur := flag.Duration("for", 5*time.Minute, "how long to run")
 	writes := flag.Float64("writes", 0.4, "fraction of operations that write")
 	seed := flag.Int64("seed", 1, "random seed")
+	ryw := flag.Bool("ryw", false, "one collection per client, so read-your-writes can be judged exactly (router.live_cache.verify_ryw)")
+	self := flag.Bool("selfcheck", false, "with -ryw: after each insert and delete, read the group back and check the client's own write is there; for a router that answers from the cache, not one in verify mode")
 	flag.Parse()
 	if *uri == "" {
 		fmt.Fprintln(os.Stderr, "need -uri")
@@ -58,10 +61,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = cl.Disconnect(ctx) }()
-	c := cl.Database(*db).Collection(*coll)
-	_ = c.Drop(ctx)
-
-	var next atomic.Int64
+	type target struct {
+		c    *mongo.Collection
+		next *atomic.Int64
+	}
 	base := time.Now().Add(-24 * time.Hour)
 	mk := func(r *rand.Rand, id int64) bson.D {
 		return bson.D{
@@ -75,24 +78,43 @@ func main() {
 			{Key: "qty", Value: int32(r.Intn(100))},
 		}
 	}
+	setup := func(name string, n int, r *rand.Rand) target {
+		c := cl.Database(*db).Collection(name)
+		_ = c.Drop(ctx)
+		t := target{c: c, next: &atomic.Int64{}}
+		docs := make([]any, 0, n)
+		for i := 0; i < n; i++ {
+			docs = append(docs, mk(r, t.next.Add(1)))
+		}
+		if _, err := c.InsertMany(ctx, docs); err != nil {
+			fmt.Fprintln(os.Stderr, "load:", err)
+			os.Exit(1)
+		}
+		if _, err := c.Indexes().CreateMany(ctx, []mongo.IndexModel{
+			{Keys: bson.D{{Key: "g", Value: 1}, {Key: "price", Value: 1}}},
+			{Keys: bson.D{{Key: "g", Value: 1}, {Key: "cat", Value: 1}, {Key: "at", Value: -1}}},
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "indexes:", err)
+			os.Exit(1)
+		}
+		return t
+	}
 	r0 := rand.New(rand.NewSource(*seed))
-	docs := make([]any, 0, *initial)
-	for i := 0; i < *initial; i++ {
-		docs = append(docs, mk(r0, next.Add(1)))
-	}
-	if _, err := c.InsertMany(ctx, docs); err != nil {
-		fmt.Fprintln(os.Stderr, "load:", err)
-		os.Exit(1)
-	}
-	if _, err := c.Indexes().CreateMany(ctx, []mongo.IndexModel{
-		{Keys: bson.D{{Key: "g", Value: 1}, {Key: "price", Value: 1}}},
-		{Keys: bson.D{{Key: "g", Value: 1}, {Key: "cat", Value: 1}, {Key: "at", Value: -1}}},
-	}); err != nil {
-		fmt.Fprintln(os.Stderr, "indexes:", err)
-		os.Exit(1)
+	targets := make([]target, *workers)
+	if *ryw {
+		// One writer per collection: the database at a client's write then
+		// holds that client's writes and nobody else's.
+		for w := range targets {
+			targets[w] = setup(fmt.Sprintf("%s_%d", *coll, w), max(*initial / *workers, 50), r0)
+		}
+	} else {
+		t := setup(*coll, *initial, r0)
+		for w := range targets {
+			targets[w] = t
+		}
 	}
 
-	var reads, wrote, failed atomic.Int64
+	var reads, wrote, failed, selfChecked, selfWrong atomic.Int64
 	var errMu sync.Mutex
 	errSeen := map[string]int{}
 	stop := time.Now().Add(*dur)
@@ -102,13 +124,15 @@ func main() {
 		go func(w int) {
 			defer wg.Done()
 			r := rand.New(rand.NewSource(*seed*1000 + int64(w)))
+			c, next := targets[w].c, targets[w].next
 			for time.Now().Before(stop) {
 				g := int32(r.Intn(*groups))
 				var err error
 				if r.Float64() < *writes {
 					wrote.Add(1)
 					id := 1 + r.Int63n(next.Load())
-					switch r.Intn(7) {
+					op := r.Intn(7)
+					switch op {
 					case 0, 1:
 						_, err = c.InsertOne(ctx, mk(r, next.Add(1)))
 					case 2:
@@ -124,6 +148,15 @@ func main() {
 							bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: "b"}}}})
 					case 6:
 						_, err = c.ReplaceOne(ctx, bson.D{{Key: "_id", Value: id}}, mk(r, id))
+					}
+					if err == nil && *ryw && *self {
+						selfChecked.Add(1)
+						if why := sameAfterWrite(ctx, c, r, g, id); why != "" {
+							selfWrong.Add(1)
+							errMu.Lock()
+							errSeen[fmt.Sprintf("own write not seen after %s: %s", []string{"insert", "insert", "deleteOne", "set price", "set g", "updateMany status", "replaceOne"}[op], why)]++
+							errMu.Unlock()
+						}
 					}
 				} else {
 					reads.Add(1)
@@ -144,8 +177,11 @@ func main() {
 	}
 	wg.Wait()
 	secs := dur.Seconds()
-	fmt.Printf("reads %d (%.0f/s), writes %d (%.0f/s), errors %d, documents inserted %d\n",
-		reads.Load(), float64(reads.Load())/secs, wrote.Load(), float64(wrote.Load())/secs, failed.Load(), next.Load())
+	fmt.Printf("reads %d (%.0f/s), writes %d (%.0f/s), errors %d\n",
+		reads.Load(), float64(reads.Load())/secs, wrote.Load(), float64(wrote.Load())/secs, failed.Load())
+	if *self {
+		fmt.Printf("own writes checked %d, not seen as written %d\n", selfChecked.Load(), selfWrong.Load())
+	}
 	for msg, n := range errSeen {
 		fmt.Printf("  error x%d: %s\n", n, msg)
 	}
@@ -195,4 +231,52 @@ func read(ctx context.Context, c *mongo.Collection, r *rand.Rand, g int32) error
 		}
 		return err
 	}
+}
+
+// sameAfterWrite asks, right after this client's own write, one of the cached
+// shapes twice: as written, which the cache may answer, and with the simple
+// collation, which the cache refuses by design, so mongod answers. This client
+// is its collection's only writer, so the two must be equal; a difference is an
+// answer that missed the client's own write. It returns why they differ, or "".
+func sameAfterWrite(ctx context.Context, c *mongo.Collection, r *rand.Rand, g int32, id int64) string {
+	simple := &options.Collation{Locale: "simple"}
+	type ask struct {
+		name   string
+		filter bson.D
+		opts   *options.FindOptionsBuilder
+	}
+	pick := []ask{
+		{"by price", bson.D{{Key: "g", Value: g}}, options.Find().SetSort(bson.D{{Key: "price", Value: 1}, {Key: "_id", Value: 1}}).SetLimit(10)},
+		{"newest", bson.D{{Key: "g", Value: g}, {Key: "cat", Value: fmt.Sprintf("c%d", r.Intn(4))}}, options.Find().SetSort(bson.D{{Key: "at", Value: -1}, {Key: "_id", Value: 1}}).SetLimit(5)},
+		{"point", bson.D{{Key: "_id", Value: id}}, options.Find().SetLimit(1)},
+	}[r.Intn(3)]
+	all := func(o *options.FindOptionsBuilder) ([]bson.Raw, error) {
+		cur, err := c.Find(ctx, pick.filter, o)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = cur.Close(ctx) }()
+		var out []bson.Raw
+		for cur.Next(ctx) {
+			out = append(out, append(bson.Raw(nil), cur.Current...))
+		}
+		return out, cur.Err()
+	}
+	got, err := all(pick.opts)
+	if err != nil {
+		return ""
+	}
+	want, err := all(pick.opts.SetCollation(simple))
+	if err != nil {
+		return ""
+	}
+	if len(got) != len(want) {
+		return fmt.Sprintf("%s: %d documents, mongod %d", pick.name, len(got), len(want))
+	}
+	for i := range got {
+		if !bytes.Equal(got[i], want[i]) {
+			return fmt.Sprintf("%s: document %d", pick.name, i)
+		}
+	}
+	return ""
 }

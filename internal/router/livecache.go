@@ -131,9 +131,13 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 	}
 	// Verify mode answers nothing, so who may read is not its question.
 	if c.r.liveVerify != nil {
+		var need bson.Timestamp
+		if c.r.cfg.LiveCache.VerifyRYW {
+			need = c.r.liveVerify.need(ns)
+		}
 		if reply, pos, hit := c.liveVerifyGet(q); hit {
 			c.liveCheck = &liveCheck{ns: ns, shape: q.Shape(), q: q.Detached(), cmd: append(bson.Raw(nil), cmd...),
-				cached: append(bson.Raw(nil), reply...), at: time.Now(), pos: pos}
+				cached: append(bson.Raw(nil), reply...), at: time.Now(), pos: pos, need: need}
 		}
 		return nil, false
 	}
@@ -308,11 +312,29 @@ func (c *conn) liveAfterReply(reply *wire.Message) {
 		return
 	}
 	if len(c.liveNotes) > 0 {
-		c.r.live.NoteWrites(c.liveNotes, checkpoint.UnpackTS(c.r.seenOpTime.Load()))
+		at := checkpoint.UnpackTS(c.r.seenOpTime.Load())
+		if c.r.liveVerify != nil {
+			for _, n := range c.liveNotes {
+				c.r.liveVerify.noteAcked(n.NS, at)
+			}
+		}
+		c.r.live.NoteWrites(c.liveNotes, at)
 		c.liveNotes = c.liveNotes[:0]
 	}
 	if len(c.liveWrites) > 0 {
 		at := checkpoint.UnpackTS(c.r.seenOpTime.Load())
+		if c.r.liveVerify != nil {
+			for _, ns := range c.liveWrites {
+				switch {
+				case ns == "*":
+					c.r.liveVerify.noteAcked("*", at)
+				case strings.HasSuffix(ns, ".*"):
+					c.r.liveVerify.noteAcked(strings.TrimSuffix(ns, "*"), at)
+				default:
+					c.r.liveVerify.noteAcked(ns, at)
+				}
+			}
+		}
 		for _, ns := range c.liveWrites {
 			if ns == "*" {
 				c.r.live.NoteWriteAll(at)

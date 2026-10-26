@@ -44,12 +44,46 @@ type liveCheck struct {
 	at     time.Time
 	// pos is where in the stream the cached answer stands. See exactAnswer.
 	pos livecache.Position
+	// need is the latest write this router had acknowledged on the namespace
+	// when the read arrived, which the answer must reflect.
+	need bson.Timestamp
 }
 
 // liveVerifier appends a line per comparison to the verify log.
 type liveVerifier struct {
 	mu   sync.Mutex
 	path string
+	// acked is, per namespace, the latest write this router acknowledged
+	// there, with "db." for a whole database and "*" for anything. Kept here,
+	// apart from the cache's own bookkeeping, so read-your-writes is checked
+	// against what the router did rather than what the cache recorded.
+	acked map[string]bson.Timestamp
+}
+
+// noteAcked records an acknowledged write for read-your-writes. See acked.
+func (v *liveVerifier) noteAcked(key string, at bson.Timestamp) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.acked == nil {
+		v.acked = map[string]bson.Timestamp{}
+	}
+	if old := v.acked[key]; at.T > old.T || (at.T == old.T && at.I > old.I) {
+		v.acked[key] = at
+	}
+}
+
+// need is the latest acknowledged write a read of ns must see.
+func (v *liveVerifier) need(ns string) bson.Timestamp {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	db, _ := splitNS(ns)
+	out := bson.Timestamp{}
+	for _, k := range []string{ns, db + ".", "*"} {
+		if t := v.acked[k]; t.T > out.T || (t.T == out.T && t.I > out.I) {
+			out = t
+		}
+	}
+	return out
 }
 
 func (v *liveVerifier) write(line string) {
@@ -218,6 +252,13 @@ func (c *conn) liveVerifyExact(chk *liveCheck) {
 	if chk.pos.Applied != chk.pos.Closed && chk.pos.Applied.T != 0 {
 		at = append(at, chk.pos.Applied)
 	}
+	// Read-your-writes. An answer from before a write this router had
+	// acknowledged is exactly right for its own position and still wrong for
+	// the client: it must equal the database at that write, unless the write
+	// does not change it. So the position it is judged at is the later one.
+	if later(chk.need, chk.pos.Closed) {
+		at = []bson.Timestamp{chk.need}
+	}
 	var why string
 	var snap bson.Raw
 	for _, ts := range at {
@@ -326,7 +367,12 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 		return false
 	}
 	took := time.Since(chk.at).Round(time.Microsecond)
-	snap, err := c.snapshotAnswer(chk, chk.pos.Closed)
+	judgeAt := chk.pos.Closed
+	if later(chk.need, judgeAt) {
+		// Read-your-writes, as in liveVerifyExact.
+		judgeAt = chk.need
+	}
+	snap, err := c.snapshotAnswer(chk, judgeAt)
 	if err != nil {
 		return false
 	}
@@ -349,7 +395,7 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 		}
 	}
 	why := liveDiffer(chk.cached, snap)
-	if why != "" && chk.pos.Applied != chk.pos.Closed && chk.pos.Applied.T != 0 {
+	if why != "" && judgeAt == chk.pos.Closed && chk.pos.Applied != chk.pos.Closed && chk.pos.Applied.T != 0 {
 		// Part of a group applied: the state at its time is the other answer
 		// the cache may give. See liveVerifyExact.
 		if at, aerr := c.snapshotAnswer(chk, chk.pos.Applied); aerr == nil && liveDiffer(chk.cached, at) == "" {
@@ -359,7 +405,7 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 	if why != "" {
 		c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
 		c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact on the fast tier at %v\tcmd=%s\tcache=%s\treal=%s\n",
-			chk.ns, took, why, chk.pos.Closed, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap)))
+			chk.ns, took, why, judgeAt, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap)))
 		return true
 	}
 	c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\texact\n", chk.ns, took, chk.shape))
@@ -395,7 +441,11 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 	if pv, err := chk.cmd.LookupErr("projection"); err == nil {
 		find = append(find, bson.E{Key: "projection", Value: pv})
 	}
-	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: chk.pos.Closed}}})
+	judgeAt := chk.pos.Closed
+	if later(chk.need, judgeAt) {
+		judgeAt = chk.need
+	}
+	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: judgeAt}}})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := c.r.hot.Database(db).RunCommand(ctx, find).Raw()
@@ -410,4 +460,9 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 		return "race"
 	}
 	return "wrong at its position"
+}
+
+// later reports whether a is after b.
+func later(a, b bson.Timestamp) bool {
+	return a.T > b.T || (a.T == b.T && a.I > b.I)
 }

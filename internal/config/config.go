@@ -1168,6 +1168,13 @@ type LiveCacheConfig struct {
 	// is checked too. For tests: it doubles every cached read and slows every
 	// miss.
 	VerifyLog string `yaml:"verify_log"`
+	// VerifyRYW makes verify mode also judge read-your-writes: an answer
+	// from before a write this router had acknowledged on the namespace must
+	// equal the database at that write. Exact only when one client writes
+	// each namespace, as test/cachestress -ryw does; with several, the
+	// database at that write holds other clients' writes not yet
+	// acknowledged, which read-your-writes does not promise.
+	VerifyRYW bool `yaml:"verify_ryw"`
 }
 
 // CacheConfig is the learned-TTL query cache.
