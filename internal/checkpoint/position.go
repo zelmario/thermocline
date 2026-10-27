@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -117,8 +118,16 @@ type Positions struct {
 }
 
 // NewPositions returns a position store backed by the cold tier.
+//
+// Its writes at w:1, which Save's comment always said and nothing set: the
+// implicit default on a replica set is majority from MongoDB 5.0, so every
+// publication, up to two hundred a second, waited for the archive's
+// secondaries, on the cluster the fast tier is there to relieve. A position
+// is written after the archive holds what it describes at majority, so losing
+// one in a failover moves it back, never past what is there.
 func NewPositions(cold *mongo.Client) *Positions {
-	return &Positions{coll: cold.Database(meta.DB).Collection(meta.PositionsColl)}
+	return &Positions{coll: cold.Database(meta.DB).Collection(meta.PositionsColl,
+		options.Collection().SetWriteConcern(writeconcern.W1()))}
 }
 
 // Save publishes how far mirroring has got.
