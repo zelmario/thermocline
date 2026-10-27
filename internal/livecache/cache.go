@@ -508,11 +508,37 @@ func sortFields(sh *shape) []string {
 
 // inherit holds a newly installed entry back by every classified write of its
 // namespace later than the position it was read at. Called with mu held.
+//
+// As one write: the newest position among them and the earliest time. That is
+// what all of them together say to fresh, which frees an entry once the stream
+// has passed the last of its writes and bounds its staleness from the first,
+// and it is the merge noteWrite already makes past maxPending.
+//
+// Copying them one by one cost every fill the whole namespace's list, up to
+// maxPending writes, kept for as long as the stream was behind. Measured on
+// staging at 11,000 ops/s with 128 clients: 49,000 entries, 10.6 GB of the
+// router's 11.2 GB heap held here, and the router grew from 19 MB to 25 GB in
+// three minutes.
 func (c *Cache) inherit(e *entry, p0 bson.Timestamp) {
+	var held pendingWrite
+	found := false
 	for _, w := range c.classified[e.shape.ns] {
-		if after(w.ts, p0) && after(w.ts, c.closed) {
-			c.pendingEntry[e.key] = append(c.pendingEntry[e.key], w)
+		if !after(w.ts, p0) || !after(w.ts, c.closed) {
+			continue
 		}
+		if !found {
+			held, found = w, true
+			continue
+		}
+		if after(w.ts, held.ts) {
+			held.ts = w.ts
+		}
+		if w.at.Before(held.at) {
+			held.at = w.at
+		}
+	}
+	if found {
+		c.pendingEntry[e.key] = append(c.pendingEntry[e.key], held)
 	}
 }
 

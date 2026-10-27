@@ -48,7 +48,11 @@ type inflight struct {
 	q   Query
 	key string
 	p0  bson.Timestamp
-	buf []Change
+	// point is the namespace and _id of a fill whose query names one _id,
+	// "" for any other. Only changes to that document can change its answer.
+	// See fillState.keep.
+	point string
+	buf   []Change
 	// dropped is set when the buffer overflowed or the namespace was
 	// forgotten while the read was out; its result is thrown away.
 	dropped bool
@@ -75,14 +79,18 @@ type fillResult struct {
 type fillState struct {
 	byKey map[string]*inflight
 	byNS  map[string][]*inflight
-	work  chan *inflight
-	done  chan fillResult
+	// byID holds the fills of queries that name one _id, by namespace and
+	// _id, and byNS every other. See keep.
+	byID map[string][]*inflight
+	work chan *inflight
+	done chan fillResult
 }
 
 func newFillState() *fillState {
 	return &fillState{
 		byKey: map[string]*inflight{},
 		byNS:  map[string][]*inflight{},
+		byID:  map[string][]*inflight{},
 		work:  make(chan *inflight, 1024),
 		done:  make(chan fillResult, 1024),
 	}
@@ -131,11 +139,15 @@ func (c *Cache) dispatch(fs *fillState) {
 				c.unpend(q)
 				continue
 			}
-			f := &inflight{q: q, key: key, p0: p0}
+			f := &inflight{q: q, key: key, p0: p0, point: pointOf(q)}
 			select {
 			case fs.work <- f:
 				fs.byKey[key] = f
-				fs.byNS[q.NS] = append(fs.byNS[q.NS], f)
+				if f.point != "" {
+					fs.byID[f.point] = append(fs.byID[f.point], f)
+				} else {
+					fs.byNS[q.NS] = append(fs.byNS[q.NS], f)
+				}
 			default:
 				c.unpend(q)
 			}
@@ -145,19 +157,80 @@ func (c *Cache) dispatch(fs *fillState) {
 	}
 }
 
-// keep records a change for every fill in flight on its namespace. Called by
-// the applier for each change before it is applied.
+// keep records a change for every fill in flight its document can change.
+// Called by the applier for each change before it is applied.
+//
+// A fill of a query naming one _id can only be changed by that document, so it
+// is given that document's changes and no others. Every change used to be
+// copied to every fill on the namespace: on staging at 11,000 ops/s with 128
+// clients, with hundreds of point fills in flight on one collection, that was
+// 60 GB allocated in three minutes and the router's CPU spent collecting it.
+// A change whose _id cannot be keyed drops every point fill of its namespace,
+// as applyToEntry drops an entry it cannot place.
 func (fs *fillState) keep(ch Change) {
 	for _, f := range fs.byNS[ch.NS] {
-		if f.dropped {
+		f.add(ch)
+	}
+	if len(fs.byID) == 0 {
+		return
+	}
+	id, ok := idKey(ch.ID)
+	if !ok {
+		fs.forgetPoints(ch.NS)
+		return
+	}
+	for _, f := range fs.byID[ch.NS+"\x00"+id] {
+		f.add(ch)
+	}
+}
+
+func (f *inflight) add(ch Change) {
+	if f.dropped {
+		return
+	}
+	if len(f.buf) >= maxFillBuffer {
+		f.dropped = true
+		f.buf = nil
+		return
+	}
+	f.buf = append(f.buf, ch)
+}
+
+// pointOf is the namespace and _id a query names, "" when it names no single
+// _id.
+func pointOf(q Query) string {
+	if q.Kind != KindFind {
+		return ""
+	}
+	for _, p := range q.Eq {
+		if p.Field != "_id" {
 			continue
 		}
-		if len(f.buf) >= maxFillBuffer {
+		// Not an embedded document: idKey keys one by its bytes, and mongod
+		// compares one field by field and by value, so {a: 1} and {a: 1.0}
+		// are one _id to the query and two keys here. Such a fill is given
+		// every change of its namespace, as before.
+		if p.Value.Type == bson.TypeEmbeddedDocument || p.Value.Type == bson.TypeArray {
+			return ""
+		}
+		if id, ok := idKey(p.Value); ok {
+			return q.NS + "\x00" + id
+		}
+	}
+	return ""
+}
+
+// forgetPoints drops the point fills in flight on a namespace, or on every
+// namespace when ns is empty.
+func (fs *fillState) forgetPoints(ns string) {
+	for k, list := range fs.byID {
+		if ns != "" && !strings.HasPrefix(k, ns+"\x00") {
+			continue
+		}
+		for _, f := range list {
 			f.dropped = true
 			f.buf = nil
-			continue
 		}
-		f.buf = append(f.buf, ch)
 	}
 }
 
@@ -173,6 +246,7 @@ func (fs *fillState) forget(ns string) {
 			f.buf = nil
 		}
 	}
+	fs.forgetPoints(ns)
 }
 
 // collect installs the results the workers have finished. Called by the
@@ -191,7 +265,11 @@ func (c *Cache) collect(fs *fillState) {
 func (c *Cache) finish(fs *fillState, r fillResult) {
 	f := r.f
 	delete(fs.byKey, f.key)
-	list := fs.byNS[f.q.NS]
+	index, at := fs.byNS, f.q.NS
+	if f.point != "" {
+		index, at = fs.byID, f.point
+	}
+	list := index[at]
 	for i, g := range list {
 		if g == f {
 			list = append(list[:i], list[i+1:]...)
@@ -199,9 +277,9 @@ func (c *Cache) finish(fs *fillState, r fillResult) {
 		}
 	}
 	if len(list) == 0 {
-		delete(fs.byNS, f.q.NS)
+		delete(index, at)
 	} else {
-		fs.byNS[f.q.NS] = list
+		index[at] = list
 	}
 	switch {
 	case f.dropped || !r.ok:
