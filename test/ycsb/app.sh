@@ -244,6 +244,9 @@ feeder:
   namespaces:
     - "ycsb.usertable"
   checkpoint_every: 5s
+  # FEEDERSTREAM=secondary reads the change stream off the fast tier's
+  # primary. See feeder.stream_from.
+  stream_from: ${FEEDERSTREAM:-primary}
 evictor:
   rate: 5000
   batch_size: 500

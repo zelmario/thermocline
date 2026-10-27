@@ -500,6 +500,24 @@ type FeederConfig struct {
 	// waiting for the next poll. Ten polls a second on an idle stream is one
 	// small getMore each, which is what a change stream does anyway.
 	MaxAwait time.Duration `yaml:"max_await"`
+	// StreamFrom is where the feeder reads the fast tier's change stream:
+	// "primary", the default, or "secondary", which reads a secondary when one
+	// is up.
+	//
+	// The stream is the feeder's whole read of the fast tier: it scans the
+	// oplog and looks up every updated document, and on the primary that is
+	// work the node every client waits on does for nobody's request. Measured
+	// on staging with the archive bound by CPU, Thermocline's own work cost
+	// the fast tier's primary a fifth of what it could serve, and this stream
+	// was the largest part of it.
+	//
+	// A secondary delivers only majority committed events, as the primary's
+	// stream does, and its resume token never claims more than that node has
+	// read, so what the feeder publishes stays true. What it costs is the
+	// secondary's replication lag, added to mirroring lag and to every read
+	// that waits for mirroring. Everything else the feeder reads on the fast
+	// tier stays on the primary.
+	StreamFrom string `yaml:"stream_from"`
 	// UnannouncedDeletes handles deletes the evictor did not announce.
 	UnannouncedDeletes UnannouncedDeletes `yaml:"unannounced_deletes"`
 }
@@ -654,6 +672,11 @@ func (c Config) Validate() error {
 	}
 	if c.Feeder.ID == "" {
 		return errors.New("feeder.id is required")
+	}
+	switch c.Feeder.StreamFrom {
+	case "", "primary", "secondary":
+	default:
+		return fmt.Errorf("feeder.stream_from must be primary or secondary, not %q", c.Feeder.StreamFrom)
 	}
 	if c.Feeder.BatchSize < 1 {
 		return errors.New("feeder.batch_size must be at least 1")

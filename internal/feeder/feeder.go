@@ -87,6 +87,11 @@ type Feeder struct {
 	// meta.Sessions.
 	sessions *meta.SessionRegister
 
+	// stream is the client the change stream is read through: the fast tier,
+	// or a secondary of it. See config.FeederConfig.StreamFrom. Nil reads
+	// through hot.
+	stream *mongo.Client
+
 	// How far this host's clock is ahead of the archive's, as last measured,
 	// and when that was. Published with the position: see clockSkew.
 	skew      time.Duration
@@ -414,6 +419,15 @@ func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Fe
 		// session. See suppressSessionEchoes.
 		sessions: sessionRegister(hot),
 	}
+}
+
+// WithStream reads the change stream through stream rather than the fast
+// tier's client. Only the stream: everything else the feeder asks the fast
+// tier, the oplog entry at a batch's end and the eviction record among them,
+// still goes to its primary. See config.FeederConfig.StreamFrom.
+func (f *Feeder) WithStream(stream *mongo.Client) *Feeder {
+	f.stream = stream
+	return f
 }
 
 func sessionRegister(hot *mongo.Client) *meta.SessionRegister {
@@ -788,7 +802,11 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		f.warnAboutUnmirrorableHead(ctx)
 	}
 
-	stream, err := f.hot.Watch(ctx, f.pipeline(), opts)
+	watcher := f.hot
+	if f.stream != nil {
+		watcher = f.stream
+	}
+	stream, err := watcher.Watch(ctx, f.pipeline(), opts)
 	if err != nil {
 		if (len(token) > 0 || startAt != nil) && checkpoint.ResumePointGone(err) {
 			// The instant the checkpoint marks, so the log says how much is

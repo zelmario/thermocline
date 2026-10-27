@@ -193,6 +193,14 @@ func runFeeder(args []string) error {
 	log.Info("connected to both tiers", "feeder", cfg.Feeder.ID)
 
 	f := feeder.New(hot, cold, cfg.Feeder, log)
+	if cfg.Feeder.StreamFrom == "secondary" {
+		stream, err := connect(ctx, cfg.Hot.URI, "hot", secondaryPreferred, appSuffix("stream"))
+		if err != nil {
+			return err
+		}
+		defer disconnect(stream, log)
+		f.WithStream(stream)
+	}
 	if err := f.Run(ctx); err != nil {
 		return fatal(log, "feeder", err)
 	}
@@ -390,7 +398,7 @@ func runRouter(args []string) error {
 
 	r := router.New(hot, cold, cfg.Router, log).WatchArchivePrimary(primary)
 	if cfg.Router.LiveCache.Enabled && cfg.Router.LiveCache.StreamFrom == "secondary" {
-		stream, err := connect(ctx, cfg.Hot.URI, "hot", secondaryPreferred)
+		stream, err := connect(ctx, cfg.Hot.URI, "hot", secondaryPreferred, appSuffix("live"))
 		if err != nil {
 			return err
 		}
@@ -493,7 +501,8 @@ func warnIfArchiveReadPreferenceIgnored(uri string, log *slog.Logger) {
 }
 
 // secondaryPreferred is a connect option for a client whose reads should go to
-// a secondary when one is up: the live cache's change stream.
+// a secondary when one is up: the live cache's change stream, and the
+// feeder's.
 var secondaryPreferred = connectOption(func(o *options.ClientOptions) {
 	o.SetReadPreference(readpref.SecondaryPreferred())
 })
@@ -501,12 +510,34 @@ var secondaryPreferred = connectOption(func(o *options.ClientOptions) {
 // connectOption is an option for connect.
 type connectOption func(*options.ClientOptions)
 
+// appSuffix names a client of a process apart from the process's other ones,
+// in the appName the servers see. See appName.
+type appSuffix string
+
+// appName is what the servers see this client as: cline and the command, so
+// that $currentOp, the profiler and the logs on either tier tell the router's
+// load from the feeder's and the evictor's. They all said "cline", and the
+// fast tier's extra work under Thermocline could be measured but not
+// attributed to anything.
+func appName(suffix appSuffix) string {
+	name := "cline"
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		name += "-" + os.Args[1]
+	}
+	if suffix != "" {
+		name += "-" + string(suffix)
+	}
+	return name
+}
+
 // connect takes at most one monitor, which the router uses to watch the
 // archive, and options of its own.
 func connect(ctx context.Context, uri, name string, extra ...any) (*mongo.Client, error) {
-	opts := options.Client().ApplyURI(uri).SetAppName("cline")
+	opts := options.Client().ApplyURI(uri).SetAppName(appName(""))
 	for _, x := range extra {
 		switch x := x.(type) {
+		case appSuffix:
+			opts.SetAppName(appName(x))
 		case *event.ServerMonitor:
 			opts.SetServerMonitor(x)
 		case connectOption:
