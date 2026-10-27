@@ -86,7 +86,28 @@ func (f *Feeder) markBatchEnd(ctx context.Context, tok bson.Raw) {
 			return
 		}
 	}
-	f.markCaughtUp(tok)
+	f.markBatchPosition(tok)
+}
+
+// markBatchPosition is what a used-up batch proves: the archive holds
+// everything up to its token's cluster time. Not up to now, which is what
+// markCaughtUp says for an empty poll.
+//
+// A batch end used to take markCaughtUp's clock reading. That is the same
+// instant in steady state, when the batch ends a moment after its last event
+// was written, and a different one when the feeder is working through a
+// backlog: every batch end said mirroring was current. Measured on staging, a
+// feeder 1,198 seconds behind in cluster time published 0.37 seconds of lag,
+// the number the alert rules watch and the evictor's max_feeder_lag judges.
+// The wall time now moves only as far as the token's time, and the events
+// handled before it, which noteEventTime keeps the later of.
+func (f *Feeder) markBatchPosition(tok bson.Raw) {
+	ts, ok := clusterTimeFromToken(tok)
+	if !ok {
+		return
+	}
+	f.noteEventTime(time.Unix(int64(ts.T), 0).UTC())
+	f.noteEventTS(ts)
 }
 
 // groupedAt reports whether the fast tier's oplog entry at ts is an applyOps,

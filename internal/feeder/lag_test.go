@@ -207,3 +207,22 @@ func TestBatchEndInsideACommitClaimsNothing(t *testing.T) {
 		})
 	}
 }
+
+// A batch that was used up says the archive holds everything up to its token,
+// not everything up to now. A feeder working through a backlog published zero
+// lag at every batch end while 1,198 seconds behind in cluster time.
+func TestBatchEndDoesNotClaimTheCurrentTime(t *testing.T) {
+	f := testFeeder()
+	f.lastEventAt = time.Unix(1787147000, 0).UTC()
+	// 262 seconds after that, and long before now.
+	f.markBatchEnd(context.Background(), tokenRaw(t, "826A85B3FE000000042B0429296E1404"))
+	if want := time.Unix(1787147262, 0).UTC(); !f.lastEventAt.Equal(want) {
+		t.Errorf("wall time after a batch end = %v, want the token's %v", f.lastEventAt, want)
+	}
+	if f.lastEventTS.T != 1787147262 || f.lastEventTS.I != 4 {
+		t.Errorf("cluster time after a batch end = %v, want the token's T=1787147262 I=4", f.lastEventTS)
+	}
+	if f.Lag() < time.Hour {
+		t.Errorf("Lag after a batch end from long ago = %v, want the time since that token", f.Lag())
+	}
+}
