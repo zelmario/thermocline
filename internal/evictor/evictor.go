@@ -550,21 +550,36 @@ func (e *Evictor) scan(ctx context.Context, coll *mongo.Collection, ns string, f
 
 // classify applies the residency hold and the archive confirmation, in two
 // round trips for the whole batch.
+//
+// Only what the hold leaves is confirmed. The confirmation reads each document
+// on the archive, which its _id index does not cover, so it is a disk read per
+// candidate on the cluster Thermocline is there to relieve. Measured on
+// staging, a sweep of a fast tier whose old documents reads had copied up:
+// 174,408 candidates, every one held, the archive's disk at its 3,000 reads/s
+// limit for the 3 minutes of the sweep and at 1,600 once it ended.
 func (e *Evictor) classify(ctx context.Context, ns string, cands []candidate) (outcome, error) {
 	docIDs := make([]string, len(cands))
-	ids := make([]bson.RawValue, len(cands))
 	for i, c := range cands {
 		docIDs[i] = c.docID
-		ids[i] = c.id
 	}
 
 	held, err := e.residencyHolds(ctx, docIDs)
 	if err != nil {
 		return outcome{}, err
 	}
-	archived, err := e.archived(ctx, ns, cands, ids)
-	if err != nil {
-		return outcome{}, err
+	var free []candidate
+	var ids []bson.RawValue
+	for _, c := range cands {
+		if !held[c.docID] {
+			free = append(free, c)
+			ids = append(ids, c.id)
+		}
+	}
+	archived := map[string]bool{}
+	if len(free) > 0 {
+		if archived, err = e.archived(ctx, ns, free, ids); err != nil {
+			return outcome{}, err
+		}
 	}
 	return partition(cands, held, archived), nil
 }
