@@ -121,6 +121,7 @@ func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, c
 	ns := db + "." + coll
 	from, until, ok := c.r.pointWindow(ctx)
 	if !ok {
+		c.r.Stats.PointWaitNoWindow.Add(1)
 		return nil, false
 	}
 	fresh := make(chan bool, 1)
@@ -139,7 +140,13 @@ func (c *conn) pointReadInParallel(ctx context.Context, msg *wire.Message, db, c
 		_ = cur.Close(ctx)
 	}
 	c.r.Metrics.RecordStage(stagePointArchive, time.Since(ta))
-	if !<-fresh || err != nil || more {
+	cleared := <-fresh
+	if !cleared {
+		c.r.Stats.PointWaitNotClear.Add(1)
+		return nil, false
+	}
+	if err != nil || more {
+		c.r.Stats.PointWaitArchiveErr.Add(1)
 		return nil, false
 	}
 	c.r.Stats.PointReadsUnwaited.Add(1)

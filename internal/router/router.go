@@ -276,6 +276,15 @@ type Stats struct {
 	// without the freshness wait, because the fast tier's oplog showed no
 	// delete of that document waiting to be mirrored. See pointfresh.go.
 	PointReadsUnwaited atomic.Int64
+	// PointWaitNoWindow, PointWaitNotClear and PointWaitArchiveErr count the
+	// reads by _id that went on to the full freshness wait, by why: the
+	// feeder's position or this router's cluster time was not known, the
+	// oplog check did not clear the document, or the archive's read failed or
+	// left a cursor open. Under strict freshness these are the reads a feeder
+	// that falls behind turns into errors. See pointfresh.go.
+	PointWaitNoWindow   atomic.Int64
+	PointWaitNotClear   atomic.Int64
+	PointWaitArchiveErr atomic.Int64
 	// PointReadsSpeculated counts point reads whose archive read was started
 	// beside the fast tier's, PointSpecUsed those that answered from it, and
 	// PointSpecWasted those it did not: the fast tier held the document, the
