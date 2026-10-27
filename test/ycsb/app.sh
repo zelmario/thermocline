@@ -258,6 +258,9 @@ warmer:
 router:
   listen: "127.0.0.1:27801"
   dashboard: "127.0.0.1:27811"
+  # Go's profiler, loopback only: a run's CPU and heap can be read while it
+  # runs (curl 127.0.0.1:6060/debug/pprof/heap).
+  pprof: "127.0.0.1:6060"
   completeness: archive
   freshness: strict
   copy_up_reads: ${COPYUP:-repeated}
