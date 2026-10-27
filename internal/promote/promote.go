@@ -32,6 +32,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -175,4 +176,77 @@ func Held(ctx context.Context, coll *mongo.Collection, ids []bson.RawValue) ([]b
 
 func heldKey(id bson.RawValue) string {
 	return string(append([]byte{byte(id.Type)}, id.Value...))
+}
+
+// ManyInSession is Many made in transactions of sess, so that every insert it
+// makes carries the session's lsid into the fast tier's oplog and onto every
+// change event. A session registered as this system's then identifies them as
+// warms without a record per document. See meta.Sessions.
+//
+// A transaction is all or nothing, so a document the fast tier already holds
+// aborts it rather than being skipped as Many skips it. The positions the
+// server names are taken out and the rest is tried again, and they are
+// reported as Many reports them. A batch the fast tier's cache cannot hold in
+// one transaction is halved, as the evictor's deletes are.
+func ManyInSession(ctx context.Context, sess *mongo.Session, coll *mongo.Collection, docs []bson.Raw) (int, []int, error) {
+	pos := make([]int, len(docs))
+	for i := range docs {
+		pos[i] = i
+	}
+	return manyInSession(ctx, sess, coll, docs, pos)
+}
+
+func manyInSession(ctx context.Context, sess *mongo.Session, coll *mongo.Collection, docs []bson.Raw, pos []int) (int, []int, error) {
+	var skipped []int
+	for len(docs) > 0 {
+		models := make([]mongo.WriteModel, len(docs))
+		for i, d := range docs {
+			models[i] = mongo.NewInsertOneModel().SetDocument(d)
+		}
+		var res *mongo.BulkWriteResult
+		_, err := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+			r, berr := coll.BulkWrite(sc, models,
+				options.BulkWrite().SetOrdered(false).SetBypassDocumentValidation(true))
+			res = r
+			return nil, berr
+		})
+		if err == nil {
+			n := 0
+			if res != nil {
+				n = int(res.InsertedCount)
+			}
+			return n, skipped, nil
+		}
+		if dup, ok := duplicatePositions(err); ok {
+			drop := make(map[int]bool, len(dup))
+			for _, i := range dup {
+				drop[i] = true
+			}
+			keptDocs, keptPos := docs[:0:0], pos[:0:0]
+			for i := range docs {
+				if drop[i] {
+					skipped = append(skipped, pos[i])
+					continue
+				}
+				keptDocs = append(keptDocs, docs[i])
+				keptPos = append(keptPos, pos[i])
+			}
+			if len(keptDocs) == len(docs) {
+				return 0, skipped, fmt.Errorf("promote into %s: %w", coll.Name(), err)
+			}
+			docs, pos = keptDocs, keptPos
+			continue
+		}
+		if len(docs) >= 2 && strings.Contains(err.Error(), "TransactionTooLargeForCache") {
+			half := len(docs) / 2
+			a, sa, aerr := manyInSession(ctx, sess, coll, docs[:half], pos[:half])
+			if aerr != nil {
+				return a, append(skipped, sa...), aerr
+			}
+			b, sb, berr := manyInSession(ctx, sess, coll, docs[half:], pos[half:])
+			return a + b, append(append(skipped, sa...), sb...), berr
+		}
+		return 0, skipped, fmt.Errorf("promote into %s: %w", coll.Name(), err)
+	}
+	return 0, skipped, nil
 }

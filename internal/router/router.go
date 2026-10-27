@@ -33,6 +33,7 @@ import (
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/livecache"
+	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/promote"
 	"github.com/zelmario/thermocline/internal/watermark"
 	"github.com/zelmario/thermocline/internal/wire"
@@ -175,6 +176,9 @@ type Router struct {
 	// residency holds. See resbatch.go.
 	resBatch     *residencyBatcher
 	resBatchOnce sync.Once
+	// sessions says which sessions are this system's own, so the sieve knows
+	// a warm by the session it was inserted in. See meta.Sessions.
+	sessions *meta.SessionRegister
 
 	// conns is every live client connection, so a stop can end the ones that
 	// are idle instead of waiting on a read that will never return.
@@ -370,6 +374,7 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 		checkpoints: checkpoint.New(cold),
 		positions:   checkpoint.NewPositions(cold),
 		indexer:     promote.NewIndexer(hot, cold, log),
+		sessions:    meta.NewSessionRegister(hot),
 		log:         log,
 		Metrics:     NewMetrics(metricsWindow),
 		started:     time.Now(),

@@ -24,7 +24,7 @@ import (
 var bookkeepingCollections = map[string]bool{
 	Residency: true, Evicting: true, Checkpoints: true, PositionsColl: true,
 	Warming: true, Markers: true, DaemonStats: true, CacheAdvice: true,
-	Watermarks: true, OwnDDL: true, Unmirrored: true, "keys": true, Evicted: true,
+	Watermarks: true, OwnDDL: true, Unmirrored: true, "keys": true, Evicted: true, Sessions: true,
 }
 
 // IsBookkeeping reports whether a database holding exactly these collections is
@@ -530,7 +530,7 @@ func ResidencyUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 		bson.D{{Key: "$ne", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
 		bson.D{{Key: "$lte", Value: bson.A{"$hotUntil", "$$NOW"}}},
 	}}}
-	return residencyPipeline(ns, id, now, hold, reopening)
+	return residencyPipeline(ns, id, now, hold, reopening, true)
 }
 
 // PromotionUpdate is ResidencyUpdate for a copy-up that knows the fast tier did
@@ -571,7 +571,25 @@ func PromotionUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
 		bson.D{{Key: "$gte", Value: bson.A{"$promotedAt", now.Add(-PromotionJoin)}}},
 	}}}
-	return residencyPipeline(ns, id, now, hold, bson.D{{Key: "$not", Value: bson.A{joining}}})
+	return residencyPipeline(ns, id, now, hold, bson.D{{Key: "$not", Value: bson.A{joining}}}, true)
+}
+
+// WarmUpdate is PromotionUpdate for a warm made in a registered session: the
+// promotion is recorded, and no echo is announced, because the feeder knows
+// the warm's insert by its session and has nothing to spend. An echo
+// announced here would be left standing and spent on the application's next
+// insert of the document, which the feeder would then drop.
+//
+// The record is still written for the reader that cannot see the session: a
+// change stream whose own stages, left to mongod, may take lsid away judges a
+// warm by promotedAt as it always did. See isPromotion.
+func WarmUpdate(ns string, id bson.RawValue, now time.Time, hold time.Duration) mongo.Pipeline {
+	joining := bson.D{{Key: "$and", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$promotedAt"}}, "date"}}},
+		bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$endedAt"}}, "missing"}}},
+		bson.D{{Key: "$gte", Value: bson.A{"$promotedAt", now.Add(-PromotionJoin)}}},
+	}}}
+	return residencyPipeline(ns, id, now, hold, bson.D{{Key: "$not", Value: bson.A{joining}}}, false)
 }
 
 // PromotionJoin is how recently a promotion must have opened for a concurrent
@@ -580,7 +598,11 @@ func PromotionUpdate(ns string, id bson.RawValue, now time.Time, hold time.Durat
 // eviction already announced; see promote.SettleWait.
 const PromotionJoin = 10 * time.Second
 
-func residencyPipeline(ns string, id bson.RawValue, now time.Time, hold time.Duration, reopening any) mongo.Pipeline {
+func residencyPipeline(ns string, id bson.RawValue, now time.Time, hold time.Duration, reopening any, announce bool) mongo.Pipeline {
+	echo := any("$echoPending")
+	if announce {
+		echo = bson.D{{Key: "$cond", Value: bson.A{reopening, true, "$echoPending"}}}
+	}
 	return mongo.Pipeline{
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "ns", Value: ns},
@@ -620,7 +642,7 @@ func residencyPipeline(ns string, id bson.RawValue, now time.Time, hold time.Dur
 			// expected, and the feeder clears it as it suppresses, so only that
 			// one insert is suppressed and a later genuine one is not. See
 			// promotion echoes in the feeder.
-			{Key: "echoPending", Value: bson.D{{Key: "$cond", Value: bson.A{reopening, true, "$echoPending"}}}},
+			{Key: "echoPending", Value: echo},
 			// The document is back, so the record is no longer ended. Left
 			// standing it would answer "the application wrote this _id again"
 			// for the copy-up's own insert.

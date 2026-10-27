@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -63,6 +64,48 @@ type Warmer struct {
 	// pace is where a pass's time went, said with each progress report at
 	// debug. See warmPace.
 	pace warmPace
+
+	// sess is the session every warm is inserted in, registered as this
+	// system's so the feeder and the router know its inserts without a
+	// record per document. Opened on the first batch and never ended: an
+	// ended session goes back to the driver's pool, and a transaction of
+	// something else made in it would read as a warm. See meta.Sessions.
+	sess     *mongo.Session
+	sessErr  error
+	sessOnce sync.Once
+}
+
+// sessionDocMax is the largest document warmed in the session. A change event
+// for a larger one can be split, and only one piece of a split event carries
+// lsid, so the router could not recognise it by its session. Those are warmed
+// as they were before sessions: announced, and recorded with an echo.
+const sessionDocMax = 8 << 20
+
+// session opens and registers the warmer's session, once. A warmer that cannot
+// register one warms as it did before.
+func (w *Warmer) session(ctx context.Context) *mongo.Session {
+	w.sessOnce.Do(func() {
+		s, err := w.hot.StartSession()
+		if err != nil {
+			w.sessErr = err
+			return
+		}
+		if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer"); err != nil {
+			s.EndSession(context.WithoutCancel(ctx))
+			w.sessErr = err
+			return
+		}
+		if err := meta.EnsureSessionIndexes(ctx, w.hot); err != nil {
+			w.log.Warn("could not keep the session register expiring", "err", err)
+		}
+		w.sess = s
+	})
+	if w.sessErr != nil {
+		w.log.Warn("warming without a registered session, announcing each document instead",
+			"err", w.sessErr)
+		return nil
+	}
+	return w.sess
 }
 
 // warmPace splits a warm's time by what it was waiting on, the way the
@@ -726,6 +769,10 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	// archive's metadata that only have to land before the insert, not before
 	// each other, so they go together: measured on staging they were 20% and
 	// 44% of a warm's time, one after the other.
+	if sess := w.sessionFor(ctx, docs); sess != nil {
+		return w.writeInSession(ctx, sess, ns, hot, docs)
+	}
+
 	ta := time.Now()
 	announced := make(chan error, 1)
 	go func() {
@@ -1308,4 +1355,51 @@ func (w *Warmer) claimMoved(rule config.WarmRule) {
 		"effect", "the claim stays where the evictor put it, and this rule stops for this run",
 		"action", "if this repeats every run, warmer.back reaches past evictor.older_than for this "+
 			"namespace, or the warm runs longer than warmer.residency protects what it copies")
+}
+
+// sessionFor is the session a batch is warmed in, or nil when any document in
+// it is too large for its event to keep lsid. See sessionDocMax.
+func (w *Warmer) sessionFor(ctx context.Context, docs []sourceDoc) *mongo.Session {
+	for _, d := range docs {
+		if len(d.raw) > sessionDocMax {
+			return nil
+		}
+	}
+	return w.session(ctx)
+}
+
+// writeInSession warms a batch in the warmer's registered session.
+//
+// What it no longer does is the point of it: no notice per document for the
+// feeder to read and delete, and no echo per document for it to spend. The
+// feeder knows these inserts by their session. The residency record stays,
+// written without an echo, because it is the hold against eviction and what a
+// change stream that cannot see lsid judges a warm by. See meta.WarmUpdate.
+func (w *Warmer) writeInSession(ctx context.Context, sess *mongo.Session, ns string, hot *mongo.Collection, docs []sourceDoc) (int, error) {
+	tr := time.Now()
+	now := time.Now().UTC()
+	models := make([]mongo.WriteModel, len(docs))
+	raw := make([]bson.Raw, len(docs))
+	for i, d := range docs {
+		raw[i] = d.raw
+		models[i] = mongo.NewUpdateOneModel().
+			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, d.id)}}).
+			SetUpdate(meta.WarmUpdate(ns, d.id, now, w.cfg.Residency.D())).
+			SetUpsert(true)
+	}
+	_, err := w.cold.Database(meta.DB).Collection(meta.Residency).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	since(&w.pace.residency, tr)
+	if err != nil {
+		return 0, fmt.Errorf("record residency for %s: %w", ns, err)
+	}
+
+	ti := time.Now()
+	inserted, _, err := promote.ManyInSession(ctx, sess, hot, raw)
+	since(&w.pace.insert, ti)
+	if err != nil {
+		return 0, fmt.Errorf("warm %s: %w", ns, err)
+	}
+	w.log.Debug("warmed", "ns", ns, "inserted", inserted, "already_present", len(raw)-inserted)
+	return inserted, nil
 }

@@ -83,6 +83,10 @@ type Feeder struct {
 	echoes        []pendingOp
 	unresurrected []pendingOp
 
+	// sessions says which sessions are this system's own. See
+	// meta.Sessions.
+	sessions *meta.SessionRegister
+
 	// How far this host's clock is ahead of the archive's, as last measured,
 	// and when that was. Published with the position: see clockSkew.
 	skew      time.Duration
@@ -372,6 +376,9 @@ type pendingOp struct {
 	// session names the transaction a delete was made in, "" for one made
 	// outside a transaction. Only a delete in the evictor's own session spends
 	// its announcement. See meta.EvictionNotice.Accepts.
+	//
+	// And the transaction an insert was made in, because an insert made in a
+	// session this system registered is a warm. See suppressSessionEchoes.
 	session string
 }
 
@@ -402,7 +409,18 @@ func New(hot, cold *mongo.Client, cfg config.FeederConfig, log *slog.Logger) *Fe
 		marks: watermark.New(cold),
 		hold:  lease.New(cold, "feeder", cfg.ID),
 		log:   log,
+		// The register is read on the fast tier, where the events are. A
+		// feeder built without one, as tests build it, suppresses nothing by
+		// session. See suppressSessionEchoes.
+		sessions: sessionRegister(hot),
 	}
+}
+
+func sessionRegister(hot *mongo.Client) *meta.SessionRegister {
+	if hot == nil {
+		return nil
+	}
+	return meta.NewSessionRegister(hot)
 }
 
 // EnsureIndexes creates the bookkeeping indexes the feeder and evictor need.
@@ -1280,6 +1298,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		ns: ns, key: ev.DocumentKey, id: id, doc: ev.FullDocument, kind: actionUpsert,
 		wasInsert: ev.OperationType == "insert",
 		at:        ev.ClusterTime,
+		session:   meta.SessionHex(ev.LSID),
 	})
 	return nil
 }

@@ -343,3 +343,55 @@ func (f *Feeder) spendResidencyEchoes(ctx context.Context, ids []string, posOf m
 	_, err := coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	return err
 }
+
+// suppressSessionEchoes drops the inserts made in a session this system
+// registered: a warm putting on the fast tier a document the archive already
+// holds, which mirrored back would be a write the archive does not need and,
+// for a document the application has since deleted there, would bring it
+// back.
+//
+// Exact, where the notices before it were judged: the event names the session
+// it was made in, the session was registered before anything was written in
+// it, and nothing but the warm writes in it. So there is no window, no first
+// insert to pick out from later ones, and nothing on the archive to read,
+// spend or expire. See meta.Sessions.
+//
+// They go to f.echoes like every other suppressed insert, so the flush still
+// asks whether one put back a document the application had deleted. See
+// undoResurrections.
+func (f *Feeder) suppressSessionEchoes(ctx context.Context) (int, error) {
+	if f.sessions == nil {
+		return 0, nil
+	}
+	ours := map[string]bool{}
+	for _, op := range f.pending {
+		if op.kind != actionUpsert || !op.wasInsert || op.session == "" {
+			continue
+		}
+		if _, asked := ours[op.session]; asked {
+			continue
+		}
+		yes, err := f.sessions.Ours(ctx, op.session)
+		if err != nil {
+			// Not suppressing would mirror a warm back over a delete the
+			// application made meanwhile. The flush is tried again.
+			return 0, err
+		}
+		ours[op.session] = yes
+	}
+	if len(ours) == 0 {
+		return 0, nil
+	}
+	kept := f.pending[:0]
+	dropped := 0
+	for _, op := range f.pending {
+		if op.kind == actionUpsert && op.wasInsert && ours[op.session] {
+			f.echoes = append(f.echoes, op)
+			dropped++
+			continue
+		}
+		kept = append(kept, op)
+	}
+	f.pending = kept
+	return dropped, nil
+}

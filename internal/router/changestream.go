@@ -713,6 +713,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHi
 
 	evicted := r.evictionNotices(ctx, deleteIDs)
 	promoted := r.promotionTimes(ctx, insertIDs)
+	warmed := r.ourSessions(ctx, events, kinds, lsidHidden)
 	ownDDL := r.ownCatalogDDL(ctx, ddlAsk)
 	// The old rule, kept as a floor. Whatever the events say about their own
 	// time, a promotion recorded within the window still counts, so this can
@@ -737,6 +738,10 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHi
 				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden || splitWithoutSession(ev)):
+			dropped++
+		case kinds[i] == "insert" && docIDs[i] != "" && warmed[eventSession(ev)]:
+			// Made in a session this system registered: a warm, known exactly.
+			// See meta.Sessions.
 			dropped++
 		case kinds[i] == "insert" && isPromotion(promoted, docIDs[i], eventTime(ev), eventPosition(ev), recent):
 			// Which one, and how the window judged it. An insert hidden from an
@@ -1527,4 +1532,35 @@ func withFullDocument(ev bson.RawValue, doc bson.Raw) (bson.RawValue, error) {
 		return ev, merr
 	}
 	return bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: raw}, nil
+}
+
+// ourSessions is which of the sessions the inserts in these events were made
+// in are this system's own. A stream whose stages may have taken lsid away
+// asks nothing: what lsid it still shows cannot be trusted to be the event's.
+// A session the register cannot be read for is not counted as ours, and its
+// inserts are judged by their residency records as they were before sessions.
+func (r *Router) ourSessions(ctx context.Context, events []bson.RawValue, kinds []string, lsidHidden bool) map[string]bool {
+	if lsidHidden || r.sessions == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for i, ev := range events {
+		if kinds[i] != "insert" {
+			continue
+		}
+		s := eventSession(ev)
+		if s == "" {
+			continue
+		}
+		if _, asked := out[s]; asked {
+			continue
+		}
+		yes, err := r.sessions.Ours(ctx, s)
+		if err != nil {
+			r.log.Warn("could not read the session register, judging these inserts by residency", "err", err)
+			yes = false
+		}
+		out[s] = yes
+	}
+	return out
 }

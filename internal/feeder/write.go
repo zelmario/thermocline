@@ -392,6 +392,11 @@ func (f *Feeder) flush(ctx context.Context) error {
 		if err := f.resolveDeletes(ctx); err != nil {
 			return err
 		}
+		if dropped, err := f.suppressSessionEchoes(ctx); err != nil {
+			return err
+		} else if dropped > 0 {
+			f.log.Debug("suppressed inserts made in this system's sessions", "count", dropped)
+		}
 		if dropped, err := f.suppressWarmEchoes(ctx); err != nil {
 			return err
 		} else if dropped > 0 {
