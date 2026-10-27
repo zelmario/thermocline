@@ -130,6 +130,37 @@ func (t *touchTracker) advanceIn(at uint64, inclusive bool, term int64) {
 	t.mu.Unlock()
 }
 
+// reach waits, at most d, for the stream to have read through until, so a
+// question about the window up to it can be answered from memory. It reports
+// whether it got there.
+func (t *touchTracker) reach(ctx context.Context, until uint64, d time.Duration) bool {
+	if t == nil {
+		return false
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for t.applied < until || (t.applied == until && !t.inclusive) {
+		if t.moved == nil {
+			t.moved = make(chan struct{})
+		}
+		moved := t.moved
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			t.mu.Lock()
+			return false
+		case <-timer.C:
+			t.mu.Lock()
+			return false
+		case <-moved:
+		}
+		t.mu.Lock()
+	}
+	return true
+}
+
 // touch records one event.
 func (t *touchTracker) touch(op, db, coll string, id bson.RawValue, at uint64) {
 	t.mu.Lock()

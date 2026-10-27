@@ -289,6 +289,9 @@ type Stats struct {
 	// memory, from memory plus the oplog entries its stream had not reached,
 	// and from the oplog alone. See touched.go.
 	OplogChecksInMemory, OplogChecksTail, OplogChecksQueried atomic.Int64
+	// OplogChecksWaited counts the checks answered from memory after waiting
+	// for the tracker to reach the window's end. See touchReachWait.
+	OplogChecksWaited atomic.Int64
 	// FamClaimed counts sorted findAndModifys whose document the archive named
 	// inside the fast tier's claim, so neither held nor copied up. See
 	// guardSortedFindAndModify.

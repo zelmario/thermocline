@@ -133,3 +133,54 @@ func TestLastWriteIn(t *testing.T) {
 		t.Error("refused once the tracker read the same term")
 	}
 }
+
+// reach waits for the stream to read up to a position, and gives up at its
+// bound rather than wait for a stream that is not moving.
+func TestTouchTrackerReach(t *testing.T) {
+	tr := newTouchTracker()
+	tr.advance(10, true)
+	ctx := context.Background()
+	if !tr.reach(ctx, 10, time.Millisecond) {
+		t.Fatal("a position already read was not reached")
+	}
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		tr.advance(15, false)
+		time.Sleep(2 * time.Millisecond)
+		tr.advance(20, true)
+	}()
+	if !tr.reach(ctx, 20, time.Second) {
+		t.Fatal("the stream reached 20 and the wait did not see it")
+	}
+	start := time.Now()
+	if tr.reach(ctx, 30, 5*time.Millisecond) {
+		t.Fatal("a position the stream never read was reached")
+	}
+	if waited := time.Since(start); waited > 200*time.Millisecond {
+		t.Fatalf("gave up after %v, the bound is 5ms", waited)
+	}
+}
+
+// A point read's check that waits for the stream must still see a delete the
+// stream reads while it waits: the document was deleted inside the window, and
+// the answer is no, not "nothing pending".
+func TestNoDeletePendingSeesADeleteReadWhileWaiting(t *testing.T) {
+	tr := newTouchTracker()
+	tr.startAt(checkpoint.PackTS(bson.Timestamp{T: 100, I: 1}))
+	tr.advance(checkpoint.PackTS(bson.Timestamp{T: 105, I: 1}), true)
+	r := &Router{touches: tr}
+	_, raw, _ := bson.MarshalValue(int32(7))
+	id := bson.RawValue{Type: bson.TypeInt32, Value: raw}
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		tr.touch("delete", "shop", "orders", id, checkpoint.PackTS(bson.Timestamp{T: 108, I: 1}))
+		tr.advance(checkpoint.PackTS(bson.Timestamp{T: 110, I: 1}), true)
+	}()
+	from, until := bson.Timestamp{T: 104, I: 1}, bson.Timestamp{T: 109, I: 1}
+	if r.noDeletePendingIn(context.Background(), "shop.orders", id, from, until) {
+		t.Fatal("a delete inside the window, read while the check waited, was answered as nothing pending")
+	}
+	if r.Stats.OplogChecksWaited.Load() != 1 {
+		t.Fatalf("the check did not take the waited path (waited %d)", r.Stats.OplogChecksWaited.Load())
+	}
+}

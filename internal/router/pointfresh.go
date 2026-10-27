@@ -50,6 +50,10 @@ import (
 // cluster time that is checked without first asking how much oplog it holds.
 const pointCheckWindow = 2 * time.Second
 
+// touchReachWait is how long a point read's oplog check waits for the
+// tracker's stream to read up to the window's end before asking the oplog.
+const touchReachWait = 10 * time.Millisecond
+
 // windowMaxEntries is the most oplog entries a window may hold and still be
 // checked rather than waited for. More means the feeder is behind, and a scan
 // of that much oplog on the read path is not cheaper than the wait it saves.
@@ -218,6 +222,22 @@ func (r *Router) noDeletePendingIn(ctx context.Context, ns string, id bson.RawVa
 		if touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until) {
 			r.Stats.OplogChecksInMemory.Add(1)
 			return !touched
+		}
+		// The stream is usually a few milliseconds short of until, and the
+		// oplog query for those milliseconds is no cheap thing: it walks
+		// entries the oplog has no index for, on the fast tier's primary.
+		// Measured on staging at 12,900 ops/s: 3,027 such queries a second
+		// against 361 answered from memory, 70,357 documents scanned a second
+		// on the primary for 19,312 returned, the primary at 84% CPU and
+		// saturated at half the rate the old cluster alone carried. Waiting a
+		// moment for the stream costs a miss that much latency and the fast
+		// tier none of that work.
+		if r.touches.reach(ctx, checkpoint.PackTS(until), touchReachWait) {
+			if touched, rest, known = r.touches.ask(ns, from, until, []bson.RawValue{id}, true); known &&
+				(touched || checkpoint.PackTS(rest) >= checkpoint.PackTS(until)) {
+				r.Stats.OplogChecksWaited.Add(1)
+				return !touched
+			}
 		}
 		// Only what the stream has not reached yet is read.
 		from = rest

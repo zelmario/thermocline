@@ -79,6 +79,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("oplog_checks_in_memory_total", "Oplog checks of merged and unwaited reads answered from memory, with no round trip to the fast tier.", snap.Counters["oplog_checks_in_memory"])
 	counter("oplog_checks_queried_total", "Oplog checks of merged and unwaited reads that read the fast tier's oplog.", snap.Counters["oplog_checks_queried"])
 	counter("oplog_checks_tail_total", "Oplog checks the tracker answered up to where its stream had got, leaving only the entries after that to read from the oplog.", snap.Counters["oplog_checks_tail"])
+	counter("oplog_checks_waited_total", "Oplog checks answered from the tracker's memory after waiting a few milliseconds for its stream to reach the window's end, rather than reading the rest from the fast tier's oplog.", snap.Counters["oplog_checks_waited"])
 	counter("fam_claimed_total", "Sorted findAndModifys whose document the archive named inside the fast tier's claim, so it was neither held nor copied up.", snap.Counters["fam_claimed"])
 	counter("warmed_for_txn_total", "Documents brought up so a transaction could run against the fast tier alone.", snap.Counters["warmed_for_txn"])
 	counter("read_misses_total", "Point lookups that found the document only in the archive.", snap.Counters["read_misses"])
