@@ -211,11 +211,10 @@ func (r *Router) copyUpAsync(ns string, id bson.RawValue, seen *archivedRead) {
 // a promotion for certain. See meta.PromotionUpdate.
 func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValue, asked bool) error {
 	now := time.Now().UTC()
-	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: meta.DocID(ns, id)}},
-		residencyFor(ns, id, now, r.cfg.Residency.D(), asked),
-		options.UpdateOne().SetUpsert(true))
-	return err
+	return r.residencyWriter().write(ctx, mongo.NewUpdateOneModel().
+		SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
+		SetUpdate(residencyFor(ns, id, now, r.cfg.Residency.D(), asked)).
+		SetUpsert(true))
 }
 
 // recordResidencyMany does the same for a batch, in one round trip.

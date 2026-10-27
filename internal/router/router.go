@@ -171,6 +171,10 @@ type Router struct {
 	// fast tier gains documents, and the only way for a namespace no warmer
 	// rule covers. See promote/indexes.go.
 	indexer *promote.Indexer
+	// resBatch shares the archive round trip among concurrent copy-ups'
+	// residency holds. See resbatch.go.
+	resBatch     *residencyBatcher
+	resBatchOnce sync.Once
 
 	// conns is every live client connection, so a stop can end the ones that
 	// are idle instead of waiting on a read that will never return.
