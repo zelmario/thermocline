@@ -70,42 +70,36 @@ type Warmer struct {
 	// record per document. Opened on the first batch and never ended: an
 	// ended session goes back to the driver's pool, and a transaction of
 	// something else made in it would read as a warm. See meta.Sessions.
-	sess     *mongo.Session
-	sessErr  error
-	sessOnce sync.Once
+	sess   *mongo.Session
+	sessMu sync.Mutex
 }
 
-// sessionDocMax is the largest document warmed in the session. A change event
-// for a larger one can be split, and only one piece of a split event carries
-// lsid, so the router could not recognise it by its session. Those are warmed
-// as they were before sessions: announced, and recorded with an echo.
-const sessionDocMax = 8 << 20
-
-// session opens and registers the warmer's session, once. A warmer that cannot
-// register one warms as it did before.
-func (w *Warmer) session(ctx context.Context) *mongo.Session {
-	w.sessOnce.Do(func() {
-		s, err := w.hot.StartSession()
-		if err != nil {
-			w.sessErr = err
-			return
-		}
-		if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer"); err != nil {
-			s.EndSession(context.WithoutCancel(ctx))
-			w.sessErr = err
-			return
-		}
-		if err := meta.EnsureSessionIndexes(ctx, w.hot); err != nil {
-			w.log.Warn("could not keep the session register expiring", "err", err)
-		}
-		w.sess = s
-	})
-	if w.sessErr != nil {
-		w.log.Warn("warming without a registered session, announcing each document instead",
-			"err", w.sessErr)
-		return nil
+// session opens and registers the warmer's session, and returns it.
+//
+// A warmer that cannot register one does not warm, rather than announcing each
+// document as it did before sessions: the feeder only reads the announcements
+// of documents larger than meta.SessionDocMax, so a small one announced would
+// be mirrored back over whatever the application did to it since. Asked again
+// on the next batch.
+func (w *Warmer) session(ctx context.Context) (*mongo.Session, error) {
+	w.sessMu.Lock()
+	defer w.sessMu.Unlock()
+	if w.sess != nil {
+		return w.sess, nil
 	}
-	return w.sess
+	s, err := w.hot.StartSession()
+	if err != nil {
+		return nil, fmt.Errorf("start the warmer's session: %w", err)
+	}
+	if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer"); err != nil {
+		s.EndSession(context.WithoutCancel(ctx))
+		return nil, err
+	}
+	if err := meta.EnsureSessionIndexes(ctx, w.hot); err != nil {
+		w.log.Warn("could not keep the session register expiring", "err", err)
+	}
+	w.sess = s
+	return s, nil
 }
 
 // warmPace splits a warm's time by what it was waiting on, the way the
@@ -769,7 +763,11 @@ func (w *Warmer) write(ctx context.Context, ns string, docs []sourceDoc) (int, e
 	// archive's metadata that only have to land before the insert, not before
 	// each other, so they go together: measured on staging they were 20% and
 	// 44% of a warm's time, one after the other.
-	if sess := w.sessionFor(ctx, docs); sess != nil {
+	sess, serr := w.sessionFor(ctx, docs)
+	if serr != nil {
+		return 0, serr
+	}
+	if sess != nil {
 		return w.writeInSession(ctx, sess, ns, hot, docs)
 	}
 
@@ -1358,11 +1356,11 @@ func (w *Warmer) claimMoved(rule config.WarmRule) {
 }
 
 // sessionFor is the session a batch is warmed in, or nil when any document in
-// it is too large for its event to keep lsid. See sessionDocMax.
-func (w *Warmer) sessionFor(ctx context.Context, docs []sourceDoc) *mongo.Session {
+// it is too large for its event to keep lsid. See meta.SessionDocMax.
+func (w *Warmer) sessionFor(ctx context.Context, docs []sourceDoc) (*mongo.Session, error) {
 	for _, d := range docs {
-		if len(d.raw) > sessionDocMax {
-			return nil
+		if len(d.raw) > meta.SessionDocMax {
+			return nil, nil
 		}
 	}
 	return w.session(ctx)

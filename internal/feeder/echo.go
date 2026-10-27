@@ -44,9 +44,15 @@ func (f *Feeder) suppressWarmEchoes(ctx context.Context) (int, error) {
 	// record can say afterwards which insert it accounted for. The first upsert
 	// for a document is the one the notice is spent on, so the first position is
 	// the one to keep; see the loop at the end of this function.
+	//
+	// Only inserts larger than meta.SessionDocMax: a warm of anything smaller
+	// is made in the warmer's registered session and suppressed by it, and a
+	// warmer that cannot register one does not warm. So a flush without such
+	// a document asks the archive nothing here, where it asked once per flush
+	// that held any insert.
 	posOf := map[string]bson.Timestamp{}
 	for _, op := range f.pending {
-		if op.kind == actionUpsert && op.wasInsert {
+		if op.kind == actionUpsert && op.wasInsert && len(op.doc) > meta.SessionDocMax {
 			id := meta.DocID(op.ns, op.id)
 			ids = append(ids, id)
 			if _, seen := posOf[id]; !seen {

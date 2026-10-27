@@ -36,6 +36,13 @@ import (
 // where the events are read and which is not the cluster under pressure.
 const Sessions = "sessions"
 
+// SessionDocMax is the largest document this system inserts in a registered
+// session. A change event for a larger one can be split, and only one piece
+// of a split event carries lsid, so such a document is announced and recorded
+// with an echo as before sessions. The feeder reads warm announcements only
+// for documents above it.
+const SessionDocMax = 8 << 20
+
 // SessionRecord is one registered session.
 type SessionRecord struct {
 	ID        string    `bson:"_id"`
