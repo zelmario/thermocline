@@ -150,11 +150,11 @@ checked() {
   [ "$bad" = 0 ] || { t "$1: FAILED, the numbers above are not a measurement"; return 4; }
 }
 
-X=/usr/local/bin/cline
+X=${CLINE:-/usr/local/bin/cline}
 stopAll() {
-  for p in $(pgrep -f "^$X (router|feeder|evictor) --config $CFG"); do kill "$p"; done
-  for _ in $(seq 50); do pgrep -f "^$X (router|feeder|evictor) --config $CFG" >/dev/null || return 0; sleep 0.2; done
-  pkill -9 -f "^$X (router|feeder|evictor) --config $CFG"
+  for p in $(pgrep -f "^$X (router|feeder|evictor|warmer) --config $CFG"); do kill "$p"; done
+  for _ in $(seq 50); do pgrep -f "^$X (router|feeder|evictor|warmer) --config $CFG" >/dev/null || return 0; sleep 0.2; done
+  pkill -9 -f "^$X (router|feeder|evictor|warmer) --config $CFG"
 }
 stopAll
 # A run ended by ssh dropping or ^C stops its daemons too: started with setsid
@@ -260,7 +260,7 @@ router:
   dashboard: "127.0.0.1:27811"
   completeness: archive
   freshness: strict
-  copy_up_reads: repeated
+  copy_up_reads: ${COPYUP:-repeated}
   live_cache:
     enabled: $LIVEB
     max_staleness: 0s
@@ -287,6 +287,13 @@ if [ "$MODE" = warm ]; then
   exit 0
 fi
 setsid nohup $X evictor --config $CFG --log-file "$OUT/$LABEL.evictor.log" >/dev/null 2>&1 < /dev/null &
+# WARMNOW=1 runs the warmer beside the application from the first second of an
+# adoption: it reads the archive newest first, which is what latest reads most,
+# so the fast tier holds the hot records within minutes instead of waiting for
+# traffic to miss on each one.
+if [ "${WARMNOW:-0}" = 1 ]; then
+  setsid nohup $X warmer --config $CFG --log-file "$OUT/$LABEL.warmer.log" > "$OUT/$LABEL.warmer.out" 2>&1 < /dev/null &
+fi
 # A fast tier kept from earlier runs had their inserts deleted by the reset
 # above, and every one of those deletes is the feeder's to mirror: after a
 # 45-minute adoption at 10,000 ops/s that is 1.35 million, and a run started
