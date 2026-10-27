@@ -26,6 +26,7 @@ import (
 
 	"github.com/zelmario/thermocline/internal/config"
 	"github.com/zelmario/thermocline/internal/health"
+	"github.com/zelmario/thermocline/internal/indexprobe"
 	"github.com/zelmario/thermocline/internal/lease"
 	"github.com/zelmario/thermocline/internal/meta"
 	"github.com/zelmario/thermocline/internal/watermark"
@@ -1645,9 +1646,26 @@ func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule,
 		return
 	}
 
-	n, err := hotColl.CountDocuments(ctx, bson.D{{Key: rule.DateField, Value: bson.D{
+	// Through an index leading with the field when there is one, as a list of
+	// every type but a date: $type is answered from index bounds, so the count
+	// reads the keys it counts and nothing else, where the $not form below
+	// reads every document. Measured on staging: the two counts here read 27
+	// million documents of a 13.3 million document fast tier at every start,
+	// on the tier the router was serving from. A missing field is indexed as
+	// null, so its branch reads only those keys too.
+	never, idx := indexprobe.NeverArray(ctx, hotColl, rule.DateField)
+	unaged := bson.D{{Key: rule.DateField, Value: bson.D{
 		{Key: "$not", Value: bson.D{{Key: "$type", Value: "date"}}},
-	}}})
+	}}}
+	count := options.Count()
+	if idx != nil {
+		unaged = bson.D{{Key: "$or", Value: bson.A{
+			bson.D{{Key: rule.DateField, Value: bson.D{{Key: "$exists", Value: false}}}},
+			bson.D{{Key: rule.DateField, Value: bson.D{{Key: "$type", Value: notDate}}}},
+		}}}
+		count.SetHint(idx)
+	}
+	n, err := hotColl.CountDocuments(ctx, unaged, count)
 	if err == nil && n > 0 {
 		e.log.Warn("the fast tier holds documents this rule can never remove",
 			"ns", rule.NS, "not_dated_by_"+rule.DateField, n,
@@ -1669,6 +1687,12 @@ func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule,
 	// Reported separately from the count above, because the reason and the
 	// action are different: those cannot be selected at all, and these could be
 	// and must not be.
+	//
+	// An index on the field that is not multikey proves there is none, with
+	// no count at all.
+	if never {
+		return
+	}
 	na, aerr := hotColl.CountDocuments(ctx, bson.D{{Key: rule.DateField, Value: bson.D{
 		{Key: "$type", Value: "array"},
 	}}})
@@ -1685,6 +1709,15 @@ func (e *Evictor) warnAboutUnaged(ctx context.Context, rule config.EvictionRule,
 			"grows by that much",
 		"action", "give each document one date in "+rule.DateField+", or age this namespace by a "+
 			"field that holds one")
+}
+
+// notDate is every BSON type but a date and an array, for warnAboutUnaged's
+// count through an index: an array is counted on its own, and a missing field
+// is asked for beside it, since $type null does not match one.
+var notDate = bson.A{
+	"double", "string", "object", "binData", "undefined", "objectId", "bool",
+	"null", "regex", "dbPointer", "javascript", "symbol", "int", "timestamp",
+	"long", "decimal", "minKey", "maxKey",
 }
 
 // settleClaim waits long enough for every reader holding the previous claim to

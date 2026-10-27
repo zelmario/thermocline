@@ -669,6 +669,45 @@ chkv "and says nothing when they are all dated"  "0" \
 H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
 
+echo "== the same, counted through an index on the field =="
+# The two counts above read every document of the fast tier when the field has
+# no index. With one they are asked as index bounds, every type but a date, and
+# an index that is not multikey answers the array question without a count.
+# Measured on staging before: 27 million documents read at every evictor start
+# on a 13.3 million document fast tier. This checks the answers are the same.
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$ENS.insertMany([
+    {_id:2, at:'$OLDDATE',     n:'old, but a string'},
+    {_id:3,                    n:'no field at all'},
+    {_id:4, at:null,           n:'null'},
+    {_id:5, at:new Date('$NOWD'), n:'dated and recent'}])" >/dev/null
+done
+H "db.getSiblingDB(process.env.TC_DB).$ENS.createIndex({at:1})" >/dev/null
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
+   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+rm -f $LOGDIR/ev_unagedix.log
+cline evictor --config $WDIR/evunaged.yaml --once --log-file $LOGDIR/ev_unagedix.log >/dev/null 2>&1
+chkv "with an index: the string, the missing and the null"  "true" \
+    "$(grep -q 'not_dated_by_at=3' $LOGDIR/ev_unagedix.log && echo true || echo false)"
+chkv "  and no array, the index not being multikey"         "0" \
+    "$(grep -c 'age is an array' $LOGDIR/ev_unagedix.log || true)"
+for U in "$HOT" "$COLD"; do
+  mongosh "$U" --quiet --eval "db.getSiblingDB('$DB').$ENS.insertOne(
+    {_id:9, at:[new Date('$OLDDATE'), new Date('$NOWD')], n:'old and new at once'})" >/dev/null
+done
+NOWMS=$(date +%s000)
+C "db.getSiblingDB(process.env.TC_META).positions.updateOne({_id:'test'},{\$set:{at:new Date($NOWMS), savedAt:new Date($NOWMS), everyMS:1000}},{upsert:true});
+   db.getSiblingDB(process.env.TC_META).checkpoints.updateOne({_id:'test'},{\$set:{eventAt:new Date($NOWMS), savedAt:new Date($NOWMS)}},{upsert:true})" >/dev/null
+rm -f $LOGDIR/ev_unagedixarr.log
+cline evictor --config $WDIR/evunaged.yaml --once --log-file $LOGDIR/ev_unagedixarr.log >/dev/null 2>&1
+chkv "  and an array once there is one, the index now multikey" "true" \
+    "$(grep -q 'array_at=1' $LOGDIR/ev_unagedixarr.log && echo true || echo false)"
+H "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$ENS.drop()" >/dev/null
+
 echo "== a restored archive under a live fast tier =="
 # The reason `cline pause` exists, and the reason the backup procedure puts it
 # before the restore rather than mentioning it afterwards.

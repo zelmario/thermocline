@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/zelmario/thermocline/internal/indexprobe"
 	"github.com/zelmario/thermocline/internal/meta"
 )
 
@@ -269,87 +270,8 @@ func (r *Router) bracketUntil(ns string) time.Time {
 // field that is not multikey, which proves no document it holds has an array
 // there. Any doubt, an error or a plan that does not say, is a no.
 func (r *Router) archiveFieldNeverArray(ctx context.Context, db, coll, field string) bool {
-	cur, err := r.cold.Database(db).Collection(coll).Indexes().List(ctx)
-	if err != nil {
-		return false
-	}
-	var keys []bson.Raw
-	for cur.Next(ctx) {
-		key, ok := cur.Current.Lookup("key").DocumentOK()
-		if !ok {
-			continue
-		}
-		// A partial or sparse index does not hold every document, so its
-		// mark speaks only for the ones it holds.
-		if _, err := cur.Current.LookupErr("partialFilterExpression"); err == nil {
-			continue
-		}
-		if sp, _ := cur.Current.Lookup("sparse").BooleanOK(); sp {
-			continue
-		}
-		elems, err := key.Elements()
-		if err != nil || len(elems) == 0 || elems[0].Key() != field {
-			continue
-		}
-		if _, ok := elems[0].Value().AsInt64OK(); !ok {
-			// A hashed, text or 2dsphere index says nothing about arrays the
-			// way a plain one does.
-			if _, ok := elems[0].Value().DoubleOK(); !ok {
-				continue
-			}
-		}
-		keys = append(keys, append(bson.Raw(nil), key...))
-	}
-	_ = cur.Close(ctx)
-	for _, key := range keys {
-		var plan bson.Raw
-		err := r.cold.Database(db).RunCommand(ctx, bson.D{
-			{Key: "explain", Value: bson.D{
-				{Key: "find", Value: coll},
-				{Key: "filter", Value: bson.D{{Key: field, Value: bson.D{{Key: "$exists", Value: true}}}}},
-				{Key: "hint", Value: key},
-				{Key: "limit", Value: int32(1)},
-			}},
-			{Key: "verbosity", Value: "queryPlanner"},
-		}).Decode(&plan)
-		if err != nil {
-			continue
-		}
-		if multi, said := multikeyIn(plan.Lookup("queryPlanner", "winningPlan")); said && !multi {
-			return true
-		}
-	}
-	return false
-}
-
-// multikeyIn reads isMultiKey off the index scans of a plan, true if any of
-// them is, and says whether any said at all.
-func multikeyIn(v bson.RawValue) (multi, said bool) {
-	var elems []bson.RawElement
-	switch v.Type {
-	case bson.TypeEmbeddedDocument:
-		elems, _ = v.Document().Elements()
-	case bson.TypeArray:
-		vals, _ := v.Array().Values()
-		for _, x := range vals {
-			m, s := multikeyIn(x)
-			multi, said = multi || m, said || s
-		}
-		return multi, said
-	default:
-		return false, false
-	}
-	for _, e := range elems {
-		if e.Key() == "isMultiKey" {
-			if b, ok := e.Value().BooleanOK(); ok {
-				multi, said = multi || b, true
-			}
-			continue
-		}
-		m, s := multikeyIn(e.Value())
-		multi, said = multi || m, said || s
-	}
-	return multi, said
+	never, _ := indexprobe.NeverArray(ctx, r.cold.Database(db).Collection(coll), field)
+	return never
 }
 
 // forgetBrackets drops what is remembered about ns, for the DDL that can make
