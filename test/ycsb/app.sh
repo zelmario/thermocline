@@ -10,6 +10,7 @@
 #   WORKLOAD=workloadd MODE=tc LABEL=d-tc bash app.sh   YCSB's own workload D
 #   MODE=warm LABEL=warm bash app.sh               fill the fast tier with the last AGE
 #   KEEPHOT=1 MODE=tc LABEL=tc-hot bash app.sh     a run on that, not on an empty one
+#   KEEPHOT=1 MODE=direct LABEL=d bash app.sh      the fast tier's own ceiling, no router
 #
 # A run lasts SECS seconds at RATE operations a second, or as fast as it can
 # with RATE=0. Every run first removes what earlier runs inserted and
@@ -201,6 +202,19 @@ fi
 # Let the archive's cache and disk settle after the deletes before measuring.
 sleep "${SETTLE:-30}"
 
+# MODE=direct points YCSB at the fast tier itself, with nothing of Thermocline
+# running: what the fast tier's machines do for this workload on their own. The
+# two tiers are different machines, so a tc run limited by the fast tier is read
+# against this, not against alone. Its reads of records the fast tier does not
+# hold come back empty, and its writes are not mirrored; the next run's reset
+# removes its inserts.
+if [ "$MODE" = direct ]; then
+  [ "${KEEPHOT:-0}" = 1 ] || { t "$LABEL: MODE=direct needs KEEPHOT=1, or there is nothing on the fast tier"; exit 3; }
+  t "$LABEL: direct to the fast tier, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
+  ycsb run "$HOT" -p operationcount=2000000000 -p maxexecutiontime="$SECS" || { t "$LABEL: YCSB exited $?"; exit 4; }
+  t "$LABEL: $(grep -E 'OVERALL\], Throughput' "$OUT/$LABEL.out")"
+  exit 0
+fi
 if [ "$MODE" = alone ]; then
   t "$LABEL: alone, $DIST, ${SECS}s at $RATE/s, $THREADS threads"
   ycsb run "$COLD" -p operationcount=2000000000 -p maxexecutiontime="$SECS" || { t "$LABEL: YCSB exited $?"; exit 4; }
@@ -306,8 +320,14 @@ fi
 if [ "${KEEPHOT:-0}" = 1 ]; then
   D0=$(date +%s); calm=0
   for _ in $(seq 1 360); do
-    lag=$(curl -s http://127.0.0.1:27811/metrics | awk '/^thermocline_mirroring_lag_seconds /{print $2}')
-    if [ -n "$lag" ] && awk -v l="$lag" 'BEGIN{exit !(l < 1)}'; then calm=$((calm + 1)); else calm=0; fi
+    # Both: the lag of the last event mirrored, and how far the feeder's
+    # position is behind the fast tier's cluster time. A feeder working
+    # through a backlog of old writes reads 0.4s on the first and 1,198s on
+    # the second, and a run started then had 2,304 reads refused.
+    m=$(curl -s http://127.0.0.1:27811/metrics)
+    lag=$(echo "$m" | awk '/^thermocline_mirroring_lag_seconds /{print $2}')
+    behind=$(echo "$m" | awk '/^thermocline_mirroring_cluster_time_behind_seconds /{print $2}')
+    if [ -n "$lag" ] && [ -n "$behind" ] && awk -v l="$lag" -v b="$behind" 'BEGIN{exit !(l < 1 && b < 2)}'; then calm=$((calm + 1)); else calm=0; fi
     [ $calm -ge 3 ] && break
     sleep 5
   done
