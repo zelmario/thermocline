@@ -846,6 +846,15 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 	f.publishCounters(ctx)
 	defer f.settleOwed(ctx)
 
+	// The stream is read ahead, one getMore batch at a time, while this loop
+	// writes the one before. See readStream.
+	items := make(chan []streamItem, 1)
+	rctx, stopReader := context.WithCancel(ctx)
+	readerDone := make(chan struct{})
+	go readStream(rctx, stream, items, readerDone)
+	defer func() { stopReader(); <-readerDone }()
+	var batch []streamItem
+
 	for {
 		if ctx.Err() != nil {
 			return f.flush(context.WithoutCancel(ctx))
@@ -856,18 +865,28 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		if f.pace.since.IsZero() {
 			f.pace.since = time.Now()
 		}
-		waitFrom := time.Now()
-		got := stream.TryNext(ctx)
-		f.pace.waiting += time.Since(waitFrom)
-		if got {
+		if len(batch) == 0 {
+			waitFrom := time.Now()
+			select {
+			case batch = <-items:
+			case <-ctx.Done():
+			}
+			f.pace.waiting += time.Since(waitFrom)
+			if len(batch) == 0 {
+				continue
+			}
+		}
+		it := batch[0]
+		batch = batch[1:]
+		if it.ev != nil {
 			readFrom := time.Now()
-			if err := f.handle(ctx, stream.Current); err != nil {
+			if err := f.handle(ctx, it.ev); err != nil {
 				return err
 			}
 			f.pace.reading += time.Since(readFrom)
 			f.pace.events++
-			f.lastToken = stream.ResumeToken()
-			f.lastTokenNS, f.lastTokenTS = tokenEvent(stream.Current, f.lastToken)
+			f.lastToken = it.token
+			f.lastTokenNS, f.lastTokenTS = tokenEvent(it.ev, f.lastToken)
 			if len(f.pending) > 0 && f.pendingSince.IsZero() {
 				f.pendingSince = readFrom
 			}
@@ -888,7 +907,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			// each second: a write reached a change stream in 2ms, the archive
 			// in 27ms and the published position in 32ms at the median, and a
 			// read that fell through waited 45ms on average.
-			if stream.RemainingBatchLength() == 0 {
+			if it.batchEnd {
 				writeFrom := time.Now()
 				if err := f.flush(ctx); err != nil {
 					return err
@@ -909,7 +928,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := stream.Err(); err != nil {
+		if err := it.err; err != nil {
 			// Flush what we have before giving the stream up, so a reopen does
 			// not repeat work we already decoded.
 			if ferr := f.flush(context.WithoutCancel(ctx)); ferr != nil {
@@ -929,7 +948,7 @@ func (f *Feeder) runOnce(ctx context.Context) error {
 		// past an empty batch precisely so a reader can record progress it made
 		// without seeing anything, which also means a long quiet spell does not
 		// leave the feeder resuming from an ancient position.
-		tok := stream.ResumeToken()
+		tok := it.token
 		if len(tok) > 0 {
 			if !bytes.Equal(tok, f.lastToken) {
 				// A post-batch token past what this stream filtered out names
