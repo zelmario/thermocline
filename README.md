@@ -317,3 +317,7 @@ it, because a README nobody reaches the end of is a README that does not work:
 The architecture, sizing from 500 GB to 5 TB, and the alternatives worth ruling
 out first are written up separately, along with a phased rollout guide for
 adopting this on a database that is already serving traffic.
+
+## License
+
+Copyright 2026 Zelmar Michelini. Licensed under the [Apache License, Version 2.0](LICENSE).
