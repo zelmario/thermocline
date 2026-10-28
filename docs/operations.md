@@ -313,8 +313,21 @@ always answers.
 
 ### Running them as services
 
-`packaging/systemd/` has a unit for each one, and `packaging/install.sh` puts
-them where they belong:
+`packaging/install.sh` installs `cline.service`, which runs `cline run`: every
+daemon in one process, in the order below, with the feeder, evictor and warmer
+restarted inside it after ten seconds and the whole unit restarted by systemd
+when the router stops.
+
+```
+sudo packaging/install.sh bin/cline
+sudo install -m 0640 -o cline -g cline cline.yaml /etc/cline/cline.yaml
+cline preflight --config /etc/cline/cline.yaml
+sudo systemctl enable --now cline
+```
+
+It installs a unit for each daemon as well, for running them apart, such as
+routers on more hosts. Enable `cline` or those on a host, not both. By hand,
+the order `cline run` keeps is:
 
 ```
 sudo packaging/install.sh bin/cline

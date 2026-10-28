@@ -188,7 +188,7 @@ func (m *Metrics) RecordStage(i int, d time.Duration) {
 	if m == nil {
 		return
 	}
-	ms :=float64(d) / float64(time.Millisecond)
+	ms := float64(d) / float64(time.Millisecond)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st := &m.stages[i]

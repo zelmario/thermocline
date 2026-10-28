@@ -2696,3 +2696,23 @@ func servedByAnArchiveIndex(fields []string, have [][]string) bool {
 	}
 	return false
 }
+
+// UnclaimedUniqueNamespaces names the tiered collections in the state
+// warnAboutUnclaimedUniqueKeys warns about: a unique index the registry holds
+// no claim for, over documents the archive holds. cline run claims their keys
+// before it starts the evictor, which is the step the warning asks for.
+//
+// A walk stopped part of the way leaves claims behind and reads as done here,
+// the same as it does to the warning. Run cline keys --rebuild after one.
+func (r *Router) UnclaimedUniqueNamespaces(ctx context.Context) []string {
+	var out []string
+	for _, ns := range r.tieredNamespaces(ctx) {
+		for _, idx := range r.uniqueIndexes(ctx, ns) {
+			if !r.registryHasAClaimFor(ctx, ns, idx) && r.archiveHoldsSomethingIndexedBy(ctx, ns, idx) {
+				out = append(out, ns)
+				break
+			}
+		}
+	}
+	return out
+}

@@ -3,6 +3,26 @@
 # The fast tier is a small cluster holding the working set. The cold tier is a
 # big cheap cluster holding everything. When adopting on a running database,
 # your existing cluster becomes the cold tier as it is.
+#
+# Most deployments need four settings, and the short form is all of them:
+#
+#   hot: "mongodb://rs-fast-1,rs-fast-2,rs-fast-3/?replicaSet=rsFast"
+#   cold: "mongodb://rs-cold-1,rs-cold-2,rs-cold-3/?replicaSet=rsCold"
+#   listen: "0.0.0.0:27017"
+#   collections:
+#     app.orders: 90d                  # leaves the fast tier at 90 days, by _id
+#     app.events:
+#       older_than: 30d
+#       date_field: createdAt          # when the age is a field, not the _id
+#
+# Each collection is named once: Load turns that line into its feeder
+# namespace, its evictor rule and its warmer rule, which this file below
+# writes out the long way. Every other setting here can sit beside the short
+# form; a collection named in both is refused. Then run it:
+#
+#   cline run --config cline.yaml
+#
+# This file is the long form, with every setting and why it is there.
 
 hot:
   uri: "mongodb://rs-fast-1,rs-fast-2,rs-fast-3/?replicaSet=rsFast"

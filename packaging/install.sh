@@ -36,7 +36,7 @@ if ! cmp -s "$BIN" "$PREFIX/cline" 2>/dev/null; then
 else
   echo "install.sh: $PREFIX/cline is already this build."
 fi
-install -m 0644 "$HERE"/systemd/cline-*.service "$HERE"/systemd/cline-*.timer "$UNITDIR/"
+install -m 0644 "$HERE"/systemd/cline*.service "$HERE"/systemd/cline-*.timer "$UNITDIR/"
 if [ -d /etc/logrotate.d ]; then
   install -m 0644 "$HERE/logrotate/cline" /etc/logrotate.d/cline
 fi
@@ -55,12 +55,16 @@ systemctl daemon-reload
 # purpose, so what the operator needs is the order to do it in: the feeder
 # records what the routers are about to start acting on, so the routers go last.
 # That order is docs/operations.md's, not this script's invention.
-if systemctl is-active --quiet cline-feeder || systemctl is-active --quiet cline-router; then
+if systemctl is-active --quiet cline || systemctl is-active --quiet cline-feeder || systemctl is-active --quiet cline-router; then
   cat <<'UPGRADE'
 
 Installed over a running deployment. Nothing here restarted anything, so a
 daemon goes on running whatever binary and unit file it started with. When you
-do restart them, the order is not arbitrary:
+do restart them, the order is not arbitrary. With the one unit:
+
+  systemctl restart cline                 # one host at a time
+
+and with a unit for each daemon:
 
   systemctl restart cline-feeder
   systemctl restart cline-evictor
@@ -76,7 +80,17 @@ fi
 
 cat <<'NEXT'
 
-Installed. Then, in this order:
+Installed. Write /etc/cline/cline.yaml, owned by cline and mode 0640 (the short
+form in cline.example.yaml is the two URIs and one line per collection), then:
+
+  cline preflight --config /etc/cline/cline.yaml     # writes nothing, refuses a bad pair
+  systemctl enable --now cline                       # every daemon, in order
+
+cline run starts the feeder, opens the router once mirroring is caught up,
+claims the unique keys the archive already holds, and only then starts the
+evictor and the warmer. The units for each daemon on its own are installed
+too, for routers on more hosts; enable those or cline on a host, not both.
+Running them apart, the order is:
 
   cline preflight --config /etc/cline/cline.yaml     # writes nothing, refuses a bad pair
   systemctl enable --now cline-feeder                # and let it catch up first

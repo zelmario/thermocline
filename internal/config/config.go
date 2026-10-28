@@ -52,6 +52,10 @@ type Config struct {
 	// internal/tierver. Turning it on accepts that a query can work for months
 	// and then fail on the day its documents age out of the fast tier.
 	AllowVersionSkew bool `yaml:"allow_version_skew"`
+
+	// Listen and Collections are the short form. See short.go.
+	Listen      string                `yaml:"listen"`
+	Collections map[string]Collection `yaml:"collections"`
 }
 
 // MetaConfig names the database Thermocline keeps its own bookkeeping in.
@@ -615,6 +619,9 @@ func Load(path string) (Config, error) {
 		// io.EOF is an empty file, which is a config that changes nothing
 		// rather than a broken one: every daemon then fails validation on the
 		// missing URIs, which is the honest error.
+		return cfg, fmt.Errorf("parse config: %w", err)
+	}
+	if err := cfg.expandShortForm(raw); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.Router.Managed = cfg.Feeder.Namespaces

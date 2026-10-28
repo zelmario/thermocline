@@ -1,0 +1,50 @@
+# Every daemon in one service: cline run.
+#
+# This is the unit to enable. It starts the feeder, opens the router once
+# mirroring is caught up, claims the unique keys an adopted archive already
+# holds, and then starts the evictor and the warmer: the order docs/adoption.md
+# gives, kept by the process instead of by whoever enables the units.
+#
+# The per-daemon units beside it are for running them apart, such as routers
+# on more hosts. Enable this one or those on a host, not both: two feeders on
+# one host is one waiting on the other's lease, and two routers on one address
+# is one that cannot listen.
+#
+# Restart=always for the same reason as the feeder's unit: a second cline run
+# on another host waits for this one's lease, and a router that stops ends the
+# process so this brings it back. The feeder, evictor and warmer are restarted
+# inside the process after ten seconds.
+[Unit]
+Description=Thermocline (feeder, router, evictor and warmer)
+Documentation=https://github.com/zelmario/thermocline
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cline
+Group=cline
+ExecStart=/usr/local/bin/cline run --config /etc/cline/cline.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10s
+# The router's limit, for the router's reason: two descriptors per client
+# while authentication is proxied, and systemd's default of 1024 runs out at
+# about five hundred. See cline-router.service.
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cline
+# It reads and writes two databases, and on this host only its logs.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/log/cline
+
+[Install]
+WantedBy=multi-user.target

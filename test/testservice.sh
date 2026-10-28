@@ -47,7 +47,7 @@ R() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval "$1" 2>&1 | tail -1; 
 routerUp() { docker exec "$NODE" mongosh "$ROUTER" --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; }
 active() { N "systemctl is-active $1 2>/dev/null" | tr -d '\n'; }
 cleanup() {
-  N "systemctl disable --now cline-feeder cline-router cline-evictor cline-warmer.timer >/dev/null 2>&1;
+  N "systemctl disable --now cline cline-feeder cline-router cline-evictor cline-warmer.timer >/dev/null 2>&1;
      systemctl stop cline-warmer.service >/dev/null 2>&1; true" >/dev/null 2>&1
 }
 trap cleanup EXIT
@@ -70,6 +70,8 @@ chk "it creates the account the units run as"     "cline" \
     "$(N "id -un cline 2>/dev/null" | tr -d '\n')"
 chk "and installs the units"                      "5" \
     "$(N "ls /etc/systemd/system/cline-* 2>/dev/null | wc -l" | tr -d '\n')"
+chk "and the one unit that runs them all"         "true" \
+    "$(N "test -f /etc/systemd/system/cline.service && echo true || echo false" | tr -d '\n')"
 chk "and says the config is the operator's to write" "true" \
     "$(grep -q 'write /etc/cline/cline.yaml next' <<<"$INST" && echo true || echo false)"
 # The order it prints is the one an operator follows, so it has to be the order
@@ -322,6 +324,48 @@ sleep 8
 chk "and comes back paused"                       "true" \
     "$(N "grep -c 'eviction is paused by an operator' /var/log/cline/cline.log" | tr -d '\n' | awk '{print ($1+0>0)?"true":"false"}')"
 N "runuser -u cline -- /usr/local/bin/cline resume --config /etc/cline/cline.yaml" >/dev/null 2>&1
+
+echo "== the one unit, with the short config =="
+# What install.sh now tells an operator to do: one unit, and a config that
+# names each collection once. The per-daemon units are stopped first, since the
+# two are not meant to share a host.
+N "systemctl disable --now cline-feeder cline-router cline-evictor cline-warmer.timer >/dev/null 2>&1; true" >/dev/null
+N "cat > /etc/cline/cline.yaml <<'YAML'
+hot: \"$HOT\"
+cold: \"$COLD\"
+listen: \"0.0.0.0:27640\"
+collections:
+  $DB.orders: 20m
+log:
+  file: \"/var/log/cline/cline.log\"
+meta:
+  db: \"$META\"
+feeder:
+  id: \"svc\"
+evictor:
+  backoff:
+    min_oplog_window: 1m
+warmer:
+  backoff:
+    min_oplog_window: 1m
+YAML
+chown cline:cline /etc/cline/cline.yaml && chmod 0640 /etc/cline/cline.yaml" >/dev/null
+N ": > /var/log/cline/cline.log" >/dev/null
+N "systemctl enable --now cline" >/dev/null 2>&1
+for _ in $(seq 1 90); do routerUp && break; sleep 1; done
+chk "systemctl enable --now cline brings a router up" "true" "$(routerUp && echo true || echo false)"
+chk "and the unit is active"                      "active" "$(active cline)"
+for _ in $(seq 1 30); do N "grep -q 'msg=running' /var/log/cline/cline.log" && break; sleep 1; done
+chk "every daemon started, in its log file"       "true" \
+    "$(N "grep -q 'msg=running' /var/log/cline/cline.log && grep -q 'component=feeder' /var/log/cline/cline.log && echo true || echo false" | tr -d '\n')"
+R "db.getSiblingDB('$DB').orders.insertOne({_id:'one-unit'})" >/dev/null
+for _ in $(seq 1 20); do [ "$(C "print(db.getSiblingDB('$DB').orders.countDocuments({_id:'one-unit'}))")" = 1 ] && break; sleep 1; done
+chk "a write through it reaches the archive"     "1" \
+    "$(C "print(db.getSiblingDB('$DB').orders.countDocuments({_id:'one-unit'}))")"
+N "systemctl stop cline" >/dev/null 2>&1
+chk "it stops"                                    "inactive" "$(active cline)"
+chk "cleanly rather than killed"                  "success" \
+    "$(N "systemctl show -p Result --value cline.service" | tr -d '\n')"
 
 echo
 echo "================================"

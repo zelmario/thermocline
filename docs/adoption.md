@@ -20,6 +20,13 @@ adoption rather than something to do afterwards.
 
 The order matters, because most of what goes wrong goes wrong quietly.
 
+`cline run` keeps the part of this order that is mechanical: it starts the
+feeder and waits for it, opens the router, claims the unique keys of step 7,
+then starts the evictor and the warm of step 6. What it cannot do for you is the
+rest of the list, which is decisions about your application and your data: the
+accounts, the connection string, the collections nothing tiers, the `_id` types,
+the change stream consumers and the way back. Read the steps either way.
+
 **0. Run `cline preflight` first, which writes nothing.** It makes the same
 comparison a router makes at startup -- versions and feature compatibility,
 collections and databases the fast tier has never held, collation and validator

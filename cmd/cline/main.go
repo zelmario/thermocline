@@ -1,10 +1,9 @@
 // Command cline runs the Thermocline daemons.
 //
-//	cline feeder --config /etc/cline.yaml
+//	cline run --config /etc/cline.yaml
 //
-// One binary, one subcommand per component. The feeder is the only one
-// implemented so far; the others report what they are waiting on rather than
-// pretending to work.
+// One binary. run starts every daemon in one process, in order (see run.go),
+// and each has its own subcommand for running them apart.
 package main
 
 import (
@@ -38,6 +37,10 @@ import (
 const usage = `cline - storage tiering for MongoDB
 
 Usage:
+  cline run      --config FILE            everything below in one process, in order:
+                                          the feeder, the router once mirroring is
+                                          caught up, the unique keys, the evictor
+                                          and the warmer
   cline feeder   --config FILE            mirror writes from the fast tier into the archive
   cline evictor  --config FILE [--dry-run] [--once]
                                           remove documents the archive already holds
@@ -106,6 +109,8 @@ func run() error {
 	}
 
 	switch os.Args[1] {
+	case "run":
+		return runAll(os.Args[2:])
 	case "feeder":
 		return runFeeder(os.Args[2:])
 	case "evictor":

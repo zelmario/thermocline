@@ -78,21 +78,56 @@ One binary, `cline`, which is every component:
 
 ```
 make build
-cp cline.example.yaml cline.yaml     # then edit the two URIs and nothing else yet
 ```
 
-`cline.example.yaml` documents every setting beside the setting itself, and the
-two URIs at the top are the only ones you must change. Both tiers have to be
-replica sets on the same MongoDB release; the daemons refuse otherwise, and say
-why.
+The configuration is two connection strings and one line per collection you
+want tiered, with the age at which its documents leave the fast tier:
+
+```yaml
+hot: "mongodb://fast1,fast2,fast3/?replicaSet=rsFast"
+cold: "mongodb://old1,old2,old3/?replicaSet=rsOld"     # your existing cluster
+listen: "0.0.0.0:27017"
+collections:
+  app.orders: 90d                 # aged by the time in a default ObjectId _id
+  app.events:
+    older_than: 30d
+    date_field: createdAt         # or by a date field
+```
+
+Both tiers have to be replica sets on the same MongoDB release; it refuses
+otherwise, and says why. `cline.example.yaml` documents every other setting
+beside the setting itself, and any of them can sit next to the short form.
 
 ## Using it
 
-Three long-running components and one that makes a pass and exits. Start the
-feeder first and let it catch up, then the router; the warmer and the evictor
-are safe to leave until the fast tier has something in it.
-[docs/adoption.md](docs/adoption.md) is the numbered order for a cluster that is
-already serving traffic, and it matters.
+One command runs it:
+
+```
+cline run --config cline.yaml
+```
+
+That starts every component in the order that matters:
+
+1. It checks both tiers: replica sets, the same release, and paired with each
+   other.
+2. It starts the feeder, which mirrors every write on the fast tier into the
+   archive, and waits until it is caught up.
+3. It opens the router on `listen`. Point the application's connection string
+   at it and nothing in the application changes.
+4. It claims the unique keys the archive already holds, so a unique index
+   keeps meaning what it meant once documents leave the fast tier.
+5. It starts the evictor, which removes documents older than their age once
+   the archive holds them, and the warmer, which fills the fast tier with
+   what is newer, once at start and then every hour.
+
+As a service: `sudo packaging/install.sh bin/cline`, write
+`/etc/cline/cline.yaml`, then `systemctl enable --now cline`. A second
+`cline run` on another host is a standby for the feeder and evictor and a second
+router. [docs/adoption.md](docs/adoption.md) is the numbered order for a
+cluster that is already serving traffic, and it matters.
+
+Each component also runs on its own, for routers on more hosts or daemons
+spread across machines:
 
 ```
 cline feeder  --config cline.yaml     # mirror writes from the fast tier into the archive
@@ -101,12 +136,8 @@ cline warmer  --config cline.yaml     # fill the fast tier from the archive, onc
 cline evictor --config cline.yaml     # remove documents the archive already holds
 ```
 
-Point the application's connection string at `router.listen` and nothing in the
-application changes.
-
-`packaging/systemd/` has a unit for each of them, and the warmer's is a timer
-rather than a service for the reason above. See "Running them as services" in
-[docs/operations.md](docs/operations.md).
+`packaging/systemd/` has a unit for each of them as well. See "Running them as
+services" in [docs/operations.md](docs/operations.md).
 
 Then the commands you reach for while it runs:
 
