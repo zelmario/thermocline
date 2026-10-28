@@ -1014,13 +1014,14 @@ func (f *Feeder) dueToFlush(now time.Time) bool {
 // pipeline restricts the stream to the operations and namespaces we mirror.
 // mirrorPace accumulates where one stretch of mirroring spent its time.
 type mirrorPace struct {
-	events  int
-	waiting time.Duration // blocked on the change stream having something
-	reading time.Duration // decoding events and buffering the work they imply
-	writing time.Duration // putting that work in the archive, all of the below
-	asking  time.Duration // asking the archive what to suppress, before writing
-	bulk    time.Duration // the bulk writes themselves
-	since   time.Time
+	events   int
+	waiting  time.Duration // blocked on the change stream having something
+	reading  time.Duration // decoding events and buffering the work they imply
+	writing  time.Duration // putting that work in the archive, all of the below
+	asking   time.Duration // asking the archive what to suppress, before writing
+	bulk     time.Duration // the bulk writes themselves
+	prefetch time.Duration // reading the flush's documents into the archive's cache, beside asking
+	since    time.Time
 }
 
 // reportRate says how fast mirroring is going and what the time went on, once
@@ -1046,6 +1047,7 @@ func (f *Feeder) reportRate() {
 		"writing_ms", f.pace.writing.Milliseconds(),
 		"asking_ms", f.pace.asking.Milliseconds(),
 		"bulk_ms", f.pace.bulk.Milliseconds(),
+		"prefetch_ms", f.pace.prefetch.Milliseconds(),
 		"elapsed_ms", elapsed.Milliseconds())
 	f.pace = mirrorPace{since: time.Now()}
 }

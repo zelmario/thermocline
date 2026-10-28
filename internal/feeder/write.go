@@ -407,6 +407,8 @@ func (f *Feeder) flush(ctx context.Context) error {
 	// they are asked once per flush rather than once per event. See reportRate:
 	// this is where the split says the time is going. About the stream's
 	// events only: a flush of refused documents alone has nothing to ask.
+	prefetched := f.prefetch(ctx, append(append([]pendingOp(nil), f.pending...), retries...))
+	defer prefetched()
 	askedFrom := time.Now()
 	f.echoes = f.echoes[:0]
 	if len(f.pending) > 0 {
@@ -495,6 +497,7 @@ func (f *Feeder) flush(ctx context.Context) error {
 			f.heldAt = time.Now()
 		}
 	}
+	prefetched()
 	bulkFrom := time.Now()
 	defer func() { f.pace.bulk += time.Since(bulkFrom) }()
 	results, err := f.writeFlush(ctx, order, byNS, opsByNS, now)
