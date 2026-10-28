@@ -61,6 +61,7 @@ func runAll(args []string) error {
 	}
 	defer closeLog()
 	warnAboutWindows(log, cfg)
+	logStartup(log, cfg, *path, "run")
 
 	sig, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

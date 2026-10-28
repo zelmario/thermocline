@@ -140,7 +140,7 @@ func run() error {
 	case "backfill":
 		return runBackfill(os.Args[2:])
 	case "version":
-		fmt.Println("cline 0.1.0-dev")
+		fmt.Println("cline " + version)
 		return nil
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -171,6 +171,7 @@ func runFeeder(args []string) error {
 	}
 	defer closeLog()
 	warnAboutWindows(log, cfg)
+	logStartup(log, cfg, *path, "feeder")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -241,6 +242,7 @@ func runEvictor(args []string) error {
 	}
 	defer closeLog()
 	warnAboutWindows(log, cfg)
+	logStartup(log, cfg, *path, "evictor")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -309,6 +311,7 @@ func runWarmer(args []string) error {
 	}
 	defer closeLog()
 	warnAboutWindows(log, cfg)
+	logStartup(log, cfg, *path, "warmer")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -381,6 +384,7 @@ func runRouter(args []string) error {
 	}
 	defer closeLog()
 	warnAboutWindows(log, cfg)
+	logStartup(log, cfg, *path, "router")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -81,6 +81,12 @@ type LogConfig struct {
 	// file and nothing to the terminal. Rotation is logrotate's job; send
 	// SIGHUP after rotating and the daemon reopens the file.
 	File string `yaml:"file"`
+	// Format is text, one key=value line per event, or json, one object per
+	// line, for a collector that should not have to parse text.
+	Format string `yaml:"format"`
+	// Level is the least severe event written: debug, info, warn or error.
+	// The -v flag overrides it with debug.
+	Level string `yaml:"level"`
 }
 
 // Completeness decides what the router does with a query whose answer the fast
@@ -722,6 +728,16 @@ func (c Config) Validate() error {
 	}
 	if err := c.validateMetaDB(); err != nil {
 		return err
+	}
+	switch c.Log.Format {
+	case "", "text", "json":
+	default:
+		return fmt.Errorf("log.format must be text or json, not %q", c.Log.Format)
+	}
+	switch c.Log.Level {
+	case "", "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("log.level must be debug, info, warn or error, not %q", c.Log.Level)
 	}
 	for _, ns := range c.Feeder.Namespaces {
 		db, coll, ok := strings.Cut(ns, ".")

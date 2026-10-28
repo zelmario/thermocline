@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -137,6 +138,10 @@ type Feeder struct {
 	// one daemon whose failures stop mirroring reporting them only to a log
 	// line. See publishCounters.
 	counters feederCounters
+	// summarised is the counters as the last summary line saw them, and when.
+	// See logSummary.
+	summarised   feederCounters
+	summarisedAt time.Time
 	// Where mirroring's time goes, since the rate it sustains is a ceiling on
 	// how fast the fast tier can take writes before every fall-through read
 	// waits. End-to-end timing on a loaded machine varied by 70% between runs
@@ -1041,6 +1046,40 @@ type mirrorPace struct {
 	bulk     time.Duration // the bulk writes themselves
 	prefetch time.Duration // reading the flush's documents into the archive's cache, beside asking
 	since    time.Time
+}
+
+// summaryEvery is how often a feeder that is mirroring says so at info.
+const summaryEvery = time.Minute
+
+// logSummary says what mirroring did over the last minute, at info, the way
+// the router reports its commands. reportRate's split of the time stays at
+// debug: it is for tuning. This is for the person reading the log to see that
+// the daemon whose failure leaves the archive behind is working, how fast, and
+// how far behind, without a dashboard. Quiet while nothing is mirrored.
+func (f *Feeder) logSummary() {
+	now := time.Now()
+	if f.summarisedAt.IsZero() {
+		f.summarised, f.summarisedAt = f.counters, now
+		return
+	}
+	elapsed := now.Sub(f.summarisedAt)
+	if elapsed < summaryEvery {
+		return
+	}
+	mirrored := f.counters.mirrored - f.summarised.mirrored
+	tombstoned := f.counters.tombstoned - f.summarised.tombstoned
+	refused := f.counters.unmirrorable - f.summarised.unmirrorable
+	f.summarised, f.summarisedAt = f.counters, now
+	if mirrored+tombstoned+refused == 0 {
+		return
+	}
+	f.log.Info("feeder",
+		"mirrored", mirrored,
+		"tombstoned", tombstoned,
+		"refused_by_archive", refused,
+		"per_second", int(math.Round(float64(mirrored+tombstoned)/elapsed.Seconds())),
+		"lag", f.Lag().Round(time.Millisecond),
+		"over", elapsed.Round(time.Second))
 }
 
 // reportRate says how fast mirroring is going and what the time went on, once

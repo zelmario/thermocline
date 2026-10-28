@@ -246,6 +246,7 @@ func (f *Feeder) flushAndCheckpoint(ctx context.Context) error {
 	f.lastSaved = time.Now()
 	f.reportRate()
 	f.publishCounters(ctx)
+	f.logSummary()
 
 	// Only now are the eviction announcements this run has used written off.
 	//

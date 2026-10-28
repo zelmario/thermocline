@@ -112,6 +112,8 @@ func TestShortFormRefusals(t *testing.T) {
 			"field url not found"},
 		{"bad age", uris + "collections:\n  app.orders: ninety\n", "duration"},
 		{"not db.collection", uris + "collections:\n  orders: 90d\n", "orders"},
+		{"log format", uris + "log:\n  format: xml\n", "log.format must be text or json"},
+		{"log level", uris + "log:\n  level: verbose\n", "log.level must be debug, info, warn or error"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := loadString(t, c.body)

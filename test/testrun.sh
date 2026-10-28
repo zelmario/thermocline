@@ -102,6 +102,12 @@ chk "preflight, then the feeder, then the router"          "true" \
     "$([ -n "$LPRE" ] && [ -n "$LCAUGHT" ] && [ -n "$LLISTEN" ] && [ "$LPRE" -lt "$LCAUGHT" ] && [ "$LCAUGHT" -lt "$LLISTEN" ] && echo true || echo false)"
 chk "the keys are claimed after the router, before the rest" "true" \
     "$([ -n "$LKEYS" ] && [ -n "$LRUN" ] && [ "$LLISTEN" -lt "$LKEYS" ] && [ "$LKEYS" -lt "$LRUN" ] && echo true || echo false)"
+# What support asks for first, on one line, and never the password the
+# connection strings carry.
+chk "it starts with one line naming what it tiers"         "true" \
+    "$(grep 'msg=starting' $LOG1 | grep -q "collections=\"$DB.trorders=30d by _id $DB.trusers=30d by joined\"" && echo true || echo false)"
+chk "and the clusters, without their credentials"         "true" \
+    "$(grep 'msg=starting' $LOG1 | grep -q 'fast_tier=rsHot/' && ! grep -q 'secret' $LOG1 && echo true || echo false)"
 chk "the router answers for all of history"                 "65" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments())")"
 
@@ -137,13 +143,17 @@ chk "the router still finds the evicted order"              "999" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.findOne({n:999}).n)")"
 
 echo "== a second cline run =="
-writecfg $WDIR/run2.yaml $P2 ""
+writecfg $WDIR/run2.yaml $P2 "log: {format: json}"
 start $WDIR/run2.yaml $LOG2 $WDIR/run2.rc
 for _ in $(seq 1 90); do up $P2 && break; sleep 1; done
 chk "its router serves"                                     "67" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments())" $P2)"
 chk "its feeder waits for the first one's lease"            "true" \
     "$(grep -q 'feeder stopped' $LOG2 && grep -qi 'lease\|held' $LOG2 && echo true || echo false)"
+# log.format json: every line an object, the same fields as text.
+chk "log.format json writes nothing but JSON lines"         "0" "$(grep -vc '^{' $LOG2)"
+chk "with the same startup line"                            "true" \
+    "$(grep '"msg":"starting"' $LOG2 | grep -q '"component":"run"' && echo true || echo false)"
 chk "and the first one's feeder is still the one mirroring" "true" \
     "$(grep -c 'feeder stopped' $LOG1 | grep -qx 0 && echo true || echo false)"
 pkill -TERM -f "^cline run --config $WDIR/run2.yaml"

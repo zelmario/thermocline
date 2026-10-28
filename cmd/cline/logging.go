@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -21,9 +22,17 @@ import (
 // The --log-file flag wins over log.file in the config, so a one-off run can
 // send its output somewhere else without editing cline.yaml.
 func setupLogging(flagPath string, cfg config.Config, verbose bool) (*slog.Logger, func(), error) {
-	level := slog.LevelInfo
+	level := map[string]slog.Level{"debug": slog.LevelDebug, "warn": slog.LevelWarn,
+		"error": slog.LevelError}[cfg.Log.Level] // info, the zero Level, otherwise
 	if verbose {
 		level = slog.LevelDebug
+	}
+	handler := func(w io.Writer) slog.Handler {
+		opts := &slog.HandlerOptions{Level: level}
+		if cfg.Log.Format == "json" {
+			return slog.NewJSONHandler(w, opts)
+		}
+		return slog.NewTextHandler(w, opts)
 	}
 
 	path := cfg.Log.File
@@ -31,7 +40,7 @@ func setupLogging(flagPath string, cfg config.Config, verbose bool) (*slog.Logge
 		path = flagPath
 	}
 	if path == "" {
-		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+		log := slog.New(handler(os.Stderr))
 		// A daemon must not die of the signal that means "reopen your log".
 		//
 		// Go terminates the process for an unhandled SIGHUP, and the handler
@@ -67,7 +76,7 @@ func setupLogging(flagPath string, cfg config.Config, verbose bool) (*slog.Logge
 	if err != nil {
 		return nil, nil, err
 	}
-	log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+	log := slog.New(handler(w))
 	w.watchSIGHUP(log)
 	log.Info("logging to file", "path", path)
 	return log, func() { _ = w.Close() }, nil

@@ -68,6 +68,15 @@ log:
   # the file you are tailing stays empty while the disk fills.
   file: ""
 
+  # text, one key=value line per event, or json, one object per line, for a
+  # collector such as Loki, Elasticsearch or Datadog that should not have to
+  # parse text. The fields are the same either way.
+  format: text
+
+  # The least severe event written: debug, info, warn or error. The -v flag
+  # turns on debug for one run without editing this.
+  level: info
+
 # Where Thermocline keeps its own bookkeeping: watermarks, residency holds,
 # checkpoints, the eviction and warming announcements and the unique key
 # registry. Almost nobody sets this, and the default is right for a deployment

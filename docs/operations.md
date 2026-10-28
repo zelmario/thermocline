@@ -489,5 +489,29 @@ gives one daemon a file and leaves the others on the journal killed the others
 at the first rotation, and systemd restarted them, so the symptom was daemons
 restarting nightly for no reason anybody could see.
 
+`log.format: json` writes one JSON object per line instead of key=value text,
+with the same fields, for a collector that should not have to parse text.
+`log.level` is the least severe event written: `debug`, `info` (the default),
+`warn` or `error`, and `-v` turns on `debug` for one run.
+
+What a healthy deployment writes at `info`:
+
+1. **One `starting` line per daemon**, with the build, the config file, both
+   clusters as `replicaSet/hosts` (never the credentials in the connection
+   string), each tiered collection with its age and the field it is read from,
+   the feeder id, the bookkeeping database, the listen address and the log
+   settings. The tiers' MongoDB versions follow it, in a `tier versions` line.
+2. **A `router` line a minute** while clients send commands: commands, read and
+   write misses, copy-ups, reads answered by the archive, refusals and open
+   clients.
+3. **A `feeder` line a minute** while it mirrors: documents mirrored and
+   tombstoned, documents the archive refused, the rate per second and the lag.
+4. **A `sweep complete` line per evictor sweep** and **a `warm complete` line per
+   warm**, with what each scanned, moved and held back.
+
+Every warning and error carries `meaning`, `effect` and `action` fields where it
+has them: what the state is, what it costs, and what to run. Under `cline run`
+every line also carries `component`.
+
 Both tiers must be replica sets, since the feeder uses change streams.
 MongoDB 4.2 or newer.
