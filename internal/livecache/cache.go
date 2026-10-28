@@ -96,6 +96,8 @@ type Cache struct {
 	failedAt map[string]fillFailure
 	// missedOnce are tiered entries missed once, by when. See admitTiered.
 	missedOnce map[string]time.Time
+	// use counts lookups and hits per shape, and when a shape rests. See rest.
+	use map[string]*shapeUse
 	// plainNS says, per namespace, that it has no default collation and is not
 	// a view. Read and written by the fill workers, under plainMu.
 	plainMu sync.Mutex
@@ -112,6 +114,9 @@ type Cache struct {
 	archive ArchiveFunc
 
 	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven atomic.Int64
+	// Rests counts shapes put to rest, Rested the fills a resting shape did
+	// not ask for. See rest.
+	Rests, Rested atomic.Int64
 }
 
 // ProveFunc reports how many of docs, the head of the fast tier's answer to a
@@ -302,6 +307,7 @@ func New(maxBytes int) *Cache {
 		unprovenAt:   map[string]time.Time{},
 		failedAt:     map[string]fillFailure{},
 		missedOnce:   map[string]time.Time{},
+		use:          map[string]*shapeUse{},
 		plainNS:      map[string]bool{},
 	}
 }
@@ -685,11 +691,13 @@ type Position struct {
 // lock as the answer itself.
 func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	key := q.entryKey()
+	sid := q.shapeID()
 	c.mu.Lock()
-	if c.refusedNS[q.NS] || c.refused[q.shapeID()] {
+	if c.refusedNS[q.NS] || c.refused[sid] {
 		c.mu.Unlock()
 		return nil, Position{}, false
 	}
+	u := c.rest(sid)
 	// A grouping on a tiered namespace is filled from both tiers, once the
 	// router lets it. See readGroup.
 	if c.isTiered(q.NS) && q.Kind == KindGroup && c.archive == nil {
@@ -717,7 +725,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		// A count over a tiered namespace is over both tiers, which the fast
 		// tier's stream cannot keep (see read), so no fill is asked for.
 		if q.Kind == KindFind || q.Kind == KindGroup || !c.isTiered(q.NS) {
-			c.requestFill(q)
+			c.requestFill(q, sid)
 		}
 		return nil, Position{}, false
 	}
@@ -739,6 +747,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		return nil, Position{}, false
 	}
 	c.lru.MoveToFront(e.el)
+	u.hits++
 	pos := Position{Applied: c.applied, Closed: c.closed}
 	var reply bson.Raw
 	if q.Kind == KindFind {
@@ -769,11 +778,16 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	return reply, pos, true
 }
 
-func (c *Cache) requestFill(q Query) {
+func (c *Cache) requestFill(q Query, sid string) {
 	c.mu.Lock()
 	key := q.entryKey()
 	if c.filling[key] {
 		c.mu.Unlock()
+		return
+	}
+	if u := c.use[sid]; u != nil && c.now().Before(u.restUntil) {
+		c.mu.Unlock()
+		c.Rested.Add(1)
 		return
 	}
 	if at, ok := c.unprovenAt[key]; ok {
@@ -799,6 +813,54 @@ func (c *Cache) requestFill(q Query) {
 		delete(c.filling, key)
 		c.mu.Unlock()
 	}
+}
+
+// shapeUse is how one shape has been asked for since it was last judged.
+type shapeUse struct {
+	lookups, hits int
+	restUntil     time.Time
+}
+
+// Rest tuning. A shape is judged every restSample lookups; one answered fewer
+// than restHitPermille of them is filled for no one for restFor, then judged
+// again with fills back on.
+const (
+	restSample       = 20000
+	restHitPermille  = 10
+	restFor          = 10 * time.Minute
+	maxShapesCounted = 10000
+)
+
+// rest counts a lookup of shape sid and returns its counts, putting it to rest
+// when it is judged and its entries are almost never answered from. Called
+// with mu held.
+//
+// A fill reads the fast tier, and on a tiered namespace may read the archive
+// too, and every entry it makes is kept current from the stream and holds
+// memory other entries could use. That pays for itself when the entry is asked
+// for again. A shape whose every query names a different key never is: YCSB's
+// read by _id on staging, 6.4 million lookups in five minutes and 36,000 hits,
+// 0.56%, for 206,000 fills. Resting changes no answer. Its entries already
+// made still answer and are still kept exact; only new fills stop, and a
+// shape that starts to repeat is noticed when it is judged again.
+func (c *Cache) rest(sid string) *shapeUse {
+	u := c.use[sid]
+	if u == nil {
+		if len(c.use) >= maxShapesCounted {
+			clear(c.use)
+		}
+		u = &shapeUse{}
+		c.use[sid] = u
+	}
+	u.lookups++
+	if u.lookups >= restSample {
+		if u.hits*1000 < u.lookups*restHitPermille && !c.now().Before(u.restUntil) {
+			u.restUntil = c.now().Add(restFor)
+			c.Rests.Add(1)
+		}
+		u.lookups, u.hits = 0, 0
+	}
+	return u
 }
 
 // admitWindow is how soon a tiered entry must be missed again to be filled.
@@ -1726,6 +1788,7 @@ func (c *Cache) Advance(at bson.Timestamp) {
 type Stats struct {
 	Entries, Bytes                                           int
 	Hits, Misses, Behind, Fills, Dropped, Refusals, Unproven int64
+	Rests, Rested                                            int64
 }
 
 func (c *Cache) Stats() Stats {
@@ -1735,6 +1798,7 @@ func (c *Cache) Stats() Stats {
 	s.Hits, s.Misses, s.Behind = c.Hits.Load(), c.Misses.Load(), c.Behind.Load()
 	s.Fills, s.Dropped, s.Refusals = c.Fills.Load(), c.Dropped.Load(), c.Refusals.Load()
 	s.Unproven = c.Unproven.Load()
+	s.Rests, s.Rested = c.Rests.Load(), c.Rested.Load()
 	return s
 }
 

@@ -206,6 +206,8 @@ func (r *Router) SnapshotAll() Snapshot {
 			"live_waited_for_stream": live.Behind,
 			"live_fills":             live.Fills,
 			"live_unproven":          live.Unproven,
+			"live_shapes_rested":     live.Rests,
+			"live_fills_rested":      live.Rested,
 			"live_dropped":           live.Dropped,
 			"live_refused_shapes":    live.Refusals,
 			"live_entries":           int64(live.Entries),

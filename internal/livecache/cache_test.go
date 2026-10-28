@@ -1057,3 +1057,49 @@ func TestEventToken(t *testing.T) {
 		}
 	}
 }
+
+// A shape whose lookups almost never hit stops asking for fills, and one that
+// is answered from does not. See rest.
+func TestShapeThatNeverRepeatsRests(t *testing.T) {
+	c := New(1 << 20)
+	for i := range restSample {
+		c.Get(listQuery(t, fmt.Sprintf("c%d", i), 3))
+	}
+	if got := c.Rests.Load(); got != 1 {
+		t.Fatalf("after %d lookups of different keys, %d shapes rested, want 1", restSample, got)
+	}
+	before := c.Rested.Load()
+	c.Get(listQuery(t, "new", 3))
+	if c.Rested.Load() != before+1 {
+		t.Fatal("a resting shape still asked for a fill")
+	}
+	if c.Filling(listQuery(t, "new", 3)) {
+		t.Fatal("a resting shape's miss was queued for a fill")
+	}
+
+	// It is judged again once the rest is over, with fills back on. No fill
+	// workers run here, so the queue the first lookups filled is emptied.
+	for len(c.fillq) > 0 {
+		<-c.fillq
+	}
+	now := time.Now().Add(restFor + time.Second)
+	c.now = func() time.Time { return now }
+	c.Get(listQuery(t, "later", 3))
+	if !c.Filling(listQuery(t, "later", 3)) {
+		t.Fatal("the shape was still resting after restFor")
+	}
+}
+
+func TestShapeThatRepeatsKeepsFilling(t *testing.T) {
+	c := New(1 << 20)
+	q := listQuery(t, "a", 3)
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1))}, true, 0)
+	for range restSample {
+		if _, hit := c.Get(q); !hit {
+			t.Fatal("the installed listing missed")
+		}
+	}
+	if got := c.Rests.Load(); got != 0 {
+		t.Fatalf("a shape answered every time was rested %d times", got)
+	}
+}

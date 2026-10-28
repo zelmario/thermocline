@@ -64,6 +64,8 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("live_waited_for_stream_total", "Reads the live cache held but sent to mongod, because a write this router acknowledged was not yet applied within router.live_cache.max_staleness.", snap.Counters["live_waited_for_stream"])
 	counter("live_fills_total", "Entries the live cache filled from MongoDB.", snap.Counters["live_fills"])
 	counter("live_unproven_total", "Fills of a tiered read the fast tier could not prove complete, so not held.", snap.Counters["live_unproven"])
+	counter("live_shapes_rested_total", "Times a query shape was put to rest for answering under 1% of its lookups.", snap.Counters["live_shapes_rested"])
+	counter("live_fills_rested_total", "Fills a resting shape did not ask for.", snap.Counters["live_fills_rested"])
 	counter("live_dropped_total", "Entries the live cache dropped: evicted for space, or invalidated by a change it could not apply.", snap.Counters["live_dropped"])
 	counter("live_refused_shapes_total", "Query shapes the live cache stopped holding because a document showed it could not answer them exactly.", snap.Counters["live_refused_shapes"])
 	gauge("live_entries", "Entries the live cache holds now.", float64(snap.Counters["live_entries"]))
