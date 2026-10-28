@@ -308,6 +308,7 @@ it, because a README nobody reaches the end of is a README that does not work:
 | [docs/tiering.md](docs/tiering.md) | Telling an eviction from a deletion, and what the evictor refuses to do |
 | [docs/bookkeeping.md](docs/bookkeeping.md) | What each tier holds that is not the application's data, and how much of it |
 | [docs/caching.md](docs/caching.md) | Which queries are worth caching, and what the cache will not do |
+| [docs/live-cache.md](docs/live-cache.md) | The cache kept current from the change stream: what it answers, what it refuses, and how it is proved |
 | [docs/dashboard.md](docs/dashboard.md) | The operator page, and what `terminate_auth` changes about who may read what |
 | [docs/testing.md](docs/testing.md) | Running the suites, and developing against a real pair of clusters |
 

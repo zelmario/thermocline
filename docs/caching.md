@@ -2,6 +2,9 @@
 
 Part of [Thermocline](../README.md).
 
+This is the learned-TTL query cache, `router.cache`. The cache kept current
+from the change stream, `router.live_cache`, is in [live-cache.md](live-cache.md).
+
 
 ## What the cache will not answer
 
