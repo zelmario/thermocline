@@ -212,6 +212,19 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # router up and no feeder: mirroring_cluster_time_behind_seconds +Inf while
 # mirroring_lag_seconds read 1507, which is the two bars disagreeing exactly as
 # docs/limitations.md describes.
+#
+# +Inf only when no feeder has ever published under this id. In a host sweep
+# testfailover runs just before this with the same id, and leaves a position
+# published seconds before the read. On an idle fast tier a reply's
+# operationTime is the last oplog entry, so every reply this router forwarded
+# could carry a time at or before that position, and the gauge then reads 0
+# for good: on 2026-10-26 the position had stood still for 15s, the router
+# forwarded nothing after the read, and the rule stayed inactive for five
+# minutes. That 0 is right, nothing this router handed out is uncovered. So
+# make it wrong: one write through the router hands a client a time no stopped
+# feeder covers.
+docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'db.getSiblingDB("shop").alertsclock.insertOne({at: new Date()})' >/dev/null 2>&1
 for _ in $(seq 1 40); do
   PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"' && break
   sleep 5
@@ -235,8 +248,8 @@ fi
 
 # Dropped on both tiers, so nothing downstream inherits this suite's fixture the
 # way this suite used to inherit everyone else's.
-docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').tprobe.drop()" >/dev/null 2>&1
-docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').tprobe.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$HOT"  --quiet --eval "db.getSiblingDB('shop').tprobe.drop(); db.getSiblingDB('shop').alertsclock.drop()" >/dev/null 2>&1
+docker exec $NODE mongosh "$COLD" --quiet --eval "db.getSiblingDB('shop').tprobe.drop(); db.getSiblingDB('shop').alertsclock.drop()" >/dev/null 2>&1
 
 sec "the archive refusing a document the fast tier holds"
 # Two rules for one condition and both were only ever parsed. The pair is worth
