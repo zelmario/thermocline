@@ -408,6 +408,7 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 	}
 
 	c.r.Stats.WriteMisses.Add(1)
+	tm := time.Now()
 	copied, err := c.r.copyUp(ctx, ns, id)
 	if err != nil {
 		return nil, err
@@ -417,6 +418,7 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 		return reply, nil
 	}
 	c.cls = ClassMiss
+	defer func() { c.r.Metrics.RecordStage(stageWriteMissTotal, time.Since(tm)) }()
 
 	// Inside a transaction the copy-up landed outside the caller's snapshot, so
 	// re-running the statement here would miss again. Ask for a replay instead.
@@ -434,6 +436,8 @@ func (c *conn) interceptWrite(ctx context.Context, msg *wire.Message, db string,
 	// had. Without it, an update moved an archived document onto a key another
 	// archived document holds: untiered MongoDB refused it with E11000, the
 	// router accepted it, and both documents held the key. See retryGuarded.
+	tr := time.Now()
+	defer func() { c.r.Metrics.RecordStage(stageWriteMissRetry, time.Since(tr)) }()
 	if cmdField == "update" {
 		return c.retryGuarded(ctx, msg, db, "update")
 	}

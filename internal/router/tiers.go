@@ -87,6 +87,8 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	if !r.cfg.Manages(ns) {
 		return false, nil
 	}
+	t0 := time.Now()
+	defer func() { r.Metrics.RecordStage(stageCopyUpTotal, time.Since(t0)) }()
 	var doc bson.Raw
 	found := false
 	if seen != nil && bytes.Equal(seen.doc.Lookup("_id").Value, id.Value) && seen.doc.Lookup("_id").Type == id.Type {
@@ -105,8 +107,11 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 				return false, err
 			}
 		}
+		ta := time.Now()
+		r.Metrics.RecordStage(stageCopyUpCheck, ta.Sub(t0))
 		var err error
 		doc, found, err = r.readArchived(ctx, ns, id, "")
+		r.Metrics.RecordStage(stageCopyUpArchive, time.Since(ta))
 		if err != nil || !found {
 			return false, err
 		}
@@ -128,6 +133,7 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	// tier already holds is held and nothing more, and one it does not hold is
 	// a promotion without any guessing. See promote.Held and meta.PromotionUpdate.
 	asked := false
+	tk := time.Now()
 	if have, left, herr := r.holdWhatIsThere(ctx, ns, r.hot.Database(db).Collection(coll), []bson.RawValue{id}); herr == nil {
 		asked = true
 		if have[0] {
@@ -141,9 +147,12 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 			}
 		}
 	}
+	tr := time.Now()
+	r.Metrics.RecordStage(stageCopyUpAsk, tr.Sub(tk))
 	if err := r.recordResidency(ctx, ns, id, asked); err != nil {
 		r.log.Warn("could not record residency before copying up", "ns", ns, "err", err)
 	}
+	r.Metrics.RecordStage(stageCopyUpResidency, time.Since(tr))
 
 	// Before the insert, because an insert is what creates the collection when
 	// the fast tier does not hold it, and a collection created that way carries
@@ -157,7 +166,9 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	// the fast tier gained this document while we were reading the archive, its
 	// copy is the newer one and the duplicate key says so. See package promote
 	// for why this is not written as $setOnInsert.
+	ti := time.Now()
 	inserted, err := promote.One(ctx, r.hot.Database(db).Collection(coll), doc)
+	r.Metrics.RecordStage(stageCopyUpInsert, time.Since(ti))
 	if err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
 	}

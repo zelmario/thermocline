@@ -27,6 +27,8 @@ import (
 // document, so the order the hold exists for is kept. See copyUpFrom.
 type residencyBatcher struct {
 	coll *mongo.Collection
+	// timed, when set, is told how long each batch took.
+	timed func(time.Duration)
 
 	mu      sync.Mutex
 	pending []residencyReq
@@ -96,6 +98,9 @@ func (b *residencyBatcher) flush(batch []residencyReq) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if b.timed != nil {
+		defer func(t0 time.Time) { b.timed(time.Since(t0)) }(time.Now())
+	}
 	// Unordered: independent holds, and one that cannot be written must not
 	// stop the rest.
 	_, err := b.coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
@@ -124,6 +129,7 @@ func (b *residencyBatcher) flush(batch []residencyReq) {
 func (r *Router) residencyWriter() *residencyBatcher {
 	r.resBatchOnce.Do(func() {
 		r.resBatch = newResidencyBatcher(r.cold.Database(meta.DB).Collection(meta.Residency))
+		r.resBatch.timed = func(d time.Duration) { r.Metrics.RecordStage(stageResidencyFlush, d) }
 	})
 	return r.resBatch
 }

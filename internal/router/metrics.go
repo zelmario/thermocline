@@ -177,11 +177,18 @@ func (m *Metrics) Record(cls Class, d time.Duration) {
 // split into what each tier and step cost. See RecordStage.
 var stageNames = [...]string{"merge_total", "merge_archive", "fam_match", "fam_hold", "fam_copyup",
 	"point_total", "point_fast", "point_prep", "point_archive", "point_check",
-	"point_spec_start", "point_spec_read"}
+	"point_spec_start", "point_spec_read",
+	"copyup_total", "copyup_check", "copyup_archive", "copyup_ask", "copyup_residency", "copyup_insert",
+	"write_miss_total", "write_miss_retry", "residency_flush"}
 
-// RecordStage adds one timing of stage i, an index into stageNames.
+// RecordStage adds one timing of stage i, an index into stageNames. A Router
+// built directly, as tests do, has no Metrics, and copyUpFrom times its stages
+// on every path, so nil records nothing.
 func (m *Metrics) RecordStage(i int, d time.Duration) {
-	ms := float64(d) / float64(time.Millisecond)
+	if m == nil {
+		return
+	}
+	ms :=float64(d) / float64(time.Millisecond)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	st := &m.stages[i]
@@ -214,6 +221,24 @@ const (
 	// command's arrival to the read being sent, and the read itself.
 	stagePointSpecStart
 	stagePointSpecRead
+	// A copy-up, whoever asked for it: all of it, the delete check and any
+	// wait for mirroring before the archive is read, the archive read, asking
+	// the fast tier whether it already holds the document, the residency
+	// hold written to the archive, and the insert. See copyUpFrom.
+	stageCopyUpTotal
+	stageCopyUpCheck
+	stageCopyUpArchive
+	stageCopyUpAsk
+	stageCopyUpResidency
+	stageCopyUpInsert
+	// A write by _id that matched nothing on the fast tier and was copied up
+	// and run again: from the first attempt's reply to the retry's, and the
+	// retry alone. See interceptWrite.
+	stageWriteMissTotal
+	stageWriteMissRetry
+	// One batch of residency holds written to the archive. Its count against
+	// copyup_residency's is the mean batch size. See residencyBatcher.
+	stageResidencyFlush
 )
 
 func (m *Metrics) RecordWait(d time.Duration) {
