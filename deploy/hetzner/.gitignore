@@ -3,6 +3,6 @@
 terraform.tfstate
 terraform.tfstate.backup
 terraform.tfvars
-.known_hosts
+.known_hosts*
 .cline.yaml
 *.plan

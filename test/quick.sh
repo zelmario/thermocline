@@ -18,7 +18,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BOX=${BOX:-zelmario@192.168.1.50}
+# The Docker test box, user@host: BOX, or the repo's .box file (not in git).
+BOX=${BOX:-$(cat "$(dirname "$0")/$(git -C "$(dirname "$0")" rev-parse --show-cdup).box" 2>/dev/null)}
+: "${BOX:?set BOX to the Docker test box as user@host, or write it to .box}"
 NODE=${NODE:-thermocline-zelmario-node0}
 HOT=${HOT:-"mongodb://dba:secret@172.18.0.6:27017,172.18.0.7:27017,172.18.0.5:27017/?replicaSet=rsHot&authSource=admin"}
 COLD=${COLD:-"mongodb://dba:secret@172.18.0.4:27017,172.18.0.2:27017,172.18.0.3:27017/?replicaSet=rsCold&authSource=admin"}

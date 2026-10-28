@@ -19,7 +19,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BOX=${BOX:-zelmario@192.168.1.50}
+# The Docker test box, user@host: BOX, or the repo's .box file (not in git).
+BOX=${BOX:-$(cat "$(dirname "$0")/$(git -C "$(dirname "$0")" rev-parse --show-cdup).box" 2>/dev/null)}
+: "${BOX:?set BOX to the Docker test box as user@host, or write it to .box}"
 NODE=${NODE:-thermocline-zelmario-node0}
 DIR=${DIR:-thermocline}
 BOXGO=${BOXGO:-go-sdk/bin}

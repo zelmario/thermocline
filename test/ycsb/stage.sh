@@ -23,7 +23,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 H=deploy/hetzner
-BOX=${BOX:-zelmario@192.168.1.50}
+# The Docker test box, user@host: BOX, or the repo's .box file (not in git).
+BOX=${BOX:-$(cat "$(dirname "$0")/$(git -C "$(dirname "$0")" rev-parse --show-cdup).box" 2>/dev/null)}
+: "${BOX:?set BOX to the Docker test box as user@host, or write it to .box}"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$PWD/$H/.known_hosts -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=30"
 IPS=$(cd $H && bash tf.sh output -json public_ips)
 ip() { echo "$IPS" | jq -r --arg n "$1" '.[$n]'; }
