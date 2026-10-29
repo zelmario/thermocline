@@ -4,6 +4,10 @@
 #
 #   bash test/echorace/echorace.sh
 #   ROUNDS=20 bash test/echorace/echorace.sh
+#   OP=update bash test/echorace/echorace.sh     write misses instead of reads
+#
+# On a box where this checkout is not, build here and run the copy there with
+# BUILD=0, setting HOT and COLD to that box's addresses.
 #
 # One document, written to the archive only, the state an adopted archive is in.
 # A feeder, two routers, and the probe in main.go driving rounds of eviction
@@ -13,8 +17,8 @@ ROUNDS=${ROUNDS:-10}
 READERS=${READERS:-32}
 CFG=/root/p9.yaml
 CFG2=/root/p9b.yaml
-HOT='mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'
-COLD='mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'
+HOT=${HOT:-'mongodb://dba:secret@172.24.0.5:27017,172.24.0.6:27017,172.24.0.7:27017/?replicaSet=rsHot&authSource=admin'}
+COLD=${COLD:-'mongodb://dba:secret@172.24.0.2:27017,172.24.0.3:27017,172.24.0.4:27017/?replicaSet=rsCold&authSource=admin'}
 R1='mongodb://dba:secret@127.0.0.1:27840/?authSource=admin'
 R2='mongodb://dba:secret@127.0.0.1:27860/?authSource=admin'
 
@@ -22,7 +26,9 @@ N() { docker exec "$NODE" bash -c "$1"; }
 ND() { docker exec -d "$NODE" bash -c "$1"; }
 Q() { docker exec "$NODE" mongosh "$1" --quiet --eval "$2" 2>/dev/null | tail -1; }
 
-CGO_ENABLED=0 go build -buildvcs=false -o bin/echorace ./test/echorace || exit 2
+if [ "${BUILD:-1}" = 1 ]; then
+  CGO_ENABLED=0 go build -buildvcs=false -o bin/echorace ./test/echorace || exit 2
+fi
 docker cp bin/echorace "$NODE":/usr/local/bin/echorace >/dev/null
 docker cp test/echorace/p9.yaml "$NODE":$CFG >/dev/null
 N "sed -e 's|0.0.0.0:27840|0.0.0.0:27860|' -e 's|0.0.0.0:27850|0.0.0.0:27870|' $CFG > $CFG2"
@@ -45,7 +51,7 @@ for r in "$R1" "$R2"; do
   for _ in $(seq 1 30); do [ "$(Q "$r" 'print(db.adminCommand({ping:1}).ok)')" = 1 ] && break; sleep 1; done
 done
 
-N "echorace -r1 '$R1' -r2 '$R2' -hot '$HOT' -cold '$COLD' -config $CFG -rounds $ROUNDS -readers $READERS -late ${LATE:-35s} -calm ${CALM:-0}"
+N "echorace -r1 '$R1' -r2 '$R2' -hot '$HOT' -cold '$COLD' -config $CFG -rounds $ROUNDS -readers $READERS -late ${LATE:-35s} -calm ${CALM:-0} -op ${OP:-read}"
 rc=$?
 N "grep -h 'letting an insert through' /root/p9log/router*.log | cut -c1-300 | head -5"
 N "for p in \$(pgrep -f 'config /root/p9'); do kill -9 \$p; done" >/dev/null 2>&1

@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -42,6 +43,12 @@ func main() {
 	readers := flag.Int("readers", 32, "simultaneous reads per round, split across the routers")
 	late := flag.Duration("late", 35*time.Second, "how far behind the consumer reads")
 	calm := flag.Int("calm", 0, "rounds at the start with one reader, so an uncontested promotion writes a position down first")
+	// update races write misses instead of reads. A read hands its copy-up the
+	// document it already took from the archive; a write miss has nothing, so
+	// its copy-up records the promotion while reading the archive and undoes
+	// it if the archive turns out to lack the document. Every update must also
+	// land: the matched count is checked against the number sent.
+	op := flag.String("op", "read", "read or update")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -71,7 +78,7 @@ func main() {
 	}
 	fmt.Printf("racing on %s %s\n", ns, id.Hex())
 
-	phantoms, raced := 0, 0
+	phantoms, raced, lostWrites := 0, 0, 0
 	for round := 1; round <= *rounds; round++ {
 		// Off the fast tier, the way it really leaves: the evictor, with the
 		// hold made to have lapsed, so the eviction is announced.
@@ -102,18 +109,30 @@ func main() {
 			n = 1
 		}
 		var wg sync.WaitGroup
+		var matched atomic.Int64
 		start := make(chan struct{})
 		for i := 0; i < n; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				_ = routers[i%2].Database(*db).Collection(*coll).
-					FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Err()
+				c := routers[i%2].Database(*db).Collection(*coll)
+				if *op == "update" {
+					if res, err := c.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}},
+						bson.D{{Key: "$inc", Value: bson.D{{Key: "raced", Value: 1}}}}); err == nil {
+						matched.Add(res.MatchedCount)
+					}
+					return
+				}
+				_ = c.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Err()
 			}(i)
 		}
 		close(start)
 		wg.Wait()
+		if *op == "update" && matched.Load() != int64(n) {
+			lostWrites++
+			fmt.Printf("  round %d: %d updates sent, %d matched\n", round, n, matched.Load())
+		}
 		time.Sleep(3 * time.Second)
 
 		inserts := insertsSince(ctx, hot, ns, id, t0)
@@ -148,7 +167,10 @@ func main() {
 			round, len(inserts), recorded, rec.Pending, len(rec.Echoed), shown)
 	}
 	fmt.Printf("\n%d round(s) where a copy-up insert went unrecorded, %d where a late consumer was shown one\n", raced, phantoms)
-	if phantoms > 0 {
+	if *op == "update" {
+		fmt.Printf("%d round(s) where an update matched nothing\n", lostWrites)
+	}
+	if phantoms > 0 || lostWrites > 0 {
 		os.Exit(1)
 	}
 }

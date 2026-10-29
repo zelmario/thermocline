@@ -311,6 +311,48 @@ chk "and both are still live in the archive"         "true" \
 chk "and the feeder suppressed rather than missed it" "direct" \
     "$(C "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:42}); print(d ? d.v : 'missing')")"
 
+echo "== a write miss the archive cannot fill takes its promotion back =="
+# A write miss copies the document up, and records the promotion first. For an
+# _id the archive does not hold there is nothing to promote, and a record
+# written anyway announces a copy-up that never happens. An update that matched
+# nothing is usually followed by the application inserting that _id, and such a
+# record hides that insert from the application's change stream and keeps the
+# feeder from mirroring it. Measured on 2026-10-29 with the promotion recorded
+# while the archive was still being read: a record left standing failed three
+# of the checks below.
+#
+# The other half is the copy-up that does happen. Taking its record back would
+# show its insert to the application as one nobody made, so _id 50, which the
+# archive holds, is updated in the same stream.
+stopDaemons
+H "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_META).residency.deleteMany({ns:process.env.TC_DB+'.$NS'})" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$NS.insertOne({_id:50,v:'archived'})" >/dev/null
+startFeeder
+startRouter
+SEEN=$(R "
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})};
+  const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cs=c.watch([], {startAtOperationTime:tcNow()});
+  const miss=c.updateOne({_id:51},{\$set:{v:'never'}}).matchedCount;
+  c.insertOne({_id:51, v:'mine'});
+  const hit=c.updateOne({_id:50},{\$set:{v:'updated'}}).matchedCount;
+  let ops=[];
+  for (let i=0;i<60;i++) {
+    const e=cs.tryNext();
+    if (e) { ops.push(e.operationType+':'+e.documentKey._id); if (e.operationType==='update') break; }
+    else sleep(250);
+  }
+  cs.close();
+  print(miss+' '+hit+' '+ops.join(','));")
+chk "the miss matched nothing and the copy-up one"   "0 1" "${SEEN%% *} $(echo "$SEEN" | cut -d' ' -f2)"
+chk "the stream shows the insert, not the copy-up"   "insert:51,update:50" "${SEEN##* }"
+chk "no promotion is left for the _id never archived" "0" \
+    "$(C "print(db.getSiblingDB(process.env.TC_META).residency.countDocuments({ns:process.env.TC_DB+'.$NS', doc:51}))")"
+for _ in $(seq 1 40); do [ "$(archived 51)" = "true" ] && break; sleep 0.5; done
+chk "and the application's insert reached the archive" "true" "$(archived 51)"
+
 echo
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
