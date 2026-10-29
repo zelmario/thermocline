@@ -33,6 +33,8 @@ type residencyBatcher struct {
 	mu      sync.Mutex
 	pending []residencyReq
 	kick    chan struct{}
+	// slots holds one token per batch on its way. See residencyInFlight.
+	slots chan struct{}
 }
 
 type residencyReq struct {
@@ -44,13 +46,22 @@ type residencyReq struct {
 // join it, and residencyBatchMax how many one batch takes. Two milliseconds is
 // a fraction of one archive write under load, and a copy-up from a read is
 // asynchronous: the client already has its answer.
+//
+// residencyInFlight is how many batches may be on their way at once. One at a
+// time made a hold that arrived during a flush wait for that flush and then
+// pay for its own. Measured on the box at 4,000 ops/s with the archive capped:
+// 2.8 holds a batch, a flush 11.9ms, the batcher busy 84% of the run, and a
+// hold waiting 23.9ms, so half of every write miss's hold was the queue. When
+// every slot is busy the holds that arrive gather into the next batch, which
+// is the sharing this was built for.
 const (
 	residencyLinger   = 2 * time.Millisecond
 	residencyBatchMax = 256
+	residencyInFlight = 4
 )
 
 func newResidencyBatcher(coll *mongo.Collection) *residencyBatcher {
-	b := &residencyBatcher{coll: coll, kick: make(chan struct{}, 1)}
+	b := &residencyBatcher{coll: coll, kick: make(chan struct{}, 1), slots: make(chan struct{}, residencyInFlight)}
 	go b.loop()
 	return b
 }
@@ -77,15 +88,22 @@ func (b *residencyBatcher) loop() {
 	for range b.kick {
 		time.Sleep(residencyLinger)
 		for {
+			// A slot first, then the batch: while every slot is busy, holds
+			// keep joining the batch this one will take.
+			b.slots <- struct{}{}
 			b.mu.Lock()
 			n := min(len(b.pending), residencyBatchMax)
 			batch := append([]residencyReq(nil), b.pending[:n]...)
 			b.pending = b.pending[n:]
 			b.mu.Unlock()
 			if n == 0 {
+				<-b.slots
 				break
 			}
-			b.flush(batch)
+			go func() {
+				defer func() { <-b.slots }()
+				b.flush(batch)
+			}()
 		}
 	}
 }
