@@ -9,7 +9,7 @@ Part of [Thermocline](../README.md).
 This is the shape every deployment starts in, and the one most of this system's
 defects have come from. **The cluster you have becomes the archive, exactly as
 it is. The fast tier is a new, smaller replica set with nothing in it. The
-application is pointed at the router.** Nothing is loaded into the fast tier by
+application is pointed at the proxy.** Nothing is loaded into the fast tier by
 hand.
 
 **Upgrade it to the fast tier's MongoDB release first.** Both tiers must run the
@@ -21,14 +21,14 @@ adoption rather than something to do afterwards.
 The order matters, because most of what goes wrong goes wrong quietly.
 
 `cline run` keeps the part of this order that is mechanical: it starts the
-feeder and waits for it, opens the router, claims the unique keys of step 7,
+feeder and waits for it, opens the proxy, claims the unique keys of step 7,
 then starts the evictor and the warm of step 6. What it cannot do for you is the
 rest of the list, which is decisions about your application and your data: the
 accounts, the connection string, the collections nothing tiers, the `_id` types,
 the change stream consumers and the way back. Read the steps either way.
 
 **0. Run `cline preflight` first, which writes nothing.** It makes the same
-comparison a router makes at startup -- versions and feature compatibility,
+comparison a proxy makes at startup -- versions and feature compatibility,
 collections and databases the fast tier has never held, collation and validator
 drift, unique indexes the fast tier is missing, accounts and roles the archive
 has and the fast tier does not, and whether anything has claimed the unique keys an adopted archive
@@ -37,26 +37,26 @@ is a kind that can be mirrored at all, and it also names what a start *would*
 build on the fast tier, with the index counts.
 
 That last check was missing here for longer than it should have been, and the
-shape of the mistake is worth keeping: preflight ran the router's checks, said
+shape of the mistake is worth keeping: preflight ran the proxy's checks, said
 "Nothing above refuses a start", and the feeder then refused to start on a
 capped collection named in `feeder.namespaces`. A report that runs one daemon's
 checks and speaks for all of them is worse than no report.
 
 That last line is the one to read before step 1, because step 1 is not a reader.
-A router start creates each tiered collection on the fast tier the way the
+A proxy start creates each tiered collection on the fast tier the way the
 archive has it and builds the archive's indexes on it, unique ones included,
-before it opens the listener. That is right for a router about to serve traffic
+before it opens the listener. That is right for a proxy about to serve traffic
 and it is a surprise on a cluster somebody is still deciding about. Preflight
-exits non-zero only when the pair is one a router would refuse outright, so a
+exits non-zero only when the pair is one a proxy would refuse outright, so a
 rollout script can gate on it.
 
-**1. Point the router at both, and read what it says at startup.** It compares
+**1. Point the proxy at both, and read what it says at startup.** It compares
 the two tiers and names, once, everything the fast tier is missing that the
 application will need. Nothing here is fatal and all of it is silent afterwards.
 
-**2. Change the connection string, do not just repoint it.** The router answers
+**2. Change the connection string, do not just repoint it.** The proxy answers
 `hello` as a mongos, so a driver told `replicaSet=` in its URI is looking for a
-replica set member and will never accept one. Measured, with the same router and
+replica set member and will never accept one. Measured, with the same proxy and
 the same credentials:
 
 ```
@@ -64,13 +64,13 @@ mongodb://user:pw@router:27017/?authSource=admin                  ok
 mongodb://user:pw@router:27017/?replicaSet=rsOld&authSource=admin MongoServerSelectionError
 ```
 
-The second one times out rather than saying what is wrong, and the router cannot
+The second one times out rather than saying what is wrong, and the proxy cannot
 help: a driver never says it was looking for a replica set. Drop `replicaSet=`
-and give it the router's address.
+and give it the proxy's address.
 
 **3. Create the application's accounts on the fast tier.** It is a new replica
 set and has none of them, nor any custom role they refer to; MongoDB refuses to
-create a user whose role is missing and names it, so do the roles first. The router authenticates against the fast tier, so
+create a user whose role is missing and names it, so do the roles first. The proxy authenticates against the fast tier, so
 until they exist every connection is refused with MongoDB's ordinary
 `Authentication failed`, which says nothing about which tier is missing them.
 
@@ -83,16 +83,16 @@ password cannot be read back from the archive. If its account cannot read
 not compare the two tiers' accounts" (or roles) instead. That is not "none
 missing": run it again with an account that can, or compare the two by hand.
 
-Give the router's own account `killAnyCursor` on the fast tier while you are
+Give the proxy's own account `killAnyCursor` on the fast tier while you are
 there. When the archive answers a query the fast tier had started, the fast tier
 is left holding a cursor for the rest of it that nothing will ever read, and the
-router closes it. It sends that on its own account, and mongod lets an account
+proxy closes it. It sends that on its own account, and mongod lets an account
 close only its own cursors without that privilege. Without it those cursors sit
-until mongod's timeout, ten minutes by default. The router says so once if it
+until mongod's timeout, ten minutes by default. The proxy says so once if it
 cannot.
 
 **4. Deal with the collections nothing tiers.** A collection the archive holds
-that is not in `feeder.namespaces` lives only on the archive, and the router
+that is not in `feeder.namespaces` lives only on the archive, and the proxy
 correctly forwards reads of it to the fast tier, which has never held it. The
 application sees it empty. Either tier it or copy it whole. Views are named
 separately because neither answer works for them: recreate them with
@@ -117,7 +117,7 @@ stands: the rule addresses documents and tiers by the wrong clock.
 
 And set `date_field` to the *same* field on both rules for a namespace. Ageing
 one collection two ways costs more than the two daemons picking different
-documents. The router will not read a lower time bound out of a query on such a
+documents. The proxy will not read a lower time bound out of a query on such a
 namespace, because it cannot tell which of the two a completeness claim is
 measured in, so every bounded query on it is answered by the archive. One word
 of configuration turns the whole thing off for that collection, and neither file
@@ -143,12 +143,12 @@ answers everything; when it does not, the warmer names what that costs.
 **7. Run `cline keys --rebuild` before you let the evictor run.** The registry
 only protects values it knows about, and a cluster adopted with documents
 already in it starts with none of them claimed. It reads the constraint from the
-fast tier's unique indexes, which the router builds there at startup, so run it
-after the router has been up once.
+fast tier's unique indexes, which the proxy builds there at startup, so run it
+after the proxy has been up once.
 
-This step is about the indexes the adoption brought with it, which no router was
+This step is about the indexes the adoption brought with it, which no proxy was
 running when they were created. A unique index created *later*, through a
-router, claims the existing documents' keys itself.
+proxy, claims the existing documents' keys itself.
 
 Run it again after upgrading past 0.1.0-dev if any of your unique keys are
 numbers. A key is derived from the value, and whole numbers are now derived the
@@ -158,10 +158,10 @@ matches nothing, so the values they hold are not enforced until the rebuild
 reclaims them.
 
 **8. Start change stream consumers fresh, do not resume them.** A resume token
-minted on the old cluster is accepted by the router and delivers nothing.
+minted on the old cluster is accepted by the proxy and delivers nothing.
 Measured with one token and one collection: against the cluster it came from it
-delivers the write that followed it; through the router after the cutover it
-delivers nothing at all and reports success. The router serves change streams
+delivers the write that followed it; through the proxy after the cutover it
+delivers nothing at all and reports success. The proxy serves change streams
 from the fast tier, which is a different replica set with its own oplog, and a
 token from another one is not a position in it. There is no error to catch, so
 this has to be a step rather than a surprise.
@@ -177,7 +177,7 @@ was served by the primary anyway.
 That stays as it is on purpose. The freshness barrier waits for mirroring to
 reach the archive's primary, and a secondary is behind that by a lag nothing
 here measures, so a read served there could miss a write that has already been
-acknowledged. The router now says the setting is ignored rather than letting you
+acknowledged. The proxy now says the setting is ignored rather than letting you
 believe it took effect. Plan the archive's primary for the read load, and warm
 the fast tier to shorten the period it lasts.
 
@@ -194,9 +194,9 @@ removes anything, which is right; on an adoption there was nothing to narrow,
 and it made a claim instead, saying the fast tier held everything since the
 eviction boundary about a tier holding nothing. A sweep that scanned zero
 documents and evicted zero was enough. Measured on 4,000 archived orders with
-the fast tier empty: the router answered a thirty day range with 240 before the
-sweep, the archive's own answer, and a router started after it answered 0 and
-reported success. The already-running router kept the claim it had cached, so
+the fast tier empty: the proxy answered a thirty day range with 240 before the
+sweep, the archive's own answer, and a proxy started after it answered 0 and
+reported success. The already-running proxy kept the claim it had cached, so
 it took a restart to appear.
 
 A sweep now narrows a claim and never makes one. The claim comes from whatever
@@ -221,12 +221,12 @@ sized for a hot window.
 into the archive, so the archive stays current and rolling back is repointing
 the application at it. One thing has to happen first: a delete is mirrored as a
 mark and not as a removal, so every document deleted since the cutover is still
-physically there carrying `_tcDeletedAt`. The router filters those out of every
+physically there carrying `_tcDeletedAt`. The proxy filters those out of every
 answer and a client reading the cluster directly does not.
 
 Measured: three documents in the collection, one of them deleted through the
-router, and the original cluster answering `countDocuments({})` with 3 where the
-router answers 2.
+proxy, and the original cluster answering `countDocuments({})` with 3 where the
+proxy answers 2.
 
 `cline rollback` counts them, across every tiered namespace, and clears them
 when you ask:
@@ -253,11 +253,11 @@ them hands an application its orders and not its catalogue.
 
 Measured by rehearsing the whole procedure rather than the command, which is
 what `test/testrollback.sh` now does: a shop with 3,081 orders in the archive,
-40 of them cancelled through the router, rolled back correctly to the 3,041 the
+40 of them cancelled through the proxy, rolled back correctly to the 3,041 the
 application had been shown, and then it would not start. The fast tier held
 `customers`, `products` and `store_marker`; the archive had never heard of them.
 `cline rollback` reported the accounts and finished with "the archive already
-answers the way the router does".
+answers the way the proxy does".
 
 It names them now, grouped by database, with the `mongodump` and `mongorestore`
 to copy them across, and it no longer calls the archive ready while anything is
@@ -267,8 +267,8 @@ archive with no errors and none of its five invariants broken.
 **The third thing in the way is the indexes, and one of them is a constraint.**
 Nothing copies an index to the archive, on purpose: an index describes the whole
 collection, and carrying every one of them on the cheap tier gives back most of
-what tiering buys. That reasoning holds while the router is in front of the
-archive. This procedure takes the router away, and then those are the
+what tiering buys. That reasoning holds while the proxy is in front of the
+archive. This procedure takes the proxy away, and then those are the
 application's own indexes and they are gone.
 
 A plain index costs speed, and the archive is the tier with the most documents
@@ -296,8 +296,8 @@ holds history the fast tier stopped holding, and expiring it on the schedule the
 application set for a collection that was only ever recent is a decision about
 retention, not a step in a rollback.
 
-**13. Run more than one router by naming them all, not by hiding them.** A read
-the fast tier cannot answer is served from a cursor the router owns in its own
+**13. Run more than one proxy by naming them all, not by hiding them.** A read
+the fast tier cannot answer is served from a cursor the proxy owns in its own
 memory, holding an open connection to the archive, so it cannot be shared with
 another process. Drivers already handle this: they pin a cursor to the server
 that created it, exactly as they do for a mongos. Give the connection string
@@ -310,30 +310,30 @@ mongodb://user:pw@router1:27017,router2:27017/?authSource=admin      iterated 20
 Putting them behind a single load balanced address breaks that, because the
 driver then believes there is one server and its pool sends the getMore down
 whichever connection is free. Measured, the same cursor asked of the second
-router: `cursor id 8792354910962146833 not found`. It fails only for reads that
+proxy: `cursor id 8792354910962146833 not found`. It fails only for reads that
 fall through and return more than one batch, which is most of them during an
 adoption, and only sometimes, which is worse.
 
-The caches do not need naming: each router keeps its own, and a write it did not
+The caches do not need naming: each proxy keeps its own, and a write it did not
 make reaches it through the change stream it watches on the fast tier. That is
 asynchronous, so it is a race by nature, and it was measured rather than
-assumed: with one router answering from its cache, nine hits deep, and the other
+assumed: with one proxy answering from its cache, nine hits deep, and the other
 taking a write before each read, twenty rounds in a row gave the new answer and
 none gave the old one.
 
-One cache is not that one, and it used to be the sharp edge here. Each router
+One cache is not that one, and it used to be the sharp edge here. Each proxy
 keeps its own listing of which unique indexes a collection has, for a minute,
 and no change stream carries index DDL. So a unique index created on a running
-system was enforced across tiers immediately by the router the command went
+system was enforced across tiers immediately by the proxy the command went
 through and only within a minute by the others, and in that window another
-router did not claim keys for it: it let through a duplicate of an archived
+proxy did not claim keys for it: it let through a duplicate of an archived
 document that the fast tier's own index cannot see, because the document is not
-there. Measured, with a second router that had written to the collection before
+there. Measured, with a second proxy that had written to the collection before
 the index existed: the duplicate was accepted and landed.
 
 **That window is now the claim's five seconds rather than the listing's minute.**
-The router that takes the DDL increments a count on the completeness claim, and
-every other router reads that claim on the hot path anyway, once per five
+The proxy that takes the DDL increments a count on the completeness claim, and
+every other proxy reads that claim on the hot path anyway, once per five
 seconds per namespace, so it costs no round trip. Seeing the number move drops
 the listing, and the listing is re-read before it is enforced from rather than
 after: the two happen concurrently otherwise, and the insert that should have
@@ -345,25 +345,25 @@ worse, and `cline keys --rebuild` is still what the rollout list asks for.
 
 **14. The archive is a hard dependency, and not only for its documents.** The
 completeness watermarks, the feeder's checkpoint and its published position all
-live on the archive, so a router that cannot reach it does not know what the
+live on the archive, so a proxy that cannot reach it does not know what the
 fast tier is allowed to answer or how far mirroring has got. It therefore
 refuses to start rather than guess: `error: ping cold tier: server selection
-error`. A router restart during an archive outage leaves the application with
+error`. A proxy restart during an archive outage leaves the application with
 nothing, including the reads the fast tier could have served alone. Plan
 restarts accordingly, and remember that on day one almost every read needs the
 archive anyway.
 
 **That one stays as it is, and it is now a decision rather than an open
-question.** Asked and answered on 2026-09-05: the router goes on refusing, and
-this is the runbook entry for it. Do not restart a router during an archive
-outage, and bring the archive back first. A router that has never read a claim
+question.** Asked and answered on 2026-09-05: the proxy goes on refusing, and
+this is the runbook entry for it. Do not restart a proxy during an archive
+outage, and bring the archive back first. A proxy that has never read a claim
 knows which namespaces are tiered and nothing about what the fast tier holds of
 them, so anything it served would be a guess dressed as an answer. Starting and
 refusing every tiered namespace by name was considered and is not obviously
 better than not starting: the application gets errors either way, and a process
 that is up is a process monitoring reports as healthy.
 
-**A router that is already running is a different case, and it has a knob.**
+**A proxy that is already running is a different case, and it has a knob.**
 About five seconds into an archive outage it stops answering tiered reads too,
 even the ones the fast tier owns, because the claim it caches expires and cannot
 be re-read.
@@ -372,7 +372,7 @@ be re-read.
 One claim read against an address nothing answers on takes **30.002 seconds**,
 the driver's default server selection timeout, which nothing here shortens. Each
 tiered read paid it in full and was then refused, so an archive outage was not a
-router refusing reads promptly, it was a router hanging for half a minute per
+proxy refusing reads promptly, it was a proxy hanging for half a minute per
 read and then refusing. Any client with a socket timeout gave up first and saw a
 broken proxy. A failed claim read is now remembered for the same five seconds the
 claim itself is cached, so one read per namespace per five seconds pays the
@@ -385,22 +385,22 @@ It is off by default and the trade is exact:
 - **Safe against an archive outage.** Narrowing a claim and evicting what it
   stops covering are both writes to the archive, so while nobody can reach it
   neither can happen and the last claim read is still true.
-- **Not safe against a partition that isolates only the router.** The archive is
+- **Not safe against a partition that isolates only the proxy.** The archive is
   up, the evictor is working, claims are being narrowed and documents removed,
-  and this router answers from a claim covering documents the fast tier no
+  and this proxy answers from a claim covering documents the fast tier no
   longer holds. Those reads are short with no error on them, for as long as the
   grace lasts.
 - **Writes are never covered by it.** An insert skips the archive's own
   duplicate check when the fast tier claims all of history, so a claim that has
   become false would let through an `_id` the archive still holds and the feeder
   would mirror the new document over the archived one. Measured, while the grace
-  still applied everywhere: an insert the same router refused without a grace
+  still applied everywhere: an insert the same proxy refused without a grace
   was accepted and landed. Every write path refuses while the archive is
   unreachable, whatever the grace is set to. The trade on offer is a short read
   against a refused read, and never a destroyed document.
-- **It invents nothing.** A namespace this router was never asked about has no
+- **It invents nothing.** A namespace this proxy was never asked about has no
   claim to hold over and is refused, and so is every namespace if the outage
-  started before the router was asked anything at all.
+  started before the proxy was asked anything at all.
 
 `thermocline_claim_grace_reads_total` counts the reads it allowed. Alert on it:
 the counter cannot tell a correct answer from a short one, and you can.
@@ -414,14 +414,14 @@ driver's own retry absorbs it.
 **The fast tier's failover costs a handful of operations, and it used to cost
 everything.** This is the one an adoption is most likely to meet, because the
 fast tier is the new replica set and the one being rolled and resized. Measured
-three times with the shop running through the router, all four daemons working
+three times with the shop running through the proxy, all four daemons working
 underneath it and the warm still filling, and the fast tier's primary stepped
 down about forty seconds in: 25,600 operations a run, an election decided in
-about a second, the router pointing at the new primary 1.1 to 1.5 seconds later,
+about a second, the proxy pointing at the new primary 1.1 to 1.5 seconds later,
 2 to 8 failed operations, and none of the five invariants broken. What the
 client sees is a few refusals and a dropped connection, which its driver retries.
 The control says what to compare that against: the same shop and the same
-stepdown against plain MongoDB, with no router in the way, cost no errors at
+stepdown against plain MongoDB, with no proxy in the way, cost no errors at
 all. Before this was fixed the same test never recovered; see the proxied
 authentication bullet under "What it does not do yet".
 
@@ -454,7 +454,7 @@ rather than a perfect one: run NTP on every host that runs a cline daemon and
 none of this has to work hard.
 
 **15. Expect the warm to cost something and the evictor not to.** With a shop
-running against the router while all four daemons worked underneath it, 38,248
+running against the proxy while all four daemons worked underneath it, 38,248
 operations completed with no errors and no violated invariants, so the pieces do
 not fight. What they cost is not equal, and the difference is worth knowing when
 choosing a window to start in.
@@ -488,7 +488,7 @@ nothing had deleted; the copy-up's own insert did not repair it, because the
 feeder suppresses that as an echo. Measured on the sample datasets with a warm
 and an evictor over the same collections: 66 batches of "deletes not announced
 by the evictor" in ninety seconds, and an archive left holding 200 tombstoned
-trips and 45 tombstoned sales that nothing had ever deleted. The router then
+trips and 45 tombstoned sales that nothing had ever deleted. The proxy then
 hid them from every answer, and the fast tier had already dropped them.
 
 It is fixed, and the announcement is now a count that only the feeder spends.
@@ -507,7 +507,7 @@ the one written after the edit, and a client read the one.
 
 Add it, start the feeder, then `cline backfill --ns db.coll --apply`. That order
 has no window in it: the feeder carries the new writes while the copy brings the
-old ones. The router also names the collection at its next start, under "the
+old ones. The proxy also names the collection at its next start, under "the
 fast tier holds tiered collections the archive does not".
 
 **16. Check the tiers agree, with `cline indexes`.** It reports both directions:
@@ -515,7 +515,7 @@ what the archive cannot answer efficiently, and what the fast tier is scanning
 for.
 
 You are told about the ones your application makes, without having to remember
-to run it. A `createIndexes` through the router on a tiered namespace that
+to run it. A `createIndexes` through the proxy on a tiered namespace that
 leaves the archive without an index over the same fields is one WARN naming the
 index, because the divergence is made by an ordinary application command and
 felt much later by a read that falls through. A text or geospatial index gets a
@@ -523,7 +523,7 @@ different line, because those two the archive needs in order to answer at all
 rather than to answer quickly.
 
 That line is said once, to whoever reads the log that minute, and only for an
-index made through the router. So every router start, and `cline preflight`,
+index made through the proxy. So every proxy start, and `cline preflight`,
 also names each tiered collection whose fast tier has an index the archive
 cannot serve, however it got there:
 
@@ -561,10 +561,10 @@ With the compound one there is no sort stage and 100 are examined. A rule with
 no `date_field` ages by the ObjectId and sorts on `_id`, which is always
 indexed, so nothing is needed.
 
-Both are named by the router: the first at every start and in `cline preflight`,
+Both are named by the proxy: the first at every start and in `cline preflight`,
 the second by the warmer once per rule per pass.
 
-What the router does for you, at startup, for every namespace it manages that
+What the proxy does for you, at startup, for every namespace it manages that
 the archive already holds: it creates the collection on the fast tier the way
 the archive has it, carrying the default collation and the validator, and builds
 the archive's indexes on it. Those are the things that are not documents, and

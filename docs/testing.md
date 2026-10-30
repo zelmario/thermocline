@@ -12,8 +12,8 @@ the command document. Every guard here reads its statements through
 not say is whether a guard fires for the sequenced form end to end.
 
 It earns its place by distinguishing: refused with a duplicate key through the
-router, accepted straight at the fast tier. A check that cannot tell those apart
-would pass against a router that had stopped guarding sequenced writes
+proxy, accepted straight at the fast tier. A check that cannot tell those apart
+would pass against a proxy that had stopped guarding sequenced writes
 altogether.
 
 `make install` builds it and copies it beside `cline`, and `testkeys.sh` skips
@@ -54,7 +54,7 @@ make dev-down
 ```
 
 `make race` is separate because it is several times slower. Run it before a
-release and after anything that adds shared state to the router, which holds a
+release and after anything that adds shared state to the proxy, which holds a
 claim cache, an index cache, a bracket cache and the set of namespaces the
 archive is not a superset of: every one of those is read by every connection and
 written by one.
@@ -92,7 +92,7 @@ A suite that passes says the system works. It does not say the suite would
 notice if a guard stopped working, and that is a different question: a check
 that cannot fail is worse than no check, because it is counted.
 
-So on 2026-09-14 each of the router's guards was disabled in turn -- `return
+So on 2026-09-14 each of the proxy's guards was disabled in turn -- `return
 nil, false` as the first statement of its body -- and the suite that ought to
 notice was run against that binary. A guard whose suite still passes is a guard
 nothing tests.

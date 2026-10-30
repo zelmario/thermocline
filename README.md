@@ -10,7 +10,7 @@ string.
 
 It is tested against real clusters rather than mocks: 34 suites and about a
 thousand checks against two three-member replica sets, and a pilot that adopts
-MongoDB's published sample datasets and compares every answer the router gives
+MongoDB's published sample datasets and compares every answer the proxy gives
 against the archive it came from. See `test/README.md` and `test/pilot`. The CI
 badge only means it compiles; a runner has no cluster to test tiering with.
 
@@ -41,6 +41,10 @@ One binary, `cline`, with a subcommand per component.
 | `watermark` | **works** | Shows, declares and withdraws what the fast tier claims to hold |
 | `keys`    | **works** | Claims the unique keys that have to survive eviction |
 
+The documents call the `router` component **the proxy**, so it is not confused
+with the `mongos` router of a sharded cluster. The command, the `router:`
+section of the configuration and the metric names keep the old name.
+
 ## The rule everything rests on
 
 **Applications delete normally. The feeder never issues a delete against the
@@ -48,15 +52,15 @@ archive.** Those are two different statements and only the second one is a
 restriction, so it is worth being exact about which.
 
 Your application deletes a document and it is gone: gone from the fast tier,
-gone from every answer the router gives, immediately. Nothing about deleting
-changes. What changes is what happens *behind* the router. The feeder mirrors
+gone from every answer the proxy gives, immediately. Nothing about deleting
+changes. What changes is what happens *behind* the proxy. The feeder mirrors
 inserts, updates and replaces into the archive as upserts, and mirrors a delete
 as a **mark** on the archived copy, `_tcDeletedAt`, rather than as a removal.
-The router filters marked documents out of every read, which is why the client
+The proxy filters marked documents out of every read, which is why the client
 cannot tell.
 
 Measured, on a shop with 3,081 orders in the archive of which the application
-had deleted 40: the router answered 3,041, the number the application expected,
+had deleted 40: the proxy answered 3,041, the number the application expected,
 while the archive still physically held all 3,081.
 
 **Why not just delete it there too.** Because then one accident on the fast tier
@@ -69,7 +73,7 @@ Two things follow, and neither is a surprise if you know about them. Storage in
 the archive grows with deletes as well as with writes, so
 `feeder.tombstone_retention` gives a marked copy an end date and mongod's TTL
 monitor erases it. And a client reading the archive **directly**, bypassing the
-router, does see the marked documents: that is what `cline rollback` counts and
+proxy, does see the marked documents: that is what `cline rollback` counts and
 what `--clear` removes before you repoint anything at it.
 
 ## Installing it
@@ -112,7 +116,7 @@ That starts every component in the order that matters:
    other.
 2. It starts the feeder, which mirrors every write on the fast tier into the
    archive, and waits until it is caught up.
-3. It opens the router on `listen`. Point the application's connection string
+3. It opens the proxy on `listen`. Point the application's connection string
    at it and nothing in the application changes.
 4. It claims the unique keys the archive already holds, so a unique index
    keeps meaning what it meant once documents leave the fast tier.
@@ -123,10 +127,10 @@ That starts every component in the order that matters:
 As a service: `sudo packaging/install.sh bin/cline`, write
 `/etc/cline/cline.yaml`, then `systemctl enable --now cline`. A second
 `cline run` on another host is a standby for the feeder and evictor and a second
-router. [docs/adoption.md](docs/adoption.md) is the numbered order for a
+proxy. [docs/adoption.md](docs/adoption.md) is the numbered order for a
 cluster that is already serving traffic, and it matters.
 
-Each component also runs on its own, for routers on more hosts or daemons
+Each component also runs on its own, for proxies on more hosts or daemons
 spread across machines:
 
 ```
@@ -170,7 +174,7 @@ error: parse config: yaml: unmarshal errors:
 
 This used to be a silence, and a silently ignored setting is the worst shape a
 configuration mistake can take. Measured on one file: `terminate-auth: true`,
-with a hyphen where the key has an underscore, loaded as `false`. The router
+with a hyphen where the key has an underscore, loaded as `false`. The proxy
 proxied authentication while the operator believed it was terminating it and
 checking privileges itself. Nothing failed, nothing was logged, and the setting
 simply did not exist. A misspelt `tombstone_retention` keeps deleted documents
@@ -219,7 +223,7 @@ and the count left standing answers for the application's own delete of that _id
 whenever it comes. `cline evictor --once` while the daemon is mid-sweep refuses;
 `--dry-run` always runs, because it announces nothing and removes nothing.
 
-Routers are the exception and are meant to be run several at a time. See
+Proxies are the exception and are meant to be run several at a time. See
 [operations.md](docs/operations.md).
 
 ### Both tiers are replica sets
@@ -257,7 +261,7 @@ which 8.0 accepts and 7.0 refuses, answered a point read from fast tier document
 and failed over the same collection when the archive had to answer it, with
 `$convert found an unknown argument: format`.
 
-**So the router adds a sentence to that error**, naming both releases and saying
+**So the proxy adds a sentence to that error**, naming both releases and saying
 that a read the fast tier cannot answer in full is sent to the archive as the
 application wrote it. Only when the archive is the older tier, and only for an
 error that is a server refusing to recognise a name: a duplicate key, a timeout
@@ -288,7 +292,7 @@ A version that cannot be read is not a refusal. `buildInfo` failing is a
 connection problem, and whatever needs that connection says so in its own words
 a moment later; the log names which tier could not be asked, so silence is not
 mistaken for agreement. Reading the feature compatibility version needs a
-privilege the router's own account may not have, and an account that cannot read
+privilege the proxy's own account may not have, and an account that cannot read
 it on both tiers skips that half of the check rather than refusing to start.
 
 A mongos is one server that does this: it answers `buildInfo`, so releases are
@@ -296,7 +300,7 @@ still compared, and it does not answer `getParameter` for
 `featureCompatibilityVersion`. Both tiers are replica sets here, so that is a
 note rather than a case.
 
-The four daemons check this: feeder, evictor, warmer and router. The one-shot
+The four daemons check this: feeder, evictor, warmer and proxy. The one-shot
 tools do not, because a mismatched pair is exactly when you need `cline
 watermark`, `cline keys` and `cline rollback` to work.
 
@@ -330,7 +334,7 @@ it, because a README nobody reaches the end of is a README that does not work:
 
 | | |
 |---|---|
-| [docs/router.md](docs/router.md) | What the proxy does with each kind of command, and why. The longest one, because it is where the work is |
+| [docs/proxy.md](docs/proxy.md) | What the proxy does with each kind of command, and why. The longest one, because it is where the work is |
 | [docs/adoption.md](docs/adoption.md) | The numbered rollout for a cluster already serving traffic, and what an adoption carries that is not a document |
 | [docs/limitations.md](docs/limitations.md) | Every limitation known, what each costs, and what would close it. **Read this before a pilot** |
 | [docs/monitoring.md](docs/monitoring.md) | Every metric published, the nine signals worth paging on, and the Prometheus rules |

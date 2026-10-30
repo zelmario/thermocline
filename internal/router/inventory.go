@@ -55,7 +55,7 @@ type Inventory struct {
 	// off the fast tier and the claim is what remembers the value was taken.
 	// Nothing removes one whose document has been deleted from both tiers except
 	// `cline keys --prune`, and that is an operator's obligation with nothing
-	// asking for it. Measured in docs/router.md: 500 inserts and 500 deletes
+	// asking for it. Measured in docs/proxy.md: 500 inserts and 500 deletes
 	// leave 500 claims, about 100 bytes each, on the expensive tier.
 	//
 	// Reported rather than alerted on. There is no number that is wrong on its

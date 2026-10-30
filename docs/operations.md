@@ -30,12 +30,12 @@ change to the code. See `docs/limitations.md`.
 **Authentication is proxied, and that is the shipped configuration.** Decided on
 2026-09-16: `router.terminate_auth` stays off. Each client gets its own upstream
 connection to the fast tier, mongod judges every command against the account the
-client authenticated as, and this router cannot grant what mongod would refuse.
+client authenticated as, and this proxy cannot grant what mongod would refuse.
 
 Three things come with that, all measured, and an operator plans around them
 rather than discovering them:
 
-- **One upstream connection per client.** The router says so once at a thousand
+- **One upstream connection per client.** The proxy says so once at a thousand
   open clients. The wall is mongod's rather than this proxy's.
 - **Read preference is not honoured.** `secondary`, `secondaryPreferred` and
   `nearest` all land on the primary, measured with the profiler recording on all
@@ -49,9 +49,9 @@ rather than discovering them:
 `router.terminate_auth: true` lifts all three and is **not supported**. It works
 and has 56 checks behind it, it has carried the whole pilot over data nobody
 here wrote, and that is still not the claim that matters: with it on, this
-router's own authorisation gate is the only thing between a client and somebody
+proxy's own authorisation gate is the only thing between a client and somebody
 else's data, and that gate has not been reviewed by anybody who did not write
-it. Turning it on is a decision about your own risk, and the router warns at
+it. Turning it on is a decision about your own risk, and the proxy warns at
 every start that you have taken it.
 
 ### Backups
@@ -63,7 +63,7 @@ captures exactly that slice however long the cluster has been running.
 What to take, and where each piece lives:
 
 - **The archive's application databases.** Every document the feeder has
-  mirrored, live and tombstoned, lagging by mirroring lag. The router's
+  mirrored, live and tombstoned, lagging by mirroring lag. The proxy's
   dashboard and `thermocline_mirroring_lag_seconds` say how far behind that is at
   the moment you take it.
 - **The archive's bookkeeping database**, `_thermocline` by default. Watermarks,
@@ -77,7 +77,7 @@ What to take, and where each piece lives:
 - **A snapshot backup holds mirroring while it runs, and nothing is lost.**
   `db.fsyncLock()` on the archive, which is what a filesystem or volume snapshot
   needs, blocks writes rather than failing them, so the feeder simply waits.
-  Measured: two writes made through the router during the lock, the feeder
+  Measured: two writes made through the proxy during the lock, the feeder
   silent throughout with no WARN or ERROR of any kind, and
   `thermocline_mirroring_lag_seconds` climbing 43, 58, 72 seconds while it was
   held. On `fsyncUnlock` the lag was back to 0.015s within seconds and both
@@ -96,7 +96,7 @@ What to take, and where each piece lives:
   `cline keys --rebuild`.
 - **The fast tier's accounts and roles**, `admin.system.users` and
   `admin.system.roles` on the fast tier. This is the piece with no other source,
-  and the reason it is easy to miss is that it is not data: the router
+  and the reason it is easy to miss is that it is not data: the proxy
   authenticates clients against the *fast* tier, and that replica set was new at
   adoption, so its accounts were created by hand at step 3 of the rollout and
   have never come from anywhere else. The archive's copies are its own and are
@@ -135,7 +135,7 @@ What to take, and where each piece lives:
   constraint**, because uniqueness across the tiers is enforced from the fast
   tier's own listing, and an index no tier declares is not enforced by anything.
   Measured: with the key registry restored and 200 rows in it, an insert
-  duplicating a value an archived document held was accepted. A router says so
+  duplicating a value an archived document held was accepted. A proxy says so
   now, at every start, as "the key registry holds claims for a unique index no
   tier has", which is the one trace left that the constraint existed.
 
@@ -145,8 +145,8 @@ What to take, and where each piece lives:
 
 Everything else on the fast tier is rebuilt rather than restored, and it is
 worth knowing which is which before an outage rather than during one. Collection
-options and indexes come back from the archive when a router starts, the unique
-key registry from `cline keys --rebuild`, views from the archive if a router
+options and indexes come back from the archive when a proxy starts, the unique
+key registry from `cline keys --rebuild`, views from the archive if a proxy
 mirrored them there, and the documents from warming. Accounts are the one thing
 on that tier that nothing rebuilds.
 
@@ -159,7 +159,7 @@ back short, with no error and nothing in any log. The claim is checked when it
 is declared and never again.
 
 Measured on a shop holding 6,187 orders, with forty taken off the fast tier the
-way a restore takes them: the same bounded read answered 147 through the router
+way a restore takes them: the same bounded read answered 147 through the proxy
 where the archive holds 187.
 
 So `cline preflight` counts both tiers for every claim before you start
@@ -232,7 +232,7 @@ older than it: the fast tier's oplog window and `feeder.eviction_record`.
   --clear-checkpoint` is the remedy, with the feeder stopped: it copies what
   the fast tier holds and marks deletes only inside the range the fast tier
   claims to hold in full. A document deleted after the backup and outside
-  that range comes back, and deleting it again through the router removes it.
+  that range comes back, and deleting it again through the proxy removes it.
 - **Past `feeder.eviction_record`**, the feeder refuses before it reads
   anything ("the checkpoint is older than the eviction record reaches"),
   because evictions in that window can no longer be told from deletes. The
@@ -293,14 +293,14 @@ wait for it to exit before starting the new one, which is the order you would
 use anyway.
 
 **The same goes for the newer protections, and in the same direction.** A feeder
-records the documents the archive refuses, and a router reads those records to
+records the documents the archive refuses, and a proxy reads those records to
 refuse the reads that would be short by them. During an upgrade the halves are
-apart: an old feeder records nothing, so a new router has nothing to read and
-answers as everything did before; a new feeder records them and an old router
+apart: an old feeder records nothing, so a new proxy has nothing to read and
+answers as everything did before; a new feeder records them and an old proxy
 ignores the records and answers short, which is what every version did until
 this one. Neither is worse than the version it replaces, and the protection is
-whole once both ends are upgraded. Upgrade the routers last, so the feeder has
-already recorded what the routers are about to start acting on.
+whole once both ends are upgraded. Upgrade the proxies last, so the feeder has
+already recorded what the proxies are about to start acting on.
 
 The evictor's lease is per sweep rather than per process, because a sweep is
 what must not overlap: two evictors taking turns are two ordinary sweeps. So
@@ -316,7 +316,7 @@ always answers.
 `packaging/install.sh` installs `cline.service`, which runs `cline run`: every
 daemon in one process, in the order below, with the feeder, evictor and warmer
 restarted inside it after ten seconds and the whole unit restarted by systemd
-when the router stops.
+when the proxy stops.
 
 ```
 sudo packaging/install.sh bin/cline
@@ -326,7 +326,7 @@ sudo systemctl enable --now cline
 ```
 
 It installs a unit for each daemon as well, for running them apart, such as
-routers on more hosts. Enable `cline` or those on a host, not both. By hand,
+proxies on more hosts. Enable `cline` or those on a host, not both. By hand,
 the order `cline run` keeps is:
 
 ```
@@ -353,7 +353,7 @@ up, it says so and gives the restart order rather than the install one.
 The config holds the credentials for both tiers, which is why it is `0640` and
 owned by the account rather than by root.
 
-**Three of them are daemons and the fourth is not.** The feeder, the router and
+**Three of them are daemons and the fourth is not.** The feeder, the proxy and
 the evictor run until they are stopped. `cline warmer` makes one pass, prints
 `warm complete` and exits, so it is a `oneshot` unit driven by
 `cline-warmer.timer` rather than a service with `Restart=`. Written the other
@@ -387,7 +387,7 @@ that point before the stream returns its first event. Measured on this
 project's test box: a checkpoint 44 hours and 1,433,277 oplog entries (1.0GB)
 behind took 2m58s to open, and 5m45s from the same point an hour later with the
 oplog's pages no longer in cache, against 0.08s for one a few minutes behind. Nothing
-is mirrored in between, so routers report mirroring as stopped and reads past
+is mirrored in between, so proxies report mirroring as stopped and reads past
 `archive_wait` that need the archive are refused, or answered stale under
 `router.freshness: permissive`. The startup line says
 `resuming from checkpoint` with `behind=` when the checkpoint is a minute or
@@ -395,18 +395,18 @@ more old, and `mirroring` when the stream is open. Silence between those two is
 the oplog scan, not a hang. The takeover times above are for a standby, whose
 checkpoint the previous holder kept current.
 
-**The router's restart loop is the archive outage procedure.** A router refuses
+**The proxy's restart loop is the archive outage procedure.** A proxy refuses
 to start while the archive is unreachable, on purpose. `Restart=always` turns
 that into "it serves again as soon as the archive is back" rather than "somebody
-has to notice". Nothing orders the router after the feeder: that order belongs
+has to notice". Nothing orders the proxy after the feeder: that order belongs
 to the day you adopt a cluster, not to a reboot.
 
-**The router's unit raises `LimitNOFILE`, and it has to.** While authentication
+**The proxy's unit raises `LimitNOFILE`, and it has to.** While authentication
 is proxied, which is the default, each client costs two file descriptors on the
-router: its own socket and the upstream connection carrying its SCRAM identity.
-systemd's default soft limit is 1024, so a router left with it meets "too many
+proxy: its own socket and the upstream connection carrying its SCRAM identity.
+systemd's default soft limit is 1024, so a proxy left with it meets "too many
 open files" at about five hundred clients, before the thousand-client warning
-the router itself prints, and well before mongod's connection limit, which is
+the proxy itself prints, and well before mongod's connection limit, which is
 where this document says the wall is. The unit sets 65535 so that stays true.
 
 **`ProtectSystem=strict` is why `log.file` has to live under `/var/log/cline`.**
@@ -416,27 +416,27 @@ nothing, so add the directory to `ReadWritePaths=` in the unit, or leave the
 logs in the journal where the units put them by default.
 
 **A stop closes idle client connections and waits for the ones mid-command.**
-A router holds one goroutine per client, parked in a read, and an application's
+A proxy holds one goroutine per client, parked in a read, and an application's
 pool holds those sockets open indefinitely, so a stop that waited for them
-waited for ever: measured, a router with one idle client was still running 60
+waited for ever: measured, a proxy with one idle client was still running 60
 seconds after SIGTERM against one second with none, and systemd then waited out
 `TimeoutStopSec` and sent SIGKILL. A stop now closes the idle ones at once,
-which is the reconnect the router already warns about, and gives a command in
+which is the reconnect the proxy already warns about, and gives a command in
 flight five seconds before cutting it. Keep `TimeoutStopSec` above that grace,
 which the default 90 seconds comfortably is.
 
-**What a router restart costs the application, measured.** With two shops
-writing through one router at about 115 operations a second each, a `SIGTERM`
+**What a proxy restart costs the application, measured.** With two shops
+writing through one proxy at about 115 operations a second each, a `SIGTERM`
 stopped it in **1 second**: the connections parked on a read are closed at once
 and the clients reconnect. Starting again and answering `ping` took **1.0 to
 1.1 seconds** with 176 tiered namespaces, because the listener opens after the
 archive's indexes are built on the fast tier.
 
-So a restart is roughly **two seconds during which that router refuses
+So a restart is roughly **two seconds during which that proxy refuses
 connections**, and an application pointed only at it sees exactly that: every
 error in the run was `connection refused`, none was a wrong answer, and both
 shops' invariants held throughout. Whoever needs no such gap runs more than one
-router and restarts them one at a time, which is step 13 of
+proxy and restarts them one at a time, which is step 13 of
 [docs/adoption.md](adoption.md).
 
 **A restart does not resume eviction.** `cline pause` writes the pause into the

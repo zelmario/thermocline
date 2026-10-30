@@ -467,7 +467,7 @@ type FeederConfig struct {
 	//
 	// 5ms by default since 2026-10-09. On the Hetzner staging pair under the
 	// shop it gave 260 operations a second against 194 at 20ms, and a mean
-	// barrier wait of 16.5ms against 28.1ms. See docs/router.md.
+	// barrier wait of 16.5ms against 28.1ms. See docs/proxy.md.
 	PositionEvery time.Duration `yaml:"position_every"`
 	// BatchSize caps documents per bulk write to the cold tier.
 	BatchSize int `yaml:"batch_size"`

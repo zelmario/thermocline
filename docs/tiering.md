@@ -39,7 +39,7 @@ in code, not documented as guidance.
    reprocessed record looks like, and until the feeder mirrors the second write
    the fast tier holds the only live copy while the archive holds a tombstone.
    Measured without that filter: one sweep, and the document was on neither tier
-   and the router answered nothing for a record the application had just
+   and the proxy answered nothing for a record the application had just
    written.
 2. **Nothing is removed while mirroring is behind.** Lag is read from the
    feeder's own checkpoint. This check fails closed: if the lag cannot be read

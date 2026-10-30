@@ -109,7 +109,7 @@ its wait. Answering both with one record made freshness as slow as durability
 was cheap.
 
 The one exception is `_tcDeletedAt`, set on archived copies whose original the
-application deleted. The router filters on it, so a tombstoned document is never
+application deleted. The proxy filters on it, so a tombstoned document is never
 returned and never copied back up.
 
 **A document already at the 16 MB limit cannot take that field**, and what
@@ -121,7 +121,7 @@ document.
 Losing one document's audit copy is much cheaper than either alternative.
 Leaving it unmarked means the archive holds a live copy of a document the
 application deleted, and a later read hands it back: measured, a 16 MB document
-deleted on the fast tier came back through the router in full. And the batch
+deleted on the fast tier came back through the proxy in full. And the batch
 carrying that mark never succeeds, so the feeder reopens its change stream on
 the same event again and again and **all** mirroring stops behind it, which was
 thirteen identical failures before the run was killed.
@@ -131,7 +131,7 @@ everything.** The fast tier accepts a value the archive already holds, the
 mirror is refused with a duplicate key, and no retry can ever succeed because
 that value belongs to another live document in the archive. Measured on an
 adoption: 85 identical reopens in 85 seconds, and an order written through the
-router afterwards never reached the archive at all.
+proxy afterwards never reached the archive at all.
 
 That document is left out of the batch and named at ERROR, with the namespace,
 the `_id` and the index that refused it. The archive is then missing one
@@ -140,10 +140,10 @@ a document the archive does not hold is never removed from the fast tier, so
 nothing is lost, it is only unarchived. Every other document, in that namespace
 and every other, goes on mirroring.
 
-The router will not let this happen through itself, because it enforces the
+The proxy will not let this happen through itself, because it enforces the
 archive's unique indexes across both tiers. What reaches the feeder is a
 duplicate something else put there: a unique index added to the archive alone,
-or a writer that does not go through the router.
+or a writer that does not go through the proxy.
 
 **`_tcDeletedAt` is therefore a reserved field name**, along with
 `_tcBodyDropped`. An application that sets either on its own documents will find

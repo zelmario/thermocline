@@ -1,21 +1,21 @@
-# The router
+# The proxy
 
 What the proxy does with each kind of command, and why. The longest of these documents, because it is where the work is.
 
 Part of [Thermocline](../README.md).
 
-## The router
+## The proxy
 
 It presents itself as a **mongos**, and that is the detail the whole proxy turns
 on. A driver uses the `hello` reply for topology discovery: forward the fast
 tier's real reply and the driver reads the `hosts` array, connects straight to
-those replica set members, and never sends the router another byte. Everything
+those replica set members, and never sends the proxy another byte. Everything
 looks healthy until an archived document comes back missing.
 
-Almost every command is forwarded untouched. The router acts on two cases:
+Almost every command is forwarded untouched. The proxy acts on two cases:
 
 **A read that found nothing.** If the filter is an exact `_id` and the archive
-has the document, the router answers with it and copies it up behind the reply.
+has the document, the proxy answers with it and copies it up behind the reply.
 The caller waits about 30 ms once; every read after that is a normal fast tier
 read.
 
@@ -36,7 +36,7 @@ Range queries are governed by the watermark below.
 - **Aggregations are completeness-checked but not miss-checked.** A pipeline is
   never resolved against the archive document by document; it is either safe to
   run on the fast tier or refused. See below.
-- **`getMore` on a fast tier cursor is passed through.** Cursors the router
+- **`getMore` on a fast tier cursor is passed through.** Cursors the proxy
   creates for archive reads are served here instead, and tracked per connection.
 - **A change stream does not show this system's own work.** Tiering moves
   documents between the tiers, and every one of those moves is an event on the
@@ -56,7 +56,7 @@ Range queries are governed by the watermark below.
   its reply, at no cost when it hits.
 - **Authentication is proxied by default, and can be terminated.** Everything in
   the next two bullets describes the default. Setting `router.terminate_auth`
-  changes the architecture: the router verifies the client's password itself,
+  changes the architecture: the proxy verifies the client's password itself,
   from the salt and stored keys mongod keeps in `admin.system.users`, loads that
   user's privileges with `usersInfo`, and reaches both tiers on connections it
   owns. That lifts all three limitations below at once, and it moves the
@@ -65,13 +65,13 @@ Range queries are governed by the watermark below.
   data. **It ships off, decided on 2026-09-16, and proxied authentication is the
   supported configuration.** What that costs is in `docs/operations.md`. Turning
   it on is a decision about your own risk: the gate has not been reviewed by
-  anybody who did not write it, and the router warns at every start that you
+  anybody who did not write it, and the proxy warns at every start that you
   have taken it.
 
   Proxied, which is the default: each client gets its own
   connection to the fast tier, so SCRAM works, at the cost of one upstream
   connection per client. It also sets what happens during a fast tier election:
-  the router never sees the credentials, so it cannot re-authenticate a fresh
+  the proxy never sees the credentials, so it cannot re-authenticate a fresh
   upstream and replay a command that was in flight. The command in flight when
   the primary goes away fails and the client has to retry it, where a driver
   talking to the replica set directly would block in server selection instead.
@@ -90,37 +90,37 @@ Range queries are governed by the watermark below.
   anybody whenever the last thing it heard was such a refusal, and keeps asking
   until somebody is: 4 of 4 paused and landed, applied exactly once each. A
   window longer than the wait still ends the connection rather than holding it,
-  and the router logs the set's own topology as the reason.
+  and the proxy logs the set's own topology as the reason.
 
   A client that is *already* connected was the worse half of this, and it was
-  not a pause but a permanent outage. The router re-resolved which member is
+  not a pause but a permanent outage. The proxy re-resolved which member is
   primary only when a dial failed, which covers a member that died; a member
   that steps down stays up, keeps accepting connections and answers every
   command with `NotPrimaryNoSecondaryOk`, so nothing ever failed to dial and
-  nothing ever asked again. Measured with the shop running through the router
+  nothing ever asked again. Measured with the shop running through the proxy
   while the fast tier's primary stepped down: 4,226 refusals and still counting
   three minutes later, against a set that had elected a new primary in one
-  second, and every client that connected afterwards was refused too. The router
+  second, and every client that connected afterwards was refused too. The proxy
   now re-resolves on the first refusal, and ends that connection once the
   refusal has been delivered, which is what mongod does to the clients of a
   member that stops being primary. The driver reconnects, that handshake
   authenticates against the member that is primary now, and the retry lands.
 - **Read preference is not honoured. Every read is served by the primary.** This
   follows from proxied authentication and is the one limitation to weigh before a
-  pilot. The router answers `hello` as a mongos, and a mongos routes by read
+  pilot. The proxy answers `hello` as a mongos, and a mongos routes by read
   preference, so drivers attach `$readPreference` to reads and expect it to be
   acted on. It cannot be: the client's SASL exchange is forwarded to one upstream
   connection, and that connection is the only thing carrying the client's
   identity. A second connection to a secondary would be authenticated as nobody,
   SCRAM is nonce-bound and one-shot so the exchange cannot be replayed there, and
-  the router never sees a password to redo it with. Using the router's own
+  the proxy never sees a password to redo it with. Using the proxy's own
   credentials instead is precisely the privilege bypass that Authorisation below
   exists to close.
 
   Nothing returns a wrong answer: a read served by the primary is strictly
   fresher than one asked of a secondary. What changes is where the load lands. An
   application that pins reporting to secondaries moves that entire read load onto
-  the fast tier's primary the day it goes behind this router. Measured on a
+  the fast tier's primary the day it goes behind this proxy. Measured on a
   three-member fast tier with the profiler recording on every node:
   `secondary`, `secondaryPreferred` and `nearest` each landed on the primary,
   while the same query sent straight to the replica set landed on a secondary.
@@ -132,14 +132,14 @@ Range queries are governed by the watermark below.
   `secondaryPreferred` and `nearest` each landed on a secondary.
 
   **A member in the set is not the same as a member you can read from**, and the
-  router learns the difference from what the member says rather than from a
+  proxy learns the difference from what the member says rather than from a
   health check of its own. It picks a secondary out of `hello`'s `hosts`, and
   `hosts` lists every configured member: one in a maintenance window, an initial
   sync or a rollback stays in it, stays up, accepts connections and answers
   reads with `NotPrimaryOrSecondary`. A driver never picks such a member.
   Measured with one secondary in maintenance and `retryReads=false`, which is
   what a `getMore` looks like too: ten reads straight at the set all answered,
-  ten through the router all failed. The read is now sent again on the primary,
+  ten through the proxy all failed. The read is now sent again on the primary,
   which is the same fallback a secondary that cannot be dialled already got, and
   the member leaves the rotation for 30 seconds with one line saying so.
   `thermocline_secondary_reads_moved_total` counts them, and anything above zero
@@ -147,10 +147,10 @@ Range queries are governed by the watermark below.
 
   Two edges are worth knowing. A `getMore` cannot be moved, because the cursor
   is on that node and nowhere else, so the client is told exactly what it would
-  be told talking to the set directly. And when no member is readable the router
+  be told talking to the set directly. And when no member is readable the proxy
   answers from the primary, where a driver asking for `secondary` would block in
   server selection until it gave up: measured with both secondaries in
-  maintenance, ten reads through the router answered and ten straight at the set
+  maintenance, ten reads through the proxy answered and ten straight at the set
   timed out. Answering is the same choice this makes for a secondary it cannot
   dial.
 - **A stats call counts the whole collection and measures one tier.** Those are
@@ -181,7 +181,7 @@ Range queries are governed by the watermark below.
   to 64-92ms, which is round trips rather than counting. Warming a collection
   removes its share of the cost entirely, because a claim covering everything
   makes the fast tier's own count the right one. If the counts cannot all be
-  taken inside ten seconds the reply is left as the fast tier's and the router
+  taken inside ten seconds the reply is left as the fast tier's and the proxy
   says so, because a total corrected half way through describes neither tier.
 
   `avgObjSize` stays with the bytes it is derived from rather than being
@@ -193,18 +193,18 @@ Range queries are governed by the watermark below.
   `sample_training.trips` reported 0 documents where the archive holds 10,000,
   because none of that collection was inside the hot window, while
   `countDocuments` on it answered 10,000 throughout. See `test/pilot`.
-- **The router names the accounts and roles the fast tier is missing.** The fast
+- **The proxy names the accounts and roles the fast tier is missing.** The fast
   tier is a new replica set and carries none of the application's users, and the
-  router authenticates against it, so on day one every connection is refused
+  proxy authenticates against it, so on day one every connection is refused
   with MongoDB's ordinary authentication failure and nothing connects that to
   the tier missing the account. It says which ones, once, at startup.
 
   It also names a cluster-wide read or write concern default the archive has and
   the fast tier does not. `setDefaultRWConcern` is a decision about durability
   and about what a read may see, made once and then never mentioned again by the
-  application, and reads and writes through the router are served by the fast
+  application, and reads and writes through the proxy are served by the fast
   tier. So an old cluster answering at majority answers at local through the
-  router, and the application asked for neither.
+  proxy, and the application asked for neither.
 
   Roles come first in that list because they come first in the fix. Creating an
   account with a custom role the fast tier does not have is refused with "Could
@@ -216,13 +216,13 @@ Range queries are governed by the watermark below.
   read or a write reaches a document only the archive holds; a warm, which does
   the same in bulk ahead of time; and an eviction. The first two are inserts on
   the fast tier and the third is a delete, and all three are hidden from a
-  client's stream. So are events for the router's own scratch collections, which
+  client's stream. So are events for the proxy's own scratch collections, which
   a `$out` or `$merge` creates and drops, and the rows this system writes to its
   own bookkeeping, including the unique key registry, which is the one piece of
   it that lives on the fast tier.
 
   **And the catalog repair behind a copy-up.** The fast tier is repaired, not
-  merely filled: before the first copy-up into a namespace the router creates
+  merely filled: before the first copy-up into a namespace the proxy creates
   the collection there with the archive's options, because a collation decides
   which documents match and cannot be added afterwards, and then builds the
   archive's indexes on it. Both land on the application's own namespace, so with
@@ -240,7 +240,7 @@ Range queries are governed by the watermark below.
   back to it an hour later is doing the correct thing, and it gets a backlog in
   which every tiering event is older than any window. So the decision is made
   against a record written when the document was moved, and against the event's
-  own position in the oplog rather than a clock: the router and the feeder read
+  own position in the oplog rather than a clock: the proxy and the feeder read
   the same field off the same event, so the two agree by construction rather
   than by being in sync.
 
@@ -254,40 +254,40 @@ Range queries are governed by the watermark below.
   batch the stream is opened with, not only to the batches that follow it,
   which is what a consumer resuming from a stored position actually reads.
 
-- **A drop through the router stops the claim at once.** Dropping a tiered
+- **A drop through the proxy stops the claim at once.** Dropping a tiered
   collection empties the fast tier immediately, and the claim that it holds
   everything outlives it: the feeder withdraws the claim when it sees the event,
-  and the router keeps a cached copy for a few seconds after that. Measured on a
+  and the proxy keeps a cached copy for a few seconds after that. Measured on a
   collection claimed complete for all of history: `countDocuments` straight
   after the drop answered **0 where the archive holds 3**, with no error.
 
-  A drop the router forwarded is one it knows about at once, so it forgets the
+  A drop the proxy forwarded is one it knows about at once, so it forgets the
   claim there and then. A drop applied straight to the fast tier, out of band,
-  reaches it a moment later: the router follows the fast tier's change stream and
+  reaches it a moment later: the proxy follows the fast tier's change stream and
   forgets the same things when it sees the drop there, so the window is the
   stream's own latency rather than the claim cache's.
 
   **That also covers the indexer's memory, which used not to correct itself at
-  all.** The router creates the fast tier's copy the way the archive has it
+  all.** The proxy creates the fast tier's copy the way the archive has it
   before any write that would otherwise create it bare, and remembers having done
   so. A drop it never saw left that memory standing, and the next write recreated
   the collection implicitly: no collation, no validator, no index but `_id_`.
   Measured on an adopted collection with a case-insensitive collation and a
   unique index on `name`: after the out-of-band drop the fast tier's copy came
-  back with neither, and a minute later, once the router had re-read its index
+  back with neither, and a minute later, once the proxy had re-read its index
   listing from a collection that no longer had one, an insert of a second `alice`
   was **accepted** against a constraint the application had relied on since
   before the adoption. Nothing in either tier's log mentioned it, and it
-  corrected itself only when something listed the catalog or the router was
+  corrected itself only when something listed the catalog or the proxy was
   restarted.
 
-  It costs one change stream per router, on the fast tier. That stream used to be
-  opened only when the query cache was on; it is now always open, so the router's
-  own account needs the privilege to open one. Without it the router still runs
+  It costs one change stream per proxy, on the fast tier. That stream used to be
+  opened only when the query cache was on; it is now always open, so the proxy's
+  own account needs the privilege to open one. Without it the proxy still runs
   and says so at ERROR, and a collection dropped out of band goes back to being
-  noticed at the next catalog listing or router start.
+  noticed at the next catalog listing or proxy start.
 
-  Dropping a tiered collection **through the router** is still the right thing to
+  Dropping a tiered collection **through the proxy** is still the right thing to
   do, because that is where every consequence of a drop is handled at once rather
   than a moment later.
 
@@ -300,7 +300,7 @@ Range queries are governed by the watermark below.
   is the direction that lets a duplicate of an archived document through and
   stops all mirroring when the archive's own index refuses it. Writing it once
   added the remembered **hint** and the remembered **view**, which neither
-  cleared: the hint is a sparse or partial index's own filter, which the router
+  cleared: the hint is a sparse or partial index's own filter, which the proxy
   reproduces against the archive so that a fall-through read is narrowed the way
   the hint narrows it, and whether a name is a view decides whose completeness
   claim judges a read of it. Both are untrue after a drop.
@@ -324,13 +324,13 @@ Range queries are governed by the watermark below.
 - **An eviction sweep waits before it removes what it has just stopped
   claiming.** The evictor raises the completeness watermark first, so an
   interrupted sweep never leaves a claim wider than the truth. That protects a
-  reader who reads the claim fresh; the router caches one, because reading it
+  reader who reads the claim fresh; the proxy caches one, because reading it
   per query would put an archive round trip on the hot path.
 
   So for a few seconds after the raise there are two copies of the claim and the
-  router's is the older, wider one. Measured before this, with a fast tier
+  proxy's is the older, wider one. Measured before this, with a fast tier
   claiming all of history and a sweep removing 905 of 2,000 documents: the
-  router answered `countDocuments` with **1,095 where the archive holds 2,000**,
+  proxy answered `countDocuments` with **1,095 where the archive holds 2,000**,
   and answered 2,000 again seven seconds later. No error either time.
 
   The sweep now waits out that window between raising the claim and acting on
@@ -358,7 +358,7 @@ Range queries are governed by the watermark below.
 - **A feeder that has stopped is not a feeder that is behind.** Reads wait for
   mirroring to reach what you have already written, up to `router.archive_wait`,
   and a feeder that is merely behind gets there. One that has stopped never
-  will, so the router stops waiting for it: a position record that exists and
+  will, so the proxy stops waiting for it: a position record that exists and
   has gone stale is the evidence. Under the default `router.freshness: strict`
   it then refuses at once, naming the feeder; under `permissive` it answers at
   once and says the answer may be behind.
@@ -419,7 +419,7 @@ Range queries are governed by the watermark below.
   feeder stopped, one update, one insert and one delete made against the fast
   tier, the oplog rolled, and the remedy then followed exactly: the updated
   document came back right, the inserted one arrived, and the deleted one stayed
-  live in the archive and was served to a client. The router counted eleven
+  live in the archive and was served to a client. The proxy counted eleven
   where the application had left ten.
 
   It is not an oversight in the remedy, it is what the remedy can see. A delete
@@ -446,14 +446,14 @@ Range queries are governed by the watermark below.
   only that some matching document is acted on, so the fast tier's choice is as
   good as the archive's. `update` and `delete` statements carry no sort.
 - **Dropping a unique index reaches both tiers.** Uniqueness across the tiers is
-  enforced from the fast tier's indexes, so once one is dropped there the router
+  enforced from the fast tier's indexes, so once one is dropped there the proxy
   accepts a value the archive still refuses. The feeder cannot mirror that
   document: it says so once and leaves it on the fast tier alone, where the
   evictor will not touch it either, because a document the archive does not hold
-  is never evicted. Measured before this: the index dropped through the router,
+  is never evicted. Measured before this: the index dropped through the proxy,
   then the duplicate the application was now entitled to write, and afterwards
   the fast tier held two documents and the archive one. The indexer also put the
-  index back on the next router start, so the constraint was off now and on
+  index back on the next proxy start, so the constraint was off now and on
   again later.
 
   A plain index is a different thing and stays where it is. It is a decision
@@ -461,7 +461,7 @@ Range queries are governed by the watermark below.
   archive for the reads that fall through; `cline indexes` reports that, and
   flags a unique index missing from the fast tier as the hazard it is.
 
-  **The router now says so at the moment the difference is made.** `cline
+  **The proxy now says so at the moment the difference is made.** `cline
   indexes` is a report somebody has to remember to run, and the divergence is
   created by an ordinary application command that nobody is watching: an index
   added for a new query lands on the fast tier, where the working set is, and
@@ -469,7 +469,7 @@ Range queries are governed by the watermark below.
   multi-terabyte archive that is minutes against milliseconds, which is that
   command's own argument for existing. So a `createIndexes` on a tiered
   namespace that leaves the archive without an index over the same fields is one
-  WARN naming the index and the namespace. Once per index per router, because a
+  WARN naming the index and the namespace. Once per index per proxy, because a
   client that rebuilds one should not fill the log, and compared by key rather
   than by name, because an archive index over the same fields under another name
   serves the read exactly as well. A unique index raises it too: the constraint
@@ -481,7 +481,7 @@ Range queries are governed by the watermark below.
   `$geoNear` with no geospatial one, rather than scanning, so a read that falls
   through to an archive without them fails rather than slows. Measured with the
   text index on the fast tier alone: `text index required for $text query`
-  through the router, and answered as soon as the archive had one too. Build it
+  through the proxy, and answered as soon as the archive had one too. Build it
   on the archive, or keep the namespace warm enough that these reads never fall
   through.
 - **A tiered collection cannot be turned into one the feeder cannot mirror.**
@@ -493,10 +493,10 @@ Range queries are governed by the watermark below.
   feeder starts, and nothing stopped a client doing it afterwards.
 
   Measured on a tiered collection of 200 documents of about a kilobyte, with
-  `convertToCapped` to 4KB through the router. Three things happened and the
+  `convertToCapped` to 4KB through the proxy. Three things happened and the
   command reported success: the fast tier went to 4 documents immediately, the
   feeder then refused to start at all so mirroring stopped for every namespace,
-  and once anything claimed the fast tier was complete the router answered
+  and once anything claimed the fast tier was complete the proxy answered
   `countDocuments` with 4 where the archive holds 200.
 
   A collection nothing tiers may still be capped or a time series collection,
@@ -539,11 +539,11 @@ Range queries are governed by the watermark below.
   index into a TTL one is the same instruction and is refused the same way. If a
   tiered collection really needs a retention rule, put the index on the archive
   yourself, and be clear that the archive is what keeps this data.
-- **The router says when a tiered collection is not the same collection on both
+- **The proxy says when a tiered collection is not the same collection on both
   tiers.** The fast tier's copy is created with the archive's options before
   anything inserts into it, which is what keeps a collation and a validator
   working after an adoption. Two things get past that: your own insert can
-  create the collection first, and a `collMod` through the router reaches the
+  create the collection first, and a `collMod` through the proxy reaches the
   fast tier alone, because DDL is not mirrored.
 
   Then which tier answers decides the answer. Measured on a collection the
@@ -602,12 +602,12 @@ Range queries are governed by the watermark below.
 
   Both listings now include what the archive holds and the configuration tiers.
   Untiered collections and views stay out, because a read of one goes to the
-  fast tier and comes back empty and listing it would be a lie; the router names
+  fast tier and comes back empty and listing it would be a lie; the proxy names
   those at startup instead. The added database entries carry `sizeOnDisk: 0`,
   for the same reason the stats above report one tier. What a client is allowed
   to see is decided by the fast tier, on that client's own connection, so a
   listing never names something the fast tier withheld. Asking is also what
-  repairs it: the router creates the collection on the fast tier with the
+  repairs it: the proxy creates the collection on the fast tier with the
   archive's options and indexes, which is what lets it be asked for its stats.
 
   **The commands that describe a collection get the same repair, and four of
@@ -625,7 +625,7 @@ Range queries are governed by the watermark below.
   ```
 
   The `collStats` *command* answered, because mongod is lenient about that one
-  form and replies `ok: 1` with a count of nought, which this router then
+  form and replies `ok: 1` with a count of nought, which this proxy then
   corrects to 6. The `$collStats` *stage* errors, and that is what `mongosh`
   sends for `db.coll.stats()`. So two spellings of one question, and the one an
   operator types by hand was the one that failed.
@@ -641,11 +641,11 @@ Range queries are governed by the watermark below.
   asked for. `cline indexes` is what reports both.
 
   `dbStats`'s `collections` counts what the fast tier has rather than what the
-  catalog now lists, and in practice those agree: the router creates the fast
+  catalog now lists, and in practice those agree: the proxy creates the fast
   tier's copy of every namespace it manages as it starts, so a database the fast
   tier had never held still reported 1 collection where the archive holds one.
   What it will not show is a collection that appeared in the archive after this
-  router started and that nothing has listed or written to since.
+  proxy started and that nothing has listed or written to since.
 - **TLS is handled, in both directions.** `router.tls.cert` and `key` make the
   listener speak it, `ca` checks client certificates, and
   `require_client_cert` insists on one. Whether the fast tier needs TLS is read
@@ -674,9 +674,9 @@ This covers the cases that used to need a decision before adoption: unbounded
 collection, and skip-based pagination. All of them now return the same answer
 they would from a single cluster.
 
-**The one difference a caller can observe is freshness**, and the router closes
+**The one difference a caller can observe is freshness**, and the proxy closes
 it rather than documenting it away. The archive trails the fast tier by the
-feeder's mirroring lag, so before answering from the archive the router waits
+feeder's mirroring lag, so before answering from the archive the proxy waits
 for mirroring to reach the instant the read began. Every write that completed
 before then is in the archive by the time it is read, which is why a fallback
 read cannot miss a write that already returned or hand back a document the
@@ -698,11 +698,11 @@ every `feeder.position_every` as one small document with no resume token at
 **What is left is two quantisations, and both were larger than they needed to
 be.** The feeder can only say "everything written up to here is mirrored" when a
 change stream poll comes back empty, so a fallback read waits for the next poll.
-And the router used to re-read the position on its own timer, every 25 ms, with
+And the proxy used to re-read the position on its own timer, every 25 ms, with
 each waiting read consulting and refreshing a reading it reused for 20 ms, which
 put a second interval in front of one it was already waiting out.
 
-The router's side is gone. One goroutine polls while anything is waiting and
+The proxy's side is gone. One goroutine polls while anything is waiting and
 wakes every waiter the moment the position moves, so the cost is a fixed stream
 of reads of one small document rather than one per waiting client, and the wait
 is as short as the position is new. The feeder's side is a cadence to choose,
@@ -754,7 +754,7 @@ through. Three runs of each, alternating, on the same data:
 | the same, p99 | 308, 313, 629 ms | **257, 310, 425 ms** |
 
 **Report the spread, because a single pair of runs here says almost nothing.**
-One machine carries six mongods, the router, the feeder and the shop, and the
+One machine carries six mongods, the proxy, the feeder and the shop, and the
 same configuration has come back at 46/s and at 98/s. Alternating the arms and
 repeating them is what makes the two ranges mean something: they do not overlap,
 so the worst run of the faster cadence still beats the best run of the slower
@@ -765,7 +765,7 @@ only move when a poll finds the stream empty.
 
 **What the wait compares was the other half of getting this right, and it was
 wrong for longer.** "How far mirroring has got" was the feeder's own wall clock,
-and "the instant the read began" is the router's, so on separate hosts the
+and "the instant the read began" is the proxy's, so on separate hosts the
 barrier was only as sound as the skew between two machines nothing keeps in
 step. The dangerous direction is silent: a feeder whose clock runs a little
 ahead publishes a position past writes it has not mirrored, and a read that
@@ -780,7 +780,7 @@ Both halves now use the replica set's own logical clock, which neither daemon
 has an opinion about. The feeder publishes the cluster time it has mirrored
 through, taken from an applied event or, when the poll is empty, from that
 poll's post-batch resume token, which is MongoDB saying "nothing exists up to
-here" rather than anyone's guess. The router keeps the newest `operationTime`
+here" rather than anyone's guess. The proxy keeps the newest `operationTime`
 the fast tier has reported, which every reply carries and which is therefore
 free, and any write already acknowledged to a client happened at or before it.
 A fallback read has to clear both bars, never either, so requiring the cluster
@@ -789,9 +789,9 @@ against a feeder from before this.
 
 **The wall-clock bar stayed, and it had the same disease with the symptoms
 reversed.** It has to stay, because it is the only one that covers a write this
-router never saw: a second router's writes are not in this one's `operationTime`,
+proxy never saw: a second proxy's writes are not in this one's `operationTime`,
 and the feeder having mirrored past the instant your read began covers them
-whatever anybody wrote them through. But a router running a few seconds ahead of
+whatever anybody wrote them through. But a proxy running a few seconds ahead of
 its feeder never clears it. Every read that falls through then waits the entire
 `archive_wait` and answers stale anyway, which is slow and stale, the pair this
 barrier exists to avoid, and the log line it produces is the one a genuinely
@@ -799,10 +799,10 @@ lagging feeder produces. Nothing distinguishes them.
 
 So the two instants are put in one frame before they are compared. Both daemons
 talk to the archive, so both can say how far their own clock is from that one:
-the feeder publishes its offset in the position record, the router measures its
+the feeder publishes its offset in the position record, the proxy measures its
 own in the background on the same one-minute cadence, and the archive's clock is
 then a reference neither has to trust the other about. With either offset
-missing, which is a feeder from before this or a router that has not managed a
+missing, which is a feeder from before this or a proxy that has not managed a
 reading yet, the raw instants are compared exactly as they were. A correction
 applied on one side only would be worse than none.
 
@@ -821,9 +821,9 @@ a second, a write reached a change stream in 7.3 ms at the median, the archive
 in 9.7 ms and the published position in 11.5 ms. The sales report answered from
 the archive took 18.8 ms at the median against 4.6 ms on the cluster alone.
 
-Most of what it waited for were writes it could not see. So the router first
+Most of what it waited for were writes it could not see. So the proxy first
 asks the fast tier's primary for `hello`'s `lastWrite`, an oplog position at or
-after every write acknowledged to anyone, through this router or not. It waits
+after every write acknowledged to anyone, through this proxy or not. It waits
 for its own tail of the fast tier's oplog to read that far, a fraction of a
 millisecond, and takes the newest write that tail saw in the read's database. A
 position at or past that write is enough, and the bars above are not consulted.
@@ -847,7 +847,7 @@ bar never asks `hello` at all.
 | the cluster alone | 4.6 ms | |
 
 **Liveness is decided by watching, not by subtracting.** A feeder that has
-stopped leaves its last position behind, and a router that read that as
+stopped leaves its last position behind, and a proxy that read that as
 "mirroring is a little behind" would make every fallback read wait the whole
 barrier for a feeder that is never going to catch up: measured with the feeder
 stopped, 40 point reads took 185 seconds against 97 ms straight at the archive.
@@ -858,9 +858,9 @@ is the floor of the staleness window at the default cadence, and two seconds
 between two hosts is ordinary. A record that differs from the one seen before is
 a publication that happened between the two readings, whatever either machine
 thinks the time is, so that is what is watched now: it moved, it is alive; it
-has not moved for a staleness window of this router's own elapsed time, it is
+has not moved for a staleness window of this proxy's own elapsed time, it is
 stopped. A record first seen already stale by more than five minutes is taken at
-its word, so a router started while the feeder has been down for hours does not
+its word, so a proxy started while the feeder has been down for hours does not
 make the first read wait to learn what is obvious.
 
 `cline preflight` and every daemon start now report a host clock more than
@@ -900,13 +900,13 @@ leaves the write the client actually sent with its own.
 What that changes for a deployment: a write with a deadline too short for the
 copy-up it needs now **fails** with `MaxTimeMSExpired` where it used to succeed
 slowly. That is what one cluster does with a deadline it cannot meet, and it is
-reported with MongoDB's own code rather than this router's generic one, so a
+reported with MongoDB's own code rather than this proxy's generic one, so a
 driver can tell a deadline from a refusal. A write with no `maxTimeMS` is
 unchanged and still copies up everything it matches.
 
 A read of something written milliseconds ago is therefore seen, at the cost of
 that wait. A stopped feeder is the one case the barrier cannot hold, and there
-the router answers anyway and warns rather than turning a dead background daemon
+the proxy answers anyway and warns rather than turning a dead background daemon
 into failed queries. It notices quickly: the position record carries the cadence
 it promised, so four missed publications mark the publisher as gone instead of
 making every read wait out the full `archive_wait`.
@@ -926,7 +926,7 @@ compares against an untiered reference for twenty error shapes.
 
 Two kinds of failure keep the refusal, because they are not MongoDB's answer to
 the client's command: a failure to reach the archive at all, and an
-authorization error, which describes the router's own credentials rather than
+authorization error, which describes the proxy's own credentials rather than
 the caller's and would otherwise send whoever investigates to the wrong cluster.
 
 ### Aggregations
@@ -953,17 +953,17 @@ Two rules do the work, and both exist because a pipeline is not a filter:
 
 Collections Thermocline does not tier are exempt. They live only on the fast
 tier, so they are whole by definition, and demanding a claim for them would
-refuse perfectly good queries. That is why the router reads `feeder.namespaces`.
+refuse perfectly good queries. That is why the proxy reads `feeder.namespaces`.
 
 `$out` and `$merge` are refused even under `completeness: permissive`. Returning
 a short answer is a wrong number on somebody's screen; writing one makes it the
 input to everything downstream.
 
-**A pipeline the router runs itself is first explained on the client's own
+**A pipeline the proxy runs itself is first explained on the client's own
 connection.** A tiered `$out`, a `$merge` whose target has archived documents,
-and an aggregation answered from the archive all run on the router's own
+and an aggregation answered from the archive all run on the proxy's own
 clients, with its own credentials. Until 2026-10-25 nothing asked whether the
-client could have run them. Measured through the router with proxied
+client could have run them. Measured through the proxy with proxied
 authentication: a user with no privilege on the database replaced a ten
 document tiered collection with one document of its own, and a user allowed to
 read one collection read another through `$unionWith`. mongod authorises an
@@ -977,7 +977,7 @@ privileges and the command goes on. `testauth.sh` checks both cases.
 
 A view is a saved pipeline over another collection. What makes it different from
 every other way of naming a collection is that the pipeline is **stored on the
-server and not sent with the query**, so every judgement the router makes about a
+server and not sent with the query**, so every judgement the proxy makes about a
 read of one is made without it.
 
 Three things follow, and all three were wrong answers before they were rules.
@@ -1000,7 +1000,7 @@ shape reporting most often takes, and it is a view whose base is untiered.
 
 It stays a refusal rather than an archive answer. The archive's copies carry
 tombstones, and the predicate that filters them goes in front of a pipeline: it
-cannot reach inside a definition the router has no way to rewrite. Answering it
+cannot reach inside a definition the proxy has no way to rewrite. Answering it
 there would join deleted documents.
 
 **Every path that reads.** A `find` is judged on the way back, an `aggregate`
@@ -1048,7 +1048,7 @@ The order matters. Running the write first and repeating it after a copy-up
 would apply `$inc` twice.
 
 A sweep over an unbounded range could drag the whole archive up to satisfy one
-statement, so there is a ceiling of 10,000 documents. Past it the router refuses
+statement, so there is a ceiling of 10,000 documents. Past it the proxy refuses
 and says so, rather than doing part of the job and reporting success.
 
 ### Writes that ask for no acknowledgement
@@ -1093,7 +1093,7 @@ only:
       after    "shipped", and the fields the fast tier could not see survived
 
     deleteOne({ref: "b1"}, {w: 0})
-      before   the document was still readable through the router
+      before   the document was still readable through the proxy
       after    erased
 
     findAndModify({status: "new"}, sort: {seq: 1}, remove: true, {w: 0})
@@ -1113,8 +1113,8 @@ any match will do, which is all MongoDB promises. An acknowledged write takes
 exactly the shortcuts it took before and pays nothing new.
 
 **Not every guard could be moved in front of the write, and one command is
-refused instead.** A unique index dropped through the router has one to drop
-behind it on the archive, or the archive goes on refusing values the router now
+refused instead.** A unique index dropped through the proxy has one to drop
+behind it on the archive, or the archive goes on refusing values the proxy now
 accepts. Both halves of that live on the reply: which indexes are going has to
 be read before the fast tier removes them, because afterwards there is nothing
 left to ask, and the archive's copy is dropped only once the reply says the fast
@@ -1174,7 +1174,7 @@ against a real mongod, one such `getMore` produced **five** replies.
 
 This proxy reads one reply per request. The other four stayed in the socket, and
 the next command on that connection was answered by them. Measured through the
-router: the reply to a `ping` sent afterwards came back as `responseTo=75`
+proxy: the reply to a `ping` sent afterwards came back as `responseTo=75`
 carrying documents 4 and 5 of the cursor. With upstream connections pooled that
 connection then goes back to the pool, so the next borrower is a different
 client, reading somebody else's documents in answer to its own command.
@@ -1218,7 +1218,7 @@ the answer means: matching nothing reads as the fast tier already holding
 everything the query matches, so the transaction proceeds on the fast tier alone
 and is short, with no error on it. Measured on a document held by the archive
 alone, `{name: "Bob"}`, read inside a transaction as
-`find({name: "bob"}).collation({locale: "en", strength: 2})`: the router
+`find({name: "bob"}).collation({locale: "en", strength: 2})`: the proxy
 answered **0** and mongod answered **1** on the same data untiered. The same
 call now takes the caller's `let`, collation and `maxTimeMS` as one value, so a
 field added to it reaches this path too. `testtxn.sh` checks it with mongod as
@@ -1233,7 +1233,7 @@ write had not, so the write could not see documents the read could. Measured on
 a fast tier collection created with `{locale: "en", strength: 2}`, its archived
 copy holding `{name: "ALICE"}` and the fast tier holding nothing:
 
-| asked with no `collation` field | through the router | untiered reference |
+| asked with no `collation` field | through the proxy | untiered reference |
 | --- | --- | --- |
 | `countDocuments({name: "alice"})` | 1 | 1 |
 | `updateMany({name: "alice"})` modified | 0 | 1 |
@@ -1256,7 +1256,7 @@ sorts before `"B"`, and under the simple collation `"B"` is `0x42` and `"a"` is
 
 | | modified |
 | --- | --- |
-| through the router | `_id: 1`, the document named `"B"` |
+| through the proxy | `_id: 1`, the document named `"B"` |
 | untiered reference | `_id: 2`, the document named `"a"` |
 
 That is not a short answer. It is the write landing on a different record, and
@@ -1265,7 +1265,7 @@ with `remove: true` it is the deletion of one.
 The reading half of an `$out` or `$merge` runs against the archive too, and it
 passed no collation either. A `$group` is where that shows: two spellings go in
 one bucket or two. Measured on `ALICE`, `alice` and `bob` held by the archive
-alone, grouped by name with `en/strength 2`, the router wrote three groups of
+alone, grouped by name with `en/strength 2`, the proxy wrote three groups of
 one where the reference wrote `{ALICE: 2}` and `{bob: 1}`. The comment above
 that function already said what makes it the worst of the three: what comes out
 of it is not an answer a client can ask again, it is written into the collection
@@ -1311,7 +1311,7 @@ has since been evicted came back with `fullDocument: null`.
 
 Null does not mean "somewhere else", it means gone. Measured: a change stream
 reported an update with `fullDocument: null` while a read of that same document
-through the router returned it. An application watching a collection to keep a
+through the proxy returned it. An application watching a collection to keep a
 cache or a search index in step would have deleted the entry, and the document is
 still there.
 
@@ -1366,7 +1366,7 @@ copies archived documents up, and the completeness guard runs a writing pipeline
 itself when the input is archived.
 
 Measured: `aggregate` with `$out` and `explain: true` wrote nothing on mongod,
-and through the router it wrote all ten documents into the target and returned no
+and through the proxy it wrote all ten documents into the target and returned no
 plan at all. The client asked what would happen and was told nothing, having had
 it happen.
 
@@ -1394,14 +1394,14 @@ uninvited, since no driver in the harness will.
 
 ### Whose cursor is it
 
-A cursor over an archive answer is this router's, not the fast tier's, so it is
-served from a registry here. That registry belongs to the router rather than to
+A cursor over an archive answer is this proxy's, not the fast tier's, so it is
+served from a registry here. That registry belongs to the proxy rather than to
 one connection, which is right: a real MongoDB cursor is server-scoped, and a
 driver's pool sends the `getMore` from whichever connection is free. Nothing else
 scoped it, and the ids ran in sequence from a fixed start, so the first cursor
 was always 2^62+1.
 
-Measured with two connections to one router: the second, which had opened
+Measured with two connections to one proxy: the second, which had opened
 nothing, sent a `getMore` for that id and was given the first client's documents
 along with their real namespace. Naming a different collection in the command
 changed nothing, because the batch comes from the cursor and not from the name.
@@ -1412,7 +1412,7 @@ Three things now hold, each of them mongod's own rule:
 
 - **Ids are random**, in the top quarter of the range so they stay clear of the
   server's own, so no id can be counted off.
-- **A cursor belongs to whoever opened it.** The user when this router knows it,
+- **A cursor belongs to whoever opened it.** The user when this proxy knows it,
   and the session whenever the client sends one, which every driver since 3.6
   does. mongod: "If authentication is enabled, you can only run getMore against
   cursors you created. Additionally, for cursors created inside a session, you
@@ -1420,7 +1420,7 @@ Three things now hold, each of them mongod's own rule:
   the cursor is scoped to the connection, which is stricter than mongod and only
   reachable with no authentication at all.
 - **The collection named has to be the cursor's.** mongod has refused a mismatch
-  since at least 6.0, and the router now returns the same error word for word.
+  since at least 6.0, and the proxy now returns the same error word for word.
 
 Refusals use mongod's code 13, so a driver sees the error it already handles.
 `test/cursorowner` is the client that found this.
@@ -1439,10 +1439,10 @@ both tiers answers both.
 
 The documents in the archive were never claimed. They are the only ones the
 constraint needs help with -- the fast tier's own index enforces itself over what
-the fast tier holds -- and none of them was ever written through a router that
+the fast tier holds -- and none of them was ever written through a proxy that
 knew about this index. Measured with the index created after the document was
 archived: the archive holds `held@x.com`, the index is created through the
-router, and an insert of a second `held@x.com` was **accepted**. It was written
+proxy, and an insert of a second `held@x.com` was **accepted**. It was written
 down, in the rollout list saying to run `cline keys --rebuild` afterwards, and a
 documented step is not a guarantee.
 
@@ -1450,7 +1450,7 @@ And the build itself was allowed over data that already violated it. mongod
 refuses `createIndex` with `unique` when two live documents share a key; split
 the pair across the tiers and the fast tier's build sees only one of each, so it
 succeeded. Measured with two documents holding `sku: "x"`, one on each tier:
-mongod refuses the same pair in one collection with 11000 and the router
+mongod refuses the same pair in one collection with 11000 and the proxy
 answered ok. The application is then told a constraint holds that does not.
 
 So the walk runs **before** the build, not after it, and that is the only order
@@ -1464,7 +1464,7 @@ goes ahead already covered, and the claims go back if the fast tier turns the
 build down for its own reasons.
 
 The cost is that `createIndexes` waits for a walk of both tiers, next to a build
-that scans the fast tier anyway. It runs only on the router that took the
+that scans the fast tier anyway. It runs only on the proxy that took the
 command, only for a spec that asks for `unique: true`, and only on a tiered
 namespace. If the walk cannot be done at all the build is let through with a
 warning, because refusing a command over a bookkeeping collection that could not
@@ -1520,7 +1520,7 @@ comparison that reports a constraint has gone.
 
 Reading one value per document was wrong in both directions and neither showed
 up as the other. A document holding `["x","y"]` mirrored and then evicted, and a
-second holding `["y","z"]`: the router accepted it, the fast tier accepted it,
+second holding `["y","z"]`: the proxy accepted it, the fast tier accepted it,
 and the archive refused the mirrored insert with `E11000 dup key { tags: "y" }`,
 leaving a document on the fast tier that the archive does not have and the
 evictor will not remove. And a unique index on a path that crosses an array,
@@ -1534,7 +1534,7 @@ What this costs is proportionate and worth knowing: a document with a thousand
 elements in an indexed array claims a thousand registry rows, because mongod puts
 a thousand entries in the index. The registry lives in the archive, so those are
 round trips to the other cluster, batched into as few as the driver will take. A
-unique index on a large array is expensive to write through this router, and it
+unique index on a large array is expensive to write through this proxy, and it
 is expensive in mongod too.
 
 The rules are mongod's and they are pinned by unit tests: one entry per element,
@@ -1558,7 +1558,7 @@ what the application already handles.
 
 Claims are permanent, so a deleted document leaves one behind. That is resolved
 lazily rather than on the delete path: a claim only matters when something
-collides with it, and at that point the router checks whether the owning
+collides with it, and at that point the proxy checks whether the owning
 document still exists in either tier. If it does not, the new document takes the
 claim over. Deletes stay untouched and this costs nothing until there is a real
 conflict.
@@ -1619,7 +1619,7 @@ The filter costs one question per batch, asked of the fast tier. It used to be
 one per document: measured, 300 inserts into a collection with a partial unique
 index took 330 ms against 50 ms for the same insert with a plain one, and now
 take 75 ms. An index whose filter cannot be evaluated is not enforced across
-tiers rather than enforced on a guess, and the router says so.
+tiers rather than enforced on a guess, and the proxy says so.
 
 ### Transactions
 
@@ -1628,7 +1628,7 @@ the statement inside the caller's transaction does not work: the copy-up is an
 ordinary write outside it, and the transaction's snapshot was taken before it
 landed.
 
-The way out is the contract drivers already implement. The router copies the
+The way out is the contract drivers already implement. The proxy copies the
 document up outside the transaction, then returns an error labelled
 `TransientTransactionError`, which every official driver's `withTransaction`
 helper retries from the start. The replay takes a fresh snapshot, the document
@@ -1654,16 +1654,16 @@ retrying forever.
 **Unique keys are checked differently inside a transaction, and have to be.**
 Everywhere else the guard runs before the write, because once a write lands it
 is visible and a duplicate cannot be taken back. Inside a transaction nothing is
-visible until commit, so the guard runs after the write instead: the router
+visible until commit, so the guard runs after the write instead: the proxy
 reads back what the statement actually produced, from inside the caller's own
 session, and refuses by aborting the transaction if it duplicates a key an
 archived document holds.
 
-That ordering is not a preference. The router's own client cannot see a
+That ordering is not a preference. The proxy's own client cannot see a
 transaction's uncommitted writes, so a guard that ran first would compute keys
 for a document that is not there yet. It did, and a transaction that inserted a
 document and then moved it onto an archived document's unique value committed
 two live documents sharing one key, reported as success. Reading the post-image
 inside the caller's session removes the guess entirely: no evaluating a `$inc`
-or a pipeline update, and no dry run in a session of the router's own that
+or a pipeline update, and no dry run in a session of the proxy's own that
 deadlocks against the caller's locks.

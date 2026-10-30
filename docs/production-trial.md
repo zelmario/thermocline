@@ -28,7 +28,7 @@ The shape this was tested in, and the only one supported:
 - `router.terminate_auth` is off, which is the default. Authentication is
   proxied, so mongod judges every command against the client's own account.
 - The four daemons run from the units in `packaging/systemd`, one of each.
-  Name every router in the config if you run more than one (step 13).
+  Name every proxy in the config if you run more than one (step 13).
 
 Know the costs of that shape before you start, because the trial will show
 them. They are in `docs/operations.md`: one upstream connection per client,
@@ -45,7 +45,7 @@ staging pair built the way production will be:
 |---|---|---|
 | Adoption | `docs/adoption.md`, steps 0 to 16 | `test/pilot/setup.sh` |
 | Rollback | `docs/adoption.md`, step 12 | `test/testrollback.sh` |
-| A feeder that stopped past the oplog | `docs/router.md`, the feeder's exit and `cline backfill --apply --clear-checkpoint` | `test/testbackfill.sh` |
+| A feeder that stopped past the oplog | `docs/proxy.md`, the feeder's exit and `cline backfill --apply --clear-checkpoint` | `test/testbackfill.sh` |
 | A rolling upgrade | `README.md`, Both tiers run the same MongoDB release | `test/verskew.sh` |
 | Losing the fast tier | `docs/operations.md`, Backups | `test/testrestore.sh` |
 | Installing the units | `packaging/systemd` | `test/testservice.sh` |
@@ -60,14 +60,14 @@ change to the document.
 
 Each stage changes one thing, so a number that moves has one cause.
 
-**Stage A: the router in front, nothing evicted.** Run the feeder and the
-router, point the application at the router, and leave the evictor and the
+**Stage A: the proxy in front, nothing evicted.** Run the feeder and the
+proxy, point the application at the proxy, and leave the evictor and the
 warmer stopped. The fast tier starts empty, so most reads fall through to the
 archive at first, and the copy-ups fill it. This stage costs only latency, and
 it is the cheapest one to leave: the archive still holds everything, so the
 way back is step 12 alone.
 
-Run `cline preflight` before the start and keep its output. Read the router's
+Run `cline preflight` before the start and keep its output. Read the proxy's
 startup lines; every warning there names its own action.
 
 **Stage B: warm, then claim the keys.** Run the warmer over the window the
@@ -93,13 +93,13 @@ Record each one in every stage:
 
 | What | Measured on the test box | Where to read it |
 |---|---|---|
-| Proxy overhead, read the fast tier answers | 130µs (720µs proxied, 590µs direct) | client timings, router on and off |
-| A read the archive answers | p50 127 to 135ms, against 1.5ms | client timings, `from_archive` on the router line |
-| Share of reads answered by the archive | 30% to 42% in the shop runs | the router's minute line |
+| Proxy overhead, read the fast tier answers | 130µs (720µs proxied, 590µs direct) | client timings, proxy on and off |
+| A read the archive answers | p50 127 to 135ms, against 1.5ms | client timings, `from_archive` on the proxy line |
+| Share of reads answered by the archive | 30% to 42% in the shop runs | the proxy's minute line |
 | Mirroring rate | 2,000 to 3,700 documents/s | the feeder's log, during a bulk load |
 | Mirroring lag, steady state | 0.116s maximum over 1,130 samples | `thermocline_mirroring_lag_seconds` |
 | A write across a failover | about 350ms | the application's own retry timings |
-| Router start, 160 tiered namespaces | 1.3s | the router's ready line |
+| Proxy start, 160 tiered namespaces | 1.3s | the proxy's ready line |
 
 A number that is worse off this box is expected and is not a defect. A number
 that is worse **and** comes with a stale read, a refusal or a violation of the

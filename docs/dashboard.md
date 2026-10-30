@@ -6,7 +6,7 @@ Part of [Thermocline](../README.md).
 
 ## The dashboard
 
-Set `router.dashboard` to an address and the router serves one page showing what
+Set `router.dashboard` to an address and the proxy serves one page showing what
 each tier holds and how it is being used:
 
 ```yaml
@@ -33,7 +33,7 @@ The page has no authentication of its own. It names collections and reports
 traffic, so bind it to an operator network rather than to the address the
 application dials.
 
-**The router says so when it is bound to every interface**, because the
+**The proxy says so when it is bound to every interface**, because the
 difference between following that advice and not is one character in a config
 file. A wildcard address gets one WARN naming what is on the page; an explicit
 address is somebody's decision and gets nothing, since a warning on a deliberate
@@ -74,20 +74,20 @@ because an index built on an empty collection is free and one built on a full
 one is a scan.
 
 Three paths do it, through one implementation in `internal/promote`: the warmer
-before it fills a namespace, the router the first time it copies a document up,
-and the router at startup for every namespace it manages that the archive
+before it fills a namespace, the proxy the first time it copies a document up,
+and the proxy at startup for every namespace it manages that the archive
 already holds. Once built, never again.
 
 **A view is stranded like a collection and cannot be fixed like one.** The
 application's views live on the existing cluster; the fast tier has none of
 them, so reads of them return nothing at all. Measured on an adopted view over a
 tiered collection: five documents on the original cluster, zero through the
-router, no error. The router names views separately at startup because the
+proxy, no error. The proxy names views separately at startup because the
 advice differs, and the advice for a collection cannot be followed for a view:
 tiering one is meaningless, so the feeder refuses it. Recreate them on the fast
 tier with `createView` and tier the collections they read from.
 
-**A view created through the router is given to the archive as well**, and that
+**A view created through the proxy is given to the archive as well**, and that
 buys something beyond a rollback working. A read through a view used to be
 refused whenever the collection underneath it was incomplete, because the archive
 held the documents and not the definition; when it holds both, the read has a
@@ -104,10 +104,10 @@ is still refused with the reason.
 
 **The accounts are the other thing the new tier does not have.** The existing
 cluster carries the application's users; the fast tier is a new replica set and
-carries none of them. The router authenticates against the fast tier, so on day
+carries none of them. The proxy authenticates against the fast tier, so on day
 one every connection is refused with MongoDB's ordinary `Authentication failed`
 and nothing connects that message to the tier missing the account. The refusal
-is correct; the silence is the failure. The router now names them once at
+is correct; the silence is the failure. The proxy now names them once at
 startup, and creating them on the fast tier with the same names, passwords and
 roles is the whole fix.
 
@@ -121,7 +121,7 @@ answers rather than performance.
 Measured on an adopted collection created with `{locale: "en", strength: 2}`,
 with the same three documents present on both tiers:
 
-| | the application's own cluster | through the router |
+| | the application's own cluster | through the proxy |
 |---|---|---|
 | `countDocuments({name: "alice"})` | 2 | **1** |
 | a write the validator rejects | refused | **accepted** |
@@ -130,7 +130,7 @@ No error and no warning in either case. A query that has always matched
 case-insensitively quietly stops, and a rule the application has relied on for
 years quietly stops applying, on the day it is adopted.
 
-So the router creates the fast tier's copy the way the archive has it, before
+So the proxy creates the fast tier's copy the way the archive has it, before
 anything inserts into it: the default collation, the validator and its level and
 action. `capped` and `timeseries` are deliberately not carried, because a capped
 fast tier would remove its own oldest documents and the feeder would read those
@@ -145,7 +145,7 @@ correct, because a unique index built after a duplicate has been accepted is too
 late and will not build; cheapest, because this is the collection the fast tier
 has never held.
 
-It is not only speed. The router reads the **fast tier's** unique indexes to
+It is not only speed. The proxy reads the **fast tier's** unique indexes to
 know which values it must protect across the tiers, so a bare fast tier means
 neither mongod nor the registry is enforcing one, and a constraint the
 application has relied on for years quietly stops holding on the day it is
@@ -170,7 +170,7 @@ inherits the application's TTL index on what is now the archive, so the tier tha
 was adopted to keep history goes on deleting it, on a schedule nothing here set.
 It is invisible from the fast tier: a read the fast tier answers whole never asks
 the archive, and a read that falls through comes back short with no error on it.
-So it is now said out loud, in both places an operator looks. The router and the
+So it is now said out loud, in both places an operator looks. The proxy and the
 warmer warn once per namespace, naming the index, the field and the interval, and
 `cline indexes` reports it as its own finding:
 
@@ -188,7 +188,7 @@ does not bring back what has already gone.
 **Every index build this system starts commits on a majority**, not on every
 voting member, which is mongod's default. The default is what lets one member
 stop an index build: it never commits, `createIndexes` never returns, and
-everything else on that cluster carries on working. The router builds the fast
+everything else on that cluster carries on working. The proxy builds the fast
 tier's indexes before it opens its listener, so what hangs is the start of the
 proxy, with nothing in the log to say why. Found on this project's own cluster
 after one member came up on the wrong address: a build sat nineteen minutes and
@@ -210,7 +210,7 @@ warm.
 A majority is what the rest of this system already waits for, and a member behind
 builds the index when it catches up, the same as it applies everything else. The
 startup build is bounded as well, at five minutes per namespace, after which the
-router says which namespace it gave up on and what is not being enforced, and
+proxy says which namespace it gave up on and what is not being enforced, and
 goes on starting: an application in front of a proxy that will not start is down.
 
 The warmer deliberately does not have that bound. It builds a namespace's indexes
@@ -287,7 +287,7 @@ nothing falls through.
 `count`, `distinct` and aggregations are judged **before** they run, because a
 pipeline can end in `$out` and refusing one afterwards would leave a truncated
 collection written. That means the fast tier never sees them, so before
-answering any of them from the archive the router asks the fast tier, over the
+answering any of them from the archive the proxy asks the fast tier, over the
 client's own authenticated connection, whether that client may read the
 collection. The fast tier's own error is returned unchanged.
 
@@ -295,14 +295,14 @@ Without that check a client with no access to a tiered collection could obtain
 its contents with a count, but only while the collection was incomplete, which
 is to say only while tiering was doing its job.
 
-The archive is reached with the router's own credentials, because the client has
+The archive is reached with the proxy's own credentials, because the client has
 no session there and cannot be given one. **It should therefore be reachable
-only by the router**, which the operating rules already require for a different
+only by the proxy**, which the operating rules already require for a different
 reason: the cheap tier is read-only to everyone except the feeder.
 
 **With `router.terminate_auth` on, none of the above applies and this section is
-the whole of the protection.** The upstream connections belong to the router, so
-the fast tier will do whatever they ask, and the router decides instead. It
+the whole of the protection.** The upstream connections belong to the proxy, so
+the fast tier will do whatever they ask, and the proxy decides instead. It
 denies by default: a command whose required privilege is not in the mapping is
 refused by name rather than guessed at, which is why an unusual client meets
 refusals rather than a hole.
@@ -365,6 +365,6 @@ It is red for that reason: unlike the counters beside it, which record things
 that have happened, this one describes a condition that is still true.
 
 `cline preflight` lists them, namespace by namespace, with the index and the
-colliding key. The same number leaves the router as
+colliding key. The same number leaves the proxy as
 `thermocline_not_superset_namespaces`, which pages.
 

@@ -29,11 +29,11 @@ much of it this is, which is the number `feeder.position_every` moves. On the
 Hetzner staging pair under the shop on 2026-10-09 it averaged 16.5ms at the 5ms
 default, and 28.1ms at the old 20ms.
 
-**`mirroring_lag_seconds` is exported by the router rather than by the feeder on
-purpose.** The router already reads the feeder's published
+**`mirroring_lag_seconds` is exported by the proxy rather than by the feeder on
+purpose.** The proxy already reads the feeder's published
 position on every fallback read, so it knows the lag continuously, and a gauge
 published by the feeder itself goes silent exactly when the feeder dies, which
-is the moment the number matters. Scraped from the router, a dead feeder reads
+is the moment the number matters. Scraped from the proxy, a dead feeder reads
 as lag climbing, which is what an alert can see.
 
 ```yaml
@@ -116,7 +116,7 @@ write drops a held answer only when it could have changed it. An insert is
 checked against the answer's filter, and an update against the fields the
 answer read. `invalidated` counts the answers a write dropped, and `spared`
 the ones it left in place. Deletes, replacements, upserts, and any query or
-write the router cannot read completely still drop everything that read the
+write the proxy cannot read completely still drop everything that read the
 collection. So a collection whose writes are mostly deletes shows `invalidated`
 climbing and `spared` flat, and that is the cache working as designed.
 
@@ -170,27 +170,27 @@ archive will never hold while the fast tier does, so the evictor will never
 remove it and a read that falls through will never find it.
 
 `inserts_over_existing` has no rule, deliberately, because it counts a shape
-rather than a fault. Through the router an insert for an `_id` the archive holds
+rather than a fault. Through the proxy an insert for an `_id` the archive holds
 live is refused as a duplicate key, so a write straight at the fast tier's
 mongod raises this and nothing else does, except an application that deletes an
 `_id` and uses it again, which is legitimate and raises it too. Measured on a
 shop run of 348 mirrored batches with copy-ups and evictions underneath: zero.
 On one write made straight at the fast tier: one. On a delete and re-insert of
-the same `_id` through the router: also one. So it is a number to go and look at
+the same `_id` through the proxy: also one. So it is a number to go and look at
 rather than one to be woken by, and a deployment where it climbs without anybody
-reusing `_id`s has a writer that is not going through the router.
+reusing `_id`s has a writer that is not going through the proxy.
 
 `resurrections_undone` counts a race the feeder repairs rather than a fault to
 act on. A copy-up reads the archive and then inserts, and a delete landing in
-between, often from another router, is undone by the insert: the fast tier held
-the deleted document live, and the router answered it, until 2026-09-30. The
+between, often from another proxy, is undone by the insert: the fast tier held
+the deleted document live, and the proxy answered it, until 2026-09-30. The
 feeder sees the delete and the copy-up's insert in the fast tier's own order, so
 it removes the document again and says so in its log. Measured with a
 transaction warming 3,000 orders while one of them was deleted through a second
-router: 12 of 12 rounds put it back before, and every one was removed after. A
+proxy: 12 of 12 rounds put it back before, and every one was removed after. A
 steady trickle is expected on a deployment that deletes documents a warm or a
 write is copying up. What each one leaves is a few milliseconds in which the
-router answers the deleted document, so a rate that climbs with traffic says
+proxy answers the deleted document, so a rate that climbs with traffic says
 those windows are adding up.
 
 
@@ -202,7 +202,7 @@ something.
 
 **1. `thermocline_panics_total` above zero. Page.** A panic is a defect, with a
 stack in the log, and the connection it happened on was closed. Nothing about
-the tiering is wrong at that moment, but something the router was asked to do it
+the tiering is wrong at that moment, but something the proxy was asked to do it
 could not, and the next client to ask will hit it too.
 
 **2. `thermocline_stale_reads_total` above zero. Page.** A read fell through to
@@ -215,9 +215,9 @@ rule 2.** This is the bar rule 2 actually fires on, and rule 3 below is not it.
 
 A fall-through read clears two bars: the feeder's published instant against the
 instant the read began, which is what `mirroring_lag_seconds` measures, and the
-feeder's published cluster time against the newest `operationTime` this router
+feeder's published cluster time against the newest `operationTime` this proxy
 has already handed a client. The second is the binding one on any deployment
-with traffic, because a busy router always has a fresh `operationTime` to clear
+with traffic, because a busy proxy always has a fresh `operationTime` to clear
 while a feeder that has fallen behind does not.
 
 Only the first was exported until 2026-09-18, which is what rule 3 watches. So
@@ -228,7 +228,7 @@ seconds before and 14ms five seconds after, and the feeder logged nothing
 because nothing failed.
 
 Zero is healthy. When rule 2 pages, read this one to tell a feeder that is
-behind from a barrier that fired for another reason, and read the router's
+behind from a barrier that fired for another reason, and read the proxy's
 `which bar the freshness wait gave up on` line, which carries both timestamps.
 
 **3. `thermocline_mirroring_lag_seconds` above the eviction notice's lifetime.
@@ -248,7 +248,7 @@ list to work through, the feeder's log names each one as it gives up, and
 is an event: that one fires when a document is given up and goes quiet, this one
 stays up until somebody resolves it.
 
-**4. `thermocline_refused_total` rising. Investigate, do not page.** The router
+**4. `thermocline_refused_total` rising. Investigate, do not page.** The proxy
 would not answer a command, and every refusal names its reason in the log. A
 steady trickle is an application asking for something this system does not do; a
 step change means completeness claims no longer cover what is being asked, which
@@ -291,7 +291,7 @@ pass.
 
 Every daemon publishes into this one family, by whatever route it has: the
 evictor in its report, the feeder in the position record it writes several times
-a second, and the router by measuring its own. The rules below select on the
+a second, and the proxy by measuring its own. The rules below select on the
 gauge name rather than the daemon, so all of them are covered without a rule
 each. The other two matter less than the evictor and are worth watching anyway:
 mirroring lag and the freshness barrier are both worked out by subtracting one
@@ -307,21 +307,21 @@ expect and alert on their absence.
 Mirroring is handled in the export instead, because it is the one that matters
 most: with no position and no checkpoint, `thermocline_mirroring_lag_seconds`
 reports `+Inf` rather than vanishing, so the first alert anyone builds fires for a
-feeder that has never run as well as one that has stopped. The router's own
+feeder that has never run as well as one that has stopped. The proxy's own
 absence is the scrape target going down, which is `up == 0` on the job.
 
 **8. `thermocline_claim_grace_reads_total` above zero, if you set
 `router.claim_grace`. Page.** Every read it counts was answered from a
-completeness claim the router could not check, because the archive was
+completeness claim the proxy could not check, because the archive was
 unreachable. That is the trade you asked for, and it is also the only signal
 that says the trade is being taken: the answers are correct if the archive is
-down and short if only this router is cut off, and the counter cannot tell those
+down and short if only this proxy is cut off, and the counter cannot tell those
 apart. Find out which it is. On a deployment that leaves the grace off this
 counter stays at zero for ever, so the alert costs nothing.
 
 **9. `thermocline_unauthorized_total` or `thermocline_unreadable_total` above
 zero. Investigate.** The first is a client reading a collection it has no
-permission for, refused. The second is a message the router could not inspect,
+permission for, refused. The second is a message the proxy could not inspect,
 which means it was forwarded unguarded; a compressed connection is the cause, and
 the remedy is removing the client's compressors.
 
@@ -332,7 +332,7 @@ resume`. A hold that is forgotten is its own outage, and no other signal says
 why, because every daemon is running and reporting healthy passes.
 
 The gauge is read from the archive's own record of when the hold was taken, so
-it survives a router restart and cannot be reset by one. It is exported as zero
+it survives a proxy restart and cannot be reset by one. It is exported as zero
 while nothing is held rather than going missing, for the same reason mirroring
 lag reports `+Inf`: a rule cannot watch a series that only appears once the
 thing it warns about has happened.
@@ -464,7 +464,7 @@ groups:
 ```
 
 **These rules are extracted from this file and run**, by `test/testalerts.sh`,
-against a real Prometheus scraping a real router. They were written down and
+against a real Prometheus scraping a real proxy. They were written down and
 never executed until 2026-09-03, which is a strange thing to leave unproved: a
 rule that does not fire is indistinguishable from a system with nothing wrong.
 
@@ -474,13 +474,13 @@ document the fast tier holds (which fires two rules of deliberately different
 shapes, an increase that reports the moment and a gauge that stays up while the
 condition lasts), a stream of refusals in a quarter of an hour, an operator's
 hold on eviction left for an hour, a daemon that has not finished a pass in ten
-minutes, and the router being down. Each of those also has to go back to quiet when the state is
+minutes, and the proxy being down. Each of those also has to go back to quiet when the state is
 put right, because a rule that never clears is a rule somebody silences.
 
 It checks the three ways they fail quietly. `promtool` rejects a typo. A metric
 this file names and the exporter does not is reported by name, which is the
 drift that matters and the one `promtool` cannot see: a renamed counter is
-valid PromQL that never matches anything. And with the router stopped,
+valid PromQL that never matches anything. And with the proxy stopped,
 `ThermoclineRouterDown` has to actually reach `firing`, while
 `ThermoclinePanic` has to stay quiet, because two rules that both fire on
 everything are worth as much as neither.

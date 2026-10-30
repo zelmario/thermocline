@@ -18,7 +18,7 @@ namespace is refused rather than answered short. An answer stored before that
 began is exactly the short answer the refusal exists to prevent, so the cache is
 not consulted for such a namespace at all.
 
-It costs nothing in a healthy deployment: the set is read from the router's own
+It costs nothing in a healthy deployment: the set is read from the proxy's own
 cached copy with no round trip, and it is empty. A write to the collection would
 drop the stored answers anyway, and the state does arise from a write, so this
 closes a window rather than a gap that was standing open. It was found by
@@ -29,8 +29,8 @@ every time.
 The other thing it will not answer is a namespace nothing can tell it about.
 
 Two things drop a stored answer, and both have a reach. A write through the
-router drops what it could have changed in that collection, and the fast tier's
-change stream covers the writers that go around the router. That stream is a
+proxy drops what it could have changed in that collection, and the fast tier's
+change stream covers the writers that go around the proxy. That stream is a
 client-level one, which MongoDB does not open on the `admin`, `local` or
 `config` databases and does not deliver system collections through, and the
 archive's own bookkeeping database sits on the other tier, so no stream of the
@@ -46,7 +46,7 @@ the whole of the answer's life. So they are not stored at all:
 A collection merely named `systems`, or a database named `configuration` or
 `locality`, is the application's and is cached as usual.
 
-Measured before this rule existed, on a router with the cache on: eighteen reads
+Measured before this rule existed, on a proxy with the cache on: eighteen reads
 of `local.oplog.rs`, `admin.system.users` and the archive's watermarks were
 looked up 11 times and left 2 entries behind. Whether one of those is then
 served back is a race against the learned TTL, so what the suite checks is that
@@ -55,7 +55,7 @@ cost of the rule is a slower answer to a question the cache was never there for.
 
 ## Which queries are worth caching
 
-The router sees every read and every answer, which is what a cache advisor
+The proxy sees every read and every answer, which is what a cache advisor
 needs. For each read it records three things: the **shape** of the query, a hash
 of its **parameters**, and a hash of the **result**. Nothing of the query's own
 data is kept, only hashes.
@@ -64,7 +64,7 @@ data is kept, only hashes.
     db.users.countDocuments({country: "AR"})
 
 is one shape asked twice, not two queries, and the split is what makes the
-question answerable. From it the router works out, in this order:
+question answerable. From it the proxy works out, in this order:
 
 1. Which shapes are asked repeatedly at all. A query asked once is not a
    candidate however stable its answer is.
@@ -132,7 +132,7 @@ command line.
 **All of it can be turned off.** The dashboard is off unless `router.dashboard`
 names an address; the caching is off unless `router.cache.enabled`; and the
 measuring, which costs a hash of every reply and a bounded table of shapes, is
-off with `router.cache.measure: false`. A router with all three off does exactly
+off with `router.cache.measure: false`. A proxy with all three off does exactly
 what it did before any of this existed.
 
 ### What it costs, and what bounds it
@@ -166,7 +166,7 @@ at startup, with those numbers in the message.
 back through the same funnel every answer does, and that funnel learns from what
 it sends, so every hit was being recorded as a fresh observation of the same
 value: the entry's age was reset and a query asked steadily was never re-fetched.
-Measured with a two second ceiling and thirteen seconds of reads, the router
+Measured with a two second ceiling and thirteen seconds of reads, the proxy
 asked the fast tier four times and served forty one from memory. Now it asks
 eleven times, which is what a two second TTL means. Stability is measured against
 the database, never against what this already believed.
@@ -181,7 +181,7 @@ linearizable, because those are promises about a position in an oplog or a
 confirmation from a primary; and a reply that leaves a cursor open, because half
 an answer is not an answer.
 
-**A write through the router drops what was learned about that collection**,
+**A write through the proxy drops what was learned about that collection**,
 rather than waiting out a timer. That is what makes this correct for the writer
 rather than merely fast: the ordinary pattern of writing and then reading the
 same collection is right immediately.
@@ -195,7 +195,7 @@ Now each held answer remembers what it read, and a write is judged against that
 first:
 
 - **An insert** drops an answer only if one of its documents could pass the
-  answer's filter. A document is ruled out only on what the router fully
+  answer's filter. A document is ruled out only on what the proxy fully
   understands: a top-level field holding a number, a date or an ObjectId,
   compared with `$eq`, `$gt`, `$gte`, `$lt` or `$lte` against a value of the
   same kind, under `$and`, `$or` or plain conjunction. Strings are left to the
@@ -216,7 +216,7 @@ answers kept, beside `cache_invalidated_total`.
 
 **And a write by anybody else drops it too, by the same rules.** The fast tier
 publishes every change it makes and this system is built on reading that, so the
-router follows the same change stream and drops the answers a write made stale,
+proxy follows the same change stream and drops the answers a write made stale,
 whoever made it: another application, a migration script, a person in a shell.
 On 6.0 and later the stream brings an insert's document, up to 1MB, and an
 update's field names, so those writes are judged as above. A larger document,
@@ -226,12 +226,12 @@ connection inserting a document straight into the fast tier, without waiting
 out the TTL.
 That is the difference between a cache that expires and one that is kept honest.
 
-That stream is no longer the cache's own. The router follows the fast tier
+That stream is no longer the cache's own. The proxy follows the fast tier
 whether or not the cache is on, because it is also how it hears that a collection
 was dropped out of band, and the cache is one of two things it corrects. With the
 cache off the stream asks the server for the DDL events alone, so it costs
 nothing per write; with it on every event is wanted and none are filtered. Either
-way it is one change stream per router, and the dashboard's `watching` says
+way it is one change stream per proxy, and the dashboard's `watching` says
 whether it is open.
 
 The learned TTL is what remains: a backstop for the moments before the stream
@@ -240,7 +240,7 @@ catches up, bounded again by `max_ttl`.
 ### What a write-heavy shop gets from it, measured
 
 On the Hetzner staging pair on 2026-10-12, with `test/store` shopping through
-one router for five minutes per run: 8,000 orders over 120 days, 800 customers,
+one proxy for five minutes per run: 8,000 orders over 120 days, 800 customers,
 300 products, six shoppers, and a warmer and an evictor running every five
 seconds underneath. Every run reported 0 errors and the shop noticed nothing
 wrong.
@@ -261,16 +261,16 @@ about three times in four, and that is nearly all of the 13%.
 faster than queries fill it. The default of 1,000 is enough for this workload.
 
 **What holds it at 13% is deletes.** A delete reaches the cache as a write of
-unknown effect, from the router's own commands and from the change stream alike,
+unknown effect, from the proxy's own commands and from the change stream alike,
 because neither says which document was removed or what it held. So every
 delete on a collection forgets every query learned on it. In the five minutes at
 200, the fast tier deleted 8,720 orders: 1,983 were the shop cancelling, and
 about 6,700 were the evictor moving documents to the archive. That is about 29
 deletes a second, and a query on `orders` rarely lived 50ms.
 
-An eviction cannot change an answer through the router, since the document is
+An eviction cannot change an answer through the proxy, since the document is
 still read from the archive. Telling one apart from an application delete is
-possible but racy: the router learns an eviction from a notice the feeder marks
+possible but racy: the proxy learns an eviction from a notice the feeder marks
 as spent only after it applies the delete, and a cache that guesses "eviction"
 before that serves a stale answer whenever the guess is wrong. Even with every
 eviction excluded, the shop's own cancels would still forget each query on
@@ -286,7 +286,7 @@ steady deletes it keeps nothing, it costs a lookup per read, and
 **The key carries who is asking**, or one client would be served another's
 documents, which is a bypass this system has had once already. With
 `terminate_auth` on that is the verified user. With authentication proxied it is
-the user the fast tier accepted, which the router reads as the conversation
+the user the fast tier accepted, which the proxy reads as the conversation
 passes through it (since 2026-08-22). Either way the connections of one user
 share answers and two users never do. Only a connection that never
 authenticated is keyed on its own.

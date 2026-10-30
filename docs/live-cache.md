@@ -87,7 +87,7 @@ Everything else goes to mongod, as before:
   bookkeeping database.
 
 When a document shows that a shape cannot be answered exactly, for example an
-array arrives in a field the shape filters on, the shape is refused for as long as the router
+array arrives in a field the shape filters on, the shape is refused for as long as the proxy
 runs and counted in `live_refused_shapes`.
 
 ## Reading your own writes
@@ -95,7 +95,7 @@ runs and counted in `live_refused_shapes`.
 ReadySet's answers lag its replication stream by however long that takes, and it
 does not promise that a client sees its own write. Thermocline does.
 
-With `max_staleness: 0s`, the default, a write through this router to a
+With `max_staleness: 0s`, the default, a write through this proxy to a
 collection sends every read of that collection to mongod until the change
 stream has applied the write. On a collection written all the time, that is
 nearly every read. Measured on a store at 32 shoppers: 1,681,919 reads were held
@@ -103,7 +103,7 @@ for the stream against 196,274 answered, and throughput was lower with the cache
 than without it.
 
 `max_staleness` is a bound in place of that. The cache answers while no write
-this router acknowledged has gone unapplied for longer than the bound. An answer
+this proxy acknowledged has gone unapplied for longer than the bound. An answer
 may miss a write, but never one acknowledged longer ago than the bound. That is
 ReadySet's model with a promise ReadySet does not make.
 
@@ -125,7 +125,7 @@ effect here within that minute.
 A tiered collection is held as far as the fast tier can prove its answer, and
 it differs in three ways:
 
-1. A sorted list is filled with only what the router's newest-first proof says
+1. A sorted list is filled with only what the proxy's newest-first proof says
    the fast tier's answer settles. What it does not prove is merged with the
    archive's answer, read at the same position.
 2. An eviction is a delete on the fast tier's change stream, of a document that
@@ -139,7 +139,7 @@ it differs in three ways:
    p95 of 14ms on the old cluster alone to 213ms.
 
 A tiered entry is asked again every 10 seconds, so it is never kept longer than
-the router would trust the proof it rested on.
+the proxy would trust the proof it rested on.
 
 ## Shapes that never repeat
 

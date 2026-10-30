@@ -378,7 +378,7 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 		// and no index but _id_, and a unique index the archive still carries
 		// stops being enforced on either tier. That consequence is not
 		// hypothetical -- it is the one measured for a drop the router never
-		// saw, and written up in docs/router.md.
+		// saw, and written up in docs/proxy.md.
 		c.r.indexer.Forget(ns)
 	}
 	// This list is forgetDropped's, minus one deliberate difference: that one
@@ -395,7 +395,7 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 	// later and calls forgetDropped for both names, which closes the window on
 	// an ordinary deployment. It does not close it where that watch is down --
 	// a privilege the router's account lacks, or a tier it cannot reach -- and
-	// that is a state the router already reports at ERROR and docs/router.md
+	// that is a state the router already reports at ERROR and docs/proxy.md
 	// already describes. Correctness here should not rest on a stream that is
 	// documented as optional.
 

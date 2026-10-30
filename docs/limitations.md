@@ -11,7 +11,7 @@ Part of [Thermocline](../README.md).
   twice over), in `documentKey` and in the document, and mongod will not return
   an event past 16MB plus 16KB. An event it will not return cannot be read past,
   so it stops mirroring for every namespace: measured with a 7MB `_id`, an event
-  of 29,360,471 bytes and a feeder reopening on it once a second. The router
+  of 29,360,471 bytes and a feeder reopening on it once a second. The proxy
   refuses a larger `_id` on every write path into a tiered collection, with the
   reason. A write made straight at the fast tier is not refused, and the feeder
   then says once what stopped it and how to recover. MongoDB itself refused any
@@ -19,7 +19,7 @@ Part of [Thermocline](../README.md).
 
 - **A unique value larger than about 12MB is not enforced across tiers.** The
   key registry names each claimed key by the key itself, base64 encoded, so a
-  value past about 12MB makes a claim row past 16MB. The router logs "could not
+  value past about 12MB makes a claim row past 16MB. The proxy logs "could not
   check unique keys, letting the insert through" and the write goes on, which
   is what mongod would do with it; what is lost is only the check against a
   duplicate that lives in the archive alone. Measured with a 13MB value.
@@ -28,7 +28,7 @@ Part of [Thermocline](../README.md).
   own reason to refuse.** An update that could never apply, `$[]` on a path the
   document does not have or `$inc` on a string, is refused by mongod for that
   reason before any index is consulted. Since 2026-10-07 a single update
-  statement gets mongod's answer: before saying E11000 the router has the fast
+  statement gets mongod's answer: before saying E11000 the proxy has the fast
   tier run it in a transaction that is thrown away, and forwards it if mongod
   refuses it on its own. An update command with several statements, a
   `bulkWrite`, and an update inside a transaction still get E11000 first for
@@ -55,7 +55,7 @@ Part of [Thermocline](../README.md).
   and an evictor account that cannot read `local.oplog.rs` (both are logged).
   In that window, if one of those documents is copied back up by a read and
   then deleted by the application, the feeder takes that delete for the
-  eviction, the archive keeps the document, and the router answers it again.
+  eviction, the archive keeps the document, and the proxy answers it again.
   Stop the evictor with SIGTERM (`systemctl stop` does), give its unit room
   for a step to finish (30 seconds is the bound), and restart it after a crash.
 
@@ -129,9 +129,9 @@ Part of [Thermocline](../README.md).
   archive, so it arrives carrying every index the application had, and those
   keep answering. The gap is an index created *after* adoption: that one is
   built on the fast tier and the archive never gets it, which is the moment the
-  router warns.
+  proxy warns.
 
-  Every router start and `cline preflight` name the namespaces in this state,
+  Every proxy start and `cline preflight` name the namespaces in this state,
   not only the moment the index is created, because that line is said once to
   whoever was reading the log that minute.
 
@@ -139,7 +139,7 @@ Part of [Thermocline](../README.md).
   duplicate is refused with E11000 exactly as one cluster would refuse it. What
   is missing is only the index. Build the same unique index on the archive for
   any tiered collection written by upserts or by inserts without an `_id`; the
-  router says so when the index is created, naming the measurement.
+  proxy says so when the index is created, naming the measurement.
 
 - **A fast tier rebuilt from the archive comes back without the indexes the
   application declared, and for a unique index that is a constraint nobody is
@@ -150,18 +150,18 @@ Part of [Thermocline](../README.md).
   enforced from the fast tier's own index listing, so once the listing is gone
   the constraint is enforced by neither tier.
 
-  Measured by `test/testrestore.sh`: a unique index created through the router,
+  Measured by `test/testrestore.sh`: a unique index created through the proxy,
   200 keys claimed in the registry, the fast tier lost and rebuilt the way
   `docs/operations.md` prescribes, and the registry restored from its own dump.
   An insert duplicating a value an archived document held was then accepted, and
   the archive ended with two documents carrying one key.
 
-  Two things narrow it. A router says "the key registry holds claims for a
+  Two things narrow it. A proxy says "the key registry holds claims for a
   unique index no tier has" at every start and in `cline preflight`, naming the
   index, because those rows are the only thing that remembers the constraint.
   And the backup list in `docs/operations.md` now names the index definitions as
   something to take, which is what makes the recreation a step rather than an
-  archaeology exercise. Recreating the index through the router walks both tiers
+  archaeology exercise. Recreating the index through the proxy walks both tiers
   and reports the duplicates that got in.
 
 - **`dropIndexes` on a tiered collection is refused when it asks for no
@@ -188,31 +188,31 @@ Part of [Thermocline](../README.md).
   refusal names is to send it without `writeConcern {w: 0}`.
 
 - **A write made straight at the fast tier destroys archived documents, and
-  nothing says so.** The application goes through the router; that is the whole
+  nothing says so.** The application goes through the proxy; that is the whole
   contract, and this is outside it. It is also one connection string away: a
   migration script, a monitoring tool that writes, a leftover config, somebody
   in a shell. Measured on an `_id` the archive held and the fast tier did not:
-  through the router the insert is refused, which is what one cluster would do
+  through the proxy the insert is refused, which is what one cluster would do
   with a duplicate key; straight at the fast tier's mongod it is accepted, and
   six seconds later the archive holds the new document with the old one's fields
-  gone. No line in the feeder's log, none in the router's.
+  gone. No line in the feeder's log, none in the proxy's.
 
-  It cannot be refused from here (the router is not in that path by
+  It cannot be refused from here (the proxy is not in that path by
   definition), and it cannot be told apart from an application reusing an `_id`
   either. It is now counted rather than silent. The feeder publishes
   `inserts_over_existing`: inserts it mirrored onto an `_id` the archive already
-  held, which through the router is refused as a duplicate key.
+  held, which through the proxy is refused as a duplicate key.
 
   What that number is worth, measured rather than reasoned. A shop run of 348
   mirrored batches with copy-ups and eviction sweeps underneath: zero. Three
   unclean feeder kills mid-batch, which is the replay this entry used to say
   would confuse it: also zero. One write made straight at the fast tier's
-  mongod: one. And a delete and re-insert of the same `_id` through the router,
+  mongod: one. And a delete and re-insert of the same `_id` through the proxy,
   which is legitimate: also one. So it is a lead rather than a verdict, and it
   carries no alert rule for that reason, but a deployment where it climbs and
-  nobody reuses `_id`s has a writer that is not going through the router.
+  nobody reuses `_id`s has a writer that is not going through the proxy.
 
-  The protection is still operational: only the router should hold credentials
+  The protection is still operational: only the proxy should hold credentials
   that can write to the fast tier's application databases.
 
 - **A document the archive refuses stays on the fast tier, and reads of that
@@ -233,7 +233,7 @@ Part of [Thermocline](../README.md).
   That was a wrong answer rather than a limitation, so it is refused now. The
   feeder records the document in `unmirrored` in the bookkeeping database, and a
   read that would be answered from the archive is refused instead, naming the
-  namespace, what is wrong and what to do. A log line cannot be read by a router
+  namespace, what is wrong and what to do. A log line cannot be read by a proxy
   and a counter cannot name a namespace, which is why recording it was the whole
   of the work. Measured on the same three documents: `countDocuments`, `find`,
   `distinct` and an aggregation are refused, `findOne({_id: ...})` still returns
@@ -265,7 +265,7 @@ Part of [Thermocline](../README.md).
   Measured on three documents with one refused: `Copied 0`, and that sentence.
   It now copies what it can, names the documents the archive refused with the
   index and the key, says the namespace is still short by them and that the
-  router refuses those reads, and keeps the old closing line only for the runs
+  proxy refuses those reads, and keeps the old closing line only for the runs
   where it is true.
 
   **It lifts by itself.** Nobody runs a command here after resolving a duplicate,
@@ -291,7 +291,7 @@ Part of [Thermocline](../README.md).
 
   Measured before they were refused, on an insert of `{_id: "x", n: 5000,
   _tcDeletedAt: <a date>}` into a tiered collection: both tiers took it, and
-  `countDocuments({n: 5000})` answered **0** through the router where the same
+  `countDocuments({n: 5000})` answered **0** through the proxy where the same
   document in an untiered collection answered **1**, with `ok` on both. A lookup
   by `_id` still returned it, because a point read asks the fast tier too, so one
   collection answered two different ways about one document. The read is the
@@ -309,7 +309,7 @@ Part of [Thermocline](../README.md).
   target is named, and `$unset` is deliberately allowed, because it is how the
   field is taken off a document that has one. A pipeline writes documents too, and both of its paths
   refuse as well, by two different readings: a tiered `$out` is performed by the
-  router, so each document it writes is read as it passes, and a `$merge` whose
+  proxy, so each document it writes is read as it passes, and a `$merge` whose
   input the fast tier can answer alone is forwarded whole for mongod to perform,
   so what can be read there is the pipeline's stages. The refusal names the
   field and says to rename it. Three things are deliberately not refused, and
@@ -332,10 +332,10 @@ Part of [Thermocline](../README.md).
   on the fast tier: nothing here writes either field there, so a fast tier
   document carrying one is the application's own. It is bounded by `--count-for`
   like the claim check, because the field is not indexed and this is a scan,
-  which is also why it is not on a router's startup path.
+  which is also why it is not on a proxy's startup path.
 
   **A batch carrying one is refused whole**, where a batch carrying a duplicate
-  key is not. Measured on both, through the router, with `ordered: false`: an
+  key is not. Measured on both, through the proxy, with `ordered: false`: an
   insert of three documents where one duplicates an archived `_id` wrote the
   other two and reported the one failure, the way mongod does; the same batch
   with one document carrying `_tcDeletedAt` wrote none of the three.
@@ -356,7 +356,7 @@ Part of [Thermocline](../README.md).
   or another expression builds its keys from the document itself, so
   `[{$replaceWith: {$mergeObjects: ["$$ROOT", "$payload"]}}]` would lift a
   nested `payload._tcDeletedAt`, which an insert is allowed to carry, to the top
-  level. The router appends one stage to every `update`, `findAndModify` and
+  level. The proxy appends one stage to every `update`, `findAndModify` and
   `bulkWrite` update pipeline that replaces the document: a document without either reserved field
   passes through unchanged, and one carrying either fails the statement with an
   error naming the field. The other statements of a batch run as mongod runs
@@ -366,7 +366,7 @@ Part of [Thermocline](../README.md).
   tiered collection, of documents that already carry the field, taken from a
   collection where carrying it is allowed because nothing tiers it. No stage
   mentions the field, mongod performs the write, and nothing here sees the
-  documents. Closing it would mean the router performing every `$merge` into a
+  documents. Closing it would mean the proxy performing every `$merge` into a
   tiered collection rather than forwarding the ones the fast tier can answer,
   which is a large cost for a narrow case.
 
@@ -386,7 +386,7 @@ Part of [Thermocline](../README.md).
 
   It is not silent, though, and that is the difference between a path nothing
   covers and a path nothing reports. Measured on exactly that shape, two
-  documents carrying the field merged in from an untiered collection: the router
+  documents carrying the field merged in from an untiered collection: the proxy
   accepted it and the feeder named it as it mirrored, once for the collection,
   with the effect in the line. The guard catches what it can see and the feeder
   catches what reaches the archive.
@@ -405,12 +405,12 @@ Part of [Thermocline](../README.md).
 
   Measured on twenty orders whose `shippedAt` is thirty days after their
   `createdAt`, claimed complete from 15 January in `createdAt`: with the rule's
-  `date_field` changed to `shippedAt`, the router answered 6 where the archive
+  `date_field` changed to `shippedAt`, the proxy answered 6 where the archive
   holds 20, and reported success. One line in a config file.
 
   A claim measured in a field the namespace no longer ages by is withdrawn
   rather than reinterpreted, so reads fall through to the archive, which is the
-  answer they would have had before anybody claimed anything. The router says so
+  answer they would have had before anybody claimed anything. The proxy says so
   once per namespace, naming both fields. Rows written before the field was
   recorded carry none, and are used exactly as they were: refusing every claim on
   an upgrade would be a worse failure than the one this prevents, and the next
@@ -423,13 +423,13 @@ Part of [Thermocline](../README.md).
   the line goes.
 
   Measured on fifty documents with the fast tier holding the most recent ten:
-  tiered, a client counted fifty and read the oldest one; untiered and the router
+  tiered, a client counted fifty and read the oldest one; untiered and the proxy
   restarted, it counted ten and the oldest was missing. Nothing was said
   anywhere, because the stranded report is the all-or-nothing form of this
   question and skips a collection the fast tier has: having some of a collection
   and having it are not the same thing.
 
-  The router now names it with both counts, as `shop.orders (10 of 50)`. It
+  The proxy now names it with both counts, as `shop.orders (10 of 50)`. It
   cannot refuse the configuration, because a collection the fast tier holds in
   full and the archive also has is a perfectly ordinary state to untier from.
 
@@ -445,7 +445,7 @@ Part of [Thermocline](../README.md).
   one, and a client read the one. The other twenty were invisible from the
   moment somebody edited the config.
 
-  The router names the collection at its next start, and `cline backfill --ns`
+  The proxy names the collection at its next start, and `cline backfill --ns`
   is the fix. Do it with the feeder running, which is the order with no window
   in it: the feeder carries what happens next while the copy brings what was
   already there. Marking deletes is held while a feeder publishes, and nothing
@@ -458,7 +458,7 @@ Part of [Thermocline](../README.md).
   documents with the feeder stopped, one update, one insert and one delete, and
   the remedy then followed by hand: the update came back right, the insert
   arrived, and the deleted document stayed live in the archive and was served to
-  a client. The router counted eleven where the application had left ten.
+  a client. The proxy counted eleven where the application had left ten.
 
   A delete leaves nothing on the fast tier to copy, so copying cannot know it
   happened. The completeness claim can: inside the range the fast tier claims to
@@ -544,19 +544,19 @@ Part of [Thermocline](../README.md).
   Nothing is lost either way, and `testfailover.sh` checks the part that
   matters: whichever way the sibling goes, no write is applied twice.
   `router.terminate_auth` does not have this at all, because the connections are
-  the router's and a re-resolution empties the pool for the old member.
+  the proxy's and a re-resolution empties the pool for the old member.
 
 - **With authentication proxied, a single write across a step-down can still
   fail: 4 of 20 on a quiet box on 2026-10-07, with a client that was busy when
   the primary moved.** The mechanism is measured further down this entry. The
   history follows. The driver retries once, and the retry lands only if
-  the router has found the new primary by then. In 6 of the last 10 full host
+  the proxy has found the new primary by then. In 6 of the last 10 full host
   sweeps, 2026-09-25 and 26, `testfailover.sh` saw that write fail after about
   2.4 seconds with "not primary", and sometimes a write during a window with
   no primary as well; in 28 runs of the suite outside a full sweep, alone or
   after the suites that precede it, it never did. The time is nearly constant,
   2,436 to 2,477ms, which suggests a timer rather than load, and it was not
-  found. cf705b0 stopped the router re-pinning the member that had just
+  found. cf705b0 stopped the proxy re-pinning the member that had just
   refused, which is a real stale answer but was not this.
 
   On 2026-09-26 it came with a second check once: "a client connecting after it
@@ -564,8 +564,8 @@ Part of [Thermocline](../README.md).
   same sweep and the same window. Both passed in three runs of the suite alone
   straight after.
 
-  The first failure with its router log kept, 2026-09-28 (hostsweep now keeps
-  them): the client gave up at 2,383ms with "not primary"; the router's probe
+  The first failure with its proxy log kept, 2026-09-28 (hostsweep now keeps
+  them): the client gave up at 2,383ms with "not primary"; the proxy's probe
   for the new primary ran from about 02:39:52.7 until its 5s timeout at
   57.711 with the set still electing, and the new primary appeared at
   02:40:01.885, twelve seconds after the step-down on a loaded box. The client's
@@ -587,27 +587,27 @@ Part of [Thermocline](../README.md).
   The second check is explained, and it is a real difference rather than a
   timer in this system. With authentication proxied a client's handshake is
   authenticated against the member its connection is pinned to, so during an
-  election the router holds a new connection's handshake until there is a
+  election the proxy holds a new connection's handshake until there is a
   primary, up to 20 seconds. Connected straight to the replica set the
   handshake needs no primary, because any member answers it, and only the
   command waits. mongosh gives a single-host connection string 2 seconds of
   server selection for the whole session, and a replica set string the
-  drivers' 30. The router is a single host, so a mongosh through it during a
+  drivers' 30. The proxy is a single host, so a mongosh through it during a
   12 second election fails with "Server selection timed out after 2000 ms" or
   "not primary", where one given the set's own string waits. Measured on
-  2026-10-02 by reading the client's options: 2000 through the router, 30000
+  2026-10-02 by reading the client's options: 2000 through the proxy, 30000
   to the set. An application whose driver keeps the default 30 second server
   selection waits instead, and so does a mongosh given
   `serverSelectionTimeoutMS=30000`.
 
   That was true only for a client holding one connection, until 2026-10-02. A
-  driver's retry takes any connection from its pool, and through the router
+  driver's retry takes any connection from its pool, and through the proxy
   there is one server and so one pool: the retry went out on a sibling
   connection still authenticated against the member that had just refused, and
   was refused at once. Straight to the set it cannot, because the new primary is
   another server with its own pool. With a client connected before the primary
   went away and the drivers' 30 seconds: 0 of 5 writes landed through the
-  router, 5 of 5 straight to the set. The router now closes every idle client
+  proxy, 5 of 5 straight to the set. The proxy now closes every idle client
   connection authenticated against a member that refuses as not primary, before
   it delivers the refusal, so the retry opens a new connection and waits for
   the new primary: 5 of 5 after, each applied once. They are counted as
@@ -615,7 +615,7 @@ Part of [Thermocline](../README.md).
 
   **What a failover still costs an application, by driver.** Measured on
   2026-10-02 with the shop (`test/store/shared.sh STEPDOWN_EVERY=60s`, Go
-  driver, two applications, two routers, five step-downs in six minutes):
+  driver, two applications, two proxies, five step-downs in six minutes):
 
       before the close              22 and 20 errors
       with it                       3 and 2, then 3 and 7 errors
@@ -630,18 +630,18 @@ Part of [Thermocline](../README.md).
 
   Closing the connection that got the refusal is not free for Node either.
   Measured on 2026-10-07 on a quiet box, a fresh mongosh writing through the
-  router just after a step-down, 20 rounds with the driver's command and
+  proxy just after a step-down, 20 rounds with the driver's command and
   connection logs on (`proxfo.sh`): 16 landed, 4 failed, none applied twice.
   All four were the same sequence to within milliseconds. mongosh's own
   startup read went out on a connection still bound to the old member and was
   refused "not primary". The write was queued waiting for a connection, and
   Node handed it that one as the refusal checked it in, before it had read the
-  router's close. The write failed `MongoNetworkError: connection 1 closed`,
-  the pool was cleared, and the retry failed on the cleared pool. The router
+  proxy's close. The write failed `MongoNetworkError: connection 1 closed`,
+  the pool was cleared, and the retry failed on the cleared pool. The proxy
   presents itself as a single server, and for that topology Node's server
   selection returns the server at once rather than waiting for the monitor, so
   any network error in a failover spends the retry. The new primary was known
-  to the router 14ms after the refusal; the election was never the problem.
+  to the proxy 14ms after the refusal; the election was never the problem.
 
   No cheaper reply fixes this. Kept open, the connection is refused again and
   Node retries on the connection it just checked in. Closed later, the window
@@ -662,19 +662,19 @@ Part of [Thermocline](../README.md).
   upstream connection that another connection of the same user authenticated
   against the new primary, with the same identity and so the same privileges,
   and mongod ties a cursor to its user rather than its connection. That is a
-  change to how the router holds upstream connections, and it is not made.
-  `router.terminate_auth`, where the router owns the upstream connections and
+  change to how the proxy holds upstream connections, and it is not made.
+  `router.terminate_auth`, where the proxy owns the upstream connections and
   replays the command itself, does not have this cost.
 
   A second sequence lost the retry the same way, and that one is fixed. A
   write refused while the set had no primary has its reply held while the
-  router looks for the new one, up to 5 seconds. When the router found it
+  proxy looks for the new one, up to 5 seconds. When the proxy found it
   inside that time, the driver's monitor check came back at once, and Node
   sent its retry on the refused connection 3ms after the refusal, before it
   had read the close: "This socket has been ended by the other party", not
   applied. Measured on the Hetzner staging pair on 2026-10-13 with the
-  router's lookup lengthened so it always found the primary: 9 of 10 failed.
-  testfailover had failed this way once in 16 runs. The router now holds
+  proxy's lookup lengthened so it always found the primary: 9 of 10 failed.
+  testfailover had failed this way once in 16 runs. The proxy now holds
   `hello` replies for 250ms after it ends a connection for a failover refusal,
   so the driver reads the close before it selects: 10 of 10 landed, each retry
   on a new connection. A write after a plain step-down pays that 250ms, which
@@ -686,7 +686,7 @@ Part of [Thermocline](../README.md).
 
   That held only after 2026-10-05. Before, a write the old primary applied and
   then stopped waiting on came back `ok: 1` with a write concern error
-  (`InterruptedDueToReplStateChange`), which the router did not read as a
+  (`InterruptedDueToReplStateChange`), which the proxy did not read as a
   failover. The connection stayed on the old member, the driver's retry went
   out on a sibling still there, and the application was told
   `NotWritablePrimary` for a write that had landed. Measured with
@@ -694,7 +694,7 @@ Part of [Thermocline](../README.md).
   every 20s for 3 minutes): 31 inserts reported an error and 30 of them had
   landed, 25 as `NotWritablePrimary`; straight to the replica set, 0 errors.
   Such a reply is now a failover reply, and the same run had 0 errors through
-  the router.
+  the proxy.
 
   A driver with a deadline on the operation hides this, which is worth knowing
   when measuring: Go driver v2 retries a retryable error until the deadline,
@@ -707,10 +707,10 @@ Part of [Thermocline](../README.md).
   namespace that falls through to an archive without them does not get slow, it
   fails, and the message names an index the application can see on the fast tier.
   Measured with the text index on the fast tier alone: `text index required for
-  $text query` through the router, answered straight at the fast tier, and
-  answered through the router as soon as the archive had one too.
+  $text query` through the proxy, answered straight at the fast tier, and
+  answered through the proxy as soon as the archive had one too.
 
-  The router says so where the difference is made rather than where it is felt:
+  The proxy says so where the difference is made rather than where it is felt:
   a `createIndexes` building a text or geospatial index on a tiered namespace
   the archive has no equivalent for gets its own line, saying the archive needs
   it to answer at all rather than to answer quickly. Building it on the archive
@@ -728,7 +728,7 @@ Part of [Thermocline](../README.md).
   also measured: an eviction sweep over the same namespace evicted nothing, so
   the fast tier's copy is not at further risk while this stands.
 
-  The same state arrives three ways and the advice differs, so the router names
+  The same state arrives three ways and the advice differs, so the proxy names
   all three rather than guessing: the collection was dropped on the archive, the
   archive was restored from a backup older than the collection, or nothing has
   ever mirrored the namespace because the feeder is not running. The last is why
@@ -739,7 +739,7 @@ Part of [Thermocline](../README.md).
   of it is already said, and not on the read path: the read that goes short is
   the cheapest possible one and putting a catalog lookup on it would cost every
   deployment for a state almost none of them are in. So a drop that happens
-  while a router runs is named at its next start rather than at once, and the
+  while a proxy runs is named at its next start rather than at once, and the
   first run of this named two namespaces left behind by the test suites that
   nobody had noticed.
 
@@ -748,13 +748,13 @@ Part of [Thermocline](../README.md).
   archive is out of band the way a write there is, and the feeder refuses to
   start against such a pair, which is the half that works while it restarts.
 
-  What a running router said was that the two tiers differ in an option, with
+  What a running proxy said was that the two tiers differ in an option, with
   the action "make the two copies the same, or know why they differ". Making
   them the same here means capping the fast tier too, which would destroy the
   recent half as well.
 
   Measured on eighty mirrored documents: the conversion itself left sixteen and
-  the rest were gone, a later insert through the router mirrored into the capped
+  the rest were gone, a later insert through the proxy mirrored into the capped
   collection and rolled another away, and an update that grew a document was
   applied on both tiers without complaint, because mongod stopped refusing those
   in 4.2. Mirroring never errored, and nothing but that one line named it. It
@@ -767,7 +767,7 @@ Part of [Thermocline](../README.md).
   a namespace arrives, and it remembers its answer until the collection is
   dropped. That covers a collection created capped; it left the case of one
   already being mirrored and converted afterwards. `convertToCapped` on a tiered
-  collection is refused by the router, so it takes running it straight at the
+  collection is refused by the proxy, so it takes running it straight at the
   fast tier's mongod. Measured before this: twenty mirrored documents, then the
   conversion, then filling past the cap, and the archive held sixty tombstones
   with two of the original twenty still live. The question is asked again when
@@ -777,18 +777,18 @@ Part of [Thermocline](../README.md).
   already does for the same reason.
 
 - **A TTL index created straight against the fast tier cannot be refused, and is
-  named rather than prevented.** The router turns down a TTL index on a tiered
+  named rather than prevented.** The proxy turns down a TTL index on a tiered
   collection, because the fast tier holds the recent part: the index expires the
   documents recent enough to be cached, the feeder mirrors those expiries as the
   application deleting them, and the older documents the rule was written for sit
-  in the archive where no TTL index is watching. That guard is on the router's
+  in the archive where no TTL index is watching. That guard is on the proxy's
   door. An operator, a migration script or a restored fixture can create the same
   index directly on the fast tier's mongod, and nothing here can stop it.
   Measured with five recent documents on both tiers and five a year old in the
   archive alone: the recent five were gone from the fast tier and tombstoned in
   the archive, the year-old five untouched, and the only trace was the feeder's
   ordinary "deletes not announced by the evictor", which is what a real
-  application delete looks like too. The router now says so when it reads the
+  application delete looks like too. The proxy now says so when it reads the
   collection's index listing, once per namespace and again whenever the answer
   changes, naming the index and which way it goes wrong. The archive's own side
   of this already had such a line; this is the fast tier's.
@@ -880,12 +880,12 @@ Part of [Thermocline](../README.md).
 
   Four things know they are not the application's data. The feeder does not
   mirror them, the catalog does not merge one in from the archive, a starting
-  router drops any a previous router left behind after dying mid-aggregation,
-  and `listCollections` through the router does not show them: measured, the
-  fast tier lists one and the router lists none, with the real collections
+  proxy drops any a previous proxy left behind after dying mid-aggregation,
+  and `listCollections` through the proxy does not show them: measured, the
+  fast tier lists one and the proxy lists none, with the real collections
   untouched.
 
-  A long listing is filtered too, which it was not at first. The router filters
+  A long listing is filtered too, which it was not at first. The proxy filters
   the first batch where it appends the archive's half, and the batches after
   that used to come straight from the fast tier: measured with `batchSize: 1`
   over 100 `getMore`s, one scratch collection appeared in a later batch of a
@@ -893,7 +893,7 @@ Part of [Thermocline](../README.md).
 
   What is still true of a long listing is the archive's half: the collections
   the archive holds and the fast tier does not are appended to the first batch
-  only, because the router does not answer the `getMore` behind a cursor the
+  only, because the proxy does not answer the `getMore` behind a cursor the
   fast tier opened. A client that pages the catalog sees them if they fit in the
   first batch and not otherwise.
 
@@ -945,11 +945,11 @@ Part of [Thermocline](../README.md).
 
 - **A view that reshapes documents is answered from the fast tier only.** The
   archive's copy of a view runs over every document the archive holds, the
-  ones marked deleted included, and the router hides those by their mark on
+  ones marked deleted included, and the proxy hides those by their mark on
   what the view returns. A view whose stages drop the mark or build new
   documents, such as an inclusion `$project`, `$group`, `$replaceRoot` or
   `$limit`, would return them. Measured on 2026-10-25: a view projecting two
-  fields counted 10 after a delete through the router, where MongoDB counts 9.
+  fields counted 10 after a delete through the proxy, where MongoDB counts 9.
   Such a view is now refused when the fast tier cannot answer it. A view made
   of `$match`, `$sort`, `$set`, `$addFields`, `$unset` and exclusion
   `$project` stages keeps the mark and is still answered from the archive.
@@ -966,7 +966,7 @@ Part of [Thermocline](../README.md).
   the fast tier answers, and the collection the view joins was never looked at.
 
   Measured on two rows whose partners the archive holds both of and the fast
-  tier one: the archive joins both, and the router answered one row joined and
+  tier one: the archive joins both, and the proxy answered one row joined and
   one with an empty join array, with `ok: 1`. That is a reporting view over
   history quietly dropping the rows whose partner has aged out, which is every
   row the tiering exists to keep.
@@ -979,35 +979,35 @@ Part of [Thermocline](../README.md).
 
   It is a refusal rather than an archive answer, and that is not laziness. The
   archive's copies carry tombstones, and a `$lookup` reads a collection of its
-  own, so the tombstone predicate the router puts in front of a pipeline never
-  reaches inside a view's definition, which the router cannot rewrite.
+  own, so the tombstone predicate the proxy puts in front of a pipeline never
+  reaches inside a view's definition, which the proxy cannot rewrite.
   Answering it there would join deleted documents, which is the defect in
   *Joined collections are read elsewhere* with the sign flipped.
 
   **A `$out` into a tiered collection that reads through a view is refused for
   the same reason**, and that refusal is the sharper end of it: the reading half
-  of a tiered `$out` is performed by the router rather than forwarded, so a short
+  of a tiered `$out` is performed by the proxy rather than forwarded, so a short
   answer there is not something a client reads and re-runs, it is something on
   disk. Measured before it was refused: a pipeline reading a view over a tiered
   collection the fast tier was short of wrote one document where the archive
   holds two. A `$lookup` *naming* a view is not refused, that one resolves to
   the collection underneath and is read from the archive, whole.
 
-- **Cursors are not shared between routers.** A read answered from the archive
-  is served from a cursor this router holds open against the archive, in its own
-  memory, so another router cannot continue it. This is what a mongos does too,
+- **Cursors are not shared between proxies.** A read answered from the archive
+  is served from a cursor this proxy holds open against the archive, in its own
+  memory, so another proxy cannot continue it. This is what a mongos does too,
   and drivers pin cursors to the server that created them, so naming every
-  router in the connection string is all it takes. What does not work is one
-  load balanced address in front of several routers: the driver sees one server,
+  proxy in the connection string is all it takes. What does not work is one
+  load balanced address in front of several proxies: the driver sees one server,
   its pool sends the getMore down whichever connection is free, and it lands on
-  a router that never had the cursor.
+  a proxy that never had the cursor.
 
-  What the application sees then is `CursorNotFound`, code 43, and the router
+  What the application sees then is `CursorNotFound`, code 43, and the proxy
   now says what that means rather than leaving it bare. It cannot say *which* of
   two things it is, because a cursor id says nothing about who minted it:
   measured on PSMDB 8.0, mongod's own ids cover the whole positive int64 range,
-  so an id from another router is indistinguishable from an expired one. So it
-  names both, and how to rule one out: name every router in the connection
+  so an id from another proxy is indistinguishable from an expired one. So it
+  names both, and how to rule one out: name every proxy in the connection
   string and the driver pins each cursor to the one that made it. The code stays
   43, because a driver decides what to retry from the code rather than from the
   words.
@@ -1015,7 +1015,7 @@ Part of [Thermocline](../README.md).
 - **A change stream whose stages read `fullDocument` and that ends in
   `$changeStreamSplitLargeEvent` is not filled from the archive.** With
   `fullDocument: "updateLookup"` the lookup runs on the fast tier, and an update
-  to a document evicted before the event is read comes back null. The router
+  to a document evicted before the event is read comes back null. The proxy
   fills it from the archive, and runs the stream's own stages from the first
   that reads `fullDocument` onwards itself, after the fill, so they see what
   MongoDB's would: a `$project` removing `fullDocument.secret` removes it, and a
@@ -1025,17 +1025,17 @@ Part of [Thermocline](../README.md).
   large event is something only the server can do, so a stream ending in that
   stage is left as mongod answered it, null where the document was evicted.
 
-- **A change stream cannot be resumed across the cutover, and the router says
+- **A change stream cannot be resumed across the cutover, and the proxy says
   so rather than letting it be discovered.**
-  A resume token is a position in one replica set's oplog. The router serves
+  A resume token is a position in one replica set's oplog. The proxy serves
   change streams from the fast tier, so a token minted on the cluster being
   adopted is not a position in it. MongoDB accepts it rather than refusing it:
   measured, the same token delivered the write that followed it against the
-  cluster it came from, and delivered nothing at all through the router, with
+  cluster it came from, and delivered nothing at all through the proxy, with
   `ok: 1`. A consumer resuming across the cutover therefore loses every event
   the old cluster saw after its last token.
 
-  It is not silent any more. The router logs a warning naming the namespace and
+  It is not silent any more. The proxy logs a warning naming the namespace and
   the option the client used, with the effect and the remedy, every time a
   stream is opened with `resumeAfter`, `startAfter` or `startAtOperationTime` on
   a tiered collection. Refusing outright would mean parsing resume tokens, whose
@@ -1043,7 +1043,7 @@ Part of [Thermocline](../README.md).
   instead: start consumers fresh after a cutover, and check the stream is
   delivering rather than merely open. Pinned by `testchange.sh`.
 
-  Refusing it would mean the router parsing resume tokens, which are an
+  Refusing it would mean the proxy parsing resume tokens, which are an
   undocumented encoding that changes between server releases, so this is a step
   in the rollout rather than a guard: start consumers fresh.
 
@@ -1060,16 +1060,16 @@ Part of [Thermocline](../README.md).
 
   A delete reaches the fast tier at once and the archive only when the feeder
   carries it across. In between, the archive still holds that document as live,
-  and the router cannot tell it apart from one that was evicted: both are
+  and the proxy cannot tell it apart from one that was evicted: both are
   documents the archive has and the fast tier does not. So before an insert, an
   update, a `bulkWrite` or a `$merge` is refused over a key only the archive
-  holds, the router waits for mirroring the way a read does, and asks again.
+  holds, the proxy waits for mirroring the way a read does, and asks again.
   With a feeder running the wait is the mirroring lag, milliseconds on this
   pair, and the write is accepted, as MongoDB accepts it.
 
   When the wait runs out, what happens depends on `router.freshness`. Measured
   on 2026-10-25 with the feeder stopped, six documents deleted through the
-  router, the archive still holding all six live and the fast tier none:
+  proxy, the archive still holding all six live and the fast tier none:
 
   ```
                                           strict (default)   permissive
@@ -1085,7 +1085,7 @@ Part of [Thermocline](../README.md).
   behind, "mirroring to the archive has not caught up", and not a duplicate key
   error. E11000 would say the key is taken when the application has just freed
   it, and an idempotent loader that reads 11000 as "already there" skips the
-  document and loses it. Under permissive the router answers from the archive
+  document and loses it. Under permissive the proxy answers from the archive
   as it stands, which is E11000, and counts it as a stale read. A write inside a
   transaction that is refused this way aborts the transaction, as a duplicate
   key does.
@@ -1098,14 +1098,14 @@ Part of [Thermocline](../README.md).
 
 - **A document deleted while a copy-up is moving it comes back for a few
   milliseconds.** A copy-up reads the archive and then inserts, and a delete
-  landing in between, from another connection or another router, is undone by
+  landing in between, from another connection or another proxy, is undone by
   the insert. The feeder sees the two in the fast tier's order and removes the
   document again, counted as `resurrections_undone`, so what is left is the time
   between the insert and the feeder's next flush. A read in that time answers
   the deleted document.
 
   Measured on 2026-09-30, a transaction warming 3,000 of one customer's orders
-  through one router while a recent order was deleted through the other:
+  through one proxy while a recent order was deleted through the other:
 
   ```
                                     before     after
@@ -1136,7 +1136,7 @@ Part of [Thermocline](../README.md).
 
   With `terminate_auth` off, a read the fast tier answers is proxied with the
   client's own credentials, so an ordinary application account is capped by it.
-  A read that falls through to the archive is not proxied: the router performs
+  A read that falls through to the archive is not proxied: the proxy performs
   it on its own connection under its own account, and it deliberately adds no
   `maxTimeMS` of its own when the caller set none.
 
@@ -1152,24 +1152,24 @@ Part of [Thermocline](../README.md).
 
   Uncapped, both answered 3000.
 
-  The router now says so at startup and in `cline preflight` when the parameter
+  The proxy now says so at startup and in `cline preflight` when the parameter
   is set on either tier. It is not silently honoured instead, because making the
   archive read carry it would start failing reads that succeed today, and that
   is the operator's decision rather than an upgrade's. Two ways to get what the
   setting was for: set `maxTimeMS` in the application, which travels with the
-  command and is honoured on both tiers, or give the router an account without
+  command and is honoured on both tiers, or give the proxy an account without
   `bypassDefaultMaxTimeMS`.
 
-- **The router answers as a mongos and tells the truth about the replica set
+- **The proxy answers as a mongos and tells the truth about the replica set
   behind it, so anything that branches on the handshake is looking at a
   deployment that does not exist.** The handshake is deliberate: a driver uses
   `hello` for topology discovery, and forwarding the fast tier's real reply lets
   it read the `hosts` array, connect straight to those members and never send
-  the router another byte. So `hello` answers `{msg: "isdbgrid",
+  the proxy another byte. So `hello` answers `{msg: "isdbgrid",
   isWritablePrimary: true}` with every membership field dropped. Nothing else
   was changed to match, and the two halves disagree in both directions.
 
-  Measured through a router in front of rsHot, authenticated as a user with
+  Measured through a proxy in front of rsHot, authenticated as a user with
   `clusterMonitor` and `clusterManager`:
 
   ```
@@ -1187,11 +1187,11 @@ Part of [Thermocline](../README.md).
   replSetStepDown       ok:1, and the primary moved
   ```
 
-  A real mongos answers the first block and refuses the second. The router does
+  A real mongos answers the first block and refuses the second. The proxy does
   the opposite of both.
 
   What it costs. A monitoring agent that reads `msg: "isdbgrid"` and then
-  collects a mongos will collect nothing: `sh.status()` against the router fails
+  collects a mongos will collect nothing: `sh.status()` against the proxy fails
   outright. An agent that ignores the handshake and asks `replSetGetStatus` gets
   a true answer about the fast tier, and with it the member addresses the
   handshake exists to withhold, which is the bypass the handshake is for. And a
@@ -1210,7 +1210,7 @@ Part of [Thermocline](../README.md).
   the fix is not obviously the honest one. Written down rather than changed.
 
 - **Sharded fast tiers are refused, with the reason.** Everything here assumes
-  the fast tier is a replica set. The router proxies bytes to one primary
+  the fast tier is a replica set. The proxy proxies bytes to one primary
   address and a mongos does not have one: measured, its `hello` answers
   `{msg: "isdbgrid", isWritablePrimary: true}` and nothing else. Every reading
   the evictor holds itself back on is a replica set's, and a mongos has none of
@@ -1221,7 +1221,7 @@ Part of [Thermocline](../README.md).
   A reading that cannot be taken does not block, so before this was refused the
   daemons ran against a mongos holding themselves back on nothing: an evictor
   dry run with five eligible documents reported `would_evict=5` and
-  `backoffs=0`. The router did stop, with "fast tier reported no primary
+  `backoffs=0`. The proxy did stop, with "fast tier reported no primary
   address", which is true and says nothing about the cause.
 
   All four commands now refuse a mongos fast tier and name it.
@@ -1286,21 +1286,21 @@ Part of [Thermocline](../README.md).
   collection through a long-running sweep should expect this and retry; a
   `batchSize` large enough to finish the read in one batch avoids it entirely.
 
-  **The guard is one router's, and a `getMore` that reaches a different router
+  **The guard is one proxy's, and a `getMore` that reaches a different proxy
   is not guarded.** What a cursor was authorised by is held in the memory of the
-  router that opened it. A fast tier cursor works from any router, because they
-  all speak to the same fast tier, so nothing fails: the second router forwards
+  proxy that opened it. A fast tier cursor works from any proxy, because they
+  all speak to the same fast tier, so nothing fails: the second proxy forwards
   the `getMore` and the answer comes back short, which is the behaviour this
   entry exists to remove. The remedy is the one already required for cursors the
-  router owns against the archive, a few entries above: **name every router in
+  proxy owns against the archive, a few entries above: **name every proxy in
   the connection string** rather than putting one load balanced address in front
-  of them, and the driver pins each cursor to the router that made it. Recording
+  of them, and the driver pins each cursor to the proxy that made it. Recording
   the authorisation in the shared bookkeeping database instead would cost a round
   trip on every tiered query that leaves a cursor, which is most of them.
 
 - **`distinct` over a field some documents do not carry can omit the `null`
   MongoDB would report.** This is the one command whose answer depends on the
-  query plan, and the router has to change the plan.
+  query plan, and the proxy has to change the plan.
 
   MongoDB reports a missing field as `null` only when it can answer from a
   non-sparse index, because an index stores a missing field as a null key.
@@ -1330,14 +1330,14 @@ Part of [Thermocline](../README.md).
   worse. Answering from the fast tier as well and merging the two value sets
   closes the case where the fast tier holds one of the documents missing the
   field, and leaves the case where they are all in the archive, so the rule
-  would become "sometimes". Reproducing the behaviour outright means the router
+  would become "sometimes". Reproducing the behaviour outright means the proxy
   deciding, from the fast tier's own indexes, whether mongod would have used a
   covered scan, which is reproducing a plan choice rather than an answer.
 
   What to rely on instead: `null` in a `distinct` result means "some document
   has no value here" only when an index makes it visible, in MongoDB as much as
   here. Ask `countDocuments({field: {$exists: false}})` for that, which is a
-  logical fact and is correct through the router.
+  logical fact and is correct through the proxy.
 
 - **A change stream consumer more than an hour behind is shown the tiering
   itself.** What makes a copy-up an insert the application never made, an
@@ -1367,7 +1367,7 @@ Part of [Thermocline](../README.md).
   as possible tiering activity rather than the application's.
 
 - **A filter written with `$expr` never bounds a query, so it is always answered
-  by the archive.** The router decides whether the fast tier can answer a read
+  by the archive.** The proxy decides whether the fast tier can answer a read
   alone by reading a lower bound out of the filter, in the dimension the
   namespace ages by. It reads that bound from the age field's own predicate:
   `{createdAt: {$gte: T}}` and the `$and` and `$or` forms around it.
@@ -1402,16 +1402,16 @@ Part of [Thermocline](../README.md).
   to need the check that reaches it. Raise `--count-for` on those, and read
   "recorded unchecked" as a claim nothing has stood behind.
 
-- **The router will not start while the archive is unreachable**, so a restart
+- **The proxy will not start while the archive is unreachable**, so a restart
   during an archive outage leaves the application with nothing, including the
   reads the fast tier could have served alone. Decided on 2026-09-05 to stay that
-  way: a router that has never read a claim knows which namespaces are tiered and
+  way: a proxy that has never read a claim knows which namespaces are tiered and
   nothing about what the fast tier holds of them, so anything it served would be
   a guess dressed as an answer, and starting-and-refusing gives the application
   errors either way while looking healthy to monitoring. The runbook entry is in
-  [adoption.md](adoption.md): bring the archive back before restarting a router.
+  [adoption.md](adoption.md): bring the archive back before restarting a proxy.
 
-  A router that is already **running** is a different case and has a knob:
+  A proxy that is already **running** is a different case and has a knob:
   `router.claim_grace` keeps tiered reads alive through an outage.
 
 - **`applyOps` is refused for a tiered collection.** It applies oplog entries
@@ -1465,7 +1465,7 @@ Part of [Thermocline](../README.md).
   feeder that is merely slow into errors on the reads that fall through.
   Answering turns it into wrong answers reported as success: on the Hetzner
   staging pair on 2026-10-12, with the feeder stopped for two minutes under a
-  shop writing through the router, `permissive` gave **2,759** answers that
+  shop writing through the proxy, `permissive` gave **2,759** answers that
   contradicted the shop's own acknowledged writes, counts that did not move
   after an order and cancelled orders coming back. An error is something the
   application can see and retry. Two rarer copy-up paths, a sorted
@@ -1497,12 +1497,12 @@ Part of [Thermocline](../README.md).
   window waits for the archive itself, so the read after it often starts just
   after the election, before the feeder has published again, and by then the
   position has been quiet for longer than `archive_wait` and reads as a feeder
-  that has stopped. The router keeps the time the driver last saw the archive
+  that has stopped. The proxy keeps the time the driver last saw the archive
   without a primary and gives the feeder its `archive_wait` from then. Measured
   on 2026-10-09 with `testfailover.sh`: 2 wrong answers in 8 runs without it, 0
   in 8 with it.
 
-  Measured with the feeder stopped and a document written through the router a
+  Measured with the feeder stopped and a document written through the proxy a
   moment before: `countDocuments` on that `_id` answered **0** after 208ms for a
   document the application had just written successfully. The effect is stated
   in the warning it logs: the answer may miss a very recent write, or include a
@@ -1529,7 +1529,7 @@ Part of [Thermocline](../README.md).
   **And the bar a fall-through read waits on is raised by traffic that has
   nothing to do with the tiered collections.** A read clears two bars, and the
   binding one compares the feeder's published cluster time against the newest
-  `operationTime` this router has handed a client. `operationTime` on a reply is
+  `operationTime` this proxy has handed a client. `operationTime` on a reply is
   the node's own latest logical time, not that command's position, so it
   advances with *any* write anywhere on the fast tier cluster, including to
   databases nothing tiers. The feeder's position advances only when it processes
@@ -1555,7 +1555,7 @@ Part of [Thermocline](../README.md).
   that the cluster-time bar is the one that failed on that occasion, which
   follows from the code rather than from a reading, because nothing exported it
   at the time.
-  `thermocline_mirroring_cluster_time_behind_seconds` and the router's
+  `thermocline_mirroring_cluster_time_behind_seconds` and the proxy's
   "which bar the freshness wait gave up on" line exist to settle it the next
   time it happens, and until one of them has caught an event this paragraph is a
   mechanism and not a diagnosis.
@@ -1568,7 +1568,7 @@ Part of [Thermocline](../README.md).
   It costs something real, though, and the cost is only visible once you ask
   what the present bar covers by accident. Because `operationTime` is
   cluster-wide, today's bar also covers a write made **straight to mongod**,
-  bypassing the router: the feeder mirrors it, and a fall-through read waits for
+  bypassing the proxy: the feeder mirrors it, and a fall-through read waits for
   that too. Narrowing to tiered replies gives that up, and a cutover with both
   kinds of writer in flight is exactly when somebody would notice. So this is a
   decision about which of two guarantees matters more on a shared cluster, not a
@@ -1618,19 +1618,19 @@ Part of [Thermocline](../README.md).
   the write ticket pool dynamic and host-sized, so an absolute floor is
   meaningless: a container reports a total of 8 tickets where a pre-7.0 server
   reported a fixed 128.
-- **Router connection pooling, with authentication proxied.** One upstream
+- **Proxy connection pooling, with authentication proxied.** One upstream
   connection per client is simple and correct for SCRAM, and it will not scale to
   tens of thousands of clients. With `router.terminate_auth` on the connections
   are pooled instead: measured, eight idle clients cost zero extra connections to
   the primary, against thirty two with it off.
 
-  The wall is mongod's rather than the router's, so a deployment used to meet it
+  The wall is mongod's rather than the proxy's, so a deployment used to meet it
   as connection errors on the fast tier with nothing here having mentioned it.
-  The router says so once, at a thousand open clients, naming what each one costs
+  The proxy says so once, at a thousand open clients, naming what each one costs
   and what turns it off. A thousand is well short of the wall and well past any
   ordinary application's pool. Nothing is said with `terminate_auth` on, where an
   idle client holds no upstream connection at all.
-- **`$out` into a tiered collection is the one place the router removes archived
+- **`$out` into a tiered collection is the one place the proxy removes archived
   data**, and it is deliberate rather than an oversight. Clearing the fast tier
   only reaches what the fast tier holds, so an evicted document lives in the
   archive alone and would come back beside the result: measured, a `$out`
@@ -1645,7 +1645,7 @@ Part of [Thermocline](../README.md).
 
   A result mongod would refuse is refused before anything is cleared. The
   result is built in a collection carrying the target's unique indexes and
-  validator, as mongod's own `$out` builds it, and the router waits for
+  validator, as mongod's own `$out` builds it, and the proxy waits for
   mirroring before it clears. Until 2026-10-25 it was built in a bare
   collection: measured, a result with two documents sharing a unique value,
   and one the validator rejected, each failed only once both tiers were
@@ -1656,15 +1656,15 @@ Part of [Thermocline](../README.md).
   expensive half as well:
   clearing the fast tier reaches only the working set, while this reaches every
   live document the archive holds for that namespace, so a `$out` over a
-  collection with years behind it is a large write. The router logs how many it
+  collection with years behind it is a large write. The proxy logs how many it
   marked.
 
-  **A `$out` whose target is tiered is performed by the router whatever its
+  **A `$out` whose target is tiered is performed by the proxy whatever its
   input reads.** mongod does a `$out` by building the result beside the target
   and renaming over it, and a rename is not mirrored: a forwarded one put the
   result on the fast tier and nowhere else. Measured, two documents written and
   the archive holding none of them a minute later, with a count through the
-  router answering 1 where the fast tier held 2. The result is built in a
+  proxy answering 1 where the fast tier held 2. The result is built in a
   temporary collection here too, because clearing the target is part of the
   write and `$out` is allowed to read the collection it replaces: clearing first
   left nought documents on either tier where MongoDB leaves two. The last step
@@ -1674,21 +1674,21 @@ Part of [Thermocline](../README.md).
 - **A unique index build waits for a walk of both tiers.** mongod refuses
   `createIndex` with `unique` when two live documents already share a key, and
   the fast tier's own build cannot see the half of a duplicate that is in the
-  archive. The router walks both tiers before forwarding the command, so the
+  archive. The proxy walks both tiers before forwarding the command, so the
   refusal is the same 11000 mongod would have given, and the keys of the
   documents already there are claimed on the way. On a large collection that
   walk is the dominant cost of creating the index. It happens only for a spec
   asking for `unique: true` on a tiered collection.
 
 - **An adopted archive's unique constraints are not enforced until something
-  claims their keys, and the router now says so at startup.** The registry is
+  claims their keys, and the proxy now says so at startup.** The registry is
   what remembers that a value is taken once its document is only in the archive,
-  and it is filled by whatever claimed the key: a write through the router, or
+  and it is filled by whatever claimed the key: a write through the proxy, or
   the walk of both tiers that a `createIndexes` for `unique: true` performs
   before the build is forwarded.
 
   An adoption has had neither. The archive arrives with its documents and its
-  indexes already on it, so no `createIndexes` ever went through the router and
+  indexes already on it, so no `createIndexes` ever went through the proxy and
   nothing has walked it. Until something does, an insert duplicating a value
   only the archive holds is **accepted**: the fast tier's own index cannot see
   the other half, and a key whose registry row inserts cleanly is settled there
@@ -1702,14 +1702,14 @@ Part of [Thermocline](../README.md).
   --rebuild` was documented as the answer to "an index created out of band, a
   fast tier rebuilt from nothing, a cluster adopted with data already in it" and
   never as a consequence of skipping it, and a documented step is not a
-  guarantee. The router now warns at startup for each tiered collection whose
+  guarantee. The proxy now warns at startup for each tiered collection whose
   unique index has no claims at all while the archive holds documents that index
   would index, naming the namespace, the index and the command. It stays quiet
   for a fast tier built from nothing, which has nothing to claim, and for an
-  index created through the router, which claimed on the way.
+  index created through the proxy, which claimed on the way.
 
 - **Dropping a tiered collection on the fast tier ends its unique constraints,
-  and the router says so rather than pretending.** The router enforces a unique
+  and the proxy says so rather than pretending.** The proxy enforces a unique
   index across the tiers by reading the fast tier's listing, so a collection
   dropped out of band takes the index with it: the next write recreates the
   collection bare, and neither tier carries the constraint any more. The archive
@@ -1721,18 +1721,18 @@ Part of [Thermocline](../README.md).
   going to be lost a minute later either way. What that minute did produce was a
   false refusal. A collection dropped and rebuilt out of band (resetting an
   environment, restoring a fixture) does not have the old collection's unique
-  index, and the router refused writes on its behalf with a duplicate key error
+  index, and the proxy refused writes on its behalf with a duplicate key error
   naming an index that exists on neither tier. The fuzzer found it after four
   rounds, because its own reseed is that shape.
 
   So the constraint is dropped as soon as the fast tier says it is gone, and the
-  router logs which index it stopped enforcing, what that allows and what to do
+  proxy logs which index it stopped enforcing, what that allows and what to do
   about it. If the drop was not deliberate, recreate the index and run
   `cline keys --rebuild`, which reports any duplicates that got in.
 
 - **`create` with `capped` written as a number was not refused, and mongod
   accepts it.** MongoDB declares that option `safeBool` in its IDL, which takes a
-  number as well as a boolean and calls anything non-zero true. The router read
+  number as well as a boolean and calls anything non-zero true. The proxy read
   it as a boolean, found none, and forwarded the command, so the capped refusal
   could be stepped around by spelling the flag differently.
 
@@ -1755,9 +1755,9 @@ Part of [Thermocline](../README.md).
   values were dates an hour old, in a tiered collection created with
   `expireAfterSeconds: 1`, mirrored to the archive as twenty live documents and
   were gone from the fast tier 27 seconds later. The archive was then holding
-  **twenty tombstones and nothing live**, and the router answered `0`. That is
+  **twenty tombstones and nothing live**, and the proxy answered `0`. That is
   the capped collection's failure through a door neither check was looking at:
-  the router's TTL refusal reads a `createIndexes` command's `indexes` array and
+  the proxy's TTL refusal reads a `createIndexes` command's `indexes` array and
   a `collMod`'s `index` document, and this is neither.
 
   Both spellings are refused now, on `create` and on `collMod`, and the feeder
@@ -1769,18 +1769,18 @@ Part of [Thermocline](../README.md).
   **The clustering itself is not refused**, and that is a decision rather than an
   oversight: the documents are ordinary documents, mirroring them is ordinary
   work, and the archive's copy is simply not clustered. So `listIndexes` through
-  the router reports the fast tier's `_id_` index while the archive's copy has an
+  the proxy reports the fast tier's `_id_` index while the archive's copy has an
   ordinary one, and a `hint` on the clustered index is not answerable on the
   archive. That is the latitude a plain index already gets here.
 
 - **A collection of a kind that cannot be mirrored stops the feeder, whenever it
-  appears**, and the router refuses every way of creating one through it. Seven
+  appears**, and the proxy refuses every way of creating one through it. Seven
   shapes: capped, time series, a view, a clustered collection with a TTL, one
   with `encryptedFields`, a name of the form `enxcol_`, and `convertToCapped` or
   `cloneCollectionAsCapped` onto a tiered name.
 
   The `enxcol_` name was the seventh and was not refused until 2026-09-16, found
-  by tabulating what the feeder refuses to mirror against what the router
+  by tabulating what the feeder refuses to mirror against what the proxy
   refuses to create. Measured: `create` on a tiered `enxcol_` name was accepted,
   one insert into it stopped the feeder with every namespace behind it, and a
   document written to a different tiered collection afterwards never reached the
@@ -1803,7 +1803,7 @@ Part of [Thermocline](../README.md).
   and the feeder stops the same way it would have refused to start, with the
   namespace named and the action in the log. **It stops rather than skipping the
   namespace**, and that is the same choice the startup check makes: a feeder that
-  carried on would be mirroring less than its configuration says, and the router
+  carried on would be mirroring less than its configuration says, and the proxy
   would answer reads of that namespace from an archive holding none of it. The
   cost is that one such collection, created anywhere a mirror-everything
   deployment can see, takes mirroring down until it is removed from scope.
@@ -1819,7 +1819,7 @@ Part of [Thermocline](../README.md).
   So an upgrade of one tier while the daemons are running is not noticed. The
   pair they refused to start against is the pair they will happily go on serving
   until something restarts them. The exposure is the one that made the rule:
-  everything the router needs of a tier goes to the fast one, and the archive
+  everything the proxy needs of a tier goes to the fast one, and the archive
   only ever runs the client's own pipeline, so what breaks is a stage or operator
   newer than the archive, and it breaks with the archive's own error naming a
   stage the application has always used.
@@ -1834,7 +1834,7 @@ Part of [Thermocline](../README.md).
   direction only: the archive runs the client's own pipeline, so what breaks is
   a stage or operator *newer than the archive*, and it breaks with the archive's
   own error naming a stage the application has always used. An archive ahead of
-  the fast tier has no equivalent, because everything the router needs of a tier
+  the fast tier has no equivalent, because everything the proxy needs of a tier
   it asks of the fast one. The feeder points the same way: it reads the fast
   tier's change stream and writes what it finds into the archive, so a fast tier
   ahead of the archive is the order in which mirroring can meet something the
@@ -1856,7 +1856,7 @@ Part of [Thermocline](../README.md).
   exposure above rather than by anything measured here.
 
   The control is what makes that readable. The first run of this reported that
-  an index created through the router never reached the archive and read as a
+  an index created through the proxy never reached the archive and read as a
   release-gap finding; the equal pair did exactly the same, because a plain index
   is a decision about speed and the two tiers are allowed to differ. A check that
   fails on an equal pair is measuring something else.
@@ -1869,7 +1869,7 @@ Part of [Thermocline](../README.md).
 
   It used to be hung from the name in the command alone, which is not what a
   read is made of. Every invalidation this cache gets arrives under a
-  collection: the router's own write path names it, and so does the fast tier's
+  collection: the proxy's own write path names it, and so does the fast tier's
   change stream. A read of a view names the view, so the two never met, and a
   cached read of a view outlived every write to the collection it reads.
   Measured with the cache on: a count through a view stayed at its old value
@@ -1881,7 +1881,7 @@ Part of [Thermocline](../README.md).
   own depth limit, where the walk stops. That direction is the same one the
   completeness guard takes there, and the learned TTL is the bound on it. The
   older and larger exposure has not changed and is stated at the top of
-  `querycache.go`: a writer this router cannot see is not seen at all, and the
+  `querycache.go`: a writer this proxy cannot see is not seen at all, and the
   TTL is the whole of that.
 
 - **A document whose age field holds an array is never evicted, and the fast
@@ -1894,7 +1894,7 @@ Part of [Thermocline](../README.md).
   Measured before it was excluded, on four documents with one holding
   `[four hours ago, thirty seconds ago]`: the evictor removed it for the old
   element, and a read bounded at the completeness claim still matched it for the
-  new one. The archive answered `1,2,3,9` and the router answered `1,2,3`, a
+  new one. The archive answered `1,2,3,9` and the proxy answered `1,2,3`, a
   short answer inside the range the claim promises, with no error on it.
 
   So the eviction filter excludes an array outright, which leaves those

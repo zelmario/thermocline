@@ -55,7 +55,7 @@ success and tiers nothing, for ever. The warmer copies nothing, concludes the
 window is done and records a completeness claim over a fast tier it never
 filled. Measured on an adopted collection of ten integer-keyed documents: the
 warmer reported `warm complete, scanned 0` and claimed it complete for all of
-history, and the router then answered `countDocuments({})` with **0** where the
+history, and the proxy then answered `countDocuments({})` with **0** where the
 original cluster answers 10. The collection had disappeared and every component
 reported success.
 
@@ -132,13 +132,13 @@ bin/cline watermark --config cline.yaml --ns app.orders --clear
 
 **A claim is checked against both tiers before it is recorded**, because it is
 otherwise a promise typed by hand: it says the fast tier holds everything, and
-recording one it does not have makes the router answer short with no error. So
+recording one it does not have makes the proxy answer short with no error. So
 this counts what each tier holds and refuses a claim the numbers contradict,
 naming both. `--force` records it anyway, for the case where the operator knows
 something the counts cannot show, such as a warm still running.
 
 **A declaration waits for an eviction sweep in progress.** A sweep raises the
-claim to its cutoff, waits for routers to read it, and only then deletes what is
+claim to its cutoff, waits for proxies to read it, and only then deletes what is
 older. A declaration counted and written inside that wait describes documents
 the sweep is about to remove, and the counts cannot see it because the deletes
 have not happened yet. So declaring takes the evictor's lease for as long as it

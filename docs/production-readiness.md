@@ -24,8 +24,8 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Pilot write, change stream and transaction batteries | 22, 5 and 15 checks, 0 failed |
 | Pilot soak, 691 rounds | 0 disagreements, 0 stale reads, 0 panics, flat memory |
 | Rolling upgrade under traffic, both orders, against an equal-version control | 25 checks, 0 failed |
-| Router startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
-| Two applications writing through one router for four hours | 2,830,950 operations, 0 errors, 0 violations |
+| Proxy startup, 160 tiered namespaces with data on both tiers | 1.3 seconds |
+| Two applications writing through one proxy for four hours | 2,830,950 operations, 0 errors, 0 violations |
 | The same two, 45 minutes against the guards added since | 637,747 operations, 0 violations, 0 refusals |
 | The same two again, four hours, 2026-09-17 | 2,494,225 operations, 0 violations, 0 refusals, 31 stale reads in one second |
 | The fuzzer's change streams, 20 rounds under three other suites | 365 minutes, 0 disagreements |
@@ -34,12 +34,12 @@ Measured, not asserted. Re-run these before believing them; the commands are in
 | Losing the fast tier and rebuilding it from the archive | 33 checks, 0 failed |
 | In-node suites after the day's second half | 1,932 checks, 0 failed |
 | Host suites after it | 310 checks, 0 failed |
-| Two applications through one router, 30 minutes, after the day's changes | 474,588 commands, 0 refused, 0 stale reads, 0 duplicate keys, 0 panics |
-| A router restarted under both of them writing | stopped in 1s, ready in 1.0-1.1s, every error a refused connection and no invariant broken |
+| Two applications through one proxy, 30 minutes, after the day's changes | 474,588 commands, 0 refused, 0 stale reads, 0 duplicate keys, 0 panics |
+| A proxy restarted under both of them writing | stopped in 1s, ready in 1.0-1.1s, every error a refused connection and no invariant broken |
 | In-node suites, 2026-09-23, after the collation audit and the residency fix | 1,990 checks, 0 failed, 32 minutes |
 | The same with the query cache on | 1,975 checks, 0 failed |
 | Host suites, 12 of them | 322 checks, 0 failed |
-| Two applications through one router, 30 minutes, with a change stream consumer tailing | 8,375 commands, 1,440 copy-ups, 0 phantom events, 0 violations |
+| Two applications through one proxy, 30 minutes, with a change stream consumer tailing | 8,375 commands, 1,440 copy-ups, 0 phantom events, 0 violations |
 | The fuzzer with pipelines that write their answer down | 489 compared, 0 disagreed |
 | In-node suites, 2026-09-28, after the day's key and pairing fixes | 2,025 checks, 0 failed |
 | Host suites, the same build | 328 checks, 0 failed |
@@ -67,11 +67,11 @@ That is not a flattering number and it belongs here rather than in a commit
 message nobody re-reads.
 
 **The reading that cuts the other way.** Six of the eight came from one question
-asked systematically: does a query this router builds against the other tier
+asked systematically: does a query this proxy builds against the other tier
 reproduce the comparison mongod already made? A collation arrives two ways and
 only the explicit one travels with the command, so the read path had been right
 since it was written and the write paths never were. That audit is finished and
-its boundaries are written down in `docs/router.md`, including the two places
+its boundaries are written down in `docs/proxy.md`, including the two places
 that must **not** carry a collation, `_id` and `files_id`. It was not a random
 sample of unknown territory.
 
@@ -97,7 +97,7 @@ application repointed at the archive accepted three duplicate order references
 in sixty rounds.
 
 Nothing copies an index to the archive, on purpose, and that reasoning is sound
-while the router is in front of it. Rollback takes the router away. Uniqueness
+while the proxy is in front of it. Rollback takes the proxy away. Uniqueness
 across the tiers is enforced by the key registry, which lives on the fast tier
 this procedure switches off, so the constraint the application declared was
 enforced by nothing and MongoDB reported each duplicate as an ordinary
@@ -143,12 +143,12 @@ procedure to its end, and a workload doing one more thing a real application
 does. Neither was a new kind of test. Both were the existing tests asked to
 finish the job.
 
-## 2026-09-25: three more, from a second router
+## 2026-09-25: three more, from a second proxy
 
 The next store addition had to be chosen rather than taken, and the choice was
 the shape every deployment with two app servers has: two applications writing
-the same collections, each through a router of its own. `test/store/shared.sh`.
-Its control against plain MongoDB was clean. Its first run through the routers
+the same collections, each through a proxy of its own. `test/store/shared.sh`.
+Its control against plain MongoDB was clean. Its first run through the proxies
 was not, and neither were the next three. Each defect below was measured before
 it was fixed and measured again after.
 
@@ -158,23 +158,23 @@ shops, a warmer and an evictor is never quiet for 20ms, so the position stood
 still for as long as a batch took to fill. Measured on a lone feeder at about 65
 inserts a second: gaps of 3,626ms, 4,078ms and 6,497ms in three runs before the
 fix, none over 208ms in four runs after, apart from the pauses of the whole
-node described two paragraphs down. A router calls two seconds without a
+node described two paragraphs down. A proxy calls two seconds without a
 publication a stopped feeder and stops waiting for mirroring, and each shop
 reported three placed orders its own count did not include. The buffer is
 written within 100ms now whatever the stream is doing.
 
 **The evictor ended a hold it had never judged.** It checks holds when it
-chooses a batch and ends them once the delete is done, and a router can place a
+chooses a batch and ends them once the delete is done, and a proxy can place a
 hold in between. The oplog gave the order to the millisecond: a hold at 27.754,
-the eviction at 27.794, the hold ended at 27.822, the other router's copy-up at
-27.833. Both routers then read the copy-up as the application writing the order
+the eviction at 27.794, the hold ended at 27.822, the other proxy's copy-up at
+27.833. Both proxies then read the copy-up as the application writing the order
 again, and both shops were shown two seeded orders as orders just placed. The
 evictor ends only lapsed holds now, which are the ones its batch was chosen
 under. `TestEvictionEndsOnlyTheHoldsItJudged` failed before the change.
 
 **A read gave up on a feeder that was only paused.** This box stops every
 process in node0 for about 2.6 seconds now and then, and nothing in any mongod
-log says why. The router's read was prepared to wait five seconds and gave up on
+log says why. The proxy's read was prepared to wait five seconds and gave up on
 the feeder at two, so a pause shorter than the read's own patience produced six
 wrong answers in one second. A position quiet for less than `archive_wait` is
 now a feeder that is behind, and the read waits for it. A feeder that has really
@@ -190,10 +190,10 @@ changed: each needed two processes that each hold a view of the same state.
 ## 2026-09-25, evening: the next store addition, and a join it did not ask about
 
 The addition was a consumer that falls further behind than the oplog, and
-recovers: told history is lost, it reads every order through the router and
+recovers: told history is lost, it reads every order through the proxy and
 tails from where it noted, and what it keeps is judged against the tiers
 themselves. It found nothing wrong. Nine resyncs each in a six-minute run
-through two routers, the router passed history-lost every time, and both
+through two proxies, the proxy passed history-lost every time, and both
 indexes matched the tiers exactly at 12,267 orders.
 
 The same run's activity report did find something. A `$lookup` from events to
@@ -221,14 +221,14 @@ transactions, so there it falls back and warns; that is written in
 Every store run had driven the warmer and one evictor sweep in turn from a
 single loop, which is not a shape any deployment has: the evictor is a resident
 daemon and the warmer an hourly timer beside it. Run that way, the first
-eight-minute two-router run found two defects, both silent wrong answers, and
+eight-minute two-proxy run found two defects, both silent wrong answers, and
 both measured before and after.
 
 **A copy-up undid a delete.** Every copy-up reads the archive, and none waited
 for mirroring the way a read does, so one landing between an application's
 delete and its tombstone found the document live and put it back. The store saw
 a cancelled order live on the fast tier a second later. Deleting a document
-through the router and then updating it by `_id` matched the deleted document
+through the proxy and then updating it by `_id` matched the deleted document
 **40 times of 40**, where MongoDB matches nothing. Copy-ups clear the read
 barrier now: 0 of 40.
 
@@ -249,10 +249,10 @@ to hold. The discovery rate has not fallen.
 ## 2026-09-26, early: every reader of the archive, not only the reads
 
 The copy-up defect of the night before was one reader of the archive missing
-the freshness barrier. So every place the router reads application documents
+the freshness barrier. So every place the proxy reads application documents
 from the archive was listed and asked the same question, and four more were
 deciding something from an archive that had not yet been told about a delete.
-Each was measured through a router against MongoDB's answer, before and after:
+Each was measured through a proxy against MongoDB's answer, before and after:
 
 | decision | before | after |
 |---|---|---|
@@ -281,7 +281,7 @@ holds the `_id`. A document updated a moment earlier has the previous version
 in the archive until the feeder mirrors the update, and evicting it removed the
 only copy of the new one. The feeder's lookup for the update came back empty
 and was skipped, because a delete was coming, and the delete that came was the
-eviction. **Twenty updates acknowledged to the client, one sweep, and the router
+eviction. **Twenty updates acknowledged to the client, one sweep, and the proxy
 answered the old value for all twenty.** The window in production is the
 mirroring lag the evictor tolerates, up to `max_feeder_lag`, 30 seconds.
 
@@ -340,11 +340,11 @@ document ending 4KB under 16MB mirrors, and so does the write after it.
 
 **A resumed change stream could never be read by the Go driver.** An update
 event whose lookup came back null is a few hundred bytes, so mongod packs up to
-a thousand into a batch, and the router fills each with the archive's copy.
+a thousand into a batch, and the proxy fills each with the archive's copy.
 200 documents of 1MB, updated, evicted, and read from a token taken before the
 updates, came back as one batch of 209,826,801 bytes. The Go driver refuses a
 message past 48MB, retried, was sent the same batch, and gave up after 28
-seconds, on every resume. The router now cuts a filled batch at 16MB and holds
+seconds, on every resume. The proxy now cuts a filled batch at 16MB and holds
 the rest for the cursor's next getMores, with the resume token following the
 cut. Resuming in the middle gives 185 after 15 with none twice; a getMore from
 another session or naming another collection is refused as mongod refuses it.
@@ -352,7 +352,7 @@ another session or naming another collection is refused as mongod refuses it.
 **An _id past about 5KB could stall mirroring for good.** The resume token
 encodes the document key, so an event holds the `_id` three times. A 7MB `_id`,
 which mongod accepts, made an insert event of 29,360,471 bytes, and no reader
-can get past one mongod will not return. The router now refuses an `_id` past
+can get past one mongod will not return. The proxy now refuses an `_id` past
 4,096 bytes on every write path into a tiered collection, and the feeder says
 once what stopped it when a write made straight at the fast tier does it. See
 `docs/limitations.md`, which also has a unique value past about 12MB going
@@ -361,14 +361,14 @@ unchecked against the archive.
 One failure in the sweep on ea87c71, testchange's "a lookup is answered from
 the archive", was chased on 2026-09-27 and is not this system's. mongosh's
 `watch()` with no start option calls `tryNext()` once to open the cursor and
-discards what it returns. A wire tap between mongosh and the router showed the
+discards what it returns. A wire tap between mongosh and the proxy showed the
 update delivered to mongosh in that first getMore, 4ms before `watch()`
-returned; against a plain mongod with no router, an insert timed to land there
+returned; against a plain mongod with no proxy, an insert timed to land there
 was lost 3 times in 20. The suite's watchers that wait for another process's
 write now open at an explicit start, which skips that call.
 
 **A multi-document write held its copy-up by count.** An updateMany over 60
-archived documents of 12MB peaked the router at 2,044MB; bounded at 16MB a
+archived documents of 12MB peaked the proxy at 2,044MB; bounded at 16MB a
 batch, 393MB.
 
 ## 2026-09-27: a field name mirroring could not replace
@@ -388,7 +388,7 @@ on this one.
 
 ## 2026-09-27: numbers compared by their bytes
 
-**The router admitted a second document with an `_id` the archive held.** The
+**The proxy admitted a second document with an `_id` the archive held.** The
 insert guard asked the archive with `$in`, which matches by value, and mapped
 the answer back to the batch by the raw bytes of the value, which a comment
 defended on purpose. mongod's `_id` index compares numbers by value, so
@@ -447,7 +447,7 @@ unordered alike. A later document of a batch with a key an earlier one claimed
 is now refused at once, as mongod refuses it.
 
 **A write that landed in part lost the claims of what landed.** After any
-write that reported an error the router released every claim the command had
+write that reported an error the proxy released every claim the command had
 made. An updateMany that changed its first document and was refused on its
 second, and an unordered insert the fast tier refused one document of, both
 left the documents that had landed with no claim. The same shape is two clients
@@ -463,11 +463,11 @@ does.
 **The two-application shop found a reference accepted twice.** The shop's
 references are unique under a case-insensitive collation, and "ref003955" was
 accepted beside an archived "Ref003955", once in about 3,000 attempts to reuse a
-reference in 30 minutes. The router asked the archive under the collation, found
+reference in 30 minutes. The proxy asked the archive under the collation, found
 the order, and passed it over because the fast tier held it too, leaving the
 refusal to the fast tier's own index; the evictor, sweeping 200 old orders at a
 time, removed that exact order from the fast tier in the same second, and
-nothing was left to refuse the second spelling. The router now passes over an
+nothing was left to refuse the second spelling. The proxy now passes over an
 archive match only when the fast tier holds that document with another value,
 which is the stale copy the rule exists for, and refuses otherwise, which is
 mongod's answer while the fast tier holds it and the only right one once it
@@ -492,10 +492,10 @@ so the shop forgot the order, and then the insert event arrived. That half was
 the harness, which now keeps an order whose insert failed as uncertain rather
 than forgetting it.
 
-The other half was the router. One of the two errors was `NotWritablePrimary`
+The other half was the proxy. One of the two errors was `NotWritablePrimary`
 for an insert that had landed. The old primary applied the write, then the
 step-down interrupted its wait for a majority, and the reply was `ok: 1` with
-a write concern error. The router read that as success, so the connection
+a write concern error. The proxy read that as success, so the connection
 stayed on the old member, the driver's retry went out on a sibling still there,
 and the old member, now a secondary, refused it. Straight to the replica set
 the retry reaches the new primary, which knows the transaction number and
@@ -505,13 +505,13 @@ answers success.
 a step-down every 20 seconds for 3 minutes:
 
     build                     errors   landed anyway   as NotWritablePrimary
-    38545d7, through router       31              30                      25
-    this fix, through router       0               0                       0
+    38545d7, through proxy       31              30                      25
+    this fix, through proxy       0               0                       0
     straight to the set            0               0                       0
 
 A step-down write concern error is now a failover reply, so the connection ends
 after the reply and the retry finds the new primary. With `terminate_auth` the
-router replays the write instead, which the transaction number deduplicates;
+proxy replays the write instead, which the transaction number deduplicates;
 both builds had 0 errors that way. Attacking the fix found the replay would
 also have resent an aggregate ending in `$merge` or `$out` that had already
 run, and so would the existing replay after a broken connection. An aggregate
@@ -520,13 +520,13 @@ that writes is no longer replayed.
 **The fuzzer found a unique key taken twice, on the build pushed that morning
 too.** Churn round 8 of `testfuzz`, the same operation on four runs and both
 builds: a pipeline update of `{ _id: 19 }` to `n: 20`, refused E11000 by the
-untiered reference and accepted through the router. The router's debug line
+untiered reference and accepted through the proxy. The proxy's debug line
 said the guard had matched 0 documents. Both documents were archived. The
 guard asks the fast tier what a statement matches, which was nothing, so it
 claimed nothing; the update then matched nothing either, the miss path copied
 document 19 up, and re-sent the command with no guard. Reproduced without the
 fuzzer, both documents in the archive only and a unique index created through
-the router:
+the proxy:
 
     statement onto the archived key     before                       after
     pipeline update                     accepted, 2 holders          refused 11000
@@ -545,16 +545,16 @@ document on the fast tier.
 
 **An `updateMany` reported success and skipped one document.** The sweep on
 2026-10-05 had one disagreement in the fuzzer's churn round 2: an `updateMany`
-with `$inc: { n: 2 }` modified 55 documents through the router and 56 on the
+with `$inc: { n: 2 }` modified 55 documents through the proxy and 56 on the
 untiered reference, and both tiers kept document 1006 at the old value. It did
 not come back in 16 more rounds on either build, so it stayed a lead.
 
-The router's log placed it. The update copied one document up, and the sweep
+The proxy's log placed it. The update copied one document up, and the sweep
 that ended two seconds before had evicted one. Before a multi-document write
-the router asks the fast tier which matches it already holds, skips those, and
+the proxy asks the fast tier which matches it already holds, skips those, and
 then writes a hold so the evictor leaves them alone. The evictor's side is to
 announce, read the holds, and delete. A sweep that read the holds before the
-router wrote its own deleted a document the router had just decided not to
+proxy wrote its own deleted a document the proxy had just decided not to
 copy, and the statement then ran against a fast tier without it. The insert
 path had the same handshake in the right order all along: write the hold, then
 read the announcement, so whichever side runs second sees the other.
@@ -609,7 +609,7 @@ compare and set against its own last write, so a raise makes it fail, and the
 warm stops for that run with a line saying why.
 
 **Two operator commands acted inside the evictor's wait.** The evictor raises
-the claim, waits about six seconds for routers to read it, and then deletes
+the claim, waits about six seconds for proxies to read it, and then deletes
 what fell below, without reading the claim again. Asking who else writes or
 reads the claim during that wait found two more:
 
@@ -637,7 +637,7 @@ waits for a sweep in progress to reach that check: 0 in three rounds.
 
 **The probe written for item 9 failed on every build.** Run to close item 11,
 `test/echorace` sends 32 simultaneous reads of one archived document through two
-routers after each eviction and reads the change stream late. A copy-up was
+proxies after each eviction and reads the change stream late. A copy-up was
 shown as an insert in 2 of 12 rounds on 38545d7, 4 of 18 on b7cc9e3 and 9 of 22
 on 810a4c6. Two copy-ups both found the document absent and both opened a
 promotion, and the second, landing after the first one's insert, moved the
@@ -664,12 +664,12 @@ to fail once before it was trusted.
 
 **The proxied failover failure was measured, not explained, and the old
 explanation was wrong.** testfailover's comment blamed an election outlasting
-the router's wait. The router log had the new primary 14ms after the refusal.
+the proxy's wait. The proxy log had the new primary 14ms after the refusal.
 With the Node driver's own logs on, 20 step-downs on a quiet box: 16 writes
 landed, 4 failed, none applied twice, and all four were the same sequence. A
 connection still bound to the old member is refused and ended; a write queued
 for a connection gets it before the driver has read the close; the pool is
-cleared; and because the router is a single server to the driver, the retry
+cleared; and because the proxy is a single server to the driver, the retry
 does not wait and fails on the cleared pool. No cheaper reply avoids it, and
 the full reasoning is in [limitations.md](limitations.md). It is a refusal,
 never a wrong answer, so it stays an accepted limitation with
@@ -713,7 +713,7 @@ of every batch.
 **Two monitoring defects came out of the same diagnosis.** The cluster-time
 gauge compared against a cache that only refreshes while a read waits, so on a
 healthy feeder it climbed one second per second, 150 after 150 seconds, and
-`ThermoclineClusterTimeBehind` would have fired on any router whose reads
+`ThermoclineClusterTimeBehind` would have fired on any proxy whose reads
 rarely fall through. And a strict refusal never said which bar it gave up on,
 because that line stayed on the permissive path. Both fixed, with checks.
 
@@ -727,9 +727,9 @@ cache off and cache on.
 
 **The failover lead from 2026-10-12 closed.** testfailover's "write with
 nowhere to go" lost its retry about once in 16 runs, and only in a run where
-the router found the new primary just inside its 5 second lookup. Forced onto
+the proxy found the new primary just inside its 5 second lookup. Forced onto
 that path, 9 of 10 writes failed: the driver's monitor check came back at once
-and the retry went out on the connection the router was closing. The router
+and the retry went out on the connection the proxy was closing. The proxy
 now holds `hello` for 250ms after such a close, and the same rounds landed 10
 of 10. The details are in [limitations.md](limitations.md).
 
@@ -794,11 +794,11 @@ conversion, a cursor whose claim narrows under it, a pipeline that joins an
 untiered collection. The system says no and says why. The boundary is the
 product's shape, not an omission.
 
-**Outside the router's path, and reported.** A write made straight at the fast
-tier's mongod, a TTL index created there, a collection dropped there. The router
+**Outside the proxy's path, and reported.** A write made straight at the fast
+tier's mongod, a TTL index created there, a collection dropped there. The proxy
 is not in that path by definition. Each is measured, written down, and now
 counted or warned: `inserts_over_existing`, the TTL warning, the fast-tier
-watch. The protection is operational: only the router holds credentials that
+watch. The protection is operational: only the proxy holds credentials that
 can write to the fast tier's application databases.
 
 Adding to this section requires the same standard as the rest of the file: a
@@ -810,7 +810,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
 
 - [x] **1. Decide `terminate_auth`.** Decided on 2026-09-16: **it ships off.**
   Authentication is proxied, mongod judges every command against the account the
-  client authenticated as, and this router cannot grant what mongod would
+  client authenticated as, and this proxy cannot grant what mongod would
   refuse. Two of the three steady-state defects found on 2026-09-15 live only in
   the other mode, and they leave the product with it.
 
@@ -825,7 +825,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
 
   `terminate_auth: true` stays in the product, tested and unsupported. It has 56
   checks and a clean pilot behind it, and that is not the claim that matters:
-  with it on this router's own gate is the only thing between a client and
+  with it on this proxy's own gate is the only thing between a client and
   somebody else's data, and nobody who did not write that gate has reviewed it.
   What would reopen this item is that review, not more traffic through it. The
   startup line says which mode is running, and turning it on warns every start.
@@ -845,7 +845,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   A change stream delivered 23 of 24 events in one sweep on 2026-09-16. The
   mechanism the code suggested was measured and refuted, and the same seed then
   passed three times, so the suite was given the evidence it would need instead
-  of a guess: the router runs with `-v` there, for the one line that names the
+  of a guess: the proxy runs with `-v` there, for the one line that names the
   document it hid and why.
 
   `test/streamsoak.sh` then ran `testfuzz` twenty times with three other suites
@@ -870,7 +870,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   the one where the interference broke an invariant and then stopped.**
 
       2,649,084 operations over 4h0m, 92/s, 0 errors
-      2,651,911 router commands, 0 refused, 0 duplicate keys, 0 panics
+      2,651,911 proxy commands, 0 refused, 0 duplicate keys, 0 panics
       86 stale reads, 9 violations
 
   Every one of the nine violations is at **one instant, 15:57:24**, and all nine
@@ -898,15 +898,15 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   sharing one disk.
 
   **Off this box, 2026-10-08.** The Hetzner pair in `deploy/hetzner`: six
-  CCX13 (2 dedicated vCPU) for `rsHot` and `rsCold`, one CCX23 for the router,
+  CCX13 (2 dedicated vCPU) for `rsHot` and `rsCold`, one CCX23 for the proxy,
   the daemons and the shop, PSMDB 8.0.26-11, one private network with 0.3 to
   0.5ms between nodes. The shop of `test/store/two.sh` with one application:
   8,000 orders over 120 days, 800 customers, 300 products, 6 shoppers, the
   warmer and the evictor looping underneath.
 
       straight at the fast tier, 5m      702,309 operations   2,341/s   0 errors
-      through the router, bare archive   84,330 in 30m           47/s   0 errors, 0 violations
-      through the router, indexed        228,317 in 30m         127/s   0 errors, 0 violations
+      through the proxy, bare archive   84,330 in 30m           47/s   0 errors, 0 violations
+      through the proxy, indexed        228,317 in 30m         127/s   0 errors, 0 violations
 
   **The archive's indexes decide the fall-through cost, not the hardware.**
   With only `_id` and `ref` on the archive, every read by customer or date
@@ -928,7 +928,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   left the feeder
   silent for 10.5 to 11.2s. Every stall began at the priority takeover about
   10s after the step-down (`rsCold` has one member at priority 2), not at the
-  step-down itself. The router's `archive_wait` is 5s, so reads stopped
+  step-down itself. The proxy's `archive_wait` is 5s, so reads stopped
   waiting for mirroring and answered from an archive that did not hold the
   client's own write yet: 7 read-your-writes violations in one six-minute run,
   every one stamped at the moment the feeder resumed. What is known:
@@ -975,7 +975,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   The errors are the ones MongoDB itself gives here. Every one the shop logged
   is a `deleteMany` of a cancelled order's events during a step-down: 39
   `NotWritablePrimary`, 3 write concern errors interrupted by the election, and
-  one connection the router closed on a fast tier step-down. A multi-document
+  one connection the proxy closed on a fast tier step-down. A multi-document
   delete is not a retryable write, so a client talking straight to mongod sees
   the same. The longest wait is a read held through an archive election rather
   than answered without the client's own write, which is the fix doing its job.
@@ -1011,16 +1011,16 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
 
 - [x] **6. A second application writing continuously for hours.** Closed on
   2026-09-16 by `FOR=4h bash test/store/two.sh`: two shops, four hours, through
-  one router, one feeder, one evictor and one claim cache. Each shop ran
+  one proxy, one feeder, one evictor and one claim cache. Each shop ran
   **1,415,475 operations at 98 to 104/s with 0 errors and 0 violations**, against
-  2,834,356 router commands with **0 stale reads, 0 refusals, 0 duplicate keys
+  2,834,356 proxy commands with **0 stale reads, 0 refusals, 0 duplicate keys
   and 0 panics**. 42.5% of reads were answered by the archive throughout, so the
   tiering was real rather than a fast tier holding everything, and p50 on those
   reads moved from 122ms to 129ms across the four hours.
 
   The run needed two changes to be possible at all, and one of them was a defect:
   the length is a duration now rather than a round count, and the churn loop
-  underneath the shops used to kill the feeder and the router when it ended,
+  underneath the shops used to kill the feeder and the proxy when it ended,
   which was invisible while forty churn iterations always outlasted three hundred
   rounds.
 
@@ -1032,7 +1032,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   The feeder gives up on a document the archive's unique index refuses, which is
   right: no retry can succeed, and retrying for ever stops mirroring for every
   namespace behind it. It said so at ERROR and counted it, and nothing else.
-  A router cannot read a log line, so every read that fell through to the archive
+  A proxy cannot read a log line, so every read that fell through to the archive
   was short by that document and reported success. Measured on three documents
   written at the fast tier with the archive carrying a unique index the third
   breaks: `countDocuments` answered 2, `find` returned two of three, and
@@ -1041,7 +1041,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   on how it was asked.
 
   The feeder records the document now, in the archive beside every other piece of
-  bookkeeping, and the router refuses the reads that would be short by it. Writes
+  bookkeeping, and the proxy refuses the reads that would be short by it. Writes
   are not refused, measured rather than reasoned: a multi-document write is
   applied at the fast tier after the archive's matches are copied up, so it
   reaches every document including this one. The refusal lifts by itself when the
@@ -1081,15 +1081,15 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
 - [x] **9. A copy-up shown to a late consumer as an insert nobody made.**
   Opened on 2026-09-25 from reading the code and closed the same day by
   measuring it, with `test/echorace`: one archived document, evicted and read
-  back each round through two routers, and a change stream opened seventy
+  back each round through two proxies, and a change stream opened seventy
   seconds late from a position before the read. It was two defects, and the
   second was the one written here first.
 
   **No race was needed.** The feeder looked for a copy-up's echo only while it
-  believed a router was promoting, and cached a "no" for five seconds. An
+  believed a proxy was promoting, and cached a "no" for five seconds. An
   occasional copy-up lands inside a stale "no" almost every time, so its echo
   was mirrored rather than spent and its position was never written down. The
-  router answers a late consumer from that list of positions, and a list holding
+  proxy answers a late consumer from that list of positions, and a list holding
   only an earlier promotion's position answered "not ours", exactly and wrongly.
   One reader, one copy-up a round: shown **2 rounds of 2** after the first. The
   feeder now asks on every flush that holds an insert, and the heartbeats and
@@ -1098,12 +1098,12 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
 
   **The race.** When two copy-ups of one `_id` run at once, the one that meets
   the duplicate key withdraws the echo, and the insert it lost to is that echo.
-  32 simultaneous reads across two routers withdrew it in every round, 8 of 8
+  32 simultaneous reads across two proxies withdrew it in every round, 8 of 8
   and 5 of 5. After one uncontested promotion had put a position in the list, a
   late consumer was shown the copy-up in **5 rounds of 5**. The withdrawal
   stays, because a flag left standing would swallow an application's own
   delete-and-reinsert. It now also marks the record `echoUncertain`, and the
-  router does not answer exactly from a list it knows may be short, or from one
+  proxy does not answer exactly from a list it knows may be short, or from one
   whose echo is still pending: the thirty-second window decides, as it did
   before the list existed. After: withdrawn 5 of 5, shown **0**.
 
@@ -1117,27 +1117,27 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   Closed on 2026-09-28 without choosing either cost: see the end of this item.
   When both tiers hold an `_id`, the insert guard hands the insert to mongod,
   so a driver's retry of an insert that already succeeded is deduplicated by
-  mongod rather than refused by this router. What that costs: an eviction of
+  mongod rather than refused by this proxy. What that costs: an eviction of
   that exact document between the guard's read and mongod applying the insert
   lets it land, and the feeder mirrors it over the archived copy. The collated
   form of that window was met in a thirty-minute shop run on 2026-09-28. The
-  other choice is the router refusing such inserts itself, which is mongod's
+  other choice is the proxy refusing such inserts itself, which is mongod's
   own answer to a second insert of an `_id` the fast tier holds, and turns a
-  retry that reaches a different router than the first attempt into an error
+  retry that reaches a different proxy than the first attempt into an error
   where plain MongoDB returns success. Which of the two is rarer and which is
   worse for the application is Zelmar's call.
 
   Zelmar said fix it, and it is fixed without giving up either side. Before
-  handing an insert back to mongod the router now places a residency hold on
+  handing an insert back to mongod the proxy now places a residency hold on
   the fast tier's copy and then looks for an eviction announcement; the evictor
   announces and then looks for holds, dropping any document held since its
   batch was chosen and taking that announcement back. Both are writes and reads
   on the archive's primary, so whichever runs second sees the first, and an
   eviction and that insert cannot both go ahead. Retries still reach mongod.
-  Measured: with an eviction announced, the insert is refused by the router
+  Measured: with an eviction announced, the insert is refused by the proxy
   rather than handed to mongod; with none, it is handed back with a hold placed.
   What it costs, on the one insert that pays it, an _id both tiers hold, which
-  mongod refuses as a duplicate: 200 of them through the router, median 8ms
+  mongod refuses as a duplicate: 200 of them through the proxy, median 8ms
   before and 11ms after, p90 17ms and 16ms. An insert of a new _id does not
   reach it, 11ms and 9ms, within noise. An application that inserts and reads
   E11000 as "already there" pays about 3ms more on each such insert.
@@ -1159,14 +1159,14 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   retryable batch insert from a fresh session (txnNumber 1, stmtId 4, the other
   four statements already present) put the archive's copy back on the fast
   tier. The feeder had tombstoned the archive at 23:45:29.610. The fast tier
-  holds the cancelled order live, so the router answers it. The batch is the
+  holds the cancelled order live, so the proxy answers it. The batch is the
   shape of a copy-up, most likely a transaction's warm (txnwarm.go), which
   inserts a customer's archived orders and skips the ones already there.
 
-  60d19ae made every copy-up wait for mirroring to the router's cluster time as
+  60d19ae made every copy-up wait for mirroring to the proxy's cluster time as
   it begins, which covers a delete acknowledged before it. This delete was
   concurrent: after the copy-up read the archive and before it inserted, from
-  the other router. Nothing covers that window, and re-checking before the
+  the other proxy. Nothing covers that window, and re-checking before the
   insert only narrows it. The direction: after inserting, wait for mirroring to
   reach the insert's time, re-read the archive for the ids copied, and remove
   from the fast tier any that are now tombstoned, hidden from change streams as
@@ -1174,10 +1174,10 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   box.
 
   **Reproduced and fixed on 2026-09-30.** A customer with 3,000 orders held
-  only by the archive, a transaction through one router counting them, and a
-  recent order deleted through the other router while it ran: 12 of 12 rounds
+  only by the archive, a transaction through one proxy counting them, and a
+  recent order deleted through the other proxy while it ran: 12 of 12 rounds
   put the order back, stale_reads 0 each time, and the window was about 1.6s
-  wide. The fix is in the feeder rather than the router, because the feeder is
+  wide. The fix is in the feeder rather than the proxy, because the feeder is
   the one process that sees the delete and the copy-up's insert in the fast
   tier's own order. A copy-up only reads documents the archive holds live, so
   an echo whose archived copy is tombstoned once the flush has landed is a
@@ -1191,7 +1191,7 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   copy-up recorded a promotion for every document it matched, including those
   the fast tier already held and the insert then skipped, and the change
   stream sieve hides any insert of a document promoted in the last 30s. An
-  order placed through the router and passed over by its customer's warm a
+  order placed through the proxy and passed over by its customer's warm a
   moment later was missing from a stream read from before it, 4 of 4, with no
   delete anywhere. Copy-ups now ask the fast tier first and only hold what it
   already has: 0 of 4.
@@ -1215,13 +1215,13 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   Open until both sweeps and a 2h `shared.sh` run are clean. What is left
   inside the race itself is written in `docs/limitations.md`.
 
-  **Closed on 2026-10-06.** The probe for the two-router promotion race,
+  **Closed on 2026-10-06.** The probe for the two-proxy promotion race,
   `test/echorace`, failed on every build when run to close this: a copy-up
   shown to a late consumer as an insert in 2 of 12 rounds on 38545d7 and 9 of
   22 on 810a4c6. Fixed in 1fcb003, 0 of 18. Then, on that code, the reached
   suites 913 passed and 0 failed, and `FOR=2h shared.sh` was clean: both
   applications 0 errors and nothing wrong, each consumer saw every one of the
-  other application's orders (30,206 and 30,225), both routers 0 stale reads,
+  other application's orders (30,206 and 30,225), both proxies 0 stale reads,
   0 refused and 0 panics across about 658,000 commands and 211,000 copy-ups
   each. The full in-node sweep was 2032 and 0 on 2ffb17e the same day.
 
@@ -1238,9 +1238,9 @@ This is the whole list. Nothing else blocks. **One of twelve remains: item 5, wh
   sweep of 200,000, then one sweep to the end: **3,000 orphaned announcements
   on c38e576** and 4,000 with the delete overlapped (0406cd3), so the defect
   is older than the overlap. Then the consequence, end to end: one of those
-  documents read through the router, which copied it up, and deleted by the
+  documents read through the proxy, which copied it up, and deleted by the
   application with `deletedCount: 1`. The feeder spent the stale announcement
-  on that delete, the archive kept the document live, and the router went on
+  on that delete, the archive kept the document live, and the proxy went on
   answering it.
 
   **Closed the same day.** A step that has announced now finishes on a context
@@ -1325,8 +1325,8 @@ production deployment gets wrong.
    asks the archive a question it has no index for: 38-40ms at 200,003 archived
    documents against 1-10ms.
 3. **Use the units in `packaging/systemd`.** They carry the descriptor limit the
-   router needs, the warmer as a timer rather than a daemon, and the drain that
-   makes a stop end. Before them, a router with a client connected never
+   proxy needs, the warmer as a timer rather than a daemon, and the drain that
+   makes a stop end. Before them, a proxy with a client connected never
    stopped: still running 60s after SIGTERM against 1s with none, so every
    restart waited out `TimeoutStopSec` and ended in SIGKILL.
 4. **Run `cline keys --rebuild` before the evictor**, which is step 7 of
