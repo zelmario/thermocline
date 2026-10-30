@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/zelmario/thermocline/internal/checkpoint"
 	"github.com/zelmario/thermocline/internal/meta"
@@ -166,8 +167,23 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	// the fast tier gained this document while we were reading the archive, its
 	// copy is the newer one and the duplicate key says so. See package promote
 	// for why this is not written as $setOnInsert.
+	//
+	// Acknowledged by the primary alone. A write miss re-sends the client's
+	// statement next, and whatever that statement waits for covers this insert
+	// too, since it comes after it in the primary's oplog. Waiting for a
+	// majority here as well was a second wait for the same thing: measured on
+	// the box, YCSB latest at 4,000 ops/s with the archive capped, two runs
+	// each, the insert went from 12.3 to 3.9 ms and a write miss from 49.8 to
+	// 42.0. An insert a failover rolls back was never seen by a change stream,
+	// which shows only what a majority holds, and the statement re-sent to that
+	// primary fails with it, so the client's driver retries the miss from the
+	// archive. What this gives up is a partition with two primaries for a
+	// moment, the insert on the old one and the re-sent statement on the new:
+	// a majority insert failed there, this one succeeds, and the client is told
+	// its statement matched nothing.
 	ti := time.Now()
-	inserted, err := promote.One(ctx, r.hot.Database(db).Collection(coll), doc)
+	inserted, err := promote.One(ctx, r.hot.Database(db).Collection(coll,
+		options.Collection().SetWriteConcern(writeconcern.W1())), doc)
 	r.Metrics.RecordStage(stageCopyUpInsert, time.Since(ti))
 	if err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
