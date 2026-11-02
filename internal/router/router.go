@@ -1195,6 +1195,23 @@ func (c *conn) pump(ctx context.Context) error {
 			return fmt.Errorf("compressed message on a connection that never negotiated one")
 		}
 
+		// Checked before anything reads the message, because everything that
+		// does reads it recursively, and a document nested millions of levels
+		// deep overflowed the stack of whichever guard got there first. That is
+		// a fatal error in Go, not a panic, so serve's recover never saw it and
+		// the whole router exited, before authentication. See wire.MaxDepth.
+		//
+		// The frame was read whole, so the connection is still in step and
+		// only this message is refused.
+		if derr := msg.CheckDepth(); derr != nil {
+			c.r.Stats.Refused.Add(1)
+			c.log.Warn("refused a message nested too deeply", "limit", wire.MaxDepth)
+			if err := c.answer(msg, c.r.tooDeep(msg)); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Timed around the whole exchange, so what is recorded is what the
 		// client waited for and not what the router thinks it did.
 		started := time.Now()
@@ -1234,6 +1251,25 @@ func (c *conn) pump(ctx context.Context) error {
 // So the guards now run for these too, and where one would have answered, the
 // command is simply not performed. A dropped write is what w:0 already means to
 // an application: it asked not to be told.
+// tooDeep is the refusal for a message nested past wire.MaxDepth, shaped as the
+// client asked: OP_REPLY for a legacy query, OP_MSG otherwise.
+func (r *Router) tooDeep(msg *wire.Message) *wire.Message {
+	errmsg := fmt.Sprintf("thermocline: refusing a message nested deeper than %d levels", wire.MaxDepth)
+	if msg.Header.OpCode == wire.OpQuery {
+		out, err := wire.NewReply(0, msg.Header.RequestID, bson.D{
+			{Key: "ok", Value: 0.0},
+			{Key: "errmsg", Value: errmsg},
+			{Key: "code", Value: int32(125)},
+			{Key: "codeName", Value: "CommandFailed"},
+		})
+		if err == nil {
+			return out
+		}
+	}
+	out, _ := r.commandError(0, msg.Header.RequestID, errmsg)
+	return out
+}
+
 func (c *conn) answer(msg, out *wire.Message) error {
 	c.abortIfRefusedInTxn(msg, out)
 	if msg.MoreToCome() {
