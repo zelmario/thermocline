@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -759,29 +760,26 @@ func (q Query) shapeID() string {
 	default:
 		b.WriteString("count|")
 	}
-	b.WriteString(q.NS)
+	writePart(&b, q.NS)
 	b.WriteString("|eq:")
 	for _, p := range q.Eq {
-		b.WriteString(p.Field)
-		b.WriteByte(',')
+		writePart(&b, p.Field)
 	}
 	// The fields and operators of a range are the shape, its bounds the key.
 	if len(q.Ranges) > 0 {
 		b.WriteString("|rng:")
 		for _, r := range q.Ranges {
-			b.WriteString(r.Field)
-			b.WriteString(r.Op)
-			b.WriteByte(',')
+			writePart(&b, r.Field)
+			writePart(&b, r.Op)
 		}
 	}
 	if q.Kind == KindFind {
 		b.WriteString("|sort:")
 		for _, s := range q.Sort {
-			b.WriteString(s.Field)
+			writePart(&b, s.Field)
 			if s.Desc {
 				b.WriteString("-")
 			}
-			b.WriteByte(',')
 		}
 		// The projection is part of the shape, because an entry keeps only
 		// the fields its projection leaves. See trimDoc.
@@ -801,8 +799,7 @@ func (q Query) shapeID() string {
 			}
 			sort.Strings(fields)
 			for _, f := range fields {
-				b.WriteByte(',')
-				b.WriteString(f)
+				writePart(&b, f)
 			}
 		}
 	}
@@ -821,8 +818,7 @@ func (q Query) entryKey() string {
 	var b strings.Builder
 	b.WriteString(g)
 	for _, r := range q.Ranges {
-		b.WriteByte(1)
-		b.WriteString(r.key)
+		writePart(&b, r.key)
 	}
 	return b.String()
 }
@@ -834,8 +830,7 @@ func (q Query) groupKey() string {
 	var b strings.Builder
 	b.WriteString(q.shapeID())
 	for _, p := range q.Eq {
-		b.WriteByte(0)
-		b.WriteString(p.key)
+		writePart(&b, p.key)
 	}
 	return b.String()
 }
@@ -867,4 +862,18 @@ func (q Query) detached() Query {
 	}
 	q.GroupID = bson.RawValue{Type: q.GroupID.Type, Value: append([]byte(nil), q.GroupID.Value...)}
 	return q
+}
+
+// writePart writes s into a key as its length, a colon, and itself.
+//
+// The keys were their parts joined by separators, ",", "|", NUL and 0x01, and
+// a client's field names and string values may hold every one of them: a
+// filter on the field "a,b" and one on the fields a and b were one shape, and
+// two different strings joined by a NUL one entry, which answered the second
+// query with the first's documents. A length in front of each part says where
+// it ends whatever it holds, so two different queries cannot write one key.
+func writePart(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
 }

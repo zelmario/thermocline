@@ -106,3 +106,32 @@ func TestSkipAndLimitThatOverflowAreNotCached(t *testing.T) {
 		t.Error("an ordinary skip and limit inside the window was refused")
 	}
 }
+
+// Two different queries must not name one entry. The keys joined their parts
+// with ",", "|", NUL and 0x01, and a client's field names and string values
+// can hold all of them.
+func TestDifferentQueriesHaveDifferentKeys(t *testing.T) {
+	parse := func(filter bson.D) Query {
+		q, ok := ParseFind("shop.orders", mustRaw(bson.D{{Key: "find", Value: "orders"},
+			{Key: "filter", Value: filter}, {Key: "limit", Value: int32(10)}}))
+		if !ok {
+			t.Fatalf("filter %v was not cacheable, so this proves nothing", filter)
+		}
+		return q
+	}
+	pairs := [][2]bson.D{
+		// One field named "a,b" against two fields a and b.
+		{{{Key: "a,b", Value: "x"}}, {{Key: "a", Value: "x"}, {Key: "b", Value: "x"}}},
+		// Two values that run together across the old NUL separator.
+		{{{Key: "a", Value: "x\x00sy"}, {Key: "b", Value: "z"}},
+			{{Key: "a", Value: "x"}, {Key: "b", Value: "y\x00sz"}}},
+		// A field name holding the old shape separator.
+		{{{Key: "a|eq:b", Value: "x"}}, {{Key: "a", Value: "x"}}},
+	}
+	for _, p := range pairs {
+		a, b := parse(p[0]), parse(p[1])
+		if a.entryKey() == b.entryKey() {
+			t.Errorf("%v and %v share the entry key %q", p[0], p[1], a.entryKey())
+		}
+	}
+}

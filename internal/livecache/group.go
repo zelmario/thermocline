@@ -309,33 +309,37 @@ func (g *GroupSpec) parseGroup(v bson.RawValue) bool {
 // canonical names the grouping for the shape, everything but the values.
 func (g *GroupSpec) canonical() string {
 	var b strings.Builder
+	// Each part through writePart, which says where it ends. See there.
 	b.WriteString("|group:")
-	b.WriteString(g.Unwind)
-	b.WriteByte('|')
+	writePart(&b, g.Unwind)
 	switch g.ID.kind {
 	case exprConst:
 		k, _ := groupKeyOf(g.ID.konst)
-		b.WriteString("c=" + k)
+		b.WriteString("c")
+		writePart(&b, k)
 	case exprField:
-		b.WriteString("f=" + g.ID.path)
+		b.WriteString("f")
+		writePart(&b, g.ID.path)
 	case exprDatePart:
-		b.WriteString(g.ID.part + "=" + g.ID.path)
+		b.WriteString("d")
+		writePart(&b, g.ID.part)
+		writePart(&b, g.ID.path)
 	}
 	for _, a := range g.Accs {
-		b.WriteString("," + a.Name + ":")
+		writePart(&b, a.Name)
 		if a.count {
 			b.WriteString("#")
 		} else {
-			b.WriteString(a.path)
+			b.WriteString("p")
+			writePart(&b, a.path)
 		}
 	}
 	b.WriteString("|sort:")
 	for _, s := range g.Sort {
-		b.WriteString(s.Field)
+		writePart(&b, s.Field)
 		if s.Desc {
 			b.WriteString("-")
 		}
-		b.WriteByte(',')
 	}
 	b.WriteString("|limit:")
 	b.WriteString(big.NewInt(int64(g.Limit)).String())

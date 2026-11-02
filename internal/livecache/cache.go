@@ -1446,12 +1446,13 @@ func (c *Cache) keyOf(sh *shape, d bson.Raw) (string, bool) {
 		}
 		keys = append(keys, k)
 	}
-	b := []byte(sh.id)
+	// Written as Query.groupKey writes it, which this has to equal.
+	var b strings.Builder
+	b.WriteString(sh.id)
 	for _, k := range keys {
-		b = append(b, 0)
-		b = append(b, k...)
+		writePart(&b, k)
 	}
-	return string(b), true
+	return b.String(), true
 }
 
 // keyOfQuiet is keyOf without refusing the shape: for a write being noted,
@@ -1480,12 +1481,13 @@ func (c *Cache) keyOfQuiet(sh *shape, d bson.Raw) (string, bool) {
 		}
 		keys = append(keys, k)
 	}
-	b := []byte(sh.id)
+	// Written as Query.groupKey writes it, which this has to equal.
+	var b strings.Builder
+	b.WriteString(sh.id)
 	for _, k := range keys {
-		b = append(b, 0)
-		b = append(b, k...)
+		writePart(&b, k)
 	}
-	return string(b), true
+	return b.String(), true
 }
 
 // planOrdered reports whether where d goes in a listing is left to mongod's
