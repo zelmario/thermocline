@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strings"
@@ -314,7 +315,7 @@ func (c *conn) finishRename(ctx context.Context, accepted bool) {
 	default:
 		c.log.Error("the fast tier renamed and the archive did not, so the tiers are split",
 			"from", op.from, "to", op.to, "err", err,
-			"remedy", "run db.adminCommand({renameCollection:'"+op.from+"',to:'"+op.to+"'}) on the archive")
+			"remedy", "run db.adminCommand({renameCollection: "+jsString(op.from)+", to: "+jsString(op.to)+"}) on the archive")
 		return
 	}
 	_ = fromDB
@@ -874,7 +875,7 @@ func (c *conn) finishIndexDrop(ctx context.Context, accepted bool, cmd bson.Raw)
 			"ns", op.ns, "indexes", op.names, "err", err,
 			"effect", "a value the router now accepts will be refused by the archive, and that "+
 				"document will stay on the fast tier alone",
-			"remedy", "run db."+coll+".dropIndex(...) on the archive for these")
+			"remedy", "run db.getSiblingDB("+jsString(db)+").getCollection("+jsString(coll)+").dropIndex(...) on the archive for these")
 	}
 }
 
@@ -1169,4 +1170,16 @@ func (c *conn) refuseUnackedCreateWithOptions(msg *wire.Message, cmd bson.Raw, d
 		return nil, false
 	}
 	return out, true
+}
+
+// jsString is s as a JavaScript string literal, for a remedy an operator is
+// told to paste into mongosh. The names in it are the client's: inside single
+// quotes, a collection named with a quote and a semicolon closed the string
+// and ran whatever followed. JSON is a JavaScript literal for every string.
+func jsString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
 }

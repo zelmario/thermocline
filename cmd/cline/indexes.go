@@ -430,7 +430,7 @@ remember the fast tier never carries a TTL index, so nothing there is expiring.
 	for _, g := range groups {
 		db, coll := splitNamespace(g.ns)
 		for _, m := range g.missing {
-			fmt.Printf("  db.getSiblingDB(%q).%s.dropIndex(%q)\n", db, coll, m.name)
+			fmt.Printf("  %s.dropIndex(%s)\n", collRef(db, coll), jsString(m.name))
 		}
 	}
 	fmt.Print(`
@@ -477,7 +477,7 @@ func printCreateCommands(groups []nsMissing) {
 				fastPrinted = true
 			}
 			db, coll := splitNamespace(g.ns)
-			opts := fmt.Sprintf("{name: %q", m.name)
+			opts := "{name: " + jsString(m.name)
 			if m.unique {
 				opts += ", unique: true"
 			}
@@ -508,8 +508,8 @@ func printCreateCommands(groups []nsMissing) {
 			if m.collation != "" {
 				opts += ", collation: " + m.collation
 			}
-			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, %s})\n",
-				db, coll, m.keyJSON, opts)
+			fmt.Printf("  %s.createIndex(%s, %s})\n",
+				collRef(db, coll), m.keyJSON, opts)
 		}
 	}
 	if fastPrinted {
@@ -541,7 +541,7 @@ data would reach into the tier that exists to keep it.
 			// nothing; one built without the partial filter covers the whole
 			// collection, which is more of the storage the tiering exists to
 			// save than the operator agreed to.
-			opts := fmt.Sprintf("{name: %q", m.name)
+			opts := "{name: " + jsString(m.name)
 			if m.sparse {
 				// Here for the reason the partial filter is: it says which
 				// documents the index covers, and one built without it covers
@@ -555,8 +555,8 @@ data would reach into the tier that exists to keep it.
 			if m.collation != "" {
 				opts += ", collation: " + m.collation
 			}
-			fmt.Printf("  db.getSiblingDB(%q).%s.createIndex(%s, %s})\n",
-				db, coll, m.keyJSON, opts)
+			fmt.Printf("  %s.createIndex(%s, %s})\n",
+				collRef(db, coll), m.keyJSON, opts)
 		}
 	}
 	if !printed {
@@ -825,7 +825,7 @@ func keyPatternJSON(raw bson.Raw) string {
 	}
 	parts := make([]string, 0, len(elems))
 	for _, e := range elems {
-		parts = append(parts, fmt.Sprintf("%q: %s", e.Key(), keyDirection(e.Value())))
+		parts = append(parts, jsString(e.Key())+": "+keyDirection(e.Value()))
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
 }

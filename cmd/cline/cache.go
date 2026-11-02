@@ -102,7 +102,7 @@ func runCache(args []string) error {
 		fmt.Printf("  %-9s %-9s %-7s %-6s %s\n", "SUGGEST", "STABLE", "ASKED", "VALUES", "QUERY")
 		for _, s := range rows {
 			fmt.Printf("  %-9s %-9s %-7d %-6d %s\n",
-				round(s.Suggested), round(s.Stable), s.Executions, s.Params, trim(s.Shape, 70))
+				round(s.Suggested), round(s.Stable), s.Executions, s.Params, trim(printable(s.Shape), 70))
 		}
 		fmt.Println("\n  SUGGEST is what to cache it for, ten per cent inside STABLE, which is the")
 		fmt.Println("  shortest stretch the same answer was observed to hold. ASKED counts this")

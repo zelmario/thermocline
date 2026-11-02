@@ -777,8 +777,8 @@ func printIndexGaps(gaps []indexGap) {
 `)
 		for _, p := range constraints {
 			db, coll := splitNamespace(p.ns)
-			fmt.Printf("    db.getSiblingDB(%q).%s.createIndex(%s, %s)\n",
-				db, coll, p.ix.keyJSON, createOptions(p.ix))
+			fmt.Printf("    %s.createIndex(%s, %s)\n",
+				collRef(db, coll), p.ix.keyJSON, createOptions(p.ix))
 		}
 		fmt.Print(`
   A build that fails names two documents already sharing a value. That is a
@@ -794,8 +794,8 @@ func printIndexGaps(gaps []indexGap) {
 		fmt.Print("\n")
 		for _, p := range plain {
 			db, coll := splitNamespace(p.ns)
-			fmt.Printf("    db.getSiblingDB(%q).%s.createIndex(%s, %s)\n",
-				db, coll, p.ix.keyJSON, createOptions(p.ix))
+			fmt.Printf("    %s.createIndex(%s, %s)\n",
+				collRef(db, coll), p.ix.keyJSON, createOptions(p.ix))
 		}
 	}
 
@@ -827,7 +827,7 @@ func printIndexGaps(gaps []indexGap) {
 // treats as the same, and an index built without them enforces something the
 // application never asked for.
 func createOptions(m indexInfo) string {
-	opts := fmt.Sprintf("{name: %q", m.name)
+	opts := "{name: " + jsString(m.name)
 	if m.unique {
 		opts += ", unique: true"
 	}
