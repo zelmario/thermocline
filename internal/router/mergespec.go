@@ -84,6 +84,9 @@ type mergeSpecResult struct {
 	err  error
 }
 
+// mergeSpecDeadline bounds an archive read started ahead of a merged find.
+const mergeSpecDeadline = 30 * time.Second
+
 func (c *conn) startMergeSpec(ctx context.Context, cmd bson.Raw, db, ns string, reqID int32) {
 	plan, ok := mergePlanOf(cmd)
 	if !ok || inTransaction(cmd) {
@@ -115,7 +118,10 @@ func (c *conn) startMergeSpec(ctx context.Context, cmd bson.Raw, db, ns string, 
 	}
 	c.r.Stats.MergesSpeculated.Add(1)
 	go func() {
-		actx := context.WithoutCancel(ctx)
+		// Detached from the command, which may finish first, and bounded, or
+		// a slow archive kept a goroutine and a connection per abandoned read.
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeSpecDeadline)
+		defer cancel()
 		var res mergeSpecResult
 		cur, err := c.r.cold.Database(db).RunCommandCursor(actx, rewritten)
 		if err == nil {

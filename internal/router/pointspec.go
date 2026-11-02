@@ -127,7 +127,7 @@ func (r *Router) notePointRead(ns string, missed bool) {
 // It leaves c.spec set for pointReadInParallel to take, or nil.
 func (c *conn) startPointSpec(ctx context.Context, msg *wire.Message, db string) {
 	c.spec, c.mspec = nil, nil
-	if msg.Header.OpCode != wire.OpMsg {
+	if msg.Header.OpCode != wire.OpMsg || !c.maySpeculate() {
 		return
 	}
 	raw, err := msg.CommandDoc()

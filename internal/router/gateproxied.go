@@ -209,3 +209,21 @@ func takesIdentityFromTransport(name string, cmd bson.Raw) bool {
 	}
 	return false
 }
+
+// maySpeculate reports whether this connection may have the archive read ahead
+// of its find, with the router's credentials, before the fast tier has judged
+// the find.
+//
+// Under proxied authentication a connection that never authenticated had its
+// filter and sort run on the archive anyway; the answer was thrown away when
+// the fast tier refused the find, and the work was not. Now the read ahead is
+// for a connection the fast tier has named a user for, or for any connection
+// when access control is off. An authenticated user without read on the
+// namespace can still cause one read ahead whose answer is discarded, which is
+// load and not disclosure.
+func (c *conn) maySpeculate() bool {
+	if c.r.cfg.TerminateAuth || c.observedUser != "" || c.r.authDisabled.Load() {
+		return true
+	}
+	return c.upstream != nil && c.authIsOff()
+}

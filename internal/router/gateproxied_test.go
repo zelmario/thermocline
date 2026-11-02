@@ -313,3 +313,23 @@ func TestUpsertInASequenceNeedsInsert(t *testing.T) {
 		t.Fatal("an upsert sent as a sequence passed with update alone")
 	}
 }
+
+// A read ahead on the archive runs with the router's credentials before the
+// fast tier has judged the find, so under proxied authentication it waits
+// until the fast tier has named a user, unless access control is off.
+func TestSpeculationWaitsForAUser(t *testing.T) {
+	f := &fastTier{}
+	c := gatedConn(t, f)
+	if c.maySpeculate() {
+		t.Fatal("an unauthenticated connection had the archive read ahead")
+	}
+	c.observedUser = "alice@admin"
+	f.probes = nil
+	if !c.maySpeculate() || len(f.probes) != 0 {
+		t.Fatalf("a named user was not allowed, or cost a probe: %v", f.probes)
+	}
+	off := gatedConn(t, &fastTier{authOff: true})
+	if !off.maySpeculate() {
+		t.Fatal("with access control off, reads ahead stopped")
+	}
+}
