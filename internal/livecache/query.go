@@ -213,7 +213,13 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 	}
 	// A list with no limit is the whole match, and a list longer than the
 	// window would be half an answer.
-	if q.Limit == 0 || q.Skip+q.Limit > maxWindow {
+	//
+	// Each bounded on its own before they are added. Both arrive as any int64
+	// the client likes, and skip 2^62 with limit 2^62 wrapped negative, passed
+	// the sum's check, and became a negative slice bound under the cache's
+	// mutex: the panic was recovered, the mutex was not released, and every
+	// read on the router waited for it.
+	if q.Limit == 0 || q.Limit > maxWindow || q.Skip > maxWindow || q.Skip+q.Limit > maxWindow {
 		return q, false
 	}
 	// The reply has to be one batch with the cursor closed, which is what the

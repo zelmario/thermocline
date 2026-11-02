@@ -2,6 +2,7 @@ package livecache
 
 import (
 	"context"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -76,5 +77,32 @@ func TestPlainNamespaces(t *testing.T) {
 	}
 	if ask("p") {
 		t.Error("a name dropped and created again as a view was still taken as plain")
+	}
+}
+
+// skip and limit arrive as any int64 the client likes. Added together they
+// wrapped negative, passed the window check, and became a negative slice bound
+// while the cache's mutex was held, which stopped every read on the router.
+func TestSkipAndLimitThatOverflowAreNotCached(t *testing.T) {
+	big := int64(1) << 62
+	for _, c := range []struct {
+		name        string
+		skip, limit int64
+	}{
+		{"sum wraps negative", big, big},
+		{"limit alone past the window", 0, big},
+		{"skip alone past the window", big, 10},
+		{"largest int64 limit", 0, math.MaxInt64},
+	} {
+		q, ok := ParseFind("shop.orders", mustRaw(bson.D{{Key: "find", Value: "orders"},
+			{Key: "skip", Value: c.skip}, {Key: "limit", Value: c.limit}}))
+		if ok {
+			t.Errorf("%s: skip %d limit %d was taken as cacheable (Skip+Limit = %d)",
+				c.name, c.skip, c.limit, q.Skip+q.Limit)
+		}
+	}
+	if _, ok := ParseFind("shop.orders", mustRaw(bson.D{{Key: "find", Value: "orders"},
+		{Key: "skip", Value: int64(10)}, {Key: "limit", Value: int64(20)}})); !ok {
+		t.Error("an ordinary skip and limit inside the window was refused")
 	}
 }

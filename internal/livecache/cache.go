@@ -692,22 +692,33 @@ type Position struct {
 func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	key := q.entryKey()
 	sid := q.shapeID()
+	// Released by hand, so the reply is built outside the lock, and by the
+	// defer only if something panics while it is held. A panic here was
+	// recovered per connection, and the lock it left held stopped every read
+	// on the router.
 	c.mu.Lock()
+	locked := true
+	unlock := func() { locked = false; c.mu.Unlock() }
+	defer func() {
+		if locked {
+			c.mu.Unlock()
+		}
+	}()
 	if c.refusedNS[q.NS] || c.refused[sid] {
-		c.mu.Unlock()
+		unlock()
 		return nil, Position{}, false
 	}
 	u := c.rest(sid)
 	// A grouping on a tiered namespace is filled from both tiers, once the
 	// router lets it. See readGroup.
 	if c.isTiered(q.NS) && q.Kind == KindGroup && c.archive == nil {
-		c.mu.Unlock()
+		unlock()
 		return nil, Position{}, false
 	}
 	db, _ := splitNS(q.NS)
 	now := c.now()
 	if !c.fresh(c.pending, q.NS, now) || !c.fresh(c.pendingDB, db, now) || !c.fresh(c.pendingDB, allKey, now) {
-		c.mu.Unlock()
+		unlock()
 		c.Behind.Add(1)
 		return nil, Position{}, false
 	}
@@ -720,7 +731,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		ok = false
 	}
 	if !ok {
-		c.mu.Unlock()
+		unlock()
 		c.Misses.Add(1)
 		// A count over a tiered namespace is over both tiers, which the fast
 		// tier's stream cannot keep (see read), so no fill is asked for.
@@ -730,7 +741,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		return nil, Position{}, false
 	}
 	if !c.entryFresh(e, q, now) {
-		c.mu.Unlock()
+		unlock()
 		c.Behind.Add(1)
 		return nil, Position{}, false
 	}
@@ -742,7 +753,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	// the group has reached: refusing every one cost 45% of cachestress's
 	// hits, where each client writes a collection of its own.
 	if after(c.applied, c.closed) && c.openNS[q.NS] {
-		c.mu.Unlock()
+		unlock()
 		c.Behind.Add(1)
 		return nil, Position{}, false
 	}
@@ -757,11 +768,11 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		for _, d := range e.docs[start:end] {
 			out = append(out, d.raw)
 		}
-		c.mu.Unlock()
+		unlock()
 		reply = findReply(q, out)
 	} else if e.grp != nil {
 		out, ok := e.grp.output()
-		c.mu.Unlock()
+		unlock()
 		if !ok {
 			// mongod's own answer would depend on an order this does not
 			// know. See groupState.output.
@@ -771,7 +782,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		reply = findReply(q, out)
 	} else {
 		n := e.n
-		c.mu.Unlock()
+		unlock()
 		reply = countReply(q, n)
 	}
 	c.Hits.Add(1)
