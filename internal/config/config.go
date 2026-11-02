@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/connstring"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zelmario/thermocline/internal/meta"
@@ -1319,6 +1320,17 @@ func tlsFromURI(uri string) (uriTLS, error) {
 	enabled, said := flag("tls", "ssl")
 	if !said && u.scheme == "mongodb+srv" {
 		enabled = true
+	}
+	// The driver also turns TLS on for tlsCAFile, the certificate and key
+	// files and tlsDisableOCSPEndpointCheck, with no tls= at all. Read only
+	// from tls= and ssl=, such a URI gave the daemons TLS and the router's raw
+	// connection to the fast tier, which carries every client's traffic,
+	// plaintext. So the driver is asked, for a plain mongodb:// string: for
+	// mongodb+srv its parser resolves DNS, and TLS is on there already.
+	if !enabled && u.scheme == "mongodb" {
+		if cs, err := connstring.Parse(uri); err == nil && cs.SSL {
+			enabled = true
+		}
 	}
 	out.enabled = enabled
 	out.insecure, _ = flag("tlsInsecure", "tlsAllowInvalidCertificates", "sslInsecure")

@@ -776,3 +776,29 @@ func TestTLSFromURIReadsWhatTheDriverReads(t *testing.T) {
 		t.Errorf("credentials read as %q %q %q, want dba p@ss:w shop", u, p, a)
 	}
 }
+
+// The driver turns TLS on for a CA file, a certificate or key file, or the OCSP
+// option, without tls=true. The router's own connection to the fast tier has to
+// agree, or it carries every client's traffic in clear beside daemons that use
+// TLS.
+func TestTLSOnWheneverTheDriverTurnsItOn(t *testing.T) {
+	for _, opt := range []string{
+		"tlsCAFile=/etc/ca.pem",
+		"tlsCertificateKeyFile=/etc/client.pem",
+		"tlsCertificateFile=/etc/client.crt&tlsPrivateKeyFile=/etc/client.key",
+		"tlsDisableOCSPEndpointCheck=true",
+		"tlscafile=/etc/ca.pem",
+	} {
+		got, err := tlsFromURI("mongodb://h1:27017,h2:27017/?replicaSet=rs&" + opt)
+		if err != nil {
+			t.Fatalf("%s: %v", opt, err)
+		}
+		if !got.enabled {
+			t.Errorf("%s: the driver uses TLS and the router's connection would not", opt)
+		}
+	}
+	plain, err := tlsFromURI("mongodb://h1:27017/?replicaSet=rs")
+	if err != nil || plain.enabled {
+		t.Errorf("a URI with no TLS option turned TLS on (err %v)", err)
+	}
+}
