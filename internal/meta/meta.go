@@ -855,6 +855,20 @@ func (n EvictionNotice) Left() int {
 	return *n.Pending
 }
 
+// SessionUIDHex is the hex of an lsid's uid, which mongod derives from the
+// authenticated user and a client cannot choose, or "" when the lsid has none:
+// a session as the driver holds it, before the server has added it.
+func SessionUIDHex(lsid bson.Raw) string {
+	if len(lsid) == 0 {
+		return ""
+	}
+	_, data, ok := lsid.Lookup("uid").BinaryOK()
+	if !ok {
+		return ""
+	}
+	return hex.EncodeToString(data)
+}
+
 // SessionHex names a session by its lsid, as a change event or a session
 // carries it: the hex of the id. "" when there is none.
 func SessionHex(lsid bson.Raw) string {

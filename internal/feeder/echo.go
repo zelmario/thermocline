@@ -369,21 +369,22 @@ func (f *Feeder) suppressSessionEchoes(ctx context.Context) (int, error) {
 	if f.sessions == nil {
 		return 0, nil
 	}
+	// Keyed by id and uid: the id alone is the client's choice. See Ours.
 	ours := map[string]bool{}
 	for _, op := range f.pending {
 		if op.kind != actionUpsert || !op.wasInsert || op.session == "" {
 			continue
 		}
-		if _, asked := ours[op.session]; asked {
+		if _, asked := ours[op.session+"."+op.uid]; asked {
 			continue
 		}
-		yes, err := f.sessions.Ours(ctx, op.session)
+		yes, err := f.sessions.Ours(ctx, op.session, op.uid)
 		if err != nil {
 			// Not suppressing would mirror a warm back over a delete the
 			// application made meanwhile. The flush is tried again.
 			return 0, err
 		}
-		ours[op.session] = yes
+		ours[op.session+"."+op.uid] = yes
 	}
 	if len(ours) == 0 {
 		return 0, nil
@@ -391,7 +392,7 @@ func (f *Feeder) suppressSessionEchoes(ctx context.Context) (int, error) {
 	kept := f.pending[:0]
 	dropped := 0
 	for _, op := range f.pending {
-		if op.kind == actionUpsert && op.wasInsert && ours[op.session] {
+		if op.kind == actionUpsert && op.wasInsert && ours[op.session+"."+op.uid] {
 			f.echoes = append(f.echoes, op)
 			dropped++
 			continue

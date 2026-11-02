@@ -91,7 +91,13 @@ func (w *Warmer) session(ctx context.Context) (*mongo.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start the warmer's session: %w", err)
 	}
-	if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer"); err != nil {
+	uid := meta.SessionUID(ctx, w.hot, s)
+	if uid == "" {
+		w.log.Warn("could not learn the warmer session's uid, registering it by id alone",
+			"effect", "another user who opens a session with the same id has its inserts "+
+				"treated as the warmer's and not mirrored")
+	}
+	if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer", uid); err != nil {
 		s.EndSession(context.WithoutCancel(ctx))
 		return nil, err
 	}

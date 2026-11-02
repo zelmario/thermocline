@@ -45,7 +45,10 @@ const SessionDocMax = 8 << 20
 
 // SessionRecord is one registered session.
 type SessionRecord struct {
-	ID        string    `bson:"_id"`
+	ID string `bson:"_id"`
+	// UID is the hex of the session's uid as mongod gave it, when the
+	// registering process could learn it. See Ours.
+	UID       string    `bson:"uid,omitempty"`
 	Kind      string    `bson:"kind"`
 	At        time.Time `bson:"at"`
 	ExpiresAt time.Time `bson:"expiresAt"`
@@ -60,7 +63,11 @@ const SessionKeep = 30 * 24 * time.Hour
 // RegisterSession records a session as this system's, and returns once a
 // majority of the fast tier holds the record, so no event made in it can be
 // read before it.
-func RegisterSession(ctx context.Context, hot *mongo.Client, lsid bson.Raw, kind string) error {
+//
+// uid is the session's uid as mongod gave it (see SessionUID), or "" when it
+// could not be learned, which registers the session as before uids were
+// recorded: matched by its id alone.
+func RegisterSession(ctx context.Context, hot *mongo.Client, lsid bson.Raw, kind, uid string) error {
 	id := SessionHex(lsid)
 	if id == "" {
 		return errors.New("register a session: it has no lsid")
@@ -68,9 +75,13 @@ func RegisterSession(ctx context.Context, hot *mongo.Client, lsid bson.Raw, kind
 	now := time.Now().UTC()
 	coll := hot.Database(DB).Collection(Sessions,
 		options.Collection().SetWriteConcern(writeconcern.Majority()))
+	set := bson.D{{Key: "kind", Value: kind}, {Key: "expiresAt", Value: now.Add(SessionKeep)}}
+	if uid != "" {
+		set = append(set, bson.E{Key: "uid", Value: uid})
+	}
 	_, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}},
 		bson.D{
-			{Key: "$set", Value: bson.D{{Key: "kind", Value: kind}, {Key: "expiresAt", Value: now.Add(SessionKeep)}}},
+			{Key: "$set", Value: set},
 			{Key: "$setOnInsert", Value: bson.D{{Key: "at", Value: now}}},
 		},
 		options.UpdateOne().SetUpsert(true))
@@ -111,14 +122,24 @@ func NewSessionRegister(hot *mongo.Client) *SessionRegister {
 	return &SessionRegister{hot: hot, known: map[string]bool{}}
 }
 
-// Ours reports whether the session named by its hex lsid id is one this system
-// registered. "" is no session, and never ours.
-func (s *SessionRegister) Ours(ctx context.Context, session string) (bool, error) {
+// Ours reports whether the session named by its hex lsid id, with the hex of
+// the event's uid, is one this system registered. "" is no session, and never
+// ours.
+//
+// The id is chosen by the client, and any user may open a session with the id
+// of the warmer's: mongod keys it by id and uid together, so it is that user's
+// own session, and its inserts carry the warmer's id. Matched by id alone,
+// they were dropped as the warmer's echoes and never mirrored to the archive.
+// A record that names a uid matches only that uid. One that names none, from a
+// process that could not learn it or from before it was recorded, matches by
+// id as every record did.
+func (s *SessionRegister) Ours(ctx context.Context, session, uid string) (bool, error) {
 	if s == nil || session == "" {
 		return false, nil
 	}
+	key := session + "." + uid
 	s.mu.Lock()
-	yes, ok := s.known[session]
+	yes, ok := s.known[key]
 	s.mu.Unlock()
 	if ok {
 		return yes, nil
@@ -127,11 +148,12 @@ func (s *SessionRegister) Ours(ctx context.Context, session string) (bool, error
 	// sent this read was read from a change stream, which is majority too.
 	coll := s.hot.Database(DB).Collection(Sessions,
 		options.Collection().SetReadConcern(readconcern.Majority()))
+	var rec SessionRecord
 	err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: session}},
-		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+		options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "uid", Value: 1}})).Decode(&rec)
 	switch {
 	case err == nil:
-		yes = true
+		yes = rec.UID == "" || rec.UID == uid
 	case errors.Is(err, mongo.ErrNoDocuments):
 		yes = false
 	default:
@@ -141,7 +163,42 @@ func (s *SessionRegister) Ours(ctx context.Context, session string) (bool, error
 	if len(s.known) >= sessionCacheMax {
 		s.known = map[string]bool{}
 	}
-	s.known[session] = yes
+	s.known[key] = yes
 	s.mu.Unlock()
 	return yes, nil
+}
+
+// SessionUID asks mongod for the uid of a session this process holds, as
+// RegisterSession records it, or "" when it cannot be learned.
+//
+// A driver's session has an id and no uid: the server adds the uid, from the
+// authenticated user, when the session is first used. So it is used once here
+// and then looked up with $listLocalSessions, which lists the sessions of the
+// user asking, on the node that just saw it used.
+func SessionUID(ctx context.Context, hot *mongo.Client, sess *mongo.Session) string {
+	_, idData, ok := sess.ID().Lookup("id").BinaryOK()
+	if !ok {
+		return ""
+	}
+	sctx := mongo.NewSessionContext(ctx, sess)
+	if err := hot.Database(DB).Collection(Sessions).FindOne(sctx, bson.D{}).Err(); err != nil &&
+		!errors.Is(err, mongo.ErrNoDocuments) {
+		return ""
+	}
+	cur, err := hot.Database("admin").Aggregate(ctx, mongo.Pipeline{
+		{{Key: "$listLocalSessions", Value: bson.D{}}},
+		{{Key: "$match", Value: bson.D{{Key: "_id.id", Value: bson.Binary{Subtype: 4, Data: idData}}}}},
+	})
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	if !cur.Next(ctx) {
+		return ""
+	}
+	id, ok := cur.Current.Lookup("_id").DocumentOK()
+	if !ok {
+		return ""
+	}
+	return SessionUIDHex(id)
 }

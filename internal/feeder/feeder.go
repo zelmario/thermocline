@@ -390,6 +390,9 @@ type pendingOp struct {
 	// And the transaction an insert was made in, because an insert made in a
 	// session this system registered is a warm. See suppressSessionEchoes.
 	session string
+	// uid is the hex of that session's uid, which mongod derives from the
+	// user and the client cannot choose. See meta.SessionRegister.Ours.
+	uid string
 }
 
 // changeEvent is the subset of a change stream document the feeder reads.
@@ -1377,6 +1380,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		wasInsert: ev.OperationType == "insert",
 		at:        ev.ClusterTime,
 		session:   meta.SessionHex(ev.LSID),
+		uid:       meta.SessionUIDHex(ev.LSID),
 	})
 	return nil
 }

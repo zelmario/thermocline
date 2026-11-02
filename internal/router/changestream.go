@@ -742,7 +742,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHi
 			dropped++
 		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden || splitWithoutSession(ev)):
 			dropped++
-		case kinds[i] == "insert" && docIDs[i] != "" && warmed[eventSession(ev)]:
+		case kinds[i] == "insert" && docIDs[i] != "" && warmed[eventSessionKey(ev)]:
 			// Made in a session this system registered: a warm, known exactly.
 			// See meta.Sessions.
 			dropped++
@@ -962,6 +962,25 @@ func eventSession(ev bson.RawValue) string {
 		return ""
 	}
 	return meta.SessionHex(lsid)
+}
+
+// eventSessionKey is an event's session by id and uid, the key ourSessions
+// answers under.
+func eventSessionKey(ev bson.RawValue) string {
+	return eventSession(ev) + "." + eventSessionUID(ev)
+}
+
+// eventSessionUID is the hex of an event's lsid uid. See meta.SessionUIDHex.
+func eventSessionUID(ev bson.RawValue) string {
+	doc, ok := ev.DocumentOK()
+	if !ok {
+		return ""
+	}
+	lsid, ok := doc.Lookup("lsid").DocumentOK()
+	if !ok {
+		return ""
+	}
+	return meta.SessionUIDHex(lsid)
 }
 
 func eventPosition(ev bson.RawValue) bson.Timestamp {
@@ -1555,15 +1574,17 @@ func (r *Router) ourSessions(ctx context.Context, events []bson.RawValue, kinds 
 		if s == "" {
 			continue
 		}
-		if _, asked := out[s]; asked {
+		// By id and uid, as the register judges them. See meta.SessionRegister.Ours.
+		k := eventSessionKey(ev)
+		if _, asked := out[k]; asked {
 			continue
 		}
-		yes, err := r.sessions.Ours(ctx, s)
+		yes, err := r.sessions.Ours(ctx, s, eventSessionUID(ev))
 		if err != nil {
 			r.log.Warn("could not read the session register, judging these inserts by residency", "err", err)
 			yes = false
 		}
-		out[s] = yes
+		out[k] = yes
 	}
 	return out
 }
