@@ -150,7 +150,11 @@ func (r *Router) constrains(ctx context.Context, dbName string, idx uniqueIndex,
 	}
 
 	cur, err := r.hot.Database(dbName).Aggregate(ctx, bson.A{
-		bson.D{{Key: "$documents", Value: bson.A{doc}}},
+		// $literal, because $documents reads its argument as an expression:
+		// a stored string starting with "$" became a field path and an object
+		// whose first key is an operator ran. See changestream.go, which
+		// carries documents the same way.
+		bson.D{{Key: "$documents", Value: bson.D{{Key: "$literal", Value: bson.A{doc}}}}},
 		bson.D{{Key: "$match", Value: idx.partial}},
 		bson.D{{Key: "$limit", Value: 1}},
 	})
@@ -1061,7 +1065,7 @@ func (r *Router) fastTierHolderOf(ctx context.Context, ns string, idx uniqueInde
 	}
 	filter := bson.D{}
 	for i, f := range idx.fields {
-		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+		filter = append(filter, eqKey(f, vals[i]))
 	}
 	if scope := indexScope(idx); len(scope) > 0 {
 		filter = append(filter, bson.E{Key: "$and", Value: scope})
@@ -1955,7 +1959,7 @@ func (r *Router) keyHeldByLiveDocument(ctx context.Context, ns string, idx uniqu
 	filter := bson.D{}
 	for i, f := range idx.fields {
 		// A missing field is indexed as null, exactly as keyID encodes it.
-		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+		filter = append(filter, eqKey(f, vals[i]))
 	}
 	if !owner.IsZero() {
 		// The document being written is allowed to hold its own value.
@@ -2050,7 +2054,7 @@ func (r *Router) constrainsBatch(ctx context.Context, dbName string, idx uniqueI
 	// Each document is carried with its position and put back together inside
 	// the pipeline, so nothing here has to rewrite BSON to add a field.
 	cur, err := r.hot.Database(dbName).Aggregate(ctx, bson.A{
-		bson.D{{Key: "$documents", Value: candidates}},
+		bson.D{{Key: "$documents", Value: bson.D{{Key: "$literal", Value: candidates}}}},
 		bson.D{{Key: "$replaceWith", Value: bson.D{{Key: "$mergeObjects", Value: bson.A{
 			"$d", bson.D{{Key: partialMarker, Value: "$i"}},
 		}}}}},
@@ -2226,7 +2230,7 @@ func (r *Router) pruneClaims(ctx context.Context, ns string, idx uniqueIndex, cl
 		want[c.ID] = true
 		clause := bson.D{}
 		for i, f := range idx.fields {
-			clause = append(clause, bson.E{Key: f, Value: vals[i]})
+			clause = append(clause, eqKey(f, vals[i]))
 		}
 		clauses = append(clauses, clause)
 	}

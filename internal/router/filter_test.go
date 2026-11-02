@@ -33,6 +33,20 @@ func TestIDFromFilter(t *testing.T) {
 			{Key: "_id", Value: bson.D{{Key: "$gte", Value: oid}}}}, false,
 			"a range is not one document"},
 		{"empty filter", bson.D{}, false, "matches everything"},
+		{"$eq of an operator document", bson.D{{Key: "_id", Value: bson.D{{Key: "$eq",
+			Value: bson.D{{Key: "$gt", Value: bson.MinKey{}}}}}}}, false,
+			"put back as {_id: operand} it is a range over every document"},
+		{"$eq beside another operator", bson.D{{Key: "_id", Value: bson.D{
+			{Key: "$eq", Value: 5}, {Key: "$ne", Value: 5}}}}, false,
+			"the other operator changes what matches"},
+		{"a bare regex", bson.D{{Key: "_id", Value: bson.Regex{Pattern: "^a"}}}, false,
+			"mongod reads it as a pattern"},
+		{"$eq of a regex", bson.D{{Key: "_id", Value: bson.D{{Key: "$eq",
+			Value: bson.Regex{Pattern: "^a"}}}}}, false,
+			"put back bare it becomes a pattern"},
+		{"$eq of a plain document", bson.D{{Key: "_id", Value: bson.D{{Key: "$eq",
+			Value: bson.D{{Key: "a", Value: 1}}}}}}, true,
+			"a compound _id is still one document"},
 	}
 
 	for _, tt := range tests {

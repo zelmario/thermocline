@@ -65,15 +65,45 @@ func idFromFilter(filter bson.Raw) (bson.RawValue, bool) {
 		if len(elems) == 0 || !strings.HasPrefix(elems[0].Key(), "$") {
 			return val, true
 		}
-		eq, err := doc.LookupErr("$eq")
-		if err != nil {
+		// $eq alone. Looked up among others, {_id: {$eq: 5, $ne: 5}} was read
+		// as a point read of 5.
+		if len(elems) != 1 || elems[0].Key() != "$eq" {
 			// An operator other than $eq, so this is a range or a set rather
 			// than one document.
 			return bson.RawValue{}, false
 		}
+		eq := elems[0].Value()
+		// The operand is what every caller puts back as {_id: operand}, and
+		// mongod reads a document whose first key starts with $ there as
+		// operators, and a regex as a pattern, where under $eq both were
+		// literals. {_id: {$eq: {$gt: MinKey}}} matches nothing, and put back
+		// it matched every document, so a read the fast tier answered empty
+		// copied up whichever archived document came first.
+		if !literalAsID(eq) {
+			return bson.RawValue{}, false
+		}
 		return eq, true
 	}
+	// A bare regex is a pattern, not a value.
+	if val.Type == bson.TypeRegex {
+		return bson.RawValue{}, false
+	}
 	return val, true
+}
+
+// literalAsID reports whether {_id: v} means equality with v.
+func literalAsID(v bson.RawValue) bool {
+	switch v.Type {
+	case bson.TypeRegex:
+		return false
+	case bson.TypeEmbeddedDocument:
+		elems, err := v.Document().Elements()
+		if err != nil {
+			return false
+		}
+		return len(elems) == 0 || !strings.HasPrefix(elems[0].Key(), "$")
+	}
+	return true
 }
 
 // lowerTimeBound returns the earliest instant a filter can match, when that can

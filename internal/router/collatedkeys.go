@@ -122,7 +122,7 @@ func (r *Router) fastTierMovedOff(ctx context.Context, ns string, idx uniqueInde
 	}
 	holds := bson.D{{Key: "_id", Value: id}}
 	for i, f := range idx.fields {
-		holds = append(holds, bson.E{Key: f, Value: vals[i]})
+		holds = append(holds, eqKey(f, vals[i]))
 	}
 	if scope := indexScope(idx); len(scope) > 0 {
 		holds = append(holds, bson.E{Key: "$and", Value: scope})
@@ -152,10 +152,10 @@ func collatedClashFilter(idx uniqueIndex, vals []any, owner bson.RawValue) bson.
 	for i, f := range idx.fields {
 		// A missing field is indexed as null, exactly as keyID encodes it.
 		if vals[i] == nil {
-			filter = append(filter, bson.E{Key: f, Value: nil})
+			filter = append(filter, eqKey(f, nil))
 			continue
 		}
-		filter = append(filter, bson.E{Key: f, Value: vals[i]})
+		filter = append(filter, eqKey(f, vals[i]))
 	}
 	if !owner.IsZero() {
 		// The document that already holds this value is allowed to keep it.
@@ -282,4 +282,18 @@ func (r *Router) archiveCanAnswerCollated(ctx context.Context, ns string, idx un
 			"action", "create the same index on the archive, with the same collation")
 	}
 	return usable
+}
+
+// eqKey is {field: {$eq: value}}: equality with a key's value, compared the
+// way the unique index compares it.
+//
+// Written as {field: value}, the value is read by mongod as a query rather than
+// a literal when it is a document of operators or a regex, and both come from
+// the client's own document. {email: {$ne: null}} matched every archived email
+// and {email: /.*/} every string, so whether the router answered E11000 itself
+// turned on what the client chose to send, which told it what the archive held.
+// $eq keeps the value literal. For every other value, null and arrays
+// included, it matches exactly what implicit equality matched.
+func eqKey(field string, value any) bson.E {
+	return bson.E{Key: field, Value: bson.D{{Key: "$eq", Value: value}}}
 }

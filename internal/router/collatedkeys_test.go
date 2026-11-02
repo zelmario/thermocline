@@ -55,8 +55,37 @@ func TestCollatedClashFilterNarrowsToWhatTheIndexIndexes(t *testing.T) {
 		t.Errorf("the owner must be excluded: %v", f)
 	}
 	for _, e := range f {
-		if e.Key == "email" && e.Value != nil {
-			t.Errorf("a missing field must be looked up as null, got %v", e.Value)
+		if e.Key == "email" && !isEqOf(e.Value, nil) {
+			t.Errorf("a missing field must be looked up as {$eq: null}, got %v", e.Value)
 		}
 	}
+}
+
+// A key value comes from the client's document, and a document of operators or
+// a regex placed bare in a filter is read as a query: {email: {$ne: null}}
+// matched every archived email. Each value is compared with $eq, literally.
+func TestKeyValuesStayLiteral(t *testing.T) {
+	plain := uniqueIndex{fields: []string{"email"}}
+	for _, v := range []any{
+		bson.D{{Key: "$ne", Value: nil}},
+		bson.Regex{Pattern: ".*"},
+		"bob@x.com",
+	} {
+		f := collatedClashFilter(plain, []any{v}, bson.RawValue{})
+		for _, e := range f {
+			if e.Key == "email" && !isEqOf(e.Value, v) {
+				t.Errorf("value %v went into the filter as %v, not {$eq: value}", v, e.Value)
+			}
+		}
+	}
+}
+
+func isEqOf(v any, want any) bool {
+	d, ok := v.(bson.D)
+	if !ok || len(d) != 1 || d[0].Key != "$eq" {
+		return false
+	}
+	a, _ := bson.Marshal(bson.D{{Key: "v", Value: d[0].Value}})
+	b, _ := bson.Marshal(bson.D{{Key: "v", Value: want}})
+	return string(a) == string(b)
 }

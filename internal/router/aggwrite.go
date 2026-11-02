@@ -532,7 +532,9 @@ func (s *writeSink) write(ctx context.Context, batch []any) error {
 	return s.r.hot.Database(s.mergeDB).RunCommand(ctx, bson.D{
 		{Key: "aggregate", Value: 1},
 		{Key: "pipeline", Value: bson.A{
-			bson.D{{Key: "$documents", Value: batch}},
+			// Literal, or a result holding the string "$price" was written as
+			// that field's value. See constrains.
+			bson.D{{Key: "$documents", Value: bson.D{{Key: "$literal", Value: batch}}}},
 			s.mergeStage,
 		}},
 		{Key: "cursor", Value: bson.D{}},
