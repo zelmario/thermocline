@@ -59,6 +59,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,7 +98,29 @@ type Source struct {
 	ttl time.Duration
 
 	mu      sync.RWMutex
-	entries map[string]cached
+	entries map[Key]cached
+}
+
+// Key names one user. A struct rather than db + "." + user, which is what it
+// was: a user name may contain a dot, so ("admin.john", "doe") and ("admin",
+// "john.doe") were the same entry, and a client before authenticating could
+// cache "no such user" over a real account by asking for the other spelling.
+type Key struct{ DB, User string }
+
+// maxEntries bounds the cache. Both halves of a key come from a client that has
+// not authenticated, and every name it asked about stayed in the map for ever,
+// expired or not.
+const maxEntries = 10_000
+
+// Plausible reports whether db and user could name a MongoDB user at all. One
+// that cannot is not looked up and not cached: mongod refuses such a database
+// name, and a name this long is a way to spend the router's memory rather than
+// a login.
+func Plausible(db, user string) bool {
+	if db == "" || len(db) > 64 || len(user) > 1024 {
+		return false
+	}
+	return !strings.ContainsAny(db, "./\\ \"$\x00")
 }
 
 type cached struct {
@@ -108,7 +131,7 @@ type cached struct {
 
 // New returns a Source reading from the fast tier.
 func New(hot *mongo.Client, ttl time.Duration) *Source {
-	return &Source{hot: hot, ttl: ttl, entries: make(map[string]cached)}
+	return &Source{hot: hot, ttl: ttl, entries: make(map[Key]cached)}
 }
 
 // Lookup returns the stored credentials for a user in an authentication
@@ -118,7 +141,10 @@ func New(hot *mongo.Client, ttl time.Duration) *Source {
 // against a mistyped username to fall through to the database on every attempt,
 // and caching it for longer would keep a freshly created user locked out.
 func (s *Source) Lookup(ctx context.Context, db, user string) (map[string]Stored, bool, error) {
-	key := db + "." + user
+	if !Plausible(db, user) {
+		return nil, false, nil
+	}
+	key := Key{db, user}
 
 	s.mu.RLock()
 	e, ok := s.entries[key]
@@ -133,7 +159,7 @@ func (s *Source) Lookup(ctx context.Context, db, user string) (map[string]Stored
 	}
 
 	s.mu.Lock()
-	s.entries[key] = cached{creds: creds, fetched: time.Now(), found: found}
+	s.store(key, cached{creds: creds, fetched: time.Now(), found: found})
 	s.mu.Unlock()
 	return creds, found, nil
 }
@@ -142,8 +168,25 @@ func (s *Source) Lookup(ctx context.Context, db, user string) (map[string]Stored
 // login rather than at the end of the TTL.
 func (s *Source) Forget(db, user string) {
 	s.mu.Lock()
-	delete(s.entries, db+"."+user)
+	delete(s.entries, Key{db, user})
 	s.mu.Unlock()
+}
+
+// store adds an entry, first dropping the expired ones when the cache is full,
+// and adding nothing when it is still full: an uncached lookup costs one read
+// of the fast tier, and a cache that only grows costs the router.
+func (s *Source) store(key Key, e cached) {
+	if _, ok := s.entries[key]; !ok && len(s.entries) >= maxEntries {
+		for k, old := range s.entries {
+			if time.Since(old.fetched) >= s.ttl {
+				delete(s.entries, k)
+			}
+		}
+		if len(s.entries) >= maxEntries {
+			return
+		}
+	}
+	s.entries[key] = e
 }
 
 // load reads one user's SCRAM credentials out of admin.system.users.

@@ -43,6 +43,8 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+
+	"github.com/zelmario/thermocline/internal/authn"
 )
 
 // Resource is what a privilege applies to, in the shapes MongoDB uses.
@@ -224,8 +226,11 @@ type Source struct {
 	ttl time.Duration
 
 	mu      sync.RWMutex
-	entries map[string]cached
+	entries map[authn.Key]cached
 }
+
+// maxEntries bounds the cache. See authn.Key.
+const maxEntries = 10_000
 
 type cached struct {
 	grants  Grants
@@ -234,12 +239,14 @@ type cached struct {
 
 // New returns a Source reading from the fast tier.
 func New(hot *mongo.Client, ttl time.Duration) *Source {
-	return &Source{hot: hot, ttl: ttl, entries: make(map[string]cached)}
+	return &Source{hot: hot, ttl: ttl, entries: make(map[authn.Key]cached)}
 }
 
 // Load returns what a user may do.
 func (s *Source) Load(ctx context.Context, db, user string) (Grants, error) {
-	key := db + "." + user
+	// Keyed and bounded like the credential cache, for the same reasons. See
+	// authn.Key.
+	key := authn.Key{DB: db, User: user}
 
 	s.mu.RLock()
 	e, ok := s.entries[key]
@@ -254,7 +261,16 @@ func (s *Source) Load(ctx context.Context, db, user string) (Grants, error) {
 	}
 
 	s.mu.Lock()
-	s.entries[key] = cached{grants: g, fetched: time.Now()}
+	if _, ok := s.entries[key]; !ok && len(s.entries) >= maxEntries {
+		for k, old := range s.entries {
+			if time.Since(old.fetched) >= s.ttl {
+				delete(s.entries, k)
+			}
+		}
+	}
+	if len(s.entries) < maxEntries {
+		s.entries[key] = cached{grants: g, fetched: time.Now()}
+	}
 	s.mu.Unlock()
 	return g, nil
 }
@@ -262,7 +278,7 @@ func (s *Source) Load(ctx context.Context, db, user string) (Grants, error) {
 // Forget drops a cached entry so a revoked role takes effect at once.
 func (s *Source) Forget(db, user string) {
 	s.mu.Lock()
-	delete(s.entries, db+"."+user)
+	delete(s.entries, authn.Key{DB: db, User: user})
 	s.mu.Unlock()
 }
 

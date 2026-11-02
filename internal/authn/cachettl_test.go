@@ -2,6 +2,8 @@ package authn
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,7 +28,7 @@ func TestLookupStopsTrustingACachedCredential(t *testing.T) {
 
 	newSource := func(age time.Duration) *Source {
 		s := New(nil, ttl)
-		s.entries["admin.alice"] = cached{
+		s.entries[Key{"admin", "alice"}] = cached{
 			creds:   creds,
 			fetched: time.Now().Add(-age),
 			found:   true,
@@ -84,4 +86,73 @@ func TestLookupStopsTrustingACachedCredential(t *testing.T) {
 			t.Error("bob was answered from alice's entry")
 		}
 	})
+}
+
+// The key was db + "." + user, and a user name may hold a dot. A client that
+// had not authenticated asked for user "doe" in database "admin.john", which
+// cached "no such user" under the real admin user "john.doe", and the real
+// user's next login was refused until the entry expired.
+func TestAnotherSpellingCannotShadowARealUser(t *testing.T) {
+	s := New(nil, time.Minute)
+	s.entries[Key{"admin", "john.doe"}] = cached{
+		creds:   map[string]Stored{SHA256: {Salt: "c2FsdA==", Iters: 15000}},
+		fetched: time.Now(),
+		found:   true,
+	}
+	// A Source with no client panics if it reaches the database, so this
+	// returning at all says the spelling was refused before any lookup.
+	if _, found, err := s.Lookup(context.Background(), "admin.john", "doe"); err != nil || found {
+		t.Fatalf("a database name with a dot was looked up: found=%v err=%v", found, err)
+	}
+	if _, found, err := s.Lookup(context.Background(), "admin", "john.doe"); err != nil || !found {
+		t.Fatalf("the real user is no longer found: found=%v err=%v", found, err)
+	}
+}
+
+func TestPlausibleNames(t *testing.T) {
+	for _, c := range []struct {
+		db, user string
+		ok       bool
+	}{
+		{"admin", "alice", true},
+		{"shop", "svc.orders", true},
+		{"admin.john", "doe", false},
+		{"", "alice", false},
+		{"a/b", "alice", false},
+		{"a$b", "alice", false},
+		{"a\x00b", "alice", false},
+		{strings.Repeat("d", 65), "alice", false},
+		{"admin", strings.Repeat("u", 1025), false},
+	} {
+		if got := Plausible(c.db, c.user); got != c.ok {
+			t.Errorf("Plausible(%q, %q) = %v, want %v", c.db, c.user, got, c.ok)
+		}
+	}
+}
+
+// Every name a client asked about before authenticating stayed in the map for
+// ever. Full, the cache drops what has expired, and adds nothing if that frees
+// nothing.
+func TestTheCacheIsBounded(t *testing.T) {
+	s := New(nil, time.Minute)
+	fresh := cached{fetched: time.Now()}
+	for i := 0; i < maxEntries; i++ {
+		s.entries[Key{"db", fmt.Sprint(i)}] = fresh
+	}
+	s.store(Key{"db", "one more"}, fresh)
+	if len(s.entries) > maxEntries {
+		t.Fatalf("a full cache grew to %d", len(s.entries))
+	}
+	if _, ok := s.entries[Key{"db", "one more"}]; ok {
+		t.Fatal("a full cache of fresh entries took another")
+	}
+
+	old := cached{fetched: time.Now().Add(-time.Hour)}
+	for k := range s.entries {
+		s.entries[k] = old
+	}
+	s.store(Key{"db", "after the sweep"}, fresh)
+	if len(s.entries) != 1 {
+		t.Fatalf("expired entries were kept: %d left", len(s.entries))
+	}
 }
