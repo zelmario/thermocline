@@ -68,13 +68,34 @@ func Read(r io.Reader) (*Message, error) {
 		return nil, fmt.Errorf("wire: implausible message length %d", h.Length)
 	}
 
-	raw := make([]byte, h.Length)
+	// Grown as the body arrives rather than allocated at the length the header
+	// claims. The header is sixteen bytes anyone can send before
+	// authenticating, and allocating from it pinned up to 64 MB per
+	// connection for as long as the sender cared to wait: a few hundred idle
+	// connections were the router's memory. Read this way, memory follows the
+	// bytes actually sent.
+	raw := make([]byte, HeaderLen, min(int(h.Length), HeaderLen+readChunk))
 	copy(raw, head[:])
-	if _, err := io.ReadFull(r, raw[HeaderLen:]); err != nil {
-		return nil, err
+	for len(raw) < int(h.Length) {
+		n := min(int(h.Length)-len(raw), readChunk)
+		if cap(raw)-len(raw) < n {
+			grown := make([]byte, len(raw), min(int(h.Length), 2*cap(raw)+n))
+			copy(grown, raw)
+			raw = grown
+		}
+		if _, err := io.ReadFull(r, raw[len(raw):len(raw)+n]); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		raw = raw[:len(raw)+n]
 	}
 	return &Message{Header: h, Raw: raw}, nil
 }
+
+// readChunk is how much of a message body Read waits for at a time.
+const readChunk = 256 * 1024
 
 // Write sends a message.
 func Write(w io.Writer, m *Message) error {

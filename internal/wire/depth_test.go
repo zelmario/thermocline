@@ -1,7 +1,9 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
+	"runtime"
 	"testing"
 	"time"
 
@@ -209,6 +211,43 @@ func TestOnlyACommandNamespaceHoldsACommand(t *testing.T) {
 		m := &Message{Header: Header{OpCode: op}, Raw: make([]byte, HeaderLen+8)}
 		if m.IsCommand() {
 			t.Fatalf("opcode %d was taken for a command", op)
+		}
+	}
+}
+
+// A header claiming 64 MB, followed by nothing, used to allocate 64 MB at once
+// and hold it while the sender waited. Memory now follows the bytes sent.
+func TestReadDoesNotAllocateWhatTheHeaderOnlyClaims(t *testing.T) {
+	head := make([]byte, HeaderLen)
+	binary.LittleEndian.PutUint32(head[0:4], uint32(maxMessageLen))
+	binary.LittleEndian.PutUint32(head[12:16], uint32(OpMsg))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := Read(bytes.NewReader(append(head, make([]byte, 100)...)))
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Fatal("a truncated message was read")
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 4<<20 {
+		t.Fatalf("reading 116 bytes of a message claiming 64 MB allocated %d bytes", grew)
+	}
+}
+
+// Whole messages of every size still come back exactly as sent.
+func TestReadReturnsWholeMessages(t *testing.T) {
+	for _, size := range []int{HeaderLen, HeaderLen + 1, readChunk, readChunk + HeaderLen + 7, 3*readChunk + 5} {
+		raw := make([]byte, size)
+		for i := range raw {
+			raw[i] = byte(i * 7)
+		}
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(size))
+		m, err := Read(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if !bytes.Equal(m.Raw, raw) {
+			t.Fatalf("size %d: the message came back changed", size)
 		}
 	}
 }
