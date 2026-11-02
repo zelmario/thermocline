@@ -1,6 +1,7 @@
 package router
 
 import (
+	"github.com/zelmario/thermocline/internal/config"
 	"testing"
 	"time"
 
@@ -466,6 +467,30 @@ func TestSplitWithoutSession(t *testing.T) {
 	} {
 		if got := splitWithoutSession(ev(c.ev)); got != c.want {
 			t.Errorf("%v: %v, want %v", c.ev, got, c.want)
+		}
+	}
+}
+
+// The fill reads the archive with the router's credentials at the namespace
+// and _id an event names, and a stage left at mongod can make an event up. So
+// only what the stream itself could carry, and only what this system tiers.
+func TestFillOnlyWhatTheStreamCovers(t *testing.T) {
+	r := &Router{cfg: config.RouterConfig{Managed: []string{"shop.orders", "shop.items", "payroll.salaries"}}}
+	for _, c := range []struct {
+		cursor, ns string
+		want       bool
+	}{
+		{"shop.orders", "shop.orders", true},
+		{"shop.orders", "shop.items", false},
+		{"shop.orders", "payroll.salaries", false},
+		{"shop.$cmd.aggregate", "shop.items", true},
+		{"shop.$cmd.aggregate", "payroll.salaries", false},
+		{"admin.$cmd.aggregate", "payroll.salaries", true},
+		{"admin.$cmd.aggregate", "shop.untiered", false},
+		{"", "shop.orders", false},
+	} {
+		if got := r.mayFill(c.cursor, c.ns); got != c.want {
+			t.Errorf("stream %q, event in %q: fill %v, want %v", c.cursor, c.ns, got, c.want)
 		}
 	}
 }

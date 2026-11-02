@@ -113,7 +113,8 @@ func (reg *changeStreamRegistry) release(id int64) {
 // tier as one command, which mongod caps at 16MB; the batch is cut between
 // pieces, so what is held for the next getMore is still events as mongod sent
 // them.
-func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTail, db string) (bson.A, bson.A, int, error) {
+func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTail, cursorNS string) (bson.A, bson.A, int, error) {
+	db, _ := splitNS(cursorNS)
 	if !tail.fills() {
 		return events, nil, 0, nil
 	}
@@ -121,7 +122,7 @@ func (r *Router) fillBounded(ctx context.Context, events bson.A, tail *streamTai
 	used, filled := 0, 0
 	for start := 0; start < len(events); start += fillChunk {
 		end := min(start+fillChunk, len(events))
-		chunk, _ := r.fillLookups(ctx, events[start:end])
+		chunk, _ := r.fillLookups(ctx, events[start:end], cursorNS)
 		if tail.applies() {
 			for _, p := range tailPieces(chunk, tailChunkBytes) {
 				a, b := p[0], p[1]
@@ -213,12 +214,13 @@ func eventSize(ev any) int {
 func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail *streamTail, rdoc bson.Raw, owner cursorOwner,
 	keep bson.A) (bson.A, bson.RawValue, int, bool, error) {
 	db := streamDB(rdoc)
+	cursorNS, _ := rdoc.Lookup("cursor", "ns").StringValueOK()
 	if id == 0 {
 		// A cursor mongod has closed has no getMore to hand the rest to.
 		if !tail.fills() {
 			return keep, bson.RawValue{}, 0, false, nil
 		}
-		out, filled := c.r.fillLookups(ctx, keep)
+		out, filled := c.r.fillLookups(ctx, keep, cursorNS)
 		if tail.applies() {
 			// In pieces, as fillBounded runs them: one command over a whole
 			// filled batch can pass mongod's 16MB.
@@ -234,7 +236,7 @@ func (c *conn) cutStreamBatch(ctx context.Context, id int64, tail *streamTail, r
 		}
 		return out, bson.RawValue{}, filled, filled > 0, nil
 	}
-	out, rest, filled, err := c.r.fillBounded(ctx, keep, tail, db)
+	out, rest, filled, err := c.r.fillBounded(ctx, keep, tail, cursorNS)
 	if err != nil {
 		return nil, bson.RawValue{}, 0, false, err
 	}
@@ -332,7 +334,7 @@ func (c *conn) serveHeldStream(ctx context.Context, msg *wire.Message, name stri
 			take = take[:n]
 		}
 	}
-	out, rest, _, ferr := c.r.fillBounded(ctx, take, c.r.changeStreams.tailOf(id), splitDBOf(h.ns))
+	out, rest, _, ferr := c.r.fillBounded(ctx, take, c.r.changeStreams.tailOf(id), h.ns)
 	if ferr != nil {
 		h.mu.Unlock()
 		reply, rerr := c.streamTailError(msg, ferr)
@@ -401,12 +403,6 @@ func replaceStreamBatch(reply bson.Raw, field string, keep bson.A, token bson.Ra
 		out = append(out, bson.E{Key: "cursor", Value: cursor})
 	}
 	return wire.NewMsg(requestID, requestID, out)
-}
-
-// splitDBOf is the database of a namespace string.
-func splitDBOf(ns string) string {
-	db, _ := splitNS(ns)
-	return db
 }
 
 // streamTailError is the reply for a getMore whose own stages failed here, the

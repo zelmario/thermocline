@@ -227,7 +227,10 @@ func (c *conn) splitStreamPipeline(ctx context.Context, msg *wire.Message, cmd b
 		}
 	}
 	if lookup || hides {
-		c.csTail = &streamTail{noFill: lookup, lsidHidden: hides}
+		// Not filled either when a stage left at mongod may rewrite the
+		// fields the fill reads, ns, documentKey and operationType among
+		// them: what it would fill is then whatever that stage made up.
+		c.csTail = &streamTail{noFill: lookup || hides, lsidHidden: hides}
 	}
 	tail := make(bson.A, 0, len(stages)-at)
 	for _, st := range stages[at:] {
@@ -1380,7 +1383,7 @@ func cursorIDsOf(cmd bson.Raw) []int64 {
 //
 // The second result counts how many were filled, for the log line that says the
 // stream was answered across both tiers.
-func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
+func (r *Router) fillLookups(ctx context.Context, events bson.A, cursorNS string) (bson.A, int) {
 	type pending struct {
 		index int
 		id    bson.RawValue
@@ -1421,7 +1424,7 @@ func (r *Router) fillLookups(ctx context.Context, events bson.A) (bson.A, int) {
 		// Per event, because a stream on a whole database carries events from
 		// several collections and two of them can hold the same _id.
 		evns, nsok := eventNS(doc)
-		if !nsok {
+		if !nsok || !r.mayFill(cursorNS, evns) {
 			continue
 		}
 		want = append(want, pending{index: i, id: idv, ns: evns})
@@ -1563,4 +1566,32 @@ func (r *Router) ourSessions(ctx context.Context, events []bson.RawValue, kinds 
 		out[s] = yes
 	}
 	return out
+}
+
+// mayFill reports whether an event naming ns may have its document read from
+// the archive for a stream whose cursor is cursorNS.
+//
+// The archive is read with the router's own credentials, and the event names
+// what to read. An event is mongod's, but stages a stream leaves at mongod can
+// rewrite it, and a $replaceWith there made one up whole, naming another
+// database's collection and any _id, with fullDocument null for this to fill.
+// So only a namespace the stream itself could carry events for, and one this
+// system tiers, is filled: a collection stream's own collection, a database
+// stream's own database, any database for a deployment stream.
+func (r *Router) mayFill(cursorNS, ns string) bool {
+	if !r.cfg.Manages(ns) {
+		return false
+	}
+	db, coll := splitNS(cursorNS)
+	evdb, _ := splitNS(ns)
+	switch {
+	case db == "":
+		return false
+	case strings.HasPrefix(coll, "$cmd"):
+		// db.$cmd.aggregate is a stream on a database, and admin's is a
+		// stream on the whole deployment.
+		return db == "admin" || evdb == db
+	default:
+		return ns == cursorNS
+	}
 }
