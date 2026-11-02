@@ -70,8 +70,10 @@ func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool)
 // explained, and queryPlanner verbosity runs nothing, so one probe answers for
 // every namespace the command names, the target included.
 //
-// Only an authorisation refusal counts, as for mayRead: an explain that fails
-// for any other reason is not an answer about privileges. Under terminate_auth
+// Unlike mayRead, only a yes is a yes. The caller runs the command with the
+// router's own credentials and clears a target before refilling it, so an
+// explain that failed for any reason, or could not be sent, refuses the command
+// with the fast tier's own error. Under terminate_auth
 // the gate decided this command before it ran and the connection carries the
 // router's identity, so the probe would ask the wrong question.
 func (c *conn) mayRun(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
@@ -98,8 +100,34 @@ func (c *conn) mayRun(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message
 		return nil, true
 	}
 	rdoc, got := c.probe(probe)
-	if !got || replyOK(rdoc) || !isAuthError(rdoc) {
+	if got && replyOK(rdoc) {
 		return nil, true
+	}
+	// Anything short of a yes is a no. The caller runs the pipeline with the
+	// router's own credentials and clears its target first, so an explain that
+	// failed for some other reason, which a client can arrange with a field the
+	// router drops when it rebuilds the pipeline, used to be read as
+	// permission. mongod would have judged the command it was sent, and this
+	// cannot know that judgement was yes.
+	if !got {
+		c.r.Stats.Refused.Add(1)
+		out, cerr := c.r.commandError(0, msg.Header.RequestID,
+			"thermocline: could not ask the fast tier whether this client may run this command, "+
+				"so it was not run; retry it")
+		if cerr != nil {
+			return nil, true
+		}
+		return out, false
+	}
+	if !isAuthError(rdoc) {
+		c.r.Stats.Refused.Add(1)
+		c.log.Warn("refused a command whose explain the fast tier refused, rather than run it "+
+			"with this router's own credentials", "db", db)
+		out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, rewriteReplyIDs(rdoc))
+		if berr != nil {
+			return nil, true
+		}
+		return out, false
 	}
 
 	c.r.Stats.Unauthorized.Add(1)

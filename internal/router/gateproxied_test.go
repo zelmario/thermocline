@@ -218,3 +218,53 @@ func TestProxiedGateJudgesFilemd5OnTheChunks(t *testing.T) {
 		t.Fatal("filemd5 by a user who may read the chunks was refused")
 	}
 }
+
+// mayRun clears and refills a $out or $merge target with the router's own
+// credentials. An explain that failed for a reason other than authorization
+// was read as permission, so only an explain that succeeds may let it run.
+func TestMayRunAllowsOnlyAnExplainThatSucceeds(t *testing.T) {
+	cmd := bson.D{{Key: "aggregate", Value: "orders"},
+		{Key: "pipeline", Value: bson.A{bson.D{{Key: "$out", Value: "copy"}}}},
+		{Key: "cursor", Value: bson.D{}}, {Key: "$db", Value: "shop"}}
+	for _, c := range []struct {
+		name    string
+		reply   bson.D
+		allowed bool
+	}{
+		{"explain succeeded", bson.D{{Key: "ok", Value: 1.0}}, true},
+		{"explain refused as unauthorized", bson.D{{Key: "ok", Value: 0.0}, {Key: "errmsg", Value: "not authorized"},
+			{Key: "code", Value: int32(13)}, {Key: "codeName", Value: "Unauthorized"}}, false},
+		{"explain failed for another reason", bson.D{{Key: "ok", Value: 0.0}, {Key: "errmsg", Value: "bad field"},
+			{Key: "code", Value: int32(40415)}, {Key: "codeName", Value: "Location40415"}}, false},
+	} {
+		mine, theirs := net.Pipe()
+		go func(reply bson.D) {
+			msg, err := wire.Read(theirs)
+			if err != nil {
+				return
+			}
+			out, _ := wire.NewMsg(0, msg.Header.RequestID, reply)
+			_ = wire.Write(theirs, out)
+		}(c.reply)
+		r := &Router{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		conn := &conn{r: r, upstream: mine, log: r.log}
+		m := command(t, cmd)
+		raw, _ := m.CommandDoc()
+		_, ok := conn.mayRun(m, raw, "shop")
+		if ok != c.allowed {
+			t.Errorf("%s: allowed = %v, want %v", c.name, ok, c.allowed)
+		}
+		_ = mine.Close()
+		_ = theirs.Close()
+	}
+
+	mine, theirs := net.Pipe()
+	_ = theirs.Close()
+	r := &Router{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	conn := &conn{r: r, upstream: mine, log: r.log}
+	m := command(t, cmd)
+	raw, _ := m.CommandDoc()
+	if _, ok := conn.mayRun(m, raw, "shop"); ok {
+		t.Error("an aggregate ran although the fast tier could not be asked")
+	}
+}
