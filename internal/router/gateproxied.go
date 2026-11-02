@@ -1,6 +1,8 @@
 package router
 
 import (
+	"strings"
+
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/authz"
@@ -175,4 +177,29 @@ func (c *conn) authIsOff() bool {
 	}
 	c.r.authDisabled.Store(true)
 	return true
+}
+
+// takesIdentityFromTransport reports whether a command authenticates with a
+// mechanism that reads the identity from the TLS connection rather than from
+// anything the client sends, which through this proxy is the wrong connection.
+//
+// A client's own certificate ends at the router: its TLS is terminated here,
+// and the connection to the fast tier is one the router opened, presenting the
+// router's certificate when hot.uri names one. MONGODB-X509 sent through it
+// therefore authenticated the client as the router, whatever the router's
+// certificate maps to, and every client could ask for that. No client can
+// authenticate as itself this way through a proxy, so it is refused.
+func takesIdentityFromTransport(name string, cmd bson.Raw) bool {
+	mech := func(doc bson.Raw) bool {
+		m, ok := lookupString(doc, "mechanism")
+		return ok && strings.EqualFold(m, "MONGODB-X509")
+	}
+	switch {
+	case name == "authenticate" || name == "saslStart":
+		return mech(cmd)
+	case isHello(name):
+		spec, ok := cmd.Lookup("speculativeAuthenticate").DocumentOK()
+		return ok && mech(spec)
+	}
+	return false
 }

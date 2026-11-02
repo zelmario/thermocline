@@ -268,3 +268,30 @@ func TestMayRunAllowsOnlyAnExplainThatSucceeds(t *testing.T) {
 		t.Error("an aggregate ran although the fast tier could not be asked")
 	}
 }
+
+// MONGODB-X509 takes the identity from the connection's certificate, and the
+// connection to the fast tier carries the router's. Through the proxy it can
+// only ever authenticate a client as the router.
+func TestX509IsRecognisedWhereverItIsAsked(t *testing.T) {
+	x509 := bson.D{{Key: "mechanism", Value: "MONGODB-X509"}}
+	for _, c := range []struct {
+		name string
+		cmd  bson.D
+		want bool
+	}{
+		{"authenticate", append(bson.D{{Key: "authenticate", Value: 1}}, x509...), true},
+		{"saslStart", append(bson.D{{Key: "saslStart", Value: 1}}, x509...), true},
+		{"hello", bson.D{{Key: "hello", Value: 1}, {Key: "speculativeAuthenticate",
+			Value: append(bson.D{{Key: "authenticate", Value: 1}}, x509...)}}, true},
+		{"isMaster", bson.D{{Key: "isMaster", Value: 1}, {Key: "speculativeAuthenticate",
+			Value: bson.D{{Key: "authenticate", Value: 1}, {Key: "mechanism", Value: "mongodb-x509"}}}}, true},
+		{"saslStart", bson.D{{Key: "saslStart", Value: 1}, {Key: "mechanism", Value: "SCRAM-SHA-256"}}, false},
+		{"hello", bson.D{{Key: "hello", Value: 1}, {Key: "speculativeAuthenticate",
+			Value: bson.D{{Key: "saslStart", Value: 1}, {Key: "mechanism", Value: "SCRAM-SHA-256"}}}}, false},
+		{"hello", bson.D{{Key: "hello", Value: 1}}, false},
+	} {
+		if got := takesIdentityFromTransport(c.name, rawDoc(t, c.cmd)); got != c.want {
+			t.Errorf("%s %v: %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

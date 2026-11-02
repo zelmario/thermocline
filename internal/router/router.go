@@ -1421,6 +1421,18 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// reaches it, and the guards below act first with the router's own
 	// credentials. The ones that do are judged here instead. See gateproxied.go.
 	if !c.r.cfg.TerminateAuth && nameErr == nil {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil && takesIdentityFromTransport(name, cmd) {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused MONGODB-X509 through the proxy, which would have authenticated "+
+				"the client with the router's own certificate", "command", name)
+			if msg.MoreToCome() {
+				return nil
+			}
+			return c.send(c.r.refusalFor(msg, "thermocline: MONGODB-X509 cannot authenticate a client "+
+				"through this proxy: the client's certificate ends here, and the connection to the "+
+				"database carries the proxy's own. Use SCRAM, or terminate_auth."))
+		}
 		if out, denied := c.proxiedGate(msg, name, db); denied {
 			if msg.MoreToCome() {
 				c.log.Warn("dropped an unauthorized unacknowledged command", "command", name, "db", db)
