@@ -1,8 +1,11 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +30,26 @@ import (
 
 //go:embed dashboard.html
 var dashboardHTML []byte
+
+// dashboardCSP lets the page run its own script and nothing else.
+//
+// The page puts collection names and query shapes into markup, and both are
+// chosen by applications. Escaping them is what stops a collection named with a
+// script tag from running in the operator's browser; this is what stops the
+// next string somebody forgets to escape. The one inline script is allowed by
+// its hash, so an injected one, an inline handler or a script loaded from
+// elsewhere is refused by the browser. connect-src is the snapshot it fetches.
+var dashboardCSP = func() string {
+	script := "'none'"
+	start := bytes.Index(dashboardHTML, []byte("<script>"))
+	end := bytes.Index(dashboardHTML, []byte("</script>"))
+	if start >= 0 && end > start {
+		sum := sha256.Sum256(dashboardHTML[start+len("<script>") : end])
+		script = "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+	}
+	return "default-src 'none'; script-src " + script + "; style-src 'unsafe-inline'; " +
+		"connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+}()
 
 // Snapshot is everything the dashboard draws.
 type Snapshot struct {
@@ -234,6 +257,8 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", dashboardCSP)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_, _ = w.Write(dashboardHTML)
 	})
 	// Prometheus scrapes this. It is on the dashboard's address rather than the
@@ -262,6 +287,7 @@ func (r *Router) ServeDashboard(ctx context.Context, addr string) error {
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", " ")
 		if err := enc.Encode(r.SnapshotAll()); err != nil {

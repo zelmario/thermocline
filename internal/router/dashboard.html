@@ -588,7 +588,7 @@ function drawNamespaces(s) {
     const hit = el("rect", {x: m.l, y: y, width: iw + 70, height: 28, fill: "transparent"});
     svg.appendChild(hit);
     hit.addEventListener("mousemove", ev => showTip(
-      "<h4>" + n.ns + "</h4>" +
+      "<h4>" + esc(n.ns) + "</h4>" +
       '<div class="row"><span><i style="background:var(--s1)"></i>fast tier</span><b>' +
         fmt(n.fast_docs) + " · " + fmtBytes(n.fast_bytes) + "</b></div>" +
       '<div class="row"><span><i style="background:var(--s2)"></i>archive</span><b>' +
@@ -653,7 +653,7 @@ function drawTable(s) {
   let n = "<tr><th>collection</th><th>fast docs</th><th>archive docs</th><th>fast size</th><th>archive size</th><th>hot</th></tr>";
   (s.inventory.namespaces || []).forEach(x => {
     const pct = x.archive_docs > 0 ? (x.fast_docs / x.archive_docs * 100) : 0;
-    n += "<tr><td>" + x.ns + "</td><td class='num'>" + fmt(x.fast_docs) + "</td><td class='num'>" +
+    n += "<tr><td>" + esc(x.ns) + "</td><td class='num'>" + fmt(x.fast_docs) + "</td><td class='num'>" +
       fmt(x.archive_docs) + "</td><td class='num'>" + fmtBytes(x.fast_bytes) + "</td><td class='num'>" +
       fmtBytes(x.archive_bytes) + "</td><td class='num'>" + (x.archive_docs ? pct.toFixed(1) + "%" : "—") + "</td></tr>";
   });
@@ -709,8 +709,11 @@ function ms(v) {
   return v + "ms";
 }
 
-// esc keeps a query shape from being read as markup. Shapes carry field names
-// from the application, and this page is not the place to trust them.
+// esc keeps a server string from being read as markup. Query shapes carry field
+// names from the application and namespaces carry collection names, which any
+// client allowed to create a collection chooses: a collection named with a
+// script tag ran in the operator's browser from the namespace table. Every
+// string the snapshot carries goes through this before it is put into markup.
 function esc(v) {
   return String(v == null ? "" : v).replace(/[&<>"']/g, function (ch) {
     return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[ch];
@@ -719,9 +722,9 @@ function esc(v) {
 
 function render(s) {
   snap = s;
-  $("idline").innerHTML = "listening on <b>" + (s.listen || "?") + "</b> · fast tier <b>" +
-    (s.fast_tier || "?") + "</b> · completeness <b>" + s.completeness + "</b> · feeder <b>" +
-    (s.feeder_id || "—") + "</b> · up <b>" + dur(s.uptime_s) + "</b>";
+  $("idline").innerHTML = "listening on <b>" + esc(s.listen || "?") + "</b> · fast tier <b>" +
+    esc(s.fast_tier || "?") + "</b> · completeness <b>" + esc(s.completeness) + "</b> · feeder <b>" +
+    esc(s.feeder_id || "—") + "</b> · up <b>" + dur(s.uptime_s) + "</b>";
   drawHero(s); drawTraffic(s); drawLatency(s); drawNamespaces(s); drawCounters(s); drawCache(s); drawTable(s);
   const inv = s.inventory && s.inventory.updated
     ? "tier sizes read " + dur(Math.max(0, s.now - s.inventory.updated)) + " ago"
