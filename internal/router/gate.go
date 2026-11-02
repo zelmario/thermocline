@@ -104,7 +104,14 @@ func needsOf(msg *wire.Message, name, db string, cmd bson.Raw) (needs []authz.Ne
 		bn, ok := bulkWriteNeeds(bcmd, msg)
 		return bn, ok, nil
 	}
-	needs, err = authz.Needs(name, db, cmd)
+	// From the inlined form, payload sequences included. A driver sends an
+	// update's statements as a sequence, and read from the body alone an
+	// upsert:true there was never seen, so it needed update and not insert.
+	full := cmd
+	if in, ierr := msg.Inlined(); ierr == nil {
+		full = in
+	}
+	needs, err = authz.Needs(name, db, full)
 	if err != nil {
 		return nil, true, err
 	}

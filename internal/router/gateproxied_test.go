@@ -295,3 +295,21 @@ func TestX509IsRecognisedWhereverItIsAsked(t *testing.T) {
 		}
 	}
 }
+
+// A driver sends an update's statements as a payload sequence, and an upsert
+// among them needs insert as well as update, however it arrived.
+func TestUpsertInASequenceNeedsInsert(t *testing.T) {
+	msg, err := wire.NewMsgSequenced(1, 0, bson.D{{Key: "update", Value: "orders"},
+		{Key: "updates", Value: bson.A{bson.D{
+			{Key: "q", Value: bson.D{{Key: "_id", Value: 1}}},
+			{Key: "u", Value: bson.D{{Key: "$set", Value: bson.D{{Key: "a", Value: 1}}}}},
+			{Key: "upsert", Value: true}}}},
+		{Key: "$db", Value: "shop"}}, "updates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fastTier{users: alice, privileges: bson.A{privilege("shop", "orders", "update")}}
+	if _, denied := gatedConn(t, f).proxiedGate(msg, "update", "shop"); !denied {
+		t.Fatal("an upsert sent as a sequence passed with update alone")
+	}
+}
