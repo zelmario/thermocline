@@ -1086,11 +1086,11 @@ type conn struct {
 	// there is nowhere else to carry them. See tieredcursor.go.
 	aggAuth []nsClaim
 
-	// observedUser is who the fast tier accepted on this connection while
-	// authentication is proxied, and observedPending is who is mid-handshake.
-	// See observeauth.go.
-	observedUser    string
-	observedPending string
+	// observedUser is who the fast tier says this connection is while
+	// authentication is proxied, and authPending that an exchange is under
+	// way. See observeauth.go.
+	observedUser string
+	authPending  bool
 
 	// id identifies this connection, which is the identity a cached answer is
 	// keyed by while authentication is proxied and the user is unknown here.
@@ -2038,7 +2038,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 
 	// And the fast tier's answer to it, before replyHello answers a handshake
 	// and returns.
-	if !c.r.cfg.TerminateAuth && c.observedPending != "" {
+	if !c.r.cfg.TerminateAuth && c.authPending {
 		if rdoc, derr := reply.ReplyDoc(); derr == nil {
 			c.confirmProxiedAuth(name, rdoc)
 		}

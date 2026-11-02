@@ -1,47 +1,13 @@
 package router
 
 import (
+	"io"
+	"log/slog"
+	"net"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
-
-// The username has to come out of a SCRAM client-first message exactly, because
-// it becomes a cache key: reading it wrong keys one user's answers under
-// another's name, which is the bypass the key exists to prevent.
-func TestScramUsername(t *testing.T) {
-	cases := []struct {
-		name    string
-		payload string
-		want    string
-		ok      bool
-	}{
-		{"ordinary", "n,,n=alice,r=rOprNGfwEbeRWgbNEkqO", "alice", true},
-		{"a gs2 header naming a channel binding", "y,,n=alice,r=abc", "alice", true},
-		{"authzid in the header", "n,a=admin,n=alice,r=abc", "alice", true},
-		{"an escaped comma", "n,,n=a=2Cb,r=abc", "a,b", true},
-		{"an escaped equals", "n,,n=a=3Db,r=abc", "a=b", true},
-		// =3D first, then =2C: unescaping the comma first would turn the literal
-		// text "=3D2C" into a comma that was never in the name.
-		{"both escapes together", "n,,n=x=3D2Cy,r=abc", "x=2Cy", true},
-		{"a name that looks like an attribute", "n,,n=r=3Dme,r=abc", "r=me", true},
-
-		{"no name field", "n,,r=abc", "", false},
-		{"an empty name", "n,,n=,r=abc", "", false},
-		{"nothing at all", "", "", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, ok := scramUsername([]byte(c.payload))
-			if ok != c.ok {
-				t.Fatalf("ok = %v, want %v", ok, c.ok)
-			}
-			if ok && got != c.want {
-				t.Errorf("username = %q, want %q", got, c.want)
-			}
-		})
-	}
-}
 
 // The cache key must change with who is asking, or the sharing this enables
 // becomes one client reading another's documents.
@@ -81,45 +47,76 @@ func TestIdentitySeparatesUsers(t *testing.T) {
 	}
 }
 
-// A name is only worth anything once the fast tier has accepted it, and a
-// refused or half-finished handshake must leave none behind.
-func TestObservedUserOnlyAfterTheFastTierAgrees(t *testing.T) {
-	start := rawDoc(t, bson.D{
-		{Key: "saslStart", Value: int32(1)},
-		{Key: "mechanism", Value: "SCRAM-SHA-256"},
-		{Key: "payload", Value: bson.Binary{Subtype: 0, Data: []byte("n,,n=alice,r=abc")}},
-		{Key: "$db", Value: "admin"},
+// The name is the fast tier's, asked once an exchange finishes, and never one
+// read out of what the client sent.
+func TestObservedUserIsWhoTheFastTierSays(t *testing.T) {
+	start := func(payload, db string) bson.Raw {
+		d := bson.D{
+			{Key: "saslStart", Value: int32(1)},
+			{Key: "mechanism", Value: "SCRAM-SHA-256"},
+			{Key: "payload", Value: bson.Binary{Subtype: 0, Data: []byte(payload)}},
+		}
+		if db != "" {
+			d = append(d, bson.E{Key: "$db", Value: db})
+		}
+		return rawDoc(t, d)
+	}
+	done := rawDoc(t, bson.D{{Key: "ok", Value: 1.0}, {Key: "done", Value: true}})
+	alicePayroll := bson.A{bson.D{{Key: "user", Value: "alice"}, {Key: "db", Value: "payroll"}}}
+
+	t.Run("a legacy saslStart with no $db", func(t *testing.T) {
+		c := gatedConn(t, &fastTier{users: alicePayroll})
+		c.noteProxiedAuth("saslStart", start("n,,n=alice,r=abc", ""))
+		c.confirmProxiedAuth("saslContinue", done)
+		if c.observedUser != "alice@payroll" {
+			t.Errorf("observedUser = %q, want alice@payroll; the old reading defaulted to admin", c.observedUser)
+		}
 	})
 
-	t.Run("refused", func(t *testing.T) {
-		c := &conn{}
-		c.noteProxiedAuth("saslStart", start)
-		if c.observedPending == "" {
-			t.Fatal("the name was not read at all, so the rest of this proves nothing")
+	t.Run("a second n= after an authzid", func(t *testing.T) {
+		c := gatedConn(t, &fastTier{users: bson.A{bson.D{{Key: "user", Value: "eve"}, {Key: "db", Value: "admin"}}}})
+		c.noteProxiedAuth("saslStart", start("n,a=eve,n=eve,r=abc,,n=root", "admin"))
+		c.confirmProxiedAuth("saslContinue", done)
+		if c.observedUser != "eve@admin" {
+			t.Errorf("observedUser = %q, want eve@admin; the old reading took the forged n=root", c.observedUser)
 		}
-		c.confirmProxiedAuth("saslStart", rawDoc(t, bson.D{{Key: "ok", Value: 0.0}}))
-		if c.observedUser != "" || c.observedPending != "" {
-			t.Errorf("a refused handshake left %q pending %q", c.observedUser, c.observedPending)
+	})
+
+	t.Run("a speculative name the fast tier did not take", func(t *testing.T) {
+		c := gatedConn(t, &fastTier{users: alicePayroll})
+		spec := rawDoc(t, bson.D{{Key: "hello", Value: int32(1)}, {Key: "speculativeAuthenticate", Value: bson.D{
+			{Key: "saslStart", Value: int32(1)}, {Key: "mechanism", Value: "SCRAM-SHA-256"},
+			{Key: "payload", Value: bson.Binary{Data: []byte("n,,n=root,r=abc")}}, {Key: "db", Value: "admin"}}}})
+		c.noteProxiedAuth("hello", spec)
+		c.confirmProxiedAuth("hello", rawDoc(t, bson.D{{Key: "ok", Value: 1.0}}))
+		if c.observedUser != "" {
+			t.Fatalf("a hello the fast tier declined set %q", c.observedUser)
+		}
+		c.confirmProxiedAuth("saslContinue", done)
+		if c.observedUser != "alice@payroll" {
+			t.Errorf("observedUser = %q, want alice@payroll; the old reading confirmed root", c.observedUser)
 		}
 	})
 
 	t.Run("still going", func(t *testing.T) {
-		c := &conn{}
-		c.noteProxiedAuth("saslStart", start)
-		c.confirmProxiedAuth("saslStart", rawDoc(t, bson.D{
-			{Key: "ok", Value: 1.0}, {Key: "done", Value: false}}))
-		if c.observedUser != "" {
-			t.Errorf("a half-finished handshake was believed: %q", c.observedUser)
+		f := &fastTier{users: alicePayroll}
+		c := gatedConn(t, f)
+		c.noteProxiedAuth("saslStart", start("n,,n=alice,r=abc", "payroll"))
+		c.confirmProxiedAuth("saslStart", rawDoc(t, bson.D{{Key: "ok", Value: 1.0}, {Key: "done", Value: false}}))
+		if c.observedUser != "" || len(f.probes) != 0 {
+			t.Errorf("a half-finished exchange set %q after %v", c.observedUser, f.probes)
 		}
 	})
 
-	t.Run("accepted", func(t *testing.T) {
-		c := &conn{}
-		c.noteProxiedAuth("saslStart", start)
-		c.confirmProxiedAuth("saslContinue", rawDoc(t, bson.D{
-			{Key: "ok", Value: 1.0}, {Key: "done", Value: true}}))
-		if c.observedUser != "alice@admin" {
-			t.Errorf("observedUser = %q, want alice@admin", c.observedUser)
+	t.Run("the fast tier cannot be asked", func(t *testing.T) {
+		mine, theirs := net.Pipe()
+		_ = theirs.Close()
+		r := &Router{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		c := &conn{r: r, upstream: mine, log: r.log}
+		c.noteProxiedAuth("saslStart", start("n,,n=alice,r=abc", "payroll"))
+		c.confirmProxiedAuth("saslContinue", done)
+		if c.observedUser != "" {
+			t.Errorf("observedUser = %q with no answer; the connection should be the identity", c.observedUser)
 		}
 	})
 

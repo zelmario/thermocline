@@ -83,7 +83,7 @@ func (c *conn) proxiedGate(msg *wire.Message, name, db string) (*wire.Message, b
 		}
 		return out, true
 	}
-	if users == 0 {
+	if len(users) == 0 {
 		if c.r.authDisabled.Load() || c.authIsOff() {
 			return nil, false
 		}
@@ -113,19 +113,19 @@ func (c *conn) proxiedGate(msg *wire.Message, name, db string) (*wire.Message, b
 }
 
 // proxiedGrants asks the fast tier, on the client's own connection, what the
-// client may do. users is how many users the connection is authenticated as.
-func (c *conn) proxiedGrants() (grants authz.Grants, users int, ok bool) {
+// client may do. users is who the connection is authenticated as, user@db.
+func (c *conn) proxiedGrants() (grants authz.Grants, users []string, ok bool) {
 	probe, err := wire.NewMsg(0, 0, bson.D{
 		{Key: "connectionStatus", Value: 1},
 		{Key: "showPrivileges", Value: true},
 		{Key: "$db", Value: "admin"},
 	})
 	if err != nil {
-		return authz.Grants{}, 0, false
+		return authz.Grants{}, nil, false
 	}
 	rdoc, got := c.probe(probe)
 	if !got || !replyOK(rdoc) {
-		return authz.Grants{}, 0, false
+		return authz.Grants{}, nil, false
 	}
 	var res struct {
 		AuthInfo struct {
@@ -137,13 +137,16 @@ func (c *conn) proxiedGrants() (grants authz.Grants, users int, ok bool) {
 		} `bson:"authInfo"`
 	}
 	if err := bson.Unmarshal(rdoc, &res); err != nil {
-		return authz.Grants{}, 0, false
+		return authz.Grants{}, nil, false
 	}
 	g := authz.Grants{Privileges: res.AuthInfo.Privileges}
-	if len(res.AuthInfo.Users) > 0 {
-		g.User, g.DB = res.AuthInfo.Users[0].User, res.AuthInfo.Users[0].DB
+	for i, u := range res.AuthInfo.Users {
+		if i == 0 {
+			g.User, g.DB = u.User, u.DB
+		}
+		users = append(users, u.User+"@"+u.DB)
 	}
-	return g, len(res.AuthInfo.Users), true
+	return g, users, true
 }
 
 // authIsOff reports whether the fast tier runs without access control, which
