@@ -1901,6 +1901,17 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// a field unique.
 	if cmd, cerr := msg.CommandDoc(); cerr == nil {
 		if coll, ok := indexDDL(cmd, name); ok {
+			// Whether the fast tier did it. Forgetting what this router
+			// remembers is safe either way and stays unconditional; acting on
+			// the archive or building on the fast tier is not. A drop the fast
+			// tier refused, for a client that may not drop or has not even
+			// authenticated, still dropped the archive's view with the
+			// router's own account, and a refused create still mirrored the
+			// collection and built its indexes.
+			applied := false
+			if rdoc, derr := reply.ReplyDoc(); derr == nil {
+				applied = replyOK(rdoc)
+			}
 			// Said here rather than left to `cline indexes`, which is a report
 			// somebody has to remember to run, and this is the moment the
 			// divergence is made. See newindex.go.
@@ -1942,7 +1953,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			//     tier it cannot reach, still reads claims.
 			//
 			// So the generation is the floor and the stream is the fast path.
-			if c.r.cfg.Manages(db + "." + coll) {
+			if applied && c.r.cfg.Manages(db+"."+coll) {
 				if berr := c.r.marks.BumpIndexGen(ctx, db+"."+coll); berr != nil {
 					c.log.Warn("could not tell the other routers the unique indexes changed",
 						"ns", db+"."+coll, "err", berr,
@@ -1998,9 +2009,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				// And the archive's copy, when what it holds under that name is
 				// a view. A view has no documents, so the rule that a drop is
 				// never replayed does not reach it. See dropArchiveView.
-				c.r.dropArchiveView(ctx, db+"."+coll)
+				if applied {
+					c.r.dropArchiveView(ctx, db+"."+coll)
+				}
 			}
-			if name == "create" {
+			if name == "create" && applied {
 				ns := db + "." + coll
 				// The archive's copy is created by the feeder's first mirrored
 				// insert, which carries no options at all, so a collection
