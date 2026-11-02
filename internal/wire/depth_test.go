@@ -172,3 +172,43 @@ func mustMarshalRaw(d bson.D) []byte {
 	}
 	return b
 }
+
+// A legacy query on a collection is a find, and its filter is not a command.
+// Read as one, {ping: {$exists: false}} on payroll.salaries was named "ping",
+// which needs no authentication.
+func TestOnlyACommandNamespaceHoldsACommand(t *testing.T) {
+	build := func(ns string) *Message {
+		filter := mustMarshalRaw(bson.D{{Key: "ping", Value: bson.D{{Key: "$exists", Value: false}}}})
+		var body []byte
+		body = binary.LittleEndian.AppendUint32(body, 0)
+		body = append(body, ns...)
+		body = append(body, 0)
+		body = binary.LittleEndian.AppendUint32(body, 0)
+		body = binary.LittleEndian.AppendUint32(body, 0xFFFFFC18) // -1000
+		body = append(body, filter...)
+		raw := make([]byte, HeaderLen)
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(HeaderLen+len(body)))
+		binary.LittleEndian.PutUint32(raw[12:16], uint32(OpQuery))
+		raw = append(raw, body...)
+		return &Message{Header: Header{Length: int32(len(raw)), OpCode: OpQuery}, Raw: raw}
+	}
+	find := build("payroll.salaries")
+	if find.IsCommand() {
+		t.Fatal("a legacy find on a collection was taken for a command")
+	}
+	if name, _, err := find.CommandName(); err == nil {
+		t.Fatalf("a legacy find was named %q", name)
+	}
+	if !build("admin.$cmd").IsCommand() {
+		t.Fatal("the handshake namespace was not taken for a command")
+	}
+	if build(".$cmd").IsCommand() {
+		t.Fatal("a command namespace with no database was taken for one")
+	}
+	for _, op := range []int32{2001, 2002, 2005, 2006, OpReply} {
+		m := &Message{Header: Header{OpCode: op}, Raw: make([]byte, HeaderLen+8)}
+		if m.IsCommand() {
+			t.Fatalf("opcode %d was taken for a command", op)
+		}
+	}
+}

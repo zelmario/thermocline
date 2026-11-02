@@ -340,3 +340,96 @@ func TestConnectionStatusNeedsNothing(t *testing.T) {
 		}
 	}
 }
+
+// readAnyDatabase is {db: "", collection: ""} with find. mongod does not let
+// that reach a system collection, and under terminate_auth the find goes out
+// on the router's own account, which can read admin.system.users.
+func TestDatabaseWidePrivilegeDoesNotCoverSystemCollections(t *testing.T) {
+	g := Grants{Privileges: []Privilege{
+		decode(t, bson.D{{Key: "db", Value: ""}, {Key: "collection", Value: ""}}, "find"),
+		decode(t, bson.D{{Key: "db", Value: "shop"}, {Key: "collection", Value: ""}}, "insert"),
+	}}
+	if g.Allowed("admin", "system.users", "find") {
+		t.Fatal("readAnyDatabase covered admin.system.users")
+	}
+	if g.Allowed("shop", "system.js", "insert") {
+		t.Fatal("a database-wide privilege covered shop.system.js")
+	}
+	if !g.Allowed("admin", "orders", "find") || !g.Allowed("shop", "orders", "insert") {
+		t.Fatal("a normal collection is no longer covered")
+	}
+	exact := Grants{Privileges: []Privilege{
+		decode(t, bson.D{{Key: "db", Value: "shop"}, {Key: "collection", Value: "system.js"}}, "find"),
+	}}
+	if !exact.Allowed("shop", "system.js", "find") {
+		t.Fatal("a privilege naming the system collection does not cover it")
+	}
+	any := Grants{Privileges: []Privilege{decode(t, bson.D{{Key: "anyResource", Value: true}}, "find")}}
+	if !any.Allowed("admin", "system.users", "find") {
+		t.Fatal("anyResource does not cover a system collection")
+	}
+}
+
+// usersInfo is judged where the users it reads live, not where it was sent.
+func TestUsersInfoIsJudgedOnTheUsersDatabases(t *testing.T) {
+	needs := func(arg any, extra ...bson.E) ([]Need, error) {
+		cmd := append(bson.D{{Key: "usersInfo", Value: arg}}, extra...)
+		raw, err := bson.Marshal(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Needs("usersInfo", "shop", raw)
+	}
+	dbs := func(ns []Need) []string {
+		var out []string
+		for _, n := range ns {
+			out = append(out, n.DB)
+		}
+		return out
+	}
+	userAdminOfShop := Grants{Privileges: []Privilege{
+		decode(t, bson.D{{Key: "db", Value: "shop"}, {Key: "collection", Value: ""}}, "viewUser"),
+	}}
+
+	n, err := needs(bson.D{{Key: "user", Value: "root"}, {Key: "db", Value: "admin"}})
+	if err != nil || len(n) != 1 || n[0].DB != "admin" {
+		t.Fatalf("{user: root, db: admin} sent to shop needs %v (err %v), want admin", dbs(n), err)
+	}
+	if _, _, denied := denied(userAdminOfShop, n); !denied {
+		t.Fatal("a user administrator of shop may read admin's users")
+	}
+
+	n, err = needs(bson.A{"alice", bson.D{{Key: "user", Value: "bob"}, {Key: "db", Value: "payroll"}}})
+	if err != nil || len(dbs(n)) < 2 || dbs(n)[len(n)-1] != "payroll" {
+		t.Fatalf("a list naming payroll needs %v (err %v)", dbs(n), err)
+	}
+
+	n, err = needs(bson.D{{Key: "forAllDBs", Value: true}})
+	if err != nil || len(n) != 1 || n[0].DB != "" {
+		t.Fatalf("forAllDBs needs %v (err %v), want every database", dbs(n), err)
+	}
+	if _, _, denied := denied(userAdminOfShop, n); !denied {
+		t.Fatal("a user administrator of shop may list every database's users")
+	}
+
+	n, err = needs(int32(1))
+	if err != nil || len(n) != 1 || n[0].DB != "shop" {
+		t.Fatalf("usersInfo: 1 needs %v (err %v), want shop", dbs(n), err)
+	}
+
+	if _, err := needs("alice", bson.E{Key: "showCredentials", Value: true}); err == nil {
+		t.Fatal("showCredentials was not refused")
+	}
+}
+
+// denied is firstDenied's check, here so the table can be tested against grants.
+func denied(g Grants, needs []Need) (Need, string, bool) {
+	for _, need := range needs {
+		for _, a := range need.Actions {
+			if need.Cluster && !g.AllowedCluster(a) || !need.Cluster && !g.Allowed(need.DB, need.Coll, a) {
+				return need, a, true
+			}
+		}
+	}
+	return Need{}, "", false
+}

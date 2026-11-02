@@ -90,3 +90,42 @@ func deepFind(depth int) []byte {
 	binary.LittleEndian.PutUint32(raw[12:16], uint32(wire.OpMsg))
 	return append(raw, body...)
 }
+
+// OP_INSERT has no command, so the gate never ran for it, and mongod before
+// 5.1 applies it on whatever connection it arrives: under terminate_auth, the
+// router's own. It is refused and the connection closed.
+func TestLegacyOpcodeIsRefusedAndClosed(t *testing.T) {
+	r := &Router{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	client, proxy := net.Pipe()
+	defer client.Close()
+	c := &conn{r: r, client: proxy, log: r.log}
+	done := make(chan error, 1)
+	go func() { done <- c.pump(context.Background()) }()
+
+	body := binary.LittleEndian.AppendUint32(nil, 0)
+	body = append(body, "payroll.salaries\x00"...)
+	body = append(body, 5, 0, 0, 0, 0)
+	raw := make([]byte, wire.HeaderLen)
+	binary.LittleEndian.PutUint32(raw[0:4], uint32(wire.HeaderLen+len(body)))
+	binary.LittleEndian.PutUint32(raw[12:16], 2002)
+	raw = append(raw, body...)
+
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	go func() { _, _ = client.Write(raw) }()
+	reply, err := wire.Read(client)
+	if err != nil {
+		t.Fatalf("no refusal for OP_INSERT: %v", err)
+	}
+	doc, _ := reply.ReplyDoc()
+	if msg, _ := doc.Lookup("errmsg").StringValueOK(); !strings.Contains(msg, "legacy wire protocol") {
+		t.Fatalf("reply %v is not the legacy refusal", doc)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("pump ended without saying why")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection stayed open after a legacy message")
+	}
+}

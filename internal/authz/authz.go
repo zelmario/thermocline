@@ -207,6 +207,16 @@ func (r Resource) covers(db, coll string) bool {
 	if r.Collection != "" && r.Collection != coll {
 		return false
 	}
+	// A resource naming a whole database, or every database, covers its
+	// normal collections and not its system ones, which is mongod's rule:
+	// only a privilege naming the system collection, or anyResource, reaches
+	// it. Read the other way, readAnyDatabase's {db: "", collection: ""}
+	// covered admin.system.users, and under terminate_auth the find went out
+	// on the router's own account, which can read it: every user's stored
+	// SCRAM keys, root's included, for a user mongod would have refused.
+	if r.Collection == "" && strings.HasPrefix(coll, "system.") {
+		return false
+	}
 	// A privilege naming a specific collection cannot satisfy an action about
 	// the database as a whole.
 	if coll == "" && r.Collection != "" {

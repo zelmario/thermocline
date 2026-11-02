@@ -241,7 +241,7 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 
 	// Database level.
 	case "usersInfo":
-		return []Need{{DB: db, Actions: []string{"viewUser"}}}, nil
+		return usersInfoNeeds(db, cmd)
 	case "dbHash":
 		return []Need{{DB: db, Actions: []string{"dbHash"}}}, nil
 	// filemd5 reads a GridFS bucket's chunks, and mongod requires find on the
@@ -381,4 +381,82 @@ func boolField(doc bson.Raw, key string) bool {
 	}
 	b, ok := v.BooleanOK()
 	return ok && b
+}
+
+// usersInfoNeeds is viewUser on the database of every user the command reads,
+// which is not the database it was sent to.
+//
+// usersInfo names users as {user, db} in any database, or every database with
+// forAllDBs, and mongod requires viewUser where each user lives. Judged against
+// $db alone, a user administrator of shop could send {usersInfo: {user:
+// "root", db: "admin"}, showCredentials: true} to shop and have the router's
+// own account, which has viewUser on admin, return root's stored keys.
+//
+// showCredentials is refused outright. The answer is the stored keys, which
+// authenticate as the user against this router, and nothing a client does
+// through a proxy needs them.
+func usersInfoNeeds(db string, cmd bson.Raw) ([]Need, error) {
+	if v, err := cmd.LookupErr("showCredentials"); err == nil {
+		if b, ok := v.BooleanOK(); !ok || b {
+			return nil, fmt.Errorf("thermocline: refusing usersInfo with showCredentials, which returns " +
+				"stored credentials read with the router's own account")
+		}
+	}
+	arg, err := cmd.LookupErr("usersInfo")
+	if err != nil {
+		return nil, fmt.Errorf("thermocline: refusing a usersInfo whose argument could not be read")
+	}
+	view := func(d string) Need { return Need{DB: d, Actions: []string{"viewUser"}} }
+
+	// {usersInfo: {forAllDBs: true}} reads every database, which only a
+	// privilege on every database covers.
+	if doc, ok := arg.DocumentOK(); ok {
+		if v, ferr := doc.LookupErr("forAllDBs"); ferr == nil {
+			if b, bok := v.BooleanOK(); bok && b {
+				return []Need{{DB: "", Actions: []string{"viewUser"}}}, nil
+			}
+		}
+	}
+
+	one := func(v bson.RawValue) (Need, bool) {
+		if _, ok := v.StringValueOK(); ok {
+			return view(db), true
+		}
+		doc, ok := v.DocumentOK()
+		if !ok {
+			return Need{}, false
+		}
+		udb, uok := stringField(doc, "db")
+		if _, nok := stringField(doc, "user"); !nok || !uok || udb == "" {
+			return Need{}, false
+		}
+		return view(udb), true
+	}
+
+	switch arg.Type {
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDouble:
+		// usersInfo: 1 is every user of this database.
+		return []Need{view(db)}, nil
+	case bson.TypeString, bson.TypeEmbeddedDocument:
+		n, ok := one(arg)
+		if !ok {
+			return nil, fmt.Errorf("thermocline: refusing a usersInfo whose users could not be read")
+		}
+		return []Need{n}, nil
+	case bson.TypeArray:
+		vals, verr := arg.Array().Values()
+		if verr != nil {
+			return nil, fmt.Errorf("thermocline: refusing a usersInfo whose users could not be read")
+		}
+		needs := []Need{view(db)}
+		for _, v := range vals {
+			n, ok := one(v)
+			if !ok {
+				return nil, fmt.Errorf("thermocline: refusing a usersInfo whose users could not be read")
+			}
+			needs = append(needs, n)
+		}
+		return needs, nil
+	}
+	return nil, fmt.Errorf("thermocline: refusing a usersInfo whose users could not be read")
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -18,6 +19,10 @@ import (
 // Layout: int32 flags, cstring fullCollectionName, int32 numberToSkip,
 // int32 numberToReturn, document query.
 func opQueryCommand(m *Message) (bson.Raw, error) {
+	// Only a command namespace holds a command. See IsCommand.
+	if !m.IsCommand() {
+		return nil, ErrNotCommand
+	}
 	body := m.Body()
 	if len(body) < 4 {
 		return nil, ErrNotCommand
@@ -81,4 +86,21 @@ func NewReply(requestID, responseTo int32, doc bson.D) (*Message, error) {
 		Header: Header{Length: int32(length), RequestID: requestID, ResponseTo: responseTo, OpCode: OpReply},
 		Raw:    raw,
 	}, nil
+}
+
+// IsCommand reports whether a message carries a command this proxy can read:
+// any OP_MSG, or an OP_QUERY addressed to a command namespace, "<db>.$cmd".
+//
+// An OP_QUERY on any other namespace is a legacy find, and its query document
+// is a filter, not a command. Read as one, its first key became the command's
+// name.
+func (m *Message) IsCommand() bool {
+	switch m.Header.OpCode {
+	case OpMsg:
+		return true
+	case OpQuery:
+		full, ok := m.OpQueryCollection()
+		return ok && strings.HasSuffix(full, ".$cmd") && len(full) > len(".$cmd")
+	}
+	return false
 }

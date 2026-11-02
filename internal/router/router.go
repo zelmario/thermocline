@@ -1207,6 +1207,28 @@ func (c *conn) pump(ctx context.Context) error {
 		//
 		// The frame was read whole, so the connection is still in step and
 		// only this message is refused.
+		// Only OP_MSG, and OP_QUERY addressed to a command namespace, which is
+		// the handshake every driver opens with. Anything else is a message
+		// no guard can read: a legacy OP_QUERY on a collection is a find whose
+		// filter CommandName read as a command, so {ping: {$exists: false}}
+		// sent to payroll.salaries was named "ping" and passed terminate_auth's
+		// gate unauthenticated, and OP_INSERT, OP_UPDATE, OP_DELETE and
+		// OP_GET_MORE have no command at all, so the gate was skipped. mongod
+		// before 5.1 runs all of them, here on the router's own connection.
+		// Refused as compression is, and the connection closed with it, since
+		// a legacy write expects no reply and there is no telling what follows.
+		if !msg.IsCommand() {
+			c.r.Stats.Unreadable.Add(1)
+			c.r.Stats.Refused.Add(1)
+			c.log.Warn("refused a legacy message and closed the connection",
+				"opcode", msg.Header.OpCode,
+				"why", "only OP_MSG and the OP_QUERY handshake carry a command this proxy can judge")
+			_ = c.send(c.r.refusalFor(msg, "thermocline: refusing a legacy wire protocol message. "+
+				"Only OP_MSG and the OP_QUERY handshake are accepted, because nothing else carries "+
+				"a command this proxy can authorize and guard."))
+			return fmt.Errorf("legacy opcode %d", msg.Header.OpCode)
+		}
+
 		if derr := msg.CheckDepth(); derr != nil {
 			c.r.Stats.Refused.Add(1)
 			c.log.Warn("refused a message nested too deeply", "limit", wire.MaxDepth)
@@ -1255,10 +1277,14 @@ func (c *conn) pump(ctx context.Context) error {
 // So the guards now run for these too, and where one would have answered, the
 // command is simply not performed. A dropped write is what w:0 already means to
 // an application: it asked not to be told.
-// tooDeep is the refusal for a message nested past wire.MaxDepth, shaped as the
-// client asked: OP_REPLY for a legacy query, OP_MSG otherwise.
+// tooDeep is the refusal for a message nested past wire.MaxDepth.
 func (r *Router) tooDeep(msg *wire.Message) *wire.Message {
-	errmsg := fmt.Sprintf("thermocline: refusing a message nested deeper than %d levels", wire.MaxDepth)
+	return r.refusalFor(msg, fmt.Sprintf("thermocline: refusing a message nested deeper than %d levels", wire.MaxDepth))
+}
+
+// refusalFor is a CommandFailed error shaped as the client asked: OP_REPLY for
+// a legacy query, OP_MSG otherwise.
+func (r *Router) refusalFor(msg *wire.Message, errmsg string) *wire.Message {
 	if msg.Header.OpCode == wire.OpQuery {
 		out, err := wire.NewReply(0, msg.Header.RequestID, bson.D{
 			{Key: "ok", Value: 0.0},
@@ -1342,6 +1368,22 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		if out, done := c.answerHello(ctx, msg); done {
 			return c.send(out)
 		}
+	}
+
+	// A command whose name cannot be read cannot be authorized, and the
+	// upstream it would go out on is logged in as the router. It used to skip
+	// the gate below, whose condition is a name it could read.
+	if c.r.cfg.TerminateAuth && nameErr != nil {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		if msg.MoreToCome() {
+			return nil
+		}
+		out, uerr := c.unauthorized(msg, "the command could not be read, so it could not be authorized")
+		if uerr != nil {
+			return uerr
+		}
+		return c.send(out)
 	}
 
 	// Authentication and authorization come first, before any guard, because
