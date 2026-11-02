@@ -48,30 +48,15 @@ func (c *conn) gate(msg *wire.Message, name, db string) (*wire.Message, bool) {
 		return out, true
 	}
 
-	// bulkWrite is judged from its own parts, because it names no collection
-	// where authorization would look for one. See bulkWriteNeeds.
-	var needs []authz.Need
-	if name == "bulkWrite" {
-		// With its payload sequences: a driver sends nsInfo as one, and read
-		// from the body every driver bulkWrite was refused as unreadable.
-		// See wire.Inlined.
-		bcmd := cmd
-		if in, ierr := msg.Inlined(); ierr == nil {
-			bcmd = in
+	needs, readable, err := needsOf(msg, name, db, cmd)
+	if !readable {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		out, rerr := c.unauthorized(msg, "the bulkWrite could not be read, so it could not be authorized")
+		if rerr != nil {
+			return nil, false
 		}
-		bn, readable := bulkWriteNeeds(bcmd, msg)
-		if !readable {
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			out, rerr := c.unauthorized(msg, "the bulkWrite could not be read, so it could not be authorized")
-			if rerr != nil {
-				return nil, false
-			}
-			return out, true
-		}
-		needs = bn
-	} else {
-		needs, err = authz.Needs(name, db, cmd)
+		return out, true
 	}
 	if err != nil {
 		// Deny by default. See package authz for why an unknown command is
@@ -87,44 +72,78 @@ func (c *conn) gate(msg *wire.Message, name, db string) (*wire.Message, bool) {
 		return out, true
 	}
 
+	if need, action, denied := firstDenied(*c.grants, needs); denied {
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Debug("refused an unauthorized command",
+			"command", name, "ns", needNS(need), "action", action, "user", c.grants.User)
+		out, rerr := c.unauthorized(msg,
+			"not authorized on "+need.DB+" to execute command "+name)
+		if rerr != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// needsOf returns what a command requires. readable is false only for a
+// bulkWrite whose parts could not be read; err names a command the table does
+// not know.
+func needsOf(msg *wire.Message, name, db string, cmd bson.Raw) (needs []authz.Need, readable bool, err error) {
+	// bulkWrite is judged from its own parts, because it names no collection
+	// where authorization would look for one. See bulkWriteNeeds.
+	if name == "bulkWrite" {
+		// With its payload sequences: a driver sends nsInfo as one, and read
+		// from the body every driver bulkWrite was refused as unreadable.
+		// See wire.Inlined.
+		bcmd := cmd
+		if in, ierr := msg.Inlined(); ierr == nil {
+			bcmd = in
+		}
+		bn, ok := bulkWriteNeeds(bcmd, msg)
+		return bn, ok, nil
+	}
+	needs, err = authz.Needs(name, db, cmd)
+	if err != nil {
+		return nil, true, err
+	}
 	// An aggregation reaches namespaces its own name does not mention, and
 	// every one of them is a namespace mongod would have judged separately. An
 	// explain of one reaches exactly the same namespaces.
 	if aggCmd, aggDB, isAgg := aggregateCommand(name, db, cmd); isAgg {
 		needs = append(needs, aggregateNeeds(aggCmd, aggDB)...)
 	}
+	return needs, true, nil
+}
 
+// firstDenied returns the first need the grants do not cover, and the action
+// that was missing.
+func firstDenied(g authz.Grants, needs []authz.Need) (authz.Need, string, bool) {
 	for _, need := range needs {
 		for _, action := range need.Actions {
 			ok := false
 			if need.Cluster {
-				ok = c.grants.AllowedCluster(action)
+				ok = g.AllowedCluster(action)
 			} else {
-				ok = c.grants.Allowed(need.DB, need.Coll, action)
+				ok = g.Allowed(need.DB, need.Coll, action)
 			}
-			if ok {
-				continue
+			if !ok {
+				return need, action, true
 			}
-			ns := need.DB
-			if need.Coll != "" {
-				ns += "." + need.Coll
-			}
-			if need.Cluster {
-				ns = "the cluster"
-			}
-			c.r.Stats.Refused.Add(1)
-			c.cls = ClassRefused
-			c.log.Debug("refused an unauthorized command",
-				"command", name, "ns", ns, "action", action, "user", c.grants.User)
-			out, rerr := c.unauthorized(msg,
-				"not authorized on "+need.DB+" to execute command "+name)
-			if rerr != nil {
-				return nil, false
-			}
-			return out, true
 		}
 	}
-	return nil, false
+	return authz.Need{}, "", false
+}
+
+func needNS(need authz.Need) string {
+	if need.Cluster {
+		return "the cluster"
+	}
+	if need.Coll != "" {
+		return need.DB + "." + need.Coll
+	}
+	return need.DB
 }
 
 // unauthorized answers the way mongod does, so a driver's error handling and an

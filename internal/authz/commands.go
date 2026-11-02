@@ -244,6 +244,15 @@ func Needs(name, db string, cmd bson.Raw) ([]Need, error) {
 		return []Need{{DB: db, Actions: []string{"viewUser"}}}, nil
 	case "dbHash":
 		return []Need{{DB: db, Actions: []string{"dbHash"}}}, nil
+	// filemd5 reads a GridFS bucket's chunks, and mongod requires find on the
+	// chunks collection named by root (fs when absent), not on the collection
+	// the command names.
+	case "filemd5":
+		root := "fs"
+		if s, ok := stringField(cmd, "root"); ok && s != "" {
+			root = s
+		}
+		return []Need{{DB: db, Coll: root + ".chunks", Actions: []string{"find"}}}, nil
 	// Reading the profiling level and setting it are the same command, and
 	// mongod requires enableProfiler for both.
 	case "profile":

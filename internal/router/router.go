@@ -111,6 +111,10 @@ type Router struct {
 	creds  *authn.Source
 	grants *authz.Source
 
+	// authDisabled is set once the fast tier is seen running without access
+	// control, so proxiedGate stops asking. See authIsOff.
+	authDisabled atomic.Bool
+
 	// checkpoints reads how far mirroring has got, so a read served from the
 	// archive can wait for it rather than answer from behind.
 	checkpoints *checkpoint.Store
@@ -1365,6 +1369,19 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 				}
 				c.log.Warn("dropped an unauthorized unacknowledged command",
 					"command", name, "db", db, "user", user)
+				return nil
+			}
+			return c.send(out)
+		}
+	}
+
+	// With authentication proxied, the fast tier judges a command only when it
+	// reaches it, and the guards below act first with the router's own
+	// credentials. The ones that do are judged here instead. See gateproxied.go.
+	if !c.r.cfg.TerminateAuth && nameErr == nil {
+		if out, denied := c.proxiedGate(msg, name, db); denied {
+			if msg.MoreToCome() {
+				c.log.Warn("dropped an unauthorized unacknowledged command", "command", name, "db", db)
 				return nil
 			}
 			return c.send(out)
