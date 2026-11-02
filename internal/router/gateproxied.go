@@ -33,13 +33,19 @@ import (
 // mayRun or mayRead before the router answers them, and a find reaches the
 // fast tier first.
 var guardedCommands = map[string]bool{
-	"insert": true, "update": true, "delete": true,
-	"findAndModify": true, "findandmodify": true,
-	"bulkWrite": true,
-	"create": true, "drop": true,
-	"createIndexes": true, "collMod": true,
+	"insert":           true,
+	"update":           true,
+	"delete":           true,
+	"findAndModify":    true,
+	"findandmodify":    true,
+	"bulkWrite":        true,
+	"create":           true,
+	"drop":             true,
+	"createIndexes":    true,
+	"collMod":          true,
 	"renameCollection": true,
-	"filemd5": true, "dbHash": true,
+	"filemd5":          true,
+	"dbHash":           true,
 }
 
 // proxiedGate refuses a guarded command the fast tier would refuse, before any
