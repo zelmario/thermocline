@@ -69,8 +69,9 @@ var sessionFields = map[string]bool{
 // for cursors created outside a session, you cannot call getMore inside a
 // session."
 //
-// The user is known only when this router terminates authentication. The
-// session is known whenever the client sends one, which every driver since 3.6
+// The user is known when this router terminates authentication, and while it
+// is proxied once the fast tier has said who the connection is. The session
+// is known whenever the client sends one, which every driver since 3.6
 // does for every command. When there is neither, the cursor is scoped to the
 // connection that opened it, which is stricter than mongod: that combination
 // means a deployment with no authentication and a driver old enough to have no
@@ -125,8 +126,15 @@ func (o cursorOwner) sameAs(other cursorOwner) bool {
 // cursors.
 func (c *conn) owner(cmd bson.Raw) cursorOwner {
 	o := cursorOwner{conn: c}
-	if c.grants != nil {
-		o.user = c.grants.User
+	// user@db, because a user is named by both: alice in admin and alice in
+	// shop are two accounts. Under proxied authentication the user is who the
+	// fast tier says this connection is, which used to be left out, so the
+	// client-chosen lsid was the whole of the scope. See observeauth.go.
+	switch {
+	case c.grants != nil:
+		o.user = c.grants.User + "@" + c.grants.DB
+	case c.observedUser != "":
+		o.user = c.observedUser
 	}
 	if v, err := cmd.LookupErr("lsid"); err == nil {
 		if doc, ok := v.DocumentOK(); ok {

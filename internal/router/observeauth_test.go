@@ -128,3 +128,22 @@ func TestObservedUserIsWhoTheFastTierSays(t *testing.T) {
 		}
 	})
 }
+
+// A cursor this router holds is mongod's to judge in spirit: only the user
+// who opened it may read on, whatever session id they send. Under proxied
+// authentication the user was left out, so a session id was the whole scope.
+func TestCursorOwnerCarriesTheProxiedUser(t *testing.T) {
+	lsid := rawDoc(t, bson.D{{Key: "find", Value: "orders"},
+		{Key: "lsid", Value: bson.D{{Key: "id", Value: bson.Binary{Subtype: 4, Data: make([]byte, 16)}}}}})
+	alice := (&conn{observedUser: "alice@admin"}).owner(lsid)
+	bob := (&conn{observedUser: "bob@admin"}).owner(lsid)
+	if alice.sameAs(bob) {
+		t.Fatal("two users sending the same session id share a cursor")
+	}
+	if !alice.sameAs((&conn{observedUser: "alice@admin"}).owner(lsid)) {
+		t.Fatal("the same user on another connection in the same session lost the cursor")
+	}
+	if alice.sameAs((&conn{observedUser: "alice@shop"}).owner(lsid)) {
+		t.Fatal("alice@admin and alice@shop share a cursor")
+	}
+}
