@@ -740,7 +740,7 @@ func (r *Router) sieveEvents(ctx context.Context, events []bson.RawValue, lsidHi
 			r.log.Debug("hiding this system's own catalog repair from a change stream",
 				"ns", ddlNS[i], "event", kinds[i])
 			dropped++
-		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), lsidHidden || splitWithoutSession(ev)):
+		case kinds[i] == "delete" && isEviction(evicted, docIDs[i], eventTime(ev), eventPosition(ev), eventSession(ev), eventSessionUID(ev), lsidHidden || splitWithoutSession(ev)):
 			dropped++
 		case kinds[i] == "insert" && docIDs[i] != "" && warmed[eventSessionKey(ev)]:
 			// Made in a session this system registered: a warm, known exactly.
@@ -867,6 +867,7 @@ type evictionNote struct {
 	spent    []bson.Timestamp
 	sessions []string
 	named    *int
+	keys     []string
 }
 
 // isEviction reports whether this delete is the evictor making room rather than
@@ -886,19 +887,20 @@ type evictionNote struct {
 // pos is the delete's own position in the fast tier's oplog, which is the same
 // value the feeder wrote down, because both read it off the same event.
 //
-// session names the transaction the delete was made in, "" for none. A notice
-// naming sessions is the evictor's own delete only in one of them; anything
-// else is the application's, announced or not. See meta.EvictionNotice.Accepts.
+// session names the transaction the delete was made in, "" for none, and uid
+// that session's uid. A notice naming sessions is the evictor's own delete only
+// in one of them; anything else is the application's, announced or not. See
+// meta.EvictionNotice.Accepts.
 //
 // lsidHidden is a stream whose own stages may have taken lsid away; its
 // deletes are judged without the session, as every delete was before.
-func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp, session string, lsidHidden bool) bool {
+func isEviction(notes map[string]evictionNote, id string, at time.Time, pos bson.Timestamp, session, uid string, lsidHidden bool) bool {
 	note, ok := notes[id]
 	if !ok {
 		return false
 	}
 	left := note.left
-	if !lsidHidden && !(meta.EvictionNotice{Sessions: note.sessions, Named: note.named, Pending: &left}).Accepts(session) {
+	if !lsidHidden && !(meta.EvictionNotice{Sessions: note.sessions, Named: note.named, Keys: note.keys, Pending: &left}).Accepts(session, uid) {
 		return false
 	}
 	// Unclaimed: announced, and the feeder has not applied it yet, so this
@@ -1018,7 +1020,7 @@ func (r *Router) evictionNotices(ctx context.Context, ids []string) map[string]e
 	for cur.Next(ctx) {
 		var rec meta.EvictionNotice
 		if cur.Decode(&rec) == nil {
-			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent, sessions: rec.Sessions, named: rec.Named}
+			out[rec.ID] = evictionNote{left: rec.Left(), at: rec.At.UTC(), spent: rec.Spent, sessions: rec.Sessions, named: rec.Named, keys: rec.Keys}
 		}
 	}
 	return out

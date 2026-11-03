@@ -1358,7 +1358,7 @@ func (f *Feeder) handle(ctx context.Context, raw bson.Raw) error {
 		// evictor is running.
 		f.pending = append(f.pending, pendingOp{
 			ns: ns, key: ev.DocumentKey, id: id, kind: actionDeletePending,
-			at: ev.ClusterTime, session: meta.SessionHex(ev.LSID),
+			at: ev.ClusterTime, session: meta.SessionHex(ev.LSID), uid: meta.SessionUIDHex(ev.LSID),
 		})
 		return nil
 	}

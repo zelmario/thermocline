@@ -1259,13 +1259,18 @@ func (e *Evictor) announce(ctx context.Context, docs []candidate) error {
 		return fmt.Errorf("start the step's session: %w", err)
 	}
 	session := meta.SessionHex(sess.ID())
+	// And its uid, which a client cannot choose as it can the id: without it
+	// an application's delete under the same id in the announcement window
+	// spent the notice. "" when mongod would not say, and the notice is then
+	// matched by id. See meta.EvictionNotice.Accepts.
+	uid := meta.SessionUID(ctx, e.hot, sess)
 	docIDs := make([]string, len(docs))
 	for i := range docs {
 		docs[i].announcedAs = by
 		docs[i].session = sess
 		docIDs[i] = docs[i].docID
 	}
-	if err := meta.AnnounceEvictionIn(ctx, e.cold, docIDs, by, session); err != nil {
+	if err := meta.AnnounceEvictionIn(ctx, e.cold, docIDs, by, session, uid); err != nil {
 		endSession(ctx, docs)
 		return err
 	}

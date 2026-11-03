@@ -817,6 +817,9 @@ type EvictionNotice struct {
 	// Named how many of the pending announcements named one. See Accepts.
 	Sessions []string `bson:"sessions,omitempty"`
 	Named    *int     `bson:"named,omitempty"`
+	// Keys names the same sessions by id and uid, "id.uid", for each whose
+	// uid the evictor could learn. See Accepts.
+	Keys []string `bson:"keys,omitempty"`
 	// By names the acts that announced this notice, newest last and capped,
 	// so one act is counted once however often it is sent and can take back
 	// exactly what it raised. See AnnounceEviction.
@@ -883,8 +886,8 @@ func SessionHex(lsid bson.Raw) string {
 }
 
 // Accepts reports whether a delete made in the session named by lsid, the hex
-// of its lsid id or "" for a delete outside a transaction, is one this notice
-// announced.
+// of its lsid id or "" for a delete outside a transaction, and uid, the hex of
+// its lsid uid, is one this notice announced.
 //
 // An application's delete of a document the evictor had announced, landing
 // between the announcement and the evictor's own delete, was read as the
@@ -903,11 +906,29 @@ func SessionHex(lsid bson.Raw) string {
 // without touching either field, and its delete, made outside a transaction,
 // must spend its own announcement: judged by the sessions of an earlier one,
 // it was tombstoned, a document lost from both tiers.
-func (n EvictionNotice) Accepts(lsid string) bool {
+//
+// The id alone is the client's choice. A client that read the evictor's
+// session id off a change event could send its own delete in a transaction
+// under that id, landing in the announcement window, and the notice was spent
+// on it: the archive kept a document the application deleted, and the
+// evictor's delete after it was tombstoned. mongod derives the uid from the
+// authenticated user, so a session the notice records a uid for is matched by
+// both. One recorded without a uid, by an evictor that could not learn it or
+// predates Keys, is matched by id as before, and a feeder that predates Keys
+// ignores them and matches by id, so a rolling upgrade tombstones nothing.
+func (n EvictionNotice) Accepts(lsid, uid string) bool {
 	if len(n.Sessions) == 0 || n.Named == nil || *n.Named != n.Left() {
 		return true
 	}
-	return lsid != "" && slices.Contains(n.Sessions, lsid)
+	if lsid == "" || !slices.Contains(n.Sessions, lsid) {
+		return false
+	}
+	for _, k := range n.Keys {
+		if id, _, _ := strings.Cut(k, "."); id == lsid {
+			return slices.Contains(n.Keys, lsid+"."+uid)
+		}
+	}
+	return true
 }
 
 // AnnounceEviction records that these documents are about to leave the fast
@@ -941,15 +962,17 @@ func (n EvictionNotice) Accepts(lsid string) bool {
 // next delete of one of them as an eviction and keeps it alive in the archive,
 // or was taken back blind and took another eviction's announcement with it.
 func AnnounceEviction(ctx context.Context, cold *mongo.Client, docIDs []string, by string) error {
-	return AnnounceEvictionIn(ctx, cold, docIDs, by, "")
+	return AnnounceEvictionIn(ctx, cold, docIDs, by, "", "")
 }
 
 // AnnounceEvictionIn is AnnounceEviction for deletes made in a transaction of
 // the session named by session, the hex of its lsid id. A notice every
 // announcement of which named a session is spent only by a delete made in one
 // of those sessions; see EvictionNotice.Accepts. An empty session announces a
-// delete made anywhere, which is what every announcement was before.
-func AnnounceEvictionIn(ctx context.Context, cold *mongo.Client, docIDs []string, by, session string) error {
+// delete made anywhere, which is what every announcement was before. uid is
+// the hex of the session's uid as mongod gave it (see SessionUID), or "" when
+// it could not be learned; see EvictionNotice.Keys.
+func AnnounceEvictionIn(ctx context.Context, cold *mongo.Client, docIDs []string, by, session, uid string) error {
 	if len(docIDs) == 0 {
 		return nil
 	}
@@ -960,7 +983,7 @@ func AnnounceEvictionIn(ctx context.Context, cold *mongo.Client, docIDs []string
 	for i, id := range docIDs {
 		models[i] = mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: id}}).
-			SetUpdate(EvictionAnnouncementIn(by, session)).
+			SetUpdate(EvictionAnnouncementIn(by, session, uid)).
 			SetUpsert(true)
 	}
 	if _, err := ParallelBulkWrite(ctx, cold.Database(DB).Collection(Evicting), models); err != nil {
@@ -1038,6 +1061,7 @@ func WithdrawEviction(ctx context.Context, cold *mongo.Client, docIDs []string, 
 var forgetSessionsWhenIdle = bson.D{{Key: "$set", Value: bson.D{
 	{Key: "sessions", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$gt", Value: bson.A{"$pending", 0}}}, "$sessions", "$$REMOVE"}}}},
 	{Key: "named", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$gt", Value: bson.A{"$pending", 0}}}, "$named", "$$REMOVE"}}}},
+	{Key: "keys", Value: bson.D{{Key: "$cond", Value: bson.A{bson.D{{Key: "$gt", Value: bson.A{"$pending", 0}}}, "$keys", "$$REMOVE"}}}},
 }}}
 
 // EvictionAnnouncement is the write that announces one eviction: another one
@@ -1056,7 +1080,7 @@ var forgetSessionsWhenIdle = bson.D{{Key: "$set", Value: bson.D{
 // Counted once per act: by is recorded on the notice, and a notice that already
 // records it is left as it is. See AnnounceEviction.
 func EvictionAnnouncement(by string) mongo.Pipeline {
-	return EvictionAnnouncementIn(by, "")
+	return EvictionAnnouncementIn(by, "", "")
 }
 
 // MaxSessionsRecorded caps the sessions a notice names. A notice is spent
@@ -1075,9 +1099,9 @@ const MaxSessionsRecorded = 16
 // named one, so an announcement that did not touch these fields, from an
 // evictor before them, leaves named below pending and the notice open. An
 // announcement naming none removes both, so the notice accepts any delete.
-func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
+func EvictionAnnouncementIn(by, session, uid string) mongo.Pipeline {
 	byNow := bson.D{{Key: "$ifNull", Value: bson.A{"$by", bson.A{}}}}
-	var sessions, named any = "$$REMOVE", "$$REMOVE"
+	var sessions, named, keys any = "$$REMOVE", "$$REMOVE", "$$REMOVE"
 	if session != "" {
 		nothingPending := bson.D{{Key: "$lte", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$pending", 0}}}, 0}}}
 		hasSessions := bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: "$sessions"}}, "array"}}}
@@ -1096,6 +1120,21 @@ func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
 				"$$REMOVE",
 			}}},
 		}}}
+		// The uid beside the id, kept the way sessions is. A session whose
+		// uid is unknown adds no key and is matched by id, as before.
+		keys = bson.D{{Key: "$cond", Value: bson.A{nothingPending, bson.A{},
+			bson.D{{Key: "$cond", Value: bson.A{hasSessions, bson.D{{Key: "$ifNull", Value: bson.A{"$keys", bson.A{}}}}, "$$REMOVE"}}},
+		}}}
+		if uid != "" {
+			keys = bson.D{{Key: "$cond", Value: bson.A{
+				bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$type", Value: keys}}, "array"}}},
+				bson.D{{Key: "$slice", Value: bson.A{
+					bson.D{{Key: "$concatArrays", Value: bson.A{keys, bson.A{session + "." + uid}}}},
+					-MaxSessionsRecorded,
+				}}},
+				"$$REMOVE",
+			}}}
+		}
 	}
 	// Only for an act not already recorded, like pending: an announcement
 	// sent again after a lost reply moved named a second time, named then
@@ -1107,7 +1146,7 @@ func EvictionAnnouncementIn(by, session string) mongo.Pipeline {
 		{{Key: "$set", Value: bson.D{{Key: "_fresh", Value: bson.D{{Key: "$not", Value: bson.A{
 			bson.D{{Key: "$in", Value: bson.A{by, byNow}}},
 		}}}}}}},
-		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: keep(sessions, "sessions")}, {Key: "named", Value: keep(named, "named")}}}},
+		{{Key: "$set", Value: bson.D{{Key: "sessions", Value: keep(sessions, "sessions")}, {Key: "named", Value: keep(named, "named")}, {Key: "keys", Value: keep(keys, "keys")}}}},
 		{{Key: "$set", Value: bson.D{
 			// At least one, not simply one more.
 			//
@@ -1195,7 +1234,7 @@ func ReadEvictionNoticesIn(ctx context.Context, cold *mongo.Client, docIDs []str
 	coll := cold.Database(DB).Collection(Evicting)
 	cur, err := coll.Find(ctx,
 		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: docIDs}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}, {Key: "sessions", Value: 1}, {Key: "named", Value: 1}}))
+		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "pending", Value: 1}, {Key: "spent", Value: 1}, {Key: "sessions", Value: 1}, {Key: "named", Value: 1}, {Key: "keys", Value: 1}}))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read eviction notices: %w", err)
 	}

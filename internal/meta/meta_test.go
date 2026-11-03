@@ -819,11 +819,11 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 		}
 		return notes[noticeID]
 	}
-	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:a", "aa11"); err != nil {
+	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:a", "aa11", ""); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
-	if n := read(); n.Accepts("") || !n.Accepts("aa11") {
-		t.Fatalf("a notice announced in session aa11 accepts %v / %v, want only aa11", n.Accepts(""), n.Accepts("aa11"))
+	if n := read(); n.Accepts("", "") || !n.Accepts("aa11", "") {
+		t.Fatalf("a notice announced in session aa11 accepts %v / %v, want only aa11", n.Accepts("", ""), n.Accepts("aa11", ""))
 	}
 	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{noticeID: {{T: 100, I: 1}}}); err != nil {
 		t.Fatalf("spend: %v", err)
@@ -833,15 +833,15 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}}, {Key: "$push", Value: bson.D{{Key: "by", Value: "old:1"}}}}); err != nil {
 		t.Fatal(err)
 	}
-	if n := read(); !n.Accepts("") {
+	if n := read(); !n.Accepts("", "") {
 		t.Errorf("the older evictor's delete is refused by a spent announcement's session (named %v, pending %d); it would be tombstoned",
 			n.Named, n.Left())
 	}
 	// A new announcement after it extends nothing: the notice stays open.
-	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:b", "bb22"); err != nil {
+	if err := AnnounceEvictionIn(ctx, c, []string{noticeID}, "step:b", "bb22", ""); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
-	if n := read(); !n.Accepts("") {
+	if n := read(); !n.Accepts("", "") {
 		t.Error("a session's announcement narrowed a notice an older evictor's announcement left open")
 	}
 
@@ -862,24 +862,24 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 		return notes[other]
 	}
 	for i := 0; i < 2; i++ {
-		if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:c", "cc33"); err != nil {
+		if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:c", "cc33", ""); err != nil {
 			t.Fatalf("announce: %v", err)
 		}
 	}
-	if n := readOther(); named(n) != n.Left() || n.Accepts("") || !n.Accepts("cc33") {
+	if n := readOther(); named(n) != n.Left() || n.Accepts("", "") || !n.Accepts("cc33", "") {
 		t.Errorf("an announcement sent twice: named %d, pending %d, accepts none %v; want named = pending and only cc33",
-			named(n), n.Left(), n.Accepts(""))
+			named(n), n.Left(), n.Accepts("", ""))
 	}
 	// A second announcement, withdrawn: named comes down with pending.
-	if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:d", "dd44"); err != nil {
+	if err := AnnounceEvictionIn(ctx, c, []string{other}, "step:d", "dd44", ""); err != nil {
 		t.Fatalf("announce: %v", err)
 	}
 	if err := WithdrawEviction(ctx, c, []string{other}, "step:d"); err != nil {
 		t.Fatalf("withdraw: %v", err)
 	}
-	if n := readOther(); named(n) != n.Left() || n.Accepts("") {
+	if n := readOther(); named(n) != n.Left() || n.Accepts("", "") {
 		t.Errorf("after a withdrawal: named %d, pending %d, accepts none %v; want named = pending and closed",
-			named(n), n.Left(), n.Accepts(""))
+			named(n), n.Left(), n.Accepts("", ""))
 	}
 	// Spent to nothing: no session survives for an older evictor to inherit.
 	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{other: {{T: 200, I: 1}}}); err != nil {
@@ -889,8 +889,38 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 		bson.D{{Key: "$inc", Value: bson.D{{Key: "pending", Value: 1}}}, {Key: "$push", Value: bson.D{{Key: "by", Value: "old:2"}}}}); err != nil {
 		t.Fatal(err)
 	}
-	if n := readOther(); !n.Accepts("") {
+	if n := readOther(); !n.Accepts("", "") {
 		t.Errorf("an older evictor's announcement inherited spent sessions (named %d, pending %d); its delete would be tombstoned",
 			named(n), n.Left())
+	}
+
+	// With the uid: written beside the id, and the id alone no longer enough.
+	// One announced without a uid in the same notice is matched by id.
+	keyed := noticeID + "k"
+	readKeyed := func() EvictionNotice {
+		_, notes, err := ReadEvictionNoticesIn(ctx, c, []string{keyed}, nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		return notes[keyed]
+	}
+	for i := 0; i < 2; i++ {
+		if err := AnnounceEvictionIn(ctx, c, []string{keyed}, "step:e", "ee55", "f00d"); err != nil {
+			t.Fatalf("announce: %v", err)
+		}
+	}
+	if err := AnnounceEvictionIn(ctx, c, []string{keyed}, "step:f", "ff66", ""); err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	if n := readKeyed(); len(n.Keys) != 1 || !n.Accepts("ee55", "f00d") || n.Accepts("ee55", "beef") || !n.Accepts("ff66", "beef") {
+		t.Errorf("keys %v: accepts own %v, other uid %v, unkeyed %v; want [ee55.f00d], true, false, true",
+			n.Keys, n.Accepts("ee55", "f00d"), n.Accepts("ee55", "beef"), n.Accepts("ff66", "beef"))
+	}
+	// Spent to nothing, the keys go with the sessions.
+	if err := SpendEvictionNotices(ctx, c, map[string][]bson.Timestamp{keyed: {{T: 300, I: 1}, {T: 300, I: 2}}}); err != nil {
+		t.Fatalf("spend: %v", err)
+	}
+	if n := readKeyed(); n.Left() == 0 && len(n.Keys) != 0 {
+		t.Errorf("a notice with nothing pending still names keys %v", n.Keys)
 	}
 }

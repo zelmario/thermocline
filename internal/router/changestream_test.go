@@ -30,13 +30,13 @@ func TestASpentNoticeAnswersForOneDeleteOnly(t *testing.T) {
 		"shop.orders|x": {left: 0, at: announced, spent: []bson.Timestamp{eviction}},
 	}
 
-	if !isEviction(notes, "shop.orders|x", announced, eviction, "", false) {
+	if !isEviction(notes, "shop.orders|x", announced, eviction, "", "", false) {
 		t.Error("the eviction the notice was spent on was not recognised")
 	}
 	// The application's own delete, well inside the window and a different
 	// oplog entry.
 	later := bson.Timestamp{T: 1022, I: 1}
-	if isEviction(notes, "shop.orders|x", time.Now(), later, "", false) {
+	if isEviction(notes, "shop.orders|x", time.Now(), later, "", "", false) {
 		t.Error("a delete the notice was not spent on was read as an eviction")
 	}
 }
@@ -48,7 +48,7 @@ func TestAnUnclaimedNoticeStillSuppresses(t *testing.T) {
 	notes := map[string]evictionNote{
 		"shop.orders|x": {left: 1, at: time.Now()},
 	}
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 9, I: 9}, "", false) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 9, I: 9}, "", "", false) {
 		t.Error("an eviction the feeder has not applied yet was let through as a delete")
 	}
 }
@@ -60,18 +60,18 @@ func TestANoticeWithoutPositionsFallsBackToTheWindow(t *testing.T) {
 	notes := map[string]evictionNote{
 		"shop.orders|x": {left: 0, at: time.Now().Add(-5 * time.Second)},
 	}
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", false) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", false) {
 		t.Error("a notice from before the upgrade stopped recognising its own eviction")
 	}
 	notes["shop.orders|x"] = evictionNote{left: 0, at: time.Now().Add(-2 * time.Hour)}
-	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", false) {
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", false) {
 		t.Error("a notice from two hours ago still answered for a delete")
 	}
 }
 
 // And a document nothing announced is never an eviction.
 func TestADeleteWithNoNoticeIsNotAnEviction(t *testing.T) {
-	if isEviction(map[string]evictionNote{}, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", false) {
+	if isEviction(map[string]evictionNote{}, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", false) {
 		t.Error("a delete with no announcement behind it was read as an eviction")
 	}
 }
@@ -395,22 +395,31 @@ func TestARecordedEchoIsHiddenWhateverTheClocksSay(t *testing.T) {
 func TestAnnouncedDocumentDeletedByTheApplicationIsShown(t *testing.T) {
 	one := 1
 	notes := map[string]evictionNote{"shop.orders|x": {left: 1, at: time.Now(), sessions: []string{"aa11"}, named: &one}}
-	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", false) {
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", false) {
 		t.Error("a delete made outside any transaction was hidden as the evictor's")
 	}
-	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "bb22", false) {
+	if isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "bb22", "", false) {
 		t.Error("a delete in another session was hidden as the evictor's")
 	}
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "aa11", false) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "aa11", "", false) {
 		t.Error("the evictor's own delete was shown")
 	}
 	// A stream whose own stages may have taken lsid away cannot ask, and is
 	// judged the old way rather than shown every eviction as a delete.
-	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", true) {
+	if !isEviction(notes, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", true) {
 		t.Error("a stream without lsid was shown the evictor's delete")
 	}
+	// The id is the client's to choose: a delete under the evictor's id with
+	// another user's uid is the application's.
+	keyed := map[string]evictionNote{"shop.orders|x": {left: 1, at: time.Now(), sessions: []string{"aa11"}, named: &one, keys: []string{"aa11.f00d"}}}
+	if isEviction(keyed, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "aa11", "beef", false) {
+		t.Error("a delete under the evictor's session id and another uid was hidden as the evictor's")
+	}
+	if !isEviction(keyed, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "aa11", "f00d", false) {
+		t.Error("the evictor's own delete, id and uid, was shown")
+	}
 	legacy := map[string]evictionNote{"shop.orders|x": {left: 1, at: time.Now()}}
-	if !isEviction(legacy, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", false) {
+	if !isEviction(legacy, "shop.orders|x", time.Now(), bson.Timestamp{T: 1, I: 1}, "", "", false) {
 		t.Error("a notice naming no session no longer hides its eviction")
 	}
 }

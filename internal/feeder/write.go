@@ -711,7 +711,7 @@ func (f *Feeder) resolveDeletes(ctx context.Context) error {
 		// its session, when the notice names one. An application's delete of
 		// the same document between the announcement and the evictor's delete
 		// is the application's. See meta.EvictionNotice.Accepts.
-		ok := avail[ids[n]] > 0 && notes[ids[n]].Accepts(f.pending[slot].session)
+		ok := avail[ids[n]] > 0 && notes[ids[n]].Accepts(f.pending[slot].session, f.pending[slot].uid)
 		if ok {
 			avail[ids[n]]--
 			// The position of the delete this announcement answers for, so the
