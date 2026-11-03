@@ -1392,6 +1392,32 @@ remedy, and the connection ends with it: there is no way to know whether what
 follows is readable either. `test/compressed` is the client that compresses
 uninvited, since no driver in the harness will.
 
+### A client that starts a message and never finishes it
+
+A message header is 16 bytes, and anyone can send one before authenticating.
+The proxy used to allocate the whole length the header claimed, up to 64 MB,
+and then wait for the body with no deadline. A few hundred connections that each
+sent a header and stopped were enough to exhaust the proxy's memory, and nothing
+limited how many connections were open.
+
+Three changes close it:
+
+1. **Memory follows the bytes that arrive.** The body is read in 256 KB pieces,
+   so a header alone costs nothing.
+2. **A started message has a deadline.** `router.message_timeout` (default
+   `2m`) is how long a client has to finish a message once its header has
+   arrived. It is not an idle timeout: a pooled connection quiet between
+   messages is never closed, the same as mongod. Two minutes is enough for a
+   48 MB message at about 3 Mbit/s.
+3. **Connections are capped.** `router.max_connections` (default `20000`)
+   limits the client connections open at once. One more is closed as it is
+   accepted, as mongod does past `net.maxIncomingConnections`, and counted in
+   `thermocline_connections_refused_total`. Under proxied authentication each
+   client connection also holds one to the fast tier, so the cap is set well
+   under the `LimitNOFILE=65535` of the shipped systemd units.
+
+`0` turns either one off.
+
 ### Whose cursor is it
 
 A cursor over an archive answer is this proxy's, not the fast tier's, so it is

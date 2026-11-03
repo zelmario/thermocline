@@ -331,6 +331,17 @@ router:
   #
   # claim_grace: 2m
 
+  # How long a client has to finish a message once its header has arrived, and
+  # how many client connections may be open at once. A header is 16 bytes
+  # anyone can send before authenticating; without these, connections that
+  # started a message and stopped could add up to the proxy's memory. Neither
+  # closes a pooled connection that is only quiet between messages. A connection
+  # past the cap is closed as it is accepted and counted in
+  # thermocline_connections_refused_total. 0 turns either off.
+  #
+  # message_timeout: 2m
+  # max_connections: 20000
+
   # Answer, rather than refuse, a pipeline that the archive has to answer and
   # that also reads a collection nothing here tiers.
   #

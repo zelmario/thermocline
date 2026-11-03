@@ -327,14 +327,17 @@ type Stats struct {
 	SupersededCursors atomic.Int64
 	// Panics counts connections closed by a recovered panic. Any value above
 	// zero is a defect, and the stack is in the log beside it. See serve.
-	Panics        atomic.Int64
-	Refused       atomic.Int64
-	Archived      atomic.Int64
-	TxnReplays    atomic.Int64
-	WarmedForTxn  atomic.Int64
-	DuplicateKeys atomic.Int64
-	ChangeStreams atomic.Int64
-	Unauthorized  atomic.Int64
+	Panics  atomic.Int64
+	Refused atomic.Int64
+	// ConnectionsRefused counts client connections closed as they were
+	// accepted, because router.max_connections were already open.
+	ConnectionsRefused atomic.Int64
+	Archived           atomic.Int64
+	TxnReplays         atomic.Int64
+	WarmedForTxn       atomic.Int64
+	DuplicateKeys      atomic.Int64
+	ChangeStreams      atomic.Int64
+	Unauthorized       atomic.Int64
 	// FailoverReplays counts commands re-sent after the fast tier changed
 	// primary underneath them. Any value above zero is an election the clients
 	// did not have to see.
@@ -767,6 +770,8 @@ func (r *Router) Listen(ctx context.Context) error {
 	r.warnTerminatedAuth()
 
 	var wg sync.WaitGroup
+	var open atomic.Int64
+	var warnedFull time.Time
 	for {
 		client, err := ln.Accept()
 		if err != nil {
@@ -776,9 +781,20 @@ func (r *Router) Listen(ctx context.Context) error {
 			r.log.Warn("accept failed", "err", err)
 			continue
 		}
+		// Past the cap the connection is closed at once, as mongod closes one
+		// past net.maxIncomingConnections, rather than left in the backlog
+		// where a client waits out its own timeout without being told. Without
+		// a cap, every connection anyone opened was a goroutine, a fast tier
+		// connection under proxied auth, and whatever part of a message it had
+		// sent, with nothing to stop them adding up to the process's memory.
+		if r.overCap(client, open.Load(), &warnedFull) {
+			continue
+		}
+		open.Add(1)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer open.Add(-1)
 			r.serve(ctx, client)
 		}()
 	}
@@ -1159,10 +1175,11 @@ func (c *conn) pump(ctx context.Context) error {
 		// many ways out and only one way in: false is exactly "parked in the
 		// read below", which is what a stop may close.
 		c.busy.Store(false)
-		msg, err := wire.Read(c.client)
+		msg, err := wire.ReadStarted(c.client, c.startMessageDeadline)
 		if err != nil {
 			return err
 		}
+		c.endMessageDeadline()
 		c.busy.Store(true)
 		c.r.Stats.Commands.Add(1)
 
@@ -2748,4 +2765,39 @@ func remoteAddr(c net.Conn) string {
 		return "unknown"
 	}
 	return a.String()
+}
+
+// startMessageDeadline gives the client router.message_timeout to finish the
+// message whose header has just arrived. See config.RouterConfig.MessageTimeout.
+func (c *conn) startMessageDeadline() {
+	if d := c.r.cfg.MessageTimeout.D(); d > 0 {
+		_ = c.client.SetReadDeadline(time.Now().Add(d))
+	}
+}
+
+// endMessageDeadline takes the deadline off once the message is whole, so a
+// connection quiet between messages is never closed for it.
+func (c *conn) endMessageDeadline() {
+	if c.r.cfg.MessageTimeout > 0 {
+		_ = c.client.SetReadDeadline(time.Time{})
+	}
+}
+
+// overCap closes and counts a client accepted with router.max_connections
+// already open, warning at most once a minute, and reports whether it did.
+func (r *Router) overCap(client net.Conn, open int64, warned *time.Time) bool {
+	max := r.cfg.MaxConnections
+	if max <= 0 || open < int64(max) {
+		return false
+	}
+	_ = client.Close()
+	r.Stats.ConnectionsRefused.Add(1)
+	if time.Since(*warned) > time.Minute {
+		*warned = time.Now()
+		r.log.Warn("refused a client connection, router.max_connections are open",
+			"max_connections", max, "remote", remoteAddr(client),
+			"meaning", "the connection was closed as it was accepted; the client sees it reset",
+			"action", "raise router.max_connections if this load is expected, or find what is opening them")
+	}
+	return true
 }

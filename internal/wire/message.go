@@ -53,9 +53,19 @@ func (m *Message) Body() []byte { return m.Raw[HeaderLen:] }
 
 // Read reads one whole message.
 func Read(r io.Reader) (*Message, error) {
+	return ReadStarted(r, nil)
+}
+
+// ReadStarted is Read calling started, when it is not nil, once the header has
+// arrived and before the body is read: the moment a sender has begun a message,
+// which is when a deadline for finishing it can start.
+func ReadStarted(r io.Reader, started func()) (*Message, error) {
 	var head [HeaderLen]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		return nil, err
+	}
+	if started != nil {
+		started()
 	}
 
 	h := Header{

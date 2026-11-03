@@ -112,6 +112,7 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("superseded_cursors_total", "Cursors the fast tier was left holding after the archive answered the query, closed by the router. Rising with no reads falling through means the router cannot close them and they sit until mongod's timeout.", snap.Counters["superseded_cursors"])
 	counter("clients_total", "Client connections accepted since start.", snap.Counters["clients_total"])
 	gauge("clients_open", "Client connections open now.", float64(snap.Counters["clients_open"]))
+	counter("connections_refused_total", "Client connections closed as they were accepted because router.max_connections were already open.", snap.Counters["connections_refused"])
 	gauge("uptime_seconds", "How long this router has been running.", float64(snap.UptimeS))
 	gauge("key_registry_rows",
 		"Unique-key claims held on the fast tier. A claim is permanent on purpose, so this grows "+

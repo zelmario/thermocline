@@ -204,6 +204,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"superseded_cursors":       r.Stats.SupersededCursors.Load(),
 			"panics":                   r.Stats.Panics.Load(),
 			"refused":                  r.Stats.Refused.Load(),
+			"connections_refused":      r.Stats.ConnectionsRefused.Load(),
 			"from_archive":             r.Stats.Archived.Load(),
 			"txn_replays":              r.Stats.TxnReplays.Load(),
 			"warmed_for_txn":           r.Stats.WarmedForTxn.Load(),

@@ -210,6 +210,24 @@ type RouterConfig struct {
 	// it at zero if it is not. There is no value that is safe in both faults,
 	// which is why there is no default other than off.
 	ClaimGrace Duration `yaml:"claim_grace"`
+	// MessageTimeout is how long a client has to finish sending a message once
+	// its header has arrived. Zero turns it off.
+	//
+	// The header is sixteen bytes anyone can send before authenticating, and
+	// the connection then held whatever part of the body had come for as long
+	// as the sender cared to wait. It is not an idle timeout: a pooled
+	// connection quiet between messages is never closed, as mongod never closes
+	// one. Two minutes is a 48 MB message at about 3 Mbit/s.
+	MessageTimeout Duration `yaml:"message_timeout"`
+	// MaxConnections caps the client connections open at once. Zero turns it
+	// off. One past it is closed as it is accepted, and counted, as mongod
+	// does past net.maxIncomingConnections.
+	//
+	// Under proxied auth every client connection holds one to the fast tier
+	// as well, so each costs this process two file descriptors, and the
+	// shipped systemd units allow 65535. 20,000 leaves room for the archive's
+	// pools and the daemons' own connections.
+	MaxConnections int `yaml:"max_connections"`
 	// AllowUntieredJoin downgrades to a warning the refusal of a pipeline that
 	// the archive would answer and that also reads a collection nothing tiers.
 	//
@@ -578,15 +596,17 @@ func Default() Config {
 			},
 		},
 		Router: RouterConfig{
-			Listen:       "127.0.0.1:27017",
-			Completeness: Archive,
-			Residency:    Duration(30 * 24 * time.Hour),
-			ArchiveWait:  Duration(5 * time.Second),
-			Freshness:    FreshnessStrict,
-			CopyUpReads:  CopyUpAlways,
-			LiveCache:    LiveCacheConfig{MaxBytes: 256 << 20},
-			CopyUpWindow: Duration(10 * time.Minute),
-			FeederID:     "default",
+			Listen:         "127.0.0.1:27017",
+			Completeness:   Archive,
+			Residency:      Duration(30 * 24 * time.Hour),
+			ArchiveWait:    Duration(5 * time.Second),
+			Freshness:      FreshnessStrict,
+			CopyUpReads:    CopyUpAlways,
+			LiveCache:      LiveCacheConfig{MaxBytes: 256 << 20},
+			CopyUpWindow:   Duration(10 * time.Minute),
+			MessageTimeout: Duration(2 * time.Minute),
+			MaxConnections: 20000,
+			FeederID:       "default",
 			Cache: CacheConfig{
 				// Off. The bounds apply when it is turned on: a thousand
 				// queries is a large working set for one router, and a minute
@@ -1017,6 +1037,12 @@ func (r RouterConfig) Validate() error {
 	}
 	if r.ClaimGrace < 0 {
 		return errors.New("router.claim_grace cannot be negative")
+	}
+	if r.MessageTimeout < 0 {
+		return errors.New("router.message_timeout cannot be negative; 0 turns it off")
+	}
+	if r.MaxConnections < 0 {
+		return errors.New("router.max_connections cannot be negative; 0 turns it off")
 	}
 	if r.ClaimGrace > 0 && r.Completeness != Archive {
 		// Nothing reads a claim it cannot re-read in the other two modes: they
