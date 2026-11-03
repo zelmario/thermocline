@@ -9,6 +9,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 // Any user may open a session with the warmer's id: mongod keys it by id and
@@ -57,7 +58,10 @@ func TestRegisterMatchesTheUIDItRecorded(t *testing.T) {
 
 	// A record with no uid, as an older warmer wrote it, matches by id.
 	old := SessionHex(sess.ID())[:30] + "ff"
-	if _, err := hot.Database(DB).Collection(Sessions).InsertOne(ctx,
+	// At majority, as RegisterSession writes: Ours reads at majority, and an
+	// insert acknowledged by the primary alone was not there yet for it.
+	if _, err := hot.Database(DB).Collection(Sessions,
+		options.Collection().SetWriteConcern(writeconcern.Majority())).InsertOne(ctx,
 		bson.D{{Key: "_id", Value: old}, {Key: "kind", Value: "warmer"}}); err != nil {
 		t.Fatal(err)
 	}
