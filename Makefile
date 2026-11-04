@@ -4,7 +4,7 @@ NODE    ?= thermocline-zelmar-node0
 HOT_PORT  := 28017
 COLD_PORT := 28018
 
-.PHONY: build store test check race fmt clean dev dev-down dev-status install check-installed
+.PHONY: build store test check race fmt clean dev dev-down dev-status install check-installed release
 
 # CGO_ENABLED=0 because the binary is built here and run in the test containers,
 # which carry an older glibc. A dynamically linked build fails there at exec with
@@ -90,7 +90,7 @@ fmt:
 	gofmt -w .
 
 clean:
-	rm -rf bin
+	rm -rf bin dist
 
 ## dev spins up two single-node replica sets to develop against.
 dev:
@@ -121,3 +121,30 @@ dev-down:
 ## check-integration runs the tests that need a live pair, after `make dev`.
 check-integration:
 	TC_TEST_COLD='mongodb://127.0.0.1:$(COLD_PORT)/?replicaSet=rsCold' go test ./... -count=1
+
+## release builds the tarballs a GitHub release carries, one per platform, and
+## their checksums, in dist/.
+##
+## VERSION is the tag without its v, and is required: a release binary that
+## says 0.1.0-dev is one nobody can match to a tag. The release workflow passes
+## it; on a tagged commit it is read from git.
+##
+## Each tarball holds the binary, packaging/ (install.sh, the systemd units and
+## logrotate), the example config, README, LICENSE and NOTICE: what install.sh
+## needs beside it, so a host without Go installs from the tarball alone.
+## -trimpath keeps this machine's paths out of the binary.
+VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+PLATFORMS := linux/amd64 linux/arm64
+release:
+	@test -n "$(VERSION)" || { echo "release: set VERSION=x.y.z, or run on a tagged commit"; exit 1; }
+	rm -rf dist && mkdir -p dist
+	@for p in $(PLATFORMS); do \
+	  os=$${p%/*}; arch=$${p#*/}; d=cline-$(VERSION)-$$os-$$arch; \
+	  mkdir -p dist/$$d && \
+	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -buildvcs=false \
+	    -ldflags "-s -w -X main.version=$(VERSION)" -o dist/$$d/cline ./cmd/cline && \
+	  cp -r packaging cline.example.yaml README.md LICENSE NOTICE dist/$$d/ && \
+	  tar -C dist -czf dist/$$d.tar.gz $$d && rm -rf dist/$$d && \
+	  echo "built dist/$$d.tar.gz" || exit 1; \
+	done
+	cd dist && sha256sum *.tar.gz > SHA256SUMS

@@ -10,8 +10,10 @@ import (
 	"github.com/zelmario/thermocline/internal/config"
 )
 
-// version is what cline version prints and every daemon logs at startup.
-const version = "0.1.0-dev"
+// version is what cline version prints and every daemon logs at startup. A
+// release sets it from the tag with -ldflags "-X main.version=..." (see make
+// release); any other build says it is not one.
+var version = "0.1.0-dev"
 
 // logStartup writes one line a daemon starts with, holding what support asks
 // for first: which build, which file, which clusters, what is tiered and by

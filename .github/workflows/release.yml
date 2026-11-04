@@ -1,0 +1,58 @@
+# A release, from a tag.
+#
+# Pushing a tag like v0.1.0 runs the same checks as ci.yml on the tagged commit,
+# builds the tarballs with make release, checks that the binary reports the
+# tag's version, and publishes them as a GitHub release whose notes are
+# docs/releases/<tag>.md. Built here and not on anybody's machine, so what is
+# downloaded is the tagged source and nothing else.
+#
+# A tag with a hyphen (v0.2.0-rc1) and every 0.x release is marked a
+# pre-release: the project is a proof of concept until it says otherwise.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: build, vet and unit tests
+        run: |
+          go build ./...
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: release notes exist for this tag
+        run: test -f "docs/releases/${GITHUB_REF_NAME}.md" || { echo "write docs/releases/${GITHUB_REF_NAME}.md first"; exit 1; }
+
+      - name: tarballs
+        run: make release VERSION="${GITHUB_REF_NAME#v}"
+
+      - name: the binary says the tag's version
+        run: |
+          d=$(mktemp -d)
+          tar -C "$d" -xzf "dist/cline-${GITHUB_REF_NAME#v}-linux-amd64.tar.gz"
+          got=$("$d/cline-${GITHUB_REF_NAME#v}-linux-amd64/cline" version)
+          echo "$got"
+          [ "$got" = "cline ${GITHUB_REF_NAME#v}" ]
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in v0.*|*-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --title "Thermocline $GITHUB_REF_NAME" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" $pre

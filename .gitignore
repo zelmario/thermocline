@@ -4,3 +4,4 @@ bin/
 *.log
 /seqwrite
 /.box
+/dist/

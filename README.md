@@ -78,7 +78,20 @@ what `--clear` removes before you repoint anything at it.
 
 ## Installing it
 
-One binary, `cline`, which is every component:
+One binary, `cline`, which is every component. Each
+[release](https://github.com/zelmario/thermocline/releases) carries it for Linux
+on amd64 and arm64, static, with the install script and the systemd units
+beside it:
+
+```
+curl -LO https://github.com/zelmario/thermocline/releases/download/v0.1.0/cline-0.1.0-linux-amd64.tar.gz
+curl -LO https://github.com/zelmario/thermocline/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+tar xzf cline-0.1.0-linux-amd64.tar.gz && cd cline-0.1.0-linux-amd64
+sudo packaging/install.sh ./cline
+```
+
+Or build it from source, with the Go release `go.mod` names:
 
 ```
 make build
@@ -124,7 +137,8 @@ That starts every component in the order that matters:
    the archive holds them, and the warmer, which fills the fast tier with
    what is newer, once at start and then every hour.
 
-As a service: `sudo packaging/install.sh bin/cline`, write
+As a service: `sudo packaging/install.sh ./cline` from a release tarball (or
+`bin/cline` from a source build), write
 `/etc/cline/cline.yaml`, then `systemctl enable --now cline`. A second
 `cline run` on another host is a standby for the feeder and evictor and a second
 proxy. [docs/adoption.md](docs/adoption.md) is the numbered order for a
