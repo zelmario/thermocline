@@ -76,7 +76,7 @@ SUITES=${SUITES:-"testchange@3 testfuzz testchange@1 testrouter testquery
         testall testnotice testtxn testedge testsingle testddl testecho
         testconcerns testmerge testtypes testauthterm testauth
         testreadprefterm testexplain testreadpref testdaemonmetrics testbulk
-        testpool testupsert testrun testretry"}
+        testpool testupsert testrun testretry testadopt"}
 
 # CACHE=1 runs the whole sweep with the query cache on.
 #

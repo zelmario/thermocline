@@ -565,9 +565,12 @@ func printNextSteps(plans []collPlan, out, coldURI, addr string, blockers []stri
 	if len(copies) > 0 {
 		next("At the cutover, with the application stopped, copy what is not tiered:")
 		fmt.Printf("     export COLD='<archive URI>' HOT='<fast tier URI>'\n")
+		// --db and --collection, not --nsInclude: mongodump has no such option
+		// and refuses the whole command, which the suite found by running it.
 		for _, p := range copies {
-			fmt.Printf("     mongodump --uri \"$COLD\" --archive --nsInclude=%s | mongorestore --uri \"$HOT\" --archive\n",
-				shellQuote(p.NS))
+			db, c, _ := strings.Cut(p.NS, ".")
+			fmt.Printf("     mongodump --uri \"$COLD\" --archive --db=%s --collection=%s | mongorestore --uri \"$HOT\" --archive\n",
+				shellQuote(db), shellQuote(c))
 		}
 		fmt.Println()
 	}
