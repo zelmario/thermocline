@@ -142,11 +142,44 @@ chk "and keeps the new one"                                 "1" \
 chk "the router still finds the evicted order"              "999" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.findOne({n:999}).n)")"
 
+echo "== estimatedDocumentCount stays a metadata read =="
+# Drivers send it as a count with no predicate, which mongod answers from the
+# collection's metadata. The archive path used to add the deletion filter and
+# scan the whole collection: 661s and still running on 60 million orders. It
+# is the archive's metadata less the deleted copies now, counted on the
+# feeder's partial index. See internal/router/estimatedcount.go.
+R "db.getSiblingDB(process.env.TC_DB).trorders.deleteMany({n:{\$in:[0,1,2]}})" >/dev/null
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments({_tcDeletedAt:{\$exists:true}}))")" = 3 ] && break; sleep 1
+done
+chk "three deleted orders are marked in the archive"        "3" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments({_tcDeletedAt:{\$exists:true}}))")"
+for _ in $(seq 1 30); do
+  [ "$(C "print(db.getSiblingDB(process.env.TC_DB).trorders.getIndexes().some(i=>i.name=='tc_tombstones'))")" = true ] && break; sleep 1
+done
+chk "the feeder built the index of deleted copies"          "true" \
+    "$(C "print(db.getSiblingDB(process.env.TC_DB).trorders.getIndexes().some(i=>i.name=='tc_tombstones'))")"
+chk "and the router did not build it on the fast tier"      "false" \
+    "$(H "print(db.getSiblingDB(process.env.TC_DB).trorders.getIndexes().some(i=>i.name=='tc_tombstones'))")"
+LIVE=$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments({}))")
+chk "the proxy counts 64 live orders"                       "64" "$LIVE"
+# The archive's profiler says how the count was answered: from the index of
+# deleted copies, examining no document.
+C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(2)" >/dev/null
+EST=$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.estimatedDocumentCount())")
+PROF=$(C "const p=db.getSiblingDB(process.env.TC_DB).system.profile.find({op:'command','command.count':'trorders'}).toArray(); print(p.length+' '+p.reduce((a,x)=>a+(x.docsExamined||0),0))")
+C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(0); db.getSiblingDB(process.env.TC_DB).system.profile.drop()" >/dev/null
+chk "estimatedDocumentCount agrees with countDocuments"      "$LIVE" "$EST"
+chk "the archive answered it examining no document"          "true" \
+    "$(set -- $PROF; [ "${1:-0}" -ge 1 ] && [ "${2:-1}" = 0 ] && echo true || echo "false ($PROF)")"
+chk "db.coll.stats() counts the same"                        "$LIVE" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'trorders'}).count)")"
+
 echo "== a second cline run =="
 writecfg $WDIR/run2.yaml $P2 "log: {format: json}"
 start $WDIR/run2.yaml $LOG2 $WDIR/run2.rc
 for _ in $(seq 1 90); do up $P2 && break; sleep 1; done
-chk "its router serves"                                     "67" \
+chk "its router serves the same live orders"               "$LIVE" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments())" $P2)"
 chk "its feeder waits for the first one's lease"            "true" \
     "$(grep -q 'feeder stopped' $LOG2 && grep -qi 'lease\|held' $LOG2 && echo true || echo false)"

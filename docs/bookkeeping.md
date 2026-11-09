@@ -190,3 +190,32 @@ Three details worth knowing:
 Retention is per feeder, not per namespace. A deployment that needs one
 collection kept for ever and another purged after a month wants two feeders with
 their own namespace lists, which is also how you would split the mirroring load.
+
+### Deleted documents are counted from an index of their own
+
+`estimatedDocumentCount()` is a count with no predicate, which mongod answers
+from the collection's metadata at once. On the archive that metadata includes
+the deleted copies, and leaving them out by filter is a scan of the whole
+collection: measured on a staging archive of 60 million orders on network
+volumes, the count was still running when it was killed at 661 seconds.
+
+So the feeder puts a second index of its own on every tiered archive
+collection, `tc_tombstones`, partial on `_tcDeletedAt` existing. It holds one
+entry per deleted copy and none for a live document, and a count with no
+predicate (through `collStats`, `$collStats` and `dbStats` too) becomes the
+metadata count less a count of that index, which examines no document.
+
+Two details worth knowing:
+
+1. **It is built in the background when the feeder starts,** for every
+   collection in `feeder.namespaces` the archive already holds, and on the first
+   delete in a collection when the list is empty. Building it reads the
+   collection once, which on a large archive takes minutes of disk on the
+   cluster being relieved. Until it is built, such a count is the metadata alone,
+   high by however many copies are marked, and the proxy says so once per
+   collection.
+2. **Neither of this system's indexes is the application's.** They are not
+   built on the fast tier, not reported by `cline indexes`, and not handed back
+   by `cline rollback`. The TTL index used to be reported at every proxy start
+   as the archive expiring the application's history, with the advice to drop
+   it.

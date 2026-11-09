@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/zelmario/thermocline/internal/config"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // Nothing copies indexes between the tiers, and nothing should: index trees
@@ -752,7 +753,10 @@ func indexesOf(ctx context.Context, client *mongo.Client, db, coll string) (map[
 			continue
 		}
 		name, _ := raw.Lookup("name").StringValueOK()
-		if name == "" {
+		// This system's own archive indexes describe deleted copies, which the
+		// fast tier never holds: not a difference between the tiers to report,
+		// nor one rollback should hand back to the application.
+		if name == "" || meta.IsOwnIndex(name) {
 			continue
 		}
 		info := indexInfo{name: name, spec: keyPattern(raw), keyJSON: keyPatternJSON(raw)}

@@ -216,6 +216,10 @@ type Feeder struct {
 	// trip per feeder run, and only namespaces that actually tombstone.
 	ttlSettled map[string]bool
 
+	// tombIndexed remembers which archive collections have had TombstoneIndex
+	// asked for, so the build is started once per run. See tombstoneindex.go.
+	tombIndexed sync.Map
+
 	// noTxn is set once the archive has refused a transaction for not being a
 	// replica set, and flushes are written one namespace at a time from then on.
 	// See writeFlush.
@@ -569,6 +573,7 @@ func (f *Feeder) Run(ctx context.Context) error {
 		return err
 	}
 	f.loadUnmirrored(ctx)
+	f.indexTombstonesAtStart(ctx)
 
 	for {
 		err := f.runOnce(ctx)

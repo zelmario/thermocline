@@ -2035,3 +2035,92 @@ func ParallelBulkWrite(ctx context.Context, coll *mongo.Collection, models []mon
 	}
 	return total, first
 }
+
+// The two indexes this system puts on an archive collection of its own accord.
+// Neither describes the application's data, so neither is copied to the fast
+// tier, warned about as the application's, or compared against the fast
+// tier's: see IsOwnIndex.
+const (
+	// TombstoneTTLIndex expires the copies of deleted documents, when
+	// feeder.tombstone_retention asks for it.
+	TombstoneTTLIndex = "tc_tombstone_ttl"
+	// TombstoneIndex holds only the deleted copies, so they can be counted
+	// without reading the collection. See LiveCountEstimate.
+	TombstoneIndex = "tc_tombstones"
+)
+
+// IsOwnIndex reports whether an archive index is one this system created.
+func IsOwnIndex(name string) bool {
+	return name == TombstoneTTLIndex || name == TombstoneIndex
+}
+
+// TombstoneIndexModel is the partial index on the deletion mark. Partial on the
+// mark's existence, so it holds an entry per deleted copy and none for a live
+// document, whatever the size of the collection.
+func TombstoneIndexModel() mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{{Key: TombstoneField, Value: 1}},
+		Options: options.Index().SetName(TombstoneIndex).SetPartialFilterExpression(
+			bson.D{{Key: TombstoneField, Value: bson.D{{Key: "$exists", Value: true}}}}),
+	}
+}
+
+// LiveCountEstimate is what a count with no predicate means on the archive: the
+// collection's own document count, from its metadata, less its deleted copies.
+//
+// A count with no predicate is a metadata read on mongod, and drivers send
+// estimatedDocumentCount as exactly that because it is instant. Adding the
+// filter that excludes deleted copies turned it into a collection scan: on a
+// staging archive of 60 million orders on network volumes the router's count
+// was still running when it was killed at 661 seconds.
+//
+// The deleted copies are counted on TombstoneIndex, bounded MinKey to MaxKey so
+// mongod answers from the index alone: 0 documents examined for 3,000 deleted
+// among 200,000. exact is false when that index is not there yet (the feeder
+// builds it in the background, and a build on a large archive takes minutes);
+// the count is then the metadata alone, high by however many copies are marked.
+func LiveCountEstimate(ctx context.Context, cold *mongo.Client, db, coll string) (n int64, exact bool, err error) {
+	d := cold.Database(db)
+	var total struct {
+		N int64 `bson:"n"`
+	}
+	if err := d.RunCommand(ctx, bson.D{{Key: "count", Value: coll}}).Decode(&total); err != nil {
+		return 0, false, fmt.Errorf("count %s.%s on the archive: %w", db, coll, err)
+	}
+	ready, err := hasIndex(ctx, d.Collection(coll), TombstoneIndex)
+	if err != nil || !ready {
+		return total.N, false, nil
+	}
+	var marked struct {
+		N int64 `bson:"n"`
+	}
+	err = d.RunCommand(ctx, bson.D{
+		{Key: "count", Value: coll},
+		{Key: "query", Value: bson.D{{Key: TombstoneField, Value: bson.D{
+			{Key: "$gte", Value: bson.MinKey{}}, {Key: "$lte", Value: bson.MaxKey{}}}}}},
+		{Key: "hint", Value: TombstoneIndex},
+	}).Decode(&marked)
+	if err != nil {
+		return total.N, false, nil
+	}
+	if marked.N > total.N {
+		return 0, true, nil
+	}
+	return total.N - marked.N, true, nil
+}
+
+// hasIndex reports whether a finished index of that name exists. listIndexes
+// leaves out builds still in progress, so a hint never names one.
+func hasIndex(ctx context.Context, c *mongo.Collection, name string) (bool, error) {
+	cur, err := c.Indexes().List(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = cur.Close(context.WithoutCancel(ctx)) }()
+	for cur.Next(ctx) {
+		if n, ok := cur.Current.Lookup("name").StringValueOK(); ok && n == name {
+			return true, nil
+		}
+	}
+	return false, cur.Err()
+}

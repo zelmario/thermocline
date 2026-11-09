@@ -979,7 +979,11 @@ func archiveIndexes(ctx context.Context, cold *mongo.Client, db, coll string) ([
 			}
 			kept = append(kept, e)
 		}
-		if name == "_id_" || !keyed {
+		// This system's own indexes describe deleted copies, which exist only
+		// on the archive: the partial one would be built empty on the fast
+		// tier, and the TTL one was reported at every start as the archive
+		// expiring the application's history, with the advice to drop it.
+		if name == "_id_" || !keyed || meta.IsOwnIndex(name) {
 			continue
 		}
 		if ttl {

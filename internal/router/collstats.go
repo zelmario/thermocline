@@ -63,8 +63,13 @@ func (c *conn) correctedCount(ctx context.Context, ns string) (int64, bool) {
 	db, coll := splitNS(base)
 	cctx, cancel := context.WithTimeout(ctx, statsCountBudget)
 	defer cancel()
-	n, err := c.r.cold.Database(db).Collection(coll).
-		CountDocuments(cctx, bson.D{meta.NotArchivedDeleted()})
+	// The archive's metadata less its deleted copies, the same answer an
+	// unpredicated count gets (estimatedcount.go). It was a countDocuments
+	// with the deletion filter, which no index serves: a scan of the whole
+	// archive collection per stats call, and dbStats made one per tiered
+	// collection, each cut off at this budget on a large archive and then
+	// reporting the fast tier's count after all.
+	n, _, err := meta.LiveCountEstimate(cctx, c.r.cold, db, coll)
 	if err != nil {
 		c.log.Warn("could not count the archive for a stats call, so the count describes the fast tier only",
 			"ns", ns, "err", err)

@@ -1206,7 +1206,14 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 		if denied, ok := c.mayRead(msg, db, coll); !ok {
 			return denied, true
 		}
-		out, aerr := c.answerSimpleFromArchive(ctx, msg, db, cmd)
+		var out *wire.Message
+		var aerr error
+		if _, honourable := archiveLevel(cmd); name == "count" && !viaView && honourable && unpredicatedCount(cmd) {
+			// A metadata read on mongod, and kept one. See estimatedcount.go.
+			out, aerr = c.answerEstimatedCount(ctx, msg, db, coll, cmd)
+		} else {
+			out, aerr = c.answerSimpleFromArchive(ctx, msg, db, cmd)
+		}
 		if aerr == nil {
 			c.r.Stats.Archived.Add(1)
 			c.cls = ClassArchive

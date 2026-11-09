@@ -956,3 +956,38 @@ func TestIDsAreNotObjectIDs(t *testing.T) {
 		check(fmt.Sprintf("with that %T _id tombstoned", other), false)
 	}
 }
+
+// A count with no predicate is the archive's metadata less its deleted copies,
+// counted on the partial index; without the index it is the metadata alone and
+// says it is not exact.
+func TestLiveCountEstimate(t *testing.T) {
+	cold, done := testCold(t)
+	defer done()
+	ctx := context.Background()
+	d := cold.Database("tctest_livecount")
+	defer func() { _ = d.Drop(ctx) }()
+	c := d.Collection("c")
+	_ = c.Drop(ctx)
+	docs := make([]any, 500)
+	for i := range docs {
+		docs[i] = bson.D{{Key: "_id", Value: i}}
+	}
+	if _, err := c.InsertMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UpdateMany(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$lt", Value: 40}}}},
+		bson.D{{Key: "$set", Value: bson.D{{Key: TombstoneField, Value: bson.DateTime(1)}}}}); err != nil {
+		t.Fatal(err)
+	}
+	n, exact, err := LiveCountEstimate(ctx, cold, "tctest_livecount", "c")
+	if err != nil || exact || n != 500 {
+		t.Fatalf("without the index: got %d exact=%v err=%v; want 500, not exact", n, exact, err)
+	}
+	if _, err := c.Indexes().CreateOne(ctx, TombstoneIndexModel()); err != nil {
+		t.Fatal(err)
+	}
+	n, exact, err = LiveCountEstimate(ctx, cold, "tctest_livecount", "c")
+	if err != nil || !exact || n != 460 {
+		t.Fatalf("with the index: got %d exact=%v err=%v; want 460, exact", n, exact, err)
+	}
+}

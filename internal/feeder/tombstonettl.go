@@ -13,7 +13,7 @@ import (
 
 // tombstoneTTLIndex is the name of the archive-side index that expires the
 // copies of documents the application deleted.
-const tombstoneTTLIndex = "tc_tombstone_ttl"
+const tombstoneTTLIndex = meta.TombstoneTTLIndex
 
 // settleTombstoneTTL puts the archive's tombstone TTL index into the state
 // feeder.tombstone_retention asks for, once per namespace per run.
