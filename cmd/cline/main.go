@@ -37,6 +37,10 @@ import (
 const usage = `cline - storage tiering for MongoDB
 
 Usage:
+  cline adopt    --hot URI --cold URI [--fast-size SIZE | --keep AGE] [--out FILE]
+                                          read the cluster you have and write the
+                                          cline.yaml that tiers it, then run
+                                          preflight on it; writes to neither tier
   cline run      --config FILE            everything below in one process, in order:
                                           the feeder, the router once mirroring is
                                           caught up, the unique keys, the evictor
@@ -129,6 +133,8 @@ func run() error {
 		return runPause(os.Args[2:], false)
 	case "preflight":
 		return runPreflight(os.Args[2:])
+	case "adopt":
+		return runAdopt(os.Args[2:])
 	case "indexes":
 		return runIndexes(os.Args[2:])
 	case "cache":

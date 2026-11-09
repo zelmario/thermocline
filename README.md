@@ -97,8 +97,36 @@ Or build it from source, with the Go release `go.mod` names:
 make build
 ```
 
-The configuration is two connection strings and one line per collection you
-want tiered, with the age at which its documents leave the fast tier:
+You do not have to write the configuration by hand. Point `cline adopt` at the
+cluster you have and the new, empty replica set that becomes the fast tier:
+
+```
+cline adopt --hot "mongodb://fast1,fast2,fast3/?replicaSet=rsFast" \
+            --cold "mongodb://old1,old2,old3/?replicaSet=rsOld" \
+            --fast-size 500GB
+```
+
+It writes to neither tier. It samples every collection and decides, with the
+evidence written beside each decision, whether the collection can be tiered and
+what ages it: the time inside an ObjectId `_id`, or a date field when `_id` is
+not an ObjectId or when the documents were re-inserted by a migration and every
+`_id` carries the load date. It prices what the fast tier would hold at 7, 30,
+90, 180 and 365 days and picks the longest window that fits in half of
+`--fast-size` (or takes `--keep 90d`). Then it writes `cline.yaml`, runs
+`cline preflight` against it, and prints what is left: the accounts, the
+indexes a date field rule needs on the archive, what to copy whole at the
+cutover, and the application's new connection string.
+
+On a test pair with seven collections of every kind (an ObjectId collection,
+an integer `_id` with a date, a migrated collection, a reference table with no
+date, a capped collection, an empty one and a view), it tiered the three it
+could, named why for the other four, and estimated the fast tier at 180 days
+holding 24.7% of the orders. After `cline run` with that file, the fast tier
+held 49,506 of 200,000, which is 24.8%.
+
+The file it writes is the short form. Written by hand, it is two connection
+strings and one line per collection you want tiered, with the age at which its
+documents leave the fast tier:
 
 ```yaml
 hot: "mongodb://fast1,fast2,fast3/?replicaSet=rsFast"

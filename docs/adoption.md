@@ -27,6 +27,15 @@ rest of the list, which is decisions about your application and your data: the
 accounts, the connection string, the collections nothing tiers, the `_id` types,
 the change stream consumers and the way back. Read the steps either way.
 
+**Start with `cline adopt`, which writes nothing to either tier.** It reads the
+cluster being adopted and answers the questions in steps 4 and 5 from the data:
+which collections can be tiered, which have to be copied whole or recreated
+(capped, empty, no usable age, views), and which clock ages each one, including
+the migrated collection whose ObjectIds all carry the load date. It writes the
+configuration with that evidence as comments, runs step 0 against it, and
+prints steps 2, 3, 4, 8 and the archive indexes of step 16 as commands. The
+rest of this list is still worth reading: it says why each of those matters.
+
 **0. Run `cline preflight` first, which writes nothing.** It makes the same
 comparison a proxy makes at startup -- versions and feature compatibility,
 collections and databases the fast tier has never held, collation and validator

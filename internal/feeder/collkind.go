@@ -394,3 +394,11 @@ func CheckCollectionKinds(ctx context.Context, hot, cold *mongo.Client, cfg conf
 	f := &Feeder{hot: hot, cold: cold, cfg: cfg, log: log}
 	return f.checkCollectionKinds(ctx)
 }
+
+// UnmirrorableKind is the same judgement for a caller deciding what to tier,
+// such as cline adopt, so the list of kinds that cannot be mirrored stays in
+// one place. info is one listCollections entry. Empty kind means it can be.
+func UnmirrorableKind(info bson.Raw) (kind, why string) {
+	kind, why, _ = unmirrorableKind(info)
+	return kind, why
+}
