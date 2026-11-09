@@ -924,3 +924,35 @@ func TestEvictionNoticeSessionsFollowThePending(t *testing.T) {
 		t.Errorf("a notice with nothing pending still names keys %v", n.Keys)
 	}
 }
+
+// The _id type check reads the two ends of the _id index: a live _id of another
+// type sorts below every ObjectId or above them all, and a tombstone does not
+// count, since a deleted document is not one a rule has to address.
+func TestIDsAreNotObjectIDs(t *testing.T) {
+	cold, done := testCold(t)
+	defer done()
+	ctx := context.Background()
+	c := cold.Database("tctest_idtype").Collection("c")
+	defer func() { _ = cold.Database("tctest_idtype").Drop(ctx) }()
+	check := func(name string, want bool) {
+		t.Helper()
+		got, err := IDsAreNotObjectIDs(ctx, cold, "tctest_idtype", "c")
+		if err != nil || got != want {
+			t.Fatalf("%s: got %v, %v; want %v", name, got, err, want)
+		}
+	}
+	_ = c.Drop(ctx)
+	check("an empty collection", false)
+	for i := 0; i < 50; i++ {
+		_, _ = c.InsertOne(ctx, bson.D{{Key: "_id", Value: bson.NewObjectID()}})
+	}
+	check("all ObjectIds", false)
+	for _, other := range []any{int32(7), "abc", bson.Binary{Subtype: 4, Data: make([]byte, 16)},
+		bson.DateTime(0), true} {
+		_, _ = c.InsertOne(ctx, bson.D{{Key: "_id", Value: other}})
+		check(fmt.Sprintf("with a %T _id", other), true)
+		_, _ = c.UpdateOne(ctx, bson.D{{Key: "_id", Value: other}},
+			bson.D{{Key: "$set", Value: bson.D{{Key: TombstoneField, Value: bson.DateTime(1)}}}})
+		check(fmt.Sprintf("with that %T _id tombstoned", other), false)
+	}
+}

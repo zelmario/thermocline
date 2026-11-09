@@ -188,3 +188,38 @@ func TestAdoptYAMLLoads(t *testing.T) {
 		t.Fatalf("the file holds credentials and is %v", st.Mode().Perm())
 	}
 }
+
+// A collection too small to be worth tiering leaves the list, whatever ages it.
+func TestAdoptKeepsSmallCollectionsWhole(t *testing.T) {
+	plans := []collPlan{
+		planCollection(collSample{NS: "app.orders", Count: 10, Storage: 50 << 30, Docs: spreadDocs(100, 365*24*time.Hour, true, "", 0)}),
+		planCollection(collSample{NS: "app.customers", Count: 10, Storage: 300 << 20, Docs: spreadDocs(100, 365*24*time.Hour, false, "since", 0)}),
+	}
+	keepWhole(plans, 1<<30)
+	if !plans[0].Tier {
+		t.Fatalf("50 GB should stay tiered: %+v", plans[0])
+	}
+	if plans[1].Tier || !plans[1].CopyWhole || !strings.Contains(plans[1].Skip, "by since") {
+		t.Fatalf("300 MB should be kept whole, naming its clock: %+v", plans[1])
+	}
+	keepWhole(plans, 0)
+	if !plans[0].Tier {
+		t.Fatalf("0 keeps everything tiered")
+	}
+}
+
+// A counted window wins over the sample, and caps at the whole collection.
+func TestAdoptCountedWindowWinsOverTheSample(t *testing.T) {
+	p := planCollection(collSample{NS: "app.orders", Count: 1000, Storage: 1 << 30, Docs: spreadDocs(100, 365*24*time.Hour, true, "", 0)})
+	w := 30 * 24 * time.Hour
+	if f, exact := keptOf(p, adoptNow, w); exact || f < 0.05 || f > 0.12 {
+		t.Fatalf("sampled: %.2f exact=%v", f, exact)
+	}
+	p.Counted = map[time.Duration]int64{w: 250, 2 * w: 5000}
+	if f, exact := keptOf(p, adoptNow, w); !exact || f != 0.25 {
+		t.Fatalf("counted: %.2f exact=%v", f, exact)
+	}
+	if f, _ := keptOf(p, adoptNow, 2*w); f != 1 {
+		t.Fatalf("a count past the collection's own is the whole of it, got %.2f", f)
+	}
+}

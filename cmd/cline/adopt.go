@@ -70,6 +70,8 @@ func runAdopt(args []string) error {
 	sampleN := fs.Int("sample", 1000, "documents sampled per collection")
 	dbsS := fs.String("db", "", "only these databases, comma separated (default: every application database)")
 	noPreflight := fs.Bool("no-preflight", false, "write the file and stop, without running preflight on it")
+	minTierS := fs.String("min-tier", "1GB", "a collection smaller than this on disk is kept whole on the fast tier rather than tiered; 0 tiers everything that can be")
+	countFor := fs.Duration("count-for", time.Minute, "how long to spend per collection counting what each window keeps, from an index; past it the sample estimates")
 	fs.Usage = func() { fmt.Print(adoptUsage); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -96,6 +98,14 @@ func runAdopt(args []string) error {
 			return fmt.Errorf("--fast-size: %w", err)
 		}
 		fastSize = n
+	}
+	minTier := int64(0)
+	if *minTierS != "0" {
+		n, err := parseSize(*minTierS)
+		if err != nil {
+			return fmt.Errorf("--min-tier: %w", err)
+		}
+		minTier = n
 	}
 	if *sampleN < 10 {
 		return errors.New("--sample: at least 10 documents, or nothing can be told from it")
@@ -159,6 +169,16 @@ func runAdopt(args []string) error {
 	for _, s := range samples {
 		plans = append(plans, planCollection(s))
 	}
+	keepWhole(plans, minTier)
+
+	// What each window keeps, counted. The windows priced are the candidates,
+	// and --keep when it is not one of them.
+	windows := append([]time.Duration(nil), candidateWindows...)
+	if keep > 0 && !containsDur(windows, keep) {
+		windows = append(windows, keep)
+		sort.Slice(windows, func(i, j int) bool { return windows[i] < windows[j] })
+	}
+	countWindows(ctx, cold, plans, now, windows, *countFor)
 
 	chosenBy := "the default"
 	switch {
@@ -287,6 +307,59 @@ func sampleArchive(ctx context.Context, cold *mongo.Client, only map[string]bool
 	return out, nil
 }
 
+// countWindows counts, on the archive, how many documents each window keeps
+// for every tiered collection whose age an index leads with. Smallest window
+// first, since each count reads the index entries newer than its cutoff; the
+// first one past the budget leaves that window and the longer ones to the
+// sample.
+func countWindows(ctx context.Context, cold *mongo.Client, plans []collPlan, now time.Time,
+	windows []time.Duration, budget time.Duration) {
+	for i := range plans {
+		p := &plans[i]
+		if !p.Tier || !p.Indexed || budget <= 0 {
+			continue
+		}
+		db, c, _ := strings.Cut(p.NS, ".")
+		coll := cold.Database(db).Collection(c)
+		deadline := time.Now().Add(budget)
+		p.Counted = map[time.Duration]int64{}
+		for _, w := range windows {
+			cut := now.Add(-w)
+			var filter bson.D
+			if p.DateField == "" {
+				filter = bson.D{{Key: "_id", Value: bson.D{{Key: "$gte", Value: bson.NewObjectIDFromTimestamp(cut)}}}}
+			} else {
+				filter = bson.D{{Key: p.DateField, Value: bson.D{{Key: "$gte", Value: cut}}}}
+			}
+			progress("  counting %s within %s", printable(p.NS), config.Duration(w))
+			cctx, cancel := context.WithDeadline(ctx, deadline)
+			n, err := coll.CountDocuments(cctx, filter)
+			cancel()
+			if err != nil {
+				break
+			}
+			p.Counted[w] = n
+		}
+	}
+	progress("")
+}
+
+func containsDur(ds []time.Duration, d time.Duration) bool {
+	for _, x := range ds {
+		if x == d {
+			return true
+		}
+	}
+	return false
+}
+
+func countedWord(exact bool) string {
+	if exact {
+		return "counted"
+	}
+	return "sampled"
+}
+
 func readStats(ctx context.Context, coll *mongo.Collection, s *collSample) {
 	cur, err := coll.Aggregate(ctx, mongo.Pipeline{
 		{{Key: "$collStats", Value: bson.D{{Key: "storageStats", Value: bson.D{}}}}},
@@ -401,13 +474,18 @@ func printPlans(plans []collPlan, now time.Time, keep time.Duration) {
 			if p.DateField != "" {
 				by = "by " + printable(p.DateField)
 			}
-			fmt.Printf("  %-*s  %13s docs  %9s  tier %-14s  %3.0f%% within %s\n", w, ns,
+			f, exact := keptOf(p, now, keep)
+			fmt.Printf("  %-*s  %13s docs  %9s  tier %-14s  %3.0f%% within %s, %s\n", w, ns,
 				commas(p.Count), humanBytes(p.Storage), by,
-				100*keptFraction(p.Ages, now, keep), config.Duration(keep))
+				100*f, config.Duration(keep), countedWord(exact))
 		default:
 			fmt.Printf("  %-*s  %13s docs  %9s  not tiered\n", w, ns, commas(p.Count), humanBytes(p.Storage))
 		}
-		for _, line := range wrap(firstNonEmpty(p.Why, p.Skip), 72) {
+		reason := p.Why
+		if !p.Tier {
+			reason = firstNonEmpty(p.Skip, p.Why)
+		}
+		for _, line := range wrap(reason, 72) {
 			fmt.Printf("  %-*s    %s\n", w, "", line)
 		}
 		if p.Warn != "" {
@@ -440,9 +518,10 @@ func printWindows(plans []collPlan, now time.Time, keep time.Duration, chosenBy 
 	if !listed {
 		fmt.Printf("  %5s  %9s   <- %s\n", config.Duration(keep), humanBytes(fastTierBytes(plans, now, keep)+copied), chosenBy)
 	}
-	fmt.Printf("\nData only, from the sample. Leave room for indexes, the oplog, the unique key\n" +
-		"registry (about 56 bytes per unique value on disk) and growth: half the disk is\n" +
-		"the budget --fast-size uses.\n")
+	fmt.Printf("\nData only, counted from an index where one leads with the age and sampled\n" +
+		"elsewhere. Leave room for indexes, the oplog, the unique key registry (about\n" +
+		"56 bytes per unique value on disk) and growth: half the disk is the budget\n" +
+		"--fast-size uses.\n")
 }
 
 // adoptYAML is the short form, with the evidence for each decision beside it.
@@ -465,8 +544,9 @@ func adoptYAML(plans []collPlan, hot, cold, listen string, keep time.Duration, n
 		if !p.Tier {
 			continue
 		}
-		fmt.Fprintf(&b, "  # %s documents, %s on disk, %.0f%% of them within %s.\n",
-			commas(p.Count), humanBytes(p.Storage), 100*keptFraction(p.Ages, now, keep), k)
+		f, exact := keptOf(p, now, keep)
+		fmt.Fprintf(&b, "  # %s documents, %s on disk, %.0f%% of them within %s (%s).\n",
+			commas(p.Count), humanBytes(p.Storage), 100*f, k, countedWord(exact))
 		for _, line := range wrap(p.Why+".", 74) {
 			b.WriteString("  # " + line + "\n")
 		}

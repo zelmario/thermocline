@@ -110,8 +110,11 @@ It writes to neither tier. It samples every collection and decides, with the
 evidence written beside each decision, whether the collection can be tiered and
 what ages it: the time inside an ObjectId `_id`, or a date field when `_id` is
 not an ObjectId or when the documents were re-inserted by a migration and every
-`_id` carries the load date. It prices what the fast tier would hold at 7, 30,
-90, 180 and 365 days and picks the longest window that fits in half of
+`_id` carries the load date. A collection smaller than `--min-tier` (1 GB) is
+kept whole on the fast tier instead, since tiering it frees almost nothing and
+sends every older document to the archive. It prices what the fast tier would
+hold at 7, 30, 90, 180 and 365 days, counted on the archive's index where one
+leads with the age, and picks the longest window that fits in half of
 `--fast-size` (or takes `--keep 90d`). Then it writes `cline.yaml`, runs
 `cline preflight` against it, and prints what is left: the accounts, the
 indexes a date field rule needs on the archive, what to copy whole at the
@@ -123,6 +126,12 @@ date, a capped collection, an empty one and a view), it tiered the three it
 could, named why for the other four, and estimated the fast tier at 180 days
 holding 24.7% of the orders. After `cline run` with that file, the fast tier
 held 49,506 of 200,000, which is 24.8%.
+
+On a Hetzner archive of 60 million orders (52 GB on network volumes), it took
+17.6 seconds and 21 MB of memory. It tiered the orders by `_id`, kept the 2
+million customers (325 MB) and the catalogue whole, and priced 365 days at
+17.8 GB against 17.5 GB counted by hand. The copy commands it printed moved
+the three untiered collections in 35 seconds.
 
 The file it writes is the short form. Written by hand, it is two connection
 strings and one line per collection you want tiered, with the age at which its

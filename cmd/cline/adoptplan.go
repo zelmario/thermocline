@@ -82,6 +82,12 @@ type collPlan struct {
 	DataSize  int64
 	Storage   int64
 	NeedIndex bool // a date_field rule whose archive lacks {field: -1, _id: -1}
+	// Indexed: an index on the archive leads with the age (the _id, or the
+	// date field), so what a window keeps can be counted rather than sampled.
+	Indexed bool
+	// Counted is the number of documents each window keeps, counted on the
+	// archive. A window missing here is estimated from the sample.
+	Counted map[time.Duration]int64
 }
 
 // planCollection decides one collection.
@@ -144,6 +150,7 @@ func planCollection(s collSample) collPlan {
 			return p
 		}
 		p.Tier, p.DateField = true, cands[0]
+		p.Indexed = leadsWith(s.Indexes, cands[0])
 		p.Why = fmt.Sprintf("_id is %s, so it ages by %s (a date in %d%% of %d sampled documents)",
 			describeTypes(types, n), cands[0], coverage[cands[0]]*100/n, n)
 		p.Ages = agesBy(s.Docs, cands[0])
@@ -153,6 +160,7 @@ func planCollection(s collSample) collPlan {
 
 	idAges := agesBy(s.Docs, "")
 	idSpread := spread(idAges)
+	p.Indexed = true // every collection has its _id index
 
 	// Every _id is an ObjectId. The question left is whether its timestamp is
 	// the clock the application means.
@@ -175,6 +183,7 @@ func planCollection(s collSample) collPlan {
 		// ageing those by _id evicted nothing.
 		if fs := spread(fieldAges); fs > 0 && idSpread*10 < fs {
 			p.Tier, p.DateField = true, f
+			p.Indexed = leadsWith(s.Indexes, f)
 			p.Why = fmt.Sprintf("_id is an ObjectId, but its times span %s where %s spans %s: the "+
 				"documents look re-inserted (a migration or a reload), so it ages by %s",
 				roundSpan(idSpread), f, roundSpan(fs), f)
@@ -199,6 +208,62 @@ func planCollection(s collSample) collPlan {
 	}
 	p.Ages = idAges
 	return p
+}
+
+// leadsWith reports whether some index starts with field f, which is what a
+// count of {f: {$gte: cutoff}} needs to avoid reading the collection.
+func leadsWith(indexes [][]indexKey, f string) bool {
+	for _, ix := range indexes {
+		if len(ix) > 0 && ix[0].Field == f {
+			return true
+		}
+	}
+	return false
+}
+
+// keepWhole takes the tiered collections smaller than minTier off the list.
+//
+// Tiering a collection is worth what it moves off the fast tier, and it costs
+// an archive read for every document past the window. Measured on a staging
+// archive of 60 million orders: customers, 325 MB on disk and aged by their
+// sign-up date, would have freed 240 MB of a 16 GB fast tier and sent every
+// long-standing customer's lookup to the archive; a one-document bookkeeping
+// collection was tiered on a sample of one. Kept whole, they cost a copy at the
+// cutover and nothing after it.
+func keepWhole(plans []collPlan, minTier int64) {
+	for i := range plans {
+		p := &plans[i]
+		if !p.Tier || p.Storage >= minTier {
+			continue
+		}
+		by := "_id"
+		if p.DateField != "" {
+			by = p.DateField
+		}
+		p.Tier, p.CopyWhole, p.Warn = false, true, ""
+		p.Skip = fmt.Sprintf("%s on disk, under --min-tier %s: tiering it (by %s) would free at most "+
+			"that much of the fast tier and make every older document an archive read, so keep "+
+			"it whole on the fast tier", humanBytes(p.Storage), humanBytes(minTier), by)
+	}
+}
+
+// keptOf is the share of a collection the fast tier keeps with window: counted
+// on the archive when it could be, otherwise read from the sample.
+//
+// The sample alone was wrong where it matters. $sample on a large collection
+// walks a WiredTiger random cursor, and measured on 60 million orders it
+// under-represents the newest documents: three samples of 1000 held 18, 7 and
+// 11 orders from the last 30 days where 27 were due, so the fast tier's size
+// came out at 0.83 GB for 30 days against 1.43 GB counted.
+func keptOf(p collPlan, now time.Time, window time.Duration) (float64, bool) {
+	if c, ok := p.Counted[window]; ok && p.Count > 0 {
+		f := float64(c) / float64(p.Count)
+		if f > 1 {
+			f = 1
+		}
+		return f, true
+	}
+	return keptFraction(p.Ages, now, window), false
 }
 
 // dateFieldRank orders candidate fields by how likely each is to be when a
@@ -353,7 +418,8 @@ func fastTierBytes(plans []collPlan, now time.Time, window time.Duration) int64 
 		if !p.Tier {
 			continue
 		}
-		total += float64(p.Storage) * keptFraction(p.Ages, now, window)
+		f, _ := keptOf(p, now, window)
+		total += float64(p.Storage) * f
 	}
 	return int64(total)
 }

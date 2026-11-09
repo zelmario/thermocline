@@ -46,7 +46,9 @@ dropall() {
 }
 trap 'cleanup; dropall' EXIT
 mkdir -p "$LOGDIR"
-adopt() { cline adopt --hot "$HOT" --cold "$COLD" --listen "127.0.0.1:$PA" --proxy-host 127.0.0.1 "$@"; }
+# --min-tier 0: these collections are kilobytes, and the point here is how
+# each kind is aged. The size cut has its own section below.
+adopt() { cline adopt --hot "$HOT" --cold "$COLD" --listen "127.0.0.1:$PA" --proxy-host 127.0.0.1 --min-tier 0 "$@"; }
 
 echo "== an archive with one collection of every kind =="
 cleanup; dropall; rm -f "$OUTF" "$RUNF"
@@ -88,8 +90,28 @@ done
 chk "the capped one says why"                                 "true" "$(yes_no grep -q 'capped collection' "$OUTF")"
 chk "the index a date_field rule needs is named for ts"       "true" "$(yes_no grep -q "getCollection(\"events\").createIndex({\"ts\": -1, _id: -1})" "$TXT")"
 chk "and for at"                                              "true" "$(yes_no grep -q "getCollection(\"legacy\").createIndex({\"at\": -1, _id: -1})" "$TXT")"
-EST=$(grep "^  $ADB.orders " "$TXT" | grep -o '[0-9]*% within' | grep -o '^[0-9]*')
-chk "orders estimate is 1800/7300 = 25%, within 5 points"     "true" "$([ -n "$EST" ] && [ "$EST" -ge 20 ] && [ "$EST" -le 30 ] && echo true || echo "false($EST)")"
+chk "orders: 1800 of 7300 kept, counted on the _id index"     "25% within 180d, counted" \
+    "$(grep "^  $ADB.orders " "$TXT" | grep -o '[0-9]*% within 180d, [a-z]*')"
+chk "events: counted too, ts has no index yet, so sampled"    "true" \
+    "$(grep "^  $ADB.events " "$TXT" | grep -q 'within 180d, sampled' && echo true || echo false)"
+
+echo "== a collection too small to be worth tiering is kept whole =="
+rm -f "$WDIR/min-$PORT.yaml"
+# The cut between the two sizes, read rather than assumed: storage sizes move
+# with the release and the compressor.
+# fsync first: a collection not yet checkpointed reports 4096 whatever it holds.
+C "db.adminCommand({fsync: 1})" >/dev/null
+OSZ=$(C "db.getSiblingDB(process.env.ADB).orders.stats().storageSize")
+LSZ=$(C "db.getSiblingDB(process.env.ADB).legacy.stats().storageSize")
+CUT=$(( (OSZ + LSZ) / 2 ))
+chk "orders is bigger on disk than legacy"                    "true" "$([ "$OSZ" -gt "$LSZ" ] && echo true || echo "false($OSZ<=$LSZ)")"
+cline adopt --hot "$HOT" --cold "$COLD" --db "$ADB" --keep 180d --min-tier "$CUT" --no-preflight \
+  --out "$WDIR/min-$PORT.yaml" > "$WDIR/min-$PORT.out" 2>&1
+chk "with --min-tier between them, orders is still tiered"    "true" "$(yes_no grep -qx "  \"$ADB.orders\": 180d" "$WDIR/min-$PORT.yaml")"
+chk "and the smaller ones are kept whole, saying why"         "true" \
+    "$(grep -A1 -x "#   $ADB.legacy" "$WDIR/min-$PORT.yaml" | grep -q 'under --min-tier' && echo true || echo false)"
+chk "with the copy command for them"                          "true" "$(yes_no grep -q -- "--db='$ADB' --collection='legacy'" "$WDIR/min-$PORT.out")"
+rm -f "$WDIR/min-$PORT."*
 
 echo "== it wrote to neither tier =="
 chk "the fast tier has no trace of the database"              "false" "$(H "db.getMongo().getDBNames().includes(process.env.ADB)")"

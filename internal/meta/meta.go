@@ -1853,19 +1853,40 @@ func ReadCacheAdvice(ctx context.Context, cold *mongo.Client) ([]CacheAdviceRepo
 // cluster answers 10. The collection had disappeared, and every part of the
 // system reported success.
 //
-// One document is enough to answer, and the query is by _id type against an
-// index that always exists.
+// It reads the two ends of the _id index and nothing else. MongoDB sorts values
+// of different types in one canonical order, and ObjectId has its own place in
+// it: numbers, strings, objects and binary (UUIDs included) sort before every
+// ObjectId, booleans, dates and timestamps after. So a live _id of any other
+// type is either below the lowest live ObjectId or above the highest, and the
+// lowest and highest live _id say whether one exists.
+//
+// It used to ask for {_id: {$not: {$type: "objectId"}}} with a limit of one,
+// and this comment said that was a query against an index. It is not: a negated
+// type cannot be turned into index bounds, so it was a collection scan, and on
+// the collection this exists for, every _id an ObjectId, the limit never stopped
+// it. Measured on the Hetzner staging archive, 60 million orders on network
+// volumes: the evictor and the warmer each sat in it for minutes at startup,
+// and neither had logged a line.
 func IDsAreNotObjectIDs(ctx context.Context, cold *mongo.Client, db, coll string) (bool, error) {
-	n, err := cold.Database(db).Collection(coll).CountDocuments(ctx,
-		bson.D{
-			NotArchivedDeleted(),
-			{Key: "_id", Value: bson.D{{Key: "$not", Value: bson.D{{Key: "$type", Value: "objectId"}}}}},
-		},
-		options.Count().SetLimit(1))
-	if err != nil {
-		return false, fmt.Errorf("check the _id type of %s.%s: %w", db, coll, err)
+	c := cold.Database(db).Collection(coll)
+	for _, dir := range []int{1, -1} {
+		var doc bson.Raw
+		err := c.FindOne(ctx, bson.D{NotArchivedDeleted()},
+			options.FindOne().
+				SetSort(bson.D{{Key: "_id", Value: dir}}).
+				SetHint(bson.D{{Key: "_id", Value: 1}}).
+				SetProjection(bson.D{{Key: "_id", Value: 1}})).Decode(&doc)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check the _id type of %s.%s: %w", db, coll, err)
+		}
+		if doc.Lookup("_id").Type != bson.TypeObjectID {
+			return true, nil
+		}
 	}
-	return n > 0, nil
+	return false, nil
 }
 
 // EvictedKey names one eviction: the document and the oplog position of the
