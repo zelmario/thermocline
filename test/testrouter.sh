@@ -62,6 +62,7 @@ H 'db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env
 C 'db.getSiblingDB(process.env.TC_DB).tprobe.drop(); db.getSiblingDB(process.env.TC_DB).tacct.drop()' >/dev/null
 C 'db.getSiblingDB(process.env.TC_META).watermarks.deleteMany({})' >/dev/null
 H 'db.getSiblingDB(process.env.TC_META).keys.deleteMany({})' >/dev/null
+FLOGAT=$(cat $LOGDIR/f.log 2>/dev/null | wc -l)
 cline feeder --config $CFG --log-file $LOGDIR/f.log &
 FP=$!
 cline router --config $CFG --log-file $LOGDIR/r.log &
@@ -71,6 +72,16 @@ RP=$!
 # connection after the six this used to sleep. The same fault as the strict
 # section's below, fixed there and not here.
 waitListening $PORT
+# And the feeder, which resumes from this worker's checkpoint and reads the
+# fast tier's oplog forward to it before its first event. On 2026-11-10, after
+# two hours of YCSB on the box, that took 18s and the first mirroring check
+# looked at the archive before the feeder had started.
+for _ in $(seq 120); do
+  tail -n +$((FLOGAT+1)) $LOGDIR/f.log 2>/dev/null | grep -q 'msg=mirroring' && break
+  sleep 1
+done
+tail -n +$((FLOGAT+1)) $LOGDIR/f.log 2>/dev/null | grep -q 'msg=mirroring' \
+  || echo "  WARN  the feeder never started mirroring"
 
 echo "== hello / handshake =="
 chk "presents as mongos (isdbgrid)" "isdbgrid" "$(R 'print(db.hello().msg)')"
