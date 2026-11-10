@@ -61,7 +61,7 @@ startFeeder() {
 }
 startRouter() {
   CFGFILE=${1:-$CFG}
-  cline router --config $CFGFILE --log-file $LOGDIR/fresh_r.log & RP=$!
+  cline router --config $CFGFILE -v --log-file $LOGDIR/fresh_r.log & RP=$!
   for _ in $(seq 1 30); do
     mongosh --port $PORT -u dba -p secret --authenticationDatabase admin \
       --quiet --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1 && return 0
@@ -267,8 +267,13 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 chk "both tiers merged in order"                   "$(C "$MQC")" "$GOTM"
+# The router runs with -v so that a refusal says why: this check failed in two
+# of five full sweeps on 2026-11-09 and never alone, with the oplog quiet.
+WHYM=$(grep 'not merging this read' $LOGDIR/fresh_r.log 2>/dev/null | grep "ns=$TC_DB.$NS" | tail -1 | grep -o 'why=.*' | cut -c1-200)
+WHYW=$(grep 'oplog window could not be checked' $LOGDIR/fresh_r.log 2>/dev/null | tail -1 | grep -o 'why=.*' | cut -c1-260)
+[ -n "$WHYW" ] && WHYM="$WHYM | window: $WHYW"
 chk "  and it was a merge, not the wait"           "true" \
-    "$([ $(( $(mergedCount) - ${M0:-0} )) -ge 1 ] && echo true || echo "false (${M0:-?} -> $(mergedCount))")"
+    "$([ $(( $(mergedCount) - ${M0:-0} )) -ge 1 ] && echo true || echo "false (${M0:-?} -> $(mergedCount)) ${WHYM:-no reason logged}")"
 # An archived order changed through the router is copied up and changed on the
 # fast tier, and the archive's copy is old until mirrored: the fast tier's wins.
 GOTU=$(R "db.getSiblingDB(process.env.TC_DB).$NS.updateOne({_id:705},{\$set:{n:900}}); $MQ")

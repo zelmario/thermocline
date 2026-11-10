@@ -74,8 +74,18 @@ const windowMaxEntries = 500
 // to from: an entry at or before it, or the window's entries are not all
 // there. Both are cheap, the first entry and a ts bound being seeks.
 func (r *Router) windowCheckable(ctx context.Context, from, until bson.Timestamp) bool {
-	if time.Duration(until.T-from.T)*time.Second <= pointCheckWindow {
+	gap := time.Duration(until.T-from.T) * time.Second
+	if gap <= pointCheckWindow {
 		return true
+	}
+	t0 := time.Now()
+	// Which way it said no, at debug, because the callers only say that it did.
+	// testfresh's merged read was refused this way in a full sweep and never
+	// alone, and "behind" covered four different answers.
+	no := func(why string, n int, err error) bool {
+		r.log.Debug("the oplog window could not be checked", "why", why, "gap", gap,
+			"entries", n, "took", time.Since(t0).Round(time.Millisecond), "err", err)
+		return false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
@@ -86,22 +96,28 @@ func (r *Router) windowCheckable(ctx context.Context, from, until bson.Timestamp
 	}
 	if err := oplog.FindOne(cctx, bson.D{}, options.FindOne().
 		SetSort(bson.D{{Key: "$natural", Value: 1}}).SetProjection(tsOnly)).Decode(&first); err != nil {
-		return false
+		return no("the oldest oplog entry could not be read", 0, err)
 	}
 	if checkpoint.PackTS(first.TS) > checkpoint.PackTS(from) {
-		return false
+		return no("the oplog no longer reaches back to the feeder's position", 0, nil)
 	}
 	cur, err := oplog.Find(cctx, bson.D{{Key: "ts", Value: bson.D{{Key: "$gt", Value: from}}}}, options.Find().
 		SetProjection(tsOnly).SetLimit(windowMaxEntries+1).SetBatchSize(windowMaxEntries+1))
 	if err != nil {
-		return false
+		return no("the window could not be read", 0, err)
 	}
 	defer cur.Close(cctx)
 	n := 0
 	for cur.Next(cctx) {
 		n++
 	}
-	return cur.Err() == nil && n <= windowMaxEntries
+	if err := cur.Err(); err != nil {
+		return no("the window could not be read to the end", n, err)
+	}
+	if n > windowMaxEntries {
+		return no("the window holds more entries than are read", n, nil)
+	}
+	return true
 }
 
 // pointReadInParallel answers a read of one document by _id from the archive
