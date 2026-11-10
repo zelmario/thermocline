@@ -356,6 +356,26 @@ func (c *conn) answerFromArchive(ctx context.Context, msg *wire.Message, db, col
 	// proxy's decision to make.
 	rewritten = withRemainingTime(rewritten, budget, time.Since(waitedFrom))
 
+	// countDocuments, counted from indexes rather than by fetching every
+	// match to look for the deletion mark. See countsub.go.
+	if _, isAgg := lookupString(cmd, "aggregate"); isAgg && hintPred == nil && batchSize != 0 && subtractable(cmd) {
+		if filter, gid, field, shaped := countDocumentsShape(cmd); shaped && c.tombstoneIndexReady(ctx, db, coll) {
+			n, cerr := c.countBySubtraction(ctx, db, coll, filter, rewritten)
+			if cerr != nil {
+				return nil, cerr
+			}
+			batch := bson.A{}
+			if n > 0 {
+				batch = append(batch, bson.D{{Key: "_id", Value: gid}, {Key: field, Value: countValue(n)}})
+			}
+			if count {
+				c.r.Stats.Archived.Add(1)
+				c.cls = ClassArchive
+			}
+			return cursorReply(msg.Header.RequestID, msg.Header.RequestID, 0, db+"."+coll, "firstBatch", batch)
+		}
+	}
+
 	cur, err := c.r.cold.Database(db).RunCommandCursor(ctx, rewritten)
 	if err != nil {
 		return nil, err
@@ -1325,6 +1345,20 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	}
 	if ferr := c.archiveReadIsFresh(ctx, db+"."+coll, time.Now(), maxTimeBudget(cmd)); ferr != nil {
 		return nil, ferr
+	}
+
+	// A count with a filter, counted from indexes. See countsub.go.
+	if _, isCount := lookupString(cmd, "count"); isCount && subtractable(cmd) {
+		if q, qerr := cmd.LookupErr("query"); qerr == nil {
+			if filter, isDoc := q.DocumentOK(); isDoc && c.tombstoneIndexReady(ctx, db, coll) {
+				n, cerr := c.countBySubtraction(ctx, db, coll, filter, out)
+				if cerr != nil {
+					return nil, cerr
+				}
+				return wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID,
+					bson.D{{Key: "n", Value: countValue(n)}, {Key: "ok", Value: 1.0}})
+			}
+		}
 	}
 
 	res := c.r.cold.Database(db).RunCommand(ctx, out)

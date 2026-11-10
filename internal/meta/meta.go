@@ -2124,3 +2124,9 @@ func hasIndex(ctx context.Context, c *mongo.Collection, name string) (bool, erro
 	}
 	return false, cur.Err()
 }
+
+// HasTombstoneIndex reports whether TombstoneIndex is built on an archive
+// collection.
+func HasTombstoneIndex(ctx context.Context, cold *mongo.Client, db, coll string) (bool, error) {
+	return hasIndex(ctx, cold.Database(db).Collection(coll), TombstoneIndex)
+}

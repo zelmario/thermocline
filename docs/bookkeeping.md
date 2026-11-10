@@ -219,3 +219,15 @@ Two details worth knowing:
    by `cline rollback`. The TTL index used to be reported at every proxy start
    as the archive expiring the application's history, with the advice to drop
    it.
+
+The same index makes a count with a filter cheap. The live count is the
+filter's count less the count of its deleted copies, `count(F) - count(F and
+marked)`, so the first can be answered from the filter's own index and the
+second picks between that index and `tc_tombstones`, whichever mongod finds
+faster. Before, every match was fetched to look for the mark: on the staging
+archive, `countDocuments` of the last 30 days by `_id` took 53 seconds through
+the proxy and 0.3 seconds on the archive directly. On 1,000,000 documents with
+5,000 deleted, a year by `_id` went from 176ms to 52ms; an unindexed filter
+pays the second count, 4ms of 250. It applies to `countDocuments` and to
+`count` with a query, not to one with a skip, a limit, a hint or `let`, and
+only once the index is built.

@@ -175,6 +175,26 @@ chk "the archive answered it examining no document"          "true" \
 chk "db.coll.stats() counts the same"                        "$LIVE" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({collStats:'trorders'}).count)")"
 
+echo "== a count with a filter is counted from indexes =="
+# The archive path added {_tcDeletedAt: {$exists: false}} to every count, which
+# no index serves, so each match was fetched to look for the mark: 53s through
+# the proxy against 0.3s on the archive for 1.64 million orders. It is now
+# count(F) less count(F and marked). See internal/router/countsub.go.
+TRUTH() { C "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments({\$and:[$1, {_tcDeletedAt:{\$exists:false}}]}))"; }
+CNT() { R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments($1))"; }
+for f in "{_id:{\$gte: ObjectId.createFromTime(Math.floor(Date.now()/1000)-400*86400)}}" "{old:true}" \
+         "{\$or:[{n:{\$lt:10}}, {fresh:true}]}" "{n:{\$in:[0,1,2,3]}}" "{}"; do
+  chk "countDocuments($f) agrees with the archive's live count" "$(TRUTH "$f")" "$(CNT "$f")"
+done
+chk "the count command with a query agrees too"              "$(TRUTH "{old:true}")" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).runCommand({count:'trorders', query:{old:true}}).n)")"
+chk "a filter matching only deleted orders counts none"      "0" "$(CNT "{n:{\$in:[0,1,2]}}")"
+C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(2)" >/dev/null
+CNT "{_id:{\$gte: ObjectId('000000000000000000000000')}}" >/dev/null
+PROF=$(C "const p=db.getSiblingDB(process.env.TC_DB).system.profile.find({op:'command','command.count':'trorders'}).toArray(); print(p.length+' '+p.reduce((a,x)=>a+(x.docsExamined||0),0))")
+C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(0); db.getSiblingDB(process.env.TC_DB).system.profile.drop()" >/dev/null
+chk "a range over every order examines only the 3 deleted"   "2 3" "$PROF"
+
 echo "== a second cline run =="
 writecfg $WDIR/run2.yaml $P2 "log: {format: json}"
 start $WDIR/run2.yaml $LOG2 $WDIR/run2.rc
