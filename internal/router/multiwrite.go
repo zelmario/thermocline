@@ -469,7 +469,13 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// Residency first, for the same reason copyUp does it first: these
 		// writes are what a client's change stream sees, and it must be able
 		// to tell a promotion from an insert the moment the event arrives.
-		if rerr := r.recordResidencyMany(ctx, ns, raw, asked); rerr != nil {
+		//
+		// In a registered session when one can be had. See copyUpSession.
+		sess := r.copyUpSession(ctx, ns, asked, docs...)
+		if sess != nil {
+			defer r.copyUps.Put(sess)
+		}
+		if rerr := r.recordResidencyMany(ctx, ns, raw, asked, sess != nil); rerr != nil {
 			r.log.Warn("could not record residency before copying up", "ns", ns, "err", rerr)
 		}
 
@@ -482,7 +488,14 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// Only the inserts moved a document. The rest were refused as duplicates
 		// of a copy the fast tier already had, which is the case the old
 		// $setOnInsert expressed by matching and doing nothing.
-		n, skipped, err := promote.Many(ctx, hot, docs)
+		var n int
+		var skipped []int
+		var err error
+		if sess != nil {
+			n, skipped, err = promote.ManyInSession(ctx, sess.S, hot, docs)
+		} else {
+			n, skipped, err = promote.Many(ctx, hot, docs)
+		}
 		if err != nil {
 			return fmt.Errorf("copy up into %s: %w", ns, err)
 		}
@@ -491,7 +504,8 @@ func (r *Router) copyUpMatching(ctx context.Context, ns string, filter bson.Raw,
 		// an echo for each. The ones the fast tier already held produce no
 		// insert, so those announcements have to be withdrawn or they are spent
 		// on whatever write comes next. See withdrawEcho.
-		if len(skipped) > 0 {
+		// One in a session announced none.
+		if len(skipped) > 0 && sess == nil {
 			stale := make([]string, 0, len(skipped))
 			for _, i := range skipped {
 				if i >= 0 && i < len(ids) {

@@ -150,7 +150,13 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	}
 	tr := time.Now()
 	r.Metrics.RecordStage(stageCopyUpAsk, tr.Sub(tk))
-	if err := r.recordResidency(ctx, ns, id, asked); err != nil {
+	// In a registered session when one can be had, so the insert is known by
+	// its lsid and the record announces no echo. See copyUpSession.
+	sess := r.copyUpSession(ctx, ns, asked, doc)
+	if sess != nil {
+		defer r.copyUps.Put(sess)
+	}
+	if err := r.recordResidencyFor(ctx, ns, id, asked, sess != nil); err != nil {
 		r.log.Warn("could not record residency before copying up", "ns", ns, "err", err)
 	}
 	r.Metrics.RecordStage(stageCopyUpResidency, time.Since(tr))
@@ -181,9 +187,19 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 	// moment, the insert on the old one and the re-sent statement on the new:
 	// a majority insert failed there, this one succeeds, and the client is told
 	// its statement matched nothing.
+	//
+	// In a session, the transaction is committed with the same w:1. See
+	// copyUpSessions.
 	ti := time.Now()
-	inserted, err := promote.One(ctx, r.hot.Database(db).Collection(coll,
-		options.Collection().SetWriteConcern(writeconcern.W1())), doc)
+	var inserted bool
+	if sess != nil {
+		var n int
+		n, _, err = promote.ManyInSession(ctx, sess.S, r.hot.Database(db).Collection(coll), []bson.Raw{doc})
+		inserted = n == 1
+	} else {
+		inserted, err = promote.One(ctx, r.hot.Database(db).Collection(coll,
+			options.Collection().SetWriteConcern(writeconcern.W1())), doc)
+	}
 	r.Metrics.RecordStage(stageCopyUpInsert, time.Since(ti))
 	if err != nil {
 		return false, fmt.Errorf("copy up into %s: %w", ns, err)
@@ -202,9 +218,10 @@ func (r *Router) copyUpFrom(ctx context.Context, ns string, id bson.RawValue, se
 			r.indexer.Ensure(context.WithoutCancel(ctx), ns)
 		})
 	}
-	if !inserted {
+	if !inserted && sess == nil {
 		// The fast tier already held it, so no insert happened and no echo is
-		// coming. See withdrawEcho for what leaving the notice would cost.
+		// coming. See withdrawEcho for what leaving the notice would cost. A
+		// copy-up in a session announced none.
 		r.withdrawEcho(ctx, []string{meta.DocID(ns, id)})
 	}
 
@@ -237,10 +254,21 @@ func (r *Router) copyUpAsync(ns string, id bson.RawValue, seen *archivedRead) {
 // asked says the fast tier was asked and did not hold the document, so this is
 // a promotion for certain. See meta.PromotionUpdate.
 func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValue, asked bool) error {
+	return r.recordResidencyFor(ctx, ns, id, asked, false)
+}
+
+// recordResidencyFor is recordResidency for a copy-up made in a registered
+// session when inSession says so: the promotion is recorded and no echo is
+// announced. See copyUpSession.
+func (r *Router) recordResidencyFor(ctx context.Context, ns string, id bson.RawValue, asked, inSession bool) error {
 	now := time.Now().UTC()
+	update := residencyFor(ns, id, now, r.cfg.Residency.D(), asked)
+	if inSession {
+		update = meta.WarmUpdate(ns, id, now, r.cfg.Residency.D())
+	}
 	return r.residencyWriter().write(ctx, mongo.NewUpdateOneModel().
 		SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-		SetUpdate(residencyFor(ns, id, now, r.cfg.Residency.D(), asked)).
+		SetUpdate(update).
 		SetUpsert(true))
 }
 
@@ -253,16 +281,23 @@ func (r *Router) recordResidency(ctx context.Context, ns string, id bson.RawValu
 // and the 200 residency holds were most of it.
 //
 // The warmer has done it this way all along; this is the same shape.
-func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.RawValue, asked bool) error {
+//
+// inSession is recordResidencyFor's: no echo, for copy-ups made in a
+// registered session.
+func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.RawValue, asked, inSession bool) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	now := time.Now().UTC()
 	models := make([]mongo.WriteModel, 0, len(ids))
 	for _, id := range ids {
+		update := residencyFor(ns, id, now, r.cfg.Residency.D(), asked)
+		if inSession {
+			update = meta.WarmUpdate(ns, id, now, r.cfg.Residency.D())
+		}
 		models = append(models, mongo.NewUpdateOneModel().
 			SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
-			SetUpdate(residencyFor(ns, id, now, r.cfg.Residency.D(), asked)).
+			SetUpdate(update).
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written

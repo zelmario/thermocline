@@ -70,7 +70,7 @@ type Warmer struct {
 	// record per document. Opened on the first batch and never ended: an
 	// ended session goes back to the driver's pool, and a transaction of
 	// something else made in it would read as a warm. See meta.Sessions.
-	sess   *mongo.Session
+	sess   *meta.OwnSession
 	sessMu sync.Mutex
 }
 
@@ -85,27 +85,25 @@ func (w *Warmer) session(ctx context.Context) (*mongo.Session, error) {
 	w.sessMu.Lock()
 	defer w.sessMu.Unlock()
 	if w.sess != nil {
-		return w.sess, nil
+		// Renewed, because the record expires meta.SessionKeep after it was
+		// written and a warmer runs as long as cline run does. One that failed
+		// is tried again on the next batch; the record has weeks left.
+		if err := w.sess.Renew(ctx, w.hot, "warmer"); err != nil {
+			w.log.Warn("could not renew the warmer session's registration", "err", err)
+		}
+		return w.sess.S, nil
 	}
-	s, err := w.hot.StartSession()
+	s, uid, err := meta.StartOwnSession(ctx, w.hot, "warmer", nil)
 	if err != nil {
-		return nil, fmt.Errorf("start the warmer's session: %w", err)
+		return nil, err
 	}
-	uid := meta.SessionUID(ctx, w.hot, s)
 	if uid == "" {
 		w.log.Warn("could not learn the warmer session's uid, registering it by id alone",
 			"effect", "another user who opens a session with the same id has its inserts "+
 				"treated as the warmer's and not mirrored")
 	}
-	if err := meta.RegisterSession(ctx, w.hot, s.ID(), "warmer", uid); err != nil {
-		s.EndSession(context.WithoutCancel(ctx))
-		return nil, err
-	}
-	if err := meta.EnsureSessionIndexes(ctx, w.hot); err != nil {
-		w.log.Warn("could not keep the session register expiring", "err", err)
-	}
 	w.sess = s
-	return s, nil
+	return s.S, nil
 }
 
 // warmPace splits a warm's time by what it was waiting on, the way the

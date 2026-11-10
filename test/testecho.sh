@@ -133,6 +133,19 @@ startFeeder
 sleep 8
 chk "the promotion did not overwrite the archive"    "kept" "$(marker 2)"
 chk "and the archived document is still live"        "true" "$(archived 2)"
+# Known by its session, as a warm is: the insert is a transaction of a session
+# the register names as a copy-up's, so the event carries the proof with it,
+# and the residency record announces no echo for the feeder to spend. Before,
+# the record was the only proof and its write concern was part of the answer.
+chk "the copy-up was made in a registered session"   "copyup" \
+    "$(H "const o=db.getSiblingDB('local').oplog.rs.find({op:'c','o.applyOps':{\$elemMatch:{op:'i',ns:process.env.TC_DB+'.$NS','o._id':2}}}).sort({\$natural:-1}).limit(1).toArray()[0];
+          if(!o||!o.lsid){print('NO SESSION')} else {
+            const s=db.getSiblingDB(process.env.TC_META).sessions.findOne({_id:o.lsid.id.toString('hex')});
+            print(s?s.kind:'NOT REGISTERED')}")"
+# Pending or already spent: the feeder spends an echo within a flush, and a
+# spent one leaves its position in echoed.
+chk "and its residency record announced no echo"     "false" \
+    "$(C "const r=db.getSiblingDB(process.env.TC_META).residency.findOne({ns:process.env.TC_DB+'.$NS',doc:2}); print(r?(r.echoPending===true||(r.echoed||[]).length>0):'NO RECORD')")"
 
 echo "== the suppression is spent on the promotion, not on the next write =="
 # The hazard: delete the promoted document and create a different one with the
@@ -187,6 +200,13 @@ for _ in $(seq 1 40); do
 done
 chk "and both updates reached the archive"           "2" \
     "$(C "print(db.getSiblingDB(process.env.TC_DB).$NS.countDocuments({v:1}))")"
+# The multi-document copy-up is made in a registered session as the single one
+# is. See copyUpSession.
+chk "its copy-up was made in a registered session"   "copyup" \
+    "$(H "const o=db.getSiblingDB('local').oplog.rs.find({op:'c','o.applyOps':{\$elemMatch:{op:'i',ns:process.env.TC_DB+'.$NS','o._id':11}}}).sort({\$natural:-1}).limit(1).toArray()[0];
+          if(!o||!o.lsid){print('NO SESSION')} else {
+            const s=db.getSiblingDB(process.env.TC_META).sessions.findOne({_id:o.lsid.id.toString('hex')});
+            print(s?s.kind:'NOT REGISTERED')}")"
 # A notice can legitimately be left standing: the feeder caches its view of
 # whether anything is being promoted, so an echo arriving inside a stale "no" is
 # mirrored rather than suppressed, which costs one redundant write and leaves the

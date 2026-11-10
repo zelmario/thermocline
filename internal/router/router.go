@@ -26,6 +26,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/zelmario/thermocline/internal/authn"
 	"github.com/zelmario/thermocline/internal/authz"
@@ -183,6 +184,9 @@ type Router struct {
 	// sessions says which sessions are this system's own, so the sieve knows
 	// a warm by the session it was inserted in. See meta.Sessions.
 	sessions *meta.SessionRegister
+	// copyUps lends the registered sessions copy-up inserts are made in, so
+	// the feeder and the sieve know them by their lsid. See copyUpInSession.
+	copyUps *meta.SessionPool
 
 	// conns is every live client connection, so a stop can end the ones that
 	// are idle instead of waiting on a read that will never return.
@@ -382,9 +386,14 @@ func New(hot, cold *mongo.Client, cfg config.RouterConfig, log *slog.Logger) *Ro
 		positions:   checkpoint.NewPositions(cold),
 		indexer:     promote.NewIndexer(hot, cold, log),
 		sessions:    meta.NewSessionRegister(hot),
-		log:         log,
-		Metrics:     NewMetrics(metricsWindow),
-		started:     time.Now(),
+		copyUps: meta.NewSessionPool(hot, "copyup", copyUpSessions, writeconcern.W1(), func() {
+			log.Warn("could not learn a copy-up session's uid, registering it by id alone",
+				"effect", "another user who opens a session with the same id has its inserts "+
+					"treated as copy-ups and not mirrored")
+		}),
+		log:     log,
+		Metrics: NewMetrics(metricsWindow),
+		started: time.Now(),
 		// Short on purpose. Both are on the path of authenticating and of every
 		// command, so they have to be cached, and a revoked role or a changed
 		// password has to take effect while somebody still cares.
