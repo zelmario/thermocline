@@ -181,6 +181,10 @@ type Router struct {
 	// residency holds. See resbatch.go.
 	resBatch     *residencyBatcher
 	resBatchOnce sync.Once
+	// resBatchW1 is the same for copy-ups made in a registered session, at
+	// w:1. See sessionResidencyWriter.
+	resBatchW1     *residencyBatcher
+	resBatchW1Once sync.Once
 	// sessions says which sessions are this system's own, so the sieve knows
 	// a warm by the session it was inserted in. See meta.Sessions.
 	sessions *meta.SessionRegister

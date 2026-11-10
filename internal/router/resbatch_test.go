@@ -31,7 +31,7 @@ func TestResidencyBatcherReportsEachWrite(t *testing.T) {
 	_ = coll.Drop(ctx)
 	defer func() { _ = coll.Drop(context.WithoutCancel(ctx)) }()
 
-	b := newResidencyBatcher(coll)
+	b := newResidencyBatcher(cold.Database("tc_resbatch"), "holds", nil)
 	const n, bad = 600, 137
 	errs := make([]error, n)
 	var wg sync.WaitGroup
@@ -62,5 +62,24 @@ func TestResidencyBatcherReportsEachWrite(t *testing.T) {
 	}
 	if got, _ := coll.CountDocuments(ctx, bson.D{}); got != n-1 {
 		t.Errorf("the archive holds %d holds, want %d", got, n-1)
+	}
+}
+
+// Only the holds of copy-ups made in a registered session are acknowledged by
+// the archive's primary alone. A hold that carries an echo stays at the
+// client's write concern, a majority, because a rollback of it is a phantom
+// insert. See sessionResidencyWriter.
+func TestSessionHoldsAloneAreW1(t *testing.T) {
+	cold, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cold.Disconnect(context.Background()) }()
+	r := &Router{cold: cold, Metrics: NewMetrics(metricsWindow)}
+	if wc := r.holdWriter(true).wc; wc == nil || fmt.Sprint(wc.W) != "1" {
+		t.Errorf("session holds: write concern %+v, want w:1", wc)
+	}
+	if wc := r.holdWriter(false).wc; wc != nil && fmt.Sprint(wc.W) == "1" {
+		t.Errorf("holds with an echo: write concern %+v, want the client's", wc)
 	}
 }

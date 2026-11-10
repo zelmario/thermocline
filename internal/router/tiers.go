@@ -266,7 +266,7 @@ func (r *Router) recordResidencyFor(ctx context.Context, ns string, id bson.RawV
 	if inSession {
 		update = meta.WarmUpdate(ns, id, now, r.cfg.Residency.D())
 	}
-	return r.residencyWriter().write(ctx, mongo.NewUpdateOneModel().
+	return r.holdWriter(inSession).write(ctx, mongo.NewUpdateOneModel().
 		SetFilter(bson.D{{Key: "_id", Value: meta.DocID(ns, id)}}).
 		SetUpdate(update).
 		SetUpsert(true))
@@ -301,8 +301,13 @@ func (r *Router) recordResidencyMany(ctx context.Context, ns string, ids []bson.
 			SetUpsert(true))
 	}
 	// Unordered: these are independent holds, and one that cannot be written
-	// must not stop the rest. The error is what the caller acts on.
-	_, err := r.cold.Database(meta.DB).Collection(meta.Residency).
+	// must not stop the rest. The error is what the caller acts on. At w:1 in
+	// a session, for the reason sessionResidencyWriter gives.
+	copts := options.Collection()
+	if inSession {
+		copts.SetWriteConcern(writeconcern.W1())
+	}
+	_, err := r.cold.Database(meta.DB).Collection(meta.Residency, copts).
 		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
 	return err
 }

@@ -8,6 +8,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/zelmario/thermocline/internal/meta"
 )
@@ -27,6 +28,8 @@ import (
 // document, so the order the hold exists for is kept. See copyUpFrom.
 type residencyBatcher struct {
 	coll *mongo.Collection
+	// wc is the write concern coll was given, nil for the client's.
+	wc *writeconcern.WriteConcern
 	// timed, when set, is told how long each batch took.
 	timed func(time.Duration)
 
@@ -60,8 +63,12 @@ const (
 	residencyInFlight = 4
 )
 
-func newResidencyBatcher(coll *mongo.Collection) *residencyBatcher {
-	b := &residencyBatcher{coll: coll, kick: make(chan struct{}, 1), slots: make(chan struct{}, residencyInFlight)}
+func newResidencyBatcher(db *mongo.Database, name string, wc *writeconcern.WriteConcern) *residencyBatcher {
+	opts := options.Collection()
+	if wc != nil {
+		opts.SetWriteConcern(wc)
+	}
+	b := &residencyBatcher{coll: db.Collection(name, opts), wc: wc, kick: make(chan struct{}, 1), slots: make(chan struct{}, residencyInFlight)}
 	go b.loop()
 	return b
 }
@@ -146,8 +153,42 @@ func (b *residencyBatcher) flush(batch []residencyReq) {
 // built directly, as tests do, gets one too.
 func (r *Router) residencyWriter() *residencyBatcher {
 	r.resBatchOnce.Do(func() {
-		r.resBatch = newResidencyBatcher(r.cold.Database(meta.DB).Collection(meta.Residency))
+		r.resBatch = newResidencyBatcher(r.cold.Database(meta.DB), meta.Residency, nil)
 		r.resBatch.timed = func(d time.Duration) { r.Metrics.RecordStage(stageResidencyFlush, d) }
 	})
 	return r.resBatch
+}
+
+// holdWriter is the batcher a copy-up's hold goes through: at w:1 for one made
+// in a registered session, at the client's write concern otherwise.
+func (r *Router) holdWriter(inSession bool) *residencyBatcher {
+	if inSession {
+		return r.sessionResidencyWriter()
+	}
+	return r.residencyWriter()
+}
+
+// sessionResidencyWriter is residencyWriter for the holds of copy-ups made in
+// a registered session, acknowledged by the archive's primary alone.
+//
+// What the archive's majority protected was the echo. A hold rolled back by a
+// failover of the archive took the echo with it, the sieve showed the copy-up
+// to clients as an insert nobody made, and the feeder mirrored it back. A
+// copy-up in a session announces no echo: both know its insert by the lsid on
+// the event, which the fast tier commits with the document. What a rollback
+// still costs is the hold, so the evictor may take the document back sooner
+// than residency says, and a change stream whose own stages hide lsid judges
+// the insert by the record as before. See copyUpSession.
+//
+// Measured on the box, YCSB latest at 4,000 ops/s with the archive capped, on
+// 2026-10-30: the hold went from 19 to 10 ms, and with the insert at w:1 the
+// write miss from 50 to 32 ms. Again on 2026-11-10 with copy-ups in sessions,
+// two alternated pairs: the hold 34 and 41 ms to 16 and 19, the write miss 70
+// and 84 to 61 and 68, the update p99 165 and 225 to 141 and 200.
+func (r *Router) sessionResidencyWriter() *residencyBatcher {
+	r.resBatchW1Once.Do(func() {
+		r.resBatchW1 = newResidencyBatcher(r.cold.Database(meta.DB), meta.Residency, writeconcern.W1())
+		r.resBatchW1.timed = func(d time.Duration) { r.Metrics.RecordStage(stageResidencyFlush, d) }
+	})
+	return r.resBatchW1
 }
