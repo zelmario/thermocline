@@ -233,6 +233,13 @@ chk "and its reference does"           "40" "$(R "print(db.getSiblingDB(process.
 echo
 echo "== the comparison can see a divergence that is really there =="
 C "print(db.getSiblingDB(process.env.TC_DB).tcfuzz.deleteMany({_id:{\$in:[41,42,43,44,45]}}).deletedCount)" >/dev/null
+# Written to the archive behind the system's back, which no change stream
+# carries. A live cache entry on a tiered collection is read again every 10
+# seconds for exactly this (livecache tieredTTL), and until then it still
+# counts the five: under LIVE=1 verify mode flagged a count of 60 against the
+# router's 55, four times in two seconds. Waited out, the comparison is of
+# the state this control arranges, not of the cache's bound on it.
+sleep 11
 NEG=$(TC_SEED=$((SEED0+13)) TC_OPS=30 TC_READONLY=1 mongosh --port $PORT -u dba -p secret         --authenticationDatabase admin --quiet --file "$HERE/fuzz.js" 2>&1 | grep -m1 '^AGREED ')
 echo "  $NEG"
 set -- $NEG
