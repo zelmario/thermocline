@@ -291,6 +291,11 @@ func (c *Cache) finish(fs *fillState, r fillResult) {
 		c.unproven(f.q)
 	default:
 		c.installAt(f, r.docs, r.complete, r.n, r.until)
+		if f.q.All && f.q.Kind == KindFind && !r.complete {
+			// Larger than an entry holds, so read again it would be again.
+			// The fill is kept for a later ask, as an unproven one is.
+			c.unproven(f.q)
+		}
 	}
 }
 
@@ -327,6 +332,13 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 		}
 		filter = append(filter, bson.E{Key: f, Value: ops})
 	}
+	if len(q.In) > 0 {
+		vals := make(bson.A, len(q.In))
+		for i, p := range q.In {
+			vals[i] = p.Value
+		}
+		filter = append(filter, bson.E{Key: "_id", Value: bson.D{{Key: "$in", Value: vals}}})
+	}
 	db, coll := splitNS(q.NS)
 	rctx, cancel := context.WithTimeout(ctx, fillTimeout)
 	defer cancel()
@@ -362,6 +374,9 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	}
 
 	window := min(maxWindow, q.Skip+q.Limit+fillWindow)
+	if q.All {
+		window = maxWindow
+	}
 	cmd := bson.D{
 		{Key: "find", Value: coll},
 		{Key: "filter", Value: filter},
@@ -431,7 +446,7 @@ func (c *Cache) proveFill(ctx context.Context, out fillResult, filter bson.D, do
 		proved, out.until = c.prove(ctx, q.NS, q.Sort, docs)
 		n = min(proved, len(docs), window)
 	}
-	if n >= q.Skip+q.Limit {
+	if !q.All && n >= q.Skip+q.Limit {
 		out.docs, out.ok = docs[:n], true
 		return out
 	}
@@ -466,7 +481,7 @@ func (c *Cache) mergeFill(ctx context.Context, out fillResult, filter bson.D, fa
 		out.docs, out.complete, out.ok = docs, true, true
 		return out
 	}
-	if len(docs) < q.Skip+q.Limit && len(docs) == window {
+	if (q.All || len(docs) < q.Skip+q.Limit) && len(docs) == window {
 		out.unproven, out.ok = true, true
 		return out
 	}

@@ -174,6 +174,9 @@ type shape struct {
 	// rng are the shape's range fields and operators, the bounds being each
 	// entry's own.
 	rng  []RangePred
+	// in says the shape filters _id by $in, the values being each entry's
+	// own. Its entries are grouped as a range's are. See candidates.
+	in   bool
 	sort []SortKey
 	// group is the grouping of a KindGroup shape.
 	group *GroupSpec
@@ -247,6 +250,9 @@ type entry struct {
 	// one. See groupKey.
 	group  string
 	bounds []RangePred
+	// in is the entry's _id $in as a set of keys, nil for a shape without
+	// one. A document belongs to the entry only if its _id is in it.
+	in map[string]bool
 	// grp is a grouped entry's documents and totals. See group.go.
 	grp *groupState
 	// docs is the sorted head of the list, complete says it is the whole of
@@ -663,8 +669,7 @@ func (c *Cache) entryFresh(e *entry, q Query, now time.Time) bool {
 	if e.shape.kind == KindCount || e.shape.kind == KindGroup {
 		return c.fresh(c.pendingCount, e.shape.ns, now)
 	}
-	end := min(q.Skip+q.Limit, len(e.docs))
-	start := min(q.Skip, end)
+	start, end := q.window(len(e.docs))
 	for _, d := range e.docs[start:end] {
 		if !c.fresh(c.pendingDoc, e.shape.ns+"\x00"+d.id, now) {
 			return false
@@ -727,7 +732,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		c.drop(e)
 		ok = false
 	}
-	if ok && q.Kind == KindFind && !e.complete && q.Skip+q.Limit > len(e.docs) {
+	if ok && q.Kind == KindFind && q.short(e) {
 		ok = false
 	}
 	if !ok {
@@ -762,11 +767,19 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	pos := Position{Applied: c.applied, Closed: c.closed}
 	var reply bson.Raw
 	if q.Kind == KindFind {
-		end := min(q.Skip+q.Limit, len(e.docs))
-		start := min(q.Skip, end)
+		start, end := q.window(len(e.docs))
 		out := make([]bson.Raw, 0, end-start)
+		size := 0
 		for _, d := range e.docs[start:end] {
 			out = append(out, d.raw)
+			size += len(d.raw)
+		}
+		if size > maxBatchBytes {
+			// mongod ends a first batch at 16MB and leaves the cursor open
+			// for the rest, which a reply from here has no cursor for.
+			unlock()
+			c.Misses.Add(1)
+			return nil, Position{}, false
 		}
 		unlock()
 		reply = findReply(q, out)
@@ -933,7 +946,7 @@ func (c *Cache) State(q Query) string {
 			return "unproven"
 		}
 		return "no entry"
-	case q.Kind == KindFind && !e.complete && q.Skip+q.Limit > len(e.docs):
+	case q.Kind == KindFind && q.short(e):
 		if c.filling[key] {
 			return "filling"
 		}
@@ -1003,7 +1016,7 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	if old, ok := c.entries[key]; ok {
 		c.drop(old)
 	}
-	e := &entry{key: key, shape: sh, complete: complete, n: n, group: q.groupKey(), bounds: q.Ranges}
+	e := &entry{key: key, shape: sh, complete: complete, n: n, group: q.groupKey(), bounds: q.Ranges, in: inSet(q.In)}
 	if c.isTiered(q.NS) {
 		e.expires = c.now().Add(tieredTTL)
 	}
@@ -1043,7 +1056,7 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 			c.addRev(id, e)
 		}
 	}
-	if len(sh.rng) > 0 {
+	if len(sh.rng) > 0 || sh.in {
 		g := c.groups[e.group]
 		if g == nil {
 			g = map[*entry]struct{}{}
@@ -1080,6 +1093,7 @@ func (c *Cache) shapeFor(q Query) *shape {
 	for _, r := range q.Ranges {
 		s.rng = append(s.rng, RangePred{Field: r.Field, Op: r.Op})
 	}
+	s.in = len(q.In) > 0
 	m[id] = s
 	return s
 }
@@ -1130,6 +1144,13 @@ func (c *Cache) plainMatch(sh *shape, q Query, d bson.Raw) bool {
 			return false
 		}
 	}
+	if len(q.In) > 0 {
+		k, ok := valueKey(d.Lookup("_id"))
+		if !ok || !inSet(q.In)[k] {
+			c.refuse(sh)
+			return false
+		}
+	}
 	return true
 }
 
@@ -1167,7 +1188,7 @@ func inBounds(bounds []RangePred, values []bson.RawValue) bool {
 // candidates are the entries a document whose values give key may belong to
 // under a shape. Called with mu held.
 func (c *Cache) candidates(sh *shape, key string) []*entry {
-	if len(sh.rng) == 0 {
+	if len(sh.rng) == 0 && !sh.in {
 		if e, ok := c.entries[key]; ok {
 			return []*entry{e}
 		}
@@ -1358,6 +1379,9 @@ func (c *Cache) Apply(ch Change) {
 	if ch.Doc == nil {
 		return
 	}
+	// The document's _id as an $in's set holds it. One valueKey refuses is
+	// in no set, since every value of one is a value valueKey takes.
+	idk, _ := valueKey(ch.ID)
 	for _, sh := range shapes {
 		key, ok := c.keyOf(sh, ch.Doc)
 		if !ok {
@@ -1376,6 +1400,9 @@ func (c *Cache) Apply(ch Change) {
 				continue
 			}
 			if !inBounds(e.bounds, values) {
+				continue
+			}
+			if e.in != nil && (idk == "" || !e.in[idk]) {
 				continue
 			}
 			if sh.kind == KindCount {

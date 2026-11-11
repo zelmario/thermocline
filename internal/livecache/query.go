@@ -59,9 +59,16 @@ type Query struct {
 	// Ranges are the filter's range bounds, sorted by field and operator. A
 	// field is in Eq or in Ranges, never both.
 	Ranges []RangePred
+	// In are the values of a filter's {_id: {$in: [...]}}, one per distinct
+	// value, sorted by key. Only _id, which is never an array, so a document
+	// is in the set by its own value and stays there for its life.
+	In []EqPair
 	// Sort is the sort, in order. Empty for a count.
 	Sort        []SortKey
 	Skip, Limit int
+	// All is a find with no limit: the whole match, answered only from an
+	// entry that holds all of it. See maxWindow.
+	All bool
 	Proj        Projection
 	// GroupID is the _id a counting pipeline groups under, echoed back.
 	GroupID bson.RawValue
@@ -127,6 +134,28 @@ type Projection struct {
 // maxWindow bounds how deep into a sorted list an entry reaches.
 const maxWindow = 500
 
+// maxBatchBytes is where mongod ends a first batch: a reply is one BSON
+// document, at most 16MB, and the documents are most of it.
+const maxBatchBytes = 16<<20 - 64<<10
+
+// window is the part of an entry's n documents the query answers with.
+func (q Query) window(n int) (int, int) {
+	end := n
+	if !q.All {
+		end = min(q.Skip+q.Limit, n)
+	}
+	return min(q.Skip, end), end
+}
+
+// short reports whether an entry holds less than the query answers with: the
+// whole match for All, which only a complete entry has.
+func (q Query) short(e *entry) bool {
+	if e.complete {
+		return false
+	}
+	return q.All || q.Skip+q.Limit > len(e.docs)
+}
+
 // ParseFind takes a find command apart, or reports that it cannot be answered
 // here. ns is db.collection.
 func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
@@ -136,6 +165,7 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 		return q, false
 	}
 	batchSize := -1
+	singleBatch := false
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
 		switch k {
@@ -152,11 +182,11 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 			if !ok {
 				return q, false
 			}
-			eq, rng, ok := parseFilter(d)
+			fp, ok := parseFilter(d)
 			if !ok {
 				return q, false
 			}
-			q.Eq, q.Ranges = eq, rng
+			q.setFilter(fp)
 		case "sort":
 			d, ok := v.DocumentOK()
 			if !ok {
@@ -203,9 +233,11 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 		case "singleBatch":
 			// Read for its type only: whether the cursor closes after one
 			// batch changes nothing here. See the batchSize check below.
-			if _, ok := v.BooleanOK(); !ok {
+			b, ok := v.BooleanOK()
+			if !ok {
 				return q, false
 			}
+			singleBatch = b
 		default:
 			// hint, collation, min, max, returnKey, showRecordId, tailable,
 			// allowPartialResults, let, and anything a later server adds.
@@ -220,7 +252,25 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 	// the sum's check, and became a negative slice bound under the cache's
 	// mutex: the panic was recovered, the mutex was not released, and every
 	// read on the router waited for it.
-	if q.Limit == 0 || q.Limit > maxWindow || q.Skip > maxWindow || q.Skip+q.Limit > maxWindow {
+	//
+	// With no limit the answer is the whole match, which an entry holds when
+	// it is complete: a match of at most maxWindow documents, an _id, a small
+	// collection read whole. The cache answers it from such an entry alone.
+	if q.Limit == 0 {
+		if q.Skip > maxWindow {
+			return q, false
+		}
+		// mongod's first batch is the batchSize, or 101 with singleBatch
+		// closing the cursor after it, so either cuts the answer short where
+		// this would give all of it. A batchSize of at least maxWindow holds
+		// any answer this gives.
+		if (batchSize >= 0 && batchSize < maxWindow) || (singleBatch && batchSize < 0) {
+			return q, false
+		}
+		q.All = true
+		return q, true
+	}
+	if q.Limit > maxWindow || q.Skip > maxWindow || q.Skip+q.Limit > maxWindow {
 		return q, false
 	}
 	// The reply has to be one batch with the cursor closed, which is what the
@@ -254,11 +304,11 @@ func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
 			if !ok {
 				return q, false
 			}
-			eq, rng, ok := parseFilter(d)
+			fp, ok := parseFilter(d)
 			if !ok {
 				return q, false
 			}
-			q.Eq, q.Ranges = eq, rng
+			q.setFilter(fp)
 		case "skip", "limit":
 			n, ok := asInt(v)
 			if !ok || n != 0 {
@@ -352,11 +402,11 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 		if !ok {
 			return q, false
 		}
-		eq, rng, ok := parseFilter(md)
+		fp, ok := parseFilter(md)
 		if !ok {
 			return q, false
 		}
-		q.Eq, q.Ranges = eq, rng
+		q.setFilter(fp)
 		at = 1
 	}
 	gd, ok := stages[at].DocumentOK()
@@ -433,16 +483,33 @@ func plainReadConcern(v bson.RawValue) bool {
 	return true
 }
 
+// filterParts is a filter taken apart. See parseFilter.
+type filterParts struct {
+	eq  []EqPair
+	rng []RangePred
+	in  []EqPair
+}
+
+func (q *Query) setFilter(f filterParts) { q.Eq, q.Ranges, q.In = f.eq, f.rng, f.in }
+
+// maxIn bounds how many values an _id $in may list. Each is a part of the
+// entry's key.
+const maxIn = 1000
+
 // parseFilter accepts a filter of top-level fields, each either equal to a
-// literal or bounded by $gt, $gte, $lt and $lte, and nothing else.
+// literal or bounded by $gt, $gte, $lt and $lte, and nothing else, and _id in
+// a list of literals.
 //
 // A bound is a value valueKey accepts, so the same values an equality takes:
 // no null, which $lte: null would match a missing field by, no array, no
-// document, no NaN, no MinKey or MaxKey.
-func parseFilter(filter bson.Raw) ([]EqPair, []RangePred, bool) {
+// document, no NaN, no MinKey or MaxKey. So is every value of an $in, which
+// is only taken on _id: elsewhere {tags: {$in: ["a"]}} matches an array that
+// holds "a", and _id is never an array.
+func parseFilter(filter bson.Raw) (filterParts, bool) {
+	var fp filterParts
 	e, err := filter.Elements()
 	if err != nil {
-		return nil, nil, false
+		return fp, false
 	}
 	out := make([]EqPair, 0, len(e))
 	var rng []RangePred
@@ -450,27 +517,35 @@ func parseFilter(filter bson.Raw) ([]EqPair, []RangePred, bool) {
 	for _, x := range e {
 		k := x.Key()
 		if k == "" || strings.HasPrefix(k, "$") || strings.Contains(k, ".") || seen[k] {
-			return nil, nil, false
+			return fp, false
 		}
 		seen[k] = true
 		if d, ok := x.Value().DocumentOK(); ok {
 			ops, err := d.Elements()
 			if err != nil || len(ops) == 0 {
-				return nil, nil, false
+				return fp, false
+			}
+			if k == "_id" && len(ops) == 1 && ops[0].Key() == "$in" {
+				in, ok := parseIn(ops[0].Value())
+				if !ok {
+					return fp, false
+				}
+				fp.in = in
+				continue
 			}
 			for _, o := range ops {
 				switch o.Key() {
 				case "$gt", "$gte", "$lt", "$lte":
 				default:
-					return nil, nil, false
+					return fp, false
 				}
 				key, ok := valueKey(o.Value())
 				if !ok {
-					return nil, nil, false
+					return fp, false
 				}
 				for _, r := range rng {
 					if r.Field == k && r.Op == o.Key() {
-						return nil, nil, false
+						return fp, false
 					}
 				}
 				rng = append(rng, RangePred{Field: k, Op: o.Key(), Value: o.Value(), key: key})
@@ -479,7 +554,7 @@ func parseFilter(filter bson.Raw) ([]EqPair, []RangePred, bool) {
 		}
 		key, ok := valueKey(x.Value())
 		if !ok {
-			return nil, nil, false
+			return fp, false
 		}
 		out = append(out, EqPair{Field: k, Value: x.Value(), key: key})
 	}
@@ -490,7 +565,49 @@ func parseFilter(filter bson.Raw) ([]EqPair, []RangePred, bool) {
 		}
 		return rng[i].Op < rng[j].Op
 	})
-	return out, rng, true
+	fp.eq, fp.rng = out, rng
+	return fp, true
+}
+
+// parseIn takes the list of an _id $in: values valueKey accepts, one per
+// key, sorted by key, so the same set written in another order or with a
+// value twice is the same entry.
+func parseIn(v bson.RawValue) ([]EqPair, bool) {
+	a, ok := v.ArrayOK()
+	if !ok {
+		return nil, false
+	}
+	vals, err := bson.Raw(a).Values()
+	if err != nil || len(vals) == 0 || len(vals) > maxIn {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	out := make([]EqPair, 0, len(vals))
+	for _, x := range vals {
+		key, ok := valueKey(x)
+		if !ok {
+			return nil, false
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, EqPair{Field: "_id", Value: x, key: key})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out, true
+}
+
+// inSet is an $in's values as a set of keys, nil for a query without one.
+func inSet(in []EqPair) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(in))
+	for _, p := range in {
+		m[p.key] = true
+	}
+	return m
 }
 
 func parseSort(d bson.Raw) ([]SortKey, bool) {
@@ -773,7 +890,13 @@ func (q Query) shapeID() string {
 			writePart(&b, r.Op)
 		}
 	}
+	if len(q.In) > 0 {
+		b.WriteString("|in:_id")
+	}
 	if q.Kind == KindFind {
+		if q.All {
+			b.WriteString("|all")
+		}
 		b.WriteString("|sort:")
 		for _, s := range q.Sort {
 			writePart(&b, s.Field)
@@ -812,13 +935,19 @@ func (q Query) shapeID() string {
 // entryKey names one entry: the shape and the values.
 func (q Query) entryKey() string {
 	g := q.groupKey()
-	if len(q.Ranges) == 0 {
+	if len(q.Ranges) == 0 && len(q.In) == 0 {
 		return g
 	}
 	var b strings.Builder
 	b.WriteString(g)
 	for _, r := range q.Ranges {
 		writePart(&b, r.key)
+	}
+	if len(q.In) > 0 {
+		b.WriteString("|in")
+		for _, p := range q.In {
+			writePart(&b, p.key)
+		}
 	}
 	return b.String()
 }
@@ -853,6 +982,14 @@ func (q Query) detached() Query {
 		rng[i] = r
 	}
 	q.Ranges = rng
+	if len(q.In) > 0 {
+		in := make([]EqPair, len(q.In))
+		for i, p := range q.In {
+			p.Value = bson.RawValue{Type: p.Value.Type, Value: append([]byte(nil), p.Value.Value...)}
+			in[i] = p
+		}
+		q.In = in
+	}
 	if q.Group != nil {
 		g := *q.Group
 		g.ID.konst = bson.RawValue{Type: g.ID.konst.Type, Value: append([]byte(nil), g.ID.konst.Value...)}

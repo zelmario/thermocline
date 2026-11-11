@@ -145,11 +145,11 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 		if !ok {
 			return q, false
 		}
-		eq, rng, ok := parseFilter(d)
+		fp, ok := parseFilter(d)
 		if !ok {
 			return q, false
 		}
-		q.Eq, q.Ranges = eq, rng
+		q.setFilter(fp)
 		i++
 	}
 	if name, v, ok := stage(); ok && name == "$unwind" {
