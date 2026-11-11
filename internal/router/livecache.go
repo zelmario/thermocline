@@ -116,7 +116,7 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 	}
 	if !ok {
 		if c.r.liveVerify != nil {
-			c.liveVerifySkip(ns, "shape: "+name)
+			c.liveVerifySkip(ns, "shape: "+liveShapeSignature(name, cmd))
 		}
 		return nil, false
 	}
