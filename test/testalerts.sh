@@ -116,6 +116,16 @@ docker run -d --name tc-prom-test --network $NET -v "$WORK":/rules \
   -v "$WORK/prometheus.yml":/etc/prometheus/prometheus.yml $IMAGE \
   --config.file=/etc/prometheus/prometheus.yml >/dev/null
 PQ() { docker exec tc-prom-test wget -qO- "http://127.0.0.1:9090/api/v1/$1" 2>/dev/null; }
+# A rule's state, read from the JSON. Every wait below used to grep for
+# '"Name","state":"firing"', and Prometheus writes state before name, so no
+# wait ever ended early: each ran its whole timeout and the checks after them
+# passed on the state read properly. Measured on 2026-11-11: the stale-read
+# section took 404s, its two rules having fired within seconds.
+ruleState() { PQ rules | A=$1 python3 -c '
+import json,os,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == os.environ["A"]: print(r.get("state"))' 2>/dev/null; }
 for _ in $(seq 1 30); do PQ rules | grep -q '"state"' && break; sleep 2; done
 chk "every rule is loaded and evaluating" "$RULES" \
     "$(PQ rules | python3 -c 'import json,sys; print(sum(len(g["rules"]) for g in json.load(sys.stdin)["data"]["groups"]))' 2>/dev/null)"
@@ -188,7 +198,7 @@ chk "the read was actually counted as stale" "true" \
 docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
   --eval 'db.getSiblingDB("shop").tprobe.find({v:{$gt:1}}).limit(5).itcount()' >/dev/null 2>&1
 for _ in $(seq 1 36); do
-  PQ rules | grep -q '"ThermoclineStaleRead","state":"firing"' && break
+  [ "$(ruleState ThermoclineStaleRead)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineStaleRead fires on a real stale read" "firing" \
@@ -228,7 +238,7 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
   --eval 'db.getSiblingDB("shop").alertsclock.insertOne({at: new Date()})' >/dev/null 2>&1
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"' && break
+  [ "$(ruleState ThermoclineClusterTimeBehind)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineClusterTimeBehind fires with no feeder" "firing" \
@@ -241,7 +251,7 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # position had stood still for 14s, which the gauge code turns into 14 and a
 # firing rule. The gauge reading 0, the series being absent and a scrape
 # failing all leave the rule inactive, so on a failure say which it was.
-if ! PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"'; then
+if ! [ "$(ruleState ThermoclineClusterTimeBehind)" = firing ]; then
   echo "      gauge now: $(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null | grep '^thermocline_mirroring_cluster_time_behind_seconds')"
   echo "      last 5m:   $(PQ 'query?query=thermocline_mirroring_cluster_time_behind_seconds%5B5m%5D' | head -c 1500)"
   echo "      scrapes:   $(PQ 'query?query=up%5B5m%5D' | grep -o '"value[s]*":.*' | head -c 600)"
@@ -291,8 +301,8 @@ chk "and counted as a stale refusal"            "true" \
 docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
   --eval 'try { db.getSiblingDB("shop").tprobe.find({v:{$gt:1}}).limit(5).itcount() } catch (e) {}' >/dev/null 2>&1
 for _ in $(seq 1 36); do
-  PQ rules | grep -q '"ThermoclineStaleRefusal","state":"firing"' &&
-    PQ rules | grep -q '"ThermoclineMirroringNearArchiveWait","state":"firing"' && break
+  [ "$(ruleState ThermoclineStaleRefusal)" = firing ] &&
+    [ "$(ruleState ThermoclineMirroringNearArchiveWait)" = firing ] && break
   sleep 5
 done
 for a in ThermoclineStaleRefusal ThermoclineMirroringNearArchiveWait; do
@@ -366,7 +376,7 @@ done
 chk "the router reports a namespace not a superset" "1" \
     "$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '/^thermocline_not_superset_namespaces /{print int($2)}')"
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineArchiveNotSuperset","state":"firing"' && break
+  [ "$(ruleState ThermoclineArchiveNotSuperset)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineArchiveNotSuperset fires on it" "firing" \
@@ -380,7 +390,7 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 # becomes true a little after the gauge does. Checked without one it passed
 # alone and read inactive under a sweep, which is a check that reports the box.
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineUnmirrorableDocument","state":"firing"' && break
+  [ "$(ruleState ThermoclineUnmirrorableDocument)" = firing ] && break
   sleep 5
 done
 chk "and the counter rule fires too"          "firing" \
@@ -398,7 +408,7 @@ for g in json.load(sys.stdin)["data"]["groups"]:
 docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
   --eval "for (let i = 0; i < 11; i++) { try { db.getSiblingDB('shop').$ANS.countDocuments({}) } catch (e) {} }" >/dev/null 2>&1
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineRefusalsRising","state":"firing"' && break
+  [ "$(ruleState ThermoclineRefusalsRising)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineRefusalsRising fires on them"  "firing" \
@@ -439,7 +449,7 @@ HELD=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" | awk '
 chk "the gauge reads the hold as hours old"   "true" \
     "$([ "${HELD:-0}" -gt 3600 ] 2>/dev/null && echo true || echo false)"
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineEvictionHeld","state":"firing"' && break
+  [ "$(ruleState ThermoclineEvictionHeld)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineEvictionHeld fires on it"     "firing" \
@@ -463,7 +473,7 @@ docker exec $NODE mongosh "$COLD" --quiet --eval '
   print(db.getSiblingDB("_thermocline").daemonstats.updateOne({_id:"evictor"},
     {$set:{at: new Date(Date.now() - 3600*1000)}}, {upsert:true}).modifiedCount)' >/dev/null 2>&1
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineDaemonStopped","state":"firing"' && break
+  [ "$(ruleState ThermoclineDaemonStopped)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineDaemonStopped fires on a stale pass" "firing" \
@@ -483,7 +493,7 @@ docker exec $NODE mongosh "$COLD" --quiet --eval '
   db.getSiblingDB("_thermocline").daemonstats.updateOne({_id:"warmer"},
     {$set:{at: new Date(Date.now() - 3*3600*1000), dryRun:false}}, {upsert:true})' >/dev/null 2>&1
 for _ in $(seq 1 40); do
-  PQ rules | grep -q '"ThermoclineWarmerStopped","state":"firing"' && break
+  [ "$(ruleState ThermoclineWarmerStopped)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineWarmerStopped fires on three hours" "firing" \
@@ -506,7 +516,7 @@ sec "an alert that should fire, does"
 # read is a rule nobody has seen work.
 docker exec $NODE sh -c "pkill -f 'cline router --config $CFG'" 2>/dev/null
 for _ in $(seq 1 60); do
-  PQ rules | grep -q '"ThermoclineRouterDown","state":"firing"' && break
+  [ "$(ruleState ThermoclineRouterDown)" = firing ] && break
   sleep 5
 done
 chk "ThermoclineRouterDown fires with the router down" "firing" \
