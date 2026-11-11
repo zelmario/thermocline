@@ -47,6 +47,9 @@ type liveCheck struct {
 	// need is the latest write this router had acknowledged on the namespace
 	// when the read arrived, which the answer must reflect.
 	need bson.Timestamp
+	// allowed says the cache would have answered this user. One it would not
+	// is sent to mongod, so mongod refusing it is no difference.
+	allowed bool
 }
 
 // liveVerifier appends a line per comparison to the verify log.
@@ -149,6 +152,13 @@ func (c *conn) liveVerifySkip(ns, why string) {
 // liveVerifyReply compares the answer the client got with the one the cache
 // would have given, and logs the comparison.
 func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
+	// testauth's limited user, refused by mongod: the cache never answers a
+	// user mongod has not let read the namespace (see Allowed), so the answer
+	// it held was never theirs to get.
+	if !chk.allowed && !replyOK(real) {
+		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\tnot allowed, and mongod refused it\n", chk.ns))
+		return
+	}
 	// Exact where it can be: the database read at the cache's own position.
 	if chk.pos.Closed.T != 0 {
 		if !c.r.cfg.Manages(chk.ns) {

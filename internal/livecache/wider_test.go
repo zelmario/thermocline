@@ -1,6 +1,7 @@
 package livecache
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -259,5 +260,85 @@ func TestStableAPIClient(t *testing.T) {
 	}
 	if _, ok := ParseCount("shop.products", raw(t, count(bson.E{Key: "apiStrict", Value: true}))); ok {
 		t.Error("answered a count with apiStrict and no apiVersion")
+	}
+}
+
+// A count on a tiered namespace remembers what it counted. A copy-up inserts a
+// document the archive half already counted, an eviction deletes one that
+// still exists, and a number alone could tell neither from the real thing.
+func TestTieredCountKeepsItsMembers(t *testing.T) {
+	c := New(1 << 20)
+	c.Tiers(func(string) bool { return true }, nil, nil)
+	c.GroupArchive(func(context.Context, string, bson.Timestamp, bson.D, bson.D) ([]bson.Raw, bool) { return nil, false })
+	q, ok := ParseCount("shop.products", raw(t, bson.D{{Key: "count", Value: "products"}, {Key: "query", Value: bson.D{{Key: "category", Value: "a"}}}}))
+	if !ok {
+		t.Fatal("count not understood")
+	}
+	count := func() (int32, bool) {
+		got, hit := c.Get(q)
+		if !hit {
+			return 0, false
+		}
+		return got.Lookup("n").Int32(), true
+	}
+	// p1 is on the fast tier, p2 only in the archive; the fill holds both.
+	c.install(q, []bson.Raw{raw(t, product("p1", "a", 1)), raw(t, product("p2", "a", 2))}, true, 0)
+	if n, hit := count(); !hit || n != 2 {
+		t.Fatalf("count %d hit %v, want 2", n, hit)
+	}
+	at := uint32(1)
+	ch := func(op, id string, d bson.D) {
+		x := Change{NS: "shop.products", Op: op, ID: strVal(t, id), At: bson.Timestamp{T: at}}
+		if d != nil {
+			x.Doc = raw(t, d)
+		}
+		at++
+		applyAll(c, x)
+	}
+	ch("insert", "p2", product("p2", "a", 2))
+	if n, _ := count(); n != 2 {
+		t.Fatalf("a copy-up of a counted document made the count %d, want 2", n)
+	}
+	ch("insert", "p3", product("p3", "a", 3))
+	ch("insert", "p4", product("p4", "b", 3))
+	if n, _ := count(); n != 3 {
+		t.Fatalf("after a new member and a stranger the count is %d, want 3", n)
+	}
+	ch("replace", "p3", product("p3", "b", 3))
+	if n, hit := count(); !hit || n != 2 {
+		t.Fatalf("after a member left by a replace the count is %d hit %v, want 2", n, hit)
+	}
+	ch("update", "p4", product("p4", "a", 3))
+	if n, _ := count(); n != 3 {
+		t.Fatalf("after a stranger joined by an update the count is %d, want 3", n)
+	}
+	// A delete of a document it never counted changes nothing; untiered, any
+	// delete dropped every count of the namespace.
+	ch("delete", "p9", nil)
+	if n, hit := count(); !hit || n != 3 {
+		t.Fatalf("a delete of a stranger: count %d hit %v, want 3", n, hit)
+	}
+	// A delete of a member may be an eviction of a document that still
+	// exists, so the count is read again.
+	ch("delete", "p1", nil)
+	if _, hit := count(); hit {
+		t.Fatal("answered after a counted document left the fast tier")
+	}
+}
+
+// A fill that read more than an entry remembers is not asked for again for a
+// while: it read that many documents, from each tier, to be refused.
+func TestOversizeFillWaits(t *testing.T) {
+	c := New(1 << 20)
+	q := inCount(t, "p1")
+	c.failed(q, "too many", true)
+	c.requestFill(q, q.shapeID())
+	if c.Filling(q) {
+		t.Fatal("an oversized fill was asked for again at once")
+	}
+	c.failed(inCount(t, "p2"), "network", false)
+	c.requestFill(inCount(t, "p2"), inCount(t, "p2").shapeID())
+	if !c.Filling(inCount(t, "p2")) {
+		t.Fatal("a fill that failed for another reason waits too")
 	}
 }

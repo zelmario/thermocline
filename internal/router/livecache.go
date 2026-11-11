@@ -81,7 +81,7 @@ type liveProof struct {
 }
 
 // liveLookup answers a read from the live cache when it can.
-func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bool) {
+func (c *conn) liveLookup(ctx context.Context, msg *wire.Message, name, db string) (*wire.Message, bool) {
 	if c.r.live == nil || msg.Header.OpCode != wire.OpMsg {
 		return nil, false
 	}
@@ -120,6 +120,19 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 		}
 		return nil, false
 	}
+	// The router refuses a tiered namespace whose archive refused one of its
+	// documents (see superset.go), and the cache answered it: an entry filled
+	// before the refusal was known, or the count of both tiers, which holds the
+	// refused document the router will not vouch for. Asked here, at the read,
+	// and not only when the entry was filled. Found by verify mode on
+	// testkeys' tkrefdel, where the cache would have counted 2 and the router
+	// refused.
+	if c.r.cfg.Manages(ns) && c.r.notSuperset(ctx, ns) != 0 {
+		if c.r.liveVerify != nil {
+			c.liveVerifySkip(ns, "the archive is not a superset")
+		}
+		return nil, false
+	}
 	// Authentication is proxied, so mongod decides who may read what, and an
 	// answer from memory would skip it. Only somebody mongod let read this
 	// namespace within the last minute is answered here; anybody else is
@@ -137,7 +150,7 @@ func (c *conn) liveLookup(msg *wire.Message, name, db string) (*wire.Message, bo
 		}
 		if reply, pos, hit := c.liveVerifyGet(q); hit {
 			c.liveCheck = &liveCheck{ns: ns, shape: q.Shape(), q: q.Detached(), cmd: append(bson.Raw(nil), cmd...),
-				cached: append(bson.Raw(nil), reply...), at: time.Now(), pos: pos, need: need}
+				cached: append(bson.Raw(nil), reply...), at: time.Now(), pos: pos, need: need, allowed: allowed}
 		}
 		return nil, false
 	}
@@ -489,8 +502,21 @@ func liveWindowEnd(seen uint64, at bson.Timestamp) bson.Timestamp {
 // the fast tier's oplog shows changed since then refuses the fill, since the
 // archive's copy may be one the fast tier has deleted.
 func (r *Router) liveArchive(ctx context.Context, ns string, at bson.Timestamp, filter, proj bson.D) ([]bson.Raw, bool) {
-	if _, has := r.defaultCollation(ctx, ns); has || r.notSupersetCached(ns) != 0 {
+	if _, has := r.defaultCollation(ctx, ns); has || r.notSuperset(ctx, ns) != 0 {
 		return nil, false
+	}
+	// No collection on the archive is the stranded case of
+	// warnAboutUnarchivedCollections: the router reads a tiered namespace from
+	// the archive and answers from nothing, and a fill that added the fast
+	// tier's half answered what the router does not. Found by verify mode on
+	// testrouter's tlostarch: the router said 0 and the cache 3. Left to the
+	// router, which names it at startup.
+	{
+		db, coll := splitNS(ns)
+		names, err := r.cold.Database(db).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
+		if err != nil || len(names) == 0 {
+			return nil, false
+		}
 	}
 	got := r.recentPosition(ctx)
 	if !got.known || got.ts.IsZero() {
@@ -526,11 +552,16 @@ func (r *Router) liveArchive(ctx context.Context, ns string, at bson.Timestamp, 
 		// and the fill refuses past it, but this half used to read every
 		// document the filter took first: a grouping with no $match over a
 		// 200 million document archive held it all in memory to be refused.
-		if len(archived) == livecache.MaxGroupDocs {
-			_ = cur.Close(cctx)
-			return nil, false
-		}
 		archived = append(archived, append(bson.Raw(nil), cur.Current...))
+		if len(archived) > livecache.MaxGroupDocs {
+			// Returned rather than refused: more distinct documents than an
+			// entry remembers is a fill the cache gives up on for a while
+			// (see oversizeRetry), where a refusal is one it asks for again
+			// in seconds. None of them is installed, so the window check
+			// below is not needed.
+			_ = cur.Close(cctx)
+			return archived, true
+		}
 	}
 	cerr := cur.Err()
 	_ = cur.Close(cctx)

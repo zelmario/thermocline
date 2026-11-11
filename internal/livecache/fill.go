@@ -70,6 +70,8 @@ type fillResult struct {
 	unproven bool
 	// why is what failed when ok is false and a read was attempted.
 	why string
+	// oversize: the $match took more documents than an entry remembers.
+	oversize bool
 	// until bounds how long the entry may be kept, zero for tieredTTL alone.
 	until time.Time
 }
@@ -284,7 +286,7 @@ func (c *Cache) finish(fs *fillState, r fillResult) {
 	switch {
 	case f.dropped || !r.ok:
 		if !f.dropped && r.why != "" {
-			c.failed(f.q, r.why)
+			c.failed(f.q, r.why, r.oversize)
 		}
 		c.unpend(f.q)
 	case r.unproven:
@@ -314,12 +316,6 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 		return out
 	}
 	tiered := c.isTiered(q.NS)
-	if tiered && q.Kind != KindFind && q.Kind != KindGroup {
-		// A count over a tiered namespace is over both tiers, and the fast
-		// tier's stream cannot keep one: a copy-up is an insert of a document
-		// that was already counted.
-		return out
-	}
 	filter := bson.D{}
 	for _, p := range q.Eq {
 		filter = append(filter, bson.E{Key: p.Field, Value: p.Value})
@@ -343,7 +339,7 @@ func (c *Cache) read(ctx context.Context, hot *mongo.Client, f *inflight) fillRe
 	rctx, cancel := context.WithTimeout(ctx, fillTimeout)
 	defer cancel()
 
-	if q.Kind == KindGroup {
+	if q.Kind == KindGroup || tiered && q.Kind != KindFind {
 		return c.readGroup(rctx, hot.Database(db), coll, filter, out)
 	}
 	if q.Kind != KindFind {
@@ -595,7 +591,7 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		c.removeDoc(e, id)
 	}
 	sh := e.shape
-	if sh.kind == KindCount {
+	if sh.kind == KindCount && e.grp == nil {
 		switch ch.Op {
 		case "delete", "replace":
 			c.drop(e)
@@ -619,14 +615,14 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 		_, live := c.entries[e.key]
 		return live
 	}
+	if e.grp != nil {
+		return c.addToGroup(sh, e, id, ch.Doc)
+	}
 	if sh.kind == KindCount {
 		if ch.Op == "insert" {
 			e.n++
 		}
 		return true
-	}
-	if sh.kind == KindGroup {
-		return c.addToGroup(sh, e, id, ch.Doc)
 	}
 	if c.fits(sh, e, ch.Doc) {
 		if planOrdered(e, id, ch.Doc) {
@@ -646,7 +642,11 @@ func (c *Cache) applyToEntry(e *entry, ch Change) bool {
 func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, filter bson.D, out fillResult) fillResult {
 	q := out.f.q
 	proj := bson.D{{Key: "_id", Value: 1}}
-	keep := append(append([]string(nil), q.Group.fields()...), filterFieldsOf(q)...)
+	var keep []string
+	if q.Group != nil {
+		keep = q.Group.fields()
+	}
+	keep = append(keep, filterFieldsOf(q)...)
 	for _, f := range keep {
 		if f == "_id" || hasKey(proj, f) {
 			continue
@@ -669,6 +669,7 @@ func (c *Cache) readGroup(ctx context.Context, db *mongo.Database, coll string, 
 	for cur.Next(ctx) {
 		if len(out.docs) == MaxGroupDocs {
 			out.why = "group: the $match takes more documents than an entry remembers"
+			out.oversize = true
 			return out
 		}
 		out.docs = append(out.docs, append(bson.Raw(nil), cur.Current...))
@@ -723,6 +724,7 @@ func (c *Cache) withArchive(ctx context.Context, out fillResult, filter, proj bs
 		}
 		if len(out.docs) == MaxGroupDocs {
 			out.why = "group: the $match takes more documents than an entry remembers"
+			out.oversize = true
 			out.docs = nil
 			return out
 		}

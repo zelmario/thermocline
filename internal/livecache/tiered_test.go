@@ -188,6 +188,48 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 		pipes.Store(q.entryKey(), p)
 		return q
 	}
+	// Counts over both tiers: by customer, which a write moves an order
+	// between, over a range of stock, and a rare customer's orders below the
+	// claim, where most of them are the archive's. Half as count, half as the
+	// pipeline countDocuments sends.
+	var counts sync.Map
+	countQ := func(r *rand.Rand) Query {
+		var filter bson.D
+		switch r.Intn(3) {
+		case 0:
+			filter = bson.D{{Key: "customer", Value: fmt.Sprintf("c%02d", r.Intn(customers+rare))}}
+		case 1:
+			lo := int32(r.Intn(6))
+			filter = bson.D{{Key: "stock", Value: bson.D{{Key: "$gte", Value: lo}, {Key: "$lte", Value: lo + int32(r.Intn(3))}}}}
+		default:
+			before := base.Add(time.Duration(1+r.Intn(3)) * 500 * time.Minute)
+			filter = bson.D{{Key: "customer", Value: fmt.Sprintf("c%02d", customers+r.Intn(rare))}, {Key: "at", Value: bson.D{{Key: "$lt", Value: before}}}}
+		}
+		var q Query
+		var ok bool
+		if r.Intn(2) == 0 {
+			q, ok = ParseCount(ns, mustRaw(bson.D{{Key: "count", Value: "orders"}, {Key: "query", Value: filter}}))
+		} else {
+			q, ok = ParseCountAgg(ns, mustRaw(bson.D{{Key: "aggregate", Value: "orders"}, {Key: "pipeline", Value: bson.A{
+				bson.D{{Key: "$match", Value: filter}},
+				bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}},
+			}}, {Key: "cursor", Value: bson.D{}}}))
+		}
+		if !ok {
+			panic(fmt.Sprintf("not understood: %v", filter))
+		}
+		counts.Store(q.entryKey(), filter)
+		return q
+	}
+	countIn := func(reply bson.Raw) int64 {
+		if n, ok := reply.Lookup("n").AsInt64OK(); ok {
+			return n
+		}
+		if n, ok := reply.Lookup("cursor", "firstBatch", "0", "n").AsInt64OK(); ok {
+			return n
+		}
+		return 0
+	}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go c.Run(runCtx, cl, streamClient(t, uri), func(string) bool { return false }, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -412,6 +454,9 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 				if r.Intn(4) == 0 {
 					c.Get(groupQ(r))
 				}
+				if r.Intn(4) == 0 {
+					c.Get(countQ(r))
+				}
 				time.Sleep(time.Millisecond)
 			}
 		}(k)
@@ -481,9 +526,37 @@ func TestTieredAgainstBothTiers(t *testing.T) {
 			}
 		}
 	}
+	counted := 0
+	for i := 0; i < 600; i++ {
+		q := countQ(r)
+		got, hit := c.Get(q)
+		if !hit {
+			time.Sleep(20 * time.Millisecond)
+			if got, hit = c.Get(q); !hit {
+				continue
+			}
+		}
+		counted++
+		f, _ := counts.Load(q.entryKey())
+		mu.Lock()
+		want, err := archive.CountDocuments(ctx, f)
+		mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := countIn(got); n != want {
+			wrong++
+			if wrong <= 5 {
+				t.Errorf("%s: cache counts %d, both tiers %d", q.entryKey(), n, want)
+			}
+		}
+	}
 	s := c.Stats()
-	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists, %d ranges, then %d groupings) after, %d wrong; %d writer reads disagreed; stats %+v",
-		evicted, warmed, written, checked, lists, ranges, grouped, wrong, n, s)
+	t.Logf("%d evicted, %d copied up, %d written; checked %d answers (%d lists, %d ranges, then %d groupings, %d counts) after, %d wrong; %d writer reads disagreed; stats %+v",
+		evicted, warmed, written, checked, lists, ranges, grouped, counted, wrong, n, s)
+	if counted < 100 {
+		t.Errorf("only %d counts came from the cache, too few to say anything", counted)
+	}
 	if ranges < 100 {
 		t.Errorf("only %d ranges came from the cache, too few to say anything", ranges)
 	}

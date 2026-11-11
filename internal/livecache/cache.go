@@ -96,6 +96,9 @@ type Cache struct {
 	failedAt map[string]fillFailure
 	// missedOnce are tiered entries missed once, by when. See admitTiered.
 	missedOnce map[string]time.Time
+	// oversizeAt are entries whose fill read more documents than an entry
+	// remembers, by when. See oversizeRetry.
+	oversizeAt map[string]time.Time
 	// use counts lookups and hits per shape, and when a shape rests. See rest.
 	use map[string]*shapeUse
 	// plainNS says, per namespace, that it has no default collation and is not
@@ -243,6 +246,26 @@ func trimDoc(sh *shape, d bson.Raw) bson.Raw {
 	return out
 }
 
+// memberSpec is a count on a tiered namespace kept as a grouping under one
+// constant: the documents counted are remembered, so the count is how many
+// there are. A number alone cannot be kept there. A copy-up is an insert of a
+// document already counted, in the archive, and an eviction is a delete of
+// one that still exists; with the members known the first changes nothing,
+// and the second drops the entry, as it does every tiered entry holding the
+// document. See Tiers.
+var memberSpec = &GroupSpec{
+	ID:   groupExpr{kind: exprConst, konst: bson.RawValue{Type: bson.TypeInt32, Value: []byte{1, 0, 0, 0}}},
+	Accs: []accSpec{{Name: "n", count: true}},
+}
+
+// countOf is a count entry's answer.
+func (e *entry) countOf() int64 {
+	if e.grp != nil {
+		return int64(len(e.grp.byDoc))
+	}
+	return e.n
+}
+
 type entry struct {
 	key   string
 	shape *shape
@@ -313,6 +336,7 @@ func New(maxBytes int) *Cache {
 		unprovenAt:   map[string]time.Time{},
 		failedAt:     map[string]fillFailure{},
 		missedOnce:   map[string]time.Time{},
+		oversizeAt:   map[string]time.Time{},
 		use:          map[string]*shapeUse{},
 		plainNS:      map[string]bool{},
 	}
@@ -322,6 +346,14 @@ func New(maxBytes int) *Cache {
 // asked for again. The fast tier gains what would prove it only as documents
 // are written or warmed, which is slow next to how often a page is asked for.
 const unprovenRetry = 5 * time.Second
+
+// oversizeRetry is how long an entry whose $match took more than MaxGroupDocs
+// documents is not filled again. Such a fill reads that many documents from
+// the fast tier, and on a tiered namespace as many again from the archive,
+// before it gives up, and every second miss asked for it again: a count of a
+// large tiered collection would have cost two 200,000 document reads a
+// minute for nothing. A collection rarely shrinks below the bound in minutes.
+const oversizeRetry = 10 * time.Minute
 
 // maxUnproven bounds what is remembered of unproven fills.
 const maxUnproven = 100000
@@ -716,7 +748,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	u := c.rest(sid)
 	// A grouping on a tiered namespace is filled from both tiers, once the
 	// router lets it. See readGroup.
-	if c.isTiered(q.NS) && q.Kind == KindGroup && c.archive == nil {
+	if c.isTiered(q.NS) && q.Kind != KindFind && c.archive == nil {
 		unlock()
 		return nil, Position{}, false
 	}
@@ -738,11 +770,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	if !ok {
 		unlock()
 		c.Misses.Add(1)
-		// A count over a tiered namespace is over both tiers, which the fast
-		// tier's stream cannot keep (see read), so no fill is asked for.
-		if q.Kind == KindFind || q.Kind == KindGroup || !c.isTiered(q.NS) {
-			c.requestFill(q, sid)
-		}
+		c.requestFill(q, sid)
 		return nil, Position{}, false
 	}
 	if !c.entryFresh(e, q, now) {
@@ -783,7 +811,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		}
 		unlock()
 		reply = findReply(q, out)
-	} else if e.grp != nil {
+	} else if e.grp != nil && e.shape.kind == KindGroup {
 		out, ok := e.grp.output()
 		unlock()
 		if !ok {
@@ -794,7 +822,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 		}
 		reply = findReply(q, out)
 	} else {
-		n := e.n
+		n := e.countOf()
 		unlock()
 		reply = countReply(q, n)
 	}
@@ -820,6 +848,13 @@ func (c *Cache) requestFill(q Query, sid string) {
 			return
 		}
 		delete(c.unprovenAt, key)
+	}
+	if at, ok := c.oversizeAt[key]; ok {
+		if c.now().Sub(at) < oversizeRetry {
+			c.mu.Unlock()
+			return
+		}
+		delete(c.oversizeAt, key)
 	}
 	if !c.admitTiered(q, key) {
 		c.mu.Unlock()
@@ -937,7 +972,7 @@ func (c *Cache) State(q Query) string {
 		ok = false
 	}
 	switch {
-	case !ok && q.Kind != KindFind && c.isTiered(q.NS):
+	case !ok && q.Kind != KindFind && c.isTiered(q.NS) && c.archive == nil:
 		return "tiered count"
 	case !ok && c.filling[key]:
 		return "filling"
@@ -965,13 +1000,19 @@ type fillFailure struct {
 	at  time.Time
 }
 
-func (c *Cache) failed(q Query, why string) {
+func (c *Cache) failed(q Query, why string, oversize bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.failedAt) >= maxUnproven {
 		clear(c.failedAt)
 	}
 	c.failedAt[q.entryKey()] = fillFailure{why: why, at: time.Now()}
+	if oversize {
+		if len(c.oversizeAt) >= maxUnproven {
+			clear(c.oversizeAt)
+		}
+		c.oversizeAt[q.entryKey()] = c.now()
+	}
 }
 
 // FailedSince reports why q's entry's last fill failed, when it failed after
@@ -1022,6 +1063,8 @@ func (c *Cache) installLocked(q Query, docs []bson.Raw, complete bool, n int64) 
 	}
 	if sh.kind == KindGroup {
 		e.grp = newGroupState(sh.group)
+	} else if sh.kind == KindCount && c.isTiered(q.NS) {
+		e.grp = newGroupState(memberSpec)
 	}
 	for _, d := range docs {
 		if e.grp != nil {
@@ -1282,7 +1325,7 @@ func (c *Cache) dropNS(ns string) {
 
 func (c *Cache) dropCounts(ns string) {
 	for _, e := range c.entries {
-		if e.shape.ns == ns && e.shape.kind == KindCount {
+		if e.shape.ns == ns && e.shape.kind == KindCount && e.grp == nil {
 			c.drop(e)
 		}
 	}
@@ -1369,7 +1412,7 @@ func (c *Cache) Apply(ch Change) {
 		for _, sh := range shapes {
 			if sh.kind == KindCount && touches(ch.Updated, filterFields(sh)) {
 				for _, e := range c.entries {
-					if e.shape == sh {
+					if e.shape == sh && e.grp == nil {
 						c.drop(e)
 					}
 				}
@@ -1405,7 +1448,7 @@ func (c *Cache) Apply(ch Change) {
 			if e.in != nil && (idk == "" || !e.in[idk]) {
 				continue
 			}
-			if sh.kind == KindCount {
+			if sh.kind == KindCount && e.grp == nil {
 				// Not an insert the read already counted. A fill reads at the
 				// stream's position, and when that falls among the events of
 				// one commit the read holds all of them while the stream has
@@ -1416,7 +1459,7 @@ func (c *Cache) Apply(ch Change) {
 				}
 				continue
 			}
-			if sh.kind == KindGroup {
+			if e.grp != nil {
 				if !c.addToGroup(sh, e, id, ch.Doc) {
 					break
 				}
@@ -1773,6 +1816,7 @@ func (c *Cache) Reset() {
 	}
 	c.applied, c.closed = bson.Timestamp{}, bson.Timestamp{}
 	clear(c.openNS)
+	clear(c.oversizeAt)
 	c.mu.Unlock()
 	// What it missed may have been a drop and a create.
 	c.plainMu.Lock()

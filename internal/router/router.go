@@ -1483,7 +1483,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// not happening. Authorization has already run above, and the key carries
 	// who is asking. See querycache.go.
 	if nameErr == nil && !msg.MoreToCome() {
-		if out, hit := c.liveLookup(msg, name, db); hit {
+		if out, hit := c.liveLookup(ctx, msg, name, db); hit {
 			return c.send(out)
 		}
 		if out, hit := c.cacheLookup(ctx, msg, name, db); hit {
