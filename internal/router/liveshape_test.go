@@ -42,4 +42,22 @@ func TestLiveShapeSignatureHasNoValues(t *testing.T) {
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
+
+	// What the cache decides by is shown, the values that do not matter are
+	// not: a batch of 7 and a batch of 8 are one shape.
+	batched, _ := bson.Marshal(bson.D{
+		{Key: "find", Value: "tconc"},
+		{Key: "filter", Value: bson.D{}},
+		{Key: "batchSize", Value: 7},
+		{Key: "limit", Value: 0},
+		{Key: "txnNumber", Value: int64(3)},
+		{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}}},
+	})
+	got = liveShapeSignature("find", batched)
+	want = "find filter{} opts{batchSize,readConcern:snapshot,txn}"
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	odd, _ := bson.Marshal(bson.D{{Key: "find", Value: "x"}, {Key: "readConcern", Value: "majority"}})
+	_ = liveShapeSignature("find", odd)
 }

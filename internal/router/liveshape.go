@@ -23,10 +23,28 @@ func liveShapeSignature(name string, cmd bson.Raw) string {
 	for _, e := range elems {
 		k := e.Key()
 		switch k {
-		case name, "$db", "lsid", "$clusterTime", "txnNumber", "$readPreference", "readConcern",
-			"cursor", "batchSize", "maxTimeMS", "comment", "apiVersion", "apiStrict", "apiDeprecationErrors",
-			"singleBatch", "limit", "skip", "startTransaction", "autocommit":
+		case name, "$db", "lsid", "$clusterTime", "$readPreference", "cursor", "maxTimeMS", "comment",
+			"startTransaction", "autocommit", "apiStrict", "apiDeprecationErrors":
 			continue
+		// Shown because the cache decides by them: a batch shorter than the
+		// answer leaves a cursor it does not have, a transaction reads its
+		// own snapshot, and a find with no limit is answered only whole.
+		// Hidden, 50 of 66 skips of "find filter{}" in one sweep were a
+		// batchSize of 7, and read as a shape the cache should learn.
+		case "batchSize", "singleBatch", "apiVersion":
+			opts = append(opts, k)
+		case "txnNumber":
+			opts = append(opts, "txn")
+		case "limit", "skip":
+			if n, ok := e.Value().AsInt64OK(); ok && n != 0 {
+				opts = append(opts, k)
+			}
+		case "readConcern":
+			if d, ok := e.Value().DocumentOK(); ok {
+				if lv, ok := d.Lookup("level").StringValueOK(); ok {
+					opts = append(opts, "readConcern:"+lv)
+				}
+			}
 		case "filter", "query":
 			if d, ok := e.Value().DocumentOK(); ok {
 				b.WriteString(" filter" + filterSignature(d))
