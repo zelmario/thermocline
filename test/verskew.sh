@@ -123,8 +123,14 @@ arm() { # label hotport hotset coldport coldset
   for _ in $(seq 1 40); do grep -q 'router listening' "$DIR/$label.router.log" 2>/dev/null && break; sleep 1; done
   chk "  the router starts on the unequal pair"           "true" \
       "$(grep -q 'router listening' "$DIR/$label.router.log" 2>/dev/null && echo true || echo false)"
+  # Waited for as the router is. The feeder reaches mirroring on its own clock,
+  # and the logs live in a directory removed on exit, so a failure prints what
+  # the feeder said.
+  for _ in $(seq 1 40); do grep -q 'msg=mirroring' "$DIR/$label.feeder.log" 2>/dev/null && break; sleep 1; done
   chk "  and the feeder does"                             "true" \
       "$(grep -q 'msg=mirroring' "$DIR/$label.feeder.log" 2>/dev/null && echo true || echo false)"
+  grep -q 'msg=mirroring' "$DIR/$label.feeder.log" 2>/dev/null ||
+    tail -5 "$DIR/$label.feeder.log" 2>/dev/null | cut -c1-300 | sed 's/^/        feeder: /'
 
   # Traffic. Ordinary documents, an index, and a collection option, because a
   # release gap shows up in what one side will store rather than in a number.
