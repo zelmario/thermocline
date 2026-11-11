@@ -173,7 +173,7 @@ type shape struct {
 	fields []string
 	// rng are the shape's range fields and operators, the bounds being each
 	// entry's own.
-	rng  []RangePred
+	rng []RangePred
 	// in says the shape filters _id by $in, the values being each entry's
 	// own. Its entries are grouped as a range's are. See candidates.
 	in   bool

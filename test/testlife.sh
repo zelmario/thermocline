@@ -499,6 +499,31 @@ if [ "${CONCFAILED:-0}" != "0" ]; then
   grep -hoE 'ERR .*' /tmp/conc.*.out 2>/dev/null | sort -u | head -2 | sed 's/^/      /'
 fi
 
+echo "== a client on the Stable API reads what any other client reads =="
+# A driver configured with serverApi sends apiVersion on every command. The
+# live cache refused all of them until 2026-11-11, so under LIVE=1 this is
+# what puts them through its comparison with mongod.
+STABLEREADS="
+  const c = db.getSiblingDB(process.env.TC_DB).tconc;
+  let out = [];
+  for (let r = 0; r < 3; r++) {
+    out = [
+      c.find({grp:'g3'}).sort({_id:1}).limit(10).toArray().map(d => d._id).join(','),
+      c.find({_id:{\$in:[4,9,14,300]}}).sort({_id:1}).toArray().map(d => d._id).join(','),
+      c.countDocuments({grp:'g3'}),
+      db.getSiblingDB(process.env.TC_DB).runCommand({count:'tconc', query:{grp:'g1'}}).n,
+      c.aggregate([{\$group:{_id:'\$grp', n:{\$sum:1}}}, {\$sort:{_id:1}}]).toArray().map(d => d._id + ':' + d.n).join(','),
+    ];
+  }
+  print(out.join(' | '));
+"
+PLAIN=$(R "$STABLEREADS")
+STABLE=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --apiVersion 1 --apiStrict --apiDeprecationErrors \
+  --quiet --eval "$STABLEREADS" 2>&1 | tail -1)
+chk "the plain client's reads are the ones expected" \
+  "3,8,13,18,23,28,33,38,43,48 | 4,9,14 | 40 | 40 | g0:40,g1:40,g2:40,g3:40,g4:40" "$PLAIN"
+chk "and a client under apiVersion 1, strict, reads the same" "$PLAIN" "$STABLE"
+
 stopDaemons
 echo
 echo "================================"

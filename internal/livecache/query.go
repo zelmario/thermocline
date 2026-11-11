@@ -68,8 +68,8 @@ type Query struct {
 	Skip, Limit int
 	// All is a find with no limit: the whole match, answered only from an
 	// entry that holds all of it. See maxWindow.
-	All bool
-	Proj        Projection
+	All  bool
+	Proj Projection
 	// GroupID is the _id a counting pipeline groups under, echoed back.
 	GroupID bson.RawValue
 	// CountField is the name the counting pipeline gives its total.
@@ -166,8 +166,12 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 	}
 	batchSize := -1
 	singleBatch := false
+	api := newAPIParams()
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
+		if api.take(k, v) {
+			continue
+		}
 		switch k {
 		case "find", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference", "txnNumber":
 			if k == "txnNumber" {
@@ -244,6 +248,9 @@ func ParseFind(ns string, cmd bson.Raw) (Query, bool) {
 			return q, false
 		}
 	}
+	if !api.fine() {
+		return q, false
+	}
 	// A list with no limit is the whole match, and a list longer than the
 	// window would be half an answer.
 	//
@@ -291,8 +298,12 @@ func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
 	if err != nil {
 		return q, false
 	}
+	api := newAPIParams()
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
+		if api.take(k, v) {
+			continue
+		}
 		switch k {
 		case "count", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference":
 		case "readConcern":
@@ -318,7 +329,7 @@ func ParseCount(ns string, cmd bson.Raw) (Query, bool) {
 			return q, false
 		}
 	}
-	return q, true
+	return q, api.fine()
 }
 
 // cursorFits reports whether an aggregate's cursor option is a document this
@@ -354,8 +365,12 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 	}
 	var pipe bson.Raw
 	hasCursor := false
+	api := newAPIParams()
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
+		if api.take(k, v) {
+			continue
+		}
 		switch k {
 		case "aggregate", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference":
 		case "cursor":
@@ -381,7 +396,7 @@ func ParseCountAgg(ns string, cmd bson.Raw) (Query, bool) {
 			return q, false
 		}
 	}
-	if !hasCursor {
+	if !hasCursor || !api.fine() {
 		return q, false
 	}
 	stages, err := pipe.Values()
@@ -482,6 +497,44 @@ func plainReadConcern(v bson.RawValue) bool {
 	}
 	return true
 }
+
+// apiParams reads the Stable API fields a driver configured with serverApi
+// sends on every command. Version 1 changes nothing in the answer to the
+// shapes taken here: find, count, and aggregate with $match, $unwind, $group,
+// $sort and $limit are all in it, and none is deprecated, so apiStrict and
+// apiDeprecationErrors refuse none of them. Refused before, every read from
+// such a client went to mongod.
+//
+// What mongod answers with an error is left to mongod: a version other than
+// "1", a field of the wrong type, and apiStrict or apiDeprecationErrors
+// without apiVersion ("Provided apiStrict:true, but the command
+// count does not specify an apiVersion" and its kin).
+type apiParams struct {
+	version, other bool
+	ok             bool
+}
+
+func newAPIParams() apiParams { return apiParams{ok: true} }
+
+// take reports whether k is a Stable API field, and records whether its value
+// is one this cache can answer.
+func (a *apiParams) take(k string, v bson.RawValue) bool {
+	switch k {
+	case "apiVersion":
+		s, ok := v.StringValueOK()
+		a.ok = a.ok && ok && s == "1"
+		a.version = true
+	case "apiStrict", "apiDeprecationErrors":
+		_, ok := v.BooleanOK()
+		a.ok = a.ok && ok
+		a.other = true
+	default:
+		return false
+	}
+	return true
+}
+
+func (a apiParams) fine() bool { return a.ok && (a.version || !a.other) }
 
 // filterParts is a filter taken apart. See parseFilter.
 type filterParts struct {

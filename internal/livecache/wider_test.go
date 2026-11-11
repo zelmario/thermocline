@@ -199,3 +199,65 @@ func TestIDInAsMongoJudgesIt(t *testing.T) {
 		t.Fatal("an entry holding a document outside its set answered")
 	}
 }
+
+// A driver configured with serverApi sends these on every command, and was
+// never answered here.
+func TestStableAPIClient(t *testing.T) {
+	api := func(extra ...bson.E) []bson.E {
+		return append([]bson.E{{Key: "apiVersion", Value: "1"}}, extra...)
+	}
+	find := func(extra ...bson.E) bson.D {
+		return append(bson.D{{Key: "find", Value: "products"}, {Key: "filter", Value: bson.D{{Key: "category", Value: "a"}}}, {Key: "limit", Value: int32(5)}}, extra...)
+	}
+	count := func(extra ...bson.E) bson.D {
+		return append(bson.D{{Key: "count", Value: "products"}, {Key: "query", Value: bson.D{{Key: "category", Value: "a"}}}}, extra...)
+	}
+	for _, cmd := range []bson.D{
+		find(api()...),
+		find(api(bson.E{Key: "apiStrict", Value: true}, bson.E{Key: "apiDeprecationErrors", Value: true})...),
+		find(api(bson.E{Key: "apiStrict", Value: false})...),
+	} {
+		q, ok := ParseFind("shop.products", raw(t, cmd))
+		if !ok {
+			t.Errorf("refused %v", cmd)
+			continue
+		}
+		plain, _ := ParseFind("shop.products", raw(t, find()))
+		if q.entryKey() != plain.entryKey() {
+			t.Errorf("%v is its own entry, but its answer is the plain find's", cmd)
+		}
+	}
+	if _, ok := ParseCount("shop.products", raw(t, count(api(bson.E{Key: "apiStrict", Value: true})...))); !ok {
+		t.Error("a count under apiVersion 1 was refused")
+	}
+	if _, ok := ParseCountAgg("shop.products", raw(t, append(bson.D{
+		{Key: "aggregate", Value: "products"},
+		{Key: "pipeline", Value: bson.A{bson.D{{Key: "$match", Value: bson.D{{Key: "category", Value: "a"}}}}, bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: int32(1)}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}},
+		{Key: "cursor", Value: bson.D{}},
+	}, api()...))); !ok {
+		t.Error("a counting aggregate under apiVersion 1 was refused")
+	}
+	if _, ok := ParseGroupAgg("shop.products", raw(t, append(bson.D{
+		{Key: "aggregate", Value: "products"},
+		{Key: "pipeline", Value: bson.A{bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$category"}, {Key: "n", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}},
+		{Key: "cursor", Value: bson.D{}},
+	}, api()...))); !ok {
+		t.Error("a $group under apiVersion 1 was refused")
+	}
+
+	// mongod answers these with an error.
+	for _, cmd := range []bson.D{
+		find(bson.E{Key: "apiVersion", Value: "2"}),
+		find(bson.E{Key: "apiVersion", Value: int32(1)}),
+		find(api(bson.E{Key: "apiStrict", Value: "yes"})...),
+		find(bson.E{Key: "apiStrict", Value: true}),
+		find(bson.E{Key: "apiDeprecationErrors", Value: false}),
+	} {
+		if _, ok := ParseFind("shop.products", raw(t, cmd)); ok {
+			t.Errorf("answered %v, which mongod refuses", cmd)
+		}
+	}
+	if _, ok := ParseCount("shop.products", raw(t, count(bson.E{Key: "apiStrict", Value: true}))); ok {
+		t.Error("answered a count with apiStrict and no apiVersion")
+	}
+}

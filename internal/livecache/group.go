@@ -86,8 +86,12 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 	}
 	var pipe bson.Raw
 	hasCursor := false
+	api := newAPIParams()
 	for _, e := range elems {
 		k, v := e.Key(), e.Value()
+		if api.take(k, v) {
+			continue
+		}
 		switch k {
 		case "aggregate", "$db", "lsid", "$clusterTime", "comment", "maxTimeMS", "$readPreference":
 		case "allowDiskUse":
@@ -118,7 +122,7 @@ func ParseGroupAgg(ns string, cmd bson.Raw) (Query, bool) {
 			return q, false
 		}
 	}
-	if !hasCursor {
+	if !hasCursor || !api.fine() {
 		return q, false
 	}
 	stages, err := pipe.Values()
