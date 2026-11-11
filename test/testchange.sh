@@ -639,9 +639,34 @@ CLOSED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --
   let tok; for (let i=0;i<40 && !tok;i++) { const e=cs.tryNext(); if (e) tok=e._id; else sleep(250); }
   cs.close();
   d.tcs7.insertOne({_id:2, secret:'s'}); d.tcs7.drop();
-  const r=d.runCommand({aggregate:'tcs7', pipeline:[{\$changeStream:{resumeAfter:tok}}, {\$project:{'fullDocument.secret':0}}], cursor:{}});
-  const ins=r.cursor.firstBatch.filter(e=>e.operationType==='insert');
-  print('id='+r.cursor.id+' '+(ins.length ? (ins[0].fullDocument.secret ? 'LEAKED' : 'CLEAN') : 'none'));" 2>&1 | tail -1)
+  // Opened again until mongod closes it in the first reply. A change stream
+  // reads the majority snapshot, and under load the drop can be acknowledged
+  // before that snapshot holds it, so the first batch has the insert and an
+  // open cursor: five sweep failures, every one printing CLEAN, the shaping
+  // right and only mongod's timing different. tc-pkc.
+  let r;
+  for (let i=0;i<6;i++) {
+    r=d.runCommand({aggregate:'tcs7', pipeline:[{\$changeStream:{resumeAfter:tok}}, {\$project:{'fullDocument.secret':0}}], cursor:{}});
+    if (!r.cursor || r.cursor.id == 0) break;
+    d.runCommand({killCursors:'tcs7', cursors:[r.cursor.id]});
+    sleep(500);
+  }
+  const ins=r.cursor ? r.cursor.firstBatch.filter(e=>e.operationType==='insert') : [];
+  let diag='';
+  if (r.cursor && r.cursor.id != 0) {
+    // DIAG tc-pkc: follow the open cursor and say when and how it closes.
+    diag=' | first='+r.cursor.firstBatch.map(e=>e.operationType).join(',');
+    const t0=Date.now(); let id=r.cursor.id, n=0;
+    while (id != 0 && n<60) {
+      const g=d.runCommand({getMore:id, collection:'tcs7', maxTimeMS:1000});
+      if (!g.ok) { diag+=' gm-err='+g.codeName; break; }
+      n++; id=g.cursor.id;
+      const ty=g.cursor.nextBatch.map(e=>e.operationType).join(',');
+      if (ty) diag+=' gm'+n+'@'+(Date.now()-t0)+'ms='+ty;
+    }
+    diag+=' closed='+(id==0)+' after '+n+' getMores '+(Date.now()-t0)+'ms';
+  }
+  print('id='+(r.cursor ? r.cursor.id : 'error')+' '+(ins.length ? (ins[0].fullDocument.secret ? 'LEAKED' : 'CLEAN') : 'none')+diag);" 2>&1 | tail -1)
 chk "  and a stream closed in its first reply is shaped" "id=0 CLEAN" "$CLOSED"
 
 fi
