@@ -27,6 +27,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 id cline >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin cline
 install -d -o cline -g cline "$CONFDIR" "$LOGDIR"
+# A PREFIX of your own may not exist yet; /usr/local/bin always does.
+install -d "$PREFIX" "$UNITDIR"
 # cmp rather than a path comparison: it covers installing a file over itself,
 # which is what a re-run does, and it also skips the copy when two paths hold
 # the same build.
