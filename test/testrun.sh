@@ -201,6 +201,11 @@ start $WDIR/run2.yaml $LOG2 $WDIR/run2.rc
 for _ in $(seq 1 90); do up $P2 && break; sleep 1; done
 chk "its router serves the same live orders"               "$LIVE" \
     "$(R "print(db.getSiblingDB(process.env.TC_DB).trorders.countDocuments())" $P2)"
+# Waited for rather than looked at once. The router opens when the first run's
+# feeder is caught up, which says nothing of where this one's feeder is: in a
+# sweep on 2026-11-11 the check ran with the second feeder not yet at its lease,
+# and the log, cut by the kill below, never showed it.
+for _ in $(seq 1 30); do grep -q 'feeder stopped' $LOG2 && break; sleep 1; done
 chk "its feeder waits for the first one's lease"            "true" \
     "$(grep -q 'feeder stopped' $LOG2 && grep -qi 'lease\|held' $LOG2 && echo true || echo false)"
 # log.format json: every line an object, the same fields as text.
