@@ -58,7 +58,13 @@ wrong. It answers:
 - `find` with equality and range (`$gt`, `$gte`, `$lt`, `$lte`) filters on
   top-level fields, a sort of up to three top-level fields, skip and limit within
   500, and a projection of top-level fields.
+- `find` with no limit, when the whole answer is at most 500 documents and
+  16MB, which is what mongod's first batch holds.
+- `_id: {$in: [...]}`, up to 1,000 values, alone or beside the filters above.
 - `count` and `countDocuments` over the same filters.
+- Any of these from a driver configured with the Stable API: `apiVersion: "1"`,
+  with or without `apiStrict` and `apiDeprecationErrors`. Every shape above is
+  in version 1, so the answer is the same.
 - Reports of this shape, which is what a dashboard asks again and again:
 
   ```
@@ -123,7 +129,7 @@ effect here within that minute.
 ## Tiered collections
 
 A tiered collection is held as far as the fast tier can prove its answer, and
-it differs in three ways:
+it differs in four ways:
 
 1. A sorted list is filled with only what the proxy's newest-first proof says
    the fast tier's answer settles. What it does not prove is merged with the
@@ -137,6 +143,12 @@ it differs in three ways:
    which is TinyLFU's doorkeeper. Without it, on the 200 million order adoption,
    the fills took the archive's volume to 98% busy and "my orders" went from a
    p95 of 14ms on the old cluster alone to 213ms.
+4. A count, like a report, remembers the documents it counted, read from both
+   tiers. A number alone cannot be kept there: a copy-up is an insert of a
+   document the archive half already counted. With the members known, a
+   copy-up changes nothing and an eviction of one drops the entry. A count or
+   report whose `$match` takes more than 200,000 documents is left to mongod,
+   and not filled again for 10 minutes.
 
 A tiered entry is asked again every 10 seconds, so it is never kept longer than
 the proxy would trust the proof it rested on.
