@@ -701,6 +701,7 @@ var errFreshnessDeadline = fmt.Errorf("%w (the caller's maxTimeMS ran out while 
 // cluster time it had not yet covered.
 func (r *Router) refuseStale(ctx context.Context, log *slog.Logger, ns, what string, started time.Time) error {
 	r.Stats.Refused.Add(1)
+	r.Stats.StaleRefusals.Add(1)
 	if suppressed, say := r.noteStaleRead(); say {
 		log.Warn(what,
 			"ns", ns,

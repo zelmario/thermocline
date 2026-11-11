@@ -370,6 +370,12 @@ type Stats struct {
 	Unreadable          atomic.Int64
 	EventsHidden        atomic.Int64
 	StaleReads          atomic.Int64
+	// StaleRefusals counts reads and writes refused under router.freshness:
+	// strict because mirroring had not caught up, the default's counterpart
+	// of StaleReads. They are in Refused too, which mixes them with every
+	// refusal made on purpose, so a feeder falling behind under the default
+	// had nothing of its own to alert on. See refuseStale.
+	StaleRefusals atomic.Int64
 	// ClaimGraceReads counts reads answered from a completeness claim the
 	// router could not re-read, which router.claim_grace allowed. Any value
 	// above zero means the archive was unreachable and this router answered

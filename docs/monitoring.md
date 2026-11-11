@@ -196,7 +196,7 @@ those windows are adding up.
 
 ### What to alert on
 
-Nine signals, and the reason each one is worth waking somebody for. Everything
+Twelve signals, and the reason each one is worth waking somebody for. Everything
 here is already published; what was missing was saying which numbers mean
 something.
 
@@ -230,6 +230,23 @@ because nothing failed.
 Zero is healthy. When rule 2 pages, read this one to tell a feeder that is
 behind from a barrier that fired for another reason, and read the proxy's
 `which bar the freshness wait gave up on` line, which carries both timestamps.
+
+**2c. `thermocline_stale_refusals_total` above zero. Page.** Rule 2's event
+under `router.freshness: strict`, the default, where it is an error instead of
+a wrong answer: a read or a write needed the archive, waited
+`router.archive_wait` for mirroring, and was refused. Every one is an error an
+application saw. They are counted in `refused_total` as well, beside every
+refusal made on purpose, which is why they need a rule of their own. Measured
+on a degraded staging volume on 2026-10-30: 9,314 in five minutes, with rule 2
+quiet throughout, because nothing was answered stale.
+
+**2d. `thermocline_mirroring_lag_seconds` above half of
+`thermocline_archive_wait_seconds`. Warn.** The warning before rule 2c. A read
+that falls through waits for mirroring up to `router.archive_wait`, five seconds
+by default, and is refused past it, so a lag climbing towards that number is
+reads about to fail. Rule 3 below fires at ten minutes, which is about eviction
+and far too late for this. `archive_wait_seconds` is the configured value,
+published so the rule does not restate it.
 
 **3. `thermocline_mirroring_lag_seconds` above the eviction notice's lifetime.
 Page.** Past that point the evictor stops, which is the safe behaviour, and a
@@ -351,6 +368,17 @@ groups:
         labels: {severity: page}
         annotations:
           summary: "an archive read was answered before mirroring caught up"
+      - alert: ThermoclineStaleRefusal
+        expr: increase(thermocline_stale_refusals_total[5m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "reads or writes were refused because mirroring had not caught up within router.archive_wait; applications saw errors"
+      - alert: ThermoclineMirroringNearArchiveWait
+        expr: thermocline_mirroring_lag_seconds > 0.5 * thermocline_archive_wait_seconds
+        for: 1m
+        labels: {severity: warn}
+        annotations:
+          summary: "mirroring lag is past half of router.archive_wait; reads that fall through to the archive are about to be refused"
       - alert: ThermoclineClusterTimeBehind
         expr: thermocline_mirroring_cluster_time_behind_seconds > 0
         for: 2m

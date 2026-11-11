@@ -30,6 +30,7 @@ CFG=${CFG:-/root/cline.yaml}
 docker exec $NODE sh -c "sed 's/^router:\$/router:\n  freshness: permissive/' $CFG > /root/alerts-permissive.yaml" &&
   docker exec $NODE grep -q 'freshness: permissive' /root/alerts-permissive.yaml ||
   { echo "  FATAL  could not derive a permissive config from $CFG"; exit 2; }
+STRICTCFG=$CFG
 CFG=/root/alerts-permissive.yaml
 WORK=$(mktemp -d)
 # The Prometheus image runs as nobody, and mktemp -d makes a directory only its
@@ -48,6 +49,7 @@ chk() {
 cleanup() {
   docker rm -f tc-prom-test >/dev/null 2>&1
   docker exec $NODE sh -c "pkill -f 'cline router --config $CFG'" 2>/dev/null
+  docker exec $NODE sh -c "pkill -f 'cline router --config $STRICTCFG'" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -245,6 +247,63 @@ if ! PQ rules | grep -q '"ThermoclineClusterTimeBehind","state":"firing"'; then
   echo "      scrapes:   $(PQ 'query?query=up%5B5m%5D' | grep -o '"value[s]*":.*' | head -c 600)"
   echo "      durations: $(PQ 'query?query=max_over_time(scrape_duration_seconds%5B5m%5D)' | head -c 400)"
 fi
+
+sec "the same stale read under the default, where it is an error"
+# Everything above runs permissive, because a stale read needs one. Under
+# router.freshness: strict, the default, the same read is refused, and until
+# 2026-11-10 that refusal was counted only in refused_total, beside every
+# refusal made on purpose. ThermoclineStaleRead never fires under the default,
+# so a feeder falling behind was an application seeing errors and nothing
+# paging: 9,314 of them in five minutes on a degraded staging volume on
+# 2026-10-30. So the default's own counter, and its rule, proved the same way.
+#
+# The lag rule beside it warns as the lag approaches router.archive_wait, which
+# with no feeder here it is past already: the position left by whatever ran
+# before, or +Inf.
+# Waited on both ways. The permissive router answers its metrics endpoint while
+# it shuts down, so a wait on that endpoint alone let the first read of
+# 2026-11-11 reach a port nothing was listening on yet.
+restartRouter() {
+  docker exec $NODE sh -c "pkill -f 'cline router --config $1'" 2>/dev/null
+  for _ in $(seq 1 30); do
+    docker exec $NODE sh -c "pgrep -f '[c]line router --config $1' >/dev/null" || break
+    sleep 1
+  done
+  docker exec -d $NODE cline router --config $2 --log-file $3
+  for _ in $(seq 1 30); do
+    [ "$(docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+         --eval 'print(db.adminCommand({ping:1}).ok)' 2>/dev/null | tail -1)" = 1 ] && break
+    sleep 1
+  done
+}
+restartRouter $CFG $STRICTCFG /var/log/cline/alerts_rs.log
+docker exec $NODE cline watermark --config $STRICTCFG --ns shop.tprobe --clear >/dev/null 2>&1
+SBEFORE=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
+         | awk '/^thermocline_stale_refusals_total /{print $2}')
+SREAD=$(docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'try { print(db.getSiblingDB("shop").tprobe.find({v:{$gt:0}}).limit(5).itcount()) } catch (e) { print(/mirroring to the archive has not caught up/.test(e.message) ? "refused" : e.message) }' 2>&1 | tail -1)
+SAFTER=$(docker exec $NODE sh -c "curl -s http://127.0.0.1:$PDASH/metrics" 2>/dev/null \
+        | awk '/^thermocline_stale_refusals_total /{print $2}')
+echo "  stale_refusals_total went from ${SBEFORE:-?} to ${SAFTER:-?}, the read returned ${SREAD:-nothing}"
+chk "the read was refused as behind"            "refused" "$SREAD"
+chk "and counted as a stale refusal"            "true" \
+    "$([ -n "$SAFTER" ] && [ "${SAFTER:-0}" -gt "${SBEFORE:-0}" ] && echo true || echo false)"
+docker exec $NODE mongosh "mongodb://dba:secret@127.0.0.1:$PORT/?authSource=admin" --quiet \
+  --eval 'try { db.getSiblingDB("shop").tprobe.find({v:{$gt:1}}).limit(5).itcount() } catch (e) {}' >/dev/null 2>&1
+for _ in $(seq 1 36); do
+  PQ rules | grep -q '"ThermoclineStaleRefusal","state":"firing"' &&
+    PQ rules | grep -q '"ThermoclineMirroringNearArchiveWait","state":"firing"' && break
+  sleep 5
+done
+for a in ThermoclineStaleRefusal ThermoclineMirroringNearArchiveWait; do
+  chk "$a fires" "firing" "$(PQ rules | A=$a python3 -c '
+import json,os,sys
+for g in json.load(sys.stdin)["data"]["groups"]:
+  for r in g["rules"]:
+    if r["name"] == os.environ["A"]: print(r.get("state"))' 2>/dev/null)"
+done
+# Back to the permissive router the sections below were written against.
+restartRouter $STRICTCFG $CFG /var/log/cline/alerts_r.log
 
 # Dropped on both tiers, so nothing downstream inherits this suite's fixture the
 # way this suite used to inherit everyone else's.

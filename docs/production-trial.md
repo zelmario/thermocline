@@ -112,7 +112,9 @@ and the Prometheus rules written there fire them. Stopping means
 `cline pause` first, then deciding whether to roll back.
 
 1. `thermocline_stale_reads_total` above zero. A read may have missed a write
-   that had already returned.
+   that had already returned. Under the default `router.freshness: strict` the
+   same event is `thermocline_stale_refusals_total`, an error the application
+   saw.
 2. `thermocline_panics_total` above zero.
 3. `thermocline_not_superset_namespaces` above zero. The archive is missing
    documents the fast tier holds.

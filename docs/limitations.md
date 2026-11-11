@@ -1510,8 +1510,10 @@ Part of [Thermocline](../README.md).
 
   Under `permissive` it is counted and it pages. `thermocline_stale_reads_total`
   above zero is a page-level rule in `docs/monitoring.md`. Under `strict` the
-  refusals are counted in `refused` instead, beside the completeness refusals,
-  and the stale-read counter stays at zero. A deployment seeing them has a feeder
+  refusals are counted in `thermocline_stale_refusals_total`, which pages the
+  same way, and in `refused` beside the completeness refusals; the stale-read
+  counter stays at zero. A warning fires earlier, when the lag passes half of
+  `archive_wait`. A deployment seeing them has a feeder
   that cannot keep up, and the answer is to fix that rather than to raise
   `archive_wait`, which only trades the stale answer for a slow one.
 

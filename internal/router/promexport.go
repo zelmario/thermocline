@@ -105,6 +105,10 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	counter("primary_only_reads_total", "Reads that asked for a secondary and were served by the primary. Answers are correct and fresher than asked for; the read load stays on the primary.", snap.Counters["primary_only_reads"])
 	counter("unreadable_total", "Messages the router could not inspect, which are therefore unguarded. Compressed connections cause these; any value above zero needs the client's compressors removed.", snap.Counters["unreadable"])
 	counter("stale_reads_total", "Archive reads answered before mirroring caught up. Any of these is worth investigating.", snap.Counters["stale_reads"])
+	// The same event under router.freshness: strict, the default, where it is
+	// an error instead of a wrong answer. Measured on a degraded staging volume
+	// on 2026-10-30: 9,314 in five minutes, visible only inside refused_total.
+	counter("stale_refusals_total", "Reads and writes refused because mirroring had not caught up within router.archive_wait, under router.freshness: strict. Each one is an error an application saw.", snap.Counters["stale_refusals"])
 	counter("claim_grace_reads_total", "Reads answered from a completeness claim the router could not re-read, allowed by router.claim_grace. Any value above zero means the archive was unreachable and this router answered anyway.", snap.Counters["claim_grace_reads"])
 	// The first thing worth paging on, and it was readable only from the
 	// dashboard: an alert cannot be written against a page somebody has to open.
@@ -249,6 +253,13 @@ func (r *Router) writeMetrics(ctx context.Context, b *strings.Builder) {
 	mirroring := r.mirroringLag(ctx)
 	if mirroring.feederSkewKnown {
 		skews = append(skews, daemonSkew{"feeder", mirroring.feederSkew.Seconds()})
+	}
+	// What the lag is measured against: past it, a read that falls through
+	// waits the whole of it and is then refused or answered stale. Published so
+	// a rule can warn as the lag approaches it, before applications see errors,
+	// without restating the configuration in the rule.
+	if r.cfg.ArchiveWait.D() > 0 {
+		gauge("archive_wait_seconds", "router.archive_wait: how long a read that falls through waits for mirroring before router.freshness decides. A lag approaching this turns into refused or stale reads.", r.cfg.ArchiveWait.D().Seconds())
 	}
 	if mirroring.known {
 		gauge("mirroring_lag_seconds", lagHelp, mirroring.lag.Seconds())
