@@ -6,8 +6,9 @@
 # docs/releases/<tag>.md. Built here and not on anybody's machine, so what is
 # downloaded is the tagged source and nothing else.
 #
-# A tag with a hyphen (v0.3.0-rc1) is marked a pre-release. 0.1.0 was one
-# too, as a proof of concept; from 0.2.0 a plain tag is a release.
+# A tag with a hyphen (v0.3.0-rc1) is marked a pre-release, and a plain tag is
+# a release. Being a release does not make it production ready: the notes and
+# the README say it is a proof of concept until that changes.
 name: release
 
 on:

@@ -6,7 +6,8 @@ Storage tiering for MongoDB. Run a small fast cluster holding what people
 actually use, and a big cheap cluster holding everything, behind one connection
 string.
 
-**Status: early, but all four components work. Not production tested.**
+**Status: a proof of concept. All four components work and are tested against
+real clusters, but it has not run in production. Try it on a copy of your data.**
 
 It is tested against real clusters rather than mocks: 34 suites and about a
 thousand checks against two three-member replica sets, and a pilot that adopts
