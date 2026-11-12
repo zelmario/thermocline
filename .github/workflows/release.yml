@@ -6,8 +6,8 @@
 # docs/releases/<tag>.md. Built here and not on anybody's machine, so what is
 # downloaded is the tagged source and nothing else.
 #
-# A tag with a hyphen (v0.2.0-rc1) and every 0.x release is marked a
-# pre-release: the project is a proof of concept until it says otherwise.
+# A tag with a hyphen (v0.3.0-rc1) is marked a pre-release. 0.1.0 was one
+# too, as a proof of concept; from 0.2.0 a plain tag is a release.
 name: release
 
 on:
@@ -52,7 +52,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=""
-          case "$GITHUB_REF_NAME" in v0.*|*-*) pre="--prerelease" ;; esac
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
             --title "Thermocline $GITHUB_REF_NAME" \
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" $pre
