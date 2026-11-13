@@ -85,10 +85,10 @@ on amd64 and arm64, static, with the install script and the systemd units
 beside it:
 
 ```
-curl -LO https://github.com/zelmario/thermocline/releases/download/v0.1.0/cline-0.1.0-linux-amd64.tar.gz
-curl -LO https://github.com/zelmario/thermocline/releases/download/v0.1.0/SHA256SUMS
+curl -LO https://github.com/zelmario/thermocline/releases/download/v0.2.0/cline-0.2.0-linux-amd64.tar.gz
+curl -LO https://github.com/zelmario/thermocline/releases/download/v0.2.0/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-tar xzf cline-0.1.0-linux-amd64.tar.gz && cd cline-0.1.0-linux-amd64
+tar xzf cline-0.2.0-linux-amd64.tar.gz && cd cline-0.2.0-linux-amd64
 sudo packaging/install.sh ./cline
 ```
 
