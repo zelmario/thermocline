@@ -79,6 +79,9 @@ what `--clear` removes before you repoint anything at it.
 
 ## Installing it
 
+To see it work before you install anything, [docs/try-it.md](docs/try-it.md)
+runs it on Docker in ten minutes.
+
 One binary, `cline`, which is every component. Each
 [release](https://github.com/zelmario/thermocline/releases) carries it for Linux
 on amd64 and arm64, static, with the install script and the systemd units
@@ -386,6 +389,7 @@ it, because a README nobody reaches the end of is a README that does not work:
 
 | | |
 |---|---|
+| [docs/try-it.md](docs/try-it.md) | Ten minutes on Docker with throwaway data: adopt, run, and compare every answer with the archive's |
 | [docs/proxy.md](docs/proxy.md) | What the proxy does with each kind of command, and why. The longest one, because it is where the work is |
 | [docs/adoption.md](docs/adoption.md) | The numbered rollout for a cluster already serving traffic, and what an adoption carries that is not a document |
 | [docs/limitations.md](docs/limitations.md) | Every limitation known, what each costs, and what would close it. **Read this before a pilot** |
