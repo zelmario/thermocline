@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -48,6 +49,28 @@ var guardedCommands = map[string]bool{
 	"dbHash":           true,
 }
 
+// writesOneCollection are the guarded writes whose every guard acts only on a
+// namespace this deployment tiers: each of guardMultiWrite, guardUpsert,
+// guardSortedFindAndModify, guardBulkWrite, guardReservedField, guardLargeID,
+// guardInsert, guardUpdateKeys and prepareTxnKeyCheck returns at
+// !cfg.Manages(ns) before touching the archive or the key registry, and
+// interceptWrite and interceptFindAndModify do the same after the reply.
+// guardReplacedRoots runs for any namespace but only rewrites the client's own
+// pipeline, which the fast tier then judges. So a write to a collection nothing
+// tiers reaches no guard, and asking the fast tier first was a round trip and a
+// 13 KB decode for nothing. Measured on 2026-11-23: a shop's carts and stock
+// updates, untiered beside tiered orders in one database, paid it on every
+// write. The DDL commands stay judged by database, because rename, create and
+// drop act across collections.
+var writesOneCollection = map[string]bool{
+	"insert":        true,
+	"update":        true,
+	"delete":        true,
+	"findAndModify": true,
+	"findandmodify": true,
+	"bulkWrite":     true,
+}
+
 // proxiedGate refuses a guarded command the fast tier would refuse, before any
 // guard acts on it. It returns a reply to send when the answer is no.
 //
@@ -68,10 +91,15 @@ func (c *conn) proxiedGate(msg *wire.Message, name, db string) (*wire.Message, b
 	}
 	reaches := false
 	for _, need := range needs {
-		if !need.Cluster && c.r.managesAnythingIn(need.DB) {
-			reaches = true
-			break
+		if need.Cluster || !c.r.managesAnythingIn(need.DB) {
+			continue
 		}
+		if writesOneCollection[name] && need.Coll != "" && !strings.HasPrefix(need.Coll, "system.") &&
+			!c.r.cfg.Manages(need.DB+"."+need.Coll) {
+			continue
+		}
+		reaches = true
+		break
 	}
 	if !reaches {
 		return nil, false
@@ -135,6 +163,20 @@ func (c *conn) proxiedGrants() (grants authz.Grants, users []string, ok bool) {
 	if !got || !replyOK(rdoc) {
 		return authz.Grants{}, nil, false
 	}
+	// The question is asked every time; only the parsing of an answer seen
+	// before is skipped. A root user's answer is 13 KB of privileges, and
+	// decoding it cost 129us, 74 KB and 1,510 allocations on every write
+	// (2026-11-23), which under sixteen shoppers was most of the router's CPU.
+	// authInfo is compared byte for byte, so a revoked role changes the bytes
+	// and is parsed again; the rest of the reply carries clock fields that
+	// change on every call and say nothing about who may do what.
+	info, err := rdoc.LookupErr("authInfo")
+	if err != nil {
+		return authz.Grants{}, nil, false
+	}
+	if c.proxSeen != nil && bytes.Equal(c.proxSeen, info.Value) {
+		return c.proxGrants, append([]string(nil), c.proxUsers...), true
+	}
 	var res struct {
 		AuthInfo struct {
 			Users []struct {
@@ -154,7 +196,9 @@ func (c *conn) proxiedGrants() (grants authz.Grants, users []string, ok bool) {
 		}
 		users = append(users, u.User+"@"+u.DB)
 	}
-	return g, users, true
+	c.proxSeen = append(c.proxSeen[:0], info.Value...)
+	c.proxGrants, c.proxUsers = g, users
+	return g, append([]string(nil), users...), true
 }
 
 // authIsOff reports whether the fast tier runs without access control, which

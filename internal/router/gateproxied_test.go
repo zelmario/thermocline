@@ -129,6 +129,58 @@ func TestProxiedGateLetsAnAllowedWriteThrough(t *testing.T) {
 	}
 }
 
+// The parse of an answer is remembered, the answer is not. A role revoked
+// between two writes on one connection, which mongod applies to the open
+// connection, is applied here to the second write, and the fast tier is asked
+// both times.
+func TestProxiedGateAsksAgainAfterARevoke(t *testing.T) {
+	f := &fastTier{users: alice, privileges: bson.A{privilege("shop", "orders", "insert")}}
+	c := gatedConn(t, f)
+	for i := 0; i < 2; i++ {
+		if _, denied := c.proxiedGate(command(t, insertOrders), "insert", "shop"); denied {
+			t.Fatalf("write %d: an insert the user is granted was refused", i+1)
+		}
+	}
+	f.privileges = bson.A{privilege("shop", "", "find")}
+	if _, denied := c.proxiedGate(command(t, insertOrders), "insert", "shop"); !denied {
+		t.Fatal("an insert after the role was revoked reached the guards")
+	}
+	f.privileges = bson.A{privilege("shop", "orders", "insert")}
+	if _, denied := c.proxiedGate(command(t, insertOrders), "insert", "shop"); denied {
+		t.Fatal("an insert after the role was granted again was refused")
+	}
+	if got := len(f.probes); got != 4 {
+		t.Fatalf("the fast tier was asked %d times for 4 writes, want 4: %v", got, f.probes)
+	}
+}
+
+// A write to a collection nothing tiers reaches no guard, so the fast tier is
+// not asked about it even when its database holds a tiered one. A write to the
+// tiered one beside it is still judged, and so is a drop of the untiered one,
+// which is DDL and judged by database.
+func TestProxiedGateSkipsWritesNoGuardActsOn(t *testing.T) {
+	f := &fastTier{users: alice, privileges: bson.A{privilege("shop", "", "find")}}
+	c := gatedConn(t, f)
+	c.r.cfg.Managed = []string{"shop.orders"}
+	carts := bson.D{{Key: "update", Value: "carts"}, {Key: "updates", Value: bson.A{bson.D{
+		{Key: "q", Value: bson.D{{Key: "_id", Value: "c1"}}},
+		{Key: "u", Value: bson.D{{Key: "$set", Value: bson.D{{Key: "items", Value: bson.A{}}}}}}}}},
+		{Key: "$db", Value: "shop"}}
+	if _, denied := c.proxiedGate(command(t, carts), "update", "shop"); denied {
+		t.Fatal("an update of an untiered collection was refused before the fast tier saw it")
+	}
+	if len(f.probes) != 0 {
+		t.Fatalf("the fast tier was asked %v about a write no guard acts on", f.probes)
+	}
+	if _, denied := c.proxiedGate(command(t, insertOrders), "insert", "shop"); !denied {
+		t.Fatal("an insert into the tiered collection by a read-only user reached the guards")
+	}
+	drop := bson.D{{Key: "drop", Value: "carts"}, {Key: "$db", Value: "shop"}}
+	if _, denied := c.proxiedGate(command(t, drop), "drop", "shop"); !denied {
+		t.Fatal("a drop by a read-only user in a database with a tiered collection reached the guards")
+	}
+}
+
 // An upsert needs insert as well as update, so update alone is not enough.
 func TestProxiedGateJudgesAnUpsertAsAnInsertToo(t *testing.T) {
 	upsert := bson.D{{Key: "update", Value: "orders"}, {Key: "updates", Value: bson.A{bson.D{
