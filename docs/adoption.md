@@ -124,6 +124,16 @@ scanned zero and evicted nothing, and would go on doing that until the
 migration itself was older than the window. Nothing is wrong from where it
 stands: the rule addresses documents and tiers by the wrong clock.
 
+When the `_id` and a date field agree, age by the one the application queries.
+A rule with no `date_field` needs no index, but its completeness claim is
+measured in `_id` time, and the proxy cannot prove a range on any other field
+against it. Every bounded query on the date field then goes to the archive.
+Measured on 2 million orders kept 90 days, with `{at: 1}` and
+`{customer: 1, at: -1}` on the collection: sales by hour over the last day took
+41 to 46 ms at p50 aged by `_id`, every run read the archive, and aged by `at` it
+took 7.8 to 8.0 ms and none did. `cline adopt` picks the date field when an
+index holds it, and asks for the `{field: -1, _id: -1}` index the warm needs.
+
 And set `date_field` to the *same* field on both rules for a namespace. Ageing
 one collection two ways costs more than the two daemons picking different
 documents. The proxy will not read a lower time bound out of a query on such a

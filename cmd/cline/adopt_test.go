@@ -43,6 +43,27 @@ func TestAdoptAgesByIDWhenItAgreesWithTheDate(t *testing.T) {
 	}
 }
 
+// The same agreement, but the application indexes the date, so it queries by
+// it: tiered by the date, and the warm's {at: -1, _id: -1} is asked for when
+// only a compound that holds at elsewhere exists.
+func TestAdoptAgesByAnIndexedDateThatAgrees(t *testing.T) {
+	docs := spreadDocs(100, 365*24*time.Hour, true, "at", time.Hour)
+	p := planCollection(collSample{NS: "app.orders", Count: 1000, Docs: docs,
+		Indexes: [][]indexKey{{{"_id", 1}}, {{"customer", 1}, {"at", -1}}}})
+	if !p.Tier || p.DateField != "at" {
+		t.Fatalf("want tiered by at, got tier=%v field=%q why=%q", p.Tier, p.DateField, p.Why)
+	}
+	if !p.NeedIndex || p.Indexed {
+		t.Fatalf("at leads no index, so the warm's index is needed: NeedIndex=%v Indexed=%v", p.NeedIndex, p.Indexed)
+	}
+	if !strings.Contains(p.Why, "an index holds at") {
+		t.Fatalf("evidence missing: %q", p.Why)
+	}
+	if got := keptFraction(p.Ages, adoptNow, 90*24*time.Hour); got < 0.2 || got > 0.3 {
+		t.Fatalf("90 days of a year should keep about a quarter, got %.2f", got)
+	}
+}
+
 // A migration re-inserted everything: the ObjectIds were all minted within an
 // hour, while the documents' own dates span a year. Ageing by _id evicts
 // nothing (docs/adoption.md step 5).
