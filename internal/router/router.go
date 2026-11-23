@@ -1092,12 +1092,13 @@ type conn struct {
 	// files the timing under it once the reply has gone out.
 	cls Class
 
-	// proxSeen is the authInfo of the last connectionStatus this connection's
-	// client was asked, and proxGrants and proxUsers what it parsed to. Only the
-	// parse is remembered, never the answer: see proxiedGrants.
-	proxSeen    []byte
-	proxGrants  authz.Grants
-	proxUsers   []string
+	// proxKey is the digest of the last authInfo this connection's client was
+	// asked for, and proxGrants and proxUsers what it parsed to. Only the parse
+	// is remembered, never the answer: see proxiedGrants.
+	proxKey    [32]byte
+	proxKeyed  bool
+	proxGrants authz.Grants
+	proxUsers  []string
 
 	// pendingKeys are unique key claims made for the insert now in flight, kept
 	// so they can be released if the fast tier rejects it.

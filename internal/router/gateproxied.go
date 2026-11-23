@@ -2,6 +2,9 @@ package router
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"sort"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -167,14 +170,15 @@ func (c *conn) proxiedGrants() (grants authz.Grants, users []string, ok bool) {
 	// before is skipped. A root user's answer is 13 KB of privileges, and
 	// decoding it cost 129us, 74 KB and 1,510 allocations on every write
 	// (2026-11-23), which under sixteen shoppers was most of the router's CPU.
-	// authInfo is compared byte for byte, so a revoked role changes the bytes
-	// and is parsed again; the rest of the reply carries clock fields that
-	// change on every call and say nothing about who may do what.
+	// authInfo is compared by content, so a revoked role changes it and is
+	// parsed again; the rest of the reply carries clock fields that change on
+	// every call and say nothing about who may do what. See authInfoKey.
 	info, err := rdoc.LookupErr("authInfo")
 	if err != nil {
 		return authz.Grants{}, nil, false
 	}
-	if c.proxSeen != nil && bytes.Equal(c.proxSeen, info.Value) {
+	key, keyed := authInfoKey(info)
+	if keyed && c.proxKeyed && key == c.proxKey {
 		return c.proxGrants, append([]string(nil), c.proxUsers...), true
 	}
 	var res struct {
@@ -196,9 +200,64 @@ func (c *conn) proxiedGrants() (grants authz.Grants, users []string, ok bool) {
 		}
 		users = append(users, u.User+"@"+u.DB)
 	}
-	c.proxSeen = append(c.proxSeen[:0], info.Value...)
+	c.proxKey, c.proxKeyed = key, keyed
 	c.proxGrants, c.proxUsers = g, users
 	return g, append([]string(nil), users...), true
+}
+
+// authInfoKey is a digest of what an authInfo says, in an order of its own.
+//
+// mongod lists a user's privileges in a different order on every call: 50
+// answers in a row on one connection on 2026-11-23 were never byte for byte
+// the same, and always the same once the privileges were sorted. So each
+// privilege is taken as its own bytes, those are sorted, and the digest covers
+// every other field of authInfo as sent, users and roles included, plus the
+// sorted privileges. SHA-256, because two answers that collide would hand one
+// client's grants to another question: not a risk a checksum may take.
+func authInfoKey(info bson.RawValue) ([sha256.Size]byte, bool) {
+	doc, ok := info.DocumentOK()
+	if !ok {
+		return [sha256.Size]byte{}, false
+	}
+	elems, err := doc.Elements()
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	h := sha256.New()
+	var n [8]byte
+	put := func(b []byte) {
+		binary.LittleEndian.PutUint64(n[:], uint64(len(b)))
+		h.Write(n[:])
+		h.Write(b)
+	}
+	for _, e := range elems {
+		put([]byte(e.Key()))
+		if e.Key() != "authenticatedUserPrivileges" {
+			v := e.Value()
+			put([]byte{byte(v.Type)})
+			put(v.Value)
+			continue
+		}
+		arr, aok := e.Value().ArrayOK()
+		if !aok {
+			return [sha256.Size]byte{}, false
+		}
+		vals, verr := arr.Values()
+		if verr != nil {
+			return [sha256.Size]byte{}, false
+		}
+		privs := make([][]byte, len(vals))
+		for i, v := range vals {
+			privs[i] = v.Value
+		}
+		sort.Slice(privs, func(i, j int) bool { return bytes.Compare(privs[i], privs[j]) < 0 })
+		for _, p := range privs {
+			put(p)
+		}
+	}
+	var out [sha256.Size]byte
+	copy(out[:], h.Sum(nil))
+	return out, true
 }
 
 // authIsOff reports whether the fast tier runs without access control, which

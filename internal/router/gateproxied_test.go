@@ -385,3 +385,49 @@ func TestSpeculationWaitsForAUser(t *testing.T) {
 		t.Fatal("with access control off, reads ahead stopped")
 	}
 }
+
+// mongod lists the same privileges in a different order on every call, so the
+// key that decides whether a parse is reused ignores their order and nothing
+// else: a changed action, resource, user or role is a different key.
+func TestAuthInfoKeyIgnoresOnlyPrivilegeOrder(t *testing.T) {
+	info := func(users bson.A, roles bson.A, privs ...bson.D) bson.RawValue {
+		ps := bson.A{}
+		for _, p := range privs {
+			ps = append(ps, p)
+		}
+		raw, err := bson.Marshal(bson.D{{Key: "authInfo", Value: bson.D{
+			{Key: "authenticatedUsers", Value: users},
+			{Key: "authenticatedUserRoles", Value: roles},
+			{Key: "authenticatedUserPrivileges", Value: ps},
+		}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bson.Raw(raw).Lookup("authInfo")
+	}
+	key := func(v bson.RawValue) [32]byte {
+		k, ok := authInfoKey(v)
+		if !ok {
+			t.Fatal("no key for a well formed authInfo")
+		}
+		return k
+	}
+	a := privilege("shop", "orders", "insert", "find")
+	b := privilege("shop", "carts", "update")
+	reader := bson.A{bson.D{{Key: "role", Value: "read"}, {Key: "db", Value: "shop"}}}
+	base := key(info(alice, reader, a, b))
+	if key(info(alice, reader, b, a)) != base {
+		t.Fatal("the same privileges in another order gave another key")
+	}
+	for name, other := range map[string]bson.RawValue{
+		"an action less":   info(alice, reader, privilege("shop", "orders", "find"), b),
+		"another resource": info(alice, reader, a, privilege("shop", "carts2", "update")),
+		"a privilege less": info(alice, reader, a),
+		"another user":     info(bson.A{bson.D{{Key: "user", Value: "bob"}, {Key: "db", Value: "admin"}}}, reader, a, b),
+		"another role":     info(alice, bson.A{}, a, b),
+	} {
+		if key(other) == base {
+			t.Errorf("%s gave the same key", name)
+		}
+	}
+}
