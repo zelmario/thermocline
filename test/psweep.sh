@@ -172,7 +172,20 @@ worker() {
 
   rm -rf "$WDIR"; mkdir -p "$LOGDIR"
   bash /root/mkworker.sh "$SHARED" "$WDIR/cline.yaml" || {
-    echo "worker $n: could not write its config" >> "$OUT/summary.txt"; return 1; }
+    echo "worker $n: SETUP FAILED, could not write its config" >> "$OUT/summary.txt"; return 1; }
+
+  # Every worker starts with no checkpoint. Its feeder id is the same in every
+  # sweep, so the checkpoint the last sweep left is still in the archive, and
+  # most suites delete it in their setup but not all of them. After eleven days
+  # with no sweep on 2026-11-23 that checkpoint was older than
+  # feeder.eviction_record, the feeder refused it as it should, and the first
+  # suite on that worker (testrouter, which does not reset it) failed 25 checks
+  # with nothing mirrored. Only the first suite per worker can meet a stale
+  # checkpoint, which is why it looked like one suite's bug.
+  local cold
+  cold=$(awk '/^cold:/{c=1} c && /uri:/{sub(/.*uri: *"/,""); sub(/".*/,""); print; exit}' "$WDIR/cline.yaml")
+  mongosh "$cold" --quiet --eval "for (const c of ['checkpoints','positions']) db.getSiblingDB('$META')[c].deleteMany({})" >/dev/null 2>&1 || {
+    echo "worker $n: SETUP FAILED, could not clear its checkpoint" >> "$OUT/summary.txt"; return 1; }
 
   local s f part start secs rc line
   while :; do
