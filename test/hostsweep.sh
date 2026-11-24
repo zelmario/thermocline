@@ -162,6 +162,18 @@ run() {
 
 echo "hostsweep: $(echo $SUITES | wc -w) suites, serial, logs in $OUT" | tee -a "$OUT/summary.txt"
 
+# Start from no mirroring checkpoint. The suites share the default meta
+# database, and a checkpoint left by the last sweep outlives the fast tier's
+# eviction record after a few idle days: on 2026-11-24, after 11 days, the
+# feeder refused one from 2026-11-12 and stopped, and testfailover and
+# testalerts failed six checks between them on a feeder that never mirrored.
+# Most suites delete it in their own setup; those two do not, so the order the
+# suites ran in decided who paid. Same fix as psweep's per worker (1cbc4d4).
+COLDURI=$(docker exec "$NODE" awk '/^cold:/{c=1} c && /uri:/{sub(/.*uri: *"/,""); sub(/".*/,""); print; exit}' /root/cline.yaml 2>/dev/null)
+docker exec "$NODE" mongosh "$COLDURI" --quiet --eval \
+  "for (const c of ['checkpoints','positions']) db.getSiblingDB('_thermocline')[c].deleteMany({})" >/dev/null 2>&1 || {
+  echo "SETUP FAILED: could not clear the mirroring checkpoint in _thermocline" | tee -a "$OUT/summary.txt"; exit 2; }
+
 for s in $SUITES; do
   [ -f "test/$s.sh" ] || { printf '%-22s MISSING\n' "$s" >> "$OUT/summary.txt"; continue; }
   reason=$(why "$s")
