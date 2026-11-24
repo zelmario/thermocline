@@ -196,6 +196,11 @@ func loadOrders(ctx context.Context, c *mongo.Collection, n, loaders int, start 
 	if _, err := c.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "customer", Value: 1}, {Key: "at", Value: -1}}},
 		{Keys: bson.D{{Key: "at", Value: 1}}},
+		// The store's back office ships the oldest placed order. Without this
+		// it walked {at: 1} past every settled order first: 1.7s at 2M orders,
+		// 310s at 20M with the archive reading from disk, and the run waited
+		// for it. A shop that ships by status indexes the status.
+		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "at", Value: 1}}},
 	}); err != nil {
 		return err
 	}
