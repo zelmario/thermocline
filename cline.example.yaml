@@ -256,7 +256,11 @@ warmer:
 
   backoff:
     max_replication_lag: 10s
-    max_cache_dirty: 0.05
+    # Higher than the evictor's. 0.05 is where WiredTiger holds the cache under
+    # any steady write, so a warm at 0.05 pauses on that alone: 60 minutes
+    # against 14 at 0.10 for the same 545k documents under load. warmer.rate is
+    # what bounds the warm's cost to the application.
+    max_cache_dirty: 0.10
     min_write_tickets_free: 0.25
     min_oplog_window: 24h
 

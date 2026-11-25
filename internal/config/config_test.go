@@ -802,3 +802,16 @@ func TestTLSOnWheneverTheDriverTurnsItOn(t *testing.T) {
 		t.Errorf("a URI with no TLS option turned TLS on (err %v)", err)
 	}
 }
+
+// The warmer's dirty cache limit sits above WiredTiger's eviction_dirty_target
+// (5%), where any steady write holds the cache; at 0.05 a warm under load took
+// 60 minutes instead of 14. The evictor's stays at 0.05 until it is measured.
+func TestWarmerDirtyLimitAboveWiredTigerTarget(t *testing.T) {
+	d := Default()
+	if got := d.Warmer.Backoff.MaxCacheDirty; got != 0.10 {
+		t.Fatalf("warmer max_cache_dirty default = %v, want 0.10", got)
+	}
+	if got := d.Evictor.Backoff.MaxCacheDirty; got != 0.05 {
+		t.Fatalf("evictor max_cache_dirty default = %v, want 0.05", got)
+	}
+}

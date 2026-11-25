@@ -589,8 +589,15 @@ func Default() Config {
 			BatchSize: 200,
 			Residency: Duration(30 * 24 * time.Hour),
 			Backoff: BackoffConfig{
-				MaxReplicationLag:   Duration(10 * time.Second),
-				MaxCacheDirty:       0.05,
+				MaxReplicationLag: Duration(10 * time.Second),
+				// Not 0.05, which is WiredTiger's own eviction_dirty_target:
+				// any sustained write holds the cache there, so a warm paused
+				// on its own noise. Measured on 545k orders with the store at
+				// 2,000 ops/s: 0.05 took 60 min and 428 pauses, 0.10 took 14.5
+				// min and 8, the cache peaked at 6.6% and no application
+				// thread was drafted into eviction (that starts at 20%). What
+				// a warm costs the foreground is warmer.rate's to bound.
+				MaxCacheDirty:       0.10,
 				MinWriteTicketsFree: 0.25,
 				MinOplogWindow:      Duration(24 * time.Hour),
 			},
