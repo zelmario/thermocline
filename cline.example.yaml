@@ -212,7 +212,10 @@ evictor:
   # forever, since that would be its own outage.
   backoff:
     max_replication_lag: 10s
-    max_cache_dirty: 0.05         # fraction of the WiredTiger cache
+    # A fraction of the WiredTiger cache. Lower than the warmer's 0.10 on
+    # purpose: at 0.10 an eviction under load finishes sooner but takes about
+    # twice the operations from the application, and nothing waits on it.
+    max_cache_dirty: 0.05
     # A fraction of the ticket pool, not a count. MongoDB 7.0 replaced the
     # fixed pool of 128 with one sized to the host, and a small container
     # reports a total of 8, so any absolute floor is unreachable there.

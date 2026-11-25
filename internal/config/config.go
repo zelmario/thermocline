@@ -578,7 +578,13 @@ func Default() Config {
 			// file that renamed its feeder without renaming this one pointed
 			// the mirroring-lag gate at a checkpoint nothing writes.
 			Backoff: BackoffConfig{
-				MaxReplicationLag:   Duration(10 * time.Second),
+				MaxReplicationLag: Duration(10 * time.Second),
+				// Kept at 0.05 where the warmer moved to 0.10, on a
+				// measurement: 548k orders evicted under 2,000 ops/s took
+				// 15.5 min with 52 pauses at 0.05 and 9.4 min with 8 at
+				// 0.10, but 0.10 cost the store about 206k operations
+				// against 104k. A warm gates when the fast tier can serve;
+				// an eviction gates nothing, so it takes the slower road.
 				MaxCacheDirty:       0.05,
 				MinWriteTicketsFree: 0.25,
 				MinOplogWindow:      Duration(24 * time.Hour),
