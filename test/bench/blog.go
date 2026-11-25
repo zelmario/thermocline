@@ -191,6 +191,9 @@ type blog struct {
 	comments *mongo.Collection
 	rate     int
 	posted   atomic.Int64
+	// gone counts the views that matched no article, so a run that deletes
+	// articles beside this one can still check every counted view landed.
+	gone atomic.Int64
 }
 
 func (b *blog) run(ctx context.Context, d time.Duration, conc int, seed int64) *report {
@@ -273,6 +276,7 @@ func (b *blog) run(ctx context.Context, d time.Duration, conc int, seed int64) *
 	wg.Wait()
 	rep.Seconds = time.Since(began).Seconds()
 	finish(rep)
+	fmt.Printf("views that matched no article: %d\n", b.gone.Swap(0))
 	return rep
 }
 
@@ -305,8 +309,11 @@ func (b *blog) step(ctx context.Context, rng *rand.Rand, name string) error {
 		return drain(b.comments.Find(ctx, bson.D{{Key: "article", Value: articleID(b.w, b.w.seqAt(rng))}},
 			options.Find().SetSort(bson.D{{Key: "at", Value: 1}}).SetLimit(50)))
 	case "count a view":
-		_, err := b.articles.UpdateOne(ctx, bson.D{{Key: "_id", Value: articleID(b.w, b.w.seqAt(rng))}},
+		res, err := b.articles.UpdateOne(ctx, bson.D{{Key: "_id", Value: articleID(b.w, b.w.seqAt(rng))}},
 			bson.D{{Key: "$inc", Value: bson.D{{Key: "views", Value: 1}}}})
+		if err == nil && res.MatchedCount == 0 {
+			b.gone.Add(1)
+		}
 		return err
 	case "post a comment":
 		now := time.Now()
