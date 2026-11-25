@@ -627,9 +627,17 @@ chk "  and one ending in a split is left unfilled"        "NULL" "$SPLIT"
 # of the command, it ran on the router's own client.
 LOOKUPSTAGE=$(R "try { db.getSiblingDB(process.env.TC_DB).$NS.watch([{\$match:{'fullDocument.v':'x'}}, {\$lookup:{from:'$NS', localField:'a', foreignField:'b', as:'y'}}]).tryNext(); print('OPENED') } catch(e) { print(/not permitted in a .changeStream pipeline/.test(e.message) ? 'REFUSED' : e.message.substring(0,60)) }")
 chk "  and a stage mongod refuses in a stream is refused" "REFUSED" "$LOOKUPSTAGE"
-# A stream mongod closes in its first reply: resumed before a drop, the
-# insert, the drop and the invalidate come at once with cursor id 0. The
-# stages still run on that batch.
+# A stream resumed before a drop: the insert, the drop and the invalidate are
+# all waiting, and when mongod returns them in its first reply the cursor id is
+# 0 and nothing follows. The stages still run on that batch.
+#
+# mongod does not promise the single reply. Asked directly, with the router out
+# of the way, it left the cursor open 19 times in 30 on an idle set and 60 in
+# 60 under six writers (2026-11-25), with the insert alone or nothing in the
+# first batch. Requiring id=0 failed this check under load six times, tc-pkc.
+# So it opens a few times hoping for the closed reply, then follows the cursor
+# to its invalidate, and judges the insert wherever it arrived. Which path ran
+# is printed, so a run that only ever took the long one shows it.
 H "db.getSiblingDB(process.env.TC_DB).tcs7.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).tcs7.drop()" >/dev/null
 R "db.getSiblingDB(process.env.TC_DB).tcs7.insertOne({_id:0})" >/dev/null
@@ -639,35 +647,27 @@ CLOSED=$(mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --
   let tok; for (let i=0;i<40 && !tok;i++) { const e=cs.tryNext(); if (e) tok=e._id; else sleep(250); }
   cs.close();
   d.tcs7.insertOne({_id:2, secret:'s'}); d.tcs7.drop();
-  // Opened again until mongod closes it in the first reply. A change stream
-  // reads the majority snapshot, and under load the drop can be acknowledged
-  // before that snapshot holds it, so the first batch has the insert and an
-  // open cursor: five sweep failures, every one printing CLEAN, the shaping
-  // right and only mongod's timing different. tc-pkc.
-  let r;
+  let r, opens=0;
   for (let i=0;i<6;i++) {
+    opens++;
     r=d.runCommand({aggregate:'tcs7', pipeline:[{\$changeStream:{resumeAfter:tok}}, {\$project:{'fullDocument.secret':0}}], cursor:{}});
     if (!r.cursor || r.cursor.id == 0) break;
     d.runCommand({killCursors:'tcs7', cursors:[r.cursor.id]});
     sleep(500);
   }
-  const ins=r.cursor ? r.cursor.firstBatch.filter(e=>e.operationType==='insert') : [];
-  let diag='';
-  if (r.cursor && r.cursor.id != 0) {
-    // DIAG tc-pkc: follow the open cursor and say when and how it closes.
-    diag=' | first='+r.cursor.firstBatch.map(e=>e.operationType).join(',');
-    const t0=Date.now(); let id=r.cursor.id, n=0;
-    while (id != 0 && n<60) {
-      const g=d.runCommand({getMore:id, collection:'tcs7', maxTimeMS:1000});
-      if (!g.ok) { diag+=' gm-err='+g.codeName; break; }
-      n++; id=g.cursor.id;
-      const ty=g.cursor.nextBatch.map(e=>e.operationType).join(',');
-      if (ty) diag+=' gm'+n+'@'+(Date.now()-t0)+'ms='+ty;
-    }
-    diag+=' closed='+(id==0)+' after '+n+' getMores '+(Date.now()-t0)+'ms';
+  if (!r.cursor) { print('error '+r.codeName); quit(); }
+  let evs=r.cursor.firstBatch, path='first reply closed', id=r.cursor.id, n=0;
+  while (id != 0 && n<60) {
+    path='followed';
+    const g=d.runCommand({getMore:id, collection:'tcs7', maxTimeMS:1000});
+    if (!g.ok) { path+=' gm-err='+g.codeName; break; }
+    n++; id=g.cursor.id; evs=evs.concat(g.cursor.nextBatch);
   }
-  print('id='+(r.cursor ? r.cursor.id : 'error')+' '+(ins.length ? (ins[0].fullDocument.secret ? 'LEAKED' : 'CLEAN') : 'none')+diag);" 2>&1 | tail -1)
-chk "  and a stream closed in its first reply is shaped" "id=0 CLEAN" "$CLOSED"
+  const ins=evs.filter(e=>e.operationType==='insert');
+  const ends=evs.some(e=>e.operationType==='invalidate') && id == 0;
+  print((ins.length ? (ins[0].fullDocument.secret ? 'LEAKED' : 'CLEAN') : 'none')+(ends ? ' ENDED' : ' OPEN')+' | '+path+' after '+opens+' opens, '+n+' getMores');" 2>&1 | tail -1)
+echo "  (closed stream: ${CLOSED#*| })"
+chk "  and a stream closed by its invalidate is shaped" "CLEAN ENDED" "${CLOSED%% |*}"
 
 fi
 if inpart 2; then
