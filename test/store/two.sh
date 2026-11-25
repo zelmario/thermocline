@@ -88,10 +88,6 @@ if [ -n "${TERMINATE_AUTH:-}" ]; then
     echo "FATAL could not turn terminate_auth on, so this run would quietly be the ordinary one"; exit 2; }
   echo "  terminate_auth is on: the router owns its upstream connections and checks every command itself"
 fi
-if [ "$CFG" != /root/two.yaml ]; then
-  N "sed 's|^  listen:|  terminate_auth: true\n  listen:|' /root/two.yaml > $CFG"
-  echo "  terminate_auth on, from $CFG"
-fi
 docker cp bin/store "$NODE":/usr/local/bin/store >/dev/null
 # Nothing of a previous run: both shops, and this deployment's own bookkeeping.
 # Both the daemons, which carry the config path, and the loop that starts them,
