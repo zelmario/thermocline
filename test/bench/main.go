@@ -58,12 +58,13 @@ func main() {
 	out := flag.String("json", "", "also write the report here as JSON")
 	label := flag.String("label", "", "a name for this run in the report")
 	seed := flag.Int64("seed", 1, "so a run can be repeated")
-	kind := flag.String("workload", "mix", "mix: the operation mix over orders alone; store: shoppers and a back office over a whole shop")
+	kind := flag.String("workload", "mix", "mix: the operation mix over orders alone; store: shoppers and a back office over a whole shop; blog: a news site's readers, see blog.go")
 	mixName := flag.String("store-mix", "store", "store workload: store (write heavy, the first one), real (a shop's shares of steps) or shop (visits: anonymous browsing, logged-in customers, a purchase funnel)")
 	custN := flag.Int("customers", customers, "with -load or -load-store: how many customers the orders belong to; a run reads it back from the load")
 	rate := flag.Int("rate", 0, "store workload: hold the shoppers to this many operations a second in all, and ship every 20ms, so every target does the same work (0: as fast as they can)")
-	resetShop := flag.Bool("reset-shop", false, "put a loaded shop back as it was loaded: remove the orders runs placed, restock the products, empty the carts, drop -meta-db; then stop")
+	resetShop := flag.Bool("reset-shop", false, "put a loaded shop back as it was loaded: remove the orders runs placed, restock the products, empty the carts, drop -meta-db; then stop. With -workload blog: remove what runs published and commented, zero the view counters, drop -meta-db")
 	metaDB := flag.String("meta-db", "_thermocline_bench", "with -reset-shop: the bookkeeping database of the Thermocline the shop was adopted by, the only one dropped")
+	loadBlogN := flag.Int("load-blog", 0, "load this many articles, spread over -days, and comments on each, into -ns and its database's comments; then stop")
 	loadStoreFlag := flag.Bool("load-store", false, "stock the shop's products and customers in -ns's database, then stop")
 	metaURI := flag.String("meta-uri", "", "where the load was recorded, when -uri is a router: "+
 		"the record lives beside the data, in a collection the router does not tier")
@@ -79,17 +80,35 @@ func main() {
 	db, coll := split(*ns)
 	c := cl.Database(db).Collection(coll)
 	period := time.Duration(*days) * 24 * time.Hour
+	// A run rebuilds each document's _id from the load's start as bench_meta
+	// recorded it, which BSON keeps to the millisecond. A start with
+	// nanoseconds put a run's ids a fraction of a millisecond off the loaded
+	// ones, and the few that crossed a second named documents that do not
+	// exist: 2 of 9,751 view counts on the blog updated nothing.
+	loadStart := time.Now().Add(-period).Truncate(time.Millisecond)
 
 	if *load > 0 {
-		start := time.Now().Add(-period)
+		start := loadStart
 		if err := loadOrders(ctx, c, *load, *loaders, start, period, *pad); err != nil {
 			die("load: %v", err)
+		}
+		return
+	}
+	if *loadBlogN > 0 {
+		if err := loadBlog(ctx, cl.Database(db), c, *loadBlogN, *loaders, loadStart, period, *pad); err != nil {
+			die("load blog: %v", err)
 		}
 		return
 	}
 	if *loadStoreFlag {
 		if err := loadStore(ctx, cl.Database(db), *pad); err != nil {
 			die("load store: %v", err)
+		}
+		return
+	}
+	if *resetShop && *kind == "blog" {
+		if err := resetBlog(ctx, cl, cl.Database(db), c, *metaDB); err != nil {
+			die("reset: %v", err)
 		}
 		return
 	}
@@ -129,6 +148,10 @@ func main() {
 		}
 		st := &store{w: w, db: cl.Database(db), orders: c, rate: *rate, mix: mix, sessions: *mixName == "shop"}
 		runner = func(d time.Duration, seed int64) *report { return st.run(ctx, d, *conc, seed) }
+	}
+	if *kind == "blog" {
+		bl := &blog{w: w, articles: c, comments: cl.Database(db).Collection("comments"), rate: *rate}
+		runner = func(d time.Duration, seed int64) *report { return bl.run(ctx, d, *conc, seed) }
 	}
 	if *warm > 0 {
 		fmt.Printf("warming for %s\n", *warm)
