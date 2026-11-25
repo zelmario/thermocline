@@ -776,10 +776,14 @@ func SameGroupAnswer(q Query, cached, real bson.Raw) string {
 	if !ok1 || !ok2 {
 		return "a reply has no first batch"
 	}
+	open := false
 	if id, ok := real.Lookup("cursor", "id").AsInt64OK(); ok && id != 0 {
-		return "the real answer is longer than one batch"
+		open = true
 	}
 	if len(cb) != len(rb) {
+		if open {
+			return "the real answer is longer than one batch"
+		}
 		return "length"
 	}
 	sums := map[string]bool{}
@@ -815,8 +819,20 @@ func SameGroupAnswer(q Query, cached, real bson.Raw) string {
 			}
 		}
 	}
+	if open {
+		return GroupBatchFull
+	}
 	return ""
 }
+
+// GroupBatchFull is SameGroupAnswer's verdict when mongod's first batch was
+// full and holds the cache's groups, with its cursor left open. mongod 8.0
+// leaves a cursor open whenever the batch fills, even when nothing follows:
+// seven groups with batchSize 7 come back open, with batchSize 8 closed. The
+// cache gives the same groups with the cursor closed, which is the same answer
+// if nothing follows and a short one if something does, and the first batch
+// alone cannot say which. A reader that can ask for one more document can.
+const GroupBatchFull = "a full first batch with mongod's cursor left open"
 
 // sameOutput compares one field of a group's output. A sum of doubles may be
 // one unit in the last place from mongod's and still be an answer mongod

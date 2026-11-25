@@ -180,6 +180,12 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		}
 	}
 	took := time.Since(chk.at).Round(time.Microsecond)
+	if why == livecache.GroupBatchFull {
+		// The client's cursor holds the rest, and reading it here would take
+		// it from the client. Not judged, rather than judged wrong.
+		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, why, chk.shape))
+		return
+	}
 	if why == "" {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
@@ -346,6 +352,17 @@ func (c *conn) snapshotAnswer(chk *liveCheck, ts bson.Timestamp) (bson.Raw, erro
 		case "lsid", "$clusterTime", "txnNumber", "autocommit", "startTransaction", "readConcern",
 			"$readPreference", "$db", "apiVersion", "apiStrict", "apiDeprecationErrors":
 			continue
+		case "cursor":
+			// One more group than the cache answers with at most. mongod
+			// leaves a full batch's cursor open even when nothing follows, so
+			// with the client's own batchSize a right answer that filled it
+			// could not be told from a short one. With one more, the
+			// snapshot's first batch is the whole answer whenever the cache's
+			// could be, and holds an extra group when the cache missed one.
+			if chk.q.Kind == livecache.KindGroup && chk.q.Group != nil {
+				cmd = append(cmd, bson.E{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: chk.q.Group.Batch + 1}}})
+				continue
+			}
 		}
 		cmd = append(cmd, bson.E{Key: e.Key(), Value: e.Value()})
 	}

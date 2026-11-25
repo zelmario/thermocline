@@ -254,6 +254,44 @@ func TestSameGroupAnswerRounding(t *testing.T) {
 	}
 }
 
+// A full first batch is the one place mongod's cursor id says nothing: 8.0
+// leaves it open when the batch fills, whether or not a group follows. Seven
+// groups with batchSize 7 came back open and with batchSize 8 closed. The live
+// verifier called the cache's closed answer to that a mismatch six times in a
+// 60-round fuzz, every one the same groups as mongod's.
+func TestSameGroupAnswerFullBatch(t *testing.T) {
+	q, ok := ParseGroupAgg("s.p", mustRaw(bson.D{{Key: "aggregate", Value: "p"}, {Key: "pipeline", Value: bson.A{
+		bson.D{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$tag"}, {Key: "c", Value: bson.D{{Key: "$sum", Value: int32(1)}}}}}}}},
+		{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(2)}}}}))
+	if !ok {
+		t.Fatal("not understood")
+	}
+	reply := func(id int64, groups ...string) bson.Raw {
+		b := bson.A{}
+		for _, g := range groups {
+			b = append(b, bson.D{{Key: "_id", Value: g}, {Key: "c", Value: int32(1)}})
+		}
+		return mustRaw(bson.D{{Key: "cursor", Value: bson.D{{Key: "id", Value: id}, {Key: "ns", Value: "s.p"},
+			{Key: "firstBatch", Value: b}}}, {Key: "ok", Value: 1.0}})
+	}
+	cached := reply(0, "t3", "common")
+	for _, c := range []struct {
+		name string
+		real bson.Raw
+		want string
+	}{
+		{"closed, same groups in another order", reply(0, "common", "t3"), ""},
+		{"full and open, same groups", reply(77, "common", "t3"), GroupBatchFull},
+		{"full and open, another group", reply(77, "common", "t9"), "documents"},
+		{"open and longer", reply(77, "common", "t3", "t9"), "the real answer is longer than one batch"},
+		{"closed and longer", reply(0, "common", "t3", "t9"), "length"},
+	} {
+		if why := SameGroupAnswer(q, cached, c.real); why != c.want {
+			t.Errorf("%s: %q, want %q", c.name, why, c.want)
+		}
+	}
+}
+
 // -0.0 is 0 to mongod: one key for equality, one group, and a group whose _id
 // was seen both ways is mongod's choice of whichever it read first.
 func TestNegativeZero(t *testing.T) {
