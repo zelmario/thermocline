@@ -260,6 +260,10 @@ type Router struct {
 	// a failover refusal, as unix nanoseconds. See holdHelloAfterFailover.
 	failoverEndedAt atomic.Int64
 
+	// parked are the upstreams of connections ended for a failover, kept for
+	// the cursors on them. See parked.go.
+	parked parkedSet
+
 	// inv is what each tier is holding, refreshed on a timer.
 	inv     inventoryCache
 	started time.Time
@@ -354,6 +358,9 @@ type Stats struct {
 	// member their proxied upstream went to stopped being primary. See
 	// closeIdleSiblings.
 	FailoverSiblingsClosed atomic.Int64
+	// CursorsFoundParked counts getMores continued on the member that made
+	// their cursor after it stopped being primary. See parked.go.
+	CursorsFoundParked atomic.Int64
 	// SecondaryReads counts reads that asked for a secondary and were sent to
 	// one. Together with PrimaryOnlyReads it says how much of the read load
 	// actually moved off the primary, which is the only way to tell the feature
@@ -940,7 +947,6 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 			r.log.Error("cannot reach the fast tier", "err", err)
 			return
 		}
-		defer func() { _ = upstream.Close() }()
 	}
 
 	c := &conn{
@@ -957,6 +963,18 @@ func (r *Router) serve(ctx context.Context, client net.Conn) {
 	// still running 60 seconds after SIGTERM, against one second with none.
 	// systemd then waits out TimeoutStopSec and sends SIGKILL, which is the
 	// ungraceful stop the rolling upgrade exists to avoid.
+	if upstream != nil {
+		defer func() {
+			// Only one whose last exchange finished: ended after its reply went
+			// out, or closed while it waited for the next command. One closed
+			// mid-command has a reply left unread on it.
+			done := c.closeAfterReply || !c.busy.Load()
+			if c.parkOnClose.Load() && done && r.parked.park(upstream, upstreamAddr, c.observedUser, time.Now()) {
+				return
+			}
+			_ = upstream.Close()
+		}()
+	}
 	r.track(c)
 	defer r.untrack(c)
 	// A borrowed connection goes back when the client goes away, and one still
@@ -1171,6 +1189,9 @@ type conn struct {
 	// closeAfterReply ends this connection once the reply in hand has gone out.
 	// See endAfterFailover for what sets it.
 	closeAfterReply bool
+	// parkOnClose keeps this connection's own upstream when it ends, for the
+	// cursors on it. Set where a failover ends it. See parked.go.
+	parkOnClose atomic.Bool
 
 	// pinned maps a cursor to the pooled connection that owns it. A cursor
 	// exists on one node, so its getMore has to go back there.
@@ -2135,6 +2156,11 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		}
 	}
 	if name == "getMore" {
+		// A cursor the member now in use never made may be on the one that
+		// stopped being primary. See parked.go.
+		if out, ok := c.retryLostCursor(msg, reply); ok {
+			reply = out
+		}
 		// A cursor that has just been drained has no more getMores to guard, so
 		// the claim it was authorised by is forgotten here rather than left for
 		// the idle reaper. Without this every tiered cursor a BI tool opens sits

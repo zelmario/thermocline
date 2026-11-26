@@ -145,6 +145,7 @@ func (c *conn) endAfterFailover(ctx context.Context) {
 	// reading it finds the stamp. See holdHelloAfterFailover.
 	c.r.failoverEndedAt.Store(time.Now().UnixNano())
 	c.closeAfterReply = true
+	c.parkOnClose.Store(true)
 }
 
 // failoverSettle is how long a hello waits after a connection was ended for a
@@ -218,6 +219,7 @@ func (r *Router) closeIdleSiblings(self *conn, member string) int {
 		if c == self || c.dialed != member || c.busy.Load() {
 			continue
 		}
+		c.parkOnClose.Store(true)
 		_ = c.client.Close()
 		n++
 	}

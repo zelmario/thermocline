@@ -105,6 +105,18 @@ Range queries are governed by the watermark below.
   refusal has been delivered, which is what mongod does to the clients of a
   member that stops being primary. The driver reconnects, that handshake
   authenticates against the member that is primary now, and the retry lands.
+
+  Ending that connection left the client's open cursors behind. mongod keeps a
+  read cursor open across a step-down, and a driver talking straight to the
+  set sends the getMore back to the member that made it; through the proxy it
+  went to the new primary, which had never heard of the cursor. Measured with a
+  cursor read on after one write across a step-down: straight to the set 3 of
+  3 read on, through the proxy 3 of 3 got `CursorNotFound`. The proxy now keeps
+  the ended connection's upstream for 10 minutes, mongod's own idle cursor
+  timeout, under the user the fast tier said it is, and sends a getMore the new
+  primary does not know to that same user's kept connections: 3 of 3 read on.
+  mongod ties a cursor to its user, so no client reaches a cursor its own user
+  could not. At most 64 are kept, the oldest closed first.
 - **Read preference is not honoured. Every read is served by the primary.** This
   follows from proxied authentication and is the one limitation to weigh before a
   pilot. The proxy answers `hello` as a mongos, and a mongos routes by read

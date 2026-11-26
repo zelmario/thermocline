@@ -209,6 +209,29 @@ SIBV=$(H "const d=db.getSiblingDB('shop').$NS.findOne({_id:1}); print(d?d.v:'MIS
 chk "and nothing was applied twice"                    "true" \
     "$(awk -v v="$SIBV" 'BEGIN{print (v+0 >= 300 && v+0 <= 302) ? "true" : "false"}')"
 
+echo "== a cursor opened before the change of primary, read after it =="
+# mongod keeps a read cursor open across a step-down, and a driver talking
+# straight to the set sends the getMore back to the member that made it. With
+# authentication proxied the router ends a connection a failover leaves on the
+# old member, so there was nowhere left to send it: measured on 2026-11-26, a
+# cursor read on after one write through the router got CursorNotFound 3 times
+# in 3, and straight to the set read on 3 times in 3. See parked.go.
+waitForPrimary
+H "const c=db.getSiblingDB('shop').${NS}_cur; c.drop(); c.insertMany(Array.from({length:20},(_,i)=>({_id:i})))" >/dev/null
+CUR=$(docker exec -e TCNS="${NS}_cur" -e TCHOT="$HOT" $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&retryWrites=true" --quiet --eval '
+  const c = db.getSiblingDB("shop")[process.env.TCNS].find({}).sort({_id:1}).batchSize(2);
+  c.next(); c.next();
+  const s = new Mongo(process.env.TCHOT);
+  try { s.getDB("admin").runCommand({replSetStepDown: 20, secondaryCatchUpPeriodSecs: 5}) } catch (e) {}
+  sleep(3000);
+  // A write, which is what ends the connection a failover left behind.
+  try { db.getSiblingDB("shop")[process.env.TCNS + "_w"].insertOne({at: new Date()}) } catch (e) {}
+  try { let n = 2; while (c.hasNext()) { c.next(); n++ } print("read " + n) }
+  catch (e) { print(e.codeName || "error") }' 2>&1 | tail -1)
+waitForPrimary
+chk "the cursor reads on after the change of primary"    "read 20" "$CUR"
+H "db.getSiblingDB('shop').${NS}_cur.drop(); db.getSiblingDB('shop').${NS}_cur_w.drop()" >/dev/null
+
 echo "== and while the fast tier has no primary at all =="
 # The check above races an election. The driver retries a write once, and if a
 # primary exists by then the retry lands, which it did nine runs in ten. The
