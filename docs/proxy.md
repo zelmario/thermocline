@@ -1299,8 +1299,17 @@ could share a value that should be unique, and refusing every insert because a
 bookkeeping collection is unreachable is worse than that. Losing an archived
 document is not in the same class.
 
-`testchaos.sh` stops every archive member and checks all three: the insert is
-refused, nothing lands, and the archived document is still there afterwards.
+A delete, update, findAndModify or find that matches nothing on the fast tier is
+refused the same way when the archive cannot be asked whether it holds the
+document. It used to be answered with the fast tier's miss: on the Docker box on
+2026-11-26, with the archive's primary gone under load, `deleteOne` of an
+archived article was told `deletedCount: 0`, and the article stayed live in the
+archive. For an erasure request that is a delete reported as unnecessary.
+
+`testchaos.sh` stops every archive member and checks all of these: the insert is
+refused, nothing lands, the delete, update, findAndModify and find of an
+archived document are refused, and the archived document is still there
+afterwards.
 
 ### A change stream that asks for the document
 

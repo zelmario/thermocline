@@ -2196,6 +2196,25 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			return c.send(out)
 		}
 	}
+	if err != nil && namesADocument(name) {
+		// The fast tier matched nothing and the archive could not be asked
+		// whether that was the truth, so its answer is the one thing not to
+		// send. On the box on 2026-11-26, with the archive's primary gone under
+		// the blog, deleteOne of an archived article was told deletedCount 0,
+		// and the article stayed live in the archive. interceptWrite returns
+		// the error for exactly this reason; it was sent the fast tier's answer
+		// here regardless.
+		c.r.Stats.Refused.Add(1)
+		c.cls = ClassRefused
+		c.log.Warn("refused a command the archive could not be asked about",
+			"command", name, "err", err)
+		if out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+			"thermocline: refusing this "+name+" because the fast tier matched nothing and the "+
+				"archive could not be asked whether it holds the document, so nothing can say whether "+
+				"it exists; retry once the archive is back: "+err.Error()); rerr == nil {
+			return c.send(out)
+		}
+	}
 	if err != nil {
 		c.log.Warn("routing failed, returning the fast tier's answer",
 			"command", name, "err", err)

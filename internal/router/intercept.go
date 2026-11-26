@@ -722,3 +722,15 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		"thermocline: refusing this query because %s. %s. To allow short answers instead, set router.completeness to permissive.",
 		because, remedy))
 }
+
+// namesADocument reports whether a command's interception resolves a miss
+// against the archive, so that failing to ask it leaves the fast tier's answer
+// saying a document does not exist when nothing knows. The others it
+// intercepts (listings and statistics) still answer from the fast tier.
+func namesADocument(name string) bool {
+	switch name {
+	case "find", "update", "delete", "findAndModify", "findandmodify":
+		return true
+	}
+	return false
+}

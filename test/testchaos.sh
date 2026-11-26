@@ -159,6 +159,7 @@ if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
   chk "an insert is refused while the archive is down" "REFUSED" "$OUT"
   chk "and nothing landed on the fast tier"            "0"       "$(H "print(db.getSiblingDB('shop').$NS.countDocuments({_id:'outage'}))")"
 
+
   # And a read of what the fast tier owns, which is what router.claim_grace is
   # for. A running router stops answering tiered reads about five seconds into
   # an archive outage, because the completeness claim lives on the archive and
@@ -229,6 +230,24 @@ if [ -z "$CLDNODES" ]; then echo "  SKIP  archive members not resolved"; else
   chk "a namespace never asked about is refused"        "REFUSED" \
       "$(docker exec $NODE mongosh --port 27104 -u dba -p secret --authenticationDatabase admin --quiet --eval "
           try { print(db.getSiblingDB('shop').tqbound.countDocuments({})); } catch(e) { print('REFUSED'); }" 2>&1 | tail -1)"
+
+  # Last, because each one waits out server selection, and the grace
+  # router's reads above are timed against its claim grace.
+  #
+  # A delete, an update and a read of a document only the archive holds. The
+  # fast tier matches nothing, and the router has to ask the archive whether
+  # that is the truth. It could not, and it sent the fast tier's answer anyway:
+  # on the box on 2026-11-26, with two of three archive members paused under the
+  # blog, deleteOne of an archived article was told deletedCount 0, and the
+  # article was still live in the archive afterwards.
+  OUTAGE_OP() { docker exec $NODE mongosh --port 27100 -u dba -p secret --authenticationDatabase admin --quiet --eval "
+    const c = db.getSiblingDB('shop').$NS;
+    try { const r = $1; print('ANSWERED ' + JSON.stringify(r)); }
+    catch(e) { print(e.message.indexOf('archive') >= 0 ? 'REFUSED' : 'OTHER: '+e.message.substring(0,60)); }" 2>&1 | tail -1; }
+  chk "a delete of an archived document is refused, not told 0" "REFUSED" "$(OUTAGE_OP "c.deleteOne({_id:'outage'}).deletedCount")"
+  chk "and so is an update of it"                               "REFUSED" "$(OUTAGE_OP "c.updateOne({_id:'outage'},{\$set:{v:'changed'}}).matchedCount")"
+  chk "and a findAndModify of it"                               "REFUSED" "$(OUTAGE_OP "c.findOneAndDelete({_id:'outage'})")"
+  chk "and a read of it by _id"                                 "REFUSED" "$(OUTAGE_OP "c.findOne({_id:'outage'})")"
 
   for n in $CLDNODES; do docker exec $n systemctl start mongod; done
   for _ in $(seq 1 60); do
