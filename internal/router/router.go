@@ -2206,12 +2206,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		// here regardless.
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
-		c.log.Warn("refused a command the archive could not be asked about",
+		//
+		// Either tier can be the one that failed: the archive read, or the
+		// copy-up onto a fast tier with no primary, so the message names
+		// neither as the cause and the error that follows says which.
+		c.log.Warn("refused a command whose miss could not be settled against the archive",
 			"command", name, "err", err)
 		if out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
 			"thermocline: refusing this "+name+" because the fast tier matched nothing and the "+
-				"archive could not be asked whether it holds the document, so nothing can say whether "+
-				"it exists; retry once the archive is back: "+err.Error()); rerr == nil {
+				"archive's copy could not be looked up or brought back, so nothing can say whether "+
+				"the document exists; retry once both tiers answer: "+err.Error()); rerr == nil {
 			return c.send(out)
 		}
 	}
