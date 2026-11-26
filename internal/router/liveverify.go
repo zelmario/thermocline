@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/zelmario/thermocline/internal/livecache"
+	"github.com/zelmario/thermocline/internal/meta"
 )
 
 // The live cache's verify mode, router.live_cache.verify_log.
@@ -204,7 +205,21 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
 	}
-	if c.tieOrderOnly(chk, real, why, nil) {
+	// Ties at the limit, judged at the cache's position: the client's answer
+	// was read later, so each document only the cache kept is read alone at
+	// that position to prove it was the database's. Measured on the box on
+	// 2026-11-26: two orders placed in the same millisecond, the cache keeping
+	// one under a limit of 1 and mongod the other, both on the archive, so
+	// the fast tier's snapshot could not judge it.
+	var tieAt *bson.Timestamp
+	if chk.pos.Closed.T != 0 {
+		t := chk.pos.Closed
+		if later(chk.need, t) {
+			t = chk.need
+		}
+		tieAt = &t
+	}
+	if c.tieOrderOnly(chk, real, why, tieAt) {
 		return
 	}
 	if verdict := c.judgeDocument(chk, real, why); verdict != "" {
@@ -310,6 +325,10 @@ func (c *conn) sameAt(chk *liveCheck, doc bson.Raw, at bson.Timestamp) bool {
 		return false
 	}
 	sb, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	if ok && len(sb) == 0 {
+		d, _, found := c.archivedAt(ctx, chk, doc.Lookup("_id"), at)
+		return found && bytes.Equal(d, doc)
+	}
 	return ok && len(sb) == 1 && bytes.Equal(sb[0], doc)
 }
 
@@ -625,32 +644,20 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 		return ""
 	}
 	sb, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
-	if ok && len(sb) == 0 && c.r.cfg.Manages(chk.ns) {
-		// Not on the fast tier at the cache's position: the document was on
-		// the archive then. When the first thing the fast tier's oplog does to
-		// it after that position is an insert, that insert is the copy-up, and
-		// it brought the archive's copy as it stood: no write reaches an
-		// archived document without one first. Measured on the box on
-		// 2026-11-26 with two shops writing in transactions: an order the
-		// cache held as placed, copied up and shipped by another shopper a
-		// moment later, was logged as a MISMATCH nothing could judge.
-		at, ok := c.reappeared(ctx, chk.ns, id, judgeAt)
-		if !ok {
+	if ok && len(sb) == 0 {
+		// Not on the fast tier at the cache's position: the archive's
+		// document then. Measured on the box on 2026-11-26 with two shops
+		// writing in transactions: an order the cache held as placed, copied
+		// up and shipped by another shopper a moment later, was logged as a
+		// MISMATCH nothing could judge. See archivedAt.
+		d, how, found := c.archivedAt(ctx, chk, id, judgeAt)
+		if !found {
 			return ""
 		}
-		find[len(find)-1] = bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: at}}}
-		out, err = c.r.hot.Database(db).RunCommand(ctx, find).Raw()
-		if err != nil {
-			return ""
-		}
-		sb, ok = rawBatch(out.Lookup("cursor", "firstBatch"))
-		if !ok || len(sb) != 1 {
-			return ""
-		}
-		if bytes.Equal(sb[0], cb[i]) {
+		if bytes.Equal(d, cb[i]) {
 			return "race"
 		}
-		return "wrong at its position, as copied up at " + fmt.Sprint(at)
+		return "wrong at its position, " + how
 	}
 	if !ok || len(sb) != 1 {
 		return ""
@@ -661,10 +668,63 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 	return "wrong at its position"
 }
 
-// reappeared finds the first entry of the fast tier's oplog for one document
-// after a time, and returns its time when it is an insert, alone or inside a
-// transaction.
-func (c *conn) reappeared(ctx context.Context, ns string, id bson.RawValue, after bson.Timestamp) (bson.Timestamp, bool) {
+// archivedAt reads a document the fast tier did not hold at cluster time at,
+// as the client's projection shows it: the archive's document at that time.
+// how names which of two ways it was read. found is false when neither can
+// say.
+//
+// When the first thing the fast tier's oplog does to the document after at is
+// an insert, that insert is the copy-up, and it brought the archive's copy as
+// it stood: no write reaches an archived document without one first. When the
+// fast tier's oplog holds nothing for it from 30 seconds before at, nothing
+// has written it since mirroring last could, and the archive's copy now is
+// the one it held then.
+func (c *conn) archivedAt(ctx context.Context, chk *liveCheck, id bson.RawValue, at bson.Timestamp) (doc bson.Raw, how string, found bool) {
+	if !c.r.cfg.Manages(chk.ns) {
+		return nil, "", false
+	}
+	db, coll := splitNS(chk.ns)
+	find := bson.D{{Key: "find", Value: coll}, {Key: "limit", Value: 1}}
+	if pv, err := chk.cmd.LookupErr("projection"); err == nil {
+		find = append(find, bson.E{Key: "projection", Value: pv})
+	}
+	one := func(out bson.Raw, err error) (bson.Raw, bool) {
+		if err != nil {
+			return nil, false
+		}
+		b, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+		if !ok || len(b) != 1 {
+			return nil, false
+		}
+		return b[0], true
+	}
+	if ts, insert, ok := c.firstEntry(ctx, chk.ns, id, at); ok {
+		if !insert {
+			return nil, "", false
+		}
+		q := append(bson.D{}, find...)
+		q = append(q, bson.E{Key: "filter", Value: bson.D{{Key: "_id", Value: id}}},
+			bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: ts}}})
+		d, ok := one(c.r.hot.Database(db).RunCommand(ctx, q).Raw())
+		return d, fmt.Sprintf("as copied up at %v", ts), ok
+	}
+	quiet := bson.Timestamp{T: at.T - 30, I: 0}
+	if at.T <= 30 {
+		return nil, "", false
+	}
+	if _, _, ok := c.firstEntry(ctx, chk.ns, id, quiet); ok {
+		return nil, "", false
+	}
+	q := append(bson.D{}, find...)
+	q = append(q, bson.E{Key: "filter", Value: bson.D{{Key: "_id", Value: id}, {Key: meta.TombstoneField, Value: bson.D{{Key: "$exists", Value: false}}}}})
+	d, ok := one(c.r.cold.Database(db).RunCommand(ctx, q).Raw())
+	return d, "as the archive holds it, untouched since", ok
+}
+
+// firstEntry finds the first entry of the fast tier's oplog for one document
+// after a time: its time, and whether it is an insert, alone or inside a
+// transaction. ok is false when there is none.
+func (c *conn) firstEntry(ctx context.Context, ns string, id bson.RawValue, after bson.Timestamp) (at bson.Timestamp, insert, ok bool) {
 	match := bson.D{{Key: "$or", Value: bson.A{
 		bson.D{{Key: "o._id", Value: id}}, bson.D{{Key: "o2._id", Value: id}}}}}
 	filter := bson.D{{Key: "ts", Value: bson.D{{Key: "$gt", Value: after}}}, {Key: "$or", Value: bson.A{
@@ -677,17 +737,17 @@ func (c *conn) reappeared(ctx context.Context, ns string, id bson.RawValue, afte
 		{Key: "sort", Value: bson.D{{Key: "$natural", Value: 1}}}, {Key: "limit", Value: int32(1)},
 	}).Raw()
 	if err != nil {
-		return bson.Timestamp{}, false
+		return bson.Timestamp{}, false, false
 	}
-	b, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
-	if !ok || len(b) != 1 {
-		return bson.Timestamp{}, false
+	b, bok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	if !bok || len(b) != 1 {
+		return bson.Timestamp{}, false, false
 	}
-	t, inc, ok := b[0].Lookup("ts").TimestampOK()
-	if !ok {
-		return bson.Timestamp{}, false
+	t, inc, tok := b[0].Lookup("ts").TimestampOK()
+	if !tok {
+		return bson.Timestamp{}, false, false
 	}
-	return bson.Timestamp{T: t, I: inc}, firstOpIsInsert(b[0], ns, id)
+	return bson.Timestamp{T: t, I: inc}, firstOpIsInsert(b[0], ns, id), true
 }
 
 // firstOpIsInsert says whether an oplog entry's first operation on one
