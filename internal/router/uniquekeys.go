@@ -1466,7 +1466,7 @@ func (r *Router) RebuildKeys(ctx context.Context, namespaces []string) (map[stri
 		if len(idxs) == 0 {
 			continue
 		}
-		got, clash, _, err := r.claimExistingKeys(ctx, ns, idxs)
+		got, clash, _, err := r.claimExistingKeys(ctx, ns, idxs, false)
 		claimed[ns] = got
 		conflicts[ns] = clash
 		if err != nil {
@@ -1484,10 +1484,16 @@ func (r *Router) RebuildKeys(ctx context.Context, namespaces []string) (map[stri
 // together already break the constraint it is about to declare. See
 // newuniqueindex.go.
 //
-// firstClash names a key two live documents share, for the error message. The
-// walk does not stop there: the count is worth having, and mongod's own build
-// reports one key and finds them all the same way.
-func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []uniqueIndex) (claimed, conflicts int, firstClash string, err error) {
+// firstClash names a key two live documents share, for the error message.
+//
+// firstOnly stops the walk at the first clash, for a createIndexes that is
+// going to be refused over it. Walked to the end, a unique index on a field
+// that repeats in nearly every document kept the client waiting the whole
+// walk: on the box on 2026-11-26, {author: 1} on a million 3KB articles was
+// still walking after 19 minutes, where mongod refuses the same build at its
+// first duplicate. cline keys --rebuild walks to the end, because the count is
+// what it reports.
+func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []uniqueIndex, firstOnly bool) (claimed, conflicts int, firstClash string, err error) {
 	db, coll := splitNS(ns)
 
 	// The archive holds every document, so it is the authoritative walk. The
@@ -1500,7 +1506,7 @@ func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []unique
 		{r.cold, bson.D{meta.NotArchivedDeleted()}, true},
 		{r.hot, bson.D{}, false},
 	} {
-		got, clash, first, werr := r.claimWalk(ctx, src.client.Database(db).Collection(coll), src.filter, ns, idxs, src.fromArchive)
+		got, clash, first, werr := r.claimWalk(ctx, src.client.Database(db).Collection(coll), src.filter, ns, idxs, src.fromArchive, firstOnly)
 		claimed += got
 		conflicts += clash
 		if firstClash == "" {
@@ -1508,6 +1514,9 @@ func (r *Router) claimExistingKeys(ctx context.Context, ns string, idxs []unique
 		}
 		if werr != nil {
 			return claimed, conflicts, firstClash, werr
+		}
+		if firstOnly && conflicts > 0 {
+			break
 		}
 	}
 	return claimed, conflicts, firstClash, nil
@@ -1526,7 +1535,7 @@ const claimWorkers = 16
 
 // claimWalk claims the keys of every document one tier returns for filter.
 func (r *Router) claimWalk(ctx context.Context, c *mongo.Collection, filter bson.D, ns string,
-	idxs []uniqueIndex, fromArchive bool) (claimed, conflicts int, firstClash string, err error) {
+	idxs []uniqueIndex, fromArchive, firstOnly bool) (claimed, conflicts int, firstClash string, err error) {
 	cur, err := c.Find(ctx, filter)
 	if err != nil {
 		return 0, 0, "", err
@@ -1539,6 +1548,9 @@ func (r *Router) claimWalk(ctx context.Context, c *mongo.Collection, filter bson
 		mu   sync.Mutex
 		werr error
 		wg   sync.WaitGroup
+		// found is a clash with firstOnly: the walk stops, and that is
+		// its answer rather than a failure.
+		found bool
 	)
 	docs := make(chan []bson.Raw, claimWorkers*2)
 	for w := 0; w < claimWorkers; w++ {
@@ -1560,8 +1572,15 @@ func (r *Router) claimWalk(ctx context.Context, c *mongo.Collection, filter bson
 				if firstClash == "" {
 					firstClash = first
 				}
-				if derr != nil && werr == nil {
+				// A batch cut short by the stop below is not a failure of
+				// the walk: read as one, the clash it stopped for was let
+				// through as "could not check".
+				if derr != nil && werr == nil && !(found && errors.Is(derr, context.Canceled)) {
 					werr = derr
+					stop()
+				}
+				if firstOnly && conflicts > 0 && !found {
+					found = true
 					stop()
 				}
 				mu.Unlock()
@@ -1582,6 +1601,9 @@ func (r *Router) claimWalk(ctx context.Context, c *mongo.Collection, filter bson
 	}
 	close(docs)
 	wg.Wait()
+	if found {
+		return claimed, conflicts, firstClash, ctx.Err()
+	}
 	if werr != nil {
 		return claimed, conflicts, firstClash, werr
 	}

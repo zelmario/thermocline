@@ -123,7 +123,7 @@ func (c *conn) claimForUniqueIndex(ctx context.Context, msg *wire.Message, ns st
 			"documents have no claim on their keys until something makes one",
 		"note", "this walks both tiers, so the command waits for it")
 
-	claimed, conflicts, clash, err := c.r.claimExistingKeys(bg, ns, idxs)
+	claimed, conflicts, clash, err := c.r.claimExistingKeys(bg, ns, idxs, true)
 	if errors.Is(err, errArchiveBehind) {
 		// Not built over keys it could not judge. See clashIsFreshOrBehind.
 		c.r.releaseIndexClaims(ns, indexNames(idxs))
@@ -142,6 +142,12 @@ func (c *conn) claimForUniqueIndex(ctx context.Context, msg *wire.Message, ns st
 			"effect", "the index is built over the fast tier alone, and a duplicate whose other "+
 				"half is in the archive is neither refused now nor refused later",
 			"action", "run cline keys --rebuild, which reports any duplicates it finds")
+		// The rows the walk wrote before it failed are held like a finished
+		// walk's, so a build the fast tier then refuses gives them back.
+		// Left behind, 300 rows named an index that was never built, and
+		// the next router warned about claims for an index no tier has.
+		c.pendingIndexKeys = append(c.pendingIndexKeys, indexNames(idxs)...)
+		c.pendingIndexNS = ns
 		return nil, false
 	}
 	if conflicts == 0 {
@@ -177,8 +183,7 @@ func (c *conn) claimForUniqueIndex(ctx context.Context, msg *wire.Message, ns st
 	out, rerr := c.r.duplicateKeyError(msg.Header.RequestID, msg.Header.RequestID,
 		"E11000 duplicate key error collection: "+ns+" index: "+indexNames(idxs)[0]+
 			" dup key: "+clash+" :: thermocline: refusing to build this unique index, because "+
-			ns+" already holds "+strconv.Itoa(conflicts)+" key(s) held by more than one live "+
-			"document. "+
+			ns+" already holds a key held by more than one live document. "+
 			"The fast tier would have built it: the duplicates are split across the tiers and "+
 			"its own build sees only the half that is here, so the index would exist and the "+
 			"constraint would not. Resolve the duplicates and create it again; cline keys "+
