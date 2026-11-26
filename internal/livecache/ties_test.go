@@ -36,3 +36,47 @@ func TestTiesReordered(t *testing.T) {
 		}
 	}
 }
+
+func TestTiesAtTheLimit(t *testing.T) {
+	doc := func(id int, views any) bson.Raw {
+		b, _ := bson.Marshal(bson.D{{Key: "_id", Value: id}, {Key: "views", Value: views}})
+		return b
+	}
+	noViews := func(id int) bson.Raw {
+		b, _ := bson.Marshal(bson.D{{Key: "_id", Value: id}})
+		return b
+	}
+	byViews := []SortKey{{Field: "views", Desc: true}}
+	a, b := doc(1, 50), doc(2, 48)
+	x, y, z := doc(3, 48), doc(4, 48), doc(5, 47)
+	cases := []struct {
+		name  string
+		sort  []SortKey
+		limit int
+		p, q  []bson.Raw
+		want  []int
+	}{
+		{"another tie kept at the cut", byViews, 3, []bson.Raw{a, b, x}, []bson.Raw{a, b, y}, []int{2}},
+		{"two kept, in another order", byViews, 3, []bson.Raw{a, x, b}, []bson.Raw{a, b, y}, []int{1}},
+		{"the outsider does not tie the cut", byViews, 3, []bson.Raw{a, b, z}, []bson.Raw{a, b, y}, nil},
+		{"a tie above the cut is not at the cut", byViews, 3, []bson.Raw{a, x, z}, []bson.Raw{a, y, z}, nil},
+		{"short of the limit holds every match", byViews, 4, []bson.Raw{a, b, x}, []bson.Raw{a, b, y}, nil},
+		{"same documents is not this", byViews, 3, []bson.Raw{a, b, x}, []bson.Raw{a, x, b}, nil},
+		{"same _id, other contents", byViews, 3, []bson.Raw{a, b, x}, []bson.Raw{doc(1, 49), b, y}, nil},
+		{"sort ending in _id", []SortKey{{Field: "views"}, {Field: "_id"}}, 3, []bson.Raw{a, b, x}, []bson.Raw{a, b, y}, nil},
+		{"sort field missing", byViews, 2, []bson.Raw{a, noViews(6)}, []bson.Raw{a, noViews(7)}, nil},
+		{"int and double tie", byViews, 2, []bson.Raw{a, doc(8, 48)}, []bson.Raw{a, doc(9, 48.0)}, []int{1}},
+	}
+	for _, tc := range cases {
+		got, ok := TiesAtTheLimit(tc.sort, tc.limit, tc.p, tc.q)
+		if ok != (tc.want != nil) || len(got) != len(tc.want) {
+			t.Errorf("%s: got %v %v, want %v", tc.name, got, ok, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+			}
+		}
+	}
+}

@@ -1963,6 +1963,84 @@ func TiesReordered(sort []SortKey, a, b []bson.Raw) bool {
 	return reordered
 }
 
+// TiesAtTheLimit is TiesReordered for an answer cut by a limit, where the
+// documents that tie on the sort at the cut need not be the same ones: mongod
+// keeps any of them. Measured on 2026-11-26 with the most viewed articles: the
+// cache and a snapshot of the fast tier at its position both held ten, the
+// last with 48 views, and the tenth was another article with 48. Both lists
+// must be full and agree on the sort values position by position, a document
+// in both must be the same bytes, and one in a single list must tie the last.
+// It returns the positions in a of the documents b does not hold, which the
+// caller must still prove are the database's, since a stale copy of one can
+// tie the cut as well as a fresh one. A sort field missing from a document,
+// as when projected away, is not a tie here.
+func TiesAtTheLimit(sort []SortKey, limit int, a, b []bson.Raw) ([]int, bool) {
+	if len(sort) == 0 || sort[len(sort)-1].Field == "_id" || limit <= 0 || len(a) != limit || len(b) != limit {
+		return nil, false
+	}
+	for _, s := range sort {
+		if strings.Contains(s.Field, ".") {
+			return nil, false
+		}
+	}
+	tie := func(x, y bson.Raw) bool {
+		for _, s := range sort {
+			if _, err := x.LookupErr(s.Field); err != nil {
+				return false
+			}
+			if _, err := y.LookupErr(s.Field); err != nil {
+				return false
+			}
+			if !strictTie(x, y, s.Field) {
+				return false
+			}
+		}
+		return true
+	}
+	ids := func(l []bson.Raw) (map[string]bson.Raw, bool) {
+		out := make(map[string]bson.Raw, len(l))
+		for _, d := range l {
+			v, err := d.LookupErr("_id")
+			if err != nil {
+				return nil, false
+			}
+			out[string(rune(v.Type))+string(v.Value)] = d
+		}
+		return out, len(out) == len(l)
+	}
+	ai, ok1 := ids(a)
+	bi, ok2 := ids(b)
+	if !ok1 || !ok2 {
+		return nil, false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) && !tie(a[i], b[i]) {
+			return nil, false
+		}
+	}
+	var outsiders []int
+	for i, d := range a {
+		v := d.Lookup("_id")
+		other, in := bi[string(rune(v.Type))+string(v.Value)]
+		switch {
+		case in && !bytes.Equal(other, d):
+			return nil, false
+		case !in:
+			if !tie(d, a[limit-1]) {
+				return nil, false
+			}
+			outsiders = append(outsiders, i)
+		}
+	}
+	for _, d := range b {
+		v := d.Lookup("_id")
+		if _, in := ai[string(rune(v.Type))+string(v.Value)]; !in && !tie(d, b[limit-1]) {
+			return nil, false
+		}
+	}
+	return outsiders, len(outsiders) > 0
+}
+
 func strictTie(a, b bson.Raw, field string) bool {
 	va, ea := a.LookupErr(field)
 	vb, eb := b.LookupErr(field)

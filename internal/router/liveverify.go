@@ -160,6 +160,12 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\tnot allowed, and mongod refused it\n", chk.ns))
 		return
 	}
+	// The client was told the member stepped down, and its driver asks again.
+	// mongod gave no answer to compare with, which is not a different one.
+	if !replyOK(real) && isFailoverReply(real) {
+		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, RealReplyFailover, chk.shape))
+		return
+	}
 	// Exact where it can be: the database read at the cache's own position.
 	if chk.pos.Closed.T != 0 {
 		if !c.r.cfg.Manages(chk.ns) {
@@ -191,7 +197,7 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
 	}
-	if c.tieOrderOnly(chk, real, why) {
+	if c.tieOrderOnly(chk, real, why, nil) {
 		return
 	}
 	if verdict := c.judgeDocument(chk, real, why); verdict != "" {
@@ -246,22 +252,71 @@ func liveDiffer(cached, real bson.Raw) string {
 // tieOrderOnly writes a SKIP, and reports true, when a find's two answers
 // differ only in the order of documents that tie on the sort. That order is
 // not the cache's to match: see livecache.TiesReordered.
-func (c *conn) tieOrderOnly(chk *liveCheck, real bson.Raw, why string) bool {
+//
+// at is the cluster time real was read at, when it is a snapshot of the fast
+// tier. Only then may the two hold different documents tying at the limit,
+// each of the cache's own read alone at that time to prove it is the
+// database's: compared with the client's answer, read later, a document could
+// also have moved in between.
+func (c *conn) tieOrderOnly(chk *liveCheck, real bson.Raw, why string, at *bson.Timestamp) bool {
 	if chk.q.Kind != livecache.KindFind || !strings.HasPrefix(why, "document ") {
 		return false
 	}
 	cb, ok1 := rawBatch(chk.cached.Lookup("cursor", "firstBatch"))
 	rb, ok2 := rawBatch(real.Lookup("cursor", "firstBatch"))
-	if !ok1 || !ok2 || !livecache.TiesReordered(chk.q.Sort, cb, rb) {
+	if !ok1 || !ok2 {
 		return false
 	}
-	c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, TiesInAnotherOrder, chk.shape))
+	if livecache.TiesReordered(chk.q.Sort, cb, rb) {
+		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, TiesInAnotherOrder, chk.shape))
+		return true
+	}
+	if at == nil || chk.q.Skip != 0 {
+		return false
+	}
+	outsiders, ok := livecache.TiesAtTheLimit(chk.q.Sort, chk.q.Limit, cb, rb)
+	if !ok {
+		return false
+	}
+	for _, i := range outsiders {
+		if !c.sameAt(chk, cb[i], *at) {
+			return false
+		}
+	}
+	c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, TiesAtTheLimit, chk.shape))
 	return true
 }
+
+// sameAt reports whether doc, as the cache answered it, is the fast tier's
+// document with its _id at cluster time at, read with the client's projection.
+func (c *conn) sameAt(chk *liveCheck, doc bson.Raw, at bson.Timestamp) bool {
+	db, coll := splitNS(chk.ns)
+	find := bson.D{{Key: "find", Value: coll}, {Key: "filter", Value: bson.D{{Key: "_id", Value: doc.Lookup("_id")}}}, {Key: "limit", Value: 1}}
+	if pv, err := chk.cmd.LookupErr("projection"); err == nil {
+		find = append(find, bson.E{Key: "projection", Value: pv})
+	}
+	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: at}}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := c.r.hot.Database(db).RunCommand(ctx, find).Raw()
+	if err != nil {
+		return false
+	}
+	sb, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	return ok && len(sb) == 1 && bytes.Equal(sb[0], doc)
+}
+
+// TiesAtTheLimit is the SKIP reason for an answer that differs from mongod's
+// only in which documents tying at the limit it kept.
+const TiesAtTheLimit = "ties at the limit"
 
 // TiesInAnotherOrder is the SKIP reason for an answer whose only difference
 // is the order among documents that tie on the sort.
 const TiesInAnotherOrder = "ties in another order"
+
+// RealReplyFailover is the SKIP reason for a read mongod refused because the
+// member it reached had stepped down.
+const RealReplyFailover = "the real reply is a failover error"
 
 // differingDocs adds the two documents a "document N" difference names. The
 // replies are clipped at 1500 characters, so a difference past the first few
@@ -339,7 +394,7 @@ func (c *conn) liveVerifyExact(chk *liveCheck) {
 			return
 		}
 	}
-	if c.tieOrderOnly(chk, snap, why) {
+	if c.tieOrderOnly(chk, snap, why, &at[len(at)-1]) {
 		return
 	}
 	c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
@@ -466,7 +521,8 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 	ci, si := ids(cb), ids(sb)
 	for k := range ci {
 		if !si[k] {
-			return false
+			// Ties at the limit, or a document the archive alone holds.
+			return c.tieOrderOnly(chk, snap, liveDiffer(chk.cached, snap), &judgeAt)
 		}
 	}
 	why := liveDiffer(chk.cached, snap)
@@ -477,7 +533,7 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 			why = ""
 		}
 	}
-	if why != "" && c.tieOrderOnly(chk, snap, why) {
+	if why != "" && c.tieOrderOnly(chk, snap, why, &judgeAt) {
 		return true
 	}
 	if why != "" {
