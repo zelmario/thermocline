@@ -391,7 +391,7 @@ func (c *conn) liveVerifyExact(chk *liveCheck) {
 	// the client: it must equal the database at that write, unless the write
 	// does not change it. So the position it is judged at is the later one.
 	if later(chk.need, chk.pos.Closed) {
-		at = []bson.Timestamp{chk.need}
+		at = judgeTimes(chk.need, chk.pos)
 	}
 	var why string
 	var snap bson.Raw
@@ -418,6 +418,24 @@ func (c *conn) liveVerifyExact(chk *liveCheck) {
 	c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
 	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact at %v\tcmd=%s\tcache=%s\treal=%s%s\n",
 		chk.ns, took, why, at, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap), differingDocs(chk.cached, snap, why)))
+}
+
+// judgeTimes is when a cached answer may stand, for a client that must see a
+// write this router acknowledged at need, later than the cache's Closed: at
+// need itself, and at Applied when that is later still.
+//
+// Judged at need alone, an answer at Applied was a MISMATCH. With two routers
+// on the blog, router 2's cache stood at Closed {T,133} and Applied {T,135},
+// and router 2 had inserted a comment at {T,134}. The answer held the view
+// counted at {T,135}, which the database at {T,134} did not have yet: one
+// more view than the snapshot, on the most viewed article, twice in 485,000
+// answers. The answer was the database at Applied, exactly.
+func judgeTimes(need bson.Timestamp, pos livecache.Position) []bson.Timestamp {
+	at := []bson.Timestamp{need}
+	if later(pos.Applied, need) {
+		at = append(at, pos.Applied)
+	}
+	return at
 }
 
 // snapshotAnswer runs the client's read on the fast tier at one cluster time,
@@ -544,9 +562,10 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 		}
 	}
 	why := liveDiffer(chk.cached, snap)
-	if why != "" && judgeAt == chk.pos.Closed && chk.pos.Applied != chk.pos.Closed && chk.pos.Applied.T != 0 {
-		// Part of a group applied: the state at its time is the other answer
-		// the cache may give. See liveVerifyExact.
+	if why != "" && later(chk.pos.Applied, judgeAt) {
+		// The state at Applied is the other answer the cache may give, and
+		// the only one when a write this router acknowledged lies between
+		// Closed and Applied. See judgeTimes.
 		if at, aerr := c.snapshotAnswer(chk, chk.pos.Applied); aerr == nil && liveDiffer(chk.cached, at) == "" {
 			why = ""
 		}

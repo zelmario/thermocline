@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/zelmario/thermocline/internal/livecache"
 )
 
 func TestProxyRefusal(t *testing.T) {
@@ -29,5 +31,31 @@ func TestProxyRefusal(t *testing.T) {
 	noMsg, _ := bson.Marshal(bson.D{{Key: "ok", Value: 0.0}})
 	if proxyRefusal(noMsg) {
 		t.Error("a reply without errmsg read as a refusal")
+	}
+}
+
+func TestJudgeTimes(t *testing.T) {
+	ts := func(i uint32) bson.Timestamp { return bson.Timestamp{T: 100, I: i} }
+	cases := []struct {
+		name string
+		need bson.Timestamp
+		pos  livecache.Position
+		want []bson.Timestamp
+	}{
+		{"applied past need: both", ts(134), livecache.Position{Closed: ts(133), Applied: ts(135)}, []bson.Timestamp{ts(134), ts(135)}},
+		{"applied at need: need alone", ts(135), livecache.Position{Closed: ts(133), Applied: ts(135)}, []bson.Timestamp{ts(135)}},
+		{"applied before need: need alone", ts(136), livecache.Position{Closed: ts(133), Applied: ts(135)}, []bson.Timestamp{ts(136)}},
+	}
+	for _, tc := range cases {
+		got := judgeTimes(tc.need, tc.pos)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+			}
+		}
 	}
 }
