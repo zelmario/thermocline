@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -190,6 +191,9 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\n", chk.ns, took, chk.shape))
 		return
 	}
+	if c.tieOrderOnly(chk, real, why) {
+		return
+	}
 	if verdict := c.judgeDocument(chk, real, why); verdict != "" {
 		if verdict == "race" {
 			c.r.liveVerify.write(fmt.Sprintf("RACE\t%s\t%s\t%s\t%s\n", chk.ns, took, chk.shape, why))
@@ -198,8 +202,8 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		why += ", " + verdict
 	}
 	c.log.Warn("the live cache would have answered differently", "ns", chk.ns, "why", why)
-	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\tcmd=%s\tcache=%s\treal=%s\n",
-		chk.ns, took, why, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(real)))
+	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\tcmd=%s\tcache=%s\treal=%s%s\n",
+		chk.ns, took, why, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(real), differingDocs(chk.cached, real, why)))
 }
 
 // liveDiffer says how two replies differ in what a client reads from them,
@@ -237,6 +241,47 @@ func liveDiffer(cached, real bson.Raw) string {
 		}
 	}
 	return ""
+}
+
+// tieOrderOnly writes a SKIP, and reports true, when a find's two answers
+// differ only in the order of documents that tie on the sort. That order is
+// not the cache's to match: see livecache.TiesReordered.
+func (c *conn) tieOrderOnly(chk *liveCheck, real bson.Raw, why string) bool {
+	if chk.q.Kind != livecache.KindFind || !strings.HasPrefix(why, "document ") {
+		return false
+	}
+	cb, ok1 := rawBatch(chk.cached.Lookup("cursor", "firstBatch"))
+	rb, ok2 := rawBatch(real.Lookup("cursor", "firstBatch"))
+	if !ok1 || !ok2 || !livecache.TiesReordered(chk.q.Sort, cb, rb) {
+		return false
+	}
+	c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, TiesInAnotherOrder, chk.shape))
+	return true
+}
+
+// TiesInAnotherOrder is the SKIP reason for an answer whose only difference
+// is the order among documents that tie on the sort.
+const TiesInAnotherOrder = "ties in another order"
+
+// differingDocs adds the two documents a "document N" difference names. The
+// replies are clipped at 1500 characters, so a difference past the first few
+// documents of a listing was logged without the documents that differ: a
+// mismatch on the ninth of ten articles showed eight equal ones and stopped.
+func differingDocs(cached, real bson.Raw, why string) string {
+	var i int
+	if _, err := fmt.Sscanf(why, "document %d", &i); err != nil {
+		return ""
+	}
+	cb, ok1 := rawBatch(cached.Lookup("cursor", "firstBatch"))
+	rb, ok2 := rawBatch(real.Lookup("cursor", "firstBatch"))
+	if !ok1 || !ok2 || i >= len(cb) || i >= len(rb) {
+		return ""
+	}
+	out := ""
+	for j := i; j < len(cb) && j < len(rb) && j < i+3; j++ {
+		out += fmt.Sprintf("\tcache[%d]=%s\treal[%d]=%s", j, trimJSON(cb[j]), j, trimJSON(rb[j]))
+	}
+	return out
 }
 
 func trimJSON(d bson.Raw) string {
@@ -294,9 +339,12 @@ func (c *conn) liveVerifyExact(chk *liveCheck) {
 			return
 		}
 	}
+	if c.tieOrderOnly(chk, snap, why) {
+		return
+	}
 	c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
-	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact at %v\tcmd=%s\tcache=%s\treal=%s\n",
-		chk.ns, took, why, at, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap)))
+	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact at %v\tcmd=%s\tcache=%s\treal=%s%s\n",
+		chk.ns, took, why, at, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap), differingDocs(chk.cached, snap, why)))
 }
 
 // snapshotAnswer runs the client's read on the fast tier at one cluster time,
@@ -429,10 +477,13 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 			why = ""
 		}
 	}
+	if why != "" && c.tieOrderOnly(chk, snap, why) {
+		return true
+	}
 	if why != "" {
 		c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
-		c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact on the fast tier at %v\tcmd=%s\tcache=%s\treal=%s\n",
-			chk.ns, took, why, judgeAt, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap)))
+		c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact on the fast tier at %v\tcmd=%s\tcache=%s\treal=%s%s\n",
+			chk.ns, took, why, judgeAt, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap), differingDocs(chk.cached, snap, why)))
 		return true
 	}
 	c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\texact\n", chk.ns, took, chk.shape))

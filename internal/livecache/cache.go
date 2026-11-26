@@ -1905,3 +1905,74 @@ func idKey(v bson.RawValue) (string, bool) {
 	}
 	return "", false
 }
+
+// TiesReordered reports whether two answers to a sorted find hold the same
+// documents, byte for byte, and differ only in the order of documents that tie
+// on every sort field. MongoDB promises no order among ties, and a sort under
+// a limit keeps the best so far in a heap, so its order among ties moves with
+// documents that are not even in the answer: measured on 2026-11-26, articles
+// with 19 views each came back 9th and 10th in one order from the cache and in
+// the other from mongod at the same position. Strict where sameSortValue is
+// lenient: a value this cannot key, or a dotted path, is not a tie here.
+func TiesReordered(sort []SortKey, a, b []bson.Raw) bool {
+	if len(sort) == 0 || sort[len(sort)-1].Field == "_id" || len(a) != len(b) {
+		return false
+	}
+	for _, s := range sort {
+		if strings.Contains(s.Field, ".") {
+			return false
+		}
+	}
+	idOf := func(d bson.Raw) (string, bool) {
+		v, err := d.LookupErr("_id")
+		if err != nil {
+			return "", false
+		}
+		return string(rune(v.Type)) + string(v.Value), true
+	}
+	byID := make(map[string]bson.Raw, len(b))
+	for _, d := range b {
+		k, ok := idOf(d)
+		if !ok {
+			return false
+		}
+		byID[k] = d
+	}
+	if len(byID) != len(b) {
+		return false
+	}
+	reordered := false
+	for i := range a {
+		k, ok := idOf(a[i])
+		if !ok {
+			return false
+		}
+		if other, ok := byID[k]; !ok || !bytes.Equal(other, a[i]) {
+			return false
+		}
+		if bytes.Equal(a[i], b[i]) {
+			continue
+		}
+		reordered = true
+		for _, s := range sort {
+			if !strictTie(a[i], b[i], s.Field) {
+				return false
+			}
+		}
+	}
+	return reordered
+}
+
+func strictTie(a, b bson.Raw, field string) bool {
+	va, ea := a.LookupErr(field)
+	vb, eb := b.LookupErr(field)
+	if ea != nil || eb != nil {
+		return ea != nil && eb != nil
+	}
+	if va.Type == vb.Type && bytes.Equal(va.Value, vb.Value) {
+		return true
+	}
+	ka, oka := valueKey(va)
+	kb, okb := valueKey(vb)
+	return oka && okb && ka == kb
+}
