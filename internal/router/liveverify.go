@@ -318,7 +318,7 @@ func (c *conn) sameAt(chk *liveCheck, doc bson.Raw, at bson.Timestamp) bool {
 		find = append(find, bson.E{Key: "projection", Value: pv})
 	}
 	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: at}}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := c.r.hot.Database(db).RunCommand(ctx, find).Raw()
 	if err != nil {
@@ -648,7 +648,7 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 		judgeAt = chk.need
 	}
 	find = append(find, bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: judgeAt}}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := c.r.hot.Database(db).RunCommand(ctx, find).Raw()
 	if err != nil {
@@ -687,9 +687,8 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 // When the first thing the fast tier's oplog does to the document after at is
 // an insert, that insert is the copy-up, and it brought the archive's copy as
 // it stood: no write reaches an archived document without one first. When the
-// fast tier's oplog holds nothing for it from 30 seconds before at, nothing
-// has written it since mirroring last could, and the archive's copy now is
-// the one it held then.
+// fast tier's oplog holds nothing for it after at and mirroring has passed at,
+// the archive's copy now is the one it held then.
 func (c *conn) archivedAt(ctx context.Context, chk *liveCheck, id bson.RawValue, at bson.Timestamp) (doc bson.Raw, how string, found bool) {
 	if !c.r.cfg.Manages(chk.ns) {
 		return nil, "", false
@@ -719,17 +718,35 @@ func (c *conn) archivedAt(ctx context.Context, chk *liveCheck, id bson.RawValue,
 		d, ok := one(c.r.hot.Database(db).RunCommand(ctx, q).Raw())
 		return d, fmt.Sprintf("as copied up at %v", ts), ok
 	}
-	quiet := bson.Timestamp{T: at.T - 30, I: 0}
-	if at.T <= 30 {
+	// Nothing on the fast tier since at, so the archive's copy is the
+	// document at at once mirroring has passed it: every write before at has
+	// reached it, a delete as a tombstone, and none since. A window of 30
+	// quiet seconds stood in for that first, and missed an order the evictor
+	// had moved 27 seconds before the cache's position.
+	if !c.mirroredPast(ctx, at) {
 		return nil, "", false
 	}
-	if _, _, ok := c.firstEntry(ctx, chk.ns, id, quiet); ok {
+	if _, _, ok := c.firstEntry(ctx, chk.ns, id, at); ok {
 		return nil, "", false
 	}
 	q := append(bson.D{}, find...)
 	q = append(q, bson.E{Key: "filter", Value: bson.D{{Key: "_id", Value: id}, {Key: meta.TombstoneField, Value: bson.D{{Key: "$exists", Value: false}}}}})
 	d, ok := one(c.r.cold.Database(db).RunCommand(ctx, q).Raw())
 	return d, "as the archive holds it, untouched since", ok
+}
+
+// mirroredPast waits up to 5 seconds for mirroring to have passed at.
+func (c *conn) mirroredPast(ctx context.Context, at bson.Timestamp) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rd := c.r.mirroredThrough(ctx); rd.known && rd.ts.T != 0 && !later(at, rd.ts) {
+			return true
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // firstEntry finds the first entry of the fast tier's oplog for one document
