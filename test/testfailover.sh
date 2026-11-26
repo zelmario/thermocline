@@ -216,6 +216,12 @@ echo "== a cursor opened before the change of primary, read after it =="
 # old member, so there was nowhere left to send it: measured on 2026-11-26, a
 # cursor read on after one write through the router got CursorNotFound 3 times
 # in 3, and straight to the set read on 3 times in 3. See parked.go.
+# With router.terminate_auth the connections are the router's own and pooled
+# by member, and the pool moved to the new primary the same way: 3 of 3
+# CursorNotFound before the fix. So both modes.
+for CURCFG in $BASE $FOCFG; do
+stopRouter
+startRouter $CURCFG
 waitForPrimary
 H "const c=db.getSiblingDB('shop').${NS}_cur; c.drop(); c.insertMany(Array.from({length:20},(_,i)=>({_id:i})))" >/dev/null
 CUR=$(docker exec -e TCNS="${NS}_cur" -e TCHOT="$HOT" $NODE mongosh "mongodb://dba:secret@127.0.0.1:27100/?authSource=admin&retryWrites=true" --quiet --eval '
@@ -229,7 +235,8 @@ CUR=$(docker exec -e TCNS="${NS}_cur" -e TCHOT="$HOT" $NODE mongosh "mongodb://d
   try { let n = 2; while (c.hasNext()) { c.next(); n++ } print("read " + n) }
   catch (e) { print(e.codeName || "error") }' 2>&1 | tail -1)
 waitForPrimary
-chk "the cursor reads on after the change of primary"    "read 20" "$CUR"
+chk "the cursor reads on after the change of primary ($(basename $CURCFG .yaml))" "read 20" "$CUR"
+done
 H "db.getSiblingDB('shop').${NS}_cur.drop(); db.getSiblingDB('shop').${NS}_cur_w.drop()" >/dev/null
 
 echo "== and while the fast tier has no primary at all =="

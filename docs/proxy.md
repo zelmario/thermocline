@@ -116,7 +116,12 @@ Range queries are governed by the watermark below.
   timeout, under the user the fast tier said it is, and sends a getMore the new
   primary does not know to that same user's kept connections: 3 of 3 read on.
   mongod ties a cursor to its user, so no client reaches a cursor its own user
-  could not. At most 64 are kept, the oldest closed first.
+  could not. At most 64 are kept, the oldest closed first. With
+  `router.terminate_auth` the pool had moved to the new primary the same way,
+  3 of 3 `CursorNotFound`; there the getMore is sent on a pooled connection to
+  each other member, and mongod's own rule that a cursor opened in a session
+  is read only in that session still holds: asked for from another session,
+  it refused 2 of 2.
 - **Read preference is not honoured. Every read is served by the primary.** This
   follows from proxied authentication and is the one limitation to weigh before a
   pilot. The proxy answers `hello` as a mongos, and a mongos routes by read
