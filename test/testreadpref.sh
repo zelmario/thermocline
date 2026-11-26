@@ -101,12 +101,17 @@ landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
 }
 
 echo "== control: straight to the replica set, so the profiler is trusted =="
-mongosh "$HOT&readPreference=secondary" --quiet \
-  --eval "db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('ctl-sec-$TAG').itcount()" >/dev/null 2>&1
+# Kept rather than thrown away. Once in a sweep of 2,319 checks no member
+# recorded this read, and with its output discarded nothing said whether the
+# read failed or which member answered it.
+CTLSEC=$(mongosh "$HOT&readPreference=secondary" --quiet \
+  --eval "const r=db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('ctl-sec-$TAG').itcount(); print(r + ' from ' + db.getMongo().getReadPrefMode())" 2>&1 | tail -2 | tr '\n' ' ')
 mongosh "$HOT&readPreference=primary" --quiet \
   --eval "db.getSiblingDB(process.env.TC_DB).$NS.find({}).comment('ctl-pri-$TAG').itcount()" >/dev/null 2>&1
 sleep 3
-chk "a secondary read lands on a secondary"             "secondary" "$(landed ctl-sec-$TAG)"
+CTLWHERE=$(landed ctl-sec-$TAG)
+chk "a secondary read lands on a secondary"             "secondary" "$CTLWHERE"
+[ "$CTLWHERE" = secondary ] || echo "      the control read said: $CTLSEC"
 chk "a primary read lands on the primary"               "PRIMARY"   "$(landed ctl-pri-$TAG)"
 
 echo "== through the router =="
