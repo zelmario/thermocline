@@ -191,7 +191,11 @@ chk "the count command with a query agrees too"              "$(TRUTH "{old:true
 chk "a filter matching only deleted orders counts none"      "0" "$(CNT "{n:{\$in:[0,1,2]}}")"
 C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(2)" >/dev/null
 CNT "{_id:{\$gte: ObjectId('000000000000000000000000')}}" >/dev/null
-PROF=$(C "const p=db.getSiblingDB(process.env.TC_DB).system.profile.find({op:'command','command.count':'trorders'}).toArray(); print(p.length+' '+p.reduce((a,x)=>a+(x.docsExamined||0),0))")
+# Only counts with a query: a router starting anywhere on this archive, in
+# another suite of the same sweep, sends {count: "trorders"} with none to
+# every collection it does not tier (warnAboutPartlyStrandedCollections), and
+# one landed here: 3 counts against 2.
+PROF=$(C "const p=db.getSiblingDB(process.env.TC_DB).system.profile.find({op:'command','command.count':'trorders','command.query':{\$exists:true}}).toArray(); print(p.length+' '+p.reduce((a,x)=>a+(x.docsExamined||0),0))")
 C "db.getSiblingDB(process.env.TC_DB).setProfilingLevel(0); db.getSiblingDB(process.env.TC_DB).system.profile.drop()" >/dev/null
 chk "a range over every order examines only the 3 deleted"   "2 3" "$PROF"
 
