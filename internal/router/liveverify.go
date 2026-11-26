@@ -215,8 +215,8 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		why += ", " + verdict
 	}
 	c.log.Warn("the live cache would have answered differently", "ns", chk.ns, "why", why)
-	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\tcmd=%s\tcache=%s\treal=%s%s\n",
-		chk.ns, took, why, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(real), differingDocs(chk.cached, real, why)))
+	c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\tpos=%v/%v from=%v merged=%v need=%v\tcmd=%s\tcache=%s\treal=%s%s\n",
+		chk.ns, took, why, chk.pos.Applied, chk.pos.Closed, chk.pos.From, chk.pos.Merged, chk.need, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(real), differingDocs(chk.cached, real, why)))
 }
 
 // liveDiffer says how two replies differ in what a client reads from them,
@@ -625,6 +625,33 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 		return ""
 	}
 	sb, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	if ok && len(sb) == 0 && c.r.cfg.Manages(chk.ns) {
+		// Not on the fast tier at the cache's position: the document was on
+		// the archive then. When the first thing the fast tier's oplog does to
+		// it after that position is an insert, that insert is the copy-up, and
+		// it brought the archive's copy as it stood: no write reaches an
+		// archived document without one first. Measured on the box on
+		// 2026-11-26 with two shops writing in transactions: an order the
+		// cache held as placed, copied up and shipped by another shopper a
+		// moment later, was logged as a MISMATCH nothing could judge.
+		at, ok := c.reappeared(ctx, chk.ns, id, judgeAt)
+		if !ok {
+			return ""
+		}
+		find[len(find)-1] = bson.E{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}, {Key: "atClusterTime", Value: at}}}
+		out, err = c.r.hot.Database(db).RunCommand(ctx, find).Raw()
+		if err != nil {
+			return ""
+		}
+		sb, ok = rawBatch(out.Lookup("cursor", "firstBatch"))
+		if !ok || len(sb) != 1 {
+			return ""
+		}
+		if bytes.Equal(sb[0], cb[i]) {
+			return "race"
+		}
+		return "wrong at its position, as copied up at " + fmt.Sprint(at)
+	}
 	if !ok || len(sb) != 1 {
 		return ""
 	}
@@ -632,6 +659,70 @@ func (c *conn) judgeDocument(chk *liveCheck, real bson.Raw, why string) string {
 		return "race"
 	}
 	return "wrong at its position"
+}
+
+// reappeared finds the first entry of the fast tier's oplog for one document
+// after a time, and returns its time when it is an insert, alone or inside a
+// transaction.
+func (c *conn) reappeared(ctx context.Context, ns string, id bson.RawValue, after bson.Timestamp) (bson.Timestamp, bool) {
+	match := bson.D{{Key: "$or", Value: bson.A{
+		bson.D{{Key: "o._id", Value: id}}, bson.D{{Key: "o2._id", Value: id}}}}}
+	filter := bson.D{{Key: "ts", Value: bson.D{{Key: "$gt", Value: after}}}, {Key: "$or", Value: bson.A{
+		bson.D{{Key: "ns", Value: ns}, {Key: "o._id", Value: id}},
+		bson.D{{Key: "ns", Value: ns}, {Key: "o2._id", Value: id}},
+		bson.D{{Key: "o.applyOps", Value: bson.D{{Key: "$elemMatch", Value: append(bson.D{{Key: "ns", Value: ns}}, match...)}}}},
+	}}}
+	out, err := c.r.hot.Database("local").RunCommand(ctx, bson.D{
+		{Key: "find", Value: "oplog.rs"}, {Key: "filter", Value: filter},
+		{Key: "sort", Value: bson.D{{Key: "$natural", Value: 1}}}, {Key: "limit", Value: int32(1)},
+	}).Raw()
+	if err != nil {
+		return bson.Timestamp{}, false
+	}
+	b, ok := rawBatch(out.Lookup("cursor", "firstBatch"))
+	if !ok || len(b) != 1 {
+		return bson.Timestamp{}, false
+	}
+	t, inc, ok := b[0].Lookup("ts").TimestampOK()
+	if !ok {
+		return bson.Timestamp{}, false
+	}
+	return bson.Timestamp{T: t, I: inc}, firstOpIsInsert(b[0], ns, id)
+}
+
+// firstOpIsInsert says whether an oplog entry's first operation on one
+// document is an insert.
+func firstOpIsInsert(e bson.Raw, ns string, id bson.RawValue) bool {
+	ops, err := e.LookupErr("o", "applyOps")
+	if err != nil {
+		op, _ := e.Lookup("op").StringValueOK()
+		return op == "i"
+	}
+	arr, ok := ops.ArrayOK()
+	if !ok {
+		return false
+	}
+	vals, err := arr.Values()
+	if err != nil {
+		return false
+	}
+	for _, v := range vals {
+		d, ok := v.DocumentOK()
+		if !ok {
+			continue
+		}
+		if n, _ := d.Lookup("ns").StringValueOK(); n != ns {
+			continue
+		}
+		for _, path := range [][]string{{"o", "_id"}, {"o2", "_id"}} {
+			got, err := d.LookupErr(path...)
+			if err == nil && got.Type == id.Type && bytes.Equal(got.Value, id.Value) {
+				op, _ := d.Lookup("op").StringValueOK()
+				return op == "i"
+			}
+		}
+	}
+	return false
 }
 
 // later reports whether a is after b.
