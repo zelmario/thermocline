@@ -246,14 +246,39 @@ func (w *Warmer) verifyClaim(ctx context.Context, rule config.WarmRule, from tim
 	return hotN < coldN, hotN, coldN, nil
 }
 
+// countSettle is how far before now countBothInWindow stops counting: longer
+// than a write takes to reach the archive.
+const countSettle = time.Minute
+
 // recheckDelay is how long verifyClaim waits before believing a shortfall.
 const recheckDelay = 3 * time.Second
 
-// countBothInWindow counts what each tier holds at or after from.
+// countBothInWindow counts what each tier holds at or after from, and before
+// countSettle ago.
+//
+// The two counts are taken one after the other, fast tier first, and a document
+// the application writes in between lands on the fast tier after its count and
+// is mirrored to the archive before the archive's. Open at the top, the archive
+// then counted more. Measured on 2026-11-26 with the blog posting 30 comments a
+// second through the proxy: 12 of 20 open counts had the archive ahead by 1 or
+// 2, and 0 of 20 with the window cut a minute ago. After each restart the
+// warmer discarded a true claim over it and scanned 340,000 comments again.
+// A document written now carries a date of now, so it falls past the cut; the
+// newest minute is checked by the next run.
 func (w *Warmer) countBothInWindow(ctx context.Context, rule config.WarmRule, from time.Time) (int64, int64, error) {
 	filter, err := windowFilter(rule, from)
 	if err != nil {
 		return 0, 0, err
+	}
+	if cut := time.Now().UTC().Add(-countSettle); cut.After(from) && len(filter) == 1 {
+		if rng, ok := filter[0].Value.(bson.D); ok {
+			if rule.UsesObjectIDTime() {
+				rng = append(rng, bson.E{Key: "$lt", Value: bson.NewObjectIDFromTimestamp(cut)})
+			} else {
+				rng = append(rng, bson.E{Key: "$lt", Value: cut})
+			}
+			filter[0].Value = rng
+		}
 	}
 	db, coll := splitNS(rule.NS)
 
