@@ -45,9 +45,11 @@ const fillTimeout = 10 * time.Second
 
 // inflight is a fill handed to a worker and the changes kept for it.
 type inflight struct {
-	q   Query
-	key string
-	p0  bson.Timestamp
+	// merged: the fill took the archive's head as well. See Position.
+	merged bool
+	q      Query
+	key    string
+	p0     bson.Timestamp
 	// point is the namespace and _id of a fill whose query names one _id,
 	// "" for any other. Only changes to that document can change its answer.
 	// See fillState.keep.
@@ -472,6 +474,7 @@ func (c *Cache) mergeFill(ctx context.Context, out fillResult, filter bson.D, fa
 		out.unproven, out.ok = true, true
 		return out
 	}
+	out.f.merged = true
 	if byID {
 		// The whole answer, found or not: an _id names one document.
 		out.docs, out.complete, out.ok = docs, true, true
@@ -551,6 +554,7 @@ func (c *Cache) installAt(f *inflight, docs []bson.Raw, complete bool, n int64, 
 		e.expires = until
 	}
 	e.from = f.p0
+	e.merged = f.merged
 	c.inherit(e, f.p0)
 	for _, ch := range f.buf {
 		if !after(ch.At, f.p0) {

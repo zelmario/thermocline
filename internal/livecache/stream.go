@@ -87,6 +87,7 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 	// first, and the largest event the stream has carried, to tell a batch
 	// mongod may have cut short. See cutShort.
 	batchN, batchBytes, biggest := 0, 0, 0
+	var batch []bson.Raw
 	var batchCursor int64
 	for {
 		if time.Since(said) >= 30*time.Second {
@@ -103,7 +104,9 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			batchN++
 			batchBytes += len(cs.Current)
 			biggest = max(biggest, len(cs.Current))
-			c.handle(cs.Current, skip, fs)
+			// Held to the end of the batch: an update's looked-up document can
+			// hold writes later in the same batch. See applyBatch.
+			batch = append(batch, append(bson.Raw(nil), cs.Current...))
 			// The end of a batch is a position the stream has passed even
 			// while it is never empty, which is when the pending marks wait
 			// longest for one. See Advance.
@@ -131,7 +134,10 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 				tok := cs.ResumeToken()
 				first := cs.ID() != batchCursor
 				batchCursor = cs.ID()
-				if at, ok := clusterTimeFromToken(tok); ok && !(cutShort(batchN, batchBytes, first, biggest) && eventToken(tok)) {
+				cut := cutShort(batchN, batchBytes, first, biggest) && eventToken(tok)
+				c.applyBatch(batch, cut, skip, fs)
+				batch = batch[:0]
+				if at, ok := clusterTimeFromToken(tok); ok && !cut {
 					c.Advance(at)
 				}
 				batchN, batchBytes = 0, 0
@@ -155,6 +161,85 @@ func (c *Cache) follow(ctx context.Context, hot, stream *mongo.Client, skip func
 			}
 		}
 	}
+}
+
+// applyBatch applies one batch of the stream's events, in order.
+//
+// An update event carries its document as looked up when the server built the
+// batch, not as the update left it, and MongoDB says so: the most current
+// majority-committed version. Applied as it came, a document updated again
+// later in the same batch went into the cache with that later write while the
+// cache's position was still the first update. Measured on the box on
+// 2026-11-26 with two routers on the blog and the stream on a secondary two
+// seconds behind: an article answered with 6,749 views at a position where it
+// had 6,716, the 33 views counted in the two seconds the batch spanned.
+//
+// The lookup reads a majority snapshot no later than the batch's own end, so
+// in a batch the server ended on its own every write it can hold is an event of
+// that batch. A namespace with a document updated and then changed again in
+// the batch is held, as a write of the router's own is, until the stream has
+// applied that document's last event: from before the first is applied, so no
+// read sees it ahead. A batch the server may have cut short ends before writes
+// the lookups may hold, so a namespace it updates is dropped before it is
+// applied, and filled again from snapshots read at the stream's position.
+func (c *Cache) applyBatch(batch []bson.Raw, cut bool, skip func(ns string) bool, fs *fillState) {
+	c.holdLookups(batch, cut, fs)
+	for _, ev := range batch {
+		c.handle(ev, skip, fs)
+	}
+}
+
+// holdLookups is applyBatch's hold, taken before any event of the batch is
+// applied.
+func (c *Cache) holdLookups(batch []bson.Raw, cut bool, fs *fillState) {
+	last := map[string]bson.Timestamp{}
+	events := map[string]int{}
+	updated := map[string]bool{}
+	for _, ev := range batch {
+		k, ns, at, op, ok := eventDoc(ev)
+		if !ok {
+			continue
+		}
+		events[k]++
+		last[k] = at
+		if op == "update" {
+			updated[ns] = true
+		}
+	}
+	if cut {
+		for ns := range updated {
+			c.DropNS(ns)
+			fs.forget(ns)
+		}
+	} else {
+		for _, ev := range batch {
+			k, ns, _, op, ok := eventDoc(ev)
+			if ok && op == "update" && events[k] > 1 {
+				c.NoteWrite(ns, last[k])
+			}
+		}
+	}
+}
+
+// eventDoc reads which document an event is about: its namespace and _id as
+// one key, the namespace, its time and its operation. ok is false for an event
+// about no single document.
+func eventDoc(ev bson.Raw) (key, ns string, at bson.Timestamp, op string, ok bool) {
+	op, _ = ev.Lookup("operationType").StringValueOK()
+	db, _ := ev.Lookup("ns", "db").StringValueOK()
+	coll, _ := ev.Lookup("ns", "coll").StringValueOK()
+	t, i, tok := ev.Lookup("clusterTime").TimestampOK()
+	id, err := ev.LookupErr("documentKey", "_id")
+	if db == "" || coll == "" || !tok || err != nil {
+		return "", "", bson.Timestamp{}, "", false
+	}
+	ns = db + "." + coll
+	idk, iok := idKey(id)
+	if !iok {
+		// An _id this cannot key is held by its namespace instead.
+		idk = "\x00ns"
+	}
+	return ns + "\x00" + idk, ns, bson.Timestamp{T: t, I: i}, op, true
 }
 
 func (c *Cache) handle(ev bson.Raw, skip func(ns string) bool, fs *fillState) {

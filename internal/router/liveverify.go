@@ -575,8 +575,9 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 	}
 	if why != "" {
 		c.log.Warn("the live cache answered differently from mongod at its own position", "ns", chk.ns, "why", why)
-		c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact on the fast tier at %v\tcmd=%s\tcache=%s\treal=%s%s\n",
-			chk.ns, took, why, judgeAt, trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap), differingDocs(chk.cached, snap, why)))
+		c.r.liveVerify.write(fmt.Sprintf("MISMATCH\t%s\t%s\t%s\texact on the fast tier at %v\tpos=%v/%v from=%v merged=%v\tcmd=%s\tcache=%s\treal=%s%s\n",
+			chk.ns, took, why, judgeAt, chk.pos.Closed, chk.pos.Applied, chk.pos.From, chk.pos.Merged,
+			trimJSON(chk.cmd), trimJSON(chk.cached), trimJSON(snap), differingDocs(chk.cached, snap, why)))
 		return true
 	}
 	c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\texact\n", chk.ns, took, chk.shape))

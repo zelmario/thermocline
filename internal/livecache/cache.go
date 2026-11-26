@@ -291,6 +291,8 @@ type entry struct {
 	// from is the position the entry was read at. Everything at or before it
 	// is in what was read, so an insert there is not counted again. See Apply.
 	from bson.Timestamp
+	// merged: the fill took the archive's head as well. See Position.
+	merged bool
 }
 
 // tieredTTL is how long an entry on a tiered namespace is kept before it is
@@ -722,6 +724,11 @@ func (c *Cache) Get(q Query) (bson.Raw, bool) {
 // Applied, or it is wrong; verify mode reads mongod at both to tell.
 type Position struct {
 	Applied, Closed bson.Timestamp
+	// From and Merged describe the entry the answer came from, for verify
+	// mode's MISMATCH lines: the position its fill read at, and whether the
+	// fill merged the archive's head in.
+	From   bson.Timestamp
+	Merged bool
 }
 
 // GetAt is Get, with the position the answer stands for, read under the same
@@ -792,7 +799,7 @@ func (c *Cache) GetAt(q Query) (bson.Raw, Position, bool) {
 	}
 	c.lru.MoveToFront(e.el)
 	u.hits++
-	pos := Position{Applied: c.applied, Closed: c.closed}
+	pos := Position{Applied: c.applied, Closed: c.closed, From: e.from, Merged: e.merged}
 	var reply bson.Raw
 	if q.Kind == KindFind {
 		start, end := q.window(len(e.docs))
