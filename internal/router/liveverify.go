@@ -166,6 +166,13 @@ func (c *conn) liveVerifyReply(chk *liveCheck, real bson.Raw) {
 		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, RealReplyFailover, chk.shape))
 		return
 	}
+	// Nor when the proxy refused it itself: with the archive's primary gone,
+	// a tiered read waited for mirroring and was refused, 3 times in a 20
+	// minute run, and each was logged as a MISMATCH against the cache's answer.
+	if !replyOK(real) && proxyRefusal(real) {
+		c.r.liveVerify.write(fmt.Sprintf("SKIP\t%s\t%s\t%s\n", chk.ns, RealReplyRefused, chk.shape))
+		return
+	}
 	// Exact where it can be: the database read at the cache's own position.
 	if chk.pos.Closed.T != 0 {
 		if !c.r.cfg.Manages(chk.ns) {
@@ -317,6 +324,17 @@ const TiesInAnotherOrder = "ties in another order"
 // RealReplyFailover is the SKIP reason for a read mongod refused because the
 // member it reached had stepped down.
 const RealReplyFailover = "the real reply is a failover error"
+
+// RealReplyRefused is the SKIP reason for a read this proxy refused rather
+// than sent to mongod, so there is no answer of mongod's to compare with.
+const RealReplyRefused = "the proxy refused the real read"
+
+// proxyRefusal reports whether an error reply is one this proxy wrote: every
+// refusal of its own starts its message with "thermocline: ".
+func proxyRefusal(reply bson.Raw) bool {
+	msg, ok := reply.Lookup("errmsg").StringValueOK()
+	return ok && strings.HasPrefix(msg, "thermocline: ")
+}
 
 // differingDocs adds the two documents a "document N" difference names. The
 // replies are clipped at 1500 characters, so a difference past the first few
