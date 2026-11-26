@@ -2061,3 +2061,28 @@ func strictTie(a, b bson.Raw, field string) bool {
 	kb, okb := valueKey(vb)
 	return oka && okb && ka == kb
 }
+
+// SortsBefore reports whether a sorts strictly before b under sort. ok is
+// false when that cannot be told here: a missing sort field, a dotted one, or
+// two values of different type brackets.
+func SortsBefore(sort []SortKey, a, b bson.Raw) (before, ok bool) {
+	for _, s := range sort {
+		if strings.Contains(s.Field, ".") {
+			return false, false
+		}
+		x, ex := a.LookupErr(s.Field)
+		y, ey := b.LookupErr(s.Field)
+		if ex != nil || ey != nil || bracket(x) != bracket(y) {
+			return false, false
+		}
+		n := compareSame(x, y)
+		if n == 0 {
+			continue
+		}
+		if s.Desc {
+			return n > 0, true
+		}
+		return n < 0, true
+	}
+	return false, true
+}

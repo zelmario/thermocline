@@ -563,7 +563,7 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 	}
 	cb, ok1 := rawBatch(chk.cached.Lookup("cursor", "firstBatch"))
 	sb, ok2 := rawBatch(snap.Lookup("cursor", "firstBatch"))
-	if !ok1 || !ok2 || len(cb) != len(sb) {
+	if !ok1 || !ok2 {
 		return false
 	}
 	ids := func(b []bson.Raw) map[string]bool {
@@ -574,11 +574,22 @@ func (c *conn) liveVerifyTieredExact(chk *liveCheck) bool {
 		return out
 	}
 	ci, si := ids(cb), ids(sb)
+	member := len(cb) == len(sb)
 	for k := range ci {
 		if !si[k] {
-			// Ties at the limit, or a document the archive alone holds.
-			return c.tieOrderOnly(chk, snap, liveDiffer(chk.cached, snap), &judgeAt)
+			member = false
 		}
+	}
+	if !member {
+		// Ties at the limit, or a document the archive alone holds.
+		if len(cb) == len(sb) && c.tieOrderOnly(chk, snap, liveDiffer(chk.cached, snap), &judgeAt) {
+			return true
+		}
+		if c.tieredPart(chk, cb, sb, judgeAt) {
+			c.r.liveVerify.write(fmt.Sprintf("OK\t%s\t%s\t%s\texact, the fast tier's part\n", chk.ns, took, chk.shape))
+			return true
+		}
+		return false
 	}
 	why := liveDiffer(chk.cached, snap)
 	if why != "" && later(chk.pos.Applied, judgeAt) {
@@ -788,4 +799,56 @@ func firstOpIsInsert(e bson.Raw, ns string, id bson.RawValue) bool {
 // later reports whether a is after b.
 func later(a, b bson.Timestamp) bool {
 	return a.T > b.T || (a.T == b.T && a.I > b.I)
+}
+
+// tieredPart judges a tiered find's cached answer at cluster time at, where
+// the fast tier alone cannot give the whole answer: sb is the fast tier's
+// answer to the same query at that time. It holds when every document of the
+// fast tier's that sorts before the cache's last is in the cache's answer as
+// the fast tier held it, and every document of the cache's that the fast tier
+// did not hold was the archive's at that time. What it cannot see is an
+// archived document the cache left out.
+//
+// Compared with the client's answer instead, read a moment later, a write by
+// another connection in between was logged as a MISMATCH: measured on the box
+// on 2026-11-26 with two shops writing in transactions, an order inserted
+// three ticks after the cache's position, and another inserted before it and
+// deleted after it, two MISMATCHes in 195,678 answers, both of them races.
+func (c *conn) tieredPart(chk *liveCheck, cb, sb []bson.Raw, at bson.Timestamp) bool {
+	if chk.q.Skip != 0 || len(chk.q.Sort) == 0 {
+		return false
+	}
+	key := func(d bson.Raw) string {
+		v := d.Lookup("_id")
+		return string(rune(v.Type)) + string(v.Value)
+	}
+	inCache := make(map[string]bson.Raw, len(cb))
+	for _, d := range cb {
+		inCache[key(d)] = d
+	}
+	inFast := make(map[string]bool, len(sb))
+	full := chk.q.Limit > 0 && len(cb) == chk.q.Limit
+	for _, d := range sb {
+		inFast[key(d)] = true
+		if cd, ok := inCache[key(d)]; ok {
+			if !bytes.Equal(cd, d) {
+				return false
+			}
+			continue
+		}
+		if !full {
+			// The cache's answer is the whole result, so it leaves nothing out.
+			return false
+		}
+		before, ok := livecache.SortsBefore(chk.q.Sort, d, cb[len(cb)-1])
+		if !ok || before {
+			return false
+		}
+	}
+	for _, d := range cb {
+		if !inFast[key(d)] && !c.sameAt(chk, d, at) {
+			return false
+		}
+	}
+	return true
 }
