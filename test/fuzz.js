@@ -1251,7 +1251,16 @@ function oneOp(i) {
       // would be reporting MongoDB rather than the router. The body is
       // rebuilt on every attempt, so nothing accumulates across a retry.
       const f2 = { _id: { $in: someIds(known, 2) } };
-      const op = 'txn: count ' + ser(F) + ', updateMany ' + ser(f2) + ' ' + ser(U) +
+      // The read concern a transaction starts with rides on its first
+      // statement, and a point read first takes a different path from a count
+      // first. A transaction started with snapshot whose first statement was a
+      // findOne of an archived document was refused for a day (7b974a3), and
+      // this case could not generate it: it always began with a count.
+      const txo = pick([undefined, { readConcern: { level: 'snapshot' } }, { readConcern: { level: 'majority' } }]);
+      const first = maybe(0.5) ? anId : undefined;
+      const op = 'txn' + (txo ? ' ' + txo.readConcern.level : '') +
+                 ': ' + (first !== undefined ? 'findOne ' + ser({ _id: first }) + ', ' : '') +
+                 'count ' + ser(F) + ', updateMany ' + ser(f2) + ' ' + ser(U) +
                  ', find sorted ' + ser(S);
       // attempts is counted and reported, not compared. A transaction the router
       // asked to be replayed runs its body more than once, by design, and the
@@ -1269,11 +1278,12 @@ function oneOp(i) {
             tries[side]++;
             const tc = s.getDatabase(DB).getCollection(c.getName());
             const acc = [];
+            if (first !== undefined) acc.push(ser(tc.findOne({ _id: first })));
             acc.push(tc.countDocuments(F));
             acc.push(tc.updateMany(f2, U).modifiedCount);
             acc.push(tc.find(F).sort(S).limit(3).toArray().length);
             out = acc;
-          });
+          }, txo);
         } finally { s.endSession(); }
         return out;
       }, 'seq');
