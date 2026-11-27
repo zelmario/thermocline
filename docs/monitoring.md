@@ -86,6 +86,14 @@ because it is what suppression failing would look like, and four defects in that
 sieve have been fixed so far. The counter existed and reached no operator at all
 until 2026-09-18.
 
+`thermocline_streams_resumed_total` counts getMores on a stream this proxy did
+not open, which it tells to resume from their last token. A stream's cursor
+lives on MongoDB and outlives the proxy process that opened it, and the stages
+the proxy runs for it do not, so after a restart the driver is sent back to open
+a fresh one. A few after each proxy restart are expected. A count that rises with
+no restart means clients are reaching a proxy other than the one that opened
+their stream.
+
 #### The query cache
 
 Ten series appear only when `router.cache.enabled` is true, because a hit
