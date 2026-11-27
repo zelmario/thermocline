@@ -25,9 +25,11 @@ func TestArchiveLevel(t *testing.T) {
 		// a difference and on a real one is the difference between an answer
 		// that can be rolled back and one that cannot.
 		{"majority", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "majority"}}}}, "majority", true},
-		// Outside a transaction snapshot means a majority-committed snapshot,
-		// and majority is what the archive can promise.
-		{"snapshot", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}}}}, "majority", true},
+		// A snapshot is one instant of one cluster, which the archive cannot
+		// share with the fast tier, with or without a named instant.
+		{"snapshot", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}}}}, "", false},
+		{"snapshot at", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"},
+			{Key: "atClusterTime", Value: bson.Timestamp{T: 1, I: 1}}}}}, "", false},
 		// Linearizable is defined for one document on the node that owns it.
 		// Answering it from another cluster cannot mean that, and quietly
 		// downgrading the strongest guarantee in the system is worse than

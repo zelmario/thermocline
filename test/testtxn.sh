@@ -465,10 +465,19 @@ SNAP="try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'ttxt', 
 chk "  mongod at that instant holds 1 and 3"            "1,3" "$(H "$SNAP")"
 # The archive cannot read at that instant, so a refusal is the honest answer
 # when the fast tier alone cannot give it. Anything else is a wrong answer.
-OUT=$(R "$SNAP"); case "$OUT" in REFUSED*atClusterTime*) OUT="refused" ;; esac
+OUT=$(R "$SNAP"); case "$OUT" in REFUSED*snapshot*) OUT="refused" ;; esac
 chk "a snapshot read at a past instant is right or refused" "1,3 or refused" \
     "$([ "$OUT" = "$(H "$SNAP")" ] || [ "$OUT" = refused ] && echo "1,3 or refused" || echo "$OUT")"
-chk "  and here it is refused, naming atClusterTime"   "refused" "$OUT"
+chk "  and here it is refused, naming snapshot"         "refused" "$OUT"
+# The first read of a snapshot session names no instant; the server picks one
+# and says which in cursor.atClusterTime, and the driver pins the session to it.
+FIRST="try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'ttxt', filter:{}, readConcern:{level:'snapshot'}});
+  print(r.ok ? (r.cursor.atClusterTime ? 'PINNED' : 'NO INSTANT')+' '+r.cursor.firstBatch.map(d=>d._id).join(',') : 'REFUSED '+r.errmsg) }
+  catch(e) { print('REFUSED '+e.message) }"
+chk "  mongod pins a snapshot session's first read"   "PINNED" "$(H "$FIRST" | cut -d' ' -f1)"
+OUT=$(R "$FIRST"); case "$OUT" in REFUSED*snapshot*) OUT="refused" ;; PINNED*) OUT="pinned" ;; esac
+chk "a first snapshot read pins the session or is refused" "pinned or refused" \
+    "$([ "$OUT" = pinned ] || [ "$OUT" = refused ] && echo "pinned or refused" || echo "$OUT")"
 RC="readConcern:{level:'snapshot', atClusterTime:Timestamp({t:${T%,*}, i:${T#*,}})}"
 for q in "{aggregate:'ttxt', pipeline:[{\$sort:{_id:1}}], cursor:{}, $RC}" \
          "{count:'ttxt', query:{}, $RC}" "{distinct:'ttxt', key:'_id', query:{}, $RC}" \

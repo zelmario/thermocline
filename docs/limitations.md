@@ -993,23 +993,25 @@ Part of [Thermocline](../README.md).
   holds two. A `$lookup` *naming* a view is not refused, that one resolves to
   the collection underneath and is read from the archive, whole.
 
-- **A snapshot read at a named instant is answered only by the fast tier, and
-  refused when it would need the archive.** `readConcern: {level: "snapshot",
-  atClusterTime: T}` reads the collection as it stood at T, and T is a position
-  in the fast tier's history. The archive holds what was mirrored since, so a
-  read sent there at T returned a document created after T and missed one
-  deleted after it. Measured in `test/testtxn.sh` before 2026-11-27: two
-  documents at T, one inserted and evicted after it and one deleted, and
-  `find`, `aggregate`, `distinct` and a point read by `_id` all answered with
-  the document that did not yet exist (1,2 where MongoDB says 1,3), and `count`
-  answered where MongoDB refuses snapshot for it. Each is now right or refused,
-  with "readConcern atClusterTime names an instant in the fast tier's history"
-  in the error. Drivers send `atClusterTime` on every read after the first in a
-  snapshot session (`startSession({snapshot: true})`, 5.0+), so a snapshot
-  session over an archived range fails at its second read. Warm the range, or
-  read without `atClusterTime`. One case is still not caught: a range warmed
-  after T is claimed complete now, and a read at T is sent to the fast tier,
-  which at T did not yet hold the documents the warm brought up.
+- **A snapshot read is answered only by the fast tier, and refused when it
+  would need the archive.** `readConcern: {level: "snapshot"}` reads one
+  instant of one cluster, and the archive shares no instant with the fast
+  tier: it holds what was mirrored since. Before 2026-11-27 the proxy read the
+  archive as it stands. With `atClusterTime: T`, measured in
+  `test/testtxn.sh`: two documents at T, one inserted and evicted after it and
+  one deleted, and `find`, `aggregate`, `distinct` and a point read by `_id`
+  all answered with the document that did not yet exist (1,2 where MongoDB
+  says 1,3), and `count` answered where MongoDB refuses snapshot for it.
+  Without `atClusterTime`, the reply carried no `cursor.atClusterTime`, so a
+  snapshot session (`startSession({snapshot: true})`, 5.0+) was never pinned
+  and each of its reads was a snapshot of its own moment, with nothing said.
+  Each is now right or refused, with "readConcern snapshot reads one instant of
+  one cluster" in the error. Warm the range, or read with majority. One case is
+  still not caught: a range warmed after T is claimed complete now, and a read
+  at T is sent to the fast tier, which at T did not yet hold the documents the
+  warm brought up. The claim records when it changed only by wall clock, and
+  every eviction sweep changes it, so refusing on it would refuse nearly every
+  snapshot session.
 
 - **Cursors are not shared between proxies.** A read answered from the archive
   is served from a cursor this proxy holds open against the archive, in its own

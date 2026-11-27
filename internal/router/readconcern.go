@@ -55,21 +55,19 @@ func archiveLevel(cmd bson.Raw) (level string, honourable bool) {
 	case "local", "available", "majority":
 		return s, true
 	case "snapshot":
-		// Outside a transaction, snapshot means a majority-committed snapshot,
-		// and majority is what the archive can promise, as long as the caller
-		// left the instant to the server.
+		// A snapshot is one instant of one cluster, and the archive shares no
+		// instant with the fast tier: it holds what was mirrored since.
 		//
-		// An atClusterTime is an instant in the fast tier's history, and the
-		// archive has none of those: it holds what was mirrored since, deletes
-		// included. Read there, a snapshot at a past instant returned a
-		// document created after it and missed one deleted after it (testtxn,
-		// "a snapshot read at a past cluster time": 1,2 where mongod says
-		// 1,3). Drivers send one on every read after the first in a snapshot
-		// session, so this is not exotic.
-		if _, err := doc.LookupErr("atClusterTime"); err == nil {
-			return "", false
-		}
-		return "majority", true
+		// With atClusterTime, the read was sent to the archive as it stands
+		// and returned a document created after the instant and missed one
+		// deleted after it (testtxn, "a snapshot read at a past cluster time":
+		// 1,2 where mongod says 1,3). Without one, the reply came back with no
+		// cursor.atClusterTime, so a snapshot session's driver never pinned
+		// the session and each later read was a snapshot of its own moment,
+		// with nothing said. Drivers send atClusterTime on every read after
+		// the first in a snapshot session (5.0+), so neither is exotic. The
+		// same rule as a transaction: it cannot span both tiers.
+		return "", false
 	case "linearizable":
 		// Linearizable promises that the read reflects every write that
 		// completed before it, on a primary confirmed still to be primary. It
@@ -103,11 +101,11 @@ func concernReason(err error) string {
 // be answered from the archive, and what the caller can do instead.
 func archiveRefusal(cmd bson.Raw) string {
 	if doc, ok := cmd.Lookup("readConcern").DocumentOK(); ok {
-		if _, err := doc.LookupErr("atClusterTime"); err == nil {
-			return "readConcern atClusterTime names an instant in the fast tier's history, which the " +
-				"archive does not have: it holds what was mirrored since, so a document created after " +
-				"that instant would be read and one deleted after it missed; warm this range, or read " +
-				"without atClusterTime"
+		if lv, _ := doc.Lookup("level").StringValueOK(); lv == "snapshot" {
+			return "readConcern snapshot reads one instant of one cluster, and the archive shares no " +
+				"instant with the fast tier: it holds what was mirrored since, so a snapshot at " +
+				"atClusterTime would read documents created after it, and a snapshot session could " +
+				"not be pinned to one; warm this range, or read with majority"
 		}
 	}
 	return "readConcern linearizable cannot be answered from the archive: it promises a read " +
