@@ -131,8 +131,12 @@ func (c *conn) mayRun(ctx context.Context, msg *wire.Message, cmd bson.Raw, db s
 		// 2 hours, 5 reads failed "not primary and secondaryOk=false", each at a
 		// step-down and each right after this refusal in the router's log.
 		c.endIfFailover(ctx, rdoc)
+		// The code says why: during a failover it is NotWritablePrimary or
+		// similar, which has nothing to do with credentials.
+		code, _ := intOf(rdoc.Lookup("code"))
+		codeName, _ := rdoc.Lookup("codeName").StringValueOK()
 		c.log.Warn("refused a command whose explain the fast tier refused, rather than run it "+
-			"with this router's own credentials", "db", db)
+			"with this router's own credentials", "db", db, "code", code, "codeName", codeName)
 		out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, rewriteReplyIDs(rdoc))
 		if berr != nil {
 			return nil, true
