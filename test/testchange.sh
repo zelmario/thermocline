@@ -748,6 +748,61 @@ chk "the second late watcher was actually watching"    "true" \
 chk "a copy-up read late is not an insert"             "true" \
     "$(echo "${LATE2:-none}" | grep -q "insert:\"$OID4\"" && echo false || echo true)"
 
+echo "== a stream that outlives the router that opened it =="
+# A change stream's cursor lives on mongod, so it survives the router process
+# that opened it, and the router's record of it does not. Killed and
+# restarted, the router was sent the consumer's next getMore on a fresh
+# connection, since the kill had cleared the driver's pool, and answered it
+# unfiltered: on the box on 2026-11-27 a consumer was told of 176 orders placed
+# that were copy-ups, 3 seconds after one restart in five.
+#
+# The order below is the one that produces it. The watcher has read once, so
+# its cursor exists. A retryable read after the kill fails on the dead
+# connection, clears the pool and retries on a new one, so the stream's own
+# next getMore goes out on a fresh connection rather than failing on the old
+# one, which would have made the driver resume by itself.
+C "db.getSiblingDB(process.env.TC_META).evicting.updateOne(
+     {_id:'$DB.$NS|07$OID4'},
+     {\$inc:{pending:1}, \$set:{at:new Date()}},
+     {upsert:true})" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$NS.deleteOne({_id:ObjectId('$OID4')})" >/dev/null
+rm -f /tmp/cs_orphan.txt /tmp/cs_orphan.go
+mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --eval "
+  const fs=require('fs');
+  const tcNow=()=>{const t=db.adminCommand({hello:1}).operationTime; return Timestamp({t:t.t, i:t.i+1})};
+  const c=db.getSiblingDB(process.env.TC_DB).$NS;
+  const cs=c.watch([], {startAtOperationTime:tcNow(), maxAwaitTimeMS:50});
+  cs.tryNext();
+  for (let i=0;i<240 && !fs.existsSync('/tmp/cs_orphan.go');i++) sleep(250);
+  try { c.countDocuments({_id:ObjectId('$OID4')}) } catch (e) {}
+  let ops=[];
+  const until=Date.now()+8000;
+  while (Date.now()<until) {
+    const e=cs.tryNext();
+    if (e) ops.push(e.operationType+':'+JSON.stringify(e.documentKey?e.documentKey._id:null)); else sleep(100);
+  }
+  cs.close();
+  print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_orphan.txt 2>&1 &
+WATCHER7=$!
+sleep 3
+RESUMED0=$(grep -c "told a change stream this router did not open to resume" $LOGDIR/cs_r.log 2>/dev/null)
+pkill -9 -f "cline router --config $WDIR/" 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f "cline router --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.2; done
+startRouter
+R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')})" >/dev/null
+touch /tmp/cs_orphan.go
+ORPHAN=$(awaitWatcher /tmp/cs_orphan.txt $WATCHER7)
+echo "  the watcher across the restart saw: ${ORPHAN:-nothing}"
+RESUMED1=$(grep -c "told a change stream this router did not open to resume" $LOGDIR/cs_r.log 2>/dev/null)
+chk "the copy-up after the restart happened"           "late" \
+    "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')}); print(d?d.v:'MISSING')")"
+chk "the watcher across the restart reported"          "true" \
+    "$(echo "${ORPHAN:-none}" | grep -qi "error\|refus" && echo false || echo true)"
+chk "the restarted router was asked for the old cursor" "true" \
+    "$([ "${RESUMED1:-0}" -gt "${RESUMED0:-0}" ] && echo true || echo "false (${RESUMED0:-?} -> ${RESUMED1:-?})")"
+chk "a copy-up after a router restart is not an insert" "true" \
+    "$(echo "${ORPHAN:-none}" | grep -q "insert:\"$OID4\"" && echo false || echo true)"
+
 fi
 if inpart 3; then
 echo "== a change stream on the whole database =="

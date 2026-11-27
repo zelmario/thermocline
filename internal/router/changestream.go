@@ -568,7 +568,7 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	}
 	watching, watched := c.r.changeStreams.get(id)
 	if !watched {
-		return nil, false
+		return c.unregisteredStream(msg, cmd, id, reply)
 	}
 	c.log.Debug("filtering a change stream batch", "watching", watching, "cursor", id)
 
@@ -609,6 +609,73 @@ func (c *conn) filterChangeStream(ctx context.Context, msg *wire.Message, reply 
 	}
 
 	out, berr := replaceStreamBatch(rdoc, "nextBatch", keep, token, msg.Header.RequestID)
+	if berr != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// unregisteredStream answers a getMore on a change stream cursor this router
+// never opened.
+//
+// The cursor lives on mongod, so it outlives the router that opened it. Killed
+// and restarted, a router came back to a driver whose pool had been cleared by
+// the kill, and the consumer's next getMore went out on a fresh connection
+// with the same cursor id and was answered: mongod still had the cursor, and
+// this router had no record of it, so nothing was filtered. Measured on the
+// box on 2026-11-27, two applications through two routers, router 1 killed -9
+// every 5 minutes: after one of the five restarts, its consumer was told of
+// 176 orders "placed" that were copy-ups, all within 3 seconds of the restart.
+//
+// Registering it here would not be enough. The router splits a stream's
+// pipeline and runs the client's own stages itself, and those stages died with
+// the process that held them. So the batch is withheld and the stream is told
+// to resume: the driver opens a new one from the last token it was given,
+// which this router registers like any other, and nothing is lost. The old
+// cursor is closed on the client's own connection, since it is the client's.
+func (c *conn) unregisteredStream(msg *wire.Message, cmd bson.Raw, id int64, reply *wire.Message) (*wire.Message, bool) {
+	rdoc, err := reply.ReplyDoc()
+	if err != nil || !replyOK(rdoc) {
+		return nil, false
+	}
+	cur, ok := rdoc.Lookup("cursor").DocumentOK()
+	if !ok {
+		return nil, false
+	}
+	// Only a change stream's batch carries this.
+	if _, perr := cur.LookupErr("postBatchResumeToken"); perr != nil {
+		return nil, false
+	}
+	db, _ := cmd.Lookup("$db").StringValueOK()
+	coll, _ := cmd.Lookup("collection").StringValueOK()
+	ns := ""
+	if coll != "$cmd.aggregate" {
+		ns = db + "." + coll
+	}
+	watching, matters := c.r.streamScope(ns, db)
+	if !matters {
+		return nil, false
+	}
+	if rid, _ := cursorIDOf(rdoc); rid != 0 {
+		if kill, kerr := wire.NewMsg(0, 0, bson.D{
+			{Key: "killCursors", Value: coll}, {Key: "cursors", Value: bson.A{id}}, {Key: "$db", Value: db},
+		}); kerr == nil {
+			_, _ = c.probe(kill)
+		}
+	}
+	c.r.Stats.StreamsResumed.Add(1)
+	c.log.Warn("told a change stream this router did not open to resume",
+		"watching", watching, "cursor", id,
+		"why", "its cursor was opened through a router process that has since ended, and the stages "+
+			"this router runs for it ended with that process")
+	out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
+		{Key: "ok", Value: 0.0},
+		{Key: "errmsg", Value: "thermocline: this change stream was opened through a router process that has " +
+			"since ended; resume it from its last token"},
+		{Key: "code", Value: int32(43)},
+		{Key: "codeName", Value: "CursorNotFound"},
+		{Key: "errorLabels", Value: bson.A{"ResumableChangeStreamError"}},
+	})
 	if berr != nil {
 		return nil, false
 	}

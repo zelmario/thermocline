@@ -376,7 +376,10 @@ type Stats struct {
 	SecondaryReadsMoved atomic.Int64
 	Unreadable          atomic.Int64
 	EventsHidden        atomic.Int64
-	StaleReads          atomic.Int64
+	// StreamsResumed counts change stream getMores on a cursor this router
+	// never opened, told to resume. See unregisteredStream.
+	StreamsResumed atomic.Int64
+	StaleReads     atomic.Int64
 	// StaleRefusals counts reads and writes refused under router.freshness:
 	// strict because mirroring had not caught up, the default's counterpart
 	// of StaleReads. They are in Refused too, which mixes them with every

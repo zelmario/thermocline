@@ -218,6 +218,7 @@ func (r *Router) SnapshotAll() Snapshot {
 			"failover_siblings_closed": r.Stats.FailoverSiblingsClosed.Load(),
 			"unreadable":               r.Stats.Unreadable.Load(),
 			"events_hidden":            r.Stats.EventsHidden.Load(),
+			"streams_resumed":          r.Stats.StreamsResumed.Load(),
 			"stale_reads":              r.Stats.StaleReads.Load(),
 			"stale_refusals":           r.Stats.StaleRefusals.Load(),
 			"claim_grace_reads":        r.Stats.ClaimGraceReads.Load(),
