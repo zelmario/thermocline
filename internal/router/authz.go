@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -76,7 +77,7 @@ func (c *conn) mayRead(msg *wire.Message, db, coll string) (*wire.Message, bool)
 // with the fast tier's own error. Under terminate_auth
 // the gate decided this command before it ran and the connection carries the
 // router's identity, so the probe would ask the wrong question.
-func (c *conn) mayRun(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
+func (c *conn) mayRun(ctx context.Context, msg *wire.Message, cmd bson.Raw, db string) (*wire.Message, bool) {
 	if c.r.cfg.TerminateAuth {
 		return nil, true
 	}
@@ -121,6 +122,15 @@ func (c *conn) mayRun(msg *wire.Message, cmd bson.Raw, db string) (*wire.Message
 	}
 	if !isAuthError(rdoc) {
 		c.r.Stats.Refused.Add(1)
+		// The explain went out on the client's own connection, so a member that
+		// stopped being primary refuses it exactly as it would the command, and
+		// the refusal gets the same treatment. Passed on bare, the connection
+		// stayed pinned to the old member and the driver's retry went out on it
+		// or on a sibling still pinned there: measured on the box on 2026-11-27,
+		// two applications through two routers, step-downs every 6 minutes for
+		// 2 hours, 5 reads failed "not primary and secondaryOk=false", each at a
+		// step-down and each right after this refusal in the router's log.
+		c.endIfFailover(ctx, rdoc)
 		c.log.Warn("refused a command whose explain the fast tier refused, rather than run it "+
 			"with this router's own credentials", "db", db)
 		out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, rewriteReplyIDs(rdoc))

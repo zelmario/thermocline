@@ -545,6 +545,9 @@ func (c *conn) applyOtherOps(ctx context.Context, msg *wire.Message, cmd bson.Ra
 			// Refused whole: the claims it took go back, as the settle in
 			// handle would have given them back for a forwarded command.
 			c.r.releaseUnheld(ctx, claimed)
+			if err == nil {
+				c.endIfFailover(ctx, up)
+			}
 			out := reply
 			out.Header.ResponseTo = msg.Header.RequestID
 			return out, true

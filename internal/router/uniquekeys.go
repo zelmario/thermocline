@@ -1318,6 +1318,7 @@ func (c *conn) guardInsert(ctx context.Context, msg *wire.Message, db string) (*
 	if derr != nil {
 		return reply, true
 	}
+	c.endIfFailover(ctx, rdoc)
 
 	n := 0
 	if v, lerr := rdoc.LookupErr("n"); lerr == nil {

@@ -812,7 +812,7 @@ func (c *conn) guardTieredOut(ctx context.Context, msg *wire.Message, cmd bson.R
 		return nil, false
 	}
 	// Everything below runs on this router's own clients. See mayRun.
-	if denied, ok := c.mayRun(msg, cmd, db); !ok {
+	if denied, ok := c.mayRun(ctx, msg, cmd, db); !ok {
 		return denied, true
 	}
 

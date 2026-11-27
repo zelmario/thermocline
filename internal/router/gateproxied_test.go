@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -302,7 +304,7 @@ func TestMayRunAllowsOnlyAnExplainThatSucceeds(t *testing.T) {
 		conn := &conn{r: r, upstream: mine, log: r.log}
 		m := command(t, cmd)
 		raw, _ := m.CommandDoc()
-		_, ok := conn.mayRun(m, raw, "shop")
+		_, ok := conn.mayRun(context.Background(), m, raw, "shop")
 		if ok != c.allowed {
 			t.Errorf("%s: allowed = %v, want %v", c.name, ok, c.allowed)
 		}
@@ -316,8 +318,50 @@ func TestMayRunAllowsOnlyAnExplainThatSucceeds(t *testing.T) {
 	conn := &conn{r: r, upstream: mine, log: r.log}
 	m := command(t, cmd)
 	raw, _ := m.CommandDoc()
-	if _, ok := conn.mayRun(m, raw, "shop"); ok {
+	if _, ok := conn.mayRun(context.Background(), m, raw, "shop"); ok {
 		t.Error("an aggregate ran although the fast tier could not be asked")
+	}
+}
+
+// The explain goes out on the client's own connection, so a member that has
+// just stepped down refuses it as it would the command. That refusal has to
+// end the connection and move the pin, or the driver's retry goes out on the
+// same member and is refused again.
+func TestMayRunEndsTheConnectionWhenTheExplainSaysNotPrimary(t *testing.T) {
+	cmd := bson.D{{Key: "aggregate", Value: "orders"},
+		{Key: "pipeline", Value: bson.A{bson.D{{Key: "$count", Value: "n"}}}},
+		{Key: "cursor", Value: bson.D{}}, {Key: "$db", Value: "shop"}}
+	mine, theirs := net.Pipe()
+	defer mine.Close()
+	defer theirs.Close()
+	go func() {
+		msg, err := wire.Read(theirs)
+		if err != nil {
+			return
+		}
+		out, _ := wire.NewMsg(0, msg.Header.RequestID, bson.D{{Key: "ok", Value: 0.0},
+			{Key: "errmsg", Value: "not primary and secondaryOk=false"},
+			{Key: "code", Value: int32(13435)}, {Key: "codeName", Value: "NotPrimaryNoSecondaryOk"}})
+		_ = wire.Write(theirs, out)
+	}()
+	r := &Router{log: slog.New(slog.NewTextHandler(io.Discard, nil)), primary: "old:27017"}
+	// Keeps the background lookup from running: there is no fast tier to ask.
+	r.primaryProbeAt = time.Now()
+	conn := &conn{r: r, upstream: mine, log: r.log, dialed: "old:27017"}
+	m := command(t, cmd)
+	raw, _ := m.CommandDoc()
+	out, ok := conn.mayRun(context.Background(), m, raw, "shop")
+	if ok {
+		t.Fatal("the aggregate ran although its explain was refused")
+	}
+	if msg := refusalText(t, out); !strings.Contains(msg, "not primary") {
+		t.Fatalf("refusal %q is not the fast tier's own", msg)
+	}
+	if !conn.closeAfterReply {
+		t.Error("the connection stays open, pinned to a member that is no longer primary")
+	}
+	if r.primaryKnown() {
+		t.Error("the pin was not marked doubtful")
 	}
 }
 

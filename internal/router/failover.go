@@ -102,6 +102,26 @@ func (c *conn) replayAfterFailover(ctx context.Context, msg *wire.Message, name 
 	return nil, false
 }
 
+// endIfFailover gives a refusal the router read on the client's own connection,
+// for a command it built or rebuilt itself, the treatment afterFailoverReply
+// gives a forwarded one, except the replay: what would be replayed is the
+// client's command, and sending that bare would skip whatever the router built
+// in its place. The pin moves, and while authentication is proxied the
+// connection ends once the refusal is delivered, so the driver's retry reaches
+// the new primary.
+//
+// Only for a reply read from the fast tier. A refusal that came from the
+// archive says nothing about the fast tier's primary, and recording the
+// fast tier's member as the refuser turns the real primary away for
+// primaryWait (see primaryMoved).
+func (c *conn) endIfFailover(ctx context.Context, rdoc bson.Raw) {
+	if !isFailoverReply(rdoc) {
+		return
+	}
+	c.r.primaryMoved(c.upstreamMember())
+	c.endAfterFailover(ctx)
+}
+
 // endAfterFailover ends a connection the router cannot point anywhere useful.
 //
 // While authentication is proxied, a client's upstream connection was made by
