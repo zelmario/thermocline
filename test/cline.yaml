@@ -262,6 +262,8 @@ feeder:
     - "shop.ttxk"
     # testtxn.sh: a read the router refuses inside a transaction, then a commit.
     - "shop.ttxr"
+    # testtxn.sh: a transaction whose router is killed before the commit.
+    - "shop.ttxs"
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"

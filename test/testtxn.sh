@@ -421,6 +421,30 @@ for shape in "c.distinct('v',{v:{\$gt:0}})" "c.find({v:{\$gt:0}}).toArray()" \
   esac
 done
 
+echo "== a transaction whose router is killed before the commit =="
+# A transaction lives on mongod with its session, not on the connection or on
+# the router. The router is killed -9 with the transaction open and restarted,
+# and the driver sends the commit to the new process, which never saw the
+# statements. MongoDB commits it; so must the proxy, with the key claim the
+# dead process wrote still enforced.
+fresh ttxs '{ref:1}'
+R "db.getSiblingDB(process.env.TC_DB).ttxs.insertOne({_id:1,bal:100})" >/dev/null
+OUT=$(TC_RP=$RP TC_CFG=$CFG TC_LOG=$LOGDIR/txn_r.log R "
+  const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxs;
+  s.startTransaction();
+  c.updateOne({_id:1},{\$inc:{bal:-100}}); c.insertOne({_id:2,ref:'r1'});
+  require('child_process').execSync('kill -9 '+process.env.TC_RP+'; setsid cline router --config '+process.env.TC_CFG+' --log-file '+process.env.TC_LOG+' >/dev/null 2>&1 < /dev/null &');
+  sleep(3000);
+  let commit='COMMITTED';
+  try { s.commitTransaction(); } catch(e) { commit='COMMIT FAILED '+(e.codeName||e.message.substring(0,60)); }
+  print(commit)")
+RP=$(pgrep -f "^cline router --config $CFG" | head -1)
+chk "the new router commits it"                         "COMMITTED" "$OUT"
+chk "  with both statements in it"                      "0 r1" \
+    "$(H "const c=db.getSiblingDB(process.env.TC_DB).ttxs; print(c.findOne({_id:1}).bal+' '+(c.findOne({_id:2})||{}).ref)")"
+chk "  and the key it took is still held"               "11000" "$(R "
+  try { db.getSiblingDB(process.env.TC_DB).ttxs.insertOne({_id:3,ref:'r1'}); print('INSERTED'); } catch(e) { print(e.code) }")"
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
