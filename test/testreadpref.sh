@@ -90,12 +90,19 @@ chk "the profiler is recording on every node"           "3" "$ON"
 # the one that ran the read. Measured once in a sweep, the control's primary
 # read named a secondary with no election in the replica set.
 landed() { # comment -> "PRIMARY" or "secondary", whichever node recorded it
+  # Asked again for up to ten seconds. In the 2026-11-27 sweep the control read
+  # returned 20 from a secondary and no member had recorded it three seconds
+  # later; under a parallel sweep the profile write or the question can lag.
   local where="none" c
-  for n in $NODES; do
-    c=$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")
-    if [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
-      where=$(N "$n" 'print(db.hello().isWritablePrimary ? "PRIMARY" : "secondary")')
-    fi
+  for _ in $(seq 1 10); do
+    for n in $NODES; do
+      c=$(N "$n" "print(db.getSiblingDB(process.env.TC_DB).system.profile.countDocuments({ns:'$DB.$NS','command.comment':'$1'}))")
+      if [[ "$c" =~ ^[1-9][0-9]*$ ]]; then
+        where=$(N "$n" 'print(db.hello().isWritablePrimary ? "PRIMARY" : "secondary")')
+      fi
+    done
+    [ "$where" != none ] && break
+    sleep 1
   done
   echo "$where"
 }
