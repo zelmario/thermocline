@@ -152,8 +152,15 @@ func (c *conn) refuseForeignGetMore(ctx context.Context, msg *wire.Message, db s
 		"action", "re-run the query")
 	out, berr := wire.NewMsg(msg.Header.RequestID, msg.Header.RequestID, bson.D{
 		{Key: "ok", Value: 0.0},
-		{Key: "errmsg", Value: "thermocline: cursor id " + strconv.FormatInt(id, 10) + " was not opened by this router process, " +
-			"which cannot tell whether the rest of it is still whole; re-run the query"},
+		// The same three causes explainCursorNotFound names, plus the restart,
+		// and how to rule out the one an operator can fix.
+		{Key: "errmsg", Value: "thermocline: cursor id " + strconv.FormatInt(id, 10) + " was not opened by this " +
+			"router process, which cannot tell whether the rest of it is still whole, so re-run the query. " +
+			"It is one of three things: a cursor opened before this router restarted, a cursor another " +
+			"router opened, or one that expired. A cursor id says nothing about who minted it, so this " +
+			"cannot say which. If several routers sit behind one load balanced address, that is the cause: " +
+			"name every router in the connection string instead, so the driver pins the cursor to the one " +
+			"that made it."},
 		{Key: "code", Value: int32(43)},
 		{Key: "codeName", Value: "CursorNotFound"},
 		// A change stream on one tiered collection names it too, and resumes
