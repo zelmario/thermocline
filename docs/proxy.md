@@ -1716,6 +1716,14 @@ succeed. Past `maxCopyUpForWrite` documents the range is refused instead, with
 an error that is deliberately not labelled transient so it fails rather than
 retrying forever.
 
+Either error ends the transaction, as any statement mongod refuses does. An
+application that catches the error and commits anyway gets a failed commit,
+not one with the statements before it. Until 2026-11-27 three of these paths
+left the transaction open: a debit, then a `distinct` or `find` past the fast
+tier refused and caught, and the commit landed the debit. The checks are in
+`test/testtxn.sh`, "a read the router refuses inside a transaction aborts it
+too", eight shapes.
+
 **Unique keys are checked differently inside a transaction, and have to be.**
 Everywhere else the guard runs before the write, because once a write lands it
 is visible and a duplicate cannot be taken back. Inside a transaction nothing is

@@ -1386,6 +1386,22 @@ func (c *conn) answer(msg, out *wire.Message) error {
 	return c.send(out)
 }
 
+// abortIfTurnedIntoRefusal aborts the caller's transaction when the fast tier
+// accepted a command and this router is sending an error in its place, such as
+// a transaction refused for reaching past the fast tier. An error the fast tier
+// gave is left to it: mongod has already decided what it does to the
+// transaction, and aborting here could end one mongod kept.
+func (c *conn) abortIfTurnedIntoRefusal(msg, reply, out *wire.Message) {
+	if out == reply {
+		return
+	}
+	rdoc, err := reply.ReplyDoc()
+	if err != nil || !replyOK(rdoc) || writeFailed(rdoc) {
+		return
+	}
+	c.abortIfRefusedInTxn(msg, out)
+}
+
 // abortIfRefusedInTxn aborts the caller's transaction when this router answered
 // one of its commands with an error.
 //
@@ -1396,6 +1412,11 @@ func (c *conn) answer(msg, out *wire.Message) error {
 // commit then succeeded with the debit in it, where MongoDB fails it. Only
 // the update path aborted, in verifyTxnKeys. An abort mongod no longer has a
 // transaction for answers NoSuchTransaction, which changes nothing.
+//
+// Every refusal the router builds goes out through here, not only the write's:
+// a distinct reaching past the fast tier inside a transaction was refused
+// straight through send, the application caught it, and the commit landed the
+// debit before it (testtxn, 2026-11-27).
 func (c *conn) abortIfRefusedInTxn(msg, out *wire.Message) {
 	name, _, nerr := msg.CommandName()
 	if nerr != nil || name == "commitTransaction" || name == "abortTransaction" {
@@ -1562,7 +1583,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// opened it. See issued.go.
 	if nameErr == nil && name == "getMore" && !msg.MoreToCome() {
 		if out, done := c.refuseForeignGetMore(ctx, msg, db); done {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 
@@ -1703,7 +1724,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// tieredcursor.go for what the alternative was measured to be.
 	if nameErr == nil && name == "getMore" && !msg.MoreToCome() {
 		if out, done := c.guardTieredGetMore(ctx, msg); done {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 
@@ -1711,7 +1732,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// the same completeness check.
 	if nameErr == nil && (name == "count" || name == "distinct") && !msg.MoreToCome() {
 		if out, done := c.guardSimpleRead(ctx, msg, db, name); done {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 
@@ -2251,7 +2272,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		// it, and a write whose copy-up was refused would report matching
 		// nothing. See config.FreshnessStrict.
 		if out, rerr := c.staleRefusal(msg, err); rerr == nil {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 	if err != nil && namesADocument(name) {
@@ -2274,7 +2295,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 			"thermocline: refusing this "+name+" because the fast tier matched nothing and the "+
 				"archive's copy could not be looked up or brought back, so nothing can say whether "+
 				"the document exists; retry once both tiers answer: "+err.Error()); rerr == nil {
-			return c.send(out)
+			return c.answer(msg, out)
 		}
 	}
 	if err != nil {
@@ -2310,6 +2331,7 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	// What the client is actually given is what is learned from, whichever tier
 	// it came from and whatever was rewritten on the way.
 	c.cacheStore(rewritten)
+	c.abortIfTurnedIntoRefusal(msg, reply, rewritten)
 	return c.send(rewritten)
 }
 

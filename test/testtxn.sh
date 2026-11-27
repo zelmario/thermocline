@@ -390,6 +390,37 @@ chk "  and mongod answers the same read the same way"   "1" \
 chk "  while without the collation it finds nothing"    "0" \
     "$(H "print(db.getSiblingDB(process.env.TC_DB).ttxkctl.find({name:'bob'}).toArray().length)")"
 
+echo "== a read the router refuses inside a transaction aborts it too =="
+# The same rule as a refused write, for every other refusal the router builds
+# itself. A transaction whose read reaches past what the fast tier holds is
+# refused, and an application that catches that and commits must see the
+# commit fail, as mongod fails a commit after any statement it refused.
+for shape in "c.distinct('v',{v:{\$gt:0}})" "c.find({v:{\$gt:0}}).toArray()" \
+             "c.aggregate([{\$match:{v:{\$gt:0}}}]).toArray()" "c.updateMany({v:{\$gt:0}},{\$set:{x:1}})" \
+             "c.find({\$expr:{\$gt:['\$v',0]}}).toArray()" "c.aggregate([{\$match:{\$expr:{\$gt:['\$v',0]}}}]).toArray()" \
+             "c.countDocuments({\$expr:{\$gt:['\$v',0]}})" "c.deleteMany({\$expr:{\$gt:['\$v',0]}})"; do
+  fresh ttxr
+  R "db.getSiblingDB(process.env.TC_DB).ttxr.insertMany([{_id:1,bal:100},{_id:2,v:5},{_id:3,v:6}])" >/dev/null
+  waitMirrored ttxr 3
+  evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).ttxr.deleteMany({_id:{\$in:[2,3]}})"
+  chk "  two of its documents are only in the archive"     "3 1" \
+      "$(C "print(db.getSiblingDB(process.env.TC_DB).ttxr.countDocuments({}))") $(H "print(db.getSiblingDB(process.env.TC_DB).ttxr.countDocuments({}))")"
+  OUT=$(R "
+    const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxr;
+    s.startTransaction(); let read='READ OK';
+    c.updateOne({_id:1},{\$inc:{bal:-100}});
+    try { $shape; } catch(e) { read='REFUSED'; }
+    let commit='COMMITTED';
+    try { s.commitTransaction(); } catch(e) { commit='COMMIT FAILED'; }
+    print(read+'/'+commit)")
+  BAL=$(R "print(db.getSiblingDB(process.env.TC_DB).ttxr.findOne({_id:1}).bal)")
+  [ "$BAL" != "100" ] && R "db.getSiblingDB(process.env.TC_DB).ttxr.updateOne({_id:1},{\$set:{bal:100}})" >/dev/null
+  case "$OUT" in
+    "READ OK/COMMITTED") chk "  $shape was answered, nothing to abort" "100" "$((BAL+100))" ;;
+    *) chk "the commit after a refused ${shape%%(*} fails" "REFUSED/COMMIT FAILED 100" "$OUT $BAL" ;;
+  esac
+done
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

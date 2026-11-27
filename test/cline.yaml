@@ -260,6 +260,8 @@ feeder:
     # testtxn.sh: a transaction whose read carries its own collation, where the
     # copy-up that makes the fast tier able to answer has to use the same one.
     - "shop.ttxk"
+    # testtxn.sh: a read the router refuses inside a transaction, then a commit.
+    - "shop.ttxr"
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"
