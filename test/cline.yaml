@@ -266,6 +266,8 @@ feeder:
     - "shop.ttxs"
     # testtxn.sh: a snapshot read at a past cluster time.
     - "shop.ttxt"
+    # testtxn.sh: a transaction started with readConcern snapshot.
+    - "shop.ttxu"
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"

@@ -67,6 +67,16 @@ func archiveLevel(cmd bson.Raw) (level string, honourable bool) {
 		// with nothing said. Drivers send atClusterTime on every read after
 		// the first in a snapshot session (5.0+), so neither is exotic. The
 		// same rule as a transaction: it cannot span both tiers.
+		//
+		// A transaction is the exception, because it carries this level on its
+		// first statement and nothing in it is read from the archive: a miss
+		// is copied up and the transaction replayed. Refusing it here turned a
+		// findOne of an archived document, first in a transaction started with
+		// readConcern snapshot, from a replay into an error (testtxn, "a
+		// transaction started with readConcern snapshot").
+		if inTransaction(cmd) {
+			return "majority", true
+		}
 		return "", false
 	case "linearizable":
 		// Linearizable promises that the read reflects every write that

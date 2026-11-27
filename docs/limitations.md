@@ -1006,7 +1006,9 @@ Part of [Thermocline](../README.md).
   snapshot session (`startSession({snapshot: true})`, 5.0+) was never pinned
   and each of its reads was a snapshot of its own moment, with nothing said.
   Each is now right or refused, with "readConcern snapshot reads one instant of
-  one cluster" in the error. Warm the range, or read with majority. One case is
+  one cluster" in the error. Warm the range, or read with majority. A
+  transaction started with readConcern snapshot is not refused: nothing in it
+  is read from the archive, a miss is copied up and the transaction replayed. One case is
   still not caught: a range warmed after T is claimed complete now, and a read
   at T is sent to the fast tier, which at T did not yet hold the documents the
   warm brought up. The claim records when it changed only by wall clock, and

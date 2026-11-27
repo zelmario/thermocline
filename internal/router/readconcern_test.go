@@ -30,6 +30,11 @@ func TestArchiveLevel(t *testing.T) {
 		{"snapshot", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}}}}, "", false},
 		{"snapshot at", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"},
 			{Key: "atClusterTime", Value: bson.Timestamp{T: 1, I: 1}}}}}, "", false},
+		// Inside a transaction nothing is read from the archive, so the level
+		// that rides on its first statement is no reason to refuse.
+		{"snapshot in a transaction", bson.D{{Key: "readConcern", Value: bson.D{{Key: "level", Value: "snapshot"}}},
+			{Key: "lsid", Value: bson.D{{Key: "id", Value: int32(1)}}}, {Key: "txnNumber", Value: int64(1)},
+			{Key: "autocommit", Value: false}}, "majority", true},
 		// Linearizable is defined for one document on the node that owns it.
 		// Answering it from another cluster cannot mean that, and quietly
 		// downgrading the strongest guarantee in the system is worse than

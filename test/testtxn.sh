@@ -492,6 +492,29 @@ for q in "{aggregate:'ttxt', pipeline:[{\$sort:{_id:1}}], cursor:{}, $RC}" \
       "$([ "$OUT" = "$WANT" ] || [ "$OUT" = refused ] && echo right || echo "got $OUT, mongod $WANT")"
 done
 
+echo "== a transaction started with readConcern snapshot =="
+# The usual way to start one: the read concern rides on the first statement.
+# That statement reaching an archived document has to be copied up and
+# replayed like any other in a transaction, not refused as a snapshot read the
+# archive cannot answer: inside a transaction nothing is read there.
+fresh ttxu
+R "db.getSiblingDB(process.env.TC_DB).ttxu.insertMany([{_id:1,bal:100},{_id:2,bal:5}])" >/dev/null
+waitMirrored ttxu 2
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).ttxu.deleteOne({_id:2})"
+for first in "c.findOne({_id:2})" "c.find({bal:{\$gte:0}}).toArray()" "c.updateOne({_id:2},{\$inc:{bal:1}})"; do
+  chk "  $first first, under snapshot, commits"  "COMMITTED" "$(R "
+    const s=db.getMongo().startSession(); const c=s.getDatabase(process.env.TC_DB).ttxu;
+    let n=0, out='';
+    for (;;) { n++;
+      s.startTransaction({readConcern:{level:'snapshot'}, writeConcern:{w:'majority'}});
+      try { $first; c.updateOne({_id:1},{\$inc:{bal:-1}}); s.commitTransaction(); out='COMMITTED'; break; }
+      catch(e) { try{s.abortTransaction()}catch(_){}
+        if (!(e.errorLabels||[]).includes('TransientTransactionError') || n>5) { out=(e.codeName||'')+' '+e.message.substring(0,120); break; } }
+    }
+    print(out)")"
+  H "db.getSiblingDB(process.env.TC_DB).ttxu.deleteOne({_id:2})" >/dev/null
+done
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"
