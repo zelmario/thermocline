@@ -257,7 +257,11 @@ function modifiers() {
   const m = {};
   if (maybe(0.15)) m.hint = pick(INDEXES);
   if (maybe(0.15)) m.collation = { locale: 'en', strength: 1 + ri(3) };
-  if (maybe(0.15)) m.readConcern = pick(['local', 'majority']);
+  // snapshot since 2026-11-27, when a snapshot read that fell through to the
+  // archive came back with no instant and, at a named one, with documents
+  // created after it. Without atClusterTime both sides read their present,
+  // so the answers must agree or the tiered side must refuse.
+  if (maybe(0.15)) m.readConcern = pick(['local', 'majority', 'snapshot']);
   return m;
 }
 // writeCollation is a collation for a write, which is the half of the rule
