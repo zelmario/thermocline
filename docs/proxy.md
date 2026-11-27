@@ -122,6 +122,19 @@ Range queries are governed by the watermark below.
   each other member, and mongod's own rule that a cursor opened in a session
   is read only in that session still holds: asked for from another session,
   it refused 2 of 2.
+- **A cursor on a tiered collection belongs to the proxy process that opened
+  it, as a cursor belongs to its mongos.** The proxy keeps, beside each such
+  cursor, the completeness claim that let the fast tier answer it, and refuses
+  the next getMore if the evictor has narrowed that claim since. That record
+  is in memory and the cursor is on mongod, so a proxy killed and restarted
+  forwarded the old cursor's getMore unguarded: in testevict, 3 of 40
+  documents delivered with no error after a restart and a sweep. A getMore on
+  a tiered collection for a cursor this process never handed out is now
+  answered `CursorNotFound`, and the client re-runs the query. The same
+  applies to a getMore sent to a different proxy from the one that opened the
+  cursor, which a load balancer that does not keep a client on one proxy
+  would do. Cursors on collections that are not tiered are forwarded as
+  before. Counted as `foreign_cursors_total`.
 - **Read preference is not honoured. Every read is served by the primary.** This
   follows from proxied authentication and is the one limitation to weigh before a
   pilot. The proxy answers `hello` as a mongos, and a mongos routes by read

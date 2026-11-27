@@ -263,6 +263,8 @@ type Router struct {
 	// parked are the upstreams of connections ended for a failover, kept for
 	// the cursors on them. See parked.go.
 	parked parkedSet
+	// issued is every cursor this process has handed a client. See issued.go.
+	issued issuedCursors
 
 	// inv is what each tier is holding, refreshed on a timer.
 	inv     inventoryCache
@@ -379,6 +381,9 @@ type Stats struct {
 	// StreamsResumed counts change stream getMores on a cursor this router
 	// never opened, told to resume. See unregisteredStream.
 	StreamsResumed atomic.Int64
+	// ForeignCursors counts getMores refused because this process never
+	// handed out the cursor they name. See issued.go.
+	ForeignCursors atomic.Int64
 	StaleReads     atomic.Int64
 	// StaleRefusals counts reads and writes refused under router.freshness:
 	// strict because mirroring had not caught up, the default's counterpart
@@ -890,6 +895,8 @@ func (r *Router) reapCursors(ctx context.Context) {
 			// And change stream events held for a client that never came back
 			// for them. See streamheld.go.
 			r.changeStreams.reapHeld(cursorIdle)
+			// And every cursor handed out, on the longer clock. See issued.go.
+			r.issued.reapIdle(issuedIdle)
 		}
 	}
 }
@@ -1192,6 +1199,9 @@ type conn struct {
 	// closeAfterReply ends this connection once the reply in hand has gone out.
 	// See endAfterFailover for what sets it.
 	closeAfterReply bool
+	// askedCursor is the cursor the getMore being handled names, or 0. See
+	// issued.go.
+	askedCursor int64
 	// parkOnClose keeps this connection's own upstream when it ends, for the
 	// cursors on it. Set where a failover ends it. See parked.go.
 	parkOnClose atomic.Bool
@@ -1429,6 +1439,16 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 	c.rename = nil
 	c.indexDrop = nil
 	c.sendInstead, c.csTail = nil, nil
+	// The cursor a getMore names, so the reply that drains it can forget it.
+	// See issued.go.
+	c.askedCursor = 0
+	if nameErr == nil && name == "getMore" {
+		if cmd, cerr := msg.CommandDoc(); cerr == nil {
+			if id, ok := intOf64(cmd.Lookup("getMore")); ok {
+				c.askedCursor = id
+			}
+		}
+	}
 
 	// A handshake is answered here rather than forwarded, because a pooled
 	// connection can only carry one. See answerHello.
@@ -1534,6 +1554,15 @@ func (c *conn) handle(ctx context.Context, msg *wire.Message) error {
 		if cmd, cerr := msg.CommandDoc(); cerr == nil {
 			c.cacheInvalidate(msg, name, db, cmd)
 			c.liveNoteWrites(msg, name, db, cmd)
+		}
+	}
+
+	// A cursor on a tiered collection that this process never handed out
+	// cannot be guarded, because what guarded it died with the process that
+	// opened it. See issued.go.
+	if nameErr == nil && name == "getMore" && !msg.MoreToCome() {
+		if out, done := c.refuseForeignGetMore(ctx, msg, db); done {
+			return c.send(out)
 		}
 	}
 

@@ -475,6 +475,70 @@ chkv "the archive kept every one of them"           "40" \
 H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
 
+echo "== the same cursor, read on after the router restarts =="
+# The guard above is a record in the router's memory, beside a cursor that
+# lives on mongod. Killed and restarted, the router has lost the record and the
+# cursor is still there: the driver sends its next getMore on a new connection,
+# and a router that does not know the id forwards it unguarded. The twin of a
+# change stream outliving its router, found on 2026-11-27 (see testchange).
+#
+# The gates hold the order still: the first batch is in hand, then the router
+# is killed and restarted, then a retryable read clears the client's pool so
+# the cursor's own getMore goes out on a fresh connection, and only then does
+# the sweep narrow the claim.
+#
+# On the section above's collection, dropped and rebuilt, because the evictor's
+# rules name the collections it sweeps and a new name would be swept by none.
+CNS=tevcursor
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+H "db.getSiblingDB(process.env.TC_DB).$CNS.insertMany($CMK)" >/dev/null
+cline watermark --config $CFG --ns $DB.$CNS --complete-all --force >/dev/null 2>&1
+kill $CRP 2>/dev/null; wait $CRP 2>/dev/null
+cline router --config $CFG --log-file $LOGDIR/ev_currestart_r.log & CRP=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+openGate rkill; openGate rback; openGate rsweep
+RSOUT_F=$LOGDIR/ev_currestart.out
+( R "
+  const c = db.getSiblingDB(process.env.TC_DB).$CNS;
+  const cur = c.find({}).sort({_id:1}).batchSize(3);
+  let first = 0;
+  for (let i=0;i<3 && cur.hasNext();i++) { cur.next(); first++; }
+  const hot = Mongo(process.env.TC_HOT).getDB(process.env.TC_DB);
+  const before = hot.$CNS.countDocuments({});
+  hot.$GATE.insertOne({_id:'rkill'});
+  for (let i=0;i<120 && hot.$GATE.countDocuments({_id:'rback'})===0; i++) sleep(500);
+  try { c.countDocuments({_id:1}) } catch (e) {}
+  hot.$GATE.insertOne({_id:'rsweep'});
+  for (let i=0;i<60 && hot.$CNS.countDocuments({}) > 10; i++) sleep(500);
+  const left = hot.$CNS.countDocuments({});
+  let got = first, refused = false, why = '';
+  try { while (cur.hasNext()) { cur.next(); got++; } }
+  catch (e) { why = String(e.message); refused = /thermocline/.test(why); }
+  print(before + '/' + left + '/' + got + '/' + refused + '/' + why.slice(0,60));" > "$RSOUT_F" ) & RSPID=$!
+waitGate rkill
+pkill -9 -f "cline router --config $WDIR/" 2>/dev/null
+wait $CRP 2>/dev/null
+cline router --config $CFG --log-file $LOGDIR/ev_currestart_r.log & CRP=$!
+for _ in $(seq 1 30); do routerUp && break; sleep 1; done
+H "db.getSiblingDB(process.env.TC_DB).$GATE.insertOne({_id:'rback'})" >/dev/null
+waitGate rsweep
+cline evictor --config $CFG --every 2s --log-file $LOGDIR/ev_currestart.log & REVP=$!
+wait $RSPID
+kill $REVP 2>/dev/null; wait $REVP 2>/dev/null
+RSOUT=$(tail -1 "$RSOUT_F")
+echo "  across the restart the fast tier held $(echo "$RSOUT" | cut -d/ -f1), then $(echo "$RSOUT" | cut -d/ -f2), and the cursor delivered $(echo "$RSOUT" | cut -d/ -f3): $(echo "$RSOUT" | cut -d/ -f5-)"
+chkv "the cursor opened while the fast tier held them" "true" \
+    "$([ "$(echo "$RSOUT" | cut -d/ -f1)" -gt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "the sweep after the restart emptied it"       "true" \
+    "$([ "$(echo "$RSOUT" | cut -d/ -f2)" -lt 10 ] 2>/dev/null && echo true || echo false)"
+chkv "a getMore after a restart is refused, not short" "true" "$(echo "$RSOUT" | cut -d/ -f4)"
+chkv "re-running it after the restart answers in full" "40" \
+    "$(R "print(db.getSiblingDB(process.env.TC_DB).$CNS.find({}).sort({_id:1}).batchSize(3).itcount())")"
+H "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+C "db.getSiblingDB(process.env.TC_DB).$CNS.drop()" >/dev/null
+
 echo "== the same, for an aggregation, which is judged before it runs =="
 # The twin of the section above, and it was open. A find is inspected on the way
 # back, so the claim that authorised it was to hand and could be remembered

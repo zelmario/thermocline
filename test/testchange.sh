@@ -785,7 +785,7 @@ mongosh --port $PORT -u dba -p secret --authenticationDatabase admin --quiet --e
   print(ops.length ? ops.join(',') : 'none');" > /tmp/cs_orphan.txt 2>&1 &
 WATCHER7=$!
 sleep 3
-RESUMED0=$(grep -c "told a change stream this router did not open to resume" $LOGDIR/cs_r.log 2>/dev/null)
+RESUMED0=$(grep -cE "told a change stream this router did not open to resume|on a cursor this router process did not open" $LOGDIR/cs_r.log 2>/dev/null)
 pkill -9 -f "cline router --config $WDIR/" 2>/dev/null
 for _ in $(seq 1 30); do pgrep -f "cline router --config $WDIR/" >/dev/null 2>&1 || break; sleep 0.2; done
 startRouter
@@ -793,7 +793,7 @@ R "db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')})" >/de
 touch /tmp/cs_orphan.go
 ORPHAN=$(awaitWatcher /tmp/cs_orphan.txt $WATCHER7)
 echo "  the watcher across the restart saw: ${ORPHAN:-nothing}"
-RESUMED1=$(grep -c "told a change stream this router did not open to resume" $LOGDIR/cs_r.log 2>/dev/null)
+RESUMED1=$(grep -cE "told a change stream this router did not open to resume|on a cursor this router process did not open" $LOGDIR/cs_r.log 2>/dev/null)
 chk "the copy-up after the restart happened"           "late" \
     "$(H "const d=db.getSiblingDB(process.env.TC_DB).$NS.findOne({_id:ObjectId('$OID4')}); print(d?d.v:'MISSING')")"
 chk "the watcher across the restart reported"          "true" \

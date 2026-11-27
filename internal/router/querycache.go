@@ -475,6 +475,7 @@ func replyAddressedTo(stored []byte, requestID int32) (*wire.Message, error) {
 func (c *conn) send(out *wire.Message) error {
 	c.cacheStore(out)
 	c.liveAfterReply(out)
+	c.noteIssued(out)
 	return wire.Write(c.client, out)
 }
 
