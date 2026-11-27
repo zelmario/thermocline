@@ -665,9 +665,7 @@ func rewriteForArchive(cmd bson.Raw, collation bson.Raw, hintPred bson.D, keepHi
 	// covers all of them.
 	level, honourable := archiveLevel(cmd)
 	if !honourable {
-		return nil, 0, errors.New("readConcern linearizable cannot be answered from the archive: " +
-			"it promises a read confirmed on the primary that owns the document; " +
-			"warm this range, or read it with majority")
+		return nil, 0, archiveConcernError(cmd)
 	}
 
 	for _, e := range elems {
@@ -1249,6 +1247,16 @@ func (c *conn) guardSimpleRead(ctx context.Context, msg *wire.Message, db, name 
 			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
 			return out, true
 		}
+		if errors.Is(aerr, errReadConcern) {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused a read whose read concern the archive cannot honour", "ns", ns, "err", aerr)
+			if out, rerr := c.r.commandError(msg.Header.RequestID, msg.Header.RequestID,
+				"thermocline: "+ns+" needs the archive for this read, because "+because+", and "+
+					concernReason(aerr)); rerr == nil {
+				return out, true
+			}
+		}
 		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
 	}
 
@@ -1296,9 +1304,7 @@ func (c *conn) answerSimpleFromArchive(ctx context.Context, msg *wire.Message, d
 	// and linearizable cannot be answered by another cluster at all.
 	level, honourable := archiveLevel(cmd)
 	if !honourable {
-		return nil, errors.New("readConcern linearizable cannot be answered from the archive: " +
-			"it promises a read confirmed on the primary that owns the document; " +
-			"warm this range, or read it with majority")
+		return nil, archiveConcernError(cmd)
 	}
 
 	out := make(bson.D, 0, len(elems)+3)

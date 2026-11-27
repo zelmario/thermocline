@@ -162,11 +162,9 @@ func (c *conn) interceptFind(ctx context.Context, msg *wire.Message, db string, 
 	if !honourable {
 		c.r.Stats.Refused.Add(1)
 		c.cls = ClassRefused
-		c.log.Warn("refused a linearizable read that only the archive can answer", "ns", ns)
+		c.log.Warn("refused a read whose read concern the archive cannot honour", "ns", ns)
 		return c.r.commandError(reply.Header.RequestID, msg.Header.RequestID,
-			"thermocline: this document is in the archive, and readConcern linearizable cannot be "+
-				"answered from there: it promises a read confirmed on the primary that owns the "+
-				"document. Warm this range, or read it with majority.")
+			"thermocline: this document is in the archive, and "+archiveRefusal(cmd)+".")
 	}
 
 	// Inside a transaction, answering from the archive would mix two clusters
@@ -706,6 +704,13 @@ func (c *conn) guardCompleteness(ctx context.Context, ns string, filter bson.Raw
 		if out, passed := c.r.serverErrorReply(reply.Header.RequestID, msg.Header.RequestID, aerr); passed {
 			c.log.Debug("the archive rejected this read; returning its own error", "ns", ns, "err", aerr)
 			return out, nil
+		}
+		if errors.Is(aerr, errReadConcern) {
+			c.r.Stats.Refused.Add(1)
+			c.cls = ClassRefused
+			c.log.Warn("refused a read whose read concern the archive cannot honour", "ns", ns, "err", aerr)
+			return c.r.errorReply(msg, reply, "thermocline: "+ns+" needs the archive for this read, because "+
+				because+", and "+concernReason(aerr))
 		}
 		c.log.Warn("could not answer this read from the archive, refusing instead", "ns", ns, "err", aerr)
 	}

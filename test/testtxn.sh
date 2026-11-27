@@ -445,6 +445,44 @@ chk "  with both statements in it"                      "0 r1" \
 chk "  and the key it took is still held"               "11000" "$(R "
   try { db.getSiblingDB(process.env.TC_DB).ttxs.insertOne({_id:3,ref:'r1'}); print('INSERTED'); } catch(e) { print(e.code) }")"
 
+echo "== a snapshot read at a past cluster time =="
+# readConcern snapshot with atClusterTime reads the collection as it stood at
+# that instant. The archive has no such instant: it holds what was mirrored
+# since, including documents created after it.
+fresh ttxt
+R "db.getSiblingDB(process.env.TC_DB).ttxt.insertMany([{_id:1},{_id:3}])" >/dev/null
+waitMirrored ttxt 2
+T=$(H "const c=db.adminCommand({ping:1}).\$clusterTime.clusterTime; print(c.getHighBits()+','+c.getLowBits())")
+sleep 1
+R "db.getSiblingDB(process.env.TC_DB).ttxt.insertOne({_id:2})" >/dev/null
+R "db.getSiblingDB(process.env.TC_DB).ttxt.deleteOne({_id:3})" >/dev/null
+sleep 2
+evictBehindTheFeeder "db.getSiblingDB(process.env.TC_DB).ttxt.deleteOne({_id:2})"
+SNAP="try { const r=db.getSiblingDB(process.env.TC_DB).runCommand({find:'ttxt', filter:{}, sort:{_id:1},
+  readConcern:{level:'snapshot', atClusterTime:Timestamp({t:${T%,*}, i:${T#*,}})}});
+  print(r.ok ? r.cursor.firstBatch.map(d=>d._id).join(',') : 'REFUSED '+r.errmsg) }
+  catch(e) { print('REFUSED '+e.message) }"
+chk "  mongod at that instant holds 1 and 3"            "1,3" "$(H "$SNAP")"
+# The archive cannot read at that instant, so a refusal is the honest answer
+# when the fast tier alone cannot give it. Anything else is a wrong answer.
+OUT=$(R "$SNAP"); case "$OUT" in REFUSED*atClusterTime*) OUT="refused" ;; esac
+chk "a snapshot read at a past instant is right or refused" "1,3 or refused" \
+    "$([ "$OUT" = "$(H "$SNAP")" ] || [ "$OUT" = refused ] && echo "1,3 or refused" || echo "$OUT")"
+chk "  and here it is refused, naming atClusterTime"   "refused" "$OUT"
+RC="readConcern:{level:'snapshot', atClusterTime:Timestamp({t:${T%,*}, i:${T#*,}})}"
+for q in "{aggregate:'ttxt', pipeline:[{\$sort:{_id:1}}], cursor:{}, $RC}" \
+         "{count:'ttxt', query:{}, $RC}" "{distinct:'ttxt', key:'_id', query:{}, $RC}" \
+         "{find:'ttxt', filter:{_id:2}, $RC}" "{find:'ttxt', filter:{_id:3}, $RC}"; do
+  Q="try { const r=db.getSiblingDB(process.env.TC_DB).runCommand($q);
+    print(!r.ok ? 'REFUSED '+r.errmsg : r.cursor ? r.cursor.firstBatch.map(d=>d._id).join(',') :
+          r.values ? r.values.join(',') : r.n) }
+    catch(e) { print('REFUSED '+e.message) }"
+  WANT=$(H "$Q"); OUT=$(R "$Q"); case "$OUT" in REFUSED*) OUT="refused" ;; esac
+  L=${q#\{}; L=${L%%,*}; echo "    $L: $OUT (mongod $WANT)"
+  chk "  $L at that instant: mongod's or refused" "right" \
+      "$([ "$OUT" = "$WANT" ] || [ "$OUT" = refused ] && echo right || echo "got $OUT, mongod $WANT")"
+done
+
 echo "================================"
 echo "PASS $PASS   FAIL $FAIL"
 [ $FAIL -gt 0 ] && printf 'failed: %s\n' "${FAILED[*]}"

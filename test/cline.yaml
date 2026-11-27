@@ -264,6 +264,8 @@ feeder:
     - "shop.ttxr"
     # testtxn.sh: a transaction whose router is killed before the commit.
     - "shop.ttxs"
+    # testtxn.sh: a snapshot read at a past cluster time.
+    - "shop.ttxt"
     # testconcerns.sh
     - "shop.tconc2"
     - "shop.tconc2u"

@@ -1,6 +1,9 @@
 package router
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -53,9 +56,19 @@ func archiveLevel(cmd bson.Raw) (level string, honourable bool) {
 		return s, true
 	case "snapshot":
 		// Outside a transaction, snapshot means a majority-committed snapshot,
-		// and majority is what the archive can promise. The atClusterTime that
-		// may accompany it is the fast tier's and is dropped, so this is a
-		// snapshot of the archive rather than of the instant the caller named.
+		// and majority is what the archive can promise, as long as the caller
+		// left the instant to the server.
+		//
+		// An atClusterTime is an instant in the fast tier's history, and the
+		// archive has none of those: it holds what was mirrored since, deletes
+		// included. Read there, a snapshot at a past instant returned a
+		// document created after it and missed one deleted after it (testtxn,
+		// "a snapshot read at a past cluster time": 1,2 where mongod says
+		// 1,3). Drivers send one on every read after the first in a snapshot
+		// session, so this is not exotic.
+		if _, err := doc.LookupErr("atClusterTime"); err == nil {
+			return "", false
+		}
 		return "majority", true
 	case "linearizable":
 		// Linearizable promises that the read reflects every write that
@@ -68,6 +81,37 @@ func archiveLevel(cmd bson.Raw) (level string, honourable bool) {
 	default:
 		return "", true
 	}
+}
+
+// errReadConcern marks an archive read refused for its read concern, so the
+// refusal the client gets names that reason rather than the incompleteness that
+// sent the read to the archive.
+var errReadConcern = errors.New("the archive cannot honour this read concern")
+
+// archiveConcernError is the error an archive read returns for a read concern
+// archiveLevel calls unhonourable.
+func archiveConcernError(cmd bson.Raw) error {
+	return fmt.Errorf("%w: %s", errReadConcern, archiveRefusal(cmd))
+}
+
+// concernReason is archiveRefusal's text, read back off an archiveConcernError.
+func concernReason(err error) string {
+	return strings.TrimPrefix(err.Error(), errReadConcern.Error()+": ")
+}
+
+// archiveRefusal says why a read concern archiveLevel calls unhonourable cannot
+// be answered from the archive, and what the caller can do instead.
+func archiveRefusal(cmd bson.Raw) string {
+	if doc, ok := cmd.Lookup("readConcern").DocumentOK(); ok {
+		if _, err := doc.LookupErr("atClusterTime"); err == nil {
+			return "readConcern atClusterTime names an instant in the fast tier's history, which the " +
+				"archive does not have: it holds what was mirrored since, so a document created after " +
+				"that instant would be read and one deleted after it missed; warm this range, or read " +
+				"without atClusterTime"
+		}
+	}
+	return "readConcern linearizable cannot be answered from the archive: it promises a read " +
+		"confirmed on the primary that owns the document; warm this range, or read it with majority"
 }
 
 // archiveReadConcern renders a level as the document to send with a command.
